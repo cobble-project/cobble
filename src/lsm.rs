@@ -69,11 +69,11 @@ impl LSMTree {
                 for file in &level_edit.removed_files {
                     if let Some(pos) = level.files.iter().position(|f| Arc::ptr_eq(f, file)) {
                         level.files.remove(pos);
-                        if insert_pos.is_none() {
-                            insert_pos = Some(pos);
-                        } else {
+                        if let Some(previous) = insert_pos {
                             // Ensure that all removed files are contiguous.
-                            assert_eq!(pos, insert_pos.unwrap());
+                            assert_eq!(pos, previous);
+                        } else {
+                            insert_pos = Some(pos);
                         }
                     }
                 }

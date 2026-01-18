@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytes = "1.11.0"
+dashmap = "6.1.0"
+opendal = { version = "0.54.0", features = ["services-fs", "services-oss", "services-s3"] }
+serial_test = "3.3.1"
+thiserror = "2.0.16"
+tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "macros"] }
+url = "2.5.7"

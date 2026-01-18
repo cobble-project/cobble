@@ -4,3 +4,4 @@
 mod data_file;
 mod file;
 mod lsm;
+mod error;
