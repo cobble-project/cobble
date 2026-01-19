@@ -1,5 +1,5 @@
-use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::error::Result;
+use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::file::opendal_fs::OpendalFileSystem;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -15,9 +15,9 @@ pub trait FileSystem {
     fn exists(&self, path: &str) -> Result<bool>;
 
     fn delete(&self, path: &str) -> Result<()>;
-    
+
     fn open_read(&self, path: &str) -> Result<Box<dyn RandomAccessFile>>;
-    
+
     fn open_write(&self, path: &str) -> Result<Box<dyn SequentialWriteFile>>;
 }
 
@@ -56,5 +56,4 @@ mod test {
         assert!(fs2.is_ok());
         assert!(Arc::ptr_eq(&fs1.unwrap(), &fs2.unwrap()));
     }
-
 }

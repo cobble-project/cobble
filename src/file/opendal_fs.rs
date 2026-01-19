@@ -1,13 +1,13 @@
+use crate::error::{Error, Result};
+use crate::file::FileHandle;
+use crate::file::file_system::FileSystem;
+use crate::file::files::{RandomAccessFile, SequentialWriteFile};
+use crate::file::opendal_file::{OpendalRandomAccessFile, OpendalSequentialWriteFile};
+use opendal::{Operator, Scheme};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use opendal::{Operator, Scheme};
 use url::Url;
-use crate::error::{Result, Error};
-use crate::file::files::{RandomAccessFile, SequentialWriteFile};
-use crate::file::file_system::FileSystem;
-use crate::file::FileHandle;
-use crate::file::opendal_file::{OpendalRandomAccessFile, OpendalSequentialWriteFile};
 
 pub struct OpendalFileSystem {
     pub(crate) op: Operator,
@@ -15,21 +15,19 @@ pub struct OpendalFileSystem {
 }
 
 impl FileSystem for OpendalFileSystem {
-    fn init(url: &Url) -> Result<Self>
-    {
-        let scheme = Scheme::from_str(
-            match url.scheme().to_lowercase().as_str() {
-                "file" => "fs",
-                other => other,
-            })
-            .map_err(|e| Error::FileSystemError(format!("Unsupported scheme: {}", e)))?;
+    fn init(url: &Url) -> Result<Self> {
+        let scheme = Scheme::from_str(match url.scheme().to_lowercase().as_str() {
+            "file" => "fs",
+            other => other,
+        })
+        .map_err(|e| Error::FileSystemError(format!("Unsupported scheme: {}", e)))?;
         // other options from url
-        let mut options : HashMap<String, String> = HashMap::new();
+        let mut options: HashMap<String, String> = HashMap::new();
         match scheme {
             Scheme::Fs => {
                 // For local fs, we only need to set the root path
                 options.insert("root".to_string(), url.path().to_string());
-            },
+            }
             _ => {
                 /* other schemes will be handled below */
                 let host = url.host_str().unwrap_or("");
@@ -43,39 +41,42 @@ impl FileSystem for OpendalFileSystem {
                 options.insert("root".to_string(), url.path().to_string());
             }
         }
-        let op = Operator::via_iter(scheme, options)
-            .map_err(|e| Error::FileSystemError(format!("Failed to create opendal operator: {}", e)))?;
+        let op = Operator::via_iter(scheme, options).map_err(|e| {
+            Error::FileSystemError(format!("Failed to create opendal operator: {}", e))
+        })?;
         // Here we would create a concrete implementation of FileSystem using `op`
-        Ok(OpendalFileSystem { op, runtime:
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| Error::FileSystemError(format!("Failed to create tokio runtime: {}", e)))?.into()
+        Ok(OpendalFileSystem {
+            op,
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    Error::FileSystemError(format!("Failed to create tokio runtime: {}", e))
+                })?
+                .into(),
         })
     }
 
     fn create_dir(&self, path: &str) -> Result<()> {
-        let path = if path.ends_with('/') { path }
-            else {
-                &format!("{}/", path)
-            };
-        self.runtime.block_on(async {
-                self.op.create_dir(path).await
-            })
+        let path = if path.ends_with('/') {
+            path
+        } else {
+            &format!("{}/", path)
+        };
+        self.runtime
+            .block_on(async { self.op.create_dir(path).await })
             .map_err(|e| Error::IoError(format!("Failed to create directory {}: {}", path, e)))
     }
 
     fn exists(&self, path: &str) -> Result<bool> {
-        self.runtime.block_on(async {
-                self.op.exists(path).await
-            })
+        self.runtime
+            .block_on(async { self.op.exists(path).await })
             .map_err(|e| Error::IoError(format!("Failed to create directory {}: {}", path, e)))
     }
 
     fn delete(&self, path: &str) -> Result<()> {
-        self.runtime.block_on(async {
-                self.op.delete(path).await
-            })
+        self.runtime
+            .block_on(async { self.op.delete(path).await })
             .map_err(|e| Error::IoError(format!("Failed to create directory {}: {}", path, e)))
     }
 
@@ -83,14 +84,15 @@ impl FileSystem for OpendalFileSystem {
         self.runtime.block_on(async {
             let reader = self.op.reader(path).await;
             match reader {
-                Ok(r) => {
-                    Ok(Box::new(OpendalRandomAccessFile {
-                        handle: FileHandle { id: 1 },
-                        reader: r,
-                        runtime: Arc::clone(&self.runtime),
-                    }) as Box<dyn RandomAccessFile>)
-                },
-                Err(e) => Err(Error::IoError(format!("Failed to create reader for {}: {}", path, e))),
+                Ok(r) => Ok(Box::new(OpendalRandomAccessFile {
+                    handle: FileHandle { id: 1 },
+                    reader: r,
+                    runtime: Arc::clone(&self.runtime),
+                }) as Box<dyn RandomAccessFile>),
+                Err(e) => Err(Error::IoError(format!(
+                    "Failed to create reader for {}: {}",
+                    path, e
+                ))),
             }
         })
     }
@@ -99,14 +101,15 @@ impl FileSystem for OpendalFileSystem {
         self.runtime.block_on(async {
             let writer = self.op.writer(path).await;
             match writer {
-                Ok(w) => {
-                    Ok(Box::new(OpendalSequentialWriteFile {
-                        handle: FileHandle { id: 1 },
-                        writer: w,
-                        runtime: Arc::clone(&self.runtime),
-                    }) as Box<dyn SequentialWriteFile>)
-                },
-                Err(e) => Err(Error::IoError(format!("Failed to create writer for {}: {}", path, e))),
+                Ok(w) => Ok(Box::new(OpendalSequentialWriteFile {
+                    handle: FileHandle { id: 1 },
+                    writer: w,
+                    runtime: Arc::clone(&self.runtime),
+                }) as Box<dyn SequentialWriteFile>),
+                Err(e) => Err(Error::IoError(format!(
+                    "Failed to create writer for {}: {}",
+                    path, e
+                ))),
             }
         })
     }

@@ -1,5 +1,5 @@
-use bytes::Bytes;
 use crate::error::Error;
+use bytes::Bytes;
 
 pub struct FileHandle {
     pub id: u64,
@@ -10,10 +10,10 @@ pub trait File {
     fn get_handle(&self) -> &FileHandle;
 }
 
-pub trait RandomAccessFile : File {
+pub trait RandomAccessFile: File {
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error>;
 }
 
-pub trait SequentialWriteFile : File {
+pub trait SequentialWriteFile: File {
     fn write(&mut self, data: &[u8]) -> Result<usize, Error>;
 }
