@@ -418,21 +418,21 @@ mod tests {
     #[test]
     #[serial_test::serial(file)]
     fn test_bytes_file_operations() {
-        let test_path = "/tmp/test_bytes_io.txt";
-        let _ = fs::remove_file(test_path);
+        let test_path = std::env::temp_dir().join("test_bytes_io.txt");
+        let _ = fs::remove_file(&test_path);
 
         // Write to file
         let mut writer = BytesWriter::new();
         writer.write(b"Hello, File System!").unwrap();
-        writer.write_to_file(test_path).unwrap();
+        writer.write_to_file(&test_path).unwrap();
 
         // Read from file
-        let reader = BytesReader::from_file(test_path).unwrap();
+        let reader = BytesReader::from_file(&test_path).unwrap();
         assert_eq!(reader.len(), 19);
         assert_eq!(reader.get_ref(), &Bytes::from_static(b"Hello, File System!"));
 
         // Clean up
-        let _ = fs::remove_file(test_path);
+        let _ = fs::remove_file(&test_path);
     }
 
     #[test]
