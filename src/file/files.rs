@@ -71,6 +71,9 @@ impl<W: SequentialWriteFile> BufferedWriter<W> {
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+        // Write data to the buffer. All data is accepted into the buffer,
+        // and flushed to the underlying file when the buffer is full.
+        // Returns the full length of data written to the buffer.
         let mut written = 0;
         let mut remaining = data;
 
