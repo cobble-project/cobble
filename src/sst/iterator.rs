@@ -54,45 +54,28 @@ impl SSTIterator {
     }
 
     fn read_footer(file: &dyn RandomAccessFile) -> Result<Footer> {
-        // TODO: This is a workaround for not having a file size method.
-        // In a production implementation, RandomAccessFile should have a size() method
-        // to allow reading the footer from the end of the file efficiently.
-        // The current approach tries common file sizes which works for tests but
-        // is inefficient for large files and may fail for files > 10MB.
+        // Read footer from the end of the file using the file size
+        let file_size = file.size() as usize;
         
-        // Common file sizes to try - covers most test scenarios
-        const TRY_OFFSETS: &[usize] = &[
-            50,       // Tiny file
-            100,      // Very small file
-            126,      // Test file size (3 entries)
-            148,      // Test file size (4 entries)
-            150,      // Small file ~150 bytes
-            200,      // Small file
-            500,      // Small file
-            1024,     // 1KB
-            4096,     // 4KB
-            10240,    // 10KB
-            102400,   // 100KB
-            1048576,  // 1MB
-            10485760, // 10MB
-        ];
-
-        for &offset in TRY_OFFSETS {
-            // Try to read from offset - FOOTER_SIZE
-            if offset >= FOOTER_SIZE {
-                if let Ok(data) = file.read_at(offset - FOOTER_SIZE, FOOTER_SIZE) {
-                    if data.len() == FOOTER_SIZE {
-                        if let Ok(footer) = Footer::decode(&data) {
-                            return Ok(footer);
-                        }
-                    }
-                }
-            }
+        if file_size < FOOTER_SIZE {
+            return Err(Error::IoError(format!(
+                "File too small to contain footer: {} bytes",
+                file_size
+            )));
         }
-
-        Err(Error::IoError(
-            "Failed to read footer from SST file".to_string(),
-        ))
+        
+        let footer_offset = file_size - FOOTER_SIZE;
+        let data = file.read_at(footer_offset, FOOTER_SIZE)?;
+        
+        if data.len() != FOOTER_SIZE {
+            return Err(Error::IoError(format!(
+                "Failed to read complete footer: expected {} bytes, got {}",
+                FOOTER_SIZE,
+                data.len()
+            )));
+        }
+        
+        Footer::decode(&data)
     }
 
     /// Seek to the first key >= target

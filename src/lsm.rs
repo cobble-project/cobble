@@ -136,7 +136,10 @@ mod tests {
             let id = FILE_ID_COUNTER;
             FILE_ID_COUNTER += 1;
             Arc::new(DataFile {
-                file_handle: FileHandle { id },
+                file_handle: FileHandle { 
+                    id,
+                    size: 0,  // Test file, size doesn't matter
+                },
                 file_type: DataFileType::SSTable,
                 start_key: start.to_vec(),
                 end_key: end.to_vec(),

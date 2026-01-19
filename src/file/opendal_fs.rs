@@ -82,10 +82,20 @@ impl FileSystem for OpendalFileSystem {
 
     fn open_read(&self, path: &str) -> Result<Box<dyn RandomAccessFile>> {
         self.runtime.block_on(async {
+            // Get file metadata to retrieve size
+            let metadata = self.op.stat(path).await.map_err(|e| {
+                Error::IoError(format!("Failed to get metadata for {}: {}", path, e))
+            })?;
+            
+            let file_size = metadata.content_length();
+            
             let reader = self.op.reader(path).await;
             match reader {
                 Ok(r) => Ok(Box::new(OpendalRandomAccessFile {
-                    handle: FileHandle { id: 1 },
+                    handle: FileHandle { 
+                        id: 1, 
+                        size: file_size,
+                    },
                     reader: r,
                     runtime: Arc::clone(&self.runtime),
                 }) as Box<dyn RandomAccessFile>),
@@ -102,7 +112,10 @@ impl FileSystem for OpendalFileSystem {
             let writer = self.op.writer(path).await;
             match writer {
                 Ok(w) => Ok(Box::new(OpendalSequentialWriteFile {
-                    handle: FileHandle { id: 1 },
+                    handle: FileHandle { 
+                        id: 1,
+                        size: 0,  // New file starts at size 0
+                    },
                     writer: w,
                     runtime: Arc::clone(&self.runtime),
                 }) as Box<dyn SequentialWriteFile>),

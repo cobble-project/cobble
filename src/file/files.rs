@@ -3,6 +3,7 @@ use bytes::{Bytes, BytesMut};
 
 pub struct FileHandle {
     pub id: u64,
+    pub size: u64,
 }
 
 pub trait File {
@@ -12,6 +13,11 @@ pub trait File {
 
 pub trait RandomAccessFile: File {
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error>;
+    
+    /// Get the size of the file in bytes
+    fn size(&self) -> u64 {
+        self.get_handle().size
+    }
 }
 
 pub trait SequentialWriteFile: File {
