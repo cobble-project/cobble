@@ -2,6 +2,6 @@
 #![allow(dead_code)]
 
 mod data_file;
+mod error;
 mod file;
 mod lsm;
-mod error;

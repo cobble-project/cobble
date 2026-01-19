@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use bytes::{Buf, Bytes};
-use crate::error::{Result, Error};
-use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
+use crate::error::{Error, Result};
 use crate::file::FileHandle;
+use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
+use bytes::{Buf, Bytes};
+use std::sync::Arc;
 
 pub(crate) struct OpendalRandomAccessFile {
     pub(crate) handle: FileHandle,
@@ -22,10 +22,19 @@ impl File for OpendalRandomAccessFile {
 
 impl RandomAccessFile for OpendalRandomAccessFile {
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes> {
-        self.runtime.block_on(async {
-            self.reader.read(offset as u64..(offset + size) as u64).await.map(|data| data.to_bytes() )
-        })
-        .map_err(|e| Error::IoError(format!("Failed to read at offset {} size {}: {}", offset, size, e)))
+        self.runtime
+            .block_on(async {
+                self.reader
+                    .read(offset as u64..(offset + size) as u64)
+                    .await
+                    .map(|data| data.to_bytes())
+            })
+            .map_err(|e| {
+                Error::IoError(format!(
+                    "Failed to read at offset {} size {}: {}",
+                    offset, size, e
+                ))
+            })
     }
 }
 
@@ -37,10 +46,9 @@ pub(crate) struct OpendalSequentialWriteFile {
 
 impl File for OpendalSequentialWriteFile {
     fn close(&mut self) -> Result<()> {
-        self.runtime.block_on( async {
-            self.writer.close().await.map(|_| ())
-        })
-        .map_err(|e| Error::IoError(format!("Failed to close writer: {}", e)))
+        self.runtime
+            .block_on(async { self.writer.close().await.map(|_| ()) })
+            .map_err(|e| Error::IoError(format!("Failed to close writer: {}", e)))
     }
 
     fn get_handle(&self) -> &FileHandle {
@@ -50,9 +58,14 @@ impl File for OpendalSequentialWriteFile {
 
 impl SequentialWriteFile for OpendalSequentialWriteFile {
     fn write(&mut self, data: &[u8]) -> Result<usize> {
-        self.runtime.block_on(async {
-            self.writer.write_from(data).await.map(|_| data.remaining())
-        })
-        .map_err(|e| Error::IoError(format!("Failed to write data of size {}: {}", data.remaining(), e)))
+        self.runtime
+            .block_on(async { self.writer.write_from(data).await.map(|_| data.remaining()) })
+            .map_err(|e| {
+                Error::IoError(format!(
+                    "Failed to write data of size {}: {}",
+                    data.remaining(),
+                    e
+                ))
+            })
     }
 }
