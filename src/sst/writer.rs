@@ -143,7 +143,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{FileSystem, FileSystemRegistry};
+    use crate::file::FileSystemRegistry;
 
     #[test]
     #[serial_test::serial(file)]
