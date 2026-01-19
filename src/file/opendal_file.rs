@@ -18,10 +18,6 @@ impl File for OpendalRandomAccessFile {
     fn get_handle(&self) -> &FileHandle {
         &self.handle
     }
-    
-    fn get_handle_mut(&mut self) -> &mut FileHandle {
-        &mut self.handle
-    }
 }
 
 impl RandomAccessFile for OpendalRandomAccessFile {
@@ -58,10 +54,6 @@ impl File for OpendalSequentialWriteFile {
     fn get_handle(&self) -> &FileHandle {
         &self.handle
     }
-    
-    fn get_handle_mut(&mut self) -> &mut FileHandle {
-        &mut self.handle
-    }
 }
 
 impl SequentialWriteFile for OpendalSequentialWriteFile {
@@ -78,7 +70,7 @@ impl SequentialWriteFile for OpendalSequentialWriteFile {
             })?;
         
         // Update the file size after successful write
-        self.handle.size += len as u64;
+        self.handle.size += len;
         Ok(len)
     }
 }

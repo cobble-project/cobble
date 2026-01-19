@@ -87,7 +87,7 @@ impl FileSystem for OpendalFileSystem {
                 Error::IoError(format!("Failed to get metadata for {}: {}", path, e))
             })?;
             
-            let file_size = metadata.content_length();
+            let file_size = metadata.content_length() as usize;
             
             let reader = self.op.reader(path).await;
             match reader {

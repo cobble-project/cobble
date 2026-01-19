@@ -55,7 +55,7 @@ impl SSTIterator {
 
     fn read_footer(file: &dyn RandomAccessFile) -> Result<Footer> {
         // Read footer from the end of the file using the file size
-        let file_size = file.size() as usize;
+        let file_size = file.size();
         
         if file_size < FOOTER_SIZE {
             return Err(Error::IoError(format!(
