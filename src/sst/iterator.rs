@@ -170,11 +170,30 @@ impl SSTIterator {
 
     /// Get the current key-value pair
     pub fn current(&self) -> Result<Option<(Bytes, Bytes)>> {
-        if let Some(block) = &self.current_data_block {
-            if self.current_entry_idx < block.len() {
-                let (key, value) = block.get(self.current_entry_idx)?;
-                return Ok(Some((key, value)));
-            }
+        if let Some(block) = &self.current_data_block
+            && self.current_entry_idx < block.len() {
+            let (key, value) = block.get(self.current_entry_idx)?;
+            return Ok(Some((key, value)));
+        }
+        Ok(None)
+    }
+    
+    /// Get the current key only
+    pub fn key(&self) -> Result<Option<Bytes>> {
+        if let Some(block) = &self.current_data_block
+            && self.current_entry_idx < block.len() {
+            let (key, _) = block.get(self.current_entry_idx)?;
+            return Ok(Some(key));
+        }
+        Ok(None)
+    }
+    
+    /// Get the current value only
+    pub fn value(&self) -> Result<Option<Bytes>> {
+        if let Some(block) = &self.current_data_block
+            && self.current_entry_idx < block.len() {
+            let (_, value) = block.get(self.current_entry_idx)?;
+            return Ok(Some(value));
         }
         Ok(None)
     }

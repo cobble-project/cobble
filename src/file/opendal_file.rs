@@ -18,6 +18,10 @@ impl File for OpendalRandomAccessFile {
     fn get_handle(&self) -> &FileHandle {
         &self.handle
     }
+    
+    fn get_handle_mut(&mut self) -> &mut FileHandle {
+        &mut self.handle
+    }
 }
 
 impl RandomAccessFile for OpendalRandomAccessFile {
@@ -54,18 +58,27 @@ impl File for OpendalSequentialWriteFile {
     fn get_handle(&self) -> &FileHandle {
         &self.handle
     }
+    
+    fn get_handle_mut(&mut self) -> &mut FileHandle {
+        &mut self.handle
+    }
 }
 
 impl SequentialWriteFile for OpendalSequentialWriteFile {
     fn write(&mut self, data: &[u8]) -> Result<usize> {
+        let len = data.remaining();
         self.runtime
-            .block_on(async { self.writer.write_from(data).await.map(|_| data.remaining()) })
+            .block_on(async { self.writer.write_from(data).await.map(|_| len) })
             .map_err(|e| {
                 Error::IoError(format!(
                     "Failed to write data of size {}: {}",
-                    data.remaining(),
+                    len,
                     e
                 ))
-            })
+            })?;
+        
+        // Update the file size after successful write
+        self.handle.size += len as u64;
+        Ok(len)
     }
 }

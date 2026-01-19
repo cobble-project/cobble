@@ -149,23 +149,23 @@ mod tests {
 
     #[test]
     fn test_lsm_tree_apply_edit() {
-        let mut lsm_tree = LSMTree::default();
-
-        // Initial version with level 0 and level 1
-        lsm_tree.current_version = Arc::new(LSMTreeVersion {
-            levels: vec![
-                Level {
-                    ordinal: 0,
-                    tiered: true,
-                    files: vec![create_data_file(b"a", b"b"), create_data_file(b"c", b"d")],
-                },
-                Level {
-                    ordinal: 1,
-                    tiered: false,
-                    files: vec![create_data_file(b"e", b"f"), create_data_file(b"g", b"h")],
-                },
-            ],
-        });
+        let mut lsm_tree = LSMTree {
+            current_version: Arc::new(LSMTreeVersion {
+                levels: vec![
+                    Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: vec![create_data_file(b"a", b"b"), create_data_file(b"c", b"d")],
+                    },
+                    Level {
+                        ordinal: 1,
+                        tiered: false,
+                        files: vec![create_data_file(b"e", b"f"), create_data_file(b"g", b"h")],
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
 
         // Create a version edit to remove one file from level 0 and add two new files
         let edit = VersionEdit {

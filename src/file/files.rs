@@ -9,6 +9,7 @@ pub struct FileHandle {
 pub trait File {
     fn close(&mut self) -> Result<(), Error>;
     fn get_handle(&self) -> &FileHandle;
+    fn get_handle_mut(&mut self) -> &mut FileHandle;
 }
 
 pub trait RandomAccessFile: File {
@@ -22,6 +23,12 @@ pub trait RandomAccessFile: File {
 
 pub trait SequentialWriteFile: File {
     fn write(&mut self, data: &[u8]) -> Result<usize, Error>;
+    
+    /// Get the current size of the file in bytes
+    /// This should be updated after each flush
+    fn size(&self) -> u64 {
+        self.get_handle().size
+    }
 }
 
 // Implement File for Box<dyn SequentialWriteFile>
@@ -32,6 +39,10 @@ impl File for Box<dyn SequentialWriteFile> {
 
     fn get_handle(&self) -> &FileHandle {
         (**self).get_handle()
+    }
+    
+    fn get_handle_mut(&mut self) -> &mut FileHandle {
+        (**self).get_handle_mut()
     }
 }
 

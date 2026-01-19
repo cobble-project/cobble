@@ -39,7 +39,7 @@ impl Footer {
             )));
         }
 
-        let mut buf = &data[..];
+        let mut buf = data;
         let index_block_offset = buf.get_u64_le();
         let index_block_size = buf.get_u64_le();
         let magic = buf.get_u32_le();
