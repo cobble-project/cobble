@@ -5,3 +5,4 @@ mod data_file;
 mod error;
 mod file;
 mod lsm;
+mod sst;
