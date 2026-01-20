@@ -44,8 +44,13 @@ impl SortedRun {
         self.files.last().map(|f| f.end_key.as_slice())
     }
 
-    /// Find the index of the first file that may contain the target key.
-    /// Returns the index of the file whose key range includes or is after the target.
+    /// Find the index of the first file whose key range could contain the target key.
+    ///
+    /// This performs a binary search to find the first file whose end_key >= target.
+    /// The returned file's start_key might be greater than the target (if the target
+    /// falls between files), but no earlier file could contain the target.
+    ///
+    /// Returns `None` if the target is beyond all files' key ranges.
     pub fn find_file(&self, target: &[u8]) -> Option<usize> {
         if self.files.is_empty() {
             return None;
@@ -133,12 +138,20 @@ where
     F: Fn(&DataFile) -> Result<I>,
 {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
-        // Find the file that may contain the target
-        let file_idx = self
-            .files
-            .iter()
-            .position(|f| f.end_key.as_slice() >= target)
-            .unwrap_or(self.files.len());
+        // Binary search for the first file whose end_key >= target
+        let mut left = 0;
+        let mut right = self.files.len();
+
+        while left < right {
+            let mid = (left + right) / 2;
+            if self.files[mid].end_key.as_slice() < target {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        let file_idx = left;
 
         if file_idx >= self.files.len() {
             self.current_iter = None;

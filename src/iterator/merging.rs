@@ -78,18 +78,6 @@ impl<I: KvIterator> MergingIterator<I> {
         self.current_idx = self.heap.peek().map(|e| e.iter_idx);
         Ok(())
     }
-
-    /// Add an iterator to the heap if it's valid.
-    #[allow(dead_code)]
-    fn add_to_heap(&mut self, idx: usize) -> Result<()> {
-        if let Some(iter) = self.iterators.get(idx)
-            && iter.valid()
-            && let Some(key) = iter.key()?
-        {
-            self.heap.push(HeapEntry { key, iter_idx: idx });
-        }
-        Ok(())
-    }
 }
 
 impl<I: KvIterator> KvIterator for MergingIterator<I> {
