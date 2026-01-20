@@ -6,3 +6,4 @@ mod error;
 mod file;
 mod lsm;
 mod sst;
+mod r#type;
