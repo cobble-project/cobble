@@ -8,6 +8,7 @@ pub(crate) struct Key {
     data: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum ValueType {
     /// Upsert semantics: insert or overwrite an existing value.
     Put,

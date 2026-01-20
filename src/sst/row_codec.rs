@@ -86,6 +86,9 @@ pub(crate) fn key_encoded_size(key: &Key) -> usize {
 }
 
 /// Returns the size of the presence bitmap for the given number of columns.
+///
+/// Calculates `ceil(num_columns / 8)` to determine the number of bytes needed
+/// for the bitmap, where each bit represents the presence of one column.
 fn bitmap_size(num_columns: usize) -> usize {
     (num_columns + 7) / 8
 }
