@@ -5,8 +5,9 @@
 //!
 //! ## Key Format
 //! ```text
-//! [group: u16][data_len: u32][data: bytes]
+//! [group: u16][data: bytes]
 //! ```
+//! Note: The key's data length is stored by the SST block format, not in the key itself.
 //!
 //! ## Value Format (with optional columns)
 //! The number of columns is stored in SST metadata, not in each value.
@@ -46,44 +47,35 @@ pub(crate) fn decode_value_type(byte: u8) -> Result<ValueType> {
 
 /// Encodes a Key to bytes.
 ///
-/// Layout: `[group: u16][data_len: u32][data: bytes]`
+/// Layout: `[group: u16][data: bytes]`
+/// Note: The key's data length is stored by the SST block format, not encoded here.
 pub(crate) fn encode_key(key: &Key) -> Bytes {
-    let size = 2 + 4 + key.data().len();
+    let size = 2 + key.data().len();
     let mut buf = BytesMut::with_capacity(size);
     buf.put_u16_le(key.group());
-    buf.put_u32_le(key.data().len() as u32);
     buf.put_slice(key.data());
     buf.freeze()
 }
 
 /// Decodes a Key from bytes.
+/// The full key data is provided (length is known from SST block format).
 pub(crate) fn decode_key(data: &[u8]) -> Result<Key> {
-    if data.len() < 6 {
+    if data.len() < 2 {
         return Err(Error::IoError(format!(
-            "Key data too small: expected at least 6 bytes, got {}",
+            "Key data too small: expected at least 2 bytes, got {}",
             data.len()
         )));
     }
 
     let mut buf = data;
     let group = buf.get_u16_le();
-    let data_len = buf.get_u32_le() as usize;
-
-    if buf.remaining() < data_len {
-        return Err(Error::IoError(format!(
-            "Key data corrupted: expected {} bytes, got {}",
-            data_len,
-            buf.remaining()
-        )));
-    }
-
-    let key_data = buf[..data_len].to_vec();
+    let key_data = buf.to_vec();
     Ok(Key::new(group, key_data))
 }
 
 /// Returns the encoded size of a Key in bytes.
 pub(crate) fn key_encoded_size(key: &Key) -> usize {
-    2 + 4 + key.data().len()
+    2 + key.data().len()
 }
 
 /// Returns the size of the presence bitmap for the given number of columns.
@@ -112,10 +104,11 @@ fn bitmap_size(num_columns: usize) -> usize {
 /// - Last present column: `[value_type: u8][data: bytes]` (data_len is omitted and calculated during decode)
 ///
 /// # Arguments
-/// * `value` - The value to encode. If a column slot is `None`, it is absent.
+/// * `value` - The Value to encode containing optional columns.
 /// * `num_columns` - Total number of columns (from SST metadata).
-pub(crate) fn encode_value(columns: &[Option<&Column>], num_columns: usize) -> Bytes {
+pub(crate) fn encode_value(value: &Value, num_columns: usize) -> Bytes {
     let bmp_size = bitmap_size(num_columns);
+    let columns = value.columns();
 
     // Count present columns to identify the last one
     let present_count = columns.iter().take(num_columns).filter(|c| c.is_some()).count();
@@ -172,8 +165,8 @@ pub(crate) fn encode_value(columns: &[Option<&Column>], num_columns: usize) -> B
 /// * `num_columns` - Total number of columns (from SST metadata).
 ///
 /// # Returns
-/// A vector of optional columns, where `None` indicates an absent column.
-pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Vec<Option<Column>>> {
+/// A Value containing optional columns, where `None` indicates an absent column.
+pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Value> {
     let bmp_size = bitmap_size(num_columns);
 
     if data.len() < bmp_size {
@@ -250,7 +243,7 @@ pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Vec<Option
         }
     }
 
-    Ok(columns)
+    Ok(Value::new(columns))
 }
 
 /// Returns the encoded size of a Value in bytes.
@@ -258,10 +251,11 @@ pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Vec<Option
 /// Note: The last present column saves 4 bytes by omitting data_len.
 ///
 /// # Arguments
-/// * `columns` - The columns (optional) to encode.
+/// * `value` - The Value containing optional columns.
 /// * `num_columns` - Total number of columns (from SST metadata).
-pub(crate) fn value_encoded_size(columns: &[Option<&Column>], num_columns: usize) -> usize {
+pub(crate) fn value_encoded_size(value: &Value, num_columns: usize) -> usize {
     let bmp_size = bitmap_size(num_columns);
+    let columns = value.columns();
     let present_count = columns.iter().take(num_columns).filter(|c| c.is_some()).count();
     let mut size = bmp_size;
     for col_opt in columns.iter().take(num_columns) {
@@ -276,17 +270,6 @@ pub(crate) fn value_encoded_size(columns: &[Option<&Column>], num_columns: usize
     size
 }
 
-/// Helper to convert a Value with all present columns to optional column references.
-pub(crate) fn value_to_optional_refs(value: &Value) -> Vec<Option<&Column>> {
-    value.columns().iter().map(|c| Some(c)).collect()
-}
-
-/// Helper to convert optional columns to a Value (filtering out None values).
-pub(crate) fn optional_columns_to_value(columns: Vec<Option<Column>>) -> Value {
-    let present_columns: Vec<Column> = columns.into_iter().flatten().collect();
-    Value::new(present_columns)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,9 +279,9 @@ mod tests {
         let key = Key::new(42, b"hello world".to_vec());
         let encoded = encode_key(&key);
 
-        // Verify encoded size: 2 (group) + 4 (data_len) + 11 (data) = 17
-        assert_eq!(encoded.len(), 17);
-        assert_eq!(key_encoded_size(&key), 17);
+        // Verify encoded size: 2 (group) + 11 (data) = 13
+        assert_eq!(encoded.len(), 13);
+        assert_eq!(key_encoded_size(&key), 13);
 
         let decoded = decode_key(&encoded).unwrap();
         assert_eq!(decoded.group(), 42);
@@ -310,7 +293,7 @@ mod tests {
         let key = Key::new(0, Vec::new());
         let encoded = encode_key(&key);
 
-        assert_eq!(encoded.len(), 6);
+        assert_eq!(encoded.len(), 2);
 
         let decoded = decode_key(&encoded).unwrap();
         assert_eq!(decoded.group(), 0);
@@ -329,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_key_decode_too_small() {
-        let result = decode_key(&[0, 1, 2, 3, 4]);
+        let result = decode_key(&[0]);
         assert!(result.is_err());
     }
 
@@ -354,27 +337,28 @@ mod tests {
     fn test_encode_decode_value_all_present() {
         let col1 = Column::new(ValueType::Put, b"data1".to_vec());
         let col2 = Column::new(ValueType::Delete, b"data2".to_vec());
-        let columns: Vec<Option<&Column>> = vec![Some(&col1), Some(&col2)];
+        let value = Value::new(vec![Some(col1), Some(col2)]);
 
-        let encoded = encode_value(&columns, 2);
+        let encoded = encode_value(&value, 2);
 
         // Bitmap size: 1 byte for 2 columns
         // Column 1: 1 + 4 + 5 = 10
         // Column 2 (last): 1 + 5 = 6 (data_len omitted)
         // Total: 1 + 10 + 6 = 17
         assert_eq!(encoded.len(), 17);
-        assert_eq!(value_encoded_size(&columns, 2), 17);
+        assert_eq!(value_encoded_size(&value, 2), 17);
 
         let decoded = decode_value(&encoded, 2).unwrap();
-        assert_eq!(decoded.len(), 2);
+        let cols = decoded.columns();
+        assert_eq!(cols.len(), 2);
 
-        assert!(decoded[0].is_some());
-        let c0 = decoded[0].as_ref().unwrap();
+        assert!(cols[0].is_some());
+        let c0 = cols[0].as_ref().unwrap();
         assert!(matches!(c0.value_type(), ValueType::Put));
         assert_eq!(c0.data(), b"data1");
 
-        assert!(decoded[1].is_some());
-        let c1 = decoded[1].as_ref().unwrap();
+        assert!(cols[1].is_some());
+        let c1 = cols[1].as_ref().unwrap();
         assert!(matches!(c1.value_type(), ValueType::Delete));
         assert_eq!(c1.data(), b"data2");
     }
@@ -382,9 +366,9 @@ mod tests {
     #[test]
     fn test_encode_decode_value_with_optional() {
         let col1 = Column::new(ValueType::Put, b"present".to_vec());
-        let columns: Vec<Option<&Column>> = vec![Some(&col1), None, None];
+        let value = Value::new(vec![Some(col1), None, None]);
 
-        let encoded = encode_value(&columns, 3);
+        let encoded = encode_value(&value, 3);
 
         // Bitmap size: 1 byte for 3 columns
         // Only column 0 is present (and is last): 1 + 7 = 8 (data_len omitted)
@@ -392,39 +376,42 @@ mod tests {
         assert_eq!(encoded.len(), 9);
 
         let decoded = decode_value(&encoded, 3).unwrap();
-        assert_eq!(decoded.len(), 3);
+        let cols = decoded.columns();
+        assert_eq!(cols.len(), 3);
 
-        assert!(decoded[0].is_some());
-        assert_eq!(decoded[0].as_ref().unwrap().data(), b"present");
+        assert!(cols[0].is_some());
+        assert_eq!(cols[0].as_ref().unwrap().data(), b"present");
 
-        assert!(decoded[1].is_none());
-        assert!(decoded[2].is_none());
+        assert!(cols[1].is_none());
+        assert!(cols[2].is_none());
     }
 
     #[test]
     fn test_encode_decode_value_all_absent() {
-        let columns: Vec<Option<&Column>> = vec![None, None, None, None];
+        let value = Value::new(vec![None, None, None, None]);
 
-        let encoded = encode_value(&columns, 4);
+        let encoded = encode_value(&value, 4);
 
         // Bitmap size: 1 byte for 4 columns, no column data
         assert_eq!(encoded.len(), 1);
 
         let decoded = decode_value(&encoded, 4).unwrap();
-        assert_eq!(decoded.len(), 4);
-        assert!(decoded.iter().all(|c| c.is_none()));
+        let cols = decoded.columns();
+        assert_eq!(cols.len(), 4);
+        assert!(cols.iter().all(|c| c.is_none()));
     }
 
     #[test]
     fn test_encode_decode_value_many_columns() {
         // Test with 16 columns (2 bytes bitmap)
         let col = Column::new(ValueType::Merge, b"x".to_vec());
-        let mut columns: Vec<Option<&Column>> = vec![None; 16];
-        columns[0] = Some(&col);
-        columns[8] = Some(&col);
-        columns[15] = Some(&col);
+        let mut columns: Vec<Option<Column>> = vec![None; 16];
+        columns[0] = Some(col.clone());
+        columns[8] = Some(col.clone());
+        columns[15] = Some(col);
+        let value = Value::new(columns);
 
-        let encoded = encode_value(&columns, 16);
+        let encoded = encode_value(&value, 16);
 
         // Bitmap size: 2 bytes for 16 columns
         // 2 non-last columns: 2 * (1 + 4 + 1) = 12
@@ -433,12 +420,13 @@ mod tests {
         assert_eq!(encoded.len(), 16);
 
         let decoded = decode_value(&encoded, 16).unwrap();
-        assert_eq!(decoded.len(), 16);
+        let cols = decoded.columns();
+        assert_eq!(cols.len(), 16);
 
-        assert!(decoded[0].is_some());
-        assert!(decoded[1].is_none());
-        assert!(decoded[8].is_some());
-        assert!(decoded[15].is_some());
+        assert!(cols[0].is_some());
+        assert!(cols[1].is_none());
+        assert!(cols[8].is_some());
+        assert!(cols[15].is_some());
     }
 
     #[test]
@@ -464,45 +452,20 @@ mod tests {
         // Single column optimization: no bitmap, column must be present
         // Also the last (and only) column, so data_len is omitted
         let col = Column::new(ValueType::Put, b"single".to_vec());
-        let columns: Vec<Option<&Column>> = vec![Some(&col)];
+        let value = Value::new(vec![Some(col)]);
 
-        let encoded = encode_value(&columns, 1);
+        let encoded = encode_value(&value, 1);
 
         // No bitmap for single column, and data_len omitted (last column)
         // 1 (value_type) + 6 (data) = 7
         assert_eq!(encoded.len(), 7);
-        assert_eq!(value_encoded_size(&columns, 1), 7);
+        assert_eq!(value_encoded_size(&value, 1), 7);
 
         let decoded = decode_value(&encoded, 1).unwrap();
-        assert_eq!(decoded.len(), 1);
-        assert!(decoded[0].is_some());
-        assert_eq!(decoded[0].as_ref().unwrap().data(), b"single");
-    }
-
-    #[test]
-    fn test_value_to_optional_refs() {
-        let value = Value::new(vec![
-            Column::new(ValueType::Put, b"a".to_vec()),
-            Column::new(ValueType::Delete, b"b".to_vec()),
-        ]);
-
-        let refs = value_to_optional_refs(&value);
-        assert_eq!(refs.len(), 2);
-        assert!(refs[0].is_some());
-        assert!(refs[1].is_some());
-    }
-
-    #[test]
-    fn test_optional_columns_to_value() {
-        let columns = vec![
-            Some(Column::new(ValueType::Put, b"a".to_vec())),
-            None,
-            Some(Column::new(ValueType::Merge, b"c".to_vec())),
-        ];
-
-        let value = optional_columns_to_value(columns);
-        // Only present columns are kept
-        assert_eq!(value.columns().len(), 2);
+        let cols = decoded.columns();
+        assert_eq!(cols.len(), 1);
+        assert!(cols[0].is_some());
+        assert_eq!(cols[0].as_ref().unwrap().data(), b"single");
     }
 
     #[test]
@@ -516,11 +479,12 @@ mod tests {
         assert_eq!(decoded_key.data(), large_data.as_slice());
 
         let col = Column::new(ValueType::Put, large_data.clone());
-        let columns: Vec<Option<&Column>> = vec![Some(&col)];
-        let encoded = encode_value(&columns, 1);
+        let value = Value::new(vec![Some(col)]);
+        let encoded = encode_value(&value, 1);
         let decoded = decode_value(&encoded, 1).unwrap();
-        assert!(decoded[0].is_some());
-        assert_eq!(decoded[0].as_ref().unwrap().data(), large_data.as_slice());
+        let cols = decoded.columns();
+        assert!(cols[0].is_some());
+        assert_eq!(cols[0].as_ref().unwrap().data(), large_data.as_slice());
     }
 
     #[test]
@@ -551,27 +515,30 @@ mod tests {
 
         // Create test Key and Value using the codec
         let key1 = Key::new(1, b"user:1".to_vec());
-        let col1_name = Column::new(ValueType::Put, b"Alice".to_vec());
-        let col1_email = Column::new(ValueType::Put, b"alice@example.com".to_vec());
-        let value1_cols: Vec<Option<&Column>> = vec![Some(&col1_name), Some(&col1_email)];
+        let value1 = Value::new(vec![
+            Some(Column::new(ValueType::Put, b"Alice".to_vec())),
+            Some(Column::new(ValueType::Put, b"alice@example.com".to_vec())),
+        ]);
 
         let key2 = Key::new(1, b"user:2".to_vec());
-        let col2_name = Column::new(ValueType::Put, b"Bob".to_vec());
         // user:2 has no email (optional column)
-        let value2_cols: Vec<Option<&Column>> = vec![Some(&col2_name), None];
+        let value2 = Value::new(vec![
+            Some(Column::new(ValueType::Put, b"Bob".to_vec())),
+            None,
+        ]);
 
         let key3 = Key::new(2, b"order:100".to_vec());
         // order:100 is deleted (all columns absent)
-        let value3_cols: Vec<Option<&Column>> = vec![None, None];
+        let value3 = Value::new(vec![None, None]);
 
         // Write SST file with encoded Key/Value
         {
             let writer_file = fs.open_write("codec_test.sst").unwrap();
             let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
 
-            writer.add(&encode_key(&key1), &encode_value(&value1_cols, num_columns)).unwrap();
-            writer.add(&encode_key(&key2), &encode_value(&value2_cols, num_columns)).unwrap();
-            writer.add(&encode_key(&key3), &encode_value(&value3_cols, num_columns)).unwrap();
+            writer.add(&encode_key(&key1), &encode_value(&value1, num_columns)).unwrap();
+            writer.add(&encode_key(&key2), &encode_value(&value2, num_columns)).unwrap();
+            writer.add(&encode_key(&key3), &encode_value(&value3, num_columns)).unwrap();
 
             writer.finish().unwrap();
         }
@@ -587,7 +554,8 @@ mod tests {
             assert!(iter.valid());
             let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
             let decoded_key = decode_key(&key_bytes).unwrap();
-            let decoded_cols = decode_value(&value_bytes, num_columns).unwrap();
+            let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
+            let decoded_cols = decoded_value.columns();
 
             assert_eq!(decoded_key.group(), 1);
             assert_eq!(decoded_key.data(), b"user:1");
@@ -602,7 +570,8 @@ mod tests {
             assert!(iter.valid());
             let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
             let decoded_key = decode_key(&key_bytes).unwrap();
-            let decoded_cols = decode_value(&value_bytes, num_columns).unwrap();
+            let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
+            let decoded_cols = decoded_value.columns();
 
             assert_eq!(decoded_key.group(), 1);
             assert_eq!(decoded_key.data(), b"user:2");
@@ -615,7 +584,8 @@ mod tests {
             assert!(iter.valid());
             let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
             let decoded_key = decode_key(&key_bytes).unwrap();
-            let decoded_cols = decode_value(&value_bytes, num_columns).unwrap();
+            let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
+            let decoded_cols = decoded_value.columns();
 
             assert_eq!(decoded_key.group(), 2);
             assert_eq!(decoded_key.data(), b"order:100");
@@ -649,17 +619,16 @@ mod tests {
         let key2 = Key::new(1, b"bbb".to_vec());
         let key3 = Key::new(2, b"aaa".to_vec());
 
-        let col = Column::new(ValueType::Put, b"test".to_vec());
-        let value_cols: Vec<Option<&Column>> = vec![Some(&col)];
+        let value = Value::new(vec![Some(Column::new(ValueType::Put, b"test".to_vec()))]);
 
         // Write SST file
         {
             let writer_file = fs.open_write("codec_seek_test.sst").unwrap();
             let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
 
-            writer.add(&encode_key(&key1), &encode_value(&value_cols, num_columns)).unwrap();
-            writer.add(&encode_key(&key2), &encode_value(&value_cols, num_columns)).unwrap();
-            writer.add(&encode_key(&key3), &encode_value(&value_cols, num_columns)).unwrap();
+            writer.add(&encode_key(&key1), &encode_value(&value, num_columns)).unwrap();
+            writer.add(&encode_key(&key2), &encode_value(&value, num_columns)).unwrap();
+            writer.add(&encode_key(&key3), &encode_value(&value, num_columns)).unwrap();
 
             writer.finish().unwrap();
         }
@@ -716,12 +685,12 @@ mod tests {
                 let col1 = Column::new(ValueType::Put, format!("val{:04}", i).into_bytes());
                 let col2 = Column::new(ValueType::Merge, b"extra".to_vec());
                 // Alternate: some entries have second column, some don't
-                let cols: Vec<Option<&Column>> = if i % 2 == 0 {
-                    vec![Some(&col1), Some(&col2)]
+                let value = if i % 2 == 0 {
+                    Value::new(vec![Some(col1), Some(col2)])
                 } else {
-                    vec![Some(&col1), None]
+                    Value::new(vec![Some(col1), None])
                 };
-                writer.add(&encode_key(&key), &encode_value(&cols, num_columns)).unwrap();
+                writer.add(&encode_key(&key), &encode_value(&value, num_columns)).unwrap();
             }
 
             writer.finish().unwrap();
@@ -738,7 +707,8 @@ mod tests {
             while iter.valid() {
                 let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
                 let decoded_key = decode_key(&key_bytes).unwrap();
-                let decoded_cols = decode_value(&value_bytes, num_columns).unwrap();
+                let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
+                let decoded_cols = decoded_value.columns();
 
                 assert_eq!(decoded_key.group(), count as u16);
                 assert_eq!(decoded_key.data(), format!("key{:04}", count).as_bytes());

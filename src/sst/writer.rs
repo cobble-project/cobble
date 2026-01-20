@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, SequentialWriteFile};
-use crate::r#type::{Column, Key};
+use crate::r#type::{Key, Value};
 use crate::sst::format::{BlockBuilder, Footer};
 use crate::sst::row_codec::{encode_key, encode_value};
 use bytes::{BufMut, BytesMut};
@@ -80,16 +80,16 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         Ok(())
     }
 
-    /// Add a typed Key and Value (as optional columns) to the SST file.
+    /// Add a typed Key and Value to the SST file.
     /// Uses the row codec to serialize the key and value.
     /// Keys must be added in sorted order (by encoded key bytes).
     ///
     /// # Arguments
     /// * `key` - The typed Key to add
-    /// * `columns` - Optional columns for the value
-    pub fn add_kv(&mut self, key: &Key, columns: &[Option<&Column>]) -> Result<()> {
+    /// * `value` - The Value containing optional columns
+    pub fn add_kv(&mut self, key: &Key, value: &Value) -> Result<()> {
         let encoded_key = encode_key(key);
-        let encoded_value = encode_value(columns, self.options.num_columns);
+        let encoded_value = encode_value(value, self.options.num_columns);
         self.add(&encoded_key, &encoded_value)
     }
 

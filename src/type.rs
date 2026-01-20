@@ -20,6 +20,7 @@ pub(crate) enum ValueType {
     Merge,
 }
 
+#[derive(Clone)]
 pub(crate) struct Column {
     /// Write semantics of this column (Put/Delete/Merge).
     value_type: ValueType,
@@ -30,7 +31,8 @@ pub(crate) struct Column {
 
 pub(crate) struct Value {
     /// A value may consist of multiple logical columns/fields.
-    columns: Vec<Column>,
+    /// Each column is optional and may be absent within a value.
+    columns: Vec<Option<Column>>,
 }
 
 impl Key {
@@ -74,13 +76,13 @@ impl Column {
 }
 
 impl Value {
-    /// Creates a new `Value` from a list of columns.
-    pub(crate) fn new(columns: Vec<Column>) -> Self {
+    /// Creates a new `Value` from a list of optional columns.
+    pub(crate) fn new(columns: Vec<Option<Column>>) -> Self {
         Self { columns }
     }
 
-    /// Returns the columns.
-    pub(crate) fn columns(&self) -> &[Column] {
+    /// Returns the optional columns.
+    pub(crate) fn columns(&self) -> &[Option<Column>] {
         &self.columns
     }
 }

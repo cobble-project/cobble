@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
-use crate::r#type::{Column, Key};
+use crate::r#type::{Key, Value};
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use bytes::Bytes;
@@ -248,22 +248,22 @@ impl SSTIterator {
         Ok(None)
     }
 
-    /// Get the current typed Value as optional columns, decoding from the row codec format.
-    /// Returns a vector of optional columns where `None` indicates an absent column.
-    pub fn current_value(&self) -> Result<Option<Vec<Option<Column>>>> {
+    /// Get the current typed Value, decoding from the row codec format.
+    /// Returns a Value containing optional columns.
+    pub fn current_value(&self) -> Result<Option<Value>> {
         if let Some(bytes) = self.value()? {
-            let columns = decode_value(&bytes, self.options.num_columns)?;
-            return Ok(Some(columns));
+            let value = decode_value(&bytes, self.options.num_columns)?;
+            return Ok(Some(value));
         }
         Ok(None)
     }
 
     /// Get the current typed Key and Value pair, decoding from the row codec format.
-    pub fn current_kv(&self) -> Result<Option<(Key, Vec<Option<Column>>)>> {
+    pub fn current_kv(&self) -> Result<Option<(Key, Value)>> {
         if let Some((key_bytes, value_bytes)) = self.current()? {
             let key = decode_key(&key_bytes)?;
-            let columns = decode_value(&value_bytes, self.options.num_columns)?;
-            return Ok(Some((key, columns)));
+            let value = decode_value(&value_bytes, self.options.num_columns)?;
+            return Ok(Some((key, value)));
         }
         Ok(None)
     }
@@ -392,7 +392,7 @@ mod tests {
     #[test]
     #[serial_test::serial(file)]
     fn test_sst_typed_kv() {
-        use crate::r#type::{Column, Key, ValueType};
+        use crate::r#type::{Column, Key, Value, ValueType};
 
         let _ = std::fs::remove_dir_all("/tmp/sst_typed_kv_test");
         let registry = FileSystemRegistry::new();
@@ -414,20 +414,26 @@ mod tests {
             );
 
             let key1 = Key::new(1, b"user:1".to_vec());
-            let col1_name = Column::new(ValueType::Put, b"Alice".to_vec());
-            let col1_email = Column::new(ValueType::Put, b"alice@example.com".to_vec());
-            writer
-                .add_kv(&key1, &[Some(&col1_name), Some(&col1_email)])
-                .unwrap();
+            let value1 = Value::new(vec![
+                Some(Column::new(ValueType::Put, b"Alice".to_vec())),
+                Some(Column::new(ValueType::Put, b"alice@example.com".to_vec())),
+            ]);
+            writer.add_kv(&key1, &value1).unwrap();
 
             let key2 = Key::new(1, b"user:2".to_vec());
-            let col2_name = Column::new(ValueType::Put, b"Bob".to_vec());
             // user:2 has no email (optional column)
-            writer.add_kv(&key2, &[Some(&col2_name), None]).unwrap();
+            let value2 = Value::new(vec![
+                Some(Column::new(ValueType::Put, b"Bob".to_vec())),
+                None,
+            ]);
+            writer.add_kv(&key2, &value2).unwrap();
 
             let key3 = Key::new(2, b"order:100".to_vec());
-            let col3 = Column::new(ValueType::Delete, b"".to_vec());
-            writer.add_kv(&key3, &[Some(&col3), None]).unwrap();
+            let value3 = Value::new(vec![
+                Some(Column::new(ValueType::Delete, b"".to_vec())),
+                None,
+            ]);
+            writer.add_kv(&key3, &value3).unwrap();
 
             writer.finish().unwrap();
         }
@@ -448,7 +454,8 @@ mod tests {
 
             // First entry
             assert!(iter.valid());
-            let (key, cols) = iter.current_kv().unwrap().unwrap();
+            let (key, value) = iter.current_kv().unwrap().unwrap();
+            let cols = value.columns();
             assert_eq!(key.group(), 1);
             assert_eq!(key.data(), b"user:1");
             assert!(cols[0].is_some());
@@ -460,7 +467,8 @@ mod tests {
             iter.next().unwrap();
             assert!(iter.valid());
             let key = iter.current_key().unwrap().unwrap();
-            let cols = iter.current_value().unwrap().unwrap();
+            let value = iter.current_value().unwrap().unwrap();
+            let cols = value.columns();
             assert_eq!(key.group(), 1);
             assert_eq!(key.data(), b"user:2");
             assert!(cols[0].is_some());
@@ -470,7 +478,8 @@ mod tests {
             // Third entry
             iter.next().unwrap();
             assert!(iter.valid());
-            let (key, cols) = iter.current_kv().unwrap().unwrap();
+            let (key, value) = iter.current_kv().unwrap().unwrap();
+            let cols = value.columns();
             assert_eq!(key.group(), 2);
             assert_eq!(key.data(), b"order:100");
             assert!(cols[0].is_some());
