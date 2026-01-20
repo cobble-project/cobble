@@ -89,8 +89,15 @@ pub(crate) fn key_encoded_size(key: &Key) -> usize {
 ///
 /// Calculates `ceil(num_columns / 8)` to determine the number of bytes needed
 /// for the bitmap, where each bit represents the presence of one column.
+///
+/// Optimization: When `num_columns == 1`, returns 0 since the bitmap is skipped.
+/// A single-column value with no column present would be invalid anyway.
 fn bitmap_size(num_columns: usize) -> usize {
-    (num_columns + 7) / 8
+    if num_columns <= 1 {
+        0
+    } else {
+        (num_columns + 7) / 8
+    }
 }
 
 /// Encodes a Value to bytes with optional columns.
@@ -99,6 +106,7 @@ fn bitmap_size(num_columns: usize) -> usize {
 /// Layout: `[presence_bitmap][present_columns...]`
 ///
 /// - `presence_bitmap`: A bitmap indicating which columns are present.
+///   (Omitted when `num_columns == 1` as a single absent column means invalid value)
 /// - Each present column: `[value_type: u8][data_len: u32][data: bytes]`
 ///
 /// # Arguments
@@ -117,14 +125,16 @@ pub(crate) fn encode_value(columns: &[Option<&Column>], num_columns: usize) -> B
 
     let mut buf = BytesMut::with_capacity(total_size);
 
-    // Write presence bitmap
-    let mut bitmap = vec![0u8; bmp_size];
-    for (i, col_opt) in columns.iter().take(num_columns).enumerate() {
-        if col_opt.is_some() {
-            bitmap[i / 8] |= 1 << (i % 8);
+    // Write presence bitmap (only if num_columns > 1)
+    if bmp_size > 0 {
+        let mut bitmap = vec![0u8; bmp_size];
+        for (i, col_opt) in columns.iter().take(num_columns).enumerate() {
+            if col_opt.is_some() {
+                bitmap[i / 8] |= 1 << (i % 8);
+            }
         }
+        buf.put_slice(&bitmap);
     }
-    buf.put_slice(&bitmap);
 
     // Write present columns
     for col_opt in columns.iter().take(num_columns) {
@@ -164,7 +174,12 @@ pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Vec<Option
 
     let mut columns = Vec::with_capacity(num_columns);
     for i in 0..num_columns {
-        let is_present = (bitmap[i / 8] >> (i % 8)) & 1 == 1;
+        // When num_columns == 1, bitmap is skipped and the single column is always present
+        let is_present = if num_columns == 1 {
+            true
+        } else {
+            (bitmap[i / 8] >> (i % 8)) & 1 == 1
+        };
         if is_present {
             if buf.remaining() < 5 {
                 return Err(Error::IoError(format!(
@@ -379,7 +394,8 @@ mod tests {
     #[test]
     fn test_bitmap_size() {
         assert_eq!(bitmap_size(0), 0);
-        assert_eq!(bitmap_size(1), 1);
+        assert_eq!(bitmap_size(1), 0); // Optimized: no bitmap for single column
+        assert_eq!(bitmap_size(2), 1);
         assert_eq!(bitmap_size(8), 1);
         assert_eq!(bitmap_size(9), 2);
         assert_eq!(bitmap_size(16), 2);
@@ -388,9 +404,28 @@ mod tests {
 
     #[test]
     fn test_value_decode_too_small() {
-        // Need at least 1 byte bitmap for 1 column
-        let result = decode_value(&[], 1);
+        // For 2 columns, need at least 1 byte bitmap
+        let result = decode_value(&[], 2);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_single_column_no_bitmap() {
+        // Single column optimization: no bitmap, column must be present
+        let col = Column::new(ValueType::Put, b"single".to_vec());
+        let columns: Vec<Option<&Column>> = vec![Some(&col)];
+
+        let encoded = encode_value(&columns, 1);
+
+        // No bitmap for single column: just the column data
+        // 1 (value_type) + 4 (data_len) + 6 (data) = 11
+        assert_eq!(encoded.len(), 11);
+        assert_eq!(value_encoded_size(&columns, 1), 11);
+
+        let decoded = decode_value(&encoded, 1).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(decoded[0].is_some());
+        assert_eq!(decoded[0].as_ref().unwrap().data(), b"single");
     }
 
     #[test]
