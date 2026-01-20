@@ -347,4 +347,217 @@ mod tests {
 
         let _ = std::fs::remove_dir_all("/tmp/sst_test");
     }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_key_value_codec() {
+        use crate::r#type::{Column, Key, Value, ValueType};
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_codec_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/sst_codec_test".to_string())
+            .unwrap();
+
+        // Create test Key and Value using the codec
+        let key1 = Key::new(1, b"user:1".to_vec());
+        let value1 = Value::new(vec![
+            Column::new(ValueType::Put, b"Alice".to_vec()),
+            Column::new(ValueType::Put, b"alice@example.com".to_vec()),
+        ]);
+
+        let key2 = Key::new(1, b"user:2".to_vec());
+        let value2 = Value::new(vec![Column::new(ValueType::Put, b"Bob".to_vec())]);
+
+        let key3 = Key::new(2, b"order:100".to_vec());
+        let value3 = Value::new(vec![Column::new(ValueType::Delete, Vec::new())]);
+
+        // Write SST file with encoded Key/Value
+        {
+            let writer_file = fs.open_write("codec_test.sst").unwrap();
+            let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+
+            writer.add(&key1.encode(), &value1.encode()).unwrap();
+            writer.add(&key2.encode(), &value2.encode()).unwrap();
+            writer.add(&key3.encode(), &value3.encode()).unwrap();
+
+            writer.finish().unwrap();
+        }
+
+        // Read SST file and decode Key/Value
+        {
+            let reader_file = fs.open_read("codec_test.sst").unwrap();
+            let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+
+            iter.seek_to_first().unwrap();
+
+            // First entry
+            assert!(iter.valid());
+            let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
+            let decoded_key = Key::decode(&key_bytes).unwrap();
+            let decoded_value = Value::decode(&value_bytes).unwrap();
+
+            assert_eq!(decoded_key.group(), 1);
+            assert_eq!(decoded_key.data(), b"user:1");
+            assert_eq!(decoded_value.columns().len(), 2);
+            assert!(matches!(
+                decoded_value.columns()[0].value_type(),
+                ValueType::Put
+            ));
+            assert_eq!(decoded_value.columns()[0].data(), b"Alice");
+            assert_eq!(decoded_value.columns()[1].data(), b"alice@example.com");
+
+            // Second entry
+            iter.next().unwrap();
+            assert!(iter.valid());
+            let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
+            let decoded_key = Key::decode(&key_bytes).unwrap();
+            let decoded_value = Value::decode(&value_bytes).unwrap();
+
+            assert_eq!(decoded_key.group(), 1);
+            assert_eq!(decoded_key.data(), b"user:2");
+            assert_eq!(decoded_value.columns().len(), 1);
+            assert_eq!(decoded_value.columns()[0].data(), b"Bob");
+
+            // Third entry
+            iter.next().unwrap();
+            assert!(iter.valid());
+            let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
+            let decoded_key = Key::decode(&key_bytes).unwrap();
+            let decoded_value = Value::decode(&value_bytes).unwrap();
+
+            assert_eq!(decoded_key.group(), 2);
+            assert_eq!(decoded_key.data(), b"order:100");
+            assert_eq!(decoded_value.columns().len(), 1);
+            assert!(matches!(
+                decoded_value.columns()[0].value_type(),
+                ValueType::Delete
+            ));
+            assert_eq!(decoded_value.columns()[0].data(), b"");
+
+            // No more entries
+            iter.next().unwrap();
+            assert!(!iter.valid());
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_codec_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_key_value_codec_seek() {
+        use crate::r#type::{Column, Key, Value, ValueType};
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_codec_seek_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/sst_codec_seek_test".to_string())
+            .unwrap();
+
+        // Create keys with sorted encoded bytes (group 1 < group 2)
+        let key1 = Key::new(1, b"aaa".to_vec());
+        let key2 = Key::new(1, b"bbb".to_vec());
+        let key3 = Key::new(2, b"aaa".to_vec());
+
+        let value = Value::new(vec![Column::new(ValueType::Put, b"test".to_vec())]);
+
+        // Write SST file
+        {
+            let writer_file = fs.open_write("codec_seek_test.sst").unwrap();
+            let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+
+            writer.add(&key1.encode(), &value.encode()).unwrap();
+            writer.add(&key2.encode(), &value.encode()).unwrap();
+            writer.add(&key3.encode(), &value.encode()).unwrap();
+
+            writer.finish().unwrap();
+        }
+
+        // Read and seek using encoded key
+        {
+            let reader_file = fs.open_read("codec_seek_test.sst").unwrap();
+            let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+
+            // Seek to second key
+            let seek_key = Key::new(1, b"bbb".to_vec());
+            iter.seek(&seek_key.encode()).unwrap();
+            assert!(iter.valid());
+
+            let (key_bytes, _) = iter.current().unwrap().unwrap();
+            let decoded_key = Key::decode(&key_bytes).unwrap();
+            assert_eq!(decoded_key.group(), 1);
+            assert_eq!(decoded_key.data(), b"bbb");
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_codec_seek_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_key_value_codec_multiple_blocks() {
+        use crate::r#type::{Column, Key, Value, ValueType};
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_codec_blocks_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/sst_codec_blocks_test".to_string())
+            .unwrap();
+
+        // Write SST file with many entries across multiple blocks
+        let num_entries = 50;
+        {
+            let writer_file = fs.open_write("codec_blocks_test.sst").unwrap();
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    block_size: 200, // Small block size to force multiple blocks
+                    buffer_size: 8192,
+                },
+            );
+
+            for i in 0..num_entries {
+                let key = Key::new(i as u16, format!("key{:04}", i).into_bytes());
+                let value = Value::new(vec![Column::new(
+                    ValueType::Put,
+                    format!("value{:04}_with_extra_data", i).into_bytes(),
+                )]);
+                writer.add(&key.encode(), &value.encode()).unwrap();
+            }
+
+            writer.finish().unwrap();
+        }
+
+        // Read and verify all entries
+        {
+            let reader_file = fs.open_read("codec_blocks_test.sst").unwrap();
+            let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+
+            iter.seek_to_first().unwrap();
+
+            let mut count = 0;
+            while iter.valid() {
+                let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
+                let decoded_key = Key::decode(&key_bytes).unwrap();
+                let decoded_value = Value::decode(&value_bytes).unwrap();
+
+                assert_eq!(decoded_key.group(), count as u16);
+                assert_eq!(
+                    decoded_key.data(),
+                    format!("key{:04}", count).as_bytes()
+                );
+                assert_eq!(decoded_value.columns().len(), 1);
+                assert_eq!(
+                    decoded_value.columns()[0].data(),
+                    format!("value{:04}_with_extra_data", count).as_bytes()
+                );
+
+                count += 1;
+                iter.next().unwrap();
+            }
+
+            assert_eq!(count, num_entries);
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_codec_blocks_test");
+    }
 }
