@@ -11,6 +11,7 @@ pub(crate) struct Key {
     data: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum ValueType {
     /// Upsert semantics: insert or overwrite an existing value.
     Put = 0,
@@ -25,11 +26,7 @@ pub(crate) enum ValueType {
 impl ValueType {
     /// Encodes the value type to a single byte.
     pub(crate) fn encode(&self) -> u8 {
-        match self {
-            ValueType::Put => 0,
-            ValueType::Delete => 1,
-            ValueType::Merge => 2,
-        }
+        *self as u8
     }
 
     /// Decodes a value type from a single byte.
@@ -157,6 +154,12 @@ impl Column {
 
     /// Decodes a column from bytes.
     pub(crate) fn decode(data: &[u8]) -> Result<Self> {
+        let (column, _) = Self::decode_with_size(data)?;
+        Ok(column)
+    }
+
+    /// Decodes a column from bytes and returns the number of bytes consumed.
+    pub(crate) fn decode_with_size(data: &[u8]) -> Result<(Self, usize)> {
         if data.len() < 5 {
             return Err(Error::IoError(format!(
                 "Column data too small: expected at least 5 bytes, got {}",
@@ -177,10 +180,14 @@ impl Column {
         }
 
         let column_data = buf[..data_len].to_vec();
-        Ok(Self {
-            value_type,
-            data: column_data,
-        })
+        let consumed = 1 + 4 + data_len;
+        Ok((
+            Self {
+                value_type,
+                data: column_data,
+            },
+            consumed,
+        ))
     }
 }
 
@@ -232,9 +239,8 @@ impl Value {
                 ));
             }
 
-            let column = Column::decode(buf)?;
-            let column_size = column.encoded_size();
-            buf = &buf[column_size..];
+            let (column, consumed) = Column::decode_with_size(buf)?;
+            buf = &buf[consumed..];
             columns.push(column);
         }
 
