@@ -8,6 +8,7 @@ pub(crate) struct Key {
     data: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum ValueType {
     /// Upsert semantics: insert or overwrite an existing value.
     Put,
@@ -19,6 +20,7 @@ pub(crate) enum ValueType {
     Merge,
 }
 
+#[derive(Clone)]
 pub(crate) struct Column {
     /// Write semantics of this column (Put/Delete/Merge).
     value_type: ValueType,
@@ -29,7 +31,8 @@ pub(crate) struct Column {
 
 pub(crate) struct Value {
     /// A value may consist of multiple logical columns/fields.
-    columns: Vec<Column>,
+    /// Each column is optional and may be absent within a value.
+    columns: Vec<Option<Column>>,
 }
 
 impl Key {
@@ -39,6 +42,16 @@ impl Key {
     /// \- `data`: raw key bytes
     pub(crate) fn new(group: u16, data: Vec<u8>) -> Self {
         Self { group, data }
+    }
+
+    /// Returns the group identifier.
+    pub(crate) fn group(&self) -> u16 {
+        self.group
+    }
+
+    /// Returns the raw key bytes.
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
     }
 }
 
@@ -50,11 +63,26 @@ impl Column {
     pub(crate) fn new(value_type: ValueType, data: Vec<u8>) -> Self {
         Self { value_type, data }
     }
+
+    /// Returns the value type.
+    pub(crate) fn value_type(&self) -> &ValueType {
+        &self.value_type
+    }
+
+    /// Returns the raw column bytes.
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 impl Value {
-    /// Creates a new `Value` from a list of columns.
-    pub(crate) fn new(columns: Vec<Column>) -> Self {
+    /// Creates a new `Value` from a list of optional columns.
+    pub(crate) fn new(columns: Vec<Option<Column>>) -> Self {
         Self { columns }
+    }
+
+    /// Returns the optional columns.
+    pub(crate) fn columns(&self) -> &[Option<Column>] {
+        &self.columns
     }
 }
