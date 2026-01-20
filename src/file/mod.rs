@@ -6,4 +6,6 @@ mod opendal_fs;
 #[allow(unused_imports)]
 pub use self::file_system::{FileSystem, FileSystemRegistry};
 #[allow(unused_imports)]
-pub use self::files::{File, FileHandle, RandomAccessFile, SequentialWriteFile};
+pub use self::files::{
+    BufferedReader, BufferedWriter, File, FileHandle, RandomAccessFile, SequentialWriteFile,
+};

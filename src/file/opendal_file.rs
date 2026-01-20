@@ -58,14 +58,13 @@ impl File for OpendalSequentialWriteFile {
 
 impl SequentialWriteFile for OpendalSequentialWriteFile {
     fn write(&mut self, data: &[u8]) -> Result<usize> {
+        let len = data.remaining();
         self.runtime
-            .block_on(async { self.writer.write_from(data).await.map(|_| data.remaining()) })
-            .map_err(|e| {
-                Error::IoError(format!(
-                    "Failed to write data of size {}: {}",
-                    data.remaining(),
-                    e
-                ))
-            })
+            .block_on(async { self.writer.write_from(data).await.map(|_| len) })
+            .map_err(|e| Error::IoError(format!("Failed to write data of size {}: {}", len, e)))?;
+
+        // Update the file size after successful write
+        self.handle.size += len;
+        Ok(len)
     }
 }
