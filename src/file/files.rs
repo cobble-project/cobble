@@ -24,6 +24,24 @@ pub trait SequentialWriteFile: File {
     fn write(&mut self, data: &[u8]) -> Result<usize, Error>;
 }
 
+// Implement File for Box<dyn RandomAccessFile>
+impl File for Box<dyn RandomAccessFile> {
+    fn close(&mut self) -> Result<(), Error> {
+        (**self).close()
+    }
+
+    fn get_handle(&self) -> &FileHandle {
+        (**self).get_handle()
+    }
+}
+
+// Implement RandomAccessFile for Box<dyn RandomAccessFile>
+impl RandomAccessFile for Box<dyn RandomAccessFile> {
+    fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
+        (**self).read_at(offset, size)
+    }
+}
+
 // Implement File for Box<dyn SequentialWriteFile>
 impl File for Box<dyn SequentialWriteFile> {
     fn close(&mut self) -> Result<(), Error> {
@@ -85,11 +103,6 @@ impl<R: RandomAccessFile> BufferedReader<R> {
         // Return the requested slice
         let end = size.min(self.buffer.len());
         Ok(self.buffer.slice(0..end))
-    }
-    
-    /// Get the size of the underlying file
-    pub fn size(&self) -> usize {
-        self.inner.size()
     }
 }
 
@@ -153,5 +166,161 @@ impl<W: SequentialWriteFile> BufferedWriter<W> {
 
     pub fn offset(&self) -> usize {
         self.offset + self.buffer.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file::FileSystemRegistry;
+
+    static TEST_ROOT: &str = "file:///tmp/buffered_test";
+
+    fn cleanup_test_root() {
+        let _ = std::fs::remove_dir_all("/tmp/buffered_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_buffered_writer() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(TEST_ROOT.to_string())
+            .unwrap();
+
+        // Test writing with buffer
+        {
+            let writer = fs.open_write("test_buffered_write.txt").unwrap();
+            let mut buffered = BufferedWriter::new(writer, 10); // Small buffer for testing
+
+            // Write data smaller than buffer
+            buffered.write(b"Hello").unwrap();
+            assert_eq!(buffered.offset(), 5);
+
+            // Write data that fills buffer and causes flush
+            buffered.write(b" World!").unwrap();
+            assert_eq!(buffered.offset(), 12);
+
+            // Write more data
+            buffered.write(b" Test").unwrap();
+            assert_eq!(buffered.offset(), 17);
+
+            buffered.close().unwrap();
+        }
+
+        // Verify written data
+        {
+            let reader = fs.open_read("test_buffered_write.txt").unwrap();
+            let data = reader.read_at(0, 17).unwrap();
+            assert_eq!(&data[..], b"Hello World! Test");
+        }
+
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_buffered_reader() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(TEST_ROOT.to_string())
+            .unwrap();
+
+        // Write test data
+        {
+            let mut writer = fs.open_write("test_buffered_read.txt").unwrap();
+            writer.write(b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz").unwrap();
+            writer.close().unwrap();
+        }
+
+        // Test buffered reading
+        {
+            let reader = fs.open_read("test_buffered_read.txt").unwrap();
+            let mut buffered = BufferedReader::new(reader, 20); // Buffer size of 20
+
+            // First read - should fill buffer
+            let data1 = buffered.read_at(0, 10).unwrap();
+            assert_eq!(&data1[..], b"0123456789");
+
+            // Second read within buffer
+            let data2 = buffered.read_at(5, 10).unwrap();
+            assert_eq!(&data2[..], b"56789ABCDE");
+
+            // Third read - overlapping buffer boundary
+            let data3 = buffered.read_at(15, 10).unwrap();
+            assert_eq!(&data3[..], b"FGHIJKLMNO");
+
+            // Fourth read - beyond buffer
+            let data4 = buffered.read_at(40, 10).unwrap();
+            assert_eq!(&data4[..], b"efghijklmn");
+        }
+
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_buffered_writer_flush() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(TEST_ROOT.to_string())
+            .unwrap();
+
+        {
+            let writer = fs.open_write("test_flush.txt").unwrap();
+            let mut buffered = BufferedWriter::new(writer, 100);
+
+            // Write data and manually flush
+            buffered.write(b"Test data 1").unwrap();
+            buffered.flush().unwrap();
+
+            // Write more data
+            buffered.write(b" and data 2").unwrap();
+            buffered.close().unwrap();
+        }
+
+        // Verify all data was written
+        {
+            let reader = fs.open_read("test_flush.txt").unwrap();
+            let data = reader.read_at(0, 22).unwrap();
+            assert_eq!(&data[..], b"Test data 1 and data 2");
+        }
+
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_buffered_reader_large_read() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(TEST_ROOT.to_string())
+            .unwrap();
+
+        // Write test data
+        {
+            let mut writer = fs.open_write("test_large_read.txt").unwrap();
+            let large_data = vec![b'X'; 1000];
+            writer.write(&large_data).unwrap();
+            writer.close().unwrap();
+        }
+
+        // Test reading larger than buffer size
+        {
+            let reader = fs.open_read("test_large_read.txt").unwrap();
+            let mut buffered = BufferedReader::new(reader, 100);
+
+            // Read larger than buffer - should bypass buffer
+            let data = buffered.read_at(0, 500).unwrap();
+            assert_eq!(data.len(), 500);
+            assert_eq!(data[0], b'X');
+            assert_eq!(data[499], b'X');
+        }
+
+        cleanup_test_root();
     }
 }
