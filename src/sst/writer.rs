@@ -1,11 +1,16 @@
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, SequentialWriteFile};
+use crate::r#type::{Column, Key};
 use crate::sst::format::{BlockBuilder, Footer};
+use crate::sst::row_codec::{encode_key, encode_value};
 use bytes::{BufMut, BytesMut};
 
 pub struct SSTWriterOptions {
     pub block_size: usize,
     pub buffer_size: usize,
+    /// Number of columns in the value schema.
+    /// Used for encoding values with the row codec.
+    pub num_columns: usize,
 }
 
 impl Default for SSTWriterOptions {
@@ -13,6 +18,7 @@ impl Default for SSTWriterOptions {
         Self {
             block_size: 4096,
             buffer_size: 8192,
+            num_columns: 1,
         }
     }
 }
@@ -72,6 +78,19 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         }
 
         Ok(())
+    }
+
+    /// Add a typed Key and Value (as optional columns) to the SST file.
+    /// Uses the row codec to serialize the key and value.
+    /// Keys must be added in sorted order (by encoded key bytes).
+    ///
+    /// # Arguments
+    /// * `key` - The typed Key to add
+    /// * `columns` - Optional columns for the value
+    pub fn add_kv(&mut self, key: &Key, columns: &[Option<&Column>]) -> Result<()> {
+        let encoded_key = encode_key(key);
+        let encoded_value = encode_value(columns, self.options.num_columns);
+        self.add(&encoded_key, &encoded_value)
     }
 
     fn finish_data_block(&mut self, first_key: Vec<u8>) -> Result<()> {
@@ -206,6 +225,7 @@ mod tests {
             SSTWriterOptions {
                 block_size: 100, // Small block size to force multiple blocks
                 buffer_size: 8192,
+                num_columns: 1,
             },
         );
 

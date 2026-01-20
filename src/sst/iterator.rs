@@ -1,17 +1,23 @@
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
+use crate::r#type::{Column, Key};
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
+use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use bytes::Bytes;
 use std::cmp::Ordering;
 
 pub struct SSTIteratorOptions {
     pub block_cache_size: usize,
+    /// Number of columns in the value schema.
+    /// Used for decoding values with the row codec.
+    pub num_columns: usize,
 }
 
 impl Default for SSTIteratorOptions {
     fn default() -> Self {
         Self {
             block_cache_size: 4096,
+            num_columns: 1,
         }
     }
 }
@@ -232,6 +238,41 @@ impl SSTIterator {
                 .map(|b| self.current_entry_idx < b.len())
                 .unwrap_or(false)
     }
+
+    /// Get the current typed Key, decoding from the row codec format.
+    pub fn current_key(&self) -> Result<Option<Key>> {
+        if let Some(bytes) = self.key()? {
+            let key = decode_key(&bytes)?;
+            return Ok(Some(key));
+        }
+        Ok(None)
+    }
+
+    /// Get the current typed Value as optional columns, decoding from the row codec format.
+    /// Returns a vector of optional columns where `None` indicates an absent column.
+    pub fn current_value(&self) -> Result<Option<Vec<Option<Column>>>> {
+        if let Some(bytes) = self.value()? {
+            let columns = decode_value(&bytes, self.options.num_columns)?;
+            return Ok(Some(columns));
+        }
+        Ok(None)
+    }
+
+    /// Get the current typed Key and Value pair, decoding from the row codec format.
+    pub fn current_kv(&self) -> Result<Option<(Key, Vec<Option<Column>>)>> {
+        if let Some((key_bytes, value_bytes)) = self.current()? {
+            let key = decode_key(&key_bytes)?;
+            let columns = decode_value(&value_bytes, self.options.num_columns)?;
+            return Ok(Some((key, columns)));
+        }
+        Ok(None)
+    }
+
+    /// Seek to a typed Key (first key >= target).
+    pub fn seek_key(&mut self, target: &Key) -> Result<()> {
+        let encoded = encode_key(target);
+        self.seek(&encoded)
+    }
 }
 
 #[cfg(test)]
@@ -346,5 +387,119 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all("/tmp/sst_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_typed_kv() {
+        use crate::r#type::{Column, Key, ValueType};
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_typed_kv_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/sst_typed_kv_test".to_string())
+            .unwrap();
+
+        let num_columns = 2;
+
+        // Write SST file using typed Key/Value API
+        {
+            let writer_file = fs.open_write("typed.sst").unwrap();
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    num_columns,
+                    ..SSTWriterOptions::default()
+                },
+            );
+
+            let key1 = Key::new(1, b"user:1".to_vec());
+            let col1_name = Column::new(ValueType::Put, b"Alice".to_vec());
+            let col1_email = Column::new(ValueType::Put, b"alice@example.com".to_vec());
+            writer
+                .add_kv(&key1, &[Some(&col1_name), Some(&col1_email)])
+                .unwrap();
+
+            let key2 = Key::new(1, b"user:2".to_vec());
+            let col2_name = Column::new(ValueType::Put, b"Bob".to_vec());
+            // user:2 has no email (optional column)
+            writer.add_kv(&key2, &[Some(&col2_name), None]).unwrap();
+
+            let key3 = Key::new(2, b"order:100".to_vec());
+            let col3 = Column::new(ValueType::Delete, b"".to_vec());
+            writer.add_kv(&key3, &[Some(&col3), None]).unwrap();
+
+            writer.finish().unwrap();
+        }
+
+        // Read SST file using typed Key/Value API
+        {
+            let reader_file = fs.open_read("typed.sst").unwrap();
+            let mut iter = SSTIterator::new(
+                reader_file,
+                SSTIteratorOptions {
+                    num_columns,
+                    ..SSTIteratorOptions::default()
+                },
+            )
+            .unwrap();
+
+            iter.seek_to_first().unwrap();
+
+            // First entry
+            assert!(iter.valid());
+            let (key, cols) = iter.current_kv().unwrap().unwrap();
+            assert_eq!(key.group(), 1);
+            assert_eq!(key.data(), b"user:1");
+            assert!(cols[0].is_some());
+            assert_eq!(cols[0].as_ref().unwrap().data(), b"Alice");
+            assert!(cols[1].is_some());
+            assert_eq!(cols[1].as_ref().unwrap().data(), b"alice@example.com");
+
+            // Second entry
+            iter.next().unwrap();
+            assert!(iter.valid());
+            let key = iter.current_key().unwrap().unwrap();
+            let cols = iter.current_value().unwrap().unwrap();
+            assert_eq!(key.group(), 1);
+            assert_eq!(key.data(), b"user:2");
+            assert!(cols[0].is_some());
+            assert_eq!(cols[0].as_ref().unwrap().data(), b"Bob");
+            assert!(cols[1].is_none());
+
+            // Third entry
+            iter.next().unwrap();
+            assert!(iter.valid());
+            let (key, cols) = iter.current_kv().unwrap().unwrap();
+            assert_eq!(key.group(), 2);
+            assert_eq!(key.data(), b"order:100");
+            assert!(cols[0].is_some());
+            assert!(matches!(cols[0].as_ref().unwrap().value_type(), ValueType::Delete));
+
+            // No more entries
+            iter.next().unwrap();
+            assert!(!iter.valid());
+        }
+
+        // Test seek_key
+        {
+            let reader_file = fs.open_read("typed.sst").unwrap();
+            let mut iter = SSTIterator::new(
+                reader_file,
+                SSTIteratorOptions {
+                    num_columns,
+                    ..SSTIteratorOptions::default()
+                },
+            )
+            .unwrap();
+
+            let target = Key::new(1, b"user:2".to_vec());
+            iter.seek_key(&target).unwrap();
+            assert!(iter.valid());
+            let key = iter.current_key().unwrap().unwrap();
+            assert_eq!(key.data(), b"user:2");
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_typed_kv_test");
     }
 }

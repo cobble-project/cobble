@@ -17,8 +17,9 @@
 //!
 //! Where:
 //! - `presence_bitmap`: A bitmap where bit i indicates if column i is present.
-//!   The bitmap size is `ceil(num_columns / 8)` bytes.
-//! - Each present column: `[value_type: u8][data_len: u32][data: bytes]`
+//!   The bitmap size is `ceil(num_columns / 8)` bytes. Omitted when `num_columns == 1`.
+//! - Non-last present column: `[value_type: u8][data_len: u32][data: bytes]`
+//! - Last present column: `[value_type: u8][data: bytes]` (data_len is omitted and calculated from remaining bytes)
 
 use crate::error::{Error, Result};
 use crate::r#type::{Column, Key, Value, ValueType};
@@ -107,7 +108,8 @@ fn bitmap_size(num_columns: usize) -> usize {
 ///
 /// - `presence_bitmap`: A bitmap indicating which columns are present.
 ///   (Omitted when `num_columns == 1` as a single absent column means invalid value)
-/// - Each present column: `[value_type: u8][data_len: u32][data: bytes]`
+/// - Each present column (except last): `[value_type: u8][data_len: u32][data: bytes]`
+/// - Last present column: `[value_type: u8][data: bytes]` (data_len is omitted and calculated during decode)
 ///
 /// # Arguments
 /// * `value` - The value to encode. If a column slot is `None`, it is absent.
@@ -115,12 +117,19 @@ fn bitmap_size(num_columns: usize) -> usize {
 pub(crate) fn encode_value(columns: &[Option<&Column>], num_columns: usize) -> Bytes {
     let bmp_size = bitmap_size(num_columns);
 
-    // Calculate total size
+    // Count present columns to identify the last one
+    let present_count = columns.iter().take(num_columns).filter(|c| c.is_some()).count();
+
+    // Calculate total size (last column saves 4 bytes by omitting data_len)
     let mut total_size = bmp_size;
     for col_opt in columns.iter().take(num_columns) {
         if let Some(col) = col_opt {
             total_size += 1 + 4 + col.data().len(); // value_type + data_len + data
         }
+    }
+    // Subtract 4 bytes for the last column's data_len if there's at least one present column
+    if present_count > 0 {
+        total_size -= 4;
     }
 
     let mut buf = BytesMut::with_capacity(total_size);
@@ -136,11 +145,16 @@ pub(crate) fn encode_value(columns: &[Option<&Column>], num_columns: usize) -> B
         buf.put_slice(&bitmap);
     }
 
-    // Write present columns
+    // Write present columns (skip data_len for the last one)
+    let mut present_idx = 0;
     for col_opt in columns.iter().take(num_columns) {
         if let Some(col) = col_opt {
+            present_idx += 1;
             buf.put_u8(encode_value_type(col.value_type()));
-            buf.put_u32_le(col.data().len() as u32);
+            // Only write data_len if not the last present column
+            if present_idx < present_count {
+                buf.put_u32_le(col.data().len() as u32);
+            }
             buf.put_slice(col.data());
         }
     }
@@ -151,6 +165,7 @@ pub(crate) fn encode_value(columns: &[Option<&Column>], num_columns: usize) -> B
 /// Decodes a Value from bytes with optional columns.
 ///
 /// The number of columns is provided by the caller (from SST metadata).
+/// The last present column's data_len is calculated from remaining bytes.
 ///
 /// # Arguments
 /// * `data` - The encoded value bytes.
@@ -172,37 +187,64 @@ pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Vec<Option
     let bitmap = &data[..bmp_size];
     let mut buf = &data[bmp_size..];
 
-    let mut columns = Vec::with_capacity(num_columns);
+    // First pass: determine which columns are present and find the last one
+    let mut presence = Vec::with_capacity(num_columns);
+    let mut last_present_idx = None;
     for i in 0..num_columns {
-        // When num_columns == 1, bitmap is skipped and the single column is always present
         let is_present = if num_columns == 1 {
             true
         } else {
             (bitmap[i / 8] >> (i % 8)) & 1 == 1
         };
+        presence.push(is_present);
         if is_present {
-            if buf.remaining() < 5 {
-                return Err(Error::IoError(format!(
-                    "Column {} data corrupted: not enough bytes",
-                    i
-                )));
+            last_present_idx = Some(i);
+        }
+    }
+
+    // Second pass: decode columns
+    let mut columns = Vec::with_capacity(num_columns);
+    for i in 0..num_columns {
+        if presence[i] {
+            let is_last = Some(i) == last_present_idx;
+
+            if is_last {
+                // Last present column: data_len is not stored, use remaining bytes
+                if buf.remaining() < 1 {
+                    return Err(Error::IoError(format!(
+                        "Column {} data corrupted: not enough bytes for value_type",
+                        i
+                    )));
+                }
+                let value_type = decode_value_type(buf.get_u8())?;
+                let col_data = buf.to_vec();
+                buf = &buf[buf.len()..];
+                columns.push(Some(Column::new(value_type, col_data)));
+            } else {
+                // Non-last column: has data_len field
+                if buf.remaining() < 5 {
+                    return Err(Error::IoError(format!(
+                        "Column {} data corrupted: not enough bytes",
+                        i
+                    )));
+                }
+
+                let value_type = decode_value_type(buf.get_u8())?;
+                let data_len = buf.get_u32_le() as usize;
+
+                if buf.remaining() < data_len {
+                    return Err(Error::IoError(format!(
+                        "Column {} data corrupted: expected {} bytes, got {}",
+                        i,
+                        data_len,
+                        buf.remaining()
+                    )));
+                }
+
+                let col_data = buf[..data_len].to_vec();
+                buf = &buf[data_len..];
+                columns.push(Some(Column::new(value_type, col_data)));
             }
-
-            let value_type = decode_value_type(buf.get_u8())?;
-            let data_len = buf.get_u32_le() as usize;
-
-            if buf.remaining() < data_len {
-                return Err(Error::IoError(format!(
-                    "Column {} data corrupted: expected {} bytes, got {}",
-                    i,
-                    data_len,
-                    buf.remaining()
-                )));
-            }
-
-            let col_data = buf[..data_len].to_vec();
-            buf = &buf[data_len..];
-            columns.push(Some(Column::new(value_type, col_data)));
         } else {
             columns.push(None);
         }
@@ -213,16 +255,23 @@ pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Vec<Option
 
 /// Returns the encoded size of a Value in bytes.
 ///
+/// Note: The last present column saves 4 bytes by omitting data_len.
+///
 /// # Arguments
 /// * `columns` - The columns (optional) to encode.
 /// * `num_columns` - Total number of columns (from SST metadata).
 pub(crate) fn value_encoded_size(columns: &[Option<&Column>], num_columns: usize) -> usize {
     let bmp_size = bitmap_size(num_columns);
+    let present_count = columns.iter().take(num_columns).filter(|c| c.is_some()).count();
     let mut size = bmp_size;
     for col_opt in columns.iter().take(num_columns) {
         if let Some(col) = col_opt {
-            size += 1 + 4 + col.data().len();
+            size += 1 + 4 + col.data().len(); // value_type + data_len + data
         }
+    }
+    // Subtract 4 bytes for the last column's data_len if there's at least one present column
+    if present_count > 0 {
+        size -= 4;
     }
     size
 }
@@ -311,10 +360,10 @@ mod tests {
 
         // Bitmap size: 1 byte for 2 columns
         // Column 1: 1 + 4 + 5 = 10
-        // Column 2: 1 + 4 + 5 = 10
-        // Total: 1 + 10 + 10 = 21
-        assert_eq!(encoded.len(), 21);
-        assert_eq!(value_encoded_size(&columns, 2), 21);
+        // Column 2 (last): 1 + 5 = 6 (data_len omitted)
+        // Total: 1 + 10 + 6 = 17
+        assert_eq!(encoded.len(), 17);
+        assert_eq!(value_encoded_size(&columns, 2), 17);
 
         let decoded = decode_value(&encoded, 2).unwrap();
         assert_eq!(decoded.len(), 2);
@@ -338,9 +387,9 @@ mod tests {
         let encoded = encode_value(&columns, 3);
 
         // Bitmap size: 1 byte for 3 columns
-        // Only column 0 is present: 1 + 4 + 7 = 12
-        // Total: 1 + 12 = 13
-        assert_eq!(encoded.len(), 13);
+        // Only column 0 is present (and is last): 1 + 7 = 8 (data_len omitted)
+        // Total: 1 + 8 = 9
+        assert_eq!(encoded.len(), 9);
 
         let decoded = decode_value(&encoded, 3).unwrap();
         assert_eq!(decoded.len(), 3);
@@ -378,9 +427,10 @@ mod tests {
         let encoded = encode_value(&columns, 16);
 
         // Bitmap size: 2 bytes for 16 columns
-        // 3 columns present: 3 * (1 + 4 + 1) = 18
-        // Total: 2 + 18 = 20
-        assert_eq!(encoded.len(), 20);
+        // 2 non-last columns: 2 * (1 + 4 + 1) = 12
+        // Last column (idx 15): 1 + 1 = 2 (data_len omitted)
+        // Total: 2 + 12 + 2 = 16
+        assert_eq!(encoded.len(), 16);
 
         let decoded = decode_value(&encoded, 16).unwrap();
         assert_eq!(decoded.len(), 16);
@@ -412,15 +462,16 @@ mod tests {
     #[test]
     fn test_single_column_no_bitmap() {
         // Single column optimization: no bitmap, column must be present
+        // Also the last (and only) column, so data_len is omitted
         let col = Column::new(ValueType::Put, b"single".to_vec());
         let columns: Vec<Option<&Column>> = vec![Some(&col)];
 
         let encoded = encode_value(&columns, 1);
 
-        // No bitmap for single column: just the column data
-        // 1 (value_type) + 4 (data_len) + 6 (data) = 11
-        assert_eq!(encoded.len(), 11);
-        assert_eq!(value_encoded_size(&columns, 1), 11);
+        // No bitmap for single column, and data_len omitted (last column)
+        // 1 (value_type) + 6 (data) = 7
+        assert_eq!(encoded.len(), 7);
+        assert_eq!(value_encoded_size(&columns, 1), 7);
 
         let decoded = decode_value(&encoded, 1).unwrap();
         assert_eq!(decoded.len(), 1);
@@ -656,6 +707,7 @@ mod tests {
                 SSTWriterOptions {
                     block_size: 200, // Small block size to force multiple blocks
                     buffer_size: 8192,
+                    num_columns: num_columns,
                 },
             );
 
