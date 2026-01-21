@@ -1,11 +1,13 @@
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
+use crate::iterator::KvIterator;
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, Value};
 use bytes::Bytes;
 use std::cmp::Ordering;
 
+#[derive(Clone)]
 pub struct SSTIteratorOptions {
     pub block_cache_size: usize,
     /// Number of columns in the value schema.
@@ -272,6 +274,32 @@ impl SSTIterator {
     pub fn seek_key(&mut self, target: &Key) -> Result<()> {
         let encoded = encode_key(target);
         self.seek(&encoded)
+    }
+}
+
+impl KvIterator for SSTIterator {
+    fn seek(&mut self, target: &[u8]) -> Result<()> {
+        SSTIterator::seek(self, target)
+    }
+
+    fn seek_to_first(&mut self) -> Result<()> {
+        SSTIterator::seek_to_first(self)
+    }
+
+    fn next(&mut self) -> Result<bool> {
+        SSTIterator::next(self)
+    }
+
+    fn valid(&self) -> bool {
+        SSTIterator::valid(self)
+    }
+
+    fn key(&self) -> Result<Option<Bytes>> {
+        SSTIterator::key(self)
+    }
+
+    fn value(&self) -> Result<Option<Bytes>> {
+        SSTIterator::value(self)
     }
 }
 
