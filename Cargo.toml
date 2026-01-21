@@ -11,3 +11,4 @@ serial_test = "3.3.1"
 thiserror = "2.0.16"
 tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "macros"] }
 url = "2.5.7"
+uuid = { version = "1.18.1", features = ["v4"] }

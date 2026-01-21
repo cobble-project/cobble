@@ -8,7 +8,7 @@
 use crate::compaction::{FileBuilder, FileBuilderFactory};
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
-use crate::file::{FileHandle, FileManager};
+use crate::file::FileManager;
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
 use crate::sst::SSTIteratorOptions;
 use std::sync::Arc;
@@ -229,17 +229,18 @@ impl CompactionExecutor {
                 if builder.offset() >= options.target_file_size {
                     let file_id = current_file_id.take().unwrap();
                     let builder = current_builder.take().unwrap();
+                    let file_size = builder.offset();
                     let (first_key, last_key) = builder.finish()?;
 
+                    // Update the file size in the file manager
+                    task.file_manager.update_data_file_size(file_id, file_size);
+
                     output_files.push(Arc::new(DataFile {
-                        file_handle: FileHandle {
-                            id: file_id,
-                            size: 0, // Size will be determined by the file system
-                        },
                         file_type: task.data_file_type,
                         start_key: first_key,
                         end_key: last_key,
                         file_id,
+                        size: file_size,
                     }));
                 }
             }
@@ -252,17 +253,18 @@ impl CompactionExecutor {
             && !builder.is_empty()
         {
             let file_id = current_file_id.take().unwrap();
+            let file_size = builder.offset();
             let (first_key, last_key) = builder.finish()?;
 
+            // Update the file size in the file manager
+            task.file_manager.update_data_file_size(file_id, file_size);
+
             output_files.push(Arc::new(DataFile {
-                file_handle: FileHandle {
-                    id: file_id,
-                    size: 0,
-                },
                 file_type: task.data_file_type,
                 start_key: first_key,
                 end_key: last_key,
                 file_id,
+                size: file_size,
             }));
         }
 
@@ -320,17 +322,18 @@ mod tests {
             writer.add(key, value)?;
         }
 
+        let file_size = writer.offset();
         writer.finish()?;
 
+        // Update the file size in the file manager
+        file_manager.update_data_file_size(file_id, file_size);
+
         Ok(Arc::new(DataFile {
-            file_handle: FileHandle {
-                id: file_id,
-                size: 0,
-            },
             file_type: DataFileType::SSTable,
             start_key: first_key,
             end_key: last_key,
             file_id,
+            size: file_size,
         }))
     }
 
@@ -576,17 +579,18 @@ mod tests {
             last_key = key.clone();
             writer.add(key, value).unwrap();
         }
+        let file_size = writer.offset();
         writer.finish().unwrap();
 
+        // Update the file size in the file manager
+        file_manager.update_data_file_size(file_id, file_size);
+
         let file = Arc::new(DataFile {
-            file_handle: FileHandle {
-                id: file_id,
-                size: 0,
-            },
             file_type: DataFileType::SSTable,
             start_key: first_key,
             end_key: last_key,
             file_id,
+            size: file_size,
         });
 
         let run = SortedRun::new(vec![file]);

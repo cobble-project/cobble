@@ -1,11 +1,10 @@
 use crate::error::{Error, Result};
-use crate::file::FileHandle;
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
 use bytes::{Buf, Bytes};
 use std::sync::Arc;
 
 pub(crate) struct OpendalRandomAccessFile {
-    pub(crate) handle: FileHandle,
+    pub(crate) size: usize,
     pub(crate) reader: opendal::Reader,
     pub(crate) runtime: Arc<tokio::runtime::Runtime>,
 }
@@ -15,8 +14,8 @@ impl File for OpendalRandomAccessFile {
         todo!()
     }
 
-    fn get_handle(&self) -> &FileHandle {
-        &self.handle
+    fn size(&self) -> usize {
+        self.size
     }
 }
 
@@ -39,7 +38,7 @@ impl RandomAccessFile for OpendalRandomAccessFile {
 }
 
 pub(crate) struct OpendalSequentialWriteFile {
-    pub(crate) handle: FileHandle,
+    pub(crate) size: usize,
     pub(crate) writer: opendal::Writer,
     pub(crate) runtime: Arc<tokio::runtime::Runtime>,
 }
@@ -51,8 +50,8 @@ impl File for OpendalSequentialWriteFile {
             .map_err(|e| Error::IoError(format!("Failed to close writer: {}", e)))
     }
 
-    fn get_handle(&self) -> &FileHandle {
-        &self.handle
+    fn size(&self) -> usize {
+        self.size
     }
 }
 
@@ -64,7 +63,7 @@ impl SequentialWriteFile for OpendalSequentialWriteFile {
             .map_err(|e| Error::IoError(format!("Failed to write data of size {}: {}", len, e)))?;
 
         // Update the file size after successful write
-        self.handle.size += len;
+        self.size += len;
         Ok(len)
     }
 }
