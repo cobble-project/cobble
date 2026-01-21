@@ -16,7 +16,6 @@ use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use uuid::Uuid;
 
 /// A unique identifier for data files managed by the FileManager.
 pub type FileId = u64;
@@ -45,8 +44,6 @@ impl Default for FileManagerOptions {
 struct TrackedFile {
     /// The path to the file relative to the file system root.
     path: String,
-    /// Size of the file in bytes.
-    size: usize,
 }
 
 /// File manager for managing files in a KV storage engine.
@@ -60,8 +57,6 @@ pub struct FileManager {
     options: FileManagerOptions,
     /// Counter for generating unique file IDs.
     next_file_id: AtomicU64,
-    /// UUID for this FileManager instance, used in file names.
-    uuid: String,
     /// Map of file ID to tracked file information for data files.
     data_files: DashMap<FileId, TrackedFile>,
     /// Map of filename to tracked file information for metadata files.
@@ -85,7 +80,6 @@ impl FileManager {
             fs,
             options,
             next_file_id: AtomicU64::new(1), // Start from 1, 0 is reserved
-            uuid: Uuid::new_v4().to_string(),
             data_files: DashMap::new(),
             metadata_files: DashMap::new(),
         })
@@ -115,18 +109,16 @@ impl FileManager {
     }
 
     /// Generates the path for a data file with the given ID.
-    /// Format: {data_dir}/{uuid}_{file_id}.{ext}
     fn data_file_path(&self, file_id: FileId) -> String {
         format!(
-            "{}/{}_{}.{}",
-            self.options.data_dir, self.uuid, file_id, self.options.data_file_extension
+            "{}/{}.{}",
+            self.options.data_dir, file_id, self.options.data_file_extension
         )
     }
 
     /// Generates the path for a metadata file with the given name.
-    /// Format: {metadata_dir}/{uuid}_{name}
     fn metadata_file_path(&self, name: &str) -> String {
-        format!("{}/{}_{}", self.options.metadata_dir, self.uuid, name)
+        format!("{}/{}", self.options.metadata_dir, name)
     }
 
     // =========================================================================
@@ -144,9 +136,8 @@ impl FileManager {
 
         let writer = self.fs.open_write(&path)?;
 
-        // Track the file (size is 0 initially, updated when file is finalized)
-        self.data_files
-            .insert(file_id, TrackedFile { path, size: 0 });
+        // Track the file
+        self.data_files.insert(file_id, TrackedFile { path });
 
         Ok((file_id, writer))
     }
@@ -169,9 +160,8 @@ impl FileManager {
         let path = self.data_file_path(file_id);
         let writer = self.fs.open_write(&path)?;
 
-        // Track the file (size is 0 initially)
-        self.data_files
-            .insert(file_id, TrackedFile { path, size: 0 });
+        // Track the file
+        self.data_files.insert(file_id, TrackedFile { path });
 
         // Update next_file_id if necessary
         let mut current = self.next_file_id.load(Ordering::SeqCst);
@@ -194,7 +184,7 @@ impl FileManager {
     ///
     /// This is useful when recovering files from disk or when files were
     /// created externally. The file is tracked but no reader is opened.
-    pub fn register_data_file(&self, file_id: FileId, path: String, size: usize) -> Result<()> {
+    pub fn register_data_file(&self, file_id: FileId, path: String) -> Result<()> {
         // Verify the file exists
         if !self.fs.exists(&path)? {
             return Err(Error::IoError(format!(
@@ -205,7 +195,7 @@ impl FileManager {
 
         // Track the file if not already tracked
         if !self.data_files.contains_key(&file_id) {
-            self.data_files.insert(file_id, TrackedFile { path, size });
+            self.data_files.insert(file_id, TrackedFile { path });
         }
 
         // Update next_file_id if necessary
@@ -223,20 +213,6 @@ impl FileManager {
         }
 
         Ok(())
-    }
-
-    /// Updates the size of a tracked data file.
-    ///
-    /// This should be called after a file has been written and closed.
-    pub fn update_data_file_size(&self, file_id: FileId, size: usize) {
-        if let Some(mut entry) = self.data_files.get_mut(&file_id) {
-            entry.size = size;
-        }
-    }
-
-    /// Returns the size of a tracked data file.
-    pub fn get_data_file_size(&self, file_id: FileId) -> Option<usize> {
-        self.data_files.get(&file_id).map(|f| f.size)
     }
 
     /// Opens a data file for reading.
@@ -297,15 +273,15 @@ impl FileManager {
         let path = self.metadata_file_path(name);
         let writer = self.fs.open_write(&path)?;
 
-        // Track the file (size is 0 initially)
+        // Track the file
         self.metadata_files
-            .insert(name.to_string(), TrackedFile { path, size: 0 });
+            .insert(name.to_string(), TrackedFile { path });
 
         Ok(writer)
     }
 
     /// Registers an existing metadata file with the FileManager.
-    pub fn register_metadata_file(&self, name: &str, path: String, size: usize) -> Result<()> {
+    pub fn register_metadata_file(&self, name: &str, path: String) -> Result<()> {
         // Verify the file exists
         if !self.fs.exists(&path)? {
             return Err(Error::IoError(format!(
@@ -317,22 +293,10 @@ impl FileManager {
         // Track the file if not already tracked
         if !self.metadata_files.contains_key(name) {
             self.metadata_files
-                .insert(name.to_string(), TrackedFile { path, size });
+                .insert(name.to_string(), TrackedFile { path });
         }
 
         Ok(())
-    }
-
-    /// Updates the size of a tracked metadata file.
-    pub fn update_metadata_file_size(&self, name: &str, size: usize) {
-        if let Some(mut entry) = self.metadata_files.get_mut(name) {
-            entry.size = size;
-        }
-    }
-
-    /// Returns the size of a tracked metadata file.
-    pub fn get_metadata_file_size(&self, name: &str) -> Option<usize> {
-        self.metadata_files.get(name).map(|f| f.size)
     }
 
     /// Opens a metadata file for reading.
@@ -551,11 +515,10 @@ mod tests {
         writer.write(b"existing").unwrap();
         writer.close().unwrap();
 
-        // Register it with path and size
-        fm.register_data_file(999, path.to_string(), 8).unwrap();
+        // Register it with path
+        fm.register_data_file(999, path.to_string()).unwrap();
         assert!(fm.has_data_file(999));
         assert_eq!(fm.peek_next_file_id(), 1000);
-        assert_eq!(fm.get_data_file_size(999), Some(8));
 
         // Can read it
         let reader = fm.open_data_file_reader(999).unwrap();

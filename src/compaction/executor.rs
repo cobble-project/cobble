@@ -231,9 +231,6 @@ impl CompactionExecutor {
                     let builder = current_builder.take().unwrap();
                     let (first_key, last_key, file_size) = builder.finish()?;
 
-                    // Update the file size in the file manager
-                    task.file_manager.update_data_file_size(file_id, file_size);
-
                     output_files.push(Arc::new(DataFile {
                         file_type: task.data_file_type,
                         start_key: first_key,
@@ -253,9 +250,6 @@ impl CompactionExecutor {
         {
             let file_id = current_file_id.take().unwrap();
             let (first_key, last_key, file_size) = builder.finish()?;
-
-            // Update the file size in the file manager
-            task.file_manager.update_data_file_size(file_id, file_size);
 
             output_files.push(Arc::new(DataFile {
                 file_type: task.data_file_type,
@@ -314,9 +308,6 @@ mod tests {
         }
 
         let (first_key, last_key, file_size) = writer.finish_with_range()?;
-
-        // Update the file size in the file manager
-        file_manager.update_data_file_size(file_id, file_size);
 
         Ok(Arc::new(DataFile {
             file_type: DataFileType::SSTable,
@@ -563,9 +554,6 @@ mod tests {
             writer.add(key, value).unwrap();
         }
         let (first_key, last_key, file_size) = writer.finish_with_range().unwrap();
-
-        // Update the file size in the file manager
-        file_manager.update_data_file_size(file_id, file_size);
 
         let file = Arc::new(DataFile {
             file_type: DataFileType::SSTable,
