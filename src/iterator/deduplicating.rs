@@ -96,8 +96,12 @@ impl<I: KvIterator> DeduplicatingIterator<I> {
 
         // Merge from oldest to newest (reverse order)
         // The last value in the list is the oldest, the first is the newest
-        let mut merged_value = decode_value(&values[values.len() - 1], self.num_columns)?;
-        for value_bytes in values.iter().rev().skip(1) {
+        let mut values_iter = values.iter().rev();
+        let mut merged_value = decode_value(
+            values_iter.next().expect("values is non-empty"),
+            self.num_columns,
+        )?;
+        for value_bytes in values_iter {
             let newer_value = decode_value(value_bytes, self.num_columns)?;
             merged_value = merged_value.merge(&newer_value);
         }
