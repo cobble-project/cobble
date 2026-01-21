@@ -74,20 +74,19 @@ impl Column {
         &self.data
     }
 
-    /// Merges this column with a newer column.
+    /// Merges this column with a newer column, consuming both.
     ///
     /// Merge semantics:
-    /// - If `newer` is `Put` or `Delete`, it replaces `self` entirely.
-    /// - If `newer` is `Merge`, the data is concatenated to `self`'s data.
+    /// - If `newer` is `Put` or `Delete`, it replaces `self` entirely (moves `newer`).
+    /// - If `newer` is `Merge`, the data is concatenated to `self`'s data (reuses `self`'s buffer).
     ///
-    /// Returns a new `Column` with the merged result.
-    pub(crate) fn merge(&self, newer: &Column) -> Column {
+    /// This API takes ownership to minimize clones for performance.
+    pub(crate) fn merge(mut self, newer: Column) -> Column {
         match newer.value_type {
-            ValueType::Put | ValueType::Delete => newer.clone(),
+            ValueType::Put | ValueType::Delete => newer,
             ValueType::Merge => {
-                let mut merged_data = self.data.clone();
-                merged_data.extend_from_slice(&newer.data);
-                Column::new(self.value_type, merged_data)
+                self.data.extend_from_slice(&newer.data);
+                self
             }
         }
     }
@@ -104,25 +103,29 @@ impl Value {
         &self.columns
     }
 
-    /// Merges this value with a newer value.
+    /// Merges this value with a newer value, consuming both.
     ///
     /// Columns at the same position are merged according to their types:
-    /// - If the newer column is `None`, keep the older column.
+    /// - If the newer column is `None`, keep the older column (moved, not cloned).
     /// - If the newer column exists, merge it with the older column using `Column::merge`.
     ///
     /// The resulting value has the maximum number of columns from both values.
-    pub(crate) fn merge(&self, newer: &Value) -> Value {
+    /// This API takes ownership to minimize clones for performance.
+    pub(crate) fn merge(self, newer: Value) -> Value {
         let max_cols = self.columns.len().max(newer.columns.len());
         let mut merged_columns = Vec::with_capacity(max_cols);
 
-        for i in 0..max_cols {
-            let older_col = self.columns.get(i).and_then(|c| c.as_ref());
-            let newer_col = newer.columns.get(i).and_then(|c| c.as_ref());
+        let mut older_iter = self.columns.into_iter();
+        let mut newer_iter = newer.columns.into_iter();
+
+        for _ in 0..max_cols {
+            let older_col = older_iter.next().flatten();
+            let newer_col = newer_iter.next().flatten();
 
             let merged = match (older_col, newer_col) {
                 (Some(old), Some(new)) => Some(old.merge(new)),
-                (Some(old), None) => Some(old.clone()),
-                (None, Some(new)) => Some(new.clone()),
+                (Some(old), None) => Some(old),
+                (None, Some(new)) => Some(new),
                 (None, None) => None,
             };
             merged_columns.push(merged);
@@ -141,7 +144,7 @@ mod tests {
         let old = Column::new(ValueType::Put, b"old_data".to_vec());
         let new = Column::new(ValueType::Put, b"new_data".to_vec());
 
-        let merged = old.merge(&new);
+        let merged = old.merge(new);
         assert!(matches!(merged.value_type(), ValueType::Put));
         assert_eq!(merged.data(), b"new_data");
     }
@@ -151,7 +154,7 @@ mod tests {
         let old = Column::new(ValueType::Put, b"old_data".to_vec());
         let new = Column::new(ValueType::Delete, b"".to_vec());
 
-        let merged = old.merge(&new);
+        let merged = old.merge(new);
         assert!(matches!(merged.value_type(), ValueType::Delete));
         assert_eq!(merged.data(), b"");
     }
@@ -161,7 +164,7 @@ mod tests {
         let old = Column::new(ValueType::Put, b"hello".to_vec());
         let new = Column::new(ValueType::Merge, b"world".to_vec());
 
-        let merged = old.merge(&new);
+        let merged = old.merge(new);
         // Merge keeps the original value_type and concatenates data
         assert!(matches!(merged.value_type(), ValueType::Put));
         assert_eq!(merged.data(), b"helloworld");
@@ -173,7 +176,7 @@ mod tests {
         let merge1 = Column::new(ValueType::Merge, b"b".to_vec());
         let merge2 = Column::new(ValueType::Merge, b"c".to_vec());
 
-        let merged = old.merge(&merge1).merge(&merge2);
+        let merged = old.merge(merge1).merge(merge2);
         assert!(matches!(merged.value_type(), ValueType::Put));
         assert_eq!(merged.data(), b"abc");
     }
@@ -189,7 +192,7 @@ mod tests {
             Some(Column::new(ValueType::Merge, b"_append".to_vec())),
         ]);
 
-        let merged = old.merge(&new);
+        let merged = old.merge(new);
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
@@ -208,7 +211,7 @@ mod tests {
             Some(Column::new(ValueType::Put, b"new2".to_vec())),
         ]);
 
-        let merged = old.merge(&new);
+        let merged = old.merge(new);
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
@@ -229,7 +232,7 @@ mod tests {
             Some(Column::new(ValueType::Put, b"new2".to_vec())),
         ]);
 
-        let merged = old.merge(&new);
+        let merged = old.merge(new);
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
@@ -246,7 +249,7 @@ mod tests {
             Some(Column::new(ValueType::Put, b"new3".to_vec())),
         ]);
 
-        let merged = old.merge(&new);
+        let merged = old.merge(new);
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 3);
@@ -260,7 +263,7 @@ mod tests {
         let old = Value::new(vec![None, None]);
         let new = Value::new(vec![None, None]);
 
-        let merged = old.merge(&new);
+        let merged = old.merge(new);
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);

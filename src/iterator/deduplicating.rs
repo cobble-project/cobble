@@ -103,7 +103,7 @@ impl<I: KvIterator> DeduplicatingIterator<I> {
         )?;
         for value_bytes in values_iter {
             let newer_value = decode_value(value_bytes, self.num_columns)?;
-            merged_value = merged_value.merge(&newer_value);
+            merged_value = merged_value.merge(newer_value);
         }
 
         // Encode the merged value
