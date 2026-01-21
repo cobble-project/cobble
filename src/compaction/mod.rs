@@ -5,8 +5,11 @@
 //! DeduplicatingIterator, producing a set of new SST files with sorted key ranges.
 
 mod executor;
+mod file_builder;
 
 #[allow(unused_imports)]
 pub(crate) use executor::{
     CompactionExecutor, CompactionOptions, CompactionResult, CompactionTask,
 };
+
+pub(crate) use file_builder::FileBuilder;

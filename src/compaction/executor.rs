@@ -5,11 +5,12 @@
 //! - `CompactionResult`: Output of a compaction operation
 //! - `CompactionExecutor`: Manages compaction execution in a thread pool
 
+use crate::compaction::FileBuilder;
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
-use crate::file::{FileHandle, FileSystem, SequentialWriteFile};
+use crate::file::{FileHandle, FileSystem};
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
-use crate::sst::SSTIteratorOptions;
+use crate::sst::{SSTIteratorOptions, SSTWriter, SSTWriterOptions};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
@@ -91,133 +92,6 @@ impl CompactionResult {
     /// Files are sorted by their key ranges.
     pub fn new_files(&self) -> &[Arc<DataFile>] {
         &self.new_files
-    }
-}
-
-/// A builder for creating SST files during compaction.
-struct SSTFileBuilder<W: SequentialWriteFile> {
-    writer: crate::file::BufferedWriter<W>,
-    data_block_builder: crate::sst::format::BlockBuilder,
-    index_block_builder: crate::sst::format::BlockBuilder,
-    last_key: Vec<u8>,
-    first_key: Option<Vec<u8>>,
-    current_block_first_key: Option<Vec<u8>>,
-    pending_data_blocks: Vec<(Vec<u8>, u64, u64)>,
-    options: CompactionOptions,
-}
-
-impl<W: SequentialWriteFile> SSTFileBuilder<W> {
-    fn new(writer: W, options: CompactionOptions) -> Self {
-        let buffered_writer = crate::file::BufferedWriter::new(writer, options.buffer_size);
-        let data_block_builder = crate::sst::format::BlockBuilder::new(options.block_size);
-        let index_block_builder = crate::sst::format::BlockBuilder::new(options.block_size);
-
-        Self {
-            writer: buffered_writer,
-            data_block_builder,
-            index_block_builder,
-            last_key: Vec::new(),
-            first_key: None,
-            current_block_first_key: None,
-            pending_data_blocks: Vec::new(),
-            options,
-        }
-    }
-
-    fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        // Track first key
-        if self.first_key.is_none() {
-            self.first_key = Some(key.to_vec());
-        }
-
-        // Track first key of current block
-        if self.data_block_builder.is_empty() {
-            self.current_block_first_key = Some(key.to_vec());
-        }
-
-        // Add to current data block
-        self.data_block_builder.add(key, value);
-        self.last_key = key.to_vec();
-
-        // Check if we should finish the current block
-        if self.data_block_builder.should_finish() {
-            let first_key = self.current_block_first_key.take().unwrap();
-            self.finish_data_block(first_key)?;
-        }
-
-        Ok(())
-    }
-
-    fn finish_data_block(&mut self, first_key: Vec<u8>) -> Result<()> {
-        if self.data_block_builder.is_empty() {
-            return Ok(());
-        }
-
-        let old_builder = std::mem::replace(
-            &mut self.data_block_builder,
-            crate::sst::format::BlockBuilder::new(self.options.block_size),
-        );
-        let block = old_builder.build();
-        let encoded = block.encode();
-        let size = encoded.len();
-        let offset = self.writer.offset();
-
-        self.writer.write(&encoded)?;
-        self.pending_data_blocks
-            .push((first_key, offset as u64, size as u64));
-
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<(Vec<u8>, Vec<u8>)> {
-        use bytes::BufMut;
-
-        // Finish any pending data block
-        if !self.data_block_builder.is_empty() {
-            let first_key = self.current_block_first_key.take().unwrap_or_default();
-            self.finish_data_block(first_key)?;
-        }
-
-        // Build index block
-        for (first_key, offset, size) in &self.pending_data_blocks {
-            let mut value = bytes::BytesMut::with_capacity(16);
-            value.put_u64_le(*offset);
-            value.put_u64_le(*size);
-            self.index_block_builder.add(first_key, &value);
-        }
-
-        let index_builder = std::mem::replace(
-            &mut self.index_block_builder,
-            crate::sst::format::BlockBuilder::new(self.options.block_size),
-        );
-        let index_block = index_builder.build();
-        let index_encoded = index_block.encode();
-        let index_offset = self.writer.offset();
-        let index_size = index_encoded.len();
-
-        // Write index block
-        self.writer.write(&index_encoded)?;
-
-        // Write footer
-        let footer = crate::sst::format::Footer::new(index_offset as u64, index_size as u64);
-        let footer_encoded = footer.encode();
-        self.writer.write(&footer_encoded)?;
-
-        // Flush and close
-        self.writer.close()?;
-
-        let first_key = self.first_key.unwrap_or_default();
-        let last_key = self.last_key;
-
-        Ok((first_key, last_key))
-    }
-
-    fn offset(&self) -> usize {
-        self.writer.offset()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.first_key.is_none()
     }
 }
 
@@ -358,8 +232,8 @@ impl CompactionExecutor {
         // Collect output files
         let mut output_files: Vec<Arc<DataFile>> = Vec::new();
 
-        // Process entries and write to output files
-        let mut current_builder: Option<SSTFileBuilder<Box<dyn SequentialWriteFile>>> = None;
+        // Process entries and write to output files using the FileBuilder trait
+        let mut current_builder: Option<Box<dyn FileBuilder>> = None;
         let mut current_file_info: Option<(String, u64)> = None; // (path, file_id)
 
         while dedup_iter.valid() {
@@ -374,7 +248,15 @@ impl CompactionExecutor {
                 let file_path = format!("{}/{}.sst", task.output_path, file_id);
                 current_file_info = Some((file_path.clone(), file_id));
                 let writer = task.file_system.open_write(&file_path)?;
-                current_builder = Some(SSTFileBuilder::new(writer, options.clone()));
+                let sst_writer = SSTWriter::new(
+                    writer,
+                    SSTWriterOptions {
+                        block_size: options.block_size,
+                        buffer_size: options.buffer_size,
+                        num_columns: options.num_columns,
+                    },
+                );
+                current_builder = Some(Box::new(sst_writer));
             }
 
             // Add entry to current file
@@ -430,9 +312,7 @@ impl CompactionExecutor {
 mod tests {
     use super::*;
     use crate::file::FileSystemRegistry;
-    use crate::iterator::mock_iterator::MockIterator;
     use crate::sst::row_codec::encode_value;
-    use crate::sst::writer::{SSTWriter, SSTWriterOptions};
     use crate::r#type::Value;
     use crate::r#type::{Column, ValueType};
 
