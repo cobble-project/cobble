@@ -35,7 +35,7 @@ pub fn create_iterator(
     match file.file_type {
         DataFileType::SSTable => {
             let reader = file_manager.open_data_file_reader(file.file_id)?;
-            let iter = SSTIterator::new(reader, options.sst_options.clone())?;
+            let iter = SSTIterator::new(Box::new(reader), options.sst_options.clone())?;
             Ok(Box::new(iter))
         }
     }

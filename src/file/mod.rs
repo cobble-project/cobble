@@ -5,7 +5,9 @@ mod opendal_file;
 mod opendal_fs;
 
 #[allow(unused_imports)]
-pub use self::file_manager::{FileId, FileManager, FileManagerOptions};
+pub use self::file_manager::{
+    FileId, FileManager, FileManagerOptions, TrackedFile, TrackedReader, TrackedWriter,
+};
 #[allow(unused_imports)]
 pub use self::file_system::{FileSystem, FileSystemRegistry};
 #[allow(unused_imports)]

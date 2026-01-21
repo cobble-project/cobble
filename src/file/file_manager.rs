@@ -12,10 +12,11 @@
 
 use crate::error::{Error, Result};
 use crate::file::file_system::FileSystem;
-use crate::file::files::{RandomAccessFile, SequentialWriteFile};
+use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
+use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A unique identifier for data files managed by the FileManager.
 pub type FileId = u64;
@@ -41,9 +42,114 @@ impl Default for FileManagerOptions {
 }
 
 /// Information about a tracked file.
-struct TrackedFile {
+pub struct TrackedFile {
     /// The path to the file relative to the file system root.
     path: String,
+    /// The underlying file system (needed for deletion on drop).
+    fs: Arc<dyn FileSystem>,
+    /// Whether to delete the file when this TrackedFile is dropped.
+    delete_on_drop: AtomicBool,
+}
+
+impl TrackedFile {
+    /// Creates a new TrackedFile.
+    fn new(path: String, fs: Arc<dyn FileSystem>) -> Self {
+        Self {
+            path,
+            fs,
+            delete_on_drop: AtomicBool::new(false),
+        }
+    }
+
+    /// Marks the file for deletion when this TrackedFile is dropped.
+    pub fn mark_for_deletion(&self) {
+        self.delete_on_drop.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns true if the file is marked for deletion on drop.
+    pub fn is_marked_for_deletion(&self) -> bool {
+        self.delete_on_drop.load(Ordering::SeqCst)
+    }
+
+    /// Returns the path to the file.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl Drop for TrackedFile {
+    fn drop(&mut self) {
+        if self.delete_on_drop.load(Ordering::SeqCst) {
+            // Attempt to delete the file, ignore errors
+            let _ = self.fs.delete(&self.path);
+        }
+    }
+}
+
+/// A wrapper around a RandomAccessFile that holds a reference to the TrackedFile.
+/// This ensures the TrackedFile is not dropped while the file is in use.
+pub struct TrackedReader {
+    inner: Box<dyn RandomAccessFile>,
+    _tracked: Arc<TrackedFile>,
+}
+
+impl TrackedReader {
+    /// Creates a new TrackedReader.
+    pub fn new(inner: Box<dyn RandomAccessFile>, tracked: Arc<TrackedFile>) -> Self {
+        Self {
+            inner,
+            _tracked: tracked,
+        }
+    }
+}
+
+impl File for TrackedReader {
+    fn close(&mut self) -> Result<(), Error> {
+        self.inner.close()
+    }
+
+    fn size(&self) -> usize {
+        self.inner.size()
+    }
+}
+
+impl RandomAccessFile for TrackedReader {
+    fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
+        self.inner.read_at(offset, size)
+    }
+}
+
+/// A wrapper around a SequentialWriteFile that holds a reference to the TrackedFile.
+/// This ensures the TrackedFile is not dropped while the file is being written.
+pub struct TrackedWriter {
+    inner: Box<dyn SequentialWriteFile>,
+    _tracked: Arc<TrackedFile>,
+}
+
+impl TrackedWriter {
+    /// Creates a new TrackedWriter.
+    pub fn new(inner: Box<dyn SequentialWriteFile>, tracked: Arc<TrackedFile>) -> Self {
+        Self {
+            inner,
+            _tracked: tracked,
+        }
+    }
+}
+
+impl File for TrackedWriter {
+    fn close(&mut self) -> Result<(), Error> {
+        self.inner.close()
+    }
+
+    fn size(&self) -> usize {
+        self.inner.size()
+    }
+}
+
+impl SequentialWriteFile for TrackedWriter {
+    fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+        self.inner.write(data)
+    }
 }
 
 /// File manager for managing files in a KV storage engine.
@@ -58,9 +164,9 @@ pub struct FileManager {
     /// Counter for generating unique file IDs.
     next_file_id: AtomicU64,
     /// Map of file ID to tracked file information for data files.
-    data_files: DashMap<FileId, TrackedFile>,
+    data_files: DashMap<FileId, Arc<TrackedFile>>,
     /// Map of filename to tracked file information for metadata files.
-    metadata_files: DashMap<String, TrackedFile>,
+    metadata_files: DashMap<String, Arc<TrackedFile>>,
 }
 
 impl FileManager {
@@ -126,30 +232,28 @@ impl FileManager {
     // =========================================================================
 
     /// Creates a new data file for writing and returns the assigned file ID
-    /// along with a writer.
+    /// along with a writer wrapped with the TrackedFile reference.
     ///
     /// The file is tracked by the FileManager and can be opened for reading
     /// later using `open_data_file_reader`.
-    pub fn create_data_file(&self) -> Result<(FileId, Box<dyn SequentialWriteFile>)> {
+    pub fn create_data_file(&self) -> Result<(FileId, TrackedWriter)> {
         let file_id = self.allocate_file_id();
         let path = self.data_file_path(file_id);
 
         let writer = self.fs.open_write(&path)?;
 
         // Track the file
-        self.data_files.insert(file_id, TrackedFile { path });
+        let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.fs)));
+        self.data_files.insert(file_id, Arc::clone(&tracked));
 
-        Ok((file_id, writer))
+        Ok((file_id, TrackedWriter::new(writer, tracked)))
     }
 
     /// Creates a new data file with a specific file ID.
     ///
     /// This is useful when recovering files or when the ID is known in advance.
     /// Returns an error if the file ID is already in use.
-    pub fn create_data_file_with_id(
-        &self,
-        file_id: FileId,
-    ) -> Result<Box<dyn SequentialWriteFile>> {
+    pub fn create_data_file_with_id(&self, file_id: FileId) -> Result<TrackedWriter> {
         if self.data_files.contains_key(&file_id) {
             return Err(Error::IoError(format!(
                 "File ID {} is already in use",
@@ -161,7 +265,8 @@ impl FileManager {
         let writer = self.fs.open_write(&path)?;
 
         // Track the file
-        self.data_files.insert(file_id, TrackedFile { path });
+        let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.fs)));
+        self.data_files.insert(file_id, Arc::clone(&tracked));
 
         // Update next_file_id if necessary
         let mut current = self.next_file_id.load(Ordering::SeqCst);
@@ -177,7 +282,7 @@ impl FileManager {
             }
         }
 
-        Ok(writer)
+        Ok(TrackedWriter::new(writer, tracked))
     }
 
     /// Registers an existing data file with the FileManager.
@@ -195,7 +300,8 @@ impl FileManager {
 
         // Track the file if not already tracked
         if !self.data_files.contains_key(&file_id) {
-            self.data_files.insert(file_id, TrackedFile { path });
+            let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.fs)));
+            self.data_files.insert(file_id, tracked);
         }
 
         // Update next_file_id if necessary
@@ -217,9 +323,10 @@ impl FileManager {
 
     /// Opens a data file for reading.
     ///
-    /// A new reader is created each time this method is called.
-    pub fn open_data_file_reader(&self, file_id: FileId) -> Result<Box<dyn RandomAccessFile>> {
-        // Get the tracked file to read the path
+    /// Returns a TrackedReader that holds a reference to the TrackedFile.
+    /// The file will not be deleted while the reader is in use.
+    pub fn open_data_file_reader(&self, file_id: FileId) -> Result<TrackedReader> {
+        // Get the tracked file
         let tracked = self.data_files.get(&file_id).ok_or_else(|| {
             Error::IoError(format!(
                 "Data file {} is not tracked by FileManager",
@@ -227,12 +334,13 @@ impl FileManager {
             ))
         })?;
 
-        self.fs.open_read(&tracked.path)
+        let reader = self.fs.open_read(tracked.path())?;
+        Ok(TrackedReader::new(reader, Arc::clone(&tracked)))
     }
 
     /// Returns the path for a data file.
     pub fn get_data_file_path(&self, file_id: FileId) -> Option<String> {
-        self.data_files.get(&file_id).map(|f| f.path.clone())
+        self.data_files.get(&file_id).map(|f| f.path().to_string())
     }
 
     /// Checks if a data file is tracked by the FileManager.
@@ -240,14 +348,36 @@ impl FileManager {
         self.data_files.contains_key(&file_id)
     }
 
-    /// Removes a data file from tracking and optionally deletes it from disk.
+    /// Marks a data file for deletion. The file will be deleted when all
+    /// references to it (readers/writers) are dropped.
     ///
-    /// If `delete_from_disk` is true, the file is also deleted from the file system.
+    /// If `remove_from_tracking` is true, the file is also removed from the
+    /// FileManager's tracking map. This means no new readers can be opened.
+    pub fn mark_data_file_for_deletion(&self, file_id: FileId, remove_from_tracking: bool) {
+        if let Some(tracked) = self.data_files.get(&file_id) {
+            tracked.mark_for_deletion();
+        }
+        if remove_from_tracking {
+            self.data_files.remove(&file_id);
+        }
+    }
+
+    /// Removes a data file from tracking and optionally deletes it from disk immediately.
+    ///
+    /// If `delete_from_disk` is true, the file is deleted immediately.
+    /// If false, the file remains on disk but is no longer tracked.
     pub fn remove_data_file(&self, file_id: FileId, delete_from_disk: bool) -> Result<()> {
         if let Some((_, tracked)) = self.data_files.remove(&file_id)
             && delete_from_disk
         {
-            self.fs.delete(&tracked.path)?;
+            // If we're the last reference, this will delete on drop
+            // But if there are other references, mark it for deletion
+            if Arc::strong_count(&tracked) > 1 {
+                tracked.mark_for_deletion();
+            } else {
+                // We're the last reference, delete immediately
+                self.fs.delete(tracked.path())?;
+            }
         }
         Ok(())
     }
@@ -269,15 +399,16 @@ impl FileManager {
     /// Creates a new metadata file for writing.
     ///
     /// Metadata files are identified by their name rather than a numeric ID.
-    pub fn create_metadata_file(&self, name: &str) -> Result<Box<dyn SequentialWriteFile>> {
+    pub fn create_metadata_file(&self, name: &str) -> Result<TrackedWriter> {
         let path = self.metadata_file_path(name);
         let writer = self.fs.open_write(&path)?;
 
         // Track the file
+        let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.fs)));
         self.metadata_files
-            .insert(name.to_string(), TrackedFile { path });
+            .insert(name.to_string(), Arc::clone(&tracked));
 
-        Ok(writer)
+        Ok(TrackedWriter::new(writer, tracked))
     }
 
     /// Registers an existing metadata file with the FileManager.
@@ -292,15 +423,17 @@ impl FileManager {
 
         // Track the file if not already tracked
         if !self.metadata_files.contains_key(name) {
-            self.metadata_files
-                .insert(name.to_string(), TrackedFile { path });
+            let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.fs)));
+            self.metadata_files.insert(name.to_string(), tracked);
         }
 
         Ok(())
     }
 
     /// Opens a metadata file for reading.
-    pub fn open_metadata_file_reader(&self, name: &str) -> Result<Box<dyn RandomAccessFile>> {
+    ///
+    /// Returns a TrackedReader that holds a reference to the TrackedFile.
+    pub fn open_metadata_file_reader(&self, name: &str) -> Result<TrackedReader> {
         // Get the tracked file to read the path
         let tracked = self.metadata_files.get(name).ok_or_else(|| {
             Error::IoError(format!(
@@ -309,7 +442,8 @@ impl FileManager {
             ))
         })?;
 
-        self.fs.open_read(&tracked.path)
+        let reader = self.fs.open_read(tracked.path())?;
+        Ok(TrackedReader::new(reader, Arc::clone(&tracked)))
     }
 
     /// Checks if a metadata file exists.
@@ -317,12 +451,27 @@ impl FileManager {
         self.metadata_files.contains_key(name)
     }
 
+    /// Marks a metadata file for deletion. The file will be deleted when all
+    /// references to it (readers/writers) are dropped.
+    pub fn mark_metadata_file_for_deletion(&self, name: &str, remove_from_tracking: bool) {
+        if let Some(tracked) = self.metadata_files.get(name) {
+            tracked.mark_for_deletion();
+        }
+        if remove_from_tracking {
+            self.metadata_files.remove(name);
+        }
+    }
+
     /// Removes a metadata file from tracking and optionally deletes it from disk.
     pub fn remove_metadata_file(&self, name: &str, delete_from_disk: bool) -> Result<()> {
         if let Some((_, tracked)) = self.metadata_files.remove(name)
             && delete_from_disk
         {
-            self.fs.delete(&tracked.path)?;
+            if Arc::strong_count(&tracked) > 1 {
+                tracked.mark_for_deletion();
+            } else {
+                self.fs.delete(tracked.path())?;
+            }
         }
         Ok(())
     }
@@ -427,6 +576,7 @@ mod tests {
         let (file_id, mut writer) = fm.create_data_file().unwrap();
         writer.write(b"data").unwrap();
         writer.close().unwrap();
+        drop(writer); // Drop the writer to release the Arc reference
 
         let path = fm.get_data_file_path(file_id).unwrap();
         assert!(fs.exists(&path).unwrap());

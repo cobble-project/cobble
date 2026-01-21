@@ -189,7 +189,7 @@ impl CompactionExecutor {
         for run in &task.sorted_runs {
             for file in run.files() {
                 let reader = task.file_manager.open_data_file_reader(file.file_id)?;
-                let iter = crate::sst::SSTIterator::new(reader, sst_options.clone())?;
+                let iter = crate::sst::SSTIterator::new(Box::new(reader), sst_options.clone())?;
                 all_iters.push(Box::new(iter));
             }
         }
@@ -218,7 +218,7 @@ impl CompactionExecutor {
             if current_builder.is_none() {
                 let (file_id, writer) = task.file_manager.create_data_file()?;
                 current_file_id = Some(file_id);
-                current_builder = Some((task.file_builder_factory)(writer));
+                current_builder = Some((task.file_builder_factory)(Box::new(writer)));
             }
 
             // Add entry to current file
@@ -390,9 +390,11 @@ mod tests {
         let reader = file_manager
             .open_data_file_reader(first_file.file_id)
             .unwrap();
-        let mut iter =
-            crate::sst::SSTIterator::new(reader, crate::sst::SSTIteratorOptions::default())
-                .unwrap();
+        let mut iter = crate::sst::SSTIterator::new(
+            Box::new(reader),
+            crate::sst::SSTIteratorOptions::default(),
+        )
+        .unwrap();
         iter.seek_to_first().unwrap();
 
         // Verify entries are merged and sorted
@@ -484,7 +486,7 @@ mod tests {
             .open_data_file_reader(result.new_files()[0].file_id)
             .unwrap();
         let mut iter = crate::sst::SSTIterator::new(
-            reader,
+            Box::new(reader),
             crate::sst::SSTIteratorOptions {
                 num_columns,
                 ..Default::default()
