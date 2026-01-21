@@ -3,6 +3,7 @@
 //! This module provides generic iterator abstractions that are independent of
 //! the underlying data file format (SST, etc.), allowing for future extensibility.
 
+mod deduplicating;
 mod factory;
 mod merging;
 pub(crate) mod mock_iterator;
@@ -10,6 +11,8 @@ mod sorted_run;
 
 // Public API exports for the iterator module.
 // These are currently unused within this crate but are exported for external usage.
+#[allow(unused_imports)]
+pub(crate) use deduplicating::DeduplicatingIterator;
 #[allow(unused_imports)]
 pub(crate) use factory::{IteratorFactoryOptions, create_iterator, make_iterator_factory};
 #[allow(unused_imports)]
