@@ -5,6 +5,7 @@
 //! (SST, etc.) can implement this trait.
 
 use crate::error::Result;
+use crate::file::SequentialWriteFile;
 
 /// A trait for building output files during compaction.
 ///
@@ -29,3 +30,11 @@ pub trait FileBuilder {
     /// Returns true if no keys have been added yet.
     fn is_empty(&self) -> bool;
 }
+
+/// A factory function type for creating FileBuilder instances.
+///
+/// The factory takes a file writer and returns a boxed FileBuilder.
+/// This allows the compaction process to be independent of the specific
+/// file format being used.
+pub type FileBuilderFactory =
+    Box<dyn Fn(Box<dyn SequentialWriteFile>) -> Box<dyn FileBuilder> + Send + Sync>;

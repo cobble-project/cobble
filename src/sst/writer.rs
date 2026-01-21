@@ -126,47 +126,9 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         Ok(())
     }
 
-    /// Finish writing the SST file
-    /// This writes the index block and footer
-    pub fn finish(mut self) -> Result<()> {
-        // Finish any pending data block
-        if !self.data_block_builder.is_empty() {
-            let first_key = self.current_block_first_key.take().unwrap_or_default();
-            self.finish_data_block(first_key)?;
-        }
-
-        // Build index block
-        for (first_key, offset, size) in &self.pending_data_blocks {
-            let mut value = BytesMut::with_capacity(16);
-            value.put_u64_le(*offset);
-            value.put_u64_le(*size);
-            self.index_block_builder.add(first_key, &value);
-        }
-
-        let index_builder = std::mem::replace(
-            &mut self.index_block_builder,
-            BlockBuilder::new(self.options.block_size),
-        );
-        let index_block = index_builder.build();
-        let index_encoded = index_block.encode();
-        let index_offset = self.writer.offset();
-        let index_size = index_encoded.len();
-
-        // Write index block
-        self.writer.write(&index_encoded)?;
-
-        // Write footer
-        let footer = Footer::new(index_offset as u64, index_size as u64);
-        let footer_encoded = footer.encode();
-        self.writer.write(&footer_encoded)?;
-
-        // Flush and close
-        self.writer.close()
-    }
-
     /// Finish writing the SST file and return (first_key, last_key).
     /// This writes the index block and footer, and returns the key range.
-    pub fn finish_with_range(mut self) -> Result<(Vec<u8>, Vec<u8>)> {
+    fn finish_internal(mut self) -> Result<(Vec<u8>, Vec<u8>)> {
         // Capture first/last keys before finishing
         let first_key = self.first_key.clone().unwrap_or_default();
         let last_key = self.last_key.clone();
@@ -206,6 +168,19 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         self.writer.close()?;
 
         Ok((first_key, last_key))
+    }
+
+    /// Finish writing the SST file
+    /// This writes the index block and footer
+    pub fn finish(self) -> Result<()> {
+        self.finish_internal()?;
+        Ok(())
+    }
+
+    /// Finish writing the SST file and return (first_key, last_key).
+    /// This writes the index block and footer, and returns the key range.
+    pub fn finish_with_range(self) -> Result<(Vec<u8>, Vec<u8>)> {
+        self.finish_internal()
     }
 
     /// Returns the current offset (bytes written) in the file.

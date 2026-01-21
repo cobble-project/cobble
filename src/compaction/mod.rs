@@ -12,4 +12,4 @@ pub(crate) use executor::{
     CompactionExecutor, CompactionOptions, CompactionResult, CompactionTask,
 };
 
-pub(crate) use file_builder::FileBuilder;
+pub(crate) use file_builder::{FileBuilder, FileBuilderFactory};

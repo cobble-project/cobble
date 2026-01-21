@@ -5,12 +5,12 @@
 //! - `CompactionResult`: Output of a compaction operation
 //! - `CompactionExecutor`: Manages compaction execution in a thread pool
 
-use crate::compaction::FileBuilder;
+use crate::compaction::{FileBuilder, FileBuilderFactory};
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
 use crate::file::{FileHandle, FileSystem};
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
-use crate::sst::{SSTIteratorOptions, SSTWriter, SSTWriterOptions};
+use crate::sst::SSTIteratorOptions;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
@@ -46,8 +46,12 @@ pub struct CompactionTask {
     sorted_runs: Vec<SortedRun>,
     /// The file system to use for reading/writing files.
     file_system: Arc<dyn FileSystem>,
-    /// The output directory path for new SST files.
+    /// The output directory path for new files.
     output_path: String,
+    /// Factory function for creating FileBuilder instances.
+    file_builder_factory: Arc<FileBuilderFactory>,
+    /// File extension for output files (e.g., "sst").
+    file_extension: String,
 }
 
 impl CompactionTask {
@@ -56,16 +60,22 @@ impl CompactionTask {
     /// # Arguments
     /// * `sorted_runs` - The sorted runs to merge together
     /// * `file_system` - The file system for reading input files and writing output files
-    /// * `output_path` - The directory path where new SST files will be written
+    /// * `output_path` - The directory path where new files will be written
+    /// * `file_builder_factory` - Factory function for creating FileBuilder instances
+    /// * `file_extension` - File extension for output files (e.g., "sst")
     pub fn new(
         sorted_runs: Vec<SortedRun>,
         file_system: Arc<dyn FileSystem>,
         output_path: String,
+        file_builder_factory: Arc<FileBuilderFactory>,
+        file_extension: String,
     ) -> Self {
         Self {
             sorted_runs,
             file_system,
             output_path,
+            file_builder_factory,
+            file_extension,
         }
     }
 
@@ -245,18 +255,10 @@ impl CompactionExecutor {
             // Check if we need to start a new file
             if current_builder.is_none() {
                 let file_id = file_id_counter.fetch_add(1, Ordering::SeqCst);
-                let file_path = format!("{}/{}.sst", task.output_path, file_id);
+                let file_path = format!("{}/{}.{}", task.output_path, file_id, task.file_extension);
                 current_file_info = Some((file_path.clone(), file_id));
                 let writer = task.file_system.open_write(&file_path)?;
-                let sst_writer = SSTWriter::new(
-                    writer,
-                    SSTWriterOptions {
-                        block_size: options.block_size,
-                        buffer_size: options.buffer_size,
-                        num_columns: options.num_columns,
-                    },
-                );
-                current_builder = Some(Box::new(sst_writer));
+                current_builder = Some((task.file_builder_factory)(writer));
             }
 
             // Add entry to current file
@@ -313,6 +315,7 @@ mod tests {
     use super::*;
     use crate::file::FileSystemRegistry;
     use crate::sst::row_codec::encode_value;
+    use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::Value;
     use crate::r#type::{Column, ValueType};
 
@@ -323,6 +326,20 @@ mod tests {
 
     fn cleanup_test_dir(path: &str) {
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// Creates an SST file builder factory for tests.
+    fn make_sst_builder_factory(options: CompactionOptions) -> Arc<FileBuilderFactory> {
+        Arc::new(Box::new(move |writer| {
+            Box::new(SSTWriter::new(
+                writer,
+                SSTWriterOptions {
+                    block_size: options.block_size,
+                    buffer_size: options.buffer_size,
+                    num_columns: options.num_columns,
+                },
+            )) as Box<dyn FileBuilder>
+        }))
     }
 
     fn create_test_sst(
@@ -396,15 +413,22 @@ mod tests {
         let run1 = SortedRun::new(vec![file1]);
         let run2 = SortedRun::new(vec![file2]);
 
-        // Create and execute compaction
-        let task = CompactionTask::new(vec![run1, run2], Arc::clone(&fs), "output".to_string());
-
-        let executor = CompactionExecutor::new(CompactionOptions {
+        let options = CompactionOptions {
             num_columns,
             target_file_size: 1024 * 1024, // 1MB - all entries fit in one file
             ..Default::default()
-        })
-        .unwrap();
+        };
+
+        // Create and execute compaction
+        let task = CompactionTask::new(
+            vec![run1, run2],
+            Arc::clone(&fs),
+            "output".to_string(),
+            make_sst_builder_factory(options.clone()),
+            "sst".to_string(),
+        );
+
+        let executor = CompactionExecutor::new(options).unwrap();
 
         let result = executor.execute_blocking(task).unwrap();
 
@@ -486,14 +510,21 @@ mod tests {
         let run1 = SortedRun::new(vec![file1]);
         let run2 = SortedRun::new(vec![file2]);
 
-        // Create and execute compaction
-        let task = CompactionTask::new(vec![run1, run2], Arc::clone(&fs), "output".to_string());
-
-        let executor = CompactionExecutor::new(CompactionOptions {
+        let options = CompactionOptions {
             num_columns,
             ..Default::default()
-        })
-        .unwrap();
+        };
+
+        // Create and execute compaction
+        let task = CompactionTask::new(
+            vec![run1, run2],
+            Arc::clone(&fs),
+            "output".to_string(),
+            make_sst_builder_factory(options.clone()),
+            "sst".to_string(),
+        );
+
+        let executor = CompactionExecutor::new(options).unwrap();
 
         let result = executor.execute_blocking(task).unwrap();
 
@@ -588,15 +619,22 @@ mod tests {
 
         let run = SortedRun::new(vec![file]);
 
-        // Create compaction with very small target file size to force multiple output files
-        let task = CompactionTask::new(vec![run], Arc::clone(&fs), "output".to_string());
-
-        let executor = CompactionExecutor::new(CompactionOptions {
+        let options = CompactionOptions {
             num_columns,
             target_file_size: 500, // Very small to force multiple files
             ..Default::default()
-        })
-        .unwrap();
+        };
+
+        // Create compaction with very small target file size to force multiple output files
+        let task = CompactionTask::new(
+            vec![run],
+            Arc::clone(&fs),
+            "output".to_string(),
+            make_sst_builder_factory(options.clone()),
+            "sst".to_string(),
+        );
+
+        let executor = CompactionExecutor::new(options).unwrap();
 
         let result = executor.execute_blocking(task).unwrap();
 
@@ -627,8 +665,16 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
+        let options = CompactionOptions::default();
+
         // Create compaction with no sorted runs
-        let task = CompactionTask::new(vec![], Arc::clone(&fs), "output".to_string());
+        let task = CompactionTask::new(
+            vec![],
+            Arc::clone(&fs),
+            "output".to_string(),
+            make_sst_builder_factory(options),
+            "sst".to_string(),
+        );
 
         let executor = CompactionExecutor::with_defaults().unwrap();
         let result = executor.execute_blocking(task).unwrap();
