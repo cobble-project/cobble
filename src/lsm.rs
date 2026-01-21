@@ -143,6 +143,7 @@ mod tests {
                 file_type: DataFileType::SSTable,
                 start_key: start.to_vec(),
                 end_key: end.to_vec(),
+                path: format!("test_{}.sst", id),
             })
         }
     }

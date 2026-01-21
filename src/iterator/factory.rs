@@ -34,9 +34,7 @@ pub fn create_iterator(
 ) -> Result<Box<dyn KvIterator>> {
     match file.file_type {
         DataFileType::SSTable => {
-            // Get the file path from the file handle
-            let file_path = format!("{}", file.file_handle.id);
-            let reader = fs.open_read(&file_path)?;
+            let reader = fs.open_read(&file.path)?;
             let iter = SSTIterator::new(reader, options.sst_options.clone())?;
             Ok(Box::new(iter))
         }
