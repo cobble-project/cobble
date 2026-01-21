@@ -1,6 +1,7 @@
 #![crate_type = "lib"]
 #![allow(dead_code)]
 
+mod compaction;
 mod data_file;
 mod error;
 mod file;

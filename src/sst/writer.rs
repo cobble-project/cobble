@@ -1,3 +1,4 @@
+use crate::compaction::FileBuilder;
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, SequentialWriteFile};
 use crate::sst::format::{BlockBuilder, Footer};
@@ -29,6 +30,7 @@ pub struct SSTWriter<W: SequentialWriteFile> {
     options: SSTWriterOptions,
     data_block_builder: BlockBuilder,
     index_block_builder: BlockBuilder,
+    first_key: Option<Vec<u8>>,
     last_key: Vec<u8>,
     current_block_first_key: Option<Vec<u8>>,
     pending_data_blocks: Vec<(Vec<u8>, u64, u64)>, // (first_key, offset, size)
@@ -45,6 +47,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             options,
             data_block_builder,
             index_block_builder,
+            first_key: None,
             last_key: Vec::new(),
             current_block_first_key: None,
             pending_data_blocks: Vec::new(),
@@ -60,6 +63,11 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
                 "Keys must be added in sorted order: {:?} <= {:?}",
                 key, self.last_key
             )));
+        }
+
+        // Track first key of the entire file
+        if self.first_key.is_none() {
+            self.first_key = Some(key.to_vec());
         }
 
         // If this is the first key in the block, remember it for the index
@@ -118,21 +126,25 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         Ok(())
     }
 
-    /// Finish writing the SST file
-    /// This writes the index block and footer
-    pub fn finish(mut self) -> Result<()> {
+    /// Finish writing the SST file and return (first_key, last_key).
+    /// This writes the index block and footer, and returns the key range.
+    fn finish_internal(mut self) -> Result<(Vec<u8>, Vec<u8>)> {
+        // Capture first/last keys before finishing
+        let first_key = self.first_key.clone().unwrap_or_default();
+        let last_key = self.last_key.clone();
+
         // Finish any pending data block
         if !self.data_block_builder.is_empty() {
-            let first_key = self.current_block_first_key.take().unwrap_or_default();
-            self.finish_data_block(first_key)?;
+            let block_first_key = self.current_block_first_key.take().unwrap_or_default();
+            self.finish_data_block(block_first_key)?;
         }
 
         // Build index block
-        for (first_key, offset, size) in &self.pending_data_blocks {
+        for (fk, offset, size) in &self.pending_data_blocks {
             let mut value = BytesMut::with_capacity(16);
             value.put_u64_le(*offset);
             value.put_u64_le(*size);
-            self.index_block_builder.add(first_key, &value);
+            self.index_block_builder.add(fk, &value);
         }
 
         let index_builder = std::mem::replace(
@@ -153,11 +165,61 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         self.writer.write(&footer_encoded)?;
 
         // Flush and close
-        self.writer.close()
+        self.writer.close()?;
+
+        Ok((first_key, last_key))
     }
 
+    /// Finish writing the SST file
+    /// This writes the index block and footer
+    pub fn finish(self) -> Result<()> {
+        self.finish_internal()?;
+        Ok(())
+    }
+
+    /// Finish writing the SST file and return (first_key, last_key).
+    /// This writes the index block and footer, and returns the key range.
+    pub fn finish_with_range(self) -> Result<(Vec<u8>, Vec<u8>)> {
+        self.finish_internal()
+    }
+
+    /// Returns the current offset (bytes written) in the file.
     pub fn offset(&self) -> usize {
         self.writer.offset()
+    }
+
+    /// Returns true if no keys have been added yet.
+    pub fn is_empty(&self) -> bool {
+        self.first_key.is_none()
+    }
+
+    /// Returns the first key added to this file, if any.
+    pub fn first_key(&self) -> Option<&[u8]> {
+        self.first_key.as_deref()
+    }
+
+    /// Returns the last key added to this file.
+    pub fn last_key(&self) -> &[u8] {
+        &self.last_key
+    }
+}
+
+/// Implement FileBuilder trait for SSTWriter to support compaction.
+impl<W: SequentialWriteFile + 'static> FileBuilder for SSTWriter<W> {
+    fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        SSTWriter::add(self, key, value)
+    }
+
+    fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>)> {
+        (*self).finish_with_range()
+    }
+
+    fn offset(&self) -> usize {
+        SSTWriter::offset(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        SSTWriter::is_empty(self)
     }
 }
 

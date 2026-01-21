@@ -62,3 +62,30 @@ pub(crate) trait KvIterator {
         }
     }
 }
+
+/// Implement KvIterator for Box<dyn KvIterator> to support dynamic dispatch.
+impl KvIterator for Box<dyn KvIterator> {
+    fn seek(&mut self, target: &[u8]) -> Result<()> {
+        (**self).seek(target)
+    }
+
+    fn seek_to_first(&mut self) -> Result<()> {
+        (**self).seek_to_first()
+    }
+
+    fn next(&mut self) -> Result<bool> {
+        (**self).next()
+    }
+
+    fn valid(&self) -> bool {
+        (**self).valid()
+    }
+
+    fn key(&self) -> Result<Option<Bytes>> {
+        (**self).key()
+    }
+
+    fn value(&self) -> Result<Option<Bytes>> {
+        (**self).value()
+    }
+}
