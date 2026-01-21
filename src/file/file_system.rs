@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use url::Url;
 
-pub trait FileSystem {
+pub trait FileSystem: Send + Sync {
     fn init(url: &Url) -> Result<Self>
     where
         Self: Sized;
