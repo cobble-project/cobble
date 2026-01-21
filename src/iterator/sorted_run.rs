@@ -225,16 +225,15 @@ where
 mod tests {
     use super::*;
     use crate::data_file::DataFileType;
-    use crate::file::FileHandle;
     use crate::iterator::mock_iterator::MockIterator;
 
     fn create_data_file(id: u64, start: &[u8], end: &[u8]) -> Arc<DataFile> {
         Arc::new(DataFile {
-            file_handle: FileHandle { id, size: 0 },
             file_type: DataFileType::SSTable,
             start_key: start.to_vec(),
             end_key: end.to_vec(),
-            path: format!("test_{}.sst", id),
+            file_id: id,
+            size: 0,
         })
     }
 
@@ -303,7 +302,7 @@ mod tests {
 
         // Create a mock iterator factory
         let create_iter = |file: &DataFile| -> Result<MockIterator> {
-            let entries = match file.file_handle.id {
+            let entries = match file.file_id {
                 1 => vec![(b"a".as_slice(), b"v1"), (b"b", b"v2"), (b"c", b"v3")],
                 2 => vec![(b"d".as_slice(), b"v4"), (b"e", b"v5"), (b"f", b"v6")],
                 _ => vec![],
@@ -340,7 +339,7 @@ mod tests {
         let run = SortedRun::new(files);
 
         let create_iter = |file: &DataFile| -> Result<MockIterator> {
-            let entries = match file.file_handle.id {
+            let entries = match file.file_id {
                 1 => vec![(b"a".as_slice(), b"v1"), (b"b", b"v2"), (b"c", b"v3")],
                 2 => vec![(b"d".as_slice(), b"v4"), (b"e", b"v5"), (b"f", b"v6")],
                 _ => vec![],

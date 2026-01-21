@@ -1,19 +1,11 @@
 use crate::error::Error;
 use bytes::{Bytes, BytesMut};
 
-pub struct FileHandle {
-    pub id: u64,
-    pub size: usize,
-}
-
 pub trait File {
     fn close(&mut self) -> Result<(), Error>;
-    fn get_handle(&self) -> &FileHandle;
 
     /// Get the size of the file in bytes
-    fn size(&self) -> usize {
-        self.get_handle().size
-    }
+    fn size(&self) -> usize;
 }
 
 pub trait RandomAccessFile: File {
@@ -30,8 +22,8 @@ impl File for Box<dyn RandomAccessFile> {
         (**self).close()
     }
 
-    fn get_handle(&self) -> &FileHandle {
-        (**self).get_handle()
+    fn size(&self) -> usize {
+        (**self).size()
     }
 }
 
@@ -48,8 +40,8 @@ impl File for Box<dyn SequentialWriteFile> {
         (**self).close()
     }
 
-    fn get_handle(&self) -> &FileHandle {
-        (**self).get_handle()
+    fn size(&self) -> usize {
+        (**self).size()
     }
 }
 

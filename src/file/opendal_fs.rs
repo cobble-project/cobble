@@ -1,5 +1,4 @@
 use crate::error::{Error, Result};
-use crate::file::FileHandle;
 use crate::file::file_system::FileSystem;
 use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::file::opendal_file::{OpendalRandomAccessFile, OpendalSequentialWriteFile};
@@ -92,10 +91,7 @@ impl FileSystem for OpendalFileSystem {
             let reader = self.op.reader(path).await;
             match reader {
                 Ok(r) => Ok(Box::new(OpendalRandomAccessFile {
-                    handle: FileHandle {
-                        id: 1,
-                        size: file_size,
-                    },
+                    size: file_size,
                     reader: r,
                     runtime: Arc::clone(&self.runtime),
                 }) as Box<dyn RandomAccessFile>),
@@ -112,10 +108,7 @@ impl FileSystem for OpendalFileSystem {
             let writer = self.op.writer(path).await;
             match writer {
                 Ok(w) => Ok(Box::new(OpendalSequentialWriteFile {
-                    handle: FileHandle {
-                        id: 1,
-                        size: 0, // New file starts at size 0
-                    },
+                    size: 0, // New file starts at size 0
                     writer: w,
                     runtime: Arc::clone(&self.runtime),
                 }) as Box<dyn SequentialWriteFile>),

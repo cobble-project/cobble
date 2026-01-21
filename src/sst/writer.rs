@@ -128,7 +128,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
 
     /// Finish writing the SST file and return (first_key, last_key).
     /// This writes the index block and footer, and returns the key range.
-    fn finish_internal(mut self) -> Result<(Vec<u8>, Vec<u8>)> {
+    fn finish_internal(mut self) -> Result<(Vec<u8>, Vec<u8>, usize)> {
         // Capture first/last keys before finishing
         let first_key = self.first_key.clone().unwrap_or_default();
         let last_key = self.last_key.clone();
@@ -164,10 +164,13 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         let footer_encoded = footer.encode();
         self.writer.write(&footer_encoded)?;
 
+        // Get final file size before closing
+        let file_size = self.writer.offset();
+
         // Flush and close
         self.writer.close()?;
 
-        Ok((first_key, last_key))
+        Ok((first_key, last_key, file_size))
     }
 
     /// Finish writing the SST file
@@ -177,9 +180,9 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         Ok(())
     }
 
-    /// Finish writing the SST file and return (first_key, last_key).
-    /// This writes the index block and footer, and returns the key range.
-    pub fn finish_with_range(self) -> Result<(Vec<u8>, Vec<u8>)> {
+    /// Finish writing the SST file and return (first_key, last_key, file_size).
+    /// This writes the index block and footer, and returns the key range and total file size.
+    pub fn finish_with_range(self) -> Result<(Vec<u8>, Vec<u8>, usize)> {
         self.finish_internal()
     }
 
@@ -210,7 +213,7 @@ impl<W: SequentialWriteFile + 'static> FileBuilder for SSTWriter<W> {
         SSTWriter::add(self, key, value)
     }
 
-    fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>)> {
+    fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>, usize)> {
         (*self).finish_with_range()
     }
 

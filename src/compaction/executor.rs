@@ -8,11 +8,10 @@
 use crate::compaction::{FileBuilder, FileBuilderFactory};
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
-use crate::file::{FileHandle, FileSystem};
+use crate::file::FileManager;
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
 use crate::sst::SSTIteratorOptions;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
 
 /// Options for the compaction executor.
@@ -44,14 +43,10 @@ impl Default for CompactionOptions {
 pub struct CompactionTask {
     /// The sorted runs to compact.
     sorted_runs: Vec<SortedRun>,
-    /// The file system to use for reading/writing files.
-    file_system: Arc<dyn FileSystem>,
-    /// The output directory path for new files.
-    output_path: String,
+    /// The file manager to use for reading/writing files.
+    file_manager: Arc<FileManager>,
     /// Factory function for creating FileBuilder instances.
     file_builder_factory: Arc<FileBuilderFactory>,
-    /// File extension for output files (e.g., "sst").
-    file_extension: String,
     /// The data file type for output files.
     data_file_type: DataFileType,
 }
@@ -61,25 +56,19 @@ impl CompactionTask {
     ///
     /// # Arguments
     /// * `sorted_runs` - The sorted runs to merge together
-    /// * `file_system` - The file system for reading input files and writing output files
-    /// * `output_path` - The directory path where new files will be written
+    /// * `file_manager` - The file manager for reading input files and writing output files
     /// * `file_builder_factory` - Factory function for creating FileBuilder instances
-    /// * `file_extension` - File extension for output files (e.g., "sst")
     /// * `data_file_type` - The data file type for output files
     pub fn new(
         sorted_runs: Vec<SortedRun>,
-        file_system: Arc<dyn FileSystem>,
-        output_path: String,
+        file_manager: Arc<FileManager>,
         file_builder_factory: Arc<FileBuilderFactory>,
-        file_extension: String,
         data_file_type: DataFileType,
     ) -> Self {
         Self {
             sorted_runs,
-            file_system,
-            output_path,
+            file_manager,
             file_builder_factory,
-            file_extension,
             data_file_type,
         }
     }
@@ -116,7 +105,6 @@ impl CompactionResult {
 pub struct CompactionExecutor {
     runtime: Option<Runtime>,
     options: CompactionOptions,
-    file_id_counter: AtomicU64,
 }
 
 impl CompactionExecutor {
@@ -131,7 +119,6 @@ impl CompactionExecutor {
         Ok(Self {
             runtime: Some(runtime),
             options,
-            file_id_counter: AtomicU64::new(0),
         })
     }
 
@@ -153,22 +140,12 @@ impl CompactionExecutor {
         Self {
             runtime: None,
             options,
-            file_id_counter: AtomicU64::new(0),
         }
     }
 
     /// Creates a new compaction executor with default options.
     pub fn with_defaults() -> Result<Self> {
         Self::new(CompactionOptions::default())
-    }
-
-    /// Sets the starting file ID counter.
-    pub fn set_file_id_counter(&self, start_id: u64) {
-        self.file_id_counter.store(start_id, Ordering::SeqCst);
-    }
-
-    fn next_file_id(&self) -> u64 {
-        self.file_id_counter.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Executes a compaction task asynchronously using the executor's internal runtime.
@@ -188,23 +165,18 @@ impl CompactionExecutor {
     ) -> tokio::task::JoinHandle<Result<CompactionResult>> {
         let runtime = self.runtime.as_ref().expect("Executor has no runtime.");
         let options = self.options.clone();
-        let file_id_counter = Arc::new(AtomicU64::new(
-            self.file_id_counter.fetch_add(1000, Ordering::SeqCst),
-        ));
 
-        runtime.spawn(async move { Self::run_compaction(task, options, file_id_counter) })
+        runtime.spawn(async move { Self::run_compaction(task, options) })
     }
 
     /// Executes a compaction task synchronously and blocks until completion.
     pub fn execute_blocking(&self, task: CompactionTask) -> Result<CompactionResult> {
-        let file_id_counter = Arc::new(AtomicU64::new(self.next_file_id()));
-        Self::run_compaction(task, self.options.clone(), file_id_counter)
+        Self::run_compaction(task, self.options.clone())
     }
 
     fn run_compaction(
         task: CompactionTask,
         options: CompactionOptions,
-        file_id_counter: Arc<AtomicU64>,
     ) -> Result<CompactionResult> {
         // Create iterators for all files in all sorted runs
         // We iterate files from all sorted runs, with earlier runs (newer data) coming first
@@ -216,8 +188,8 @@ impl CompactionExecutor {
         let mut all_iters: Vec<Box<dyn KvIterator>> = Vec::new();
         for run in &task.sorted_runs {
             for file in run.files() {
-                let reader = task.file_system.open_read(&file.path)?;
-                let iter = crate::sst::SSTIterator::new(reader, sst_options.clone())?;
+                let reader = task.file_manager.open_data_file_reader(file.file_id)?;
+                let iter = crate::sst::SSTIterator::new(Box::new(reader), sst_options.clone())?;
                 all_iters.push(Box::new(iter));
             }
         }
@@ -234,7 +206,7 @@ impl CompactionExecutor {
 
         // Process entries and write to output files using the FileBuilder trait
         let mut current_builder: Option<Box<dyn FileBuilder>> = None;
-        let mut current_file_info: Option<(String, u64)> = None; // (path, file_id)
+        let mut current_file_id: Option<u64> = None;
 
         while dedup_iter.valid() {
             let (key, value) = match dedup_iter.current()? {
@@ -244,11 +216,9 @@ impl CompactionExecutor {
 
             // Check if we need to start a new file
             if current_builder.is_none() {
-                let file_id = file_id_counter.fetch_add(1, Ordering::SeqCst);
-                let file_path = format!("{}/{}.{}", task.output_path, file_id, task.file_extension);
-                current_file_info = Some((file_path.clone(), file_id));
-                let writer = task.file_system.open_write(&file_path)?;
-                current_builder = Some((task.file_builder_factory)(writer));
+                let (file_id, writer) = task.file_manager.create_data_file()?;
+                current_file_id = Some(file_id);
+                current_builder = Some((task.file_builder_factory)(Box::new(writer)));
             }
 
             // Add entry to current file
@@ -257,19 +227,16 @@ impl CompactionExecutor {
 
                 // Check if we should close this file and start a new one
                 if builder.offset() >= options.target_file_size {
-                    let (file_path, file_id) = current_file_info.take().unwrap();
+                    let file_id = current_file_id.take().unwrap();
                     let builder = current_builder.take().unwrap();
-                    let (first_key, last_key) = builder.finish()?;
+                    let (first_key, last_key, file_size) = builder.finish()?;
 
                     output_files.push(Arc::new(DataFile {
-                        file_handle: FileHandle {
-                            id: file_id,
-                            size: 0, // Size will be determined by the file system
-                        },
                         file_type: task.data_file_type,
                         start_key: first_key,
                         end_key: last_key,
-                        path: file_path,
+                        file_id,
+                        size: file_size,
                     }));
                 }
             }
@@ -281,18 +248,15 @@ impl CompactionExecutor {
         if let Some(builder) = current_builder
             && !builder.is_empty()
         {
-            let (file_path, file_id) = current_file_info.take().unwrap();
-            let (first_key, last_key) = builder.finish()?;
+            let file_id = current_file_id.take().unwrap();
+            let (first_key, last_key, file_size) = builder.finish()?;
 
             output_files.push(Arc::new(DataFile {
-                file_handle: FileHandle {
-                    id: file_id,
-                    size: 0,
-                },
                 file_type: task.data_file_type,
                 start_key: first_key,
                 end_key: last_key,
-                path: file_path,
+                file_id,
+                size: file_size,
             }));
         }
 
@@ -303,7 +267,7 @@ impl CompactionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::FileSystemRegistry;
+    use crate::file::{FileManagerOptions, FileSystemRegistry};
     use crate::sst::row_codec::encode_value;
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::Value;
@@ -333,32 +297,24 @@ mod tests {
     }
 
     fn create_test_sst(
-        fs: &Arc<dyn FileSystem>,
-        filename: &str,
+        file_manager: &FileManager,
         entries: Vec<(&[u8], &[u8])>,
     ) -> Result<Arc<DataFile>> {
-        let writer_file = fs.open_write(filename)?;
+        let (file_id, writer_file) = file_manager.create_data_file()?;
         let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
 
-        let mut first_key = Vec::new();
-        let mut last_key = Vec::new();
-
         for (key, value) in entries {
-            if first_key.is_empty() {
-                first_key = key.to_vec();
-            }
-            last_key = key.to_vec();
             writer.add(key, value)?;
         }
 
-        writer.finish()?;
+        let (first_key, last_key, file_size) = writer.finish_with_range()?;
 
         Ok(Arc::new(DataFile {
-            file_handle: FileHandle { id: 0, size: 0 },
             file_type: DataFileType::SSTable,
             start_key: first_key,
             end_key: last_key,
-            path: filename.to_string(),
+            file_id,
+            size: file_size,
         }))
     }
 
@@ -373,12 +329,14 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
+        let file_manager =
+            Arc::new(FileManager::new(Arc::clone(&fs), FileManagerOptions::default()).unwrap());
+
         let num_columns = 1;
 
         // Create first SST file with entries a, c, e
         let file1 = create_test_sst(
-            &fs,
-            "input1.sst",
+            &file_manager,
             vec![
                 (b"a", &make_value_bytes(b"v1", num_columns)),
                 (b"c", &make_value_bytes(b"v3", num_columns)),
@@ -389,8 +347,7 @@ mod tests {
 
         // Create second SST file with entries b, d, f
         let file2 = create_test_sst(
-            &fs,
-            "input2.sst",
+            &file_manager,
             vec![
                 (b"b", &make_value_bytes(b"v2", num_columns)),
                 (b"d", &make_value_bytes(b"v4", num_columns)),
@@ -412,10 +369,8 @@ mod tests {
         // Create and execute compaction
         let task = CompactionTask::new(
             vec![run1, run2],
-            Arc::clone(&fs),
-            "output".to_string(),
+            Arc::clone(&file_manager),
             make_sst_builder_factory(options.clone()),
-            "sst".to_string(),
             DataFileType::SSTable,
         );
 
@@ -432,10 +387,14 @@ mod tests {
         assert_eq!(first_file.end_key, b"f");
 
         // Verify file exists and is readable
-        let reader = fs.open_read(&first_file.path).unwrap();
-        let mut iter =
-            crate::sst::SSTIterator::new(reader, crate::sst::SSTIteratorOptions::default())
-                .unwrap();
+        let reader = file_manager
+            .open_data_file_reader(first_file.file_id)
+            .unwrap();
+        let mut iter = crate::sst::SSTIterator::new(
+            Box::new(reader),
+            crate::sst::SSTIteratorOptions::default(),
+        )
+        .unwrap();
         iter.seek_to_first().unwrap();
 
         // Verify entries are merged and sorted
@@ -472,12 +431,14 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
+        let file_manager =
+            Arc::new(FileManager::new(Arc::clone(&fs), FileManagerOptions::default()).unwrap());
+
         let num_columns = 1;
 
         // Create first SST file (newer) with entries a, b
         let file1 = create_test_sst(
-            &fs,
-            "input1.sst",
+            &file_manager,
             vec![
                 (b"a", &make_value_bytes(b"new_a", num_columns)),
                 (b"b", &make_value_bytes(b"new_b", num_columns)),
@@ -487,8 +448,7 @@ mod tests {
 
         // Create second SST file (older) with entries a, b, c
         let file2 = create_test_sst(
-            &fs,
-            "input2.sst",
+            &file_manager,
             vec![
                 (b"a", &make_value_bytes(b"old_a", num_columns)),
                 (b"b", &make_value_bytes(b"old_b", num_columns)),
@@ -509,10 +469,8 @@ mod tests {
         // Create and execute compaction
         let task = CompactionTask::new(
             vec![run1, run2],
-            Arc::clone(&fs),
-            "output".to_string(),
+            Arc::clone(&file_manager),
             make_sst_builder_factory(options.clone()),
-            "sst".to_string(),
             DataFileType::SSTable,
         );
 
@@ -524,9 +482,11 @@ mod tests {
         assert_eq!(result.new_files().len(), 1);
 
         // Read and verify merged entries
-        let reader = fs.open_read(&result.new_files()[0].path).unwrap();
+        let reader = file_manager
+            .open_data_file_reader(result.new_files()[0].file_id)
+            .unwrap();
         let mut iter = crate::sst::SSTIterator::new(
-            reader,
+            Box::new(reader),
             crate::sst::SSTIteratorOptions {
                 num_columns,
                 ..Default::default()
@@ -573,6 +533,9 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
+        let file_manager =
+            Arc::new(FileManager::new(Arc::clone(&fs), FileManagerOptions::default()).unwrap());
+
         let num_columns = 1;
 
         // Create a large SST file
@@ -586,27 +549,20 @@ mod tests {
             ));
         }
 
-        let writer_file = fs.open_write("input.sst").unwrap();
+        let (file_id, writer_file) = file_manager.create_data_file().unwrap();
         let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
 
-        let mut first_key = Vec::new();
-        let mut last_key = Vec::new();
-
         for (key, value) in &entries {
-            if first_key.is_empty() {
-                first_key = key.clone();
-            }
-            last_key = key.clone();
             writer.add(key, value).unwrap();
         }
-        writer.finish().unwrap();
+        let (first_key, last_key, file_size) = writer.finish_with_range().unwrap();
 
         let file = Arc::new(DataFile {
-            file_handle: FileHandle { id: 0, size: 0 },
             file_type: DataFileType::SSTable,
             start_key: first_key,
             end_key: last_key,
-            path: "input.sst".to_string(),
+            file_id,
+            size: file_size,
         });
 
         let run = SortedRun::new(vec![file]);
@@ -620,10 +576,8 @@ mod tests {
         // Create compaction with very small target file size to force multiple output files
         let task = CompactionTask::new(
             vec![run],
-            Arc::clone(&fs),
-            "output".to_string(),
+            Arc::clone(&file_manager),
             make_sst_builder_factory(options.clone()),
-            "sst".to_string(),
             DataFileType::SSTable,
         );
 
@@ -658,15 +612,16 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
+        let file_manager =
+            Arc::new(FileManager::new(Arc::clone(&fs), FileManagerOptions::default()).unwrap());
+
         let options = CompactionOptions::default();
 
         // Create compaction with no sorted runs
         let task = CompactionTask::new(
             vec![],
-            Arc::clone(&fs),
-            "output".to_string(),
+            Arc::clone(&file_manager),
             make_sst_builder_factory(options),
-            "sst".to_string(),
             DataFileType::SSTable,
         );
 

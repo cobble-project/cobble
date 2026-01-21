@@ -18,11 +18,12 @@ pub trait FileBuilder {
     /// Keys must be added in sorted order.
     fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
 
-    /// Finishes building the file and returns (first_key, last_key).
+    /// Finishes building the file and returns (first_key, last_key, file_size).
     ///
     /// After calling this method, the builder is consumed and the file
-    /// is ready to be read.
-    fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>)>;
+    /// is ready to be read. The returned file_size is the total size of
+    /// the file including all headers, data, indexes, and footers.
+    fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>, usize)>;
 
     /// Returns the current offset (bytes written) in the file.
     fn offset(&self) -> usize;
