@@ -360,7 +360,7 @@ impl CompactionExecutor {
 
         // Process entries and write to output files
         let mut current_builder: Option<SSTFileBuilder<Box<dyn SequentialWriteFile>>> = None;
-        let mut current_file_path: Option<String> = None;
+        let mut current_file_info: Option<(String, u64)> = None; // (path, file_id)
 
         while dedup_iter.valid() {
             let (key, value) = match dedup_iter.current()? {
@@ -372,7 +372,7 @@ impl CompactionExecutor {
             if current_builder.is_none() {
                 let file_id = file_id_counter.fetch_add(1, Ordering::SeqCst);
                 let file_path = format!("{}/{}.sst", task.output_path, file_id);
-                current_file_path = Some(file_path.clone());
+                current_file_info = Some((file_path.clone(), file_id));
                 let writer = task.file_system.open_write(&file_path)?;
                 current_builder = Some(SSTFileBuilder::new(writer, options.clone()));
             }
@@ -383,11 +383,10 @@ impl CompactionExecutor {
 
                 // Check if we should close this file and start a new one
                 if builder.offset() >= options.target_file_size {
-                    let file_path = current_file_path.take().unwrap();
+                    let (file_path, file_id) = current_file_info.take().unwrap();
                     let builder = current_builder.take().unwrap();
                     let (first_key, last_key) = builder.finish()?;
 
-                    let file_id = file_id_counter.fetch_add(1, Ordering::SeqCst);
                     output_files.push(Arc::new(DataFile {
                         file_handle: FileHandle {
                             id: file_id,
@@ -408,10 +407,9 @@ impl CompactionExecutor {
         if let Some(builder) = current_builder
             && !builder.is_empty()
         {
-            let file_path = current_file_path.take().unwrap();
+            let (file_path, file_id) = current_file_info.take().unwrap();
             let (first_key, last_key) = builder.finish()?;
 
-            let file_id = file_id_counter.fetch_add(1, Ordering::SeqCst);
             output_files.push(Arc::new(DataFile {
                 file_handle: FileHandle {
                     id: file_id,
