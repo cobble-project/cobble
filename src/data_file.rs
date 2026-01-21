@@ -1,5 +1,6 @@
 use crate::file::FileHandle;
 
+#[derive(Clone, Copy)]
 pub(crate) enum DataFileType {
     SSTable,
 }

@@ -52,6 +52,8 @@ pub struct CompactionTask {
     file_builder_factory: Arc<FileBuilderFactory>,
     /// File extension for output files (e.g., "sst").
     file_extension: String,
+    /// The data file type for output files.
+    data_file_type: DataFileType,
 }
 
 impl CompactionTask {
@@ -63,12 +65,14 @@ impl CompactionTask {
     /// * `output_path` - The directory path where new files will be written
     /// * `file_builder_factory` - Factory function for creating FileBuilder instances
     /// * `file_extension` - File extension for output files (e.g., "sst")
+    /// * `data_file_type` - The data file type for output files
     pub fn new(
         sorted_runs: Vec<SortedRun>,
         file_system: Arc<dyn FileSystem>,
         output_path: String,
         file_builder_factory: Arc<FileBuilderFactory>,
         file_extension: String,
+        data_file_type: DataFileType,
     ) -> Self {
         Self {
             sorted_runs,
@@ -76,6 +80,7 @@ impl CompactionTask {
             output_path,
             file_builder_factory,
             file_extension,
+            data_file_type,
         }
     }
 
@@ -276,7 +281,7 @@ impl CompactionExecutor {
                             id: file_id,
                             size: 0, // Size will be determined by the file system
                         },
-                        file_type: DataFileType::SSTable,
+                        file_type: task.data_file_type,
                         start_key: first_key,
                         end_key: last_key,
                         path: file_path,
@@ -299,7 +304,7 @@ impl CompactionExecutor {
                     id: file_id,
                     size: 0,
                 },
-                file_type: DataFileType::SSTable,
+                file_type: task.data_file_type,
                 start_key: first_key,
                 end_key: last_key,
                 path: file_path,
@@ -426,6 +431,7 @@ mod tests {
             "output".to_string(),
             make_sst_builder_factory(options.clone()),
             "sst".to_string(),
+            DataFileType::SSTable,
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -522,6 +528,7 @@ mod tests {
             "output".to_string(),
             make_sst_builder_factory(options.clone()),
             "sst".to_string(),
+            DataFileType::SSTable,
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -632,6 +639,7 @@ mod tests {
             "output".to_string(),
             make_sst_builder_factory(options.clone()),
             "sst".to_string(),
+            DataFileType::SSTable,
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -674,6 +682,7 @@ mod tests {
             "output".to_string(),
             make_sst_builder_factory(options),
             "sst".to_string(),
+            DataFileType::SSTable,
         );
 
         let executor = CompactionExecutor::with_defaults().unwrap();
