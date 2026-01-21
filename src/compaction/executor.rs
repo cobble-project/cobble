@@ -229,8 +229,7 @@ impl CompactionExecutor {
                 if builder.offset() >= options.target_file_size {
                     let file_id = current_file_id.take().unwrap();
                     let builder = current_builder.take().unwrap();
-                    let file_size = builder.offset();
-                    let (first_key, last_key) = builder.finish()?;
+                    let (first_key, last_key, file_size) = builder.finish()?;
 
                     // Update the file size in the file manager
                     task.file_manager.update_data_file_size(file_id, file_size);
@@ -253,8 +252,7 @@ impl CompactionExecutor {
             && !builder.is_empty()
         {
             let file_id = current_file_id.take().unwrap();
-            let file_size = builder.offset();
-            let (first_key, last_key) = builder.finish()?;
+            let (first_key, last_key, file_size) = builder.finish()?;
 
             // Update the file size in the file manager
             task.file_manager.update_data_file_size(file_id, file_size);
@@ -311,19 +309,11 @@ mod tests {
         let (file_id, writer_file) = file_manager.create_data_file()?;
         let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
 
-        let mut first_key = Vec::new();
-        let mut last_key = Vec::new();
-
         for (key, value) in entries {
-            if first_key.is_empty() {
-                first_key = key.to_vec();
-            }
-            last_key = key.to_vec();
             writer.add(key, value)?;
         }
 
-        let file_size = writer.offset();
-        writer.finish()?;
+        let (first_key, last_key, file_size) = writer.finish_with_range()?;
 
         // Update the file size in the file manager
         file_manager.update_data_file_size(file_id, file_size);
@@ -569,18 +559,10 @@ mod tests {
         let (file_id, writer_file) = file_manager.create_data_file().unwrap();
         let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
 
-        let mut first_key = Vec::new();
-        let mut last_key = Vec::new();
-
         for (key, value) in &entries {
-            if first_key.is_empty() {
-                first_key = key.clone();
-            }
-            last_key = key.clone();
             writer.add(key, value).unwrap();
         }
-        let file_size = writer.offset();
-        writer.finish().unwrap();
+        let (first_key, last_key, file_size) = writer.finish_with_range().unwrap();
 
         // Update the file size in the file manager
         file_manager.update_data_file_size(file_id, file_size);
