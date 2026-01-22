@@ -154,7 +154,7 @@ mod test {
         assert!(fs.is_ok());
         let fs = fs.unwrap();
         assert!(!fs.exists("example").unwrap());
-        let data = b"Hello, Stella!";
+        let data = b"Hello, Cobble!";
         {
             let mut writer = fs.open_write("example").unwrap();
             let written = writer.write(data).unwrap();

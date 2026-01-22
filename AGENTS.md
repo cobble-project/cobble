@@ -1,4 +1,4 @@
-# Agent guidelines for stellakv project
+# Agent guidelines for cobble project
 
 This repository is a Rust + Cargo project implementing an LSM-style KV storage engine with SST (Sorted String Table) files.
 
