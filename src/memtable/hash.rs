@@ -1,0 +1,412 @@
+use bytes::{Buf, BufMut, Bytes};
+
+use crate::error::{Error, Result};
+use crate::iterator::KvIterator;
+use crate::memtable::Memtable;
+
+/// Hash-indexed memtable storing both entries and bucketed index inside one contiguous buffer.
+pub(crate) struct HashMemtable {
+    buffer: Vec<u8>,
+    data_end: usize,
+    index_cursor: usize,
+    bucket_base: usize,
+    bucket_count: usize,
+}
+
+pub(crate) struct MemtableValueIter<'a> {
+    mem: &'a HashMemtable,
+    key: Vec<u8>,
+    next_node: u32,
+    bucket: usize,
+}
+
+pub(crate) struct MemtableKvIterator<'a> {
+    mem: &'a HashMemtable,
+    keys: Vec<Vec<u8>>,
+    key_idx: usize,
+    current_values: Option<MemtableValueIter<'a>>,
+    current_key: Option<Bytes>,
+    current_value: Option<Bytes>,
+}
+
+impl HashMemtable {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        let bucket_count = Self::default_bucket_count(capacity);
+        Self::with_capacity_and_buckets(capacity, bucket_count)
+    }
+
+    fn with_capacity_and_buckets(capacity: usize, bucket_count: usize) -> Self {
+        let bucket_count = bucket_count.max(1);
+        let bucket_table_bytes = bucket_count * 4;
+        assert!(
+            capacity > bucket_table_bytes,
+            "capacity must exceed bucket table bytes"
+        );
+        let mut buffer = vec![0u8; capacity];
+        let bucket_base = capacity - bucket_table_bytes;
+        for chunk in buffer[bucket_base..].chunks_mut(4) {
+            chunk.copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        Self {
+            buffer,
+            data_end: 0,
+            index_cursor: bucket_base,
+            bucket_base,
+            bucket_count,
+        }
+    }
+
+    fn default_bucket_count(capacity: usize) -> usize {
+        let target = capacity / 128;
+        target.clamp(4, 1024)
+    }
+
+    fn hash_key(key: &[u8]) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut hash = FNV_OFFSET;
+        for &b in key {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    fn entry_size(key_len: usize, value_len: usize) -> usize {
+        4 + 4 + key_len + value_len
+    }
+
+    fn index_entry_size() -> usize {
+        8 + 4 + 4
+    }
+
+    fn has_space(&self, data_len: usize) -> Result<()> {
+        let need = data_len + Self::index_entry_size();
+        if self.data_end + need > self.index_cursor {
+            return Err(Error::MemtableFull {
+                needed: need,
+                remaining: self.index_cursor.saturating_sub(self.data_end),
+            });
+        }
+        Ok(())
+    }
+
+    fn write_data(&mut self, key: &[u8], value: &[u8]) -> usize {
+        let key_len = key.len() as u32;
+        let value_len = value.len() as u32;
+        let start = self.data_end;
+        let end = start + Self::entry_size(key.len(), value.len());
+        let mut slice = &mut self.buffer[start..end];
+        slice.put_u32(key_len);
+        slice.put_u32(value_len);
+        slice.put_slice(key);
+        slice.put_slice(value);
+        self.data_end = end;
+        start
+    }
+
+    fn bucket_head(&self, bucket: usize) -> u32 {
+        let pos = self.bucket_base + bucket * 4;
+        let mut slice = &self.buffer[pos..pos + 4];
+        slice.get_u32_le()
+    }
+
+    fn set_bucket_head(&mut self, bucket: usize, head: u32) {
+        let pos = self.bucket_base + bucket * 4;
+        let mut slice = &mut self.buffer[pos..pos + 4];
+        slice.put_u32_le(head);
+    }
+
+    fn write_index(&mut self, bucket: usize, hash: u64, key_offset: u32) -> u32 {
+        let entry_size = Self::index_entry_size();
+        let start = self.index_cursor - entry_size;
+        let head = self.bucket_head(bucket);
+        {
+            let mut slice = &mut self.buffer[start..self.index_cursor];
+            slice.put_u64(hash);
+            slice.put_u32(key_offset);
+            slice.put_u32(head);
+        }
+        self.index_cursor = start;
+        start as u32
+    }
+
+    fn bucket_index_from_hash(&self, hash: u64) -> usize {
+        (hash as usize) % self.bucket_count
+    }
+}
+
+impl Memtable for HashMemtable {
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let data_len = Self::entry_size(key.len(), value.len());
+        self.has_space(data_len)?;
+        let data_offset = self.write_data(key, value);
+        let hash = Self::hash_key(key);
+        let bucket = self.bucket_index_from_hash(hash);
+        let node_off = self.write_index(bucket, hash, data_offset as u32);
+        self.set_bucket_head(bucket, node_off);
+        Ok(())
+    }
+
+    fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        let hash = Self::hash_key(key);
+        let bucket = self.bucket_index_from_hash(hash);
+        let mut node_off = self.bucket_head(bucket);
+        while node_off != u32::MAX {
+            let start = node_off as usize;
+            if start + Self::index_entry_size() > self.buffer.len() {
+                break;
+            }
+            let mut node_slice = &self.buffer[start..start + Self::index_entry_size()];
+            let h = node_slice.get_u64();
+            let key_off = node_slice.get_u32() as usize;
+            let next = node_slice.get_u32();
+            if h == hash && key_off + 8 <= self.data_end {
+                let mut slice = &self.buffer[key_off..self.data_end];
+                let key_len = slice.get_u32() as usize;
+                let value_len = slice.get_u32() as usize;
+                if key_len + value_len <= slice.remaining() && slice[..key_len] == *key {
+                    let value_start = key_len;
+                    let value_end = value_start + value_len;
+                    return Some(&slice[value_start..value_end]);
+                }
+            }
+            node_off = next;
+        }
+        None
+    }
+
+    fn get_all(&self, key: &[u8]) -> MemtableValueIter<'_> {
+        let bucket = self.bucket_index_from_hash(Self::hash_key(key));
+        let head = self.bucket_head(bucket);
+        MemtableValueIter {
+            mem: self,
+            key: key.to_vec(),
+            next_node: head,
+            bucket,
+        }
+    }
+
+    fn remaining_capacity(&self) -> usize {
+        self.index_cursor.saturating_sub(self.data_end)
+    }
+
+    /// Returns an iterator over all key-value pairs ordered by key bytes ascending.
+    /// For duplicate keys, values are yielded in reverse insertion order (latest first).
+    fn iter(&self) -> MemtableKvIterator<'_> {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut offset = 0;
+        while offset < self.data_end {
+            if offset + 8 > self.data_end {
+                break;
+            }
+            let mut slice = &self.buffer[offset..self.data_end];
+            let key_len = slice.get_u32() as usize;
+            let value_len = slice.get_u32() as usize;
+            if key_len + value_len > slice.remaining() {
+                break;
+            }
+            let key_bytes = slice.copy_to_bytes(key_len);
+            if !keys.iter().any(|k| k.as_slice() == key_bytes.as_ref()) {
+                keys.push(key_bytes.to_vec());
+            }
+            offset += Self::entry_size(key_len, value_len);
+        }
+        keys.sort();
+        MemtableKvIterator {
+            mem: self,
+            keys,
+            key_idx: 0,
+            current_values: None,
+            current_key: None,
+            current_value: None,
+        }
+    }
+
+    type ValueIter<'a>
+        = MemtableValueIter<'a>
+    where
+        Self: 'a;
+
+    type KvIter<'a> = MemtableKvIterator<'a>;
+}
+
+impl<'a> Iterator for MemtableValueIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.next_node != u32::MAX {
+            let start = self.next_node as usize;
+            if start + HashMemtable::index_entry_size() > self.mem.buffer.len() {
+                self.next_node = u32::MAX;
+                return None;
+            }
+            let mut node_slice = &self.mem.buffer[start..start + HashMemtable::index_entry_size()];
+            let h = node_slice.get_u64();
+            let key_off = node_slice.get_u32() as usize;
+            let next = node_slice.get_u32();
+            self.next_node = next;
+            if h == HashMemtable::hash_key(&self.key) && key_off + 8 <= self.mem.data_end {
+                let mut slice = &self.mem.buffer[key_off..self.mem.data_end];
+                let key_len = slice.get_u32() as usize;
+                let value_len = slice.get_u32() as usize;
+                if key_len + value_len <= slice.remaining() && slice[..key_len] == self.key {
+                    let value_start = key_len;
+                    let value_end = value_start + value_len;
+                    return Some(&slice[value_start..value_end]);
+                }
+            }
+        }
+        None
+    }
+}
+
+impl KvIterator for MemtableKvIterator<'_> {
+    fn seek(&mut self, target: &[u8]) -> Result<()> {
+        match self.keys.binary_search_by(|k| k.as_slice().cmp(target)) {
+            Ok(idx) => self.key_idx = idx,
+            Err(idx) => self.key_idx = idx,
+        }
+        self.current_values = None;
+        self.current_key = None;
+        self.current_value = None;
+        Ok(())
+    }
+
+    fn seek_to_first(&mut self) -> Result<()> {
+        self.key_idx = 0;
+        self.current_values = None;
+        self.current_key = None;
+        self.current_value = None;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<bool> {
+        loop {
+            if let Some(ref mut vals) = self.current_values
+                && let Some(v) = vals.next()
+            {
+                let key_bytes = Bytes::copy_from_slice(self.keys[self.key_idx - 1].as_slice());
+                self.current_key = Some(key_bytes);
+                self.current_value = Some(Bytes::copy_from_slice(v));
+                return Ok(true);
+            }
+            if self.key_idx >= self.keys.len() {
+                self.current_key = None;
+                self.current_value = None;
+                return Ok(false);
+            }
+            let key = &self.keys[self.key_idx];
+            self.key_idx += 1;
+            let iter = self.mem.get_all(key);
+            self.current_values = Some(iter);
+            // continue loop to fetch first value for this key
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.current_key.is_some() && self.current_value.is_some()
+    }
+
+    fn key(&self) -> Result<Option<Bytes>> {
+        Ok(self.current_key.clone())
+    }
+
+    fn value(&self) -> Result<Option<Bytes>> {
+        Ok(self.current_value.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn put_and_get() {
+        let mut mem = HashMemtable::with_capacity(1024);
+        mem.put(b"key1", b"value1").unwrap();
+        mem.put(b"key2", b"value2").unwrap();
+
+        assert_eq!(mem.get(b"key1").unwrap(), b"value1");
+        assert_eq!(mem.get(b"key2").unwrap(), b"value2");
+        assert!(mem.get(b"missing").is_none());
+    }
+
+    #[test]
+    fn overwrite_updates_value() {
+        let mut mem = HashMemtable::with_capacity(1024);
+        mem.put(b"key", b"old").unwrap();
+        mem.put(b"key", b"new").unwrap();
+        assert_eq!(mem.get(b"key").unwrap(), b"new");
+    }
+
+    #[test]
+    fn capacity_enforced() {
+        let mut mem = HashMemtable::with_capacity(64);
+        mem.put(b"k1", b"v1").unwrap();
+        let err = mem.put(b"k2", b"value_too_long").unwrap_err();
+        match err {
+            Error::MemtableFull { .. } => {}
+            _ => panic!("unexpected error type"),
+        }
+    }
+
+    #[test]
+    fn remaining_capacity_updates() {
+        let mut mem = HashMemtable::with_capacity(100);
+        let before = mem.remaining_capacity();
+        mem.put(b"k", b"v").unwrap();
+        assert!(mem.remaining_capacity() < before);
+    }
+
+    #[test]
+    fn bucket_distribution_and_lookup() {
+        // Use small bucket count to force chaining.
+        let mut mem = HashMemtable::with_capacity_and_buckets(256, 4);
+        mem.put(b"key1", b"v1").unwrap();
+        mem.put(b"key2", b"v2").unwrap();
+        mem.put(b"key3", b"v3").unwrap();
+
+        assert_eq!(mem.get(b"key1").unwrap(), b"v1");
+        assert_eq!(mem.get(b"key2").unwrap(), b"v2");
+        assert_eq!(mem.get(b"key3").unwrap(), b"v3");
+    }
+
+    #[test]
+    fn get_all_returns_latest_first() {
+        let mut mem = HashMemtable::with_capacity(512);
+        mem.put(b"key", b"v1").unwrap();
+        mem.put(b"key", b"v2").unwrap();
+        mem.put(b"key", b"v3").unwrap();
+
+        let mut iter = mem.get_all(b"key");
+        assert_eq!(iter.next().unwrap(), b"v3");
+        assert_eq!(iter.next().unwrap(), b"v2");
+        assert_eq!(iter.next().unwrap(), b"v1");
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn kv_iterator_orders_keys_and_values() {
+        let mut mem = HashMemtable::with_capacity(1024);
+        mem.put(b"b", b"v1").unwrap();
+        mem.put(b"a", b"x1").unwrap();
+        mem.put(b"a", b"x2").unwrap();
+        mem.put(b"c", b"z1").unwrap();
+
+        let mut iter = mem.iter();
+        iter.seek_to_first().unwrap();
+        let mut collected = Vec::new();
+        while iter.next().unwrap() {
+            let (k, v) = (iter.key().unwrap().unwrap(), iter.value().unwrap().unwrap());
+            collected.push((k, v));
+        }
+        let expected = vec![
+            (Bytes::from("a"), Bytes::from("x2")),
+            (Bytes::from("a"), Bytes::from("x1")),
+            (Bytes::from("b"), Bytes::from("v1")),
+            (Bytes::from("c"), Bytes::from("z1")),
+        ];
+        assert_eq!(collected, expected);
+    }
+}

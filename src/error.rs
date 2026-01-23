@@ -7,6 +7,8 @@ pub enum Error {
     FileSystemError(String),
     #[error("IO error: {0}")]
     IoError(String),
+    #[error("Memtable full: needed {needed} bytes but only {remaining} remaining.")]
+    MemtableFull { needed: usize, remaining: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

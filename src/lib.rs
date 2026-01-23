@@ -7,5 +7,6 @@ mod error;
 mod file;
 mod iterator;
 mod lsm;
+mod memtable;
 mod sst;
 mod r#type;
