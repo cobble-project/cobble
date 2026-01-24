@@ -1,4 +1,9 @@
 use crate::data_file::DataFile;
+use crate::error::Result;
+use crate::file::FileManager;
+use crate::sst::row_codec::decode_value_masked;
+use crate::sst::{SSTIterator, SSTIteratorOptions};
+use crate::r#type::Value;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -143,6 +148,130 @@ impl LSMTree {
             .find(|l| l.ordinal == level)
             .map(|l| l.files.clone())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn get(
+        &self,
+        file_manager: &Arc<FileManager>,
+        encoded_key: &[u8],
+        num_columns: usize,
+        mut terminal_mask: Option<&mut [u8]>,
+    ) -> Result<Vec<Value>> {
+        let mut values = Vec::new();
+        let mask_size = num_columns.div_ceil(8);
+        let mut decode_mask = vec![0u8; mask_size.max(1)];
+        if num_columns == 1 {
+            decode_mask[0] = 0x01;
+            terminal_mask = None;
+        } else if let Some(ref cols) = terminal_mask {
+            for (idx, mask_byte) in cols.iter().enumerate().take(mask_size) {
+                decode_mask[idx] = !*mask_byte;
+            }
+            if mask_size > 0 {
+                let last_bits = (num_columns - 1) % 8 + 1;
+                let last_mask = (1u8 << last_bits) - 1;
+                decode_mask[mask_size - 1] &= last_mask;
+            }
+        } else {
+            for mask in decode_mask.iter_mut().take(mask_size) {
+                *mask = 0xFF;
+            }
+            if mask_size > 0 {
+                let last_bits = (num_columns - 1) % 8 + 1;
+                let last_mask = (1u8 << last_bits) - 1;
+                decode_mask[mask_size - 1] = last_mask;
+            }
+        }
+
+        for level in self.current_version.levels.iter() {
+            if level.tiered {
+                for file in level.files.iter().rev() {
+                    let reader = file_manager.open_data_file_reader(file.file_id)?;
+                    let mut iter = SSTIterator::new(
+                        Box::new(reader),
+                        SSTIteratorOptions {
+                            num_columns,
+                            ..SSTIteratorOptions::default()
+                        },
+                    )?;
+                    iter.seek(encoded_key)?;
+                    if iter.valid()
+                        && let Some(current_key) = iter.key()?
+                        && current_key.as_ref() == encoded_key
+                        && let Some(value_bytes) = iter.value()?
+                    {
+                        let value = decode_value_masked(
+                            &value_bytes,
+                            num_columns,
+                            &decode_mask,
+                            terminal_mask.as_deref_mut(),
+                        )?;
+                        let should_stop = num_columns > 1 && value.is_terminal();
+                        if let Some(ref mask) = terminal_mask {
+                            for (idx, mask_byte) in mask.iter().enumerate().take(mask_size) {
+                                decode_mask[idx] &= !*mask_byte;
+                            }
+                            if mask_size > 0 {
+                                let last_bits = (num_columns - 1) % 8 + 1;
+                                let last_mask = (1u8 << last_bits) - 1;
+                                decode_mask[mask_size - 1] &= last_mask;
+                            }
+                        }
+                        values.push(value);
+                        if should_stop {
+                            return Ok(values);
+                        }
+                    }
+                }
+            } else {
+                for file in level.files.iter() {
+                    if encoded_key < file.start_key.as_slice()
+                        || encoded_key > file.end_key.as_slice()
+                    {
+                        continue;
+                    }
+                    let reader = file_manager.open_data_file_reader(file.file_id)?;
+                    let mut iter = SSTIterator::new(
+                        Box::new(reader),
+                        SSTIteratorOptions {
+                            num_columns,
+                            ..SSTIteratorOptions::default()
+                        },
+                    )?;
+                    iter.seek(encoded_key)?;
+                    if iter.valid()
+                        && let Some(current_key) = iter.key()?
+                        && current_key.as_ref() == encoded_key
+                        && let Some(value_bytes) = iter.value()?
+                    {
+                        let value = decode_value_masked(
+                            &value_bytes,
+                            num_columns,
+                            &decode_mask,
+                            terminal_mask.as_deref_mut(),
+                        )?;
+                        let should_stop = num_columns > 1 && value.is_terminal();
+                        if let Some(ref mask) = terminal_mask {
+                            for (idx, mask_byte) in mask.iter().enumerate().take(mask_size) {
+                                decode_mask[idx] &= !*mask_byte;
+                            }
+                            if mask_size > 0 {
+                                let last_bits = (num_columns - 1) % 8 + 1;
+                                let last_mask = (1u8 << last_bits) - 1;
+                                decode_mask[mask_size - 1] &= last_mask;
+                            }
+                        }
+                        values.push(value);
+                        if should_stop {
+                            return Ok(values);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        Ok(values)
     }
 }
 

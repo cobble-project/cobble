@@ -246,6 +246,119 @@ pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Value> {
     Ok(Value::new(columns))
 }
 
+/// Decodes a Value but only materializes columns requested by `decode_columns`.
+/// Columns not requested are skipped and returned as None, while their value types
+/// can still update `terminal_columns` if provided.
+pub(crate) fn decode_value_masked(
+    data: &[u8],
+    num_columns: usize,
+    decode_mask: &[u8],
+    mut terminal_mask: Option<&mut [u8]>,
+) -> Result<Value> {
+    let mask_size = bitmap_size(num_columns).max(1);
+    if decode_mask.len() < mask_size {
+        return Err(Error::IoError(format!(
+            "decode_mask length {} is less than required {}",
+            decode_mask.len(),
+            mask_size
+        )));
+    }
+
+    let bmp_size = bitmap_size(num_columns);
+    if data.len() < bmp_size {
+        return Err(Error::IoError(format!(
+            "Value data too small: expected at least {} bytes for bitmap, got {}",
+            bmp_size,
+            data.len()
+        )));
+    }
+
+    let bitmap = &data[..bmp_size];
+    let mut buf = &data[bmp_size..];
+    let mut last_present_idx = None;
+    if num_columns == 1 {
+        last_present_idx = Some(0);
+    } else if bmp_size > 0 {
+        let last_byte_bits = (num_columns - 1) % 8 + 1;
+        let last_byte_mask = (1u8 << last_byte_bits) - 1;
+        for byte_idx in (0..bmp_size).rev() {
+            let mut byte = bitmap[byte_idx];
+            if byte_idx == bmp_size - 1 {
+                byte &= last_byte_mask;
+            }
+            if byte == 0 {
+                continue;
+            }
+            let leading = byte.leading_zeros() as usize;
+            let bit = 7 - leading;
+            last_present_idx = Some(byte_idx * 8 + bit);
+            break;
+        }
+    }
+
+    let mut columns = Vec::with_capacity(num_columns);
+    for i in 0..num_columns {
+        let is_presence = if num_columns == 1 {
+            true
+        } else {
+            (bitmap[i / 8] >> (i % 8)) & 1 == 1
+        };
+        if is_presence {
+            let is_last = Some(i) == last_present_idx;
+            if buf.remaining() < 1 {
+                return Err(Error::IoError(format!(
+                    "Column {} data corrupted: not enough bytes for value_type",
+                    i
+                )));
+            }
+            let value_type = decode_value_type(buf.get_u8())?;
+            if let Some(ref mut mask) = terminal_mask
+                && matches!(value_type, ValueType::Put | ValueType::Delete)
+                && let Some(byte) = mask.get_mut(i / 8)
+            {
+                *byte |= 1 << (i % 8);
+            }
+            if is_last {
+                if decode_mask[i / 8] & (1 << (i % 8)) != 0 {
+                    let col_data = buf.to_vec();
+                    buf = &buf[buf.len()..];
+                    columns.push(Some(Column::new(value_type, col_data)));
+                } else {
+                    buf = &buf[buf.len()..];
+                    columns.push(None);
+                }
+            } else {
+                if buf.remaining() < 4 {
+                    return Err(Error::IoError(format!(
+                        "Column {} data corrupted: not enough bytes for length",
+                        i
+                    )));
+                }
+                let data_len = buf.get_u32_le() as usize;
+                if buf.remaining() < data_len {
+                    return Err(Error::IoError(format!(
+                        "Column {} data corrupted: expected {} bytes, got {}",
+                        i,
+                        data_len,
+                        buf.remaining()
+                    )));
+                }
+                if decode_mask[i / 8] & (1 << (i % 8)) != 0 {
+                    let col_data = buf[..data_len].to_vec();
+                    columns.push(Some(Column::new(value_type, col_data)));
+                } else {
+                    columns.push(None);
+                }
+                buf = &buf[data_len..];
+            }
+        } else {
+            columns.push(None);
+        }
+    }
+
+    Ok(Value::new(columns))
+}
+
 /// Returns the encoded size of a Value in bytes.
 ///
 /// Note: The last present column saves 4 bytes by omitting data_len.

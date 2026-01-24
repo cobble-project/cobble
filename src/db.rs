@@ -1,14 +1,14 @@
-use std::sync::{Arc, Mutex};
-
 use crate::Config;
 use crate::error::{Error, Result};
 use crate::file::{FileManager, FileSystemRegistry};
 use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::sst::SSTWriterOptions;
-use crate::sst::row_codec::{encode_key, encode_value};
+use crate::sst::row_codec::{decode_value, encode_key, encode_value};
 use crate::r#type::{Column, Key, Value, ValueType};
 use crate::write_batch::{WriteBatch, WriteOp};
+use bytes::Bytes;
+use std::sync::{Arc, Mutex};
 
 /// Public database interface.
 pub struct Db {
@@ -93,10 +93,351 @@ impl Db {
     pub fn close(&self) -> Result<()> {
         self.memtable_manager.close()
     }
+
+    /// Lookup a key across the memtable and LSM levels.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
+        let lookup_key = Key::new(0, key.to_vec());
+        let encoded_key = encode_key(&lookup_key);
+
+        let mut values: Vec<Value> = Vec::new();
+        self.memtable_manager.get_all(encoded_key.as_ref(), |raw| {
+            values.push(decode_value(raw, self.num_columns)?);
+            Ok(())
+        })?;
+        let mut terminal_mask = if self.num_columns == 1 {
+            None
+        } else {
+            let mask_size = self.num_columns.div_ceil(8).max(1);
+            let mut mask = vec![0u8; mask_size];
+            for value in &values {
+                let value_mask = value.terminal_mask();
+                for (idx, byte) in value_mask.iter().enumerate().take(mask_size) {
+                    mask[idx] |= *byte;
+                }
+            }
+            Some(mask)
+        };
+        let mut should_stop =
+            self.num_columns > 1 && values.last().is_some_and(|value| value.is_terminal());
+        let lsm_values = self.lsm_tree.lock().unwrap().get(
+            &self.file_manager,
+            encoded_key.as_ref(),
+            self.num_columns,
+            terminal_mask.as_deref_mut(),
+        )?;
+        for value in lsm_values {
+            if should_stop {
+                break;
+            }
+            if self.num_columns > 1 {
+                should_stop = value.is_terminal();
+            }
+            values.push(value);
+        }
+
+        if values.is_empty() {
+            return Ok(None);
+        }
+        let mut iter = values.into_iter().rev();
+        let mut merged = iter.next().expect("values not empty");
+        for newer in iter {
+            merged = merged.merge(newer);
+        }
+        Ok(Some(
+            merged
+                .columns
+                .into_iter()
+                .map(|col_opt| {
+                    col_opt.and_then(|col| match col.value_type() {
+                        ValueType::Put | ValueType::Merge => Some(Bytes::from(col)),
+                        ValueType::Delete => None,
+                    })
+                })
+                .collect(),
+        ))
+    }
 }
 
 impl Drop for Db {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn cleanup_test_root(path: &str) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_write_batch_triggers_flush() {
+        let root = "/tmp/db_write_batch_flush";
+        cleanup_test_root(root);
+        let config = Config {
+            path: format!("file://{}", root),
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 1,
+        };
+        let db = Db::open(config).unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, vec![b'a'; 64]);
+        batch.put(b"k2", 0, vec![b'b'; 64]);
+        db.write_batch(batch).unwrap();
+
+        let results = db.memtable_manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        assert_eq!(db.lsm_tree.lock().unwrap().level_files(0).len(), 1);
+
+        db.memtable_manager.flush_active().unwrap();
+        let results = db.memtable_manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        assert_eq!(db.lsm_tree.lock().unwrap().level_files(0).len(), 2);
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_write_batch_put_coalesces_with_flush() {
+        let root = "/tmp/db_write_batch_put";
+        cleanup_test_root(root);
+        let config = Config {
+            path: format!("file://{}", root),
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 1,
+        };
+        let db = Db::open(config).unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, b"old".to_vec());
+        batch.put(b"k1", 0, b"new".to_vec());
+        batch.put(b"k2", 0, vec![b'x'; 64]);
+        db.write_batch(batch).unwrap();
+
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let value = db.get(b"k1").unwrap().expect("value present");
+        let col = value[0].as_ref().unwrap();
+        assert_eq!(col.as_ref(), b"new");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_get_prefers_newer_l0_file() {
+        let root = "/tmp/db_get_newer_l0";
+        cleanup_test_root(root);
+        let config = Config {
+            path: format!("file://{}", root),
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 1,
+        };
+        let db = Db::open(config).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, b"old".to_vec());
+        batch.put(b"k2", 0, vec![b'a'; 64]);
+        db.write_batch(batch).unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, b"new".to_vec());
+        batch.put(b"k3", 0, vec![b'b'; 64]);
+        db.write_batch(batch).unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let value = db.get(b"k1").unwrap().expect("value present");
+        let col = value[0].as_ref().unwrap();
+        assert_eq!(col.as_ref(), b"new");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_get_merges_across_l0_files() {
+        let root = "/tmp/db_get_merge_l0";
+        cleanup_test_root(root);
+        let config = Config {
+            path: format!("file://{}", root),
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 1,
+        };
+        let db = Db::open(config).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, b"base".to_vec());
+        batch.put(b"k2", 0, vec![b'a'; 64]);
+        db.write_batch(batch).unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let mut batch = WriteBatch::new();
+        batch.merge(b"k1", 0, b"_x".to_vec());
+        batch.put(b"k3", 0, vec![b'b'; 64]);
+        db.write_batch(batch).unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let value = db.get(b"k1").unwrap().expect("value present");
+        let col = value[0].as_ref().unwrap();
+        assert_eq!(col.as_ref(), b"base_x");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_get_memtable_overlaps_l0_value() {
+        let root = "/tmp/db_get_memtable_overlaps_l0";
+        cleanup_test_root(root);
+        let config = Config {
+            path: format!("file://{}", root),
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 1,
+        };
+        let db = Db::open(config).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, b"old".to_vec());
+        batch.put(b"k2", 0, vec![b'a'; 64]);
+        db.write_batch(batch).unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, b"new".to_vec());
+        db.write_batch(batch).unwrap();
+
+        let value = db.get(b"k1").unwrap().expect("value present");
+        let col = value[0].as_ref().unwrap();
+        assert_eq!(col.as_ref(), b"new");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_get_memtable_merges_with_l0_value() {
+        let root = "/tmp/db_get_memtable_merge_l0";
+        cleanup_test_root(root);
+        let config = Config {
+            path: format!("file://{}", root),
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 1,
+        };
+        let db = Db::open(config).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, b"base".to_vec());
+        batch.put(b"k2", 0, vec![b'a'; 64]);
+        db.write_batch(batch).unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let mut batch = WriteBatch::new();
+        batch.merge(b"k1", 0, b"_x".to_vec());
+        db.write_batch(batch).unwrap();
+
+        let value = db.get(b"k1").unwrap().expect("value present");
+        let col = value[0].as_ref().unwrap();
+        assert_eq!(col.as_ref(), b"base_x");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_multi_column_overrides_column_only() {
+        let root = "/tmp/db_multi_column_override";
+        cleanup_test_root(root);
+        let config = Config {
+            path: format!("file://{}", root),
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 2,
+        };
+        let db = Db::open(config).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, b"c0-old".to_vec());
+        batch.put(b"k1", 1, b"c1-old".to_vec());
+        batch.put(b"k2", 0, vec![b'a'; 64]);
+        db.write_batch(batch).unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 1, b"c1-new".to_vec());
+        db.write_batch(batch).unwrap();
+
+        let value = db.get(b"k1").unwrap().expect("value present");
+        let col0 = value[0].as_ref().unwrap();
+        let col1 = value[1].as_ref().unwrap();
+        assert_eq!(col0.as_ref(), b"c0-old");
+        assert_eq!(col1.as_ref(), b"c1-new");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_multi_column_merge_across_l0() {
+        let root = "/tmp/db_multi_column_merge_l0";
+        cleanup_test_root(root);
+        let config = Config {
+            path: format!("file://{}", root),
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 2,
+        };
+        let db = Db::open(config).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, b"c0".to_vec());
+        batch.put(b"k1", 1, b"c1".to_vec());
+        batch.put(b"k2", 0, vec![b'a'; 64]);
+        db.write_batch(batch).unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let mut batch = WriteBatch::new();
+        batch.merge(b"k1", 1, b"_x".to_vec());
+        batch.put(b"k3", 0, vec![b'b'; 64]);
+        db.write_batch(batch).unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let value = db.get(b"k1").unwrap().expect("value present");
+        let col0 = value[0].as_ref().unwrap();
+        let col1 = value[1].as_ref().unwrap();
+        assert_eq!(col0.as_ref(), b"c0");
+        assert_eq!(col1.as_ref(), b"c1_x");
+
+        cleanup_test_root(root);
     }
 }

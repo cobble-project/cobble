@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 pub(crate) struct Key {
     /// Logical namespace / group identifier.
     /// Used to partition the keyspace (e.g., different logical groups or column families).
@@ -23,7 +25,7 @@ pub(crate) enum ValueType {
 #[derive(Clone)]
 pub(crate) struct Column {
     /// Write semantics of this column (Put/Delete/Merge).
-    value_type: ValueType,
+    pub(crate) value_type: ValueType,
 
     /// Raw column bytes.
     data: Vec<u8>,
@@ -32,7 +34,7 @@ pub(crate) struct Column {
 pub(crate) struct Value {
     /// A value may consist of multiple logical columns/fields.
     /// Each column is optional and may be absent within a value.
-    columns: Vec<Option<Column>>,
+    pub(crate) columns: Vec<Option<Column>>,
 }
 
 impl Key {
@@ -92,6 +94,12 @@ impl Column {
     }
 }
 
+impl From<Column> for Bytes {
+    fn from(value: Column) -> Self {
+        Bytes::from(value.data)
+    }
+}
+
 impl Value {
     /// Creates a new `Value` from a list of optional columns.
     pub(crate) fn new(columns: Vec<Option<Column>>) -> Self {
@@ -101,6 +109,30 @@ impl Value {
     /// Returns the optional columns.
     pub(crate) fn columns(&self) -> &[Option<Column>] {
         &self.columns
+    }
+
+    /// Checks if all columns are terminal (Put or Delete).
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.columns.iter().all(|col| {
+            matches!(
+                col.as_ref().map(|c| c.value_type()),
+                Some(ValueType::Put | ValueType::Delete)
+            )
+        })
+    }
+
+    pub(crate) fn terminal_mask(&self) -> Vec<u8> {
+        let mask_size = self.columns.len().div_ceil(8).max(1);
+        let mut mask = vec![0u8; mask_size];
+        for (idx, col) in self.columns.iter().enumerate() {
+            if matches!(
+                col.as_ref().map(|c| c.value_type()),
+                Some(ValueType::Put | ValueType::Delete)
+            ) {
+                mask[idx / 8] |= 1 << (idx % 8);
+            }
+        }
+        mask
     }
 
     /// Merges this value with a newer value, consuming both.

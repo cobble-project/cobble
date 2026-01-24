@@ -185,6 +185,24 @@ impl MemtableManager {
         }
     }
 
+    /// Gets all values associated with the given key.
+    /// The provided closure `f` is called for each value. This allows
+    /// processing values without returning byte copy.
+    pub(crate) fn get_all<F>(&self, key: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let mut state = self.state.lock().unwrap();
+        while state.active.is_none() {
+            state = self.buffer_ready.wait(state).unwrap();
+        }
+        let active = state.active.as_ref().expect("active memtable exists");
+        for value in active.get_all(key) {
+            f(value)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn flush_active(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         while state.active.is_none() {
