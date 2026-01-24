@@ -100,7 +100,7 @@ impl Db {
         let encoded_key = encode_key(&lookup_key);
 
         let mut values: Vec<Value> = Vec::new();
-        self.memtable_manager.get_all(encoded_key.as_ref(), |raw| {
+        let memtable_min_seq = self.memtable_manager.get_all(encoded_key.as_ref(), |raw| {
             values.push(decode_value(raw, self.num_columns)?);
             Ok(())
         })?;
@@ -124,6 +124,7 @@ impl Db {
             encoded_key.as_ref(),
             self.num_columns,
             terminal_mask.as_deref_mut(),
+            memtable_min_seq,
         )?;
         for value in lsm_values {
             if should_stop {

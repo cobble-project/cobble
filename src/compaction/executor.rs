@@ -194,6 +194,14 @@ impl CompactionExecutor {
             }
         }
 
+        let max_seq = task
+            .sorted_runs
+            .iter()
+            .flat_map(|run| run.files().iter())
+            .map(|file| file.seq)
+            .max()
+            .unwrap_or(0);
+
         // Create merging iterator
         let merging_iter = MergingIterator::new(all_iters);
 
@@ -236,6 +244,7 @@ impl CompactionExecutor {
                         start_key: first_key,
                         end_key: last_key,
                         file_id,
+                        seq: max_seq,
                         size: file_size,
                     }));
                 }
@@ -256,6 +265,7 @@ impl CompactionExecutor {
                 start_key: first_key,
                 end_key: last_key,
                 file_id,
+                seq: max_seq,
                 size: file_size,
             }));
         }
@@ -314,6 +324,7 @@ mod tests {
             start_key: first_key,
             end_key: last_key,
             file_id,
+            seq: 0,
             size: file_size,
         }))
     }
@@ -562,6 +573,7 @@ mod tests {
             start_key: first_key,
             end_key: last_key,
             file_id,
+            seq: 0,
             size: file_size,
         });
 

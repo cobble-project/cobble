@@ -233,6 +233,7 @@ mod tests {
             start_key: start.to_vec(),
             end_key: end.to_vec(),
             file_id: id,
+            seq: 0,
             size: 0,
         })
     }

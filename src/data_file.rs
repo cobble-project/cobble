@@ -11,6 +11,8 @@ pub(crate) struct DataFile {
     pub(crate) end_key: Vec<u8>,
     /// Unique file identifier assigned by the FileManager.
     pub(crate) file_id: FileId,
+    /// Maximum sequence id for data contained in this file.
+    pub(crate) seq: u64,
     /// Size of the file in bytes.
     pub(crate) size: usize,
 }

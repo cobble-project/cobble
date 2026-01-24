@@ -156,6 +156,7 @@ impl LSMTree {
         encoded_key: &[u8],
         num_columns: usize,
         mut terminal_mask: Option<&mut [u8]>,
+        max_seq: Option<u64>,
     ) -> Result<Vec<Value>> {
         let mut values = Vec::new();
         let mask_size = num_columns.div_ceil(8);
@@ -186,6 +187,11 @@ impl LSMTree {
         for level in self.current_version.levels.iter() {
             if level.tiered {
                 for file in level.files.iter().rev() {
+                    if let Some(max_seq) = max_seq
+                        && file.seq >= max_seq
+                    {
+                        continue;
+                    }
                     let reader = file_manager.open_data_file_reader(file.file_id)?;
                     let mut iter = SSTIterator::new(
                         Box::new(reader),
@@ -279,6 +285,10 @@ impl LSMTree {
 mod tests {
     use super::*;
     use crate::data_file::DataFileType;
+    use crate::file::{FileManager, FileSystemRegistry};
+    use crate::sst::row_codec::{encode_key, encode_value};
+    use crate::sst::{SSTWriter, SSTWriterOptions};
+    use crate::r#type::{Column, Key, Value, ValueType};
 
     static mut FILE_ID_COUNTER: u64 = 0;
 
@@ -291,9 +301,47 @@ mod tests {
                 start_key: start.to_vec(),
                 end_key: end.to_vec(),
                 file_id: id,
+                seq: 0,
                 size: 0, // Test file, size doesn't matter
             })
         }
+    }
+
+    fn cleanup_test_root(path: &str) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn create_test_sst(
+        file_manager: &FileManager,
+        seq: u64,
+        entries: Vec<(&[u8], &[u8])>,
+    ) -> Result<Arc<DataFile>> {
+        let (file_id, writer_file) = file_manager.create_data_file()?;
+        let mut writer = SSTWriter::new(
+            writer_file,
+            SSTWriterOptions {
+                num_columns: 1,
+                ..SSTWriterOptions::default()
+            },
+        );
+        for (key, value) in entries {
+            let encoded_key = encode_key(&Key::new(0, key.to_vec()));
+            writer.add(encoded_key.as_ref(), value)?;
+        }
+        let (first_key, last_key, file_size) = writer.finish_with_range()?;
+        Ok(Arc::new(DataFile {
+            file_type: DataFileType::SSTable,
+            start_key: first_key,
+            end_key: last_key,
+            file_id,
+            seq,
+            size: file_size,
+        }))
+    }
+
+    fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {
+        let value = Value::new(vec![Some(Column::new(ValueType::Put, data.to_vec()))]);
+        encode_value(&value, num_columns).to_vec()
     }
 
     #[test]
@@ -354,5 +402,96 @@ mod tests {
         assert_eq!(level1.files[0].start_key, b"d1");
         assert_eq!(level1.files[1].start_key, b"e");
         assert_eq!(level1.files[2].start_key, b"g");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_lsm_get_respects_max_seq() {
+        let root = "/tmp/lsm_get_max_seq";
+        cleanup_test_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
+        let num_columns = 1;
+        let older = create_test_sst(
+            &file_manager,
+            1,
+            vec![(b"k1", &make_value_bytes(b"old", num_columns))],
+        )
+        .unwrap();
+        let newer = create_test_sst(
+            &file_manager,
+            3,
+            vec![(b"k1", &make_value_bytes(b"new", num_columns))],
+        )
+        .unwrap();
+        let lsm_tree = LSMTree {
+            current_version: Arc::new(LSMTreeVersion {
+                levels: vec![Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: vec![older, newer],
+                }],
+            }),
+            ..Default::default()
+        };
+        let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));
+        let value = lsm_tree
+            .get(
+                &file_manager,
+                encoded_key.as_ref(),
+                num_columns,
+                None,
+                Some(2),
+            )
+            .unwrap();
+        assert_eq!(value.len(), 1);
+        assert_eq!(value[0].columns()[0].as_ref().unwrap().data(), b"old");
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_lsm_get_without_max_seq() {
+        let root = "/tmp/lsm_get_no_max_seq";
+        cleanup_test_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
+        let num_columns = 1;
+        let older = create_test_sst(
+            &file_manager,
+            1,
+            vec![(b"k1", &make_value_bytes(b"old", num_columns))],
+        )
+        .unwrap();
+        let newer = create_test_sst(
+            &file_manager,
+            3,
+            vec![(b"k1", &make_value_bytes(b"new", num_columns))],
+        )
+        .unwrap();
+        let lsm_tree = LSMTree {
+            current_version: Arc::new(LSMTreeVersion {
+                levels: vec![Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: vec![older, newer],
+                }],
+            }),
+            ..Default::default()
+        };
+        let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));
+        let value = lsm_tree
+            .get(&file_manager, encoded_key.as_ref(), num_columns, None, None)
+            .unwrap();
+        assert_eq!(value.len(), 2);
+        assert_eq!(value[0].columns()[0].as_ref().unwrap().data(), b"new");
+        assert_eq!(value[1].columns()[0].as_ref().unwrap().data(), b"old");
+        cleanup_test_root(root);
     }
 }

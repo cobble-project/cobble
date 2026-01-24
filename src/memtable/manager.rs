@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::data_file::{DataFile, DataFileType};
@@ -15,6 +16,7 @@ use tokio::sync::mpsc;
 
 pub(crate) struct MemtableFlushResult {
     pub(crate) data_file: Arc<DataFile>,
+    pub(crate) seq: u64,
 }
 
 pub(crate) struct MemtableManagerOptions {
@@ -49,15 +51,28 @@ pub(crate) struct MemtableManager {
 }
 
 struct MemtableManagerState {
-    active: Option<HashMemtable>,
+    active: Option<ActiveMemtable>,
+    immutables: VecDeque<ImmutableMemtable>,
     free_buffers: Vec<Vec<u8>>,
     in_flight: usize,
+    next_seq: u64,
     #[cfg(test)]
     flush_results: Vec<Result<MemtableFlushResult>>,
 }
 
 struct FlushJob {
+    seq: u64,
+    memtable: Arc<HashMemtable>,
+}
+
+struct ActiveMemtable {
+    seq: u64,
     memtable: HashMemtable,
+}
+
+struct ImmutableMemtable {
+    seq: u64,
+    memtable: Arc<HashMemtable>,
 }
 
 impl MemtableManager {
@@ -78,9 +93,14 @@ impl MemtableManager {
         let active_buffer = buffers.pop().expect("buffer_count > 0");
         let active = HashMemtable::with_buffer(active_buffer);
         let state = MemtableManagerState {
-            active: Some(active),
+            active: Some(ActiveMemtable {
+                seq: 0,
+                memtable: active,
+            }),
+            immutables: VecDeque::new(),
             free_buffers: buffers,
             in_flight: 0,
+            next_seq: 1,
             #[cfg(test)]
             flush_results: Vec::new(),
         };
@@ -106,37 +126,40 @@ impl MemtableManager {
             while let Some(job) = flush_rx.recv().await {
                 let file_manager = Arc::clone(&file_manager_clone);
                 let file_builder_factory = Arc::clone(&file_builder_factory_clone);
-                let (result, buffer) = tokio::task::spawn_blocking(move || {
+                let handle = tokio::task::spawn_blocking(move || {
                     flush_memtable(
+                        job.seq,
                         job.memtable,
                         file_manager,
                         file_builder_factory,
                         num_columns,
                     )
-                })
-                .await
-                .unwrap_or_else(|err| {
-                    (
-                        Err(Error::IoError(format!("Flush task failed: {}", err))),
-                        Vec::new(),
-                    )
                 });
+                let (result, memtable, completed_seq) = match handle.await {
+                    Ok(result) => result,
+                    Err(err) => (
+                        Err(Error::IoError(format!("Flush task failed: {}", err))),
+                        Arc::new(HashMemtable::with_buffer(vec![0u8; 8])),
+                        job.seq,
+                    ),
+                };
                 let mut state = state_clone.lock().unwrap();
-                if !buffer.is_empty() && state.active.is_none() {
-                    state.active = Some(HashMemtable::with_buffer(buffer));
-                } else if !buffer.is_empty() {
-                    state.free_buffers.push(buffer);
-                }
                 state.in_flight = state.in_flight.saturating_sub(1);
+                let mut reclaim_buffer = false;
                 match result {
                     Ok(Some(res)) => {
                         if let Ok(mut tree) = lsm_tree_clone.lock() {
                             tree.add_level0_files(vec![Arc::clone(&res.data_file)]);
                         }
+                        state.immutables.retain(|entry| entry.seq != res.seq);
+                        reclaim_buffer = true;
                         #[cfg(test)]
                         state.flush_results.push(Ok(res));
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        state.immutables.retain(|entry| entry.seq != completed_seq);
+                        reclaim_buffer = true;
+                    }
                     Err(err) => {
                         #[cfg(test)]
                         state.flush_results.push(Err(err));
@@ -145,6 +168,16 @@ impl MemtableManager {
                             let _ = err;
                         }
                     }
+                }
+                if reclaim_buffer {
+                    let buffer = match Arc::try_unwrap(memtable) {
+                        Ok(memtable) => memtable.into_buffer(),
+                        Err(_) => Vec::new(),
+                    };
+                    if !buffer.is_empty() {
+                        state.free_buffers.push(buffer);
+                    }
+                    Self::make_active_buffer(&mut state);
                 }
                 buffer_ready_clone.notify_all();
             }
@@ -161,6 +194,20 @@ impl MemtableManager {
         })
     }
 
+    /// Makes an active memtable from a free buffer if none exists.
+    /// Assumes the caller holds the lock on the state.
+    fn make_active_buffer(state: &mut MemtableManagerState) {
+        if state.active.is_none() && !state.free_buffers.is_empty() {
+            let buffer = state.free_buffers.pop().expect("free buffer exists");
+            let seq = state.next_seq;
+            state.next_seq += 1;
+            state.active = Some(ActiveMemtable {
+                seq,
+                memtable: HashMemtable::with_buffer(buffer),
+            });
+        }
+    }
+
     pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         loop {
             let mut state = self.state.lock().unwrap();
@@ -168,17 +215,22 @@ impl MemtableManager {
                 state = self.buffer_ready.wait(state).unwrap();
             }
             let active = state.active.as_mut().expect("active memtable exists");
-            match active.put(key, value) {
+            match active.memtable.put(key, value) {
                 Ok(()) => return Ok(()),
                 Err(Error::MemtableFull { needed, remaining }) => {
-                    if active.is_empty() {
+                    if active.memtable.is_empty() {
                         return Err(Error::MemtableFull { needed, remaining });
                     }
-                    let memtable = state.active.take().expect("active memtable exists");
-                    state.active = state.free_buffers.pop().map(HashMemtable::with_buffer);
+                    let active_memtable = state.active.take().expect("active memtable exists");
+                    let sealed = Arc::new(active_memtable.memtable);
+                    state.immutables.push_back(ImmutableMemtable {
+                        seq: active_memtable.seq,
+                        memtable: Arc::clone(&sealed),
+                    });
+                    Self::make_active_buffer(&mut state);
                     state.in_flight += 1;
                     drop(state);
-                    self.spawn_flush(memtable);
+                    self.spawn_flush(active_memtable.seq, sealed);
                 }
                 Err(err) => return Err(err),
             }
@@ -188,7 +240,9 @@ impl MemtableManager {
     /// Gets all values associated with the given key.
     /// The provided closure `f` is called for each value. This allows
     /// processing values without returning byte copy.
-    pub(crate) fn get_all<F>(&self, key: &[u8], mut f: F) -> Result<()>
+    ///
+    /// Returns the minimum sequence number among the memtables searched.
+    pub(crate) fn get_all<F>(&self, key: &[u8], mut f: F) -> Result<Option<u64>>
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
@@ -196,11 +250,20 @@ impl MemtableManager {
         while state.active.is_none() {
             state = self.buffer_ready.wait(state).unwrap();
         }
+        let mut min_seq = state.active.as_ref().map(|entry| entry.seq).unwrap_or(0);
+        if let Some(front) = state.immutables.front() {
+            min_seq = min_seq.min(front.seq);
+        }
         let active = state.active.as_ref().expect("active memtable exists");
-        for value in active.get_all(key) {
+        for value in active.memtable.get_all(key) {
             f(value)?;
         }
-        Ok(())
+        for immutable in state.immutables.iter().rev() {
+            for value in immutable.memtable.get_all(key) {
+                f(value)?;
+            }
+        }
+        Ok(Some(min_seq))
     }
 
     pub(crate) fn flush_active(&self) -> Result<()> {
@@ -211,15 +274,20 @@ impl MemtableManager {
         let should_flush = state
             .active
             .as_ref()
-            .is_some_and(|memtable| !memtable.is_empty());
+            .is_some_and(|memtable| !memtable.memtable.is_empty());
         if !should_flush {
             return Ok(());
         }
-        let memtable = state.active.take().expect("active memtable exists");
-        state.active = state.free_buffers.pop().map(HashMemtable::with_buffer);
+        let active_memtable = state.active.take().expect("active memtable exists");
+        let sealed = Arc::new(active_memtable.memtable);
+        state.immutables.push_back(ImmutableMemtable {
+            seq: active_memtable.seq,
+            memtable: Arc::clone(&sealed),
+        });
+        Self::make_active_buffer(&mut state);
         state.in_flight += 1;
         drop(state);
-        self.spawn_flush(memtable);
+        self.spawn_flush(active_memtable.seq, sealed);
         Ok(())
     }
 
@@ -251,16 +319,13 @@ impl MemtableManager {
         Ok(())
     }
 
-    fn spawn_flush(&self, memtable: HashMemtable) {
+    fn spawn_flush(&self, seq: u64, memtable: Arc<HashMemtable>) {
         let sender = self.flush_tx.lock().unwrap();
         if let Some(sender) = sender.as_ref()
-            && sender.send(FlushJob { memtable }).is_err()
+            && sender.send(FlushJob { seq, memtable }).is_err()
         {
             let mut state = self.state.lock().unwrap();
-            if state.active.is_none() && !state.free_buffers.is_empty() {
-                let buffer = state.free_buffers.pop().expect("free buffer exists");
-                state.active = Some(HashMemtable::with_buffer(buffer));
-            }
+            Self::make_active_buffer(&mut state);
             state.in_flight = state.in_flight.saturating_sub(1);
             #[cfg(test)]
             state
@@ -269,10 +334,7 @@ impl MemtableManager {
             self.buffer_ready.notify_all();
         } else if sender.is_none() {
             let mut state = self.state.lock().unwrap();
-            if state.active.is_none() && !state.free_buffers.is_empty() {
-                let buffer = state.free_buffers.pop().expect("free buffer exists");
-                state.active = Some(HashMemtable::with_buffer(buffer));
-            }
+            Self::make_active_buffer(&mut state);
             state.in_flight = state.in_flight.saturating_sub(1);
             #[cfg(test)]
             state
@@ -290,11 +352,12 @@ impl Drop for MemtableManager {
 }
 
 fn flush_memtable(
-    memtable: HashMemtable,
+    seq: u64,
+    memtable: Arc<HashMemtable>,
     file_manager: Arc<FileManager>,
     file_builder_factory: Arc<FileBuilderFactory>,
     num_columns: usize,
-) -> (Result<Option<MemtableFlushResult>>, Vec<u8>) {
+) -> (Result<Option<MemtableFlushResult>>, Arc<HashMemtable>, u64) {
     let result = (|| {
         if memtable.is_empty() {
             return Ok(None);
@@ -317,13 +380,14 @@ fn flush_memtable(
             end_key,
             file_id,
             size: file_size,
+            seq,
         };
         Ok(Some(MemtableFlushResult {
             data_file: Arc::new(data_file),
+            seq,
         }))
     })();
-    let buffer = memtable.into_buffer();
-    (result, buffer)
+    (result, memtable, seq)
 }
 
 struct PrimedIterator<I: KvIterator> {
@@ -435,6 +499,7 @@ mod tests {
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().seq, 0);
         let data_file = results[0].as_ref().unwrap().data_file.clone();
         let level0_files = lsm_tree.lock().unwrap().level_files(0);
         assert_eq!(level0_files.len(), 1);
