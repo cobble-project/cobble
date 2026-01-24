@@ -1,11 +1,12 @@
-use crate::compaction::FileBuilder;
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, SequentialWriteFile};
+use crate::format::FileBuilder;
 use crate::sst::format::{BlockBuilder, Footer};
 use crate::sst::row_codec::{encode_key, encode_value};
 use crate::r#type::{Key, Value};
 use bytes::{BufMut, BytesMut};
 
+#[derive(Clone)]
 pub struct SSTWriterOptions {
     pub block_size: usize,
     pub buffer_size: usize,

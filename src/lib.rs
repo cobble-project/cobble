@@ -7,6 +7,7 @@ mod data_file;
 mod db;
 mod error;
 mod file;
+mod format;
 mod iterator;
 mod lsm;
 mod memtable;

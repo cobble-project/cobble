@@ -35,6 +35,26 @@ impl HashMemtable {
         Self::with_capacity_and_buckets(capacity, bucket_count)
     }
 
+    pub(crate) fn with_buffer(mut buffer: Vec<u8>) -> Self {
+        let capacity = buffer.len();
+        let bucket_count = Self::default_bucket_count(capacity);
+        let bucket_count = bucket_count.max(1);
+        let bucket_table_bytes = bucket_count * 4;
+        assert!(
+            capacity > bucket_table_bytes,
+            "capacity must exceed bucket table bytes"
+        );
+        let bucket_base = capacity - bucket_table_bytes;
+        Self::init_bucket_table(&mut buffer, bucket_base);
+        Self {
+            buffer,
+            data_end: 0,
+            index_cursor: bucket_base,
+            bucket_base,
+            bucket_count,
+        }
+    }
+
     fn with_capacity_and_buckets(capacity: usize, bucket_count: usize) -> Self {
         let bucket_count = bucket_count.max(1);
         let bucket_table_bytes = bucket_count * 4;
@@ -44,9 +64,7 @@ impl HashMemtable {
         );
         let mut buffer = vec![0u8; capacity];
         let bucket_base = capacity - bucket_table_bytes;
-        for chunk in buffer[bucket_base..].chunks_mut(4) {
-            chunk.copy_from_slice(&u32::MAX.to_le_bytes());
-        }
+        Self::init_bucket_table(&mut buffer, bucket_base);
         Self {
             buffer,
             data_end: 0,
@@ -59,6 +77,12 @@ impl HashMemtable {
     fn default_bucket_count(capacity: usize) -> usize {
         let target = capacity / 128;
         target.clamp(4, 1024)
+    }
+
+    fn init_bucket_table(buffer: &mut [u8], bucket_base: usize) {
+        for chunk in buffer[bucket_base..].chunks_mut(4) {
+            chunk.copy_from_slice(&u32::MAX.to_le_bytes());
+        }
     }
 
     fn hash_key(key: &[u8]) -> u64 {
@@ -133,6 +157,14 @@ impl HashMemtable {
 
     fn bucket_index_from_hash(&self, hash: u64) -> usize {
         (hash as usize) % self.bucket_count
+    }
+
+    pub(crate) fn into_buffer(self) -> Vec<u8> {
+        self.buffer
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.data_end == 0
     }
 }
 

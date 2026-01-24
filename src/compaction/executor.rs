@@ -5,10 +5,10 @@
 //! - `CompactionResult`: Output of a compaction operation
 //! - `CompactionExecutor`: Manages compaction execution in a thread pool
 
-use crate::compaction::{FileBuilder, FileBuilderFactory};
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
 use crate::file::FileManager;
+use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
 use crate::sst::SSTIteratorOptions;
 use std::sync::Arc;
