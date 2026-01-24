@@ -29,14 +29,14 @@ pub(crate) struct LSMTree {
 
 #[derive(Clone)]
 pub(crate) struct LevelEdit {
-    level: u8,
-    removed_files: Vec<Arc<DataFile>>,
-    new_files: Vec<Arc<DataFile>>,
+    pub(crate) level: u8,
+    pub(crate) removed_files: Vec<Arc<DataFile>>,
+    pub(crate) new_files: Vec<Arc<DataFile>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct VersionEdit {
-    level_edits: Vec<LevelEdit>,
+    pub(crate) level_edits: Vec<LevelEdit>,
 }
 
 impl Default for LSMTree {

@@ -10,6 +10,7 @@ use crate::error::Result;
 use crate::file::FileManager;
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
+use crate::lsm::{LevelEdit, VersionEdit};
 use crate::sst::SSTIteratorOptions;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -43,6 +44,7 @@ impl Default for CompactionOptions {
 pub struct CompactionTask {
     /// The sorted runs to compact.
     sorted_runs: Vec<SortedRun>,
+    output_level: u8,
     /// The file manager to use for reading/writing files.
     file_manager: Arc<FileManager>,
     /// Factory function for creating FileBuilder instances.
@@ -61,12 +63,14 @@ impl CompactionTask {
     /// * `data_file_type` - The data file type for output files
     pub fn new(
         sorted_runs: Vec<SortedRun>,
+        output_level: u8,
         file_manager: Arc<FileManager>,
         file_builder_factory: Arc<FileBuilderFactory>,
         data_file_type: DataFileType,
     ) -> Self {
         Self {
             sorted_runs,
+            output_level,
             file_manager,
             file_builder_factory,
             data_file_type,
@@ -77,6 +81,10 @@ impl CompactionTask {
     pub fn sorted_runs(&self) -> &[SortedRun] {
         &self.sorted_runs
     }
+
+    pub fn output_level(&self) -> u8 {
+        self.output_level
+    }
 }
 
 /// The result of a compaction operation.
@@ -84,18 +92,23 @@ pub struct CompactionResult {
     /// New files created by the compaction.
     /// Files are sorted by their key ranges (first key of each file is sorted).
     new_files: Vec<Arc<DataFile>>,
+    edit: VersionEdit,
 }
 
 impl CompactionResult {
     /// Creates a new compaction result.
-    pub fn new(new_files: Vec<Arc<DataFile>>) -> Self {
-        Self { new_files }
+    pub fn new(new_files: Vec<Arc<DataFile>>, edit: VersionEdit) -> Self {
+        Self { new_files, edit }
     }
 
     /// Returns the new files created by compaction.
     /// Files are sorted by their key ranges.
     pub fn new_files(&self) -> &[Arc<DataFile>] {
         &self.new_files
+    }
+
+    pub fn edit(&self) -> &VersionEdit {
+        &self.edit
     }
 }
 
@@ -162,16 +175,31 @@ impl CompactionExecutor {
     pub fn execute(
         &self,
         task: CompactionTask,
+        on_complete: Option<Arc<dyn Fn(VersionEdit) + Send + Sync>>,
     ) -> tokio::task::JoinHandle<Result<CompactionResult>> {
         let runtime = self.runtime.as_ref().expect("Executor has no runtime.");
         let options = self.options.clone();
 
-        runtime.spawn(async move { Self::run_compaction(task, options) })
+        runtime.spawn(async move {
+            let result = Self::run_compaction(task, options)?;
+            if let Some(callback) = on_complete {
+                callback(result.edit.clone());
+            }
+            Ok(result)
+        })
     }
 
     /// Executes a compaction task synchronously and blocks until completion.
-    pub fn execute_blocking(&self, task: CompactionTask) -> Result<CompactionResult> {
-        Self::run_compaction(task, self.options.clone())
+    pub fn execute_blocking(
+        &self,
+        task: CompactionTask,
+        on_complete: Option<Arc<dyn Fn(VersionEdit) + Send + Sync>>,
+    ) -> Result<CompactionResult> {
+        let result = Self::run_compaction(task, self.options.clone())?;
+        if let Some(callback) = on_complete {
+            callback(result.edit.clone());
+        }
+        Ok(result)
     }
 
     fn run_compaction(
@@ -270,7 +298,30 @@ impl CompactionExecutor {
             }));
         }
 
-        Ok(CompactionResult::new(output_files))
+        // Create version edits
+        let mut level_edits: std::collections::BTreeMap<u8, LevelEdit> =
+            std::collections::BTreeMap::new();
+        for run in &task.sorted_runs {
+            let entry = level_edits.entry(run.level()).or_insert_with(|| LevelEdit {
+                level: run.level(),
+                removed_files: Vec::new(),
+                new_files: Vec::new(),
+            });
+            entry.removed_files.extend(run.files().iter().cloned());
+        }
+        let entry = level_edits
+            .entry(task.output_level)
+            .or_insert_with(|| LevelEdit {
+                level: task.output_level,
+                removed_files: Vec::new(),
+                new_files: Vec::new(),
+            });
+        entry.new_files = output_files.clone();
+
+        let edit = VersionEdit {
+            level_edits: level_edits.into_values().collect(),
+        };
+        Ok(CompactionResult::new(output_files, edit))
     }
 }
 
@@ -368,8 +419,8 @@ mod tests {
         .unwrap();
 
         // Create sorted runs
-        let run1 = SortedRun::new(vec![file1]);
-        let run2 = SortedRun::new(vec![file2]);
+        let run1 = SortedRun::new(0, vec![file1]);
+        let run2 = SortedRun::new(1, vec![file2]);
 
         let options = CompactionOptions {
             num_columns,
@@ -380,6 +431,7 @@ mod tests {
         // Create and execute compaction
         let task = CompactionTask::new(
             vec![run1, run2],
+            1,
             Arc::clone(&file_manager),
             make_sst_builder_factory(options.clone()),
             DataFileType::SSTable,
@@ -387,7 +439,15 @@ mod tests {
 
         let executor = CompactionExecutor::new(options).unwrap();
 
-        let result = executor.execute_blocking(task).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+        assert_eq!(result.edit().level_edits.len(), 2);
+        assert!(
+            result
+                .edit()
+                .level_edits
+                .iter()
+                .any(|edit| edit.new_files.len() == 1)
+        );
 
         // Verify output
         assert!(!result.new_files().is_empty());
@@ -469,8 +529,8 @@ mod tests {
         .unwrap();
 
         // Create sorted runs (first run is newer)
-        let run1 = SortedRun::new(vec![file1]);
-        let run2 = SortedRun::new(vec![file2]);
+        let run1 = SortedRun::new(0, vec![file1]);
+        let run2 = SortedRun::new(0, vec![file2]);
 
         let options = CompactionOptions {
             num_columns,
@@ -480,6 +540,7 @@ mod tests {
         // Create and execute compaction
         let task = CompactionTask::new(
             vec![run1, run2],
+            1,
             Arc::clone(&file_manager),
             make_sst_builder_factory(options.clone()),
             DataFileType::SSTable,
@@ -487,7 +548,15 @@ mod tests {
 
         let executor = CompactionExecutor::new(options).unwrap();
 
-        let result = executor.execute_blocking(task).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+        assert_eq!(result.edit().level_edits.len(), 2);
+        assert!(
+            result
+                .edit()
+                .level_edits
+                .iter()
+                .any(|edit| edit.new_files.len() == 1)
+        );
 
         // Verify output
         assert_eq!(result.new_files().len(), 1);
@@ -577,7 +646,7 @@ mod tests {
             size: file_size,
         });
 
-        let run = SortedRun::new(vec![file]);
+        let run = SortedRun::new(0, vec![file]);
 
         let options = CompactionOptions {
             num_columns,
@@ -588,6 +657,7 @@ mod tests {
         // Create compaction with very small target file size to force multiple output files
         let task = CompactionTask::new(
             vec![run],
+            1,
             Arc::clone(&file_manager),
             make_sst_builder_factory(options.clone()),
             DataFileType::SSTable,
@@ -595,7 +665,15 @@ mod tests {
 
         let executor = CompactionExecutor::new(options).unwrap();
 
-        let result = executor.execute_blocking(task).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+        assert_eq!(result.edit().level_edits.len(), 2);
+        assert!(
+            result
+                .edit()
+                .level_edits
+                .iter()
+                .any(|edit| edit.new_files.len() > 1)
+        );
 
         // Should have multiple output files
         assert!(result.new_files().len() > 1);
@@ -632,13 +710,16 @@ mod tests {
         // Create compaction with no sorted runs
         let task = CompactionTask::new(
             vec![],
+            1,
             Arc::clone(&file_manager),
             make_sst_builder_factory(options),
             DataFileType::SSTable,
         );
 
         let executor = CompactionExecutor::with_defaults().unwrap();
-        let result = executor.execute_blocking(task).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+        assert_eq!(result.edit().level_edits.len(), 1);
+        assert!(result.edit().level_edits[0].new_files.is_empty());
 
         // Should have no output files
         assert!(result.new_files().is_empty());

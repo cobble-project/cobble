@@ -10,13 +10,14 @@ use std::sync::Arc;
 pub struct SortedRun {
     /// The data files in this sorted run, ordered by their key ranges.
     files: Vec<Arc<DataFile>>,
+    level: u8,
 }
 
 impl SortedRun {
     /// Create a new SortedRun from a list of data files.
     /// The files should already be sorted by their key ranges.
-    pub fn new(files: Vec<Arc<DataFile>>) -> Self {
-        Self { files }
+    pub fn new(level: u8, files: Vec<Arc<DataFile>>) -> Self {
+        Self { files, level }
     }
 
     /// Get the number of files in this sorted run.
@@ -32,6 +33,10 @@ impl SortedRun {
     /// Get the files in this sorted run.
     pub fn files(&self) -> &[Arc<DataFile>] {
         &self.files
+    }
+
+    pub fn level(&self) -> u8 {
+        self.level
     }
 
     /// Get the start key of this sorted run (the smallest key).
@@ -246,7 +251,7 @@ mod tests {
             create_data_file(3, b"g", b"i"),
         ];
 
-        let run = SortedRun::new(files);
+        let run = SortedRun::new(1, files);
         assert_eq!(run.len(), 3);
         assert!(!run.is_empty());
         assert_eq!(run.start_key(), Some(b"a".as_slice()));
@@ -255,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_sorted_run_empty() {
-        let run = SortedRun::new(vec![]);
+        let run = SortedRun::new(1, vec![]);
         assert_eq!(run.len(), 0);
         assert!(run.is_empty());
         assert_eq!(run.start_key(), None);
@@ -270,7 +275,7 @@ mod tests {
             create_data_file(3, b"g", b"i"),
         ];
 
-        let run = SortedRun::new(files);
+        let run = SortedRun::new(1, files);
 
         // Target in first file
         assert_eq!(run.find_file(b"b"), Some(0));
@@ -299,7 +304,7 @@ mod tests {
             create_data_file(2, b"d", b"f"),
         ];
 
-        let run = SortedRun::new(files);
+        let run = SortedRun::new(1, files);
 
         // Create a mock iterator factory
         let create_iter = |file: &DataFile| -> Result<MockIterator> {
@@ -337,7 +342,7 @@ mod tests {
             create_data_file(2, b"d", b"f"),
         ];
 
-        let run = SortedRun::new(files);
+        let run = SortedRun::new(1, files);
 
         let create_iter = |file: &DataFile| -> Result<MockIterator> {
             let entries = match file.file_id {
