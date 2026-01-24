@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::file::FileManager;
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator};
+use crate::lsm::LSMTree;
 use crate::memtable::Memtable;
 use crate::memtable::hash::HashMemtable;
 use crate::sst::{SSTWriter, SSTWriterOptions};
@@ -42,6 +43,7 @@ pub(crate) struct MemtableManager {
     file_manager: Arc<FileManager>,
     file_builder_factory: Arc<FileBuilderFactory>,
     num_columns: usize,
+    lsm_tree: Arc<Mutex<LSMTree>>,
     flush_tx: Mutex<Option<mpsc::UnboundedSender<FlushJob>>>,
     runtime: Mutex<Option<Runtime>>,
 }
@@ -50,6 +52,7 @@ struct MemtableManagerState {
     active: Option<HashMemtable>,
     free_buffers: Vec<Vec<u8>>,
     in_flight: usize,
+    #[cfg(test)]
     flush_results: Vec<Result<MemtableFlushResult>>,
 }
 
@@ -60,6 +63,7 @@ struct FlushJob {
 impl MemtableManager {
     pub(crate) fn new(
         file_manager: Arc<FileManager>,
+        lsm_tree: Arc<Mutex<LSMTree>>,
         options: MemtableManagerOptions,
     ) -> Result<Self> {
         if options.buffer_count == 0 {
@@ -77,6 +81,7 @@ impl MemtableManager {
             active: Some(active),
             free_buffers: buffers,
             in_flight: 0,
+            #[cfg(test)]
             flush_results: Vec::new(),
         };
         let state = Arc::new(Mutex::new(state));
@@ -96,6 +101,7 @@ impl MemtableManager {
         let file_manager_clone = Arc::clone(&file_manager);
         let file_builder_factory_clone = Arc::clone(&file_builder_factory);
         let num_columns = options.num_columns;
+        let lsm_tree_clone = Arc::clone(&lsm_tree);
         runtime.spawn(async move {
             while let Some(job) = flush_rx.recv().await {
                 let file_manager = Arc::clone(&file_manager_clone);
@@ -123,9 +129,22 @@ impl MemtableManager {
                 }
                 state.in_flight = state.in_flight.saturating_sub(1);
                 match result {
-                    Ok(Some(res)) => state.flush_results.push(Ok(res)),
+                    Ok(Some(res)) => {
+                        if let Ok(mut tree) = lsm_tree_clone.lock() {
+                            tree.add_level0_files(vec![Arc::clone(&res.data_file)]);
+                        }
+                        #[cfg(test)]
+                        state.flush_results.push(Ok(res));
+                    }
                     Ok(None) => {}
-                    Err(err) => state.flush_results.push(Err(err)),
+                    Err(err) => {
+                        #[cfg(test)]
+                        state.flush_results.push(Err(err));
+                        #[cfg(not(test))]
+                        {
+                            let _ = err;
+                        }
+                    }
                 }
                 buffer_ready_clone.notify_all();
             }
@@ -136,6 +155,7 @@ impl MemtableManager {
             file_manager,
             file_builder_factory,
             num_columns: options.num_columns,
+            lsm_tree,
             flush_tx: Mutex::new(Some(flush_tx)),
             runtime: Mutex::new(Some(runtime)),
         })
@@ -185,11 +205,13 @@ impl MemtableManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_flush_results(&self) -> Vec<Result<MemtableFlushResult>> {
         let mut state = self.state.lock().unwrap();
         state.flush_results.drain(..).collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn wait_for_flushes(&self) -> Vec<Result<MemtableFlushResult>> {
         let mut state = self.state.lock().unwrap();
         while state.in_flight > 0 {
@@ -222,6 +244,7 @@ impl MemtableManager {
                 state.active = Some(HashMemtable::with_buffer(buffer));
             }
             state.in_flight = state.in_flight.saturating_sub(1);
+            #[cfg(test)]
             state
                 .flush_results
                 .push(Err(Error::IoError("Flush worker unavailable".to_string())));
@@ -233,6 +256,7 @@ impl MemtableManager {
                 state.active = Some(HashMemtable::with_buffer(buffer));
             }
             state.in_flight = state.in_flight.saturating_sub(1);
+            #[cfg(test)]
             state
                 .flush_results
                 .push(Err(Error::IoError("Memtable manager closed".to_string())));
@@ -358,8 +382,10 @@ mod tests {
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
         let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
+        let lsm_tree = Arc::new(Mutex::new(crate::lsm::LSMTree::default()));
         let manager = MemtableManager::new(
             Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
             MemtableManagerOptions {
                 memtable_capacity: 256,
                 buffer_count: 2,
@@ -392,6 +418,9 @@ mod tests {
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
         let data_file = results[0].as_ref().unwrap().data_file.clone();
+        let level0_files = lsm_tree.lock().unwrap().level_files(0);
+        assert_eq!(level0_files.len(), 1);
+        assert_eq!(level0_files[0].file_id, data_file.file_id);
         let reader = file_manager
             .open_data_file_reader(data_file.file_id)
             .unwrap();
@@ -429,8 +458,10 @@ mod tests {
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
         let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
+        let lsm_tree = Arc::new(Mutex::new(crate::lsm::LSMTree::default()));
         let manager = MemtableManager::new(
             Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
             MemtableManagerOptions {
                 memtable_capacity: 256,
                 buffer_count: 2,
@@ -450,6 +481,7 @@ mod tests {
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
+        assert_eq!(lsm_tree.lock().unwrap().level_files(0).len(), 1);
         {
             let state = manager.state.lock().unwrap();
             assert_eq!(state.free_buffers.len(), 1);
@@ -463,6 +495,7 @@ mod tests {
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
+        assert_eq!(lsm_tree.lock().unwrap().level_files(0).len(), 2);
         cleanup_test_root();
     }
 }

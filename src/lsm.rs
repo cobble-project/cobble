@@ -56,7 +56,7 @@ impl LSMTree {
         }
     }
 
-    fn apply_edit(&mut self, edit: VersionEdit) {
+    pub(crate) fn apply_edit(&mut self, edit: VersionEdit) {
         let mut new_levels = self.current_version.levels.clone();
 
         for level_edit in edit.level_edits {
@@ -120,6 +120,29 @@ impl LSMTree {
         }
 
         self.current_version = Arc::new(LSMTreeVersion { levels: new_levels });
+    }
+
+    pub(crate) fn add_level0_files(&mut self, new_files: Vec<Arc<DataFile>>) {
+        if new_files.is_empty() {
+            return;
+        }
+        let edit = VersionEdit {
+            level_edits: vec![LevelEdit {
+                level: 0,
+                removed_files: Vec::new(),
+                new_files,
+            }],
+        };
+        self.apply_edit(edit);
+    }
+
+    pub(crate) fn level_files(&self, level: u8) -> Vec<Arc<DataFile>> {
+        self.current_version
+            .levels
+            .iter()
+            .find(|l| l.ordinal == level)
+            .map(|l| l.files.clone())
+            .unwrap_or_default()
     }
 }
 
