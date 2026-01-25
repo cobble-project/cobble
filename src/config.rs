@@ -28,6 +28,8 @@ pub struct Config {
     pub compaction_policy: CompactionPolicyKind,
     /// Size of the block cache in bytes. If zero, cache is disabled.
     pub block_cache_size: usize,
+    /// Target base SST file size in bytes.
+    pub base_file_size: usize,
 }
 
 impl Default for Config {
@@ -43,6 +45,7 @@ impl Default for Config {
             max_level: 6,
             compaction_policy: CompactionPolicyKind::RoundRobin,
             block_cache_size: 64 * 1024 * 1024,
+            base_file_size: 64 * 1024 * 1024,
         }
     }
 }

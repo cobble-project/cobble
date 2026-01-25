@@ -45,6 +45,7 @@ impl Db {
             level_size_multiplier: config.level_size_multiplier,
             max_level: config.max_level,
             num_columns: config.num_columns,
+            target_file_size: config.base_file_size,
             ..crate::compaction::CompactionConfig::default()
         };
         let compaction_factory = crate::compaction::make_sst_builder_factory(sst_options.clone());

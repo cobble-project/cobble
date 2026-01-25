@@ -81,3 +81,9 @@ impl WriteBatch {
         self.current_seq += 1;
     }
 }
+
+impl Default for WriteBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
