@@ -1,3 +1,7 @@
+use crate::compaction::{
+    CompactionConfig, CompactionPlan, CompactionPolicy, CompactionWorker, MinOverlapPolicy,
+    RoundRobinPolicy, build_runs_for_plan,
+};
 use crate::data_file::DataFile;
 use crate::error::Result;
 use crate::file::FileManager;
@@ -25,6 +29,10 @@ pub(crate) struct LSMTreeVersion {
 pub(crate) struct LSMTree {
     current_version: Arc<LSMTreeVersion>,
     level_options: Vec<LevelOptions>,
+    compaction_config: CompactionConfig,
+    compaction_policy: Box<dyn CompactionPolicy>,
+    pending_compaction: bool,
+    compaction_worker: Option<Arc<CompactionWorker>>,
 }
 
 #[derive(Clone)]
@@ -48,6 +56,10 @@ impl Default for LSMTree {
                 LevelOptions { tiered: true },
                 LevelOptions { tiered: false },
             ],
+            compaction_config: CompactionConfig::default(),
+            compaction_policy: Box::new(RoundRobinPolicy::new()),
+            pending_compaction: false,
+            compaction_worker: None,
         }
     }
 }
@@ -125,6 +137,7 @@ impl LSMTree {
         }
 
         self.current_version = Arc::new(LSMTreeVersion { levels: new_levels });
+        self.maybe_trigger_compaction();
     }
 
     pub(crate) fn add_level0_files(&mut self, new_files: Vec<Arc<DataFile>>) {
@@ -148,6 +161,101 @@ impl LSMTree {
             .find(|l| l.ordinal == level)
             .map(|l| l.files.clone())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn configure_compaction(
+        &mut self,
+        config: CompactionConfig,
+        worker: Option<Arc<CompactionWorker>>,
+    ) {
+        self.compaction_config = config;
+        self.compaction_policy = Self::make_policy(config.policy);
+        self.compaction_worker = worker;
+    }
+
+    fn make_policy(kind: crate::config::CompactionPolicyKind) -> Box<dyn CompactionPolicy> {
+        match kind {
+            crate::config::CompactionPolicyKind::RoundRobin => Box::new(RoundRobinPolicy::new()),
+            crate::config::CompactionPolicyKind::MinOverlap => Box::new(MinOverlapPolicy::new()),
+        }
+    }
+
+    pub(crate) fn on_compaction_complete(&mut self) {
+        self.pending_compaction = false;
+    }
+
+    pub(crate) fn on_compaction_started(&mut self) {
+        self.pending_compaction = true;
+    }
+
+    fn maybe_trigger_compaction(&mut self) {
+        if self.pending_compaction {
+            return;
+        }
+        let levels = &self.current_version.levels;
+        let max_level = levels
+            .iter()
+            .map(|level| level.ordinal as usize)
+            .max()
+            .unwrap_or(0);
+        let max_level = max_level.max(self.compaction_config.max_level as usize);
+        let mut level_files = vec![Vec::new(); max_level + 2];
+        for level in levels {
+            level_files[level.ordinal as usize] = level.files.clone();
+        }
+        let plan = self
+            .compaction_policy
+            .pick(&level_files, self.compaction_config);
+        let Some(plan) = plan else {
+            return;
+        };
+        let Some(worker) = self.compaction_worker.clone() else {
+            return;
+        };
+        if plan.trivial_move {
+            if let Some(edit) = self.build_trivial_move_edit(&level_files, &plan) {
+                self.apply_edit(edit);
+            }
+            return;
+        }
+        let runs = build_runs_for_plan(&level_files, &plan);
+        if let Some(handle) = worker.submit_runs(
+            runs,
+            plan.output_level,
+            crate::data_file::DataFileType::SSTable,
+        ) {
+            self.pending_compaction = true;
+            std::mem::drop(handle);
+        }
+    }
+
+    fn build_trivial_move_edit(
+        &self,
+        levels: &[Vec<Arc<DataFile>>],
+        plan: &CompactionPlan,
+    ) -> Option<VersionEdit> {
+        let input_level = plan.input_level as usize;
+        if input_level >= levels.len() {
+            return None;
+        }
+        let file = levels[input_level]
+            .iter()
+            .find(|file| file.file_id == plan.base_file_id)
+            .cloned()?;
+        Some(VersionEdit {
+            level_edits: vec![
+                LevelEdit {
+                    level: plan.input_level,
+                    removed_files: vec![Arc::clone(&file)],
+                    new_files: Vec::new(),
+                },
+                LevelEdit {
+                    level: plan.output_level,
+                    removed_files: Vec::new(),
+                    new_files: vec![file],
+                },
+            ],
+        })
     }
 
     pub(crate) fn get(
@@ -285,12 +393,12 @@ impl LSMTree {
 mod tests {
     use super::*;
     use crate::data_file::DataFileType;
-    use crate::file::{FileManager, FileSystemRegistry};
+    use crate::file::{FileId, FileManager, FileSystemRegistry};
     use crate::sst::row_codec::{encode_key, encode_value};
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::{Column, Key, Value, ValueType};
 
-    static mut FILE_ID_COUNTER: u64 = 0;
+    static mut FILE_ID_COUNTER: FileId = 0;
 
     fn create_data_file(start: &[u8], end: &[u8]) -> Arc<DataFile> {
         unsafe {
@@ -303,6 +411,21 @@ mod tests {
                 file_id: id,
                 seq: 0,
                 size: 0, // Test file, size doesn't matter
+            })
+        }
+    }
+
+    fn create_data_file_with_size(start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
+        unsafe {
+            let id = FILE_ID_COUNTER;
+            FILE_ID_COUNTER += 1;
+            Arc::new(DataFile {
+                file_type: DataFileType::SSTable,
+                start_key: start.to_vec(),
+                end_key: end.to_vec(),
+                file_id: id,
+                seq: 0,
+                size,
             })
         }
     }
@@ -402,6 +525,82 @@ mod tests {
         assert_eq!(level1.files[0].start_key, b"d1");
         assert_eq!(level1.files[1].start_key, b"e");
         assert_eq!(level1.files[2].start_key, b"g");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_lsm_trivial_move_compaction() {
+        let root = "/tmp/lsm_trivial_move";
+        cleanup_test_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
+        let config = crate::compaction::CompactionConfig {
+            l1_base_bytes: 1,
+            level_size_multiplier: 1,
+            max_level: 3,
+            ..crate::compaction::CompactionConfig::default()
+        };
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions::default());
+        let lsm_tree = Arc::new(std::sync::Mutex::new(LSMTree {
+            current_version: Arc::new(LSMTreeVersion {
+                levels: vec![
+                    Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: Vec::new(),
+                    },
+                    Level {
+                        ordinal: 1,
+                        tiered: false,
+                        files: vec![
+                            create_data_file_with_size(b"a", b"b", 10),
+                            create_data_file_with_size(b"c", b"d", 10),
+                        ],
+                    },
+                    Level {
+                        ordinal: 2,
+                        tiered: false,
+                        files: vec![create_data_file_with_size(b"e", b"f", 1)],
+                    },
+                ],
+            }),
+            ..Default::default()
+        }));
+        let worker = Arc::new(crate::compaction::CompactionWorker::new(
+            crate::compaction::CompactionExecutor::new(config).unwrap(),
+            factory,
+            Arc::clone(&file_manager),
+            Arc::downgrade(&lsm_tree),
+        ));
+        {
+            let mut tree = lsm_tree.lock().unwrap();
+            tree.configure_compaction(config, Some(Arc::clone(&worker)));
+            let target = tree
+                .current_version
+                .levels
+                .iter()
+                .find(|level| level.ordinal == 1)
+                .and_then(|level| level.files.iter().find(|file| file.start_key == b"a"))
+                .cloned()
+                .expect("target file");
+            tree.apply_edit(VersionEdit {
+                level_edits: vec![LevelEdit {
+                    level: 1,
+                    removed_files: vec![target],
+                    new_files: Vec::new(),
+                }],
+            });
+        }
+        let tree = lsm_tree.lock().unwrap();
+        let level1 = tree.level_files(1);
+        let level2 = tree.level_files(2);
+        assert_eq!(level1.len(), 0);
+        assert_eq!(level2.len(), 1);
+        assert!(level2.iter().any(|file| file.start_key == b"e"));
+        cleanup_test_root(root);
     }
 
     #[test]

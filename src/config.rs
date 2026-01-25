@@ -1,3 +1,10 @@
+/// Compaction policy selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompactionPolicyKind {
+    RoundRobin,
+    MinOverlap,
+}
+
 /// Config for opening the database.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -9,6 +16,16 @@ pub struct Config {
     pub memtable_buffer_count: usize,
     /// Number of columns in the value schema.
     pub num_columns: usize,
+    /// Maximum number of L0 files before triggering compaction.
+    pub l0_file_limit: usize,
+    /// Base size for level 1.
+    pub l1_base_bytes: usize,
+    /// Size multiplier for deeper levels.
+    pub level_size_multiplier: usize,
+    /// Maximum level number (inclusive).
+    pub max_level: u8,
+    /// Compaction policy to use.
+    pub compaction_policy: CompactionPolicyKind,
 }
 
 impl Default for Config {
@@ -18,6 +35,11 @@ impl Default for Config {
             memtable_capacity: 64 * 1024 * 1024,
             memtable_buffer_count: 2,
             num_columns: 1,
+            l0_file_limit: 4,
+            l1_base_bytes: 64 * 1024 * 1024,
+            level_size_multiplier: 10,
+            max_level: 6,
+            compaction_policy: CompactionPolicyKind::RoundRobin,
         }
     }
 }

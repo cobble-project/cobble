@@ -29,6 +29,30 @@ impl Db {
             num_columns: config.num_columns,
             ..SSTWriterOptions::default()
         };
+
+        // Compaction setup
+        let compaction_options = crate::compaction::CompactionConfig {
+            policy: config.compaction_policy,
+            l0_file_limit: config.l0_file_limit,
+            l1_base_bytes: config.l1_base_bytes,
+            level_size_multiplier: config.level_size_multiplier,
+            max_level: config.max_level,
+            num_columns: config.num_columns,
+            ..crate::compaction::CompactionConfig::default()
+        };
+        let compaction_factory = crate::compaction::make_sst_builder_factory(sst_options.clone());
+        let compaction_worker = Arc::new(crate::compaction::CompactionWorker::new(
+            crate::compaction::CompactionExecutor::new(compaction_options)?,
+            Arc::clone(&compaction_factory),
+            Arc::clone(&file_manager),
+            Arc::downgrade(&lsm_tree),
+        ));
+        {
+            let mut tree = lsm_tree.lock().unwrap();
+            tree.configure_compaction(compaction_options, Some(Arc::clone(&compaction_worker)));
+        }
+
+        // Memtable manager setup
         let memtable_manager = MemtableManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
@@ -184,6 +208,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            ..Config::default()
         };
         let db = Db::open(config).unwrap();
         let mut batch = WriteBatch::new();
@@ -213,6 +238,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            ..Config::default()
         };
         let db = Db::open(config).unwrap();
         let mut batch = WriteBatch::new();
@@ -242,6 +268,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            ..Config::default()
         };
         let db = Db::open(config).unwrap();
 
@@ -278,6 +305,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            ..Config::default()
         };
         let db = Db::open(config).unwrap();
 
@@ -314,6 +342,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            ..Config::default()
         };
         let db = Db::open(config).unwrap();
 
@@ -346,6 +375,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            ..Config::default()
         };
         let db = Db::open(config).unwrap();
 
@@ -378,6 +408,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 2,
+            ..Config::default()
         };
         let db = Db::open(config).unwrap();
 
@@ -413,6 +444,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 2,
+            ..Config::default()
         };
         let db = Db::open(config).unwrap();
 

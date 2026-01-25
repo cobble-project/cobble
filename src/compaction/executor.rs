@@ -5,6 +5,7 @@
 //! - `CompactionResult`: Output of a compaction operation
 //! - `CompactionExecutor`: Manages compaction execution in a thread pool
 
+use crate::compaction::CompactionConfig;
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
 use crate::file::FileManager;
@@ -14,31 +15,6 @@ use crate::lsm::{LevelEdit, VersionEdit};
 use crate::sst::SSTIteratorOptions;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
-
-/// Options for the compaction executor.
-#[derive(Clone)]
-pub struct CompactionOptions {
-    /// Block size for SST files.
-    pub block_size: usize,
-    /// Buffer size for file writes.
-    pub buffer_size: usize,
-    /// Number of columns in the value schema.
-    pub num_columns: usize,
-    /// Target file size for output SST files.
-    /// Compaction will start a new file when this size is exceeded.
-    pub target_file_size: usize,
-}
-
-impl Default for CompactionOptions {
-    fn default() -> Self {
-        Self {
-            block_size: 4096,
-            buffer_size: 8192,
-            num_columns: 1,
-            target_file_size: 64 * 1024 * 1024, // 64 MB
-        }
-    }
-}
 
 /// A compaction task describes the input and output parameters for a compaction.
 pub struct CompactionTask {
@@ -117,12 +93,12 @@ impl CompactionResult {
 /// The executor uses tokio's runtime for async task execution in a thread pool.
 pub struct CompactionExecutor {
     runtime: Option<Runtime>,
-    options: CompactionOptions,
+    options: CompactionConfig,
 }
 
 impl CompactionExecutor {
     /// Creates a new compaction executor with the given options and its own runtime.
-    pub fn new(options: CompactionOptions) -> Result<Self> {
+    pub fn new(options: CompactionConfig) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -149,7 +125,7 @@ impl CompactionExecutor {
 
     /// Creates a new compaction executor with the given options without its own runtime.
     /// Use this when running in an existing tokio runtime.
-    pub fn new_without_runtime(options: CompactionOptions) -> Self {
+    pub fn new_without_runtime(options: CompactionConfig) -> Self {
         Self {
             runtime: None,
             options,
@@ -158,7 +134,7 @@ impl CompactionExecutor {
 
     /// Creates a new compaction executor with default options.
     pub fn with_defaults() -> Result<Self> {
-        Self::new(CompactionOptions::default())
+        Self::new(CompactionConfig::default())
     }
 
     /// Executes a compaction task asynchronously using the executor's internal runtime.
@@ -178,7 +154,7 @@ impl CompactionExecutor {
         on_complete: Option<Arc<dyn Fn(VersionEdit) + Send + Sync>>,
     ) -> tokio::task::JoinHandle<Result<CompactionResult>> {
         let runtime = self.runtime.as_ref().expect("Executor has no runtime.");
-        let options = self.options.clone();
+        let options = self.options;
 
         runtime.spawn(async move {
             let result = Self::run_compaction(task, options)?;
@@ -195,17 +171,14 @@ impl CompactionExecutor {
         task: CompactionTask,
         on_complete: Option<Arc<dyn Fn(VersionEdit) + Send + Sync>>,
     ) -> Result<CompactionResult> {
-        let result = Self::run_compaction(task, self.options.clone())?;
+        let result = Self::run_compaction(task, self.options)?;
         if let Some(callback) = on_complete {
             callback(result.edit.clone());
         }
         Ok(result)
     }
 
-    fn run_compaction(
-        task: CompactionTask,
-        options: CompactionOptions,
-    ) -> Result<CompactionResult> {
+    fn run_compaction(task: CompactionTask, options: CompactionConfig) -> Result<CompactionResult> {
         // Create iterators for all files in all sorted runs
         // We iterate files from all sorted runs, with earlier runs (newer data) coming first
         let sst_options = SSTIteratorOptions {
@@ -343,20 +316,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
-    /// Creates an SST file builder factory for tests.
-    fn make_sst_builder_factory(options: CompactionOptions) -> Arc<FileBuilderFactory> {
-        Arc::new(Box::new(move |writer| {
-            Box::new(SSTWriter::new(
-                writer,
-                SSTWriterOptions {
-                    block_size: options.block_size,
-                    buffer_size: options.buffer_size,
-                    num_columns: options.num_columns,
-                },
-            )) as Box<dyn FileBuilder>
-        }))
-    }
-
     fn create_test_sst(
         file_manager: &FileManager,
         entries: Vec<(&[u8], &[u8])>,
@@ -422,18 +381,23 @@ mod tests {
         let run1 = SortedRun::new(0, vec![file1]);
         let run2 = SortedRun::new(1, vec![file2]);
 
-        let options = CompactionOptions {
+        let options = CompactionConfig {
             num_columns,
             target_file_size: 1024 * 1024, // 1MB - all entries fit in one file
             ..Default::default()
         };
 
         // Create and execute compaction
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            block_size: options.block_size,
+            buffer_size: options.buffer_size,
+            num_columns: options.num_columns,
+        });
         let task = CompactionTask::new(
             vec![run1, run2],
             1,
             Arc::clone(&file_manager),
-            make_sst_builder_factory(options.clone()),
+            factory,
             DataFileType::SSTable,
         );
 
@@ -532,17 +496,22 @@ mod tests {
         let run1 = SortedRun::new(0, vec![file1]);
         let run2 = SortedRun::new(0, vec![file2]);
 
-        let options = CompactionOptions {
+        let options = CompactionConfig {
             num_columns,
             ..Default::default()
         };
 
         // Create and execute compaction
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            block_size: options.block_size,
+            buffer_size: options.buffer_size,
+            num_columns: options.num_columns,
+        });
         let task = CompactionTask::new(
             vec![run1, run2],
             1,
             Arc::clone(&file_manager),
-            make_sst_builder_factory(options.clone()),
+            factory,
             DataFileType::SSTable,
         );
 
@@ -648,18 +617,23 @@ mod tests {
 
         let run = SortedRun::new(0, vec![file]);
 
-        let options = CompactionOptions {
+        let options = CompactionConfig {
             num_columns,
             target_file_size: 500, // Very small to force multiple files
             ..Default::default()
         };
 
         // Create compaction with very small target file size to force multiple output files
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            block_size: options.block_size,
+            buffer_size: options.buffer_size,
+            num_columns: options.num_columns,
+        });
         let task = CompactionTask::new(
             vec![run],
             1,
             Arc::clone(&file_manager),
-            make_sst_builder_factory(options.clone()),
+            factory,
             DataFileType::SSTable,
         );
 
@@ -705,14 +679,19 @@ mod tests {
         let file_manager =
             Arc::new(FileManager::new(Arc::clone(&fs), FileManagerOptions::default()).unwrap());
 
-        let options = CompactionOptions::default();
+        let options = CompactionConfig::default();
 
         // Create compaction with no sorted runs
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            block_size: options.block_size,
+            buffer_size: options.buffer_size,
+            num_columns: options.num_columns,
+        });
         let task = CompactionTask::new(
             vec![],
             1,
             Arc::clone(&file_manager),
-            make_sst_builder_factory(options),
+            factory,
             DataFileType::SSTable,
         );
 
