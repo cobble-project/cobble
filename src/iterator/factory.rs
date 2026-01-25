@@ -4,6 +4,7 @@ use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
 use crate::file::FileManager;
 use crate::iterator::KvIterator;
+use crate::sst::block_cache::BlockCache;
 use crate::sst::{SSTIterator, SSTIteratorOptions};
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use std::sync::Arc;
 pub struct IteratorFactoryOptions {
     /// Options for SST iterators.
     pub sst_options: SSTIteratorOptions,
+    pub block_cache: Option<BlockCache>,
 }
 
 /// Creates an iterator for a data file based on its type.
@@ -35,7 +37,12 @@ pub fn create_iterator(
     match file.file_type {
         DataFileType::SSTable => {
             let reader = file_manager.open_data_file_reader(file.file_id)?;
-            let iter = SSTIterator::new(Box::new(reader), options.sst_options.clone())?;
+            let iter = SSTIterator::with_cache(
+                Box::new(reader),
+                file.file_id,
+                options.sst_options.clone(),
+                options.block_cache.clone(),
+            )?;
             Ok(Box::new(iter))
         }
     }

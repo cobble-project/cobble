@@ -507,7 +507,12 @@ mod tests {
         let reader = file_manager
             .open_data_file_reader(data_file.file_id)
             .unwrap();
-        let mut iter = SSTIterator::new(Box::new(reader), SSTIteratorOptions::default()).unwrap();
+        let mut iter = SSTIterator::with_file_id(
+            Box::new(reader),
+            data_file.file_id,
+            SSTIteratorOptions::default(),
+        )
+        .unwrap();
         iter.seek_to_first().unwrap();
         let mut entries = Vec::new();
         while iter.valid() {

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 bytes = "1.11.0"
 dashmap = "6.1.0"
+foyer = "0.22.3"
 opendal = { version = "0.54.0", features = ["services-fs", "services-oss", "services-s3"] }
 serial_test = "3.3.1"
 thiserror = "2.0.16"

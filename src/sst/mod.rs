@@ -1,3 +1,4 @@
+pub(crate) mod block_cache;
 pub(crate) mod format;
 pub(crate) mod iterator;
 pub(crate) mod row_codec;

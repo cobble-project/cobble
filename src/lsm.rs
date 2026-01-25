@@ -5,6 +5,7 @@ use crate::compaction::{
 use crate::data_file::DataFile;
 use crate::error::Result;
 use crate::file::FileManager;
+use crate::sst::block_cache::BlockCache;
 use crate::sst::row_codec::decode_value_masked;
 use crate::sst::{SSTIterator, SSTIteratorOptions};
 use crate::r#type::Value;
@@ -33,6 +34,7 @@ pub(crate) struct LSMTree {
     compaction_policy: Box<dyn CompactionPolicy>,
     pending_compaction: bool,
     compaction_worker: Option<Arc<CompactionWorker>>,
+    block_cache: Option<BlockCache>,
 }
 
 #[derive(Clone)]
@@ -60,6 +62,7 @@ impl Default for LSMTree {
             compaction_policy: Box::new(RoundRobinPolicy::new()),
             pending_compaction: false,
             compaction_worker: None,
+            block_cache: None,
         }
     }
 }
@@ -171,6 +174,10 @@ impl LSMTree {
         self.compaction_config = config;
         self.compaction_policy = Self::make_policy(config.policy);
         self.compaction_worker = worker;
+    }
+
+    pub(crate) fn set_block_cache(&mut self, block_cache: Option<BlockCache>) {
+        self.block_cache = block_cache;
     }
 
     fn make_policy(kind: crate::config::CompactionPolicyKind) -> Box<dyn CompactionPolicy> {
@@ -301,12 +308,14 @@ impl LSMTree {
                         continue;
                     }
                     let reader = file_manager.open_data_file_reader(file.file_id)?;
-                    let mut iter = SSTIterator::new(
+                    let mut iter = SSTIterator::with_cache(
                         Box::new(reader),
+                        file.file_id,
                         SSTIteratorOptions {
                             num_columns,
                             ..SSTIteratorOptions::default()
                         },
+                        self.block_cache.clone(),
                     )?;
                     iter.seek(encoded_key)?;
                     if iter.valid()
@@ -345,12 +354,14 @@ impl LSMTree {
                         continue;
                     }
                     let reader = file_manager.open_data_file_reader(file.file_id)?;
-                    let mut iter = SSTIterator::new(
+                    let mut iter = SSTIterator::with_cache(
                         Box::new(reader),
+                        file.file_id,
                         SSTIteratorOptions {
                             num_columns,
                             ..SSTIteratorOptions::default()
                         },
+                        self.block_cache.clone(),
                     )?;
                     iter.seek(encoded_key)?;
                     if iter.valid()

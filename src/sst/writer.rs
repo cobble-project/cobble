@@ -112,7 +112,9 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             &mut self.data_block_builder,
             BlockBuilder::new(self.options.block_size),
         );
-        let block = old_builder.build();
+        let mut block = old_builder.build();
+        let block_id = self.pending_data_blocks.len() as u32;
+        block.set_block_id(block_id);
         let encoded = block.encode();
         let size = encoded.len();
         let offset = self.writer.offset();

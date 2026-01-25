@@ -667,7 +667,8 @@ mod tests {
         // Read SST file and decode Key/Value
         {
             let reader_file = fs.open_read("codec_test.sst").unwrap();
-            let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+            let mut iter =
+                SSTIterator::with_file_id(reader_file, 0, SSTIteratorOptions::default()).unwrap();
 
             iter.seek_to_first().unwrap();
 
@@ -766,7 +767,8 @@ mod tests {
         // Read and seek using encoded key
         {
             let reader_file = fs.open_read("codec_seek_test.sst").unwrap();
-            let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+            let mut iter =
+                SSTIterator::with_file_id(reader_file, 0, SSTIteratorOptions::default()).unwrap();
 
             // Seek to second key
             let seek_key = Key::new(1, b"bbb".to_vec());
@@ -831,7 +833,8 @@ mod tests {
         // Read and verify all entries
         {
             let reader_file = fs.open_read("codec_blocks_test.sst").unwrap();
-            let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+            let mut iter =
+                SSTIterator::with_file_id(reader_file, 0, SSTIteratorOptions::default()).unwrap();
 
             iter.seek_to_first().unwrap();
 

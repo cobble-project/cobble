@@ -65,13 +65,11 @@ impl Footer {
 pub struct Block {
     data: Bytes,
     offsets: Vec<u32>,
+    block_id: u32,
+    size_in_bytes: usize,
 }
 
 impl Block {
-    pub fn new(data: Bytes, offsets: Vec<u32>) -> Self {
-        Self { data, offsets }
-    }
-
     pub fn encode(&self) -> Bytes {
         let offsets_size = self.offsets.len() * 4;
         let total_size = 4 + self.data.len() + offsets_size;
@@ -96,6 +94,7 @@ impl Block {
             return Err(Error::IoError("Block too small".to_string()));
         }
 
+        let size_in_bytes = data.len();
         let mut buf = data.clone();
         let num_entries = buf.get_u32_le() as usize;
 
@@ -103,6 +102,8 @@ impl Block {
             return Ok(Self {
                 data: Bytes::new(),
                 offsets: vec![],
+                block_id: 0,
+                size_in_bytes,
             });
         }
 
@@ -123,7 +124,17 @@ impl Block {
         Ok(Self {
             data: block_data,
             offsets,
+            block_id: 0,
+            size_in_bytes,
         })
+    }
+
+    pub fn set_block_id(&mut self, block_id: u32) {
+        self.block_id = block_id;
+    }
+
+    pub fn block_id(&self) -> u32 {
+        self.block_id
     }
 
     pub fn get(&self, idx: usize) -> Result<(Bytes, Bytes)> {
@@ -170,6 +181,24 @@ impl Block {
     pub fn is_empty(&self) -> bool {
         self.offsets.is_empty()
     }
+
+    pub fn lower_bound(&self, target: &[u8]) -> Result<usize> {
+        let mut left = 0;
+        let mut right = self.len();
+        while left < right {
+            let mid = (left + right) / 2;
+            let (key, _) = self.get(mid)?;
+            match key.as_ref().cmp(target) {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => right = mid,
+            }
+        }
+        Ok(left)
+    }
+
+    pub(crate) fn size_in_bytes(&self) -> usize {
+        self.size_in_bytes
+    }
 }
 
 /// Builder for creating blocks
@@ -211,9 +240,12 @@ impl BlockBuilder {
     }
 
     pub fn build(self) -> Block {
+        let size_in_bytes = 4 + self.data.len() + self.offsets.len() * 4;
         Block {
             data: self.data.freeze(),
             offsets: self.offsets,
+            block_id: 0,
+            size_in_bytes,
         }
     }
 

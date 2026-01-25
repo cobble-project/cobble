@@ -4,6 +4,7 @@ use crate::file::{FileManager, FileSystemRegistry};
 use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::sst::SSTWriterOptions;
+use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value, encode_key, encode_value};
 use crate::r#type::{Column, Key, Value, ValueType};
 use crate::write_batch::{WriteBatch, WriteOp};
@@ -25,6 +26,12 @@ impl Db {
         let fs = registry.get_or_register(config.path)?;
         let file_manager = Arc::new(FileManager::with_defaults(fs)?);
         let lsm_tree = Arc::new(Mutex::new(LSMTree::default()));
+        if config.block_cache_size > 0 {
+            lsm_tree
+                .lock()
+                .unwrap()
+                .set_block_cache(Some(new_block_cache(config.block_cache_size)));
+        }
         let sst_options = SSTWriterOptions {
             num_columns: config.num_columns,
             ..SSTWriterOptions::default()

@@ -190,7 +190,11 @@ impl CompactionExecutor {
         for run in &task.sorted_runs {
             for file in run.files() {
                 let reader = task.file_manager.open_data_file_reader(file.file_id)?;
-                let iter = crate::sst::SSTIterator::new(Box::new(reader), sst_options.clone())?;
+                let iter = crate::sst::SSTIterator::with_file_id(
+                    Box::new(reader),
+                    file.file_id,
+                    sst_options.clone(),
+                )?;
                 all_iters.push(Box::new(iter));
             }
         }
@@ -425,8 +429,9 @@ mod tests {
         let reader = file_manager
             .open_data_file_reader(first_file.file_id)
             .unwrap();
-        let mut iter = crate::sst::SSTIterator::new(
+        let mut iter = crate::sst::SSTIterator::with_file_id(
             Box::new(reader),
+            first_file.file_id,
             crate::sst::SSTIteratorOptions::default(),
         )
         .unwrap();
@@ -534,8 +539,9 @@ mod tests {
         let reader = file_manager
             .open_data_file_reader(result.new_files()[0].file_id)
             .unwrap();
-        let mut iter = crate::sst::SSTIterator::new(
+        let mut iter = crate::sst::SSTIterator::with_file_id(
             Box::new(reader),
+            result.new_files()[0].file_id,
             crate::sst::SSTIteratorOptions {
                 num_columns,
                 ..Default::default()

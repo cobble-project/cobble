@@ -1,42 +1,68 @@
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
 use crate::iterator::KvIterator;
+use crate::sst::block_cache::{BlockCache, BlockCacheKey};
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, Value};
 use bytes::Bytes;
-use std::cmp::Ordering;
 
 #[derive(Clone)]
-pub struct SSTIteratorOptions {
+pub(crate) struct SSTIteratorOptions {
+    /// Size of the block cache in bytes.
+    /// If zero, block caching is disabled.
     pub block_cache_size: usize,
     /// Number of columns in the value schema.
     /// Used for decoding values with the row codec.
     pub num_columns: usize,
 }
 
+#[cfg(test)]
+pub struct SSTIteratorTestCache {
+    inner: SSTIterator,
+}
+
 impl Default for SSTIteratorOptions {
     fn default() -> Self {
         Self {
-            block_cache_size: 4096,
+            block_cache_size: 64 * 1024 * 1024, // 64 MB
             num_columns: 1,
         }
     }
 }
 
 /// Iterator for reading key-value pairs from an SST file
-pub struct SSTIterator {
+pub(crate) struct SSTIterator {
     file: Box<dyn RandomAccessFile>,
+    file_id: u64,
     footer: Footer,
     index_block: Block,
     current_data_block: Option<Block>,
     current_block_idx: usize,
     current_entry_idx: usize,
     options: SSTIteratorOptions,
+    block_cache: Option<BlockCache>,
 }
 
 impl SSTIterator {
     pub fn new(file: Box<dyn RandomAccessFile>, options: SSTIteratorOptions) -> Result<Self> {
+        Self::with_file_id(file, 0, options)
+    }
+
+    pub fn with_file_id(
+        file: Box<dyn RandomAccessFile>,
+        file_id: u64,
+        options: SSTIteratorOptions,
+    ) -> Result<Self> {
+        Self::with_cache(file, file_id, options, None)
+    }
+
+    pub fn with_cache(
+        file: Box<dyn RandomAccessFile>,
+        file_id: u64,
+        options: SSTIteratorOptions,
+        block_cache: Option<BlockCache>,
+    ) -> Result<Self> {
         // Read footer
         let footer = Self::read_footer(&*file)?;
 
@@ -45,17 +71,31 @@ impl SSTIterator {
             footer.index_block_offset as usize,
             footer.index_block_size as usize,
         )?;
-        let index_block = Block::decode(index_data)?;
+        let mut index_block = Block::decode(index_data)?;
+        index_block.set_block_id(u32::MAX);
 
         Ok(Self {
             file,
+            file_id,
             footer,
             index_block,
             current_data_block: None,
             current_block_idx: 0,
             current_entry_idx: 0,
             options,
+            block_cache,
         })
+    }
+
+    #[cfg(test)]
+    pub fn with_cache_test(
+        file: Box<dyn RandomAccessFile>,
+        file_id: u64,
+        options: SSTIteratorOptions,
+        block_cache: BlockCache,
+    ) -> Result<SSTIteratorTestCache> {
+        let inner = Self::with_cache(file, file_id, options, Some(block_cache))?;
+        Ok(SSTIteratorTestCache { inner })
     }
 
     fn read_footer(file: &dyn RandomAccessFile) -> Result<Footer> {
@@ -85,38 +125,19 @@ impl SSTIterator {
 
     /// Seek to the first key >= target
     pub fn seek(&mut self, target: &[u8]) -> Result<()> {
-        // Binary search in index block to find the data block
-        let mut left = 0;
-        let mut right = self.index_block.len();
-
-        while left < right {
-            let mid = (left + right) / 2;
-            let (key, _) = self.index_block.get(mid)?;
-
-            match key.as_ref().cmp(target) {
-                Ordering::Less => left = mid + 1,
-                Ordering::Equal | Ordering::Greater => right = mid,
-            }
+        if self.index_block.is_empty() {
+            self.current_data_block = None;
+            return Ok(());
         }
-
-        // If left == index_block.len(), the target is beyond all keys
-        if left == self.index_block.len() {
-            if left > 0 {
-                // Load the last block and seek within it
-                self.current_block_idx = left - 1;
-                self.load_data_block(self.current_block_idx)?;
-                self.seek_in_current_block(target)?;
-            } else {
-                // No blocks, iterator is exhausted
-                self.current_data_block = None;
-            }
+        let left = self.index_block.lower_bound(target)?;
+        let block_idx = if left == self.index_block.len() {
+            left.saturating_sub(1)
         } else {
-            // Load the block at left
-            self.current_block_idx = left;
-            self.load_data_block(left)?;
-            self.seek_in_current_block(target)?;
-        }
-
+            left
+        };
+        self.current_block_idx = block_idx;
+        self.load_data_block(block_idx)?;
+        self.seek_in_current_block(target)?;
         Ok(())
     }
 
@@ -137,8 +158,27 @@ impl SSTIterator {
         let offset = u64::from_le_bytes(value[0..8].try_into().unwrap()) as usize;
         let size = u64::from_le_bytes(value[8..16].try_into().unwrap()) as usize;
 
-        let data = self.file.read_at(offset, size)?;
-        self.current_data_block = Some(Block::decode(data)?);
+        let cache_key = BlockCacheKey {
+            file_id: self.file_id,
+            block_id: block_idx as u32,
+        };
+        let block = if let Some(cache) = &self.block_cache {
+            if let Some(block) = cache.get(&cache_key) {
+                block
+            } else {
+                let data = self.file.read_at(offset, size)?;
+                let mut block = Block::decode(data)?;
+                block.set_block_id(block_idx as u32);
+                cache.insert(cache_key, block.clone());
+                block
+            }
+        } else {
+            let data = self.file.read_at(offset, size)?;
+            let mut block = Block::decode(data)?;
+            block.set_block_id(block_idx as u32);
+            block
+        };
+        self.current_data_block = Some(block);
         self.current_entry_idx = 0;
 
         Ok(())
@@ -146,16 +186,7 @@ impl SSTIterator {
 
     fn seek_in_current_block(&mut self, target: &[u8]) -> Result<()> {
         if let Some(block) = &self.current_data_block {
-            // Linear search in the current block
-            for i in 0..block.len() {
-                let (key, _) = block.get(i)?;
-                if key.as_ref() >= target {
-                    self.current_entry_idx = i;
-                    return Ok(());
-                }
-            }
-            // Target is beyond all keys in this block
-            self.current_entry_idx = block.len();
+            self.current_entry_idx = block.lower_bound(target)?;
         }
         Ok(())
     }
@@ -304,6 +335,17 @@ impl KvIterator for SSTIterator {
 }
 
 #[cfg(test)]
+impl SSTIteratorTestCache {
+    pub fn seek(&mut self, target: &[u8]) -> Result<()> {
+        self.inner.seek(target)
+    }
+
+    pub fn valid(&self) -> bool {
+        self.inner.valid()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::file::FileSystemRegistry;
@@ -333,7 +375,8 @@ mod tests {
         // Read SST file
         {
             let reader_file = fs.open_read("test.sst").unwrap();
-            let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+            let mut iter =
+                SSTIterator::with_file_id(reader_file, 0, SSTIteratorOptions::default()).unwrap();
 
             iter.seek_to_first().unwrap();
 
@@ -390,7 +433,8 @@ mod tests {
         // Read and seek
         {
             let reader_file = fs.open_read("test_seek.sst").unwrap();
-            let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+            let mut iter =
+                SSTIterator::with_file_id(reader_file, 0, SSTIteratorOptions::default()).unwrap();
 
             // Seek to exact key
             iter.seek(b"key3").unwrap();
@@ -469,8 +513,9 @@ mod tests {
         // Read SST file using typed Key/Value API
         {
             let reader_file = fs.open_read("typed.sst").unwrap();
-            let mut iter = SSTIterator::new(
+            let mut iter = SSTIterator::with_file_id(
                 reader_file,
+                0,
                 SSTIteratorOptions {
                     num_columns,
                     ..SSTIteratorOptions::default()
@@ -524,8 +569,9 @@ mod tests {
         // Test seek_key
         {
             let reader_file = fs.open_read("typed.sst").unwrap();
-            let mut iter = SSTIterator::new(
+            let mut iter = SSTIterator::with_file_id(
                 reader_file,
+                0,
                 SSTIteratorOptions {
                     num_columns,
                     ..SSTIteratorOptions::default()

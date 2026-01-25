@@ -26,6 +26,8 @@ pub struct Config {
     pub max_level: u8,
     /// Compaction policy to use.
     pub compaction_policy: CompactionPolicyKind,
+    /// Size of the block cache in bytes. If zero, cache is disabled.
+    pub block_cache_size: usize,
 }
 
 impl Default for Config {
@@ -40,6 +42,7 @@ impl Default for Config {
             level_size_multiplier: 10,
             max_level: 6,
             compaction_policy: CompactionPolicyKind::RoundRobin,
+            block_cache_size: 64 * 1024 * 1024,
         }
     }
 }
