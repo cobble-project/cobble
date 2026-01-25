@@ -79,6 +79,11 @@ impl CompactionWorker {
         );
         Some(self.submit(task))
     }
+
+    pub(crate) fn shutdown(self) {
+        let mut executor = self.executor;
+        executor.shutdown();
+    }
 }
 
 pub(crate) fn make_sst_builder_factory(options: SSTWriterOptions) -> Arc<FileBuilderFactory> {

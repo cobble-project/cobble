@@ -123,7 +123,11 @@ impl Db {
 
     /// Close the database and flush pending state.
     pub fn close(&self) -> Result<()> {
-        self.memtable_manager.close()
+        self.memtable_manager.close()?;
+        if let Ok(mut tree) = self.lsm_tree.lock() {
+            tree.shutdown_compaction();
+        }
+        Ok(())
     }
 
     /// Lookup a key across the memtable and LSM levels.

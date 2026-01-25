@@ -180,6 +180,16 @@ impl LSMTree {
         self.block_cache = block_cache;
     }
 
+    pub(crate) fn shutdown_compaction(&mut self) {
+        if let Some(worker) = self.compaction_worker.take()
+            && let Ok(worker) = Arc::try_unwrap(worker)
+        {
+            worker.shutdown();
+        }
+        self.compaction_worker = None;
+        self.pending_compaction = false;
+    }
+
     fn make_policy(kind: crate::config::CompactionPolicyKind) -> Box<dyn CompactionPolicy> {
         match kind {
             crate::config::CompactionPolicyKind::RoundRobin => Box::new(RoundRobinPolicy::new()),

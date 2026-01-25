@@ -100,6 +100,7 @@ impl CompactionExecutor {
     /// Creates a new compaction executor with the given options and its own runtime.
     pub fn new(options: CompactionConfig) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            .thread_name("cobble-compaction")
             .worker_threads(4)
             .enable_all()
             .build()
@@ -156,7 +157,7 @@ impl CompactionExecutor {
         let runtime = self.runtime.as_ref().expect("Executor has no runtime.");
         let options = self.options;
 
-        runtime.spawn(async move {
+        runtime.spawn_blocking(move || {
             let result = Self::run_compaction(task, options)?;
             if let Some(callback) = on_complete {
                 callback(result.edit.clone());
@@ -176,6 +177,12 @@ impl CompactionExecutor {
             callback(result.edit.clone());
         }
         Ok(result)
+    }
+
+    pub fn shutdown(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        }
     }
 
     fn run_compaction(task: CompactionTask, options: CompactionConfig) -> Result<CompactionResult> {
