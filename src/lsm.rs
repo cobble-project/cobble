@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct Level {
-    ordinal: u8,
-    tiered: bool,
-    files: Vec<Arc<DataFile>>,
+    pub(crate) ordinal: u8,
+    pub(crate) tiered: bool,
+    pub(crate) files: Vec<Arc<DataFile>>,
 }
 
 pub(crate) struct LevelOptions {
@@ -153,10 +153,14 @@ impl LSMTree {
                 for file in &level_edit.removed_files {
                     if let Some(pos) = level.files.iter().position(|f| Arc::ptr_eq(f, file)) {
                         level.files.remove(pos);
-                        if let Some(previous) = insert_pos {
-                            // Ensure that all removed files are contiguous.
-                            assert_eq!(pos, previous);
-                        } else {
+                        if !level.tiered {
+                            if let Some(previous) = insert_pos {
+                                // Ensure that all removed files are contiguous.
+                                assert_eq!(pos, previous);
+                            } else {
+                                insert_pos = Some(pos);
+                            }
+                        } else if insert_pos.is_none() {
                             insert_pos = Some(pos);
                         }
                     }
@@ -279,19 +283,7 @@ impl LSMTree {
             return;
         }
         let levels = &self.current_version.levels;
-        let max_level = levels
-            .iter()
-            .map(|level| level.ordinal as usize)
-            .max()
-            .unwrap_or(0);
-        let max_level = max_level.max(self.compaction_config.max_level as usize);
-        let mut level_files = vec![Vec::new(); max_level + 2];
-        for level in levels {
-            level_files[level.ordinal as usize] = level.files.clone();
-        }
-        let plan = self
-            .compaction_policy
-            .pick(&level_files, self.compaction_config);
+        let plan = self.compaction_policy.pick(levels, self.compaction_config);
         let Some(plan) = plan else {
             return;
         };
@@ -299,7 +291,7 @@ impl LSMTree {
             return;
         };
         if plan.trivial_move {
-            if let Some(edit) = self.build_trivial_move_edit(&level_files, &plan) {
+            if let Some(edit) = self.build_trivial_move_edit(levels, &plan) {
                 debug!(
                     "compaction trivial move L{}->L{} file_id={}",
                     plan.input_level, plan.output_level, plan.base_file_id
@@ -309,7 +301,7 @@ impl LSMTree {
             return;
         }
         debug!("trigger compaction plan {}", plan);
-        let runs = build_runs_for_plan(&level_files, &plan);
+        let runs = build_runs_for_plan(levels, &plan);
         if let Some(handle) = worker.submit_runs(
             runs,
             plan.output_level,
@@ -322,16 +314,18 @@ impl LSMTree {
 
     fn build_trivial_move_edit(
         &self,
-        levels: &[Vec<Arc<DataFile>>],
+        levels: &[Level],
         plan: &CompactionPlan,
     ) -> Option<VersionEdit> {
-        let input_level = plan.input_level as usize;
-        if input_level >= levels.len() {
-            return None;
-        }
-        let file = levels[input_level]
+        let file = levels
             .iter()
-            .find(|file| file.file_id == plan.base_file_id)
+            .find(|level| level.ordinal == plan.input_level)
+            .and_then(|level| {
+                level
+                    .files
+                    .iter()
+                    .find(|file| file.file_id == plan.base_file_id)
+            })
             .cloned()?;
         Some(VersionEdit {
             level_edits: vec![
