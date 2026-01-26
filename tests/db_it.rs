@@ -23,6 +23,9 @@ fn test_db_put_get_large_dataset() {
         compaction_policy: CompactionPolicyKind::RoundRobin,
         block_cache_size: 0,
         base_file_size: 1024 * 1024,
+        log_path: None,
+        log_console: true,
+        log_level: log::LevelFilter::Debug,
     };
     let db = Db::open(config).unwrap();
 

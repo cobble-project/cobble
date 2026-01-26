@@ -9,6 +9,7 @@ use crate::sst::block_cache::BlockCache;
 use crate::sst::row_codec::decode_value_masked;
 use crate::sst::{SSTIterator, SSTIteratorOptions};
 use crate::r#type::Value;
+use log::debug;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -49,6 +50,69 @@ pub(crate) struct VersionEdit {
     pub(crate) level_edits: Vec<LevelEdit>,
 }
 
+struct VersionEditSummary<'a>(&'a VersionEdit);
+
+impl std::fmt::Display for VersionEditSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "apply version edit [")?;
+        for (idx, level_edit) in self.0.level_edits.iter().enumerate() {
+            if idx > 0 {
+                write!(f, "; ")?;
+            }
+            write!(
+                f,
+                "L{} -{} +{}",
+                level_edit.level,
+                level_edit.removed_files.len(),
+                level_edit.new_files.len()
+            )?;
+            if !level_edit.removed_files.is_empty() {
+                write!(f, " removed=")?;
+                for (file_idx, file) in level_edit.removed_files.iter().enumerate() {
+                    if file_idx > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{}", file.file_id)?;
+                }
+            }
+            if !level_edit.new_files.is_empty() {
+                write!(f, " new=")?;
+                for (file_idx, file) in level_edit.new_files.iter().enumerate() {
+                    if file_idx > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{}", file.file_id)?;
+                }
+            }
+        }
+        write!(f, "]")
+    }
+}
+
+struct VersionSummary<'a>(&'a LSMTreeVersion);
+
+impl std::fmt::Display for VersionSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "current version [")?;
+        for (idx, level) in self.0.levels.iter().enumerate() {
+            if idx > 0 {
+                write!(f, "; ")?;
+            }
+            write!(f, "L{} files={}", level.ordinal, level.files.len())?;
+            if !level.files.is_empty() {
+                write!(f, " ids=")?;
+                for (file_idx, file) in level.files.iter().enumerate() {
+                    if file_idx > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{}", file.file_id)?;
+                }
+            }
+        }
+        write!(f, "]")
+    }
+}
+
 impl Default for LSMTree {
     fn default() -> Self {
         Self {
@@ -79,7 +143,7 @@ impl LSMTree {
     pub(crate) fn apply_edit(&mut self, edit: VersionEdit) {
         let mut new_levels = self.current_version.levels.clone();
 
-        for level_edit in edit.level_edits {
+        for level_edit in &edit.level_edits {
             if let Some(level) = new_levels
                 .iter_mut()
                 .find(|l| l.ordinal == level_edit.level)
@@ -140,6 +204,11 @@ impl LSMTree {
         }
 
         self.current_version = Arc::new(LSMTreeVersion { levels: new_levels });
+        debug!(
+            "{}. {}",
+            VersionEditSummary(&edit),
+            VersionSummary(&self.current_version)
+        );
         self.maybe_trigger_compaction();
     }
 
@@ -231,10 +300,15 @@ impl LSMTree {
         };
         if plan.trivial_move {
             if let Some(edit) = self.build_trivial_move_edit(&level_files, &plan) {
+                debug!(
+                    "compaction trivial move L{}->L{} file_id={}",
+                    plan.input_level, plan.output_level, plan.base_file_id
+                );
                 self.apply_edit(edit);
             }
             return;
         }
+        debug!("trigger compaction plan {}", plan);
         let runs = build_runs_for_plan(&level_files, &plan);
         if let Some(handle) = worker.submit_runs(
             runs,

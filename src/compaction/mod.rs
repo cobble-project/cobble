@@ -21,6 +21,7 @@ use crate::error::Result;
 use crate::iterator::SortedRun;
 use crate::lsm::VersionEdit;
 use crate::sst::SSTWriterOptions;
+use log::info;
 use std::sync::{Arc, Mutex, Weak};
 
 pub(crate) struct CompactionWorker {
@@ -81,6 +82,7 @@ impl CompactionWorker {
     }
 
     pub(crate) fn shutdown(self) {
+        info!("compaction worker shutdown");
         let mut executor = self.executor;
         executor.shutdown();
     }

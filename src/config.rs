@@ -30,6 +30,12 @@ pub struct Config {
     pub block_cache_size: usize,
     /// Target base SST file size in bytes.
     pub base_file_size: usize,
+    /// Optional log file path. If None, logs go to console only. Must be a local path.
+    pub log_path: Option<String>,
+    /// Whether to enable console logging.
+    pub log_console: bool,
+    /// Log level filter (trace, debug, info, warn, error, off).
+    pub log_level: log::LevelFilter,
 }
 
 impl Default for Config {
@@ -46,6 +52,9 @@ impl Default for Config {
             compaction_policy: CompactionPolicyKind::RoundRobin,
             block_cache_size: 64 * 1024 * 1024,
             base_file_size: 64 * 1024 * 1024,
+            log_path: None,
+            log_console: false,
+            log_level: log::LevelFilter::Info,
         }
     }
 }

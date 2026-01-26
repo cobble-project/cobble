@@ -11,6 +11,7 @@ use crate::lsm::LSMTree;
 use crate::memtable::Memtable;
 use crate::memtable::hash::HashMemtable;
 use crate::sst::{SSTWriter, SSTWriterOptions};
+use log::{debug, trace, warn};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
@@ -124,6 +125,7 @@ impl MemtableManager {
         let lsm_tree_clone = Arc::clone(&lsm_tree);
         runtime.spawn(async move {
             while let Some(job) = flush_rx.recv().await {
+                trace!("memtable flush start seq={}", job.seq);
                 let file_manager = Arc::clone(&file_manager_clone);
                 let file_builder_factory = Arc::clone(&file_builder_factory_clone);
                 let handle = tokio::task::spawn_blocking(move || {
@@ -148,6 +150,10 @@ impl MemtableManager {
                 let mut reclaim_buffer = false;
                 match result {
                     Ok(Some(res)) => {
+                        debug!(
+                            "memtable flush complete seq={} file_id={} size={}",
+                            res.seq, res.data_file.file_id, res.data_file.size
+                        );
                         if let Ok(mut tree) = lsm_tree_clone.lock() {
                             tree.add_level0_files(vec![Arc::clone(&res.data_file)]);
                         }
@@ -157,10 +163,12 @@ impl MemtableManager {
                         state.flush_results.push(Ok(res));
                     }
                     Ok(None) => {
+                        debug!("memtable flush skipped empty seq={}", completed_seq);
                         state.immutables.retain(|entry| entry.seq != completed_seq);
                         reclaim_buffer = true;
                     }
                     Err(err) => {
+                        warn!("memtable flush failed seq={} err={}", completed_seq, err);
                         #[cfg(test)]
                         state.flush_results.push(Err(err));
                         #[cfg(not(test))]

@@ -3,6 +3,7 @@ use crate::data_file::DataFile;
 use crate::file::FileId;
 use crate::iterator::SortedRun;
 use std::cmp::Ordering;
+use std::fmt;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
@@ -41,6 +42,23 @@ pub(crate) struct CompactionPlan {
     pub(crate) output_files: Vec<Arc<DataFile>>,
     pub(crate) base_file_id: u64,
     pub(crate) trivial_move: bool,
+}
+
+impl fmt::Display for CompactionPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "L{}->L{} base_file_id={} trivial_move={} output_files=[",
+            self.input_level, self.output_level, self.base_file_id, self.trivial_move
+        )?;
+        for (idx, file) in self.output_files.iter().enumerate() {
+            if idx > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "id={} size={}", file.file_id, file.size)?;
+        }
+        write!(f, "]")
+    }
 }
 
 pub(crate) trait CompactionPolicy: Send {

@@ -9,6 +9,7 @@ use crate::sst::row_codec::{decode_value, encode_key, encode_value};
 use crate::r#type::{Column, Key, Value, ValueType};
 use crate::write_batch::{WriteBatch, WriteOp};
 use bytes::Bytes;
+use log::info;
 use std::sync::{Arc, Mutex};
 
 /// Public database interface.
@@ -22,6 +23,7 @@ pub struct Db {
 impl Db {
     /// Open a database with the provided configuration.
     pub fn open(config: Config) -> Result<Self> {
+        Self::init_logging(&config);
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(config.path)?;
         let file_manager = Arc::new(FileManager::with_defaults(fs)?);
@@ -55,6 +57,14 @@ impl Db {
             Arc::clone(&file_manager),
             Arc::downgrade(&lsm_tree),
         ));
+        info!(
+            "db compaction configured: l0_limit={} l1_base={} multiplier={} max_level={} target_file_size={}",
+            compaction_options.l0_file_limit,
+            compaction_options.l1_base_bytes,
+            compaction_options.level_size_multiplier,
+            compaction_options.max_level,
+            compaction_options.target_file_size
+        );
         {
             let mut tree = lsm_tree.lock().unwrap();
             tree.configure_compaction(compaction_options, Some(Arc::clone(&compaction_worker)));
@@ -78,6 +88,32 @@ impl Db {
             memtable_manager,
             num_columns: config.num_columns,
         })
+    }
+
+    fn init_logging(config: &Config) {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let mut builder = log4rs::Config::builder();
+            let mut root = log4rs::config::Root::builder();
+            if config.log_console {
+                let stdout = log4rs::append::console::ConsoleAppender::builder().build();
+                builder = builder.appender(
+                    log4rs::config::Appender::builder().build("stdout", Box::new(stdout)),
+                );
+                root = root.appender("stdout");
+            }
+            if let Some(ref path) = config.log_path {
+                let file = log4rs::append::file::FileAppender::builder()
+                    .build(path)
+                    .unwrap();
+                builder = builder
+                    .appender(log4rs::config::Appender::builder().build("file", Box::new(file)));
+                root = root.appender("file");
+            }
+            let root = root.build(config.log_level);
+            let config = builder.build(root).unwrap();
+            let _ = log4rs::init_config(config);
+        });
     }
 
     /// Write a batch of operations to the database.

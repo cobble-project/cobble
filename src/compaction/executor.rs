@@ -13,6 +13,7 @@ use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
 use crate::lsm::{LevelEdit, VersionEdit};
 use crate::sst::SSTIteratorOptions;
+use log::trace;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -250,6 +251,10 @@ impl CompactionExecutor {
                     let file_id = current_file_id.take().unwrap();
                     let builder = current_builder.take().unwrap();
                     let (first_key, last_key, file_size) = builder.finish()?;
+                    trace!(
+                        "compaction output file level={} file_id={} size={}",
+                        task.output_level, file_id, file_size
+                    );
 
                     output_files.push(Arc::new(DataFile {
                         file_type: task.data_file_type,
@@ -271,6 +276,10 @@ impl CompactionExecutor {
         {
             let file_id = current_file_id.take().unwrap();
             let (first_key, last_key, file_size) = builder.finish()?;
+            trace!(
+                "compaction output file level={} file_id={} size={}",
+                task.output_level, file_id, file_size
+            );
 
             output_files.push(Arc::new(DataFile {
                 file_type: task.data_file_type,
@@ -305,6 +314,22 @@ impl CompactionExecutor {
         let edit = VersionEdit {
             level_edits: level_edits.into_values().collect(),
         };
+        let output_bytes = output_files.iter().map(|file| file.size).sum::<usize>();
+        trace!(
+            "compaction complete output_level={} input_files={} input_bytes={} output_files={} output_bytes={}",
+            task.output_level,
+            task.sorted_runs
+                .iter()
+                .map(|run| run.files().len())
+                .sum::<usize>(),
+            task.sorted_runs
+                .iter()
+                .flat_map(|run| run.files().iter())
+                .map(|file| file.size)
+                .sum::<usize>(),
+            output_files.len(),
+            output_bytes
+        );
         Ok(CompactionResult::new(output_files, edit))
     }
 }
