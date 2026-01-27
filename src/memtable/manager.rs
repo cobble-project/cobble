@@ -46,7 +46,7 @@ pub(crate) struct MemtableManager {
     file_manager: Arc<FileManager>,
     file_builder_factory: Arc<FileBuilderFactory>,
     num_columns: usize,
-    lsm_tree: Arc<Mutex<LSMTree>>,
+    lsm_tree: Arc<LSMTree>,
     flush_tx: Mutex<Option<mpsc::UnboundedSender<FlushJob>>>,
     runtime: Mutex<Option<Runtime>>,
 }
@@ -79,7 +79,7 @@ struct ImmutableMemtable {
 impl MemtableManager {
     pub(crate) fn new(
         file_manager: Arc<FileManager>,
-        lsm_tree: Arc<Mutex<LSMTree>>,
+        lsm_tree: Arc<LSMTree>,
         options: MemtableManagerOptions,
     ) -> Result<Self> {
         if options.buffer_count == 0 {
@@ -154,9 +154,7 @@ impl MemtableManager {
                             "memtable flush complete seq={} file_id={} size={}",
                             res.seq, res.data_file.file_id, res.data_file.size
                         );
-                        if let Ok(mut tree) = lsm_tree_clone.lock() {
-                            tree.add_level0_files(vec![Arc::clone(&res.data_file)]);
-                        }
+                        lsm_tree_clone.add_level0_files(vec![Arc::clone(&res.data_file)]);
                         state.immutables.retain(|entry| entry.seq != res.seq);
                         reclaim_buffer = true;
                         #[cfg(test)]
@@ -472,7 +470,7 @@ mod tests {
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
         let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
-        let lsm_tree = Arc::new(Mutex::new(crate::lsm::LSMTree::default()));
+        let lsm_tree = Arc::new(crate::lsm::LSMTree::default());
         let manager = MemtableManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
@@ -509,7 +507,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].as_ref().unwrap().seq, 0);
         let data_file = results[0].as_ref().unwrap().data_file.clone();
-        let level0_files = lsm_tree.lock().unwrap().level_files(0);
+        let level0_files = lsm_tree.level_files(0);
         assert_eq!(level0_files.len(), 1);
         assert_eq!(level0_files[0].file_id, data_file.file_id);
         let reader = file_manager
@@ -554,7 +552,7 @@ mod tests {
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
         let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
-        let lsm_tree = Arc::new(Mutex::new(crate::lsm::LSMTree::default()));
+        let lsm_tree = Arc::new(crate::lsm::LSMTree::default());
         let manager = MemtableManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
@@ -577,7 +575,7 @@ mod tests {
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
-        assert_eq!(lsm_tree.lock().unwrap().level_files(0).len(), 1);
+        assert_eq!(lsm_tree.level_files(0).len(), 1);
         {
             let state = manager.state.lock().unwrap();
             assert_eq!(state.free_buffers.len(), 1);
@@ -591,7 +589,7 @@ mod tests {
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
-        assert_eq!(lsm_tree.lock().unwrap().level_files(0).len(), 2);
+        assert_eq!(lsm_tree.level_files(0).len(), 2);
         cleanup_test_root();
     }
 }

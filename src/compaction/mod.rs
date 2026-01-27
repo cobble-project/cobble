@@ -22,13 +22,13 @@ use crate::iterator::SortedRun;
 use crate::lsm::VersionEdit;
 use crate::sst::SSTWriterOptions;
 use log::info;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 pub(crate) struct CompactionWorker {
     executor: CompactionExecutor,
     file_builder_factory: Arc<FileBuilderFactory>,
     file_manager: Arc<crate::file::FileManager>,
-    lsm_tree: Weak<Mutex<crate::lsm::LSMTree>>,
+    lsm_tree: Weak<crate::lsm::LSMTree>,
 }
 
 impl CompactionWorker {
@@ -36,7 +36,7 @@ impl CompactionWorker {
         executor: CompactionExecutor,
         file_builder_factory: Arc<FileBuilderFactory>,
         file_manager: Arc<crate::file::FileManager>,
-        lsm_tree: Weak<Mutex<crate::lsm::LSMTree>>,
+        lsm_tree: Weak<crate::lsm::LSMTree>,
     ) -> Self {
         Self {
             executor,
@@ -52,11 +52,9 @@ impl CompactionWorker {
     ) -> tokio::task::JoinHandle<Result<CompactionResult>> {
         let lsm_tree = self.lsm_tree.clone();
         let on_complete = Arc::new(move |edit: VersionEdit| {
-            if let Some(lsm_tree) = lsm_tree.upgrade()
-                && let Ok(mut tree) = lsm_tree.lock()
-            {
-                tree.on_compaction_complete();
-                tree.apply_edit(edit);
+            if let Some(lsm_tree) = lsm_tree.upgrade() {
+                lsm_tree.on_compaction_complete();
+                lsm_tree.apply_edit(edit);
             }
         });
         self.executor.execute(task, Some(on_complete))

@@ -146,6 +146,7 @@ checksum = "d7ee2cfacbd29706479902b06d75ad8f1362900836aa32799eabc7e004bfd854"
 name = "cobble"
 version = "0.0.1"
 dependencies = [
+ "arc-swap",
  "bytes",
  "dashmap",
  "foyer",

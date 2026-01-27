@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bytes = "1.11.0"
+arc-swap = "1.7.1"
 dashmap = "6.1.0"
 foyer = "0.22.3"
 log = "0.4.28"

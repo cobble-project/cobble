@@ -10,12 +10,12 @@ use crate::r#type::{Column, Key, Value, ValueType};
 use crate::write_batch::{WriteBatch, WriteOp};
 use bytes::Bytes;
 use log::info;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Public database interface.
 pub struct Db {
     file_manager: Arc<FileManager>,
-    lsm_tree: Arc<Mutex<LSMTree>>,
+    lsm_tree: Arc<LSMTree>,
     memtable_manager: MemtableManager,
     num_columns: usize,
 }
@@ -27,13 +27,11 @@ impl Db {
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(config.path)?;
         let file_manager = Arc::new(FileManager::with_defaults(fs)?);
-        let lsm_tree = Arc::new(Mutex::new(LSMTree::default()));
+        let mut lsm_tree = LSMTree::default();
         if config.block_cache_size > 0 {
-            lsm_tree
-                .lock()
-                .unwrap()
-                .set_block_cache(Some(new_block_cache(config.block_cache_size)));
+            lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
+        let lsm_tree = Arc::new(lsm_tree);
         let sst_options = SSTWriterOptions {
             num_columns: config.num_columns,
             ..SSTWriterOptions::default()
@@ -65,10 +63,7 @@ impl Db {
             compaction_options.max_level,
             compaction_options.target_file_size
         );
-        {
-            let mut tree = lsm_tree.lock().unwrap();
-            tree.configure_compaction(compaction_options, Some(Arc::clone(&compaction_worker)));
-        }
+        lsm_tree.configure_compaction(compaction_options, Some(Arc::clone(&compaction_worker)));
 
         // Memtable manager setup
         let memtable_manager = MemtableManager::new(
@@ -160,9 +155,7 @@ impl Db {
     /// Close the database and flush pending state.
     pub fn close(&self) -> Result<()> {
         self.memtable_manager.close()?;
-        if let Ok(mut tree) = self.lsm_tree.lock() {
-            tree.shutdown_compaction();
-        }
+        self.lsm_tree.shutdown_compaction();
         Ok(())
     }
 
@@ -191,7 +184,7 @@ impl Db {
         };
         let mut should_stop =
             self.num_columns > 1 && values.last().is_some_and(|value| value.is_terminal());
-        let lsm_values = self.lsm_tree.lock().unwrap().get(
+        let lsm_values = self.lsm_tree.get(
             &self.file_manager,
             encoded_key.as_ref(),
             self.num_columns,
@@ -266,12 +259,12 @@ mod tests {
 
         let results = db.memtable_manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
-        assert_eq!(db.lsm_tree.lock().unwrap().level_files(0).len(), 1);
+        assert_eq!(db.lsm_tree.level_files(0).len(), 1);
 
         db.memtable_manager.flush_active().unwrap();
         let results = db.memtable_manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
-        assert_eq!(db.lsm_tree.lock().unwrap().level_files(0).len(), 2);
+        assert_eq!(db.lsm_tree.level_files(0).len(), 2);
 
         cleanup_test_root(root);
     }
