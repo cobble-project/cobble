@@ -6,6 +6,7 @@ mod compaction;
 mod config;
 mod data_file;
 mod db;
+mod db_state;
 mod error;
 mod file;
 mod format;

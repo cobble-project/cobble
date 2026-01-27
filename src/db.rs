@@ -12,6 +12,8 @@ use bytes::Bytes;
 use log::info;
 use std::sync::Arc;
 
+use crate::db_state::DbStateHandle;
+
 /// Public database interface.
 pub struct Db {
     file_manager: Arc<FileManager>,
@@ -27,7 +29,8 @@ impl Db {
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(config.path)?;
         let file_manager = Arc::new(FileManager::with_defaults(fs)?);
-        let mut lsm_tree = LSMTree::default();
+        let db_state = Arc::new(DbStateHandle::new());
+        let mut lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
         if config.block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }

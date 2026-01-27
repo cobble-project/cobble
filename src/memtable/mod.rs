@@ -5,7 +5,9 @@ use crate::error::Result;
 use crate::iterator::KvIterator;
 
 #[allow(unused_imports)]
-pub(crate) use manager::{MemtableFlushResult, MemtableManager, MemtableManagerOptions};
+pub(crate) use manager::{
+    ActiveMemtable, ImmutableMemtable, MemtableFlushResult, MemtableManager, MemtableManagerOptions,
+};
 
 /// Trait for memtable implementations.
 pub(crate) trait Memtable {

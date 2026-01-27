@@ -1,8 +1,8 @@
 use bytes::Bytes;
-use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::data_file::{DataFile, DataFileType};
+use crate::db_state::{DbState, DbStateHandle};
 use crate::error::{Error, Result};
 use crate::file::FileManager;
 use crate::format::{FileBuilder, FileBuilderFactory};
@@ -47,13 +47,12 @@ pub(crate) struct MemtableManager {
     file_builder_factory: Arc<FileBuilderFactory>,
     num_columns: usize,
     lsm_tree: Arc<LSMTree>,
+    db_state: Arc<DbStateHandle>,
     flush_tx: Mutex<Option<mpsc::UnboundedSender<FlushJob>>>,
     runtime: Mutex<Option<Runtime>>,
 }
 
 struct MemtableManagerState {
-    active: Option<ActiveMemtable>,
-    immutables: VecDeque<ImmutableMemtable>,
     free_buffers: Vec<Vec<u8>>,
     in_flight: usize,
     next_seq: u64,
@@ -66,13 +65,14 @@ struct FlushJob {
     memtable: Arc<HashMemtable>,
 }
 
-struct ActiveMemtable {
+pub(crate) struct ActiveMemtable {
     seq: u64,
-    memtable: HashMemtable,
+    memtable: Option<HashMemtable>,
 }
 
-struct ImmutableMemtable {
-    seq: u64,
+#[derive(Clone)]
+pub(crate) struct ImmutableMemtable {
+    pub(crate) seq: u64,
     memtable: Arc<HashMemtable>,
 }
 
@@ -91,17 +91,10 @@ impl MemtableManager {
         for _ in 0..options.buffer_count {
             buffers.push(vec![0u8; options.memtable_capacity]);
         }
-        let active_buffer = buffers.pop().expect("buffer_count > 0");
-        let active = HashMemtable::with_buffer(active_buffer);
         let state = MemtableManagerState {
-            active: Some(ActiveMemtable {
-                seq: 0,
-                memtable: active,
-            }),
-            immutables: VecDeque::new(),
             free_buffers: buffers,
             in_flight: 0,
-            next_seq: 1,
+            next_seq: 0,
             #[cfg(test)]
             flush_results: Vec::new(),
         };
@@ -110,6 +103,45 @@ impl MemtableManager {
         let file_builder_factory = options
             .file_builder_factory
             .unwrap_or_else(|| Arc::new(make_sst_builder_factory(options.sst_options.clone())));
+        let db_state = lsm_tree.db_state();
+        {
+            // init the first active buffer
+            let mut state = state.lock().unwrap();
+            Self::make_active_buffer(&mut state, &db_state);
+        }
+        // Initialize the flush runtime
+        let (runtime, flush_tx) = Self::init_flush_runtime(
+            Arc::clone(&state),
+            Arc::clone(&buffer_ready),
+            Arc::clone(&file_manager),
+            Arc::clone(&file_builder_factory),
+            options.num_columns,
+            Arc::clone(&lsm_tree),
+            Arc::clone(&db_state),
+        )?;
+        Ok(Self {
+            state,
+            buffer_ready,
+            file_manager,
+            file_builder_factory,
+            num_columns: options.num_columns,
+            lsm_tree,
+            db_state,
+            flush_tx: Mutex::new(Some(flush_tx)),
+            runtime: Mutex::new(Some(runtime)),
+        })
+    }
+
+    /// Initializes the flush runtime and returns the runtime and flush sender.
+    fn init_flush_runtime(
+        state: Arc<Mutex<MemtableManagerState>>,
+        buffer_ready: Arc<Condvar>,
+        file_manager: Arc<FileManager>,
+        file_builder_factory: Arc<FileBuilderFactory>,
+        num_columns: usize,
+        lsm_tree: Arc<LSMTree>,
+        db_state: Arc<DbStateHandle>,
+    ) -> Result<(tokio::runtime::Runtime, mpsc::UnboundedSender<FlushJob>)> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .thread_name("cobble-flush")
             .worker_threads(1)
@@ -121,8 +153,8 @@ impl MemtableManager {
         let buffer_ready_clone = Arc::clone(&buffer_ready);
         let file_manager_clone = Arc::clone(&file_manager);
         let file_builder_factory_clone = Arc::clone(&file_builder_factory);
-        let num_columns = options.num_columns;
         let lsm_tree_clone = Arc::clone(&lsm_tree);
+        let db_state_clone = Arc::clone(&db_state);
         runtime.spawn(async move {
             while let Some(job) = flush_rx.recv().await {
                 trace!("memtable flush start seq={}", job.seq);
@@ -149,21 +181,15 @@ impl MemtableManager {
                 state.in_flight = state.in_flight.saturating_sub(1);
                 let mut reclaim_buffer = false;
                 match result {
-                    Ok(Some(res)) => {
+                    Ok(res) => {
                         debug!(
                             "memtable flush complete seq={} file_id={} size={}",
                             res.seq, res.data_file.file_id, res.data_file.size
                         );
-                        lsm_tree_clone.add_level0_files(vec![Arc::clone(&res.data_file)]);
-                        state.immutables.retain(|entry| entry.seq != res.seq);
+                        lsm_tree_clone.add_level0_files(res.seq, vec![Arc::clone(&res.data_file)]);
                         reclaim_buffer = true;
                         #[cfg(test)]
                         state.flush_results.push(Ok(res));
-                    }
-                    Ok(None) => {
-                        debug!("memtable flush skipped empty seq={}", completed_seq);
-                        state.immutables.retain(|entry| entry.seq != completed_seq);
-                        reclaim_buffer = true;
                     }
                     Err(err) => {
                         warn!("memtable flush failed seq={} err={}", completed_seq, err);
@@ -183,60 +209,64 @@ impl MemtableManager {
                     if !buffer.is_empty() {
                         state.free_buffers.push(buffer);
                     }
-                    Self::make_active_buffer(&mut state);
+                    Self::make_active_buffer(&mut state, &db_state_clone);
                 }
                 buffer_ready_clone.notify_all();
             }
         });
-        Ok(Self {
-            state,
-            buffer_ready,
-            file_manager,
-            file_builder_factory,
-            num_columns: options.num_columns,
-            lsm_tree,
-            flush_tx: Mutex::new(Some(flush_tx)),
-            runtime: Mutex::new(Some(runtime)),
-        })
+        Ok((runtime, flush_tx))
     }
 
     /// Makes an active memtable from a free buffer if none exists.
     /// Assumes the caller holds the lock on the state.
-    fn make_active_buffer(state: &mut MemtableManagerState) {
-        if state.active.is_none() && !state.free_buffers.is_empty() {
+    fn make_active_buffer(state: &mut MemtableManagerState, db_state: &DbStateHandle) {
+        let _guard = db_state.lock();
+        let snapshot = db_state.load();
+        if snapshot.active.is_none() && !state.free_buffers.is_empty() {
             let buffer = state.free_buffers.pop().expect("free buffer exists");
             let seq = state.next_seq;
             state.next_seq += 1;
-            state.active = Some(ActiveMemtable {
+            let active = Arc::new(Mutex::new(ActiveMemtable {
                 seq,
-                memtable: HashMemtable::with_buffer(buffer),
+                memtable: Some(HashMemtable::with_buffer(buffer)),
+            }));
+            db_state.cas_mutate(snapshot.seq_id, |db_state, snapshot| {
+                DbState::new(
+                    db_state,
+                    snapshot.lsm_version.clone(),
+                    Some(Arc::clone(&active)),
+                    snapshot.immutables.clone(),
+                )
             });
         }
     }
 
     pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         loop {
-            let mut state = self.state.lock().unwrap();
-            while state.active.is_none() {
-                state = self.buffer_ready.wait(state).unwrap();
+            // Wait for an active memtable to be available.
+            if self.db_state.load().active.is_none() {
+                let mut state = self.state.lock().unwrap();
+                while self.db_state.load().active.is_none() {
+                    state = self.buffer_ready.wait(state).unwrap();
+                }
+                drop(state);
             }
-            let active = state.active.as_mut().expect("active memtable exists");
-            match active.memtable.put(key, value) {
+            let active = self
+                .db_state
+                .load()
+                .active
+                .clone()
+                .expect("active memtable exists");
+            let mut active = active.lock().unwrap();
+            let memtable = active.memtable.as_mut().expect("active memtable exists");
+            match memtable.put(key, value) {
                 Ok(()) => return Ok(()),
                 Err(Error::MemtableFull { needed, remaining }) => {
-                    if active.memtable.is_empty() {
+                    if memtable.is_empty() {
                         return Err(Error::MemtableFull { needed, remaining });
                     }
-                    let active_memtable = state.active.take().expect("active memtable exists");
-                    let sealed = Arc::new(active_memtable.memtable);
-                    state.immutables.push_back(ImmutableMemtable {
-                        seq: active_memtable.seq,
-                        memtable: Arc::clone(&sealed),
-                    });
-                    Self::make_active_buffer(&mut state);
-                    state.in_flight += 1;
-                    drop(state);
-                    self.spawn_flush(active_memtable.seq, sealed);
+                    drop(active);
+                    self.flush_active()?;
                 }
                 Err(err) => return Err(err),
             }
@@ -252,19 +282,21 @@ impl MemtableManager {
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
-        let mut state = self.state.lock().unwrap();
-        while state.active.is_none() {
-            state = self.buffer_ready.wait(state).unwrap();
+        let mut min_seq = u64::MAX;
+        let snapshot = self.db_state.load();
+        if let Some(active) = &snapshot.active {
+            let active = active.lock().unwrap();
+            let memtable = active.memtable.as_ref().expect("active memtable exists");
+            min_seq = active.seq;
+            for value in memtable.get_all(key) {
+                f(value)?;
+            }
+            drop(active);
         }
-        let mut min_seq = state.active.as_ref().map(|entry| entry.seq).unwrap_or(0);
-        if let Some(front) = state.immutables.front() {
+        if let Some(front) = snapshot.immutables.front() {
             min_seq = min_seq.min(front.seq);
         }
-        let active = state.active.as_ref().expect("active memtable exists");
-        for value in active.memtable.get_all(key) {
-            f(value)?;
-        }
-        for immutable in state.immutables.iter().rev() {
+        for immutable in snapshot.immutables.iter().rev() {
             for value in immutable.memtable.get_all(key) {
                 f(value)?;
             }
@@ -274,26 +306,36 @@ impl MemtableManager {
 
     pub(crate) fn flush_active(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        while state.active.is_none() {
-            state = self.buffer_ready.wait(state).unwrap();
-        }
-        let should_flush = state
-            .active
-            .as_ref()
-            .is_some_and(|memtable| !memtable.memtable.is_empty());
-        if !should_flush {
-            return Ok(());
-        }
-        let active_memtable = state.active.take().expect("active memtable exists");
-        let sealed = Arc::new(active_memtable.memtable);
-        state.immutables.push_back(ImmutableMemtable {
-            seq: active_memtable.seq,
-            memtable: Arc::clone(&sealed),
-        });
-        Self::make_active_buffer(&mut state);
+        let guard = self.db_state.lock();
+        let snapshot = self.db_state.load();
+        let mut to_flush = None;
+        self.db_state
+            .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
+                let active = snapshot.active.clone().expect("active memtable exists");
+                let mut inner_active = active.lock().unwrap();
+                let active_memtable = inner_active
+                    .memtable
+                    .take()
+                    .expect("active memtable exists");
+                let mut immutables = snapshot.immutables.clone();
+                let new_immutable = ImmutableMemtable {
+                    seq: inner_active.seq,
+                    memtable: Arc::new(active_memtable),
+                };
+                to_flush = Some(new_immutable.clone());
+                immutables.push_back(new_immutable);
+
+                DbState::new(db_state, snapshot.lsm_version.clone(), None, immutables)
+            });
+        drop(guard);
+        Self::make_active_buffer(&mut state, &self.db_state);
         state.in_flight += 1;
         drop(state);
-        self.spawn_flush(active_memtable.seq, sealed);
+
+        let Some(to_flush) = to_flush else {
+            return Ok(());
+        };
+        self.spawn_flush(to_flush.seq, to_flush.memtable);
         Ok(())
     }
 
@@ -331,7 +373,7 @@ impl MemtableManager {
             && sender.send(FlushJob { seq, memtable }).is_err()
         {
             let mut state = self.state.lock().unwrap();
-            Self::make_active_buffer(&mut state);
+            Self::make_active_buffer(&mut state, &self.db_state);
             state.in_flight = state.in_flight.saturating_sub(1);
             #[cfg(test)]
             state
@@ -340,7 +382,7 @@ impl MemtableManager {
             self.buffer_ready.notify_all();
         } else if sender.is_none() {
             let mut state = self.state.lock().unwrap();
-            Self::make_active_buffer(&mut state);
+            Self::make_active_buffer(&mut state, &self.db_state);
             state.in_flight = state.in_flight.saturating_sub(1);
             #[cfg(test)]
             state
@@ -363,11 +405,8 @@ fn flush_memtable(
     file_manager: Arc<FileManager>,
     file_builder_factory: Arc<FileBuilderFactory>,
     num_columns: usize,
-) -> (Result<Option<MemtableFlushResult>>, Arc<HashMemtable>, u64) {
+) -> (Result<MemtableFlushResult>, Arc<HashMemtable>, u64) {
     let result = (|| {
-        if memtable.is_empty() {
-            return Ok(None);
-        }
         let (file_id, writer) = file_manager.create_data_file()?;
         let mut builder = (file_builder_factory)(Box::new(writer));
         let mut dedup_iter =
@@ -388,10 +427,10 @@ fn flush_memtable(
             size: file_size,
             seq,
         };
-        Ok(Some(MemtableFlushResult {
+        Ok(MemtableFlushResult {
             data_file: Arc::new(data_file),
             seq,
-        }))
+        })
     })();
     (result, memtable, seq)
 }

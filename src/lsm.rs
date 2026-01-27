@@ -9,10 +9,10 @@ use crate::sst::block_cache::BlockCache;
 use crate::sst::row_codec::decode_value_masked;
 use crate::sst::{SSTIterator, SSTIteratorOptions};
 use crate::r#type::Value;
-use arc_swap::ArcSwap;
 use log::debug;
 use std::sync::{Arc, Mutex};
 
+use crate::db_state::{DbState, DbStateHandle};
 #[derive(Clone)]
 pub(crate) struct Level {
     pub(crate) ordinal: u8,
@@ -26,11 +26,11 @@ pub(crate) struct LevelOptions {
 
 #[derive(Clone)]
 pub(crate) struct LSMTreeVersion {
-    levels: Vec<Level>,
+    pub(crate) levels: Vec<Level>,
 }
 
 pub(crate) struct LSMTree {
-    current_version: ArcSwap<LSMTreeVersion>,
+    db_state: Arc<DbStateHandle>,
     block_cache: Option<BlockCache>,
     state: Mutex<LSMTreeState>,
 }
@@ -120,8 +120,14 @@ impl std::fmt::Display for VersionSummary<'_> {
 
 impl Default for LSMTree {
     fn default() -> Self {
+        Self::with_state(Arc::new(DbStateHandle::new()))
+    }
+}
+
+impl LSMTree {
+    pub(crate) fn with_state(db_state: Arc<DbStateHandle>) -> Self {
         Self {
-            current_version: ArcSwap::from_pointee(LSMTreeVersion { levels: vec![] }),
+            db_state,
             block_cache: None,
             state: Mutex::new(LSMTreeState {
                 // at least 2 level option
@@ -136,9 +142,7 @@ impl Default for LSMTree {
             }),
         }
     }
-}
 
-impl LSMTree {
     fn get_level_option(state: &LSMTreeState, level: u8) -> &LevelOptions {
         if let Some(opt) = state.level_options.get(level as usize) {
             opt
@@ -147,13 +151,24 @@ impl LSMTree {
         }
     }
 
-    pub(crate) fn apply_edit(&self, edit: VersionEdit) {
-        let mut state = self.state.lock().unwrap();
-        self.apply_edit_locked(&mut state, edit);
+    pub(crate) fn db_state(&self) -> Arc<DbStateHandle> {
+        Arc::clone(&self.db_state)
     }
 
-    fn apply_edit_locked(&self, state: &mut LSMTreeState, edit: VersionEdit) {
-        let mut new_levels = self.current_version.load().levels.clone();
+    pub(crate) fn apply_edit(&self, edit: VersionEdit) {
+        let mut state = self.state.lock().unwrap();
+        self.apply_edit_locked(&mut state, edit, |_db_state| {});
+    }
+
+    fn apply_edit_locked(
+        &self,
+        state: &mut LSMTreeState,
+        edit: VersionEdit,
+        fix: impl Fn(&mut DbState),
+    ) {
+        let guard = self.db_state.lock();
+        let snapshot = self.db_state.load();
+        let mut new_levels = snapshot.lsm_version.levels.clone();
 
         for level_edit in &edit.level_edits {
             if let Some(level) = new_levels
@@ -219,17 +234,33 @@ impl LSMTree {
             }
         }
 
-        self.current_version
-            .store(Arc::new(LSMTreeVersion { levels: new_levels }));
+        self.db_state
+            .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
+                let mut new_db_state = DbState::new(
+                    db_state,
+                    LSMTreeVersion {
+                        levels: new_levels.clone(),
+                    },
+                    snapshot.active.clone(),
+                    snapshot.immutables.clone(),
+                );
+                fix(&mut new_db_state);
+                new_db_state
+            });
+        drop(guard);
         debug!(
             "{}. {}",
             VersionEditSummary(&edit),
-            VersionSummary(&self.current_version.load())
+            VersionSummary(&self.db_state.load().lsm_version)
         );
         self.maybe_trigger_compaction_locked(state);
     }
 
-    pub(crate) fn add_level0_files(&self, new_files: Vec<Arc<DataFile>>) {
+    pub(crate) fn add_level0_files(
+        &self,
+        to_remove_memtable_seq: u64,
+        new_files: Vec<Arc<DataFile>>,
+    ) {
         if new_files.is_empty() {
             return;
         }
@@ -240,12 +271,18 @@ impl LSMTree {
                 new_files,
             }],
         };
-        self.apply_edit(edit);
+        let mut state = self.state.lock().unwrap();
+        self.apply_edit_locked(&mut state, edit, |db_state| {
+            db_state
+                .immutables
+                .retain(|imm| imm.seq != to_remove_memtable_seq);
+        });
     }
 
     pub(crate) fn level_files(&self, level: u8) -> Vec<Arc<DataFile>> {
-        self.current_version
+        self.db_state
             .load()
+            .lsm_version
             .levels
             .iter()
             .find(|l| l.ordinal == level)
@@ -300,10 +337,10 @@ impl LSMTree {
         if state.pending_compaction {
             return;
         }
-        let levels_snapshot = self.current_version.load();
+        let levels_snapshot = self.db_state.load();
         let plan = state
             .compaction_policy
-            .pick(&levels_snapshot.levels, state.compaction_config);
+            .pick(&levels_snapshot.lsm_version.levels, state.compaction_config);
         let Some(plan) = plan else {
             return;
         };
@@ -311,17 +348,19 @@ impl LSMTree {
             return;
         };
         if plan.trivial_move {
-            if let Some(edit) = self.build_trivial_move_edit(&levels_snapshot.levels, &plan) {
+            if let Some(edit) =
+                self.build_trivial_move_edit(&levels_snapshot.lsm_version.levels, &plan)
+            {
                 debug!(
                     "compaction trivial move L{}->L{} file_id={}",
                     plan.input_level, plan.output_level, plan.base_file_id
                 );
-                self.apply_edit_locked(state, edit);
+                self.apply_edit_locked(state, edit, |_db_state| {});
             }
             return;
         }
         debug!("trigger compaction plan {}", plan);
-        let runs = build_runs_for_plan(&levels_snapshot.levels, &plan);
+        let runs = build_runs_for_plan(&levels_snapshot.lsm_version.levels, &plan);
         if let Some(handle) = worker.submit_runs(
             runs,
             plan.output_level,
@@ -397,7 +436,7 @@ impl LSMTree {
             }
         }
 
-        for level in self.current_version.load().levels.iter() {
+        for level in self.db_state.load().lsm_version.levels.iter() {
             if level.tiered {
                 for file in level.files.iter().rev() {
                     if let Some(max_seq) = max_seq
@@ -502,6 +541,7 @@ impl LSMTree {
 mod tests {
     use super::*;
     use crate::data_file::DataFileType;
+    use crate::db_state::{DbState, DbStateHandle};
     use crate::file::{FileId, FileManager, FileSystemRegistry};
     use crate::sst::row_codec::{encode_key, encode_value};
     use crate::sst::{SSTWriter, SSTWriterOptions};
@@ -578,8 +618,10 @@ mod tests {
 
     #[test]
     fn test_lsm_tree_apply_edit() {
-        let lsm_tree = LSMTree {
-            current_version: ArcSwap::from_pointee(LSMTreeVersion {
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(DbState {
+            seq_id: 0,
+            lsm_version: LSMTreeVersion {
                 levels: vec![
                     Level {
                         ordinal: 0,
@@ -592,12 +634,14 @@ mod tests {
                         files: vec![create_data_file(b"e", b"f"), create_data_file(b"g", b"h")],
                     },
                 ],
-            }),
-            ..Default::default()
-        };
+            },
+            active: None,
+            immutables: Vec::new().into(),
+        });
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
 
         // Create a version edit to remove one file from level 0 and add two new files
-        let current_version = lsm_tree.current_version.load();
+        let current_version = db_state.load().lsm_version.clone();
         let edit = VersionEdit {
             level_edits: vec![
                 LevelEdit {
@@ -619,7 +663,7 @@ mod tests {
         lsm_tree.apply_edit(edit);
 
         // Verify the new version
-        let version = lsm_tree.current_version.load();
+        let version = db_state.load().lsm_version.clone();
         assert_eq!(version.levels.len(), 2);
 
         let level0 = &version.levels[0];
@@ -654,8 +698,10 @@ mod tests {
             ..crate::compaction::CompactionConfig::default()
         };
         let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions::default());
-        let lsm_tree = Arc::new(LSMTree {
-            current_version: ArcSwap::from_pointee(LSMTreeVersion {
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(DbState {
+            seq_id: 0,
+            lsm_version: LSMTreeVersion {
                 levels: vec![
                     Level {
                         ordinal: 0,
@@ -676,9 +722,11 @@ mod tests {
                         files: vec![create_data_file_with_size(b"e", b"f", 1)],
                     },
                 ],
-            }),
-            ..Default::default()
+            },
+            active: None,
+            immutables: Vec::new().into(),
         });
+        let lsm_tree = Arc::new(LSMTree::with_state(Arc::clone(&db_state)));
         let worker = Arc::new(crate::compaction::CompactionWorker::new(
             crate::compaction::CompactionExecutor::new(config).unwrap(),
             factory,
@@ -687,8 +735,9 @@ mod tests {
         ));
         lsm_tree.configure_compaction(config, Some(Arc::clone(&worker)));
         let target = lsm_tree
-            .current_version
+            .db_state
             .load()
+            .lsm_version
             .levels
             .iter()
             .find(|level| level.ordinal == 1)
@@ -733,16 +782,20 @@ mod tests {
             vec![(b"k1", &make_value_bytes(b"new", num_columns))],
         )
         .unwrap();
-        let lsm_tree = LSMTree {
-            current_version: ArcSwap::from_pointee(LSMTreeVersion {
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(DbState {
+            seq_id: 0,
+            lsm_version: LSMTreeVersion {
                 levels: vec![Level {
                     ordinal: 0,
                     tiered: true,
                     files: vec![older, newer],
                 }],
-            }),
-            ..Default::default()
-        };
+            },
+            active: None,
+            immutables: Vec::new().into(),
+        });
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
         let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));
         let value = lsm_tree
             .get(
@@ -781,16 +834,20 @@ mod tests {
             vec![(b"k1", &make_value_bytes(b"new", num_columns))],
         )
         .unwrap();
-        let lsm_tree = LSMTree {
-            current_version: ArcSwap::from_pointee(LSMTreeVersion {
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(DbState {
+            seq_id: 0,
+            lsm_version: LSMTreeVersion {
                 levels: vec![Level {
                     ordinal: 0,
                     tiered: true,
                     files: vec![older, newer],
                 }],
-            }),
-            ..Default::default()
-        };
+            },
+            active: None,
+            immutables: Vec::new().into(),
+        });
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
         let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));
         let value = lsm_tree
             .get(&file_manager, encoded_key.as_ref(), num_columns, None, None)
