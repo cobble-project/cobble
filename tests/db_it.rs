@@ -17,6 +17,7 @@ fn test_db_put_get_large_dataset() {
         memtable_buffer_count: 2,
         num_columns: 1,
         l0_file_limit: 2,
+        write_stall_limit: None,
         l1_base_bytes: 16 * 1024 * 1024,
         level_size_multiplier: 2,
         max_level: 4,
@@ -26,6 +27,7 @@ fn test_db_put_get_large_dataset() {
         log_path: None,
         log_console: true,
         log_level: log::LevelFilter::Debug,
+        ..Config::default()
     };
     let db = Db::open(config).unwrap();
 

@@ -26,6 +26,7 @@ pub(crate) struct MemtableManagerOptions {
     pub(crate) sst_options: SSTWriterOptions,
     pub(crate) file_builder_factory: Option<Arc<FileBuilderFactory>>,
     pub(crate) num_columns: usize,
+    pub(crate) write_stall_limit: usize,
 }
 
 impl Default for MemtableManagerOptions {
@@ -36,6 +37,7 @@ impl Default for MemtableManagerOptions {
             sst_options: SSTWriterOptions::default(),
             file_builder_factory: None,
             num_columns: 1,
+            write_stall_limit: 8,
         }
     }
 }
@@ -48,6 +50,7 @@ pub(crate) struct MemtableManager {
     num_columns: usize,
     lsm_tree: Arc<LSMTree>,
     db_state: Arc<DbStateHandle>,
+    write_stall_limit: usize,
     flush_tx: Mutex<Option<mpsc::UnboundedSender<FlushJob>>>,
     runtime: Mutex<Option<Runtime>>,
 }
@@ -127,6 +130,7 @@ impl MemtableManager {
             num_columns: options.num_columns,
             lsm_tree,
             db_state,
+            write_stall_limit: options.write_stall_limit,
             flush_tx: Mutex::new(Some(flush_tx)),
             runtime: Mutex::new(Some(runtime)),
         })
@@ -306,7 +310,8 @@ impl MemtableManager {
 
     pub(crate) fn flush_active(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        let guard = self.db_state.lock();
+        let mut guard = self.db_state.lock();
+        guard = self.wait_for_write_stall_under_guard(guard);
         let snapshot = self.db_state.load();
         let mut to_flush = None;
         self.db_state
@@ -390,6 +395,29 @@ impl MemtableManager {
                 .push(Err(Error::IoError("Memtable manager closed".to_string())));
             self.buffer_ready.notify_all();
         }
+    }
+
+    fn wait_for_write_stall_under_guard<'a>(
+        &self,
+        mut guard: std::sync::MutexGuard<'a, ()>,
+    ) -> std::sync::MutexGuard<'a, ()> {
+        while Self::should_write_stall_with_snapshot(&self.db_state.load(), self.write_stall_limit)
+        {
+            guard = self.db_state.wait_for_change(guard);
+        }
+        guard
+    }
+
+    fn should_write_stall_with_snapshot(snapshot: &DbState, write_stall_limit: usize) -> bool {
+        let immutables = snapshot.immutables.len();
+        let level0 = snapshot
+            .lsm_version
+            .levels
+            .iter()
+            .find(|level| level.ordinal == 0)
+            .map(|level| level.files.len())
+            .unwrap_or(0);
+        immutables + level0 > write_stall_limit
     }
 }
 
@@ -519,6 +547,7 @@ mod tests {
                 sst_options: SSTWriterOptions::default(),
                 file_builder_factory: None,
                 num_columns: 1,
+                write_stall_limit: 8,
             },
         )
         .unwrap();
@@ -601,6 +630,7 @@ mod tests {
                 sst_options: SSTWriterOptions::default(),
                 file_builder_factory: None,
                 num_columns: 1,
+                write_stall_limit: 8,
             },
         )
         .unwrap();

@@ -27,7 +27,7 @@ impl Db {
     pub fn open(config: Config) -> Result<Self> {
         Self::init_logging(&config);
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(config.path)?;
+        let fs = registry.get_or_register(config.path.clone())?;
         let file_manager = Arc::new(FileManager::with_defaults(fs)?);
         let db_state = Arc::new(DbStateHandle::new());
         let mut lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
@@ -78,6 +78,7 @@ impl Db {
                 sst_options,
                 file_builder_factory: None,
                 num_columns: config.num_columns,
+                write_stall_limit: config.resolved_write_stall_limit(),
             },
         )?;
         Ok(Self {

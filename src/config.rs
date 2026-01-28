@@ -1,3 +1,5 @@
+use log::warn;
+
 /// Compaction policy selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompactionPolicyKind {
@@ -18,6 +20,9 @@ pub struct Config {
     pub num_columns: usize,
     /// Maximum number of L0 files before triggering compaction.
     pub l0_file_limit: usize,
+    /// Maximum number of immutables + L0 files before write stall.
+    /// If None, uses min(l0_file_limit + 4, l0_file_limit * 2).
+    pub write_stall_limit: Option<usize>,
     /// Base size for level 1.
     pub l1_base_bytes: usize,
     /// Size multiplier for deeper levels.
@@ -46,6 +51,7 @@ impl Default for Config {
             memtable_buffer_count: 2,
             num_columns: 1,
             l0_file_limit: 4,
+            write_stall_limit: None,
             l1_base_bytes: 64 * 1024 * 1024,
             level_size_multiplier: 10,
             max_level: 6,
@@ -55,6 +61,29 @@ impl Default for Config {
             log_path: None,
             log_console: false,
             log_level: log::LevelFilter::Info,
+        }
+    }
+}
+
+impl Config {
+    pub(crate) fn resolved_write_stall_limit(&self) -> usize {
+        let default_limit = self
+            .l0_file_limit
+            .saturating_add(4)
+            .min(self.l0_file_limit.saturating_mul(2));
+        match self.write_stall_limit {
+            Some(limit) => {
+                if limit > self.l0_file_limit.saturating_add(1) {
+                    limit
+                } else {
+                    warn!(
+                        "write stall limit {} invalid for l0 limit {}; using default as {}",
+                        limit, self.l0_file_limit, default_limit
+                    );
+                    default_limit
+                }
+            }
+            _ => default_limit,
         }
     }
 }

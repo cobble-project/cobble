@@ -3,7 +3,7 @@ use crate::memtable::{ActiveMemtable, ImmutableMemtable};
 use arc_swap::ArcSwap;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 pub(crate) struct DbState {
     pub(crate) seq_id: u64,
@@ -33,6 +33,7 @@ pub(crate) struct DbStateHandle {
     current: ArcSwap<DbState>,
     lock: Mutex<()>,
     next_seq_id: AtomicU64,
+    changed: Condvar,
 }
 
 impl DbStateHandle {
@@ -46,6 +47,7 @@ impl DbStateHandle {
             }),
             lock: Mutex::new(()),
             next_seq_id: AtomicU64::new(1),
+            changed: Condvar::new(),
         }
     }
 
@@ -60,6 +62,13 @@ impl DbStateHandle {
 
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
         self.lock.lock().unwrap()
+    }
+
+    pub(crate) fn wait_for_change<'a>(
+        &self,
+        guard: std::sync::MutexGuard<'a, ()>,
+    ) -> std::sync::MutexGuard<'a, ()> {
+        self.changed.wait(guard).unwrap()
     }
 
     pub(crate) fn cas_mutate<F>(&self, expected: u64, f: F) -> bool
@@ -77,5 +86,6 @@ impl DbStateHandle {
 
     pub(crate) fn store(&self, new_version: DbState) {
         self.current.store(Arc::new(new_version));
+        self.changed.notify_all();
     }
 }
