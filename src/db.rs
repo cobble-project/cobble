@@ -1,4 +1,3 @@
-use crate::Config;
 use crate::error::{Error, Result};
 use crate::file::{FileManager, FileSystemRegistry};
 use crate::lsm::LSMTree;
@@ -8,11 +7,13 @@ use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value, encode_key, encode_value};
 use crate::r#type::{Column, Key, Value, ValueType};
 use crate::write_batch::{WriteBatch, WriteOp};
+use crate::{Config, TimeProvider};
 use bytes::Bytes;
 use log::info;
 use std::sync::Arc;
 
 use crate::db_state::DbStateHandle;
+use crate::ttl::{TTLProvider, TtlConfig};
 
 /// Public database interface.
 pub struct Db {
@@ -20,6 +21,8 @@ pub struct Db {
     lsm_tree: Arc<LSMTree>,
     memtable_manager: MemtableManager,
     num_columns: usize,
+    time_provider: Arc<dyn TimeProvider>,
+    ttl_provider: TTLProvider,
 }
 
 impl Db {
@@ -81,11 +84,24 @@ impl Db {
                 write_stall_limit: config.resolved_write_stall_limit(),
             },
         )?;
+
+        // Time provider and TTL config
+        let time_provider = config.time_provider.create();
+        let ttl_provider = crate::ttl::TTLProvider::new(
+            &TtlConfig {
+                enabled: config.ttl_enabled,
+                default_ttl_seconds: config.default_ttl_seconds,
+            },
+            Arc::clone(&time_provider),
+        );
+
         Ok(Self {
             file_manager,
             lsm_tree,
             memtable_manager,
             num_columns: config.num_columns,
+            time_provider,
+            ttl_provider,
         })
     }
 
@@ -119,6 +135,7 @@ impl Db {
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         let mut pending: std::collections::BTreeMap<Vec<u8>, Value> =
             std::collections::BTreeMap::new();
+        let expired_at = self.ttl_provider.get_expiration_timestamp(None);
         for (key_and_seq, op) in batch.ops {
             let column_idx = key_and_seq.column as usize;
             if column_idx >= self.num_columns {
@@ -134,7 +151,7 @@ impl Db {
             };
             let mut columns = vec![None; self.num_columns];
             columns[column_idx] = Some(column);
-            let next_value = Value::new(columns);
+            let next_value = Value::new_with_expired_at(columns, expired_at);
             match pending.entry(key_and_seq.key.to_vec()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(next_value);

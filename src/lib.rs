@@ -14,10 +14,13 @@ mod iterator;
 mod lsm;
 mod memtable;
 mod sst;
+mod time;
+mod ttl;
 mod r#type;
 mod write_batch;
 
 pub use config::CompactionPolicyKind;
 pub use config::Config;
 pub use db::Db;
+pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProviderKind};
 pub use write_batch::WriteBatch;

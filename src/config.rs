@@ -1,3 +1,4 @@
+use crate::time::TimeProviderKind;
 use log::warn;
 
 /// Compaction policy selection.
@@ -35,6 +36,12 @@ pub struct Config {
     pub block_cache_size: usize,
     /// Target base SST file size in bytes.
     pub base_file_size: usize,
+    /// Whether TTL is enabled. If false, TTL metadata is ignored.
+    pub ttl_enabled: bool,
+    /// Default TTL duration (in seconds). None means no expiration by default.
+    pub default_ttl_seconds: Option<u32>,
+    /// Time provider to use for TTL.
+    pub time_provider: TimeProviderKind,
     /// Optional log file path. If None, logs go to console only. Must be a local path.
     pub log_path: Option<String>,
     /// Whether to enable console logging.
@@ -58,6 +65,9 @@ impl Default for Config {
             compaction_policy: CompactionPolicyKind::RoundRobin,
             block_cache_size: 64 * 1024 * 1024,
             base_file_size: 64 * 1024 * 1024,
+            ttl_enabled: false,
+            default_ttl_seconds: None,
+            time_provider: TimeProviderKind::default(),
             log_path: None,
             log_console: false,
             log_level: log::LevelFilter::Info,

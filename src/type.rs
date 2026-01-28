@@ -35,6 +35,8 @@ pub(crate) struct Value {
     /// A value may consist of multiple logical columns/fields.
     /// Each column is optional and may be absent within a value.
     pub(crate) columns: Vec<Option<Column>>,
+    /// Optional expiration timestamp (seconds since epoch).
+    pub(crate) expired_at: Option<u32>,
 }
 
 impl Key {
@@ -103,12 +105,27 @@ impl From<Column> for Bytes {
 impl Value {
     /// Creates a new `Value` from a list of optional columns.
     pub(crate) fn new(columns: Vec<Option<Column>>) -> Self {
-        Self { columns }
+        Self::new_with_expired_at(columns, None)
+    }
+
+    pub(crate) fn new_with_expired_at(
+        columns: Vec<Option<Column>>,
+        expired_at: Option<u32>,
+    ) -> Self {
+        Self {
+            columns,
+            expired_at,
+        }
     }
 
     /// Returns the optional columns.
     pub(crate) fn columns(&self) -> &[Option<Column>] {
         &self.columns
+    }
+
+    /// Returns the expiration timestamp if present.
+    pub(crate) fn expired_at(&self) -> Option<u32> {
+        self.expired_at
     }
 
     /// Checks if all columns are terminal (Put or Delete).
@@ -163,7 +180,10 @@ impl Value {
             merged_columns.push(merged);
         }
 
-        Value::new(merged_columns)
+        // Prefer expiration from the newer value if present.
+        let merged_expired_at = newer.expired_at.or(self.expired_at);
+
+        Value::new_with_expired_at(merged_columns, merged_expired_at)
     }
 }
 
