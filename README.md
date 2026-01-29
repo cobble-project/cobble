@@ -1,6 +1,7 @@
-# Cobble: A high-performance, embedded key-value store designed for use in distributed systems and standalone applications
+<p align="center"><img src="logo.png" width="60%" alt="Cobble logo" /></p>
 
-Cobble is a Rust-based key-value storage engine that implements an LSM (Log-Structured Merge) tree architecture using multiple file formats (SST, parquet, etc.).
+Cobble is a high-performance, embedded key-value store designed for use in distributed systems as well as standalone applications.
+It is built-on Rust and implements an LSM (Log-Structured Merge) tree architecture using multiple file formats (SST, parquet, etc.).
 It fulfills all your expectations for embedded LSM storage and can be integrated into various distributed systems and standalone applications as the underlying storage.
 
 ## Features
@@ -17,6 +18,7 @@ We list some of Cobble's key features below, they are either implemented or are 
 - **Key-value Separation**: Separates keys and values to optimize large-value, low-access patterns.
 - **Time-to-live (TTL)**: Expire and clean up data automatically.
 - **Hot/Cold Separation**: Optimize storage and access efficiency with multiple strategies.
+- **Merge Operators**: Support for user-defined merge operations on values. Efficiently handle updates without reading existing values.
 - **High performance**: Built on Rust, optimized for low latency and high throughput workloads.
 - **Multi-language Bindings**: Planned support for C, C++, Python, Go, and Java bindings.
 
