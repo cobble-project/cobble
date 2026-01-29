@@ -7,7 +7,9 @@
 use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::sst::row_codec::{decode_value, encode_value};
+use crate::ttl::TTLProvider;
 use bytes::Bytes;
+use std::sync::Arc;
 
 /// A deduplicating iterator that wraps another iterator and merges
 /// values with the same key.
@@ -29,6 +31,8 @@ pub struct DeduplicatingIterator<I: KvIterator> {
     current_key: Option<Bytes>,
     /// Current merged value (if valid).
     current_value: Option<Bytes>,
+    /// TTL provider to evaluate expiration.
+    ttl_provider: Arc<TTLProvider>,
 }
 
 impl<I: KvIterator> DeduplicatingIterator<I> {
@@ -37,12 +41,13 @@ impl<I: KvIterator> DeduplicatingIterator<I> {
     /// # Arguments
     /// * `inner` - The underlying iterator to wrap.
     /// * `num_columns` - Number of columns in the value schema.
-    pub fn new(inner: I, num_columns: usize) -> Self {
+    pub fn new(inner: I, num_columns: usize, ttl_provider: Arc<TTLProvider>) -> Self {
         Self {
             inner,
             num_columns,
             current_key: None,
             current_value: None,
+            ttl_provider,
         }
     }
 
@@ -55,62 +60,72 @@ impl<I: KvIterator> DeduplicatingIterator<I> {
     /// come before older entries for the same key. We collect all values and
     /// then merge from oldest to newest, so that newer values override older ones.
     fn collect_and_merge(&mut self) -> Result<()> {
-        if !self.inner.valid() {
-            self.current_key = None;
-            self.current_value = None;
-            return Ok(());
-        }
+        loop {
+            if !self.inner.valid() {
+                self.current_key = None;
+                self.current_value = None;
+                return Ok(());
+            }
 
-        // Get the first key-value pair
-        let key = self.inner.key()?;
-        let value = self.inner.value()?;
+            // Get the first key-value pair
+            let key = self.inner.key()?;
+            let value_bytes = self.inner.value()?;
 
-        let (Some(key), Some(value)) = (key, value) else {
-            self.current_key = None;
-            self.current_value = None;
-            return Ok(());
-        };
+            let (Some(key), Some(value_bytes)) = (key, value_bytes) else {
+                self.current_key = None;
+                self.current_value = None;
+                return Ok(());
+            };
 
-        let current_key = key;
+            let current_key = key;
 
-        // Collect all values with the same key
-        let mut values = vec![value];
+            // Collect all values with the same key, skipping expired ones
+            let mut values = Vec::new();
+            let value = decode_value(&value_bytes, self.num_columns)?;
+            if !self.ttl_provider.expired(&value.expired_at) {
+                values.push(value);
+            }
 
-        // Advance to next entry and check for same key
-        while self.inner.next()? {
-            let next_key = self.inner.key()?;
-            if let Some(ref nk) = next_key {
-                if nk.as_ref() != current_key.as_ref() {
-                    // Different key, stop collecting
+            // Advance to next entry and check for same key
+            while self.inner.next()? {
+                let next_key = self.inner.key()?;
+                if let Some(ref nk) = next_key {
+                    if nk.as_ref() != current_key.as_ref() {
+                        // Different key, stop collecting
+                        break;
+                    }
+
+                    // Same key, collect the value
+                    if let Some(next_value_bytes) = self.inner.value()? {
+                        let value = decode_value(&next_value_bytes, self.num_columns)?;
+                        if !self.ttl_provider.expired(&value.expired_at) {
+                            values.push(value);
+                        }
+                    }
+                } else {
                     break;
                 }
-
-                // Same key, collect the value
-                if let Some(next_value_bytes) = self.inner.value()? {
-                    values.push(next_value_bytes);
-                }
-            } else {
-                break;
             }
+
+            if values.is_empty() {
+                // All versions for this key are expired; continue to the next key.
+                continue;
+            }
+
+            // Merge from oldest to newest (reverse order)
+            // The last value in the list is the oldest, the first is the newest
+            let mut values_iter = values.into_iter().rev();
+            let mut merged_value = values_iter.next().expect("values is non-empty");
+            for newer_value in values_iter {
+                merged_value = merged_value.merge(newer_value);
+            }
+
+            // Encode the merged value
+            self.current_key = Some(current_key);
+            self.current_value = Some(encode_value(&merged_value, self.num_columns));
+
+            return Ok(());
         }
-
-        // Merge from oldest to newest (reverse order)
-        // The last value in the list is the oldest, the first is the newest
-        let mut values_iter = values.iter().rev();
-        let mut merged_value = decode_value(
-            values_iter.next().expect("values is non-empty"),
-            self.num_columns,
-        )?;
-        for value_bytes in values_iter {
-            let newer_value = decode_value(value_bytes, self.num_columns)?;
-            merged_value = merged_value.merge(newer_value);
-        }
-
-        // Encode the merged value
-        self.current_key = Some(current_key);
-        self.current_value = Some(encode_value(&merged_value, self.num_columns));
-
-        Ok(())
     }
 }
 
@@ -163,6 +178,15 @@ mod tests {
         encode_value(&value, num_columns).to_vec()
     }
 
+    fn make_value_bytes_with_expiry(
+        columns: Vec<Option<Column>>,
+        num_columns: usize,
+        expired_at: Option<u32>,
+    ) -> Vec<u8> {
+        let value = Value::new_with_expired_at(columns, expired_at);
+        encode_value(&value, num_columns).to_vec()
+    }
+
     #[test]
     fn test_deduplicating_no_duplicates() {
         let num_columns = 1;
@@ -192,7 +216,8 @@ mod tests {
         ];
 
         let iter = MockIterator::new(entries);
-        let mut dedup = DeduplicatingIterator::new(iter, num_columns);
+        let mut dedup =
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
         dedup.seek_to_first().unwrap();
 
         let mut results = vec![];
@@ -239,7 +264,8 @@ mod tests {
         ];
 
         let iter = MockIterator::new(entries);
-        let mut dedup = DeduplicatingIterator::new(iter, num_columns);
+        let mut dedup =
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
         dedup.seek_to_first().unwrap();
 
         let mut results = vec![];
@@ -280,7 +306,8 @@ mod tests {
         ];
 
         let iter = MockIterator::new(entries);
-        let mut dedup = DeduplicatingIterator::new(iter, num_columns);
+        let mut dedup =
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
         dedup.seek_to_first().unwrap();
 
         let (k, v) = dedup.current().unwrap().unwrap();
@@ -332,7 +359,8 @@ mod tests {
         ];
 
         let iter = MockIterator::new(entries);
-        let mut dedup = DeduplicatingIterator::new(iter, num_columns);
+        let mut dedup =
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
         dedup.seek_to_first().unwrap();
 
         let (k, v) = dedup.current().unwrap().unwrap();
@@ -368,7 +396,8 @@ mod tests {
         ];
 
         let iter = MockIterator::new(entries);
-        let mut dedup = DeduplicatingIterator::new(iter, num_columns);
+        let mut dedup =
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
         dedup.seek_to_first().unwrap();
 
         let (k, v) = dedup.current().unwrap().unwrap();
@@ -385,7 +414,7 @@ mod tests {
     #[test]
     fn test_deduplicating_empty() {
         let iter = MockIterator::new(Vec::<(&[u8], &[u8])>::new());
-        let mut dedup = DeduplicatingIterator::new(iter, 1);
+        let mut dedup = DeduplicatingIterator::new(iter, 1, Arc::new(TTLProvider::disabled()));
         dedup.seek_to_first().unwrap();
 
         assert!(!dedup.valid());
@@ -420,7 +449,8 @@ mod tests {
         ];
 
         let iter = MockIterator::new(entries);
-        let mut dedup = DeduplicatingIterator::new(iter, num_columns);
+        let mut dedup =
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
 
         dedup.seek(b"b").unwrap();
         assert!(dedup.valid());
@@ -452,7 +482,8 @@ mod tests {
         let entries: Vec<(&[u8], Vec<u8>)> = vec![(b"a", v1), (b"a", v2)];
 
         let iter = MockIterator::new(entries);
-        let mut dedup = DeduplicatingIterator::new(iter, num_columns);
+        let mut dedup =
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
         dedup.seek_to_first().unwrap();
 
         let (k, v) = dedup.current().unwrap().unwrap();
@@ -464,6 +495,83 @@ mod tests {
         assert_eq!(cols[0].as_ref().unwrap().data(), b"col1_new");
         // Column 1: Merge appends -> "col2_old_append"
         assert_eq!(cols[1].as_ref().unwrap().data(), b"col2_old_append");
+    }
+
+    #[test]
+    fn test_deduplicating_skips_expired_for_key() {
+        let num_columns = 1;
+        let ttl_provider = Arc::new(TTLProvider::new(
+            &crate::ttl::TtlConfig {
+                enabled: true,
+                default_ttl_seconds: None,
+            },
+            Arc::new(crate::time::ManualTimeProvider::new(10)),
+        ));
+        let now = ttl_provider.now_seconds();
+
+        // Key "a": newest is expired, older is valid -> should return older
+        // Key "b": both expired -> should be skipped entirely
+        // Key "c": valid
+        let entries: Vec<(&[u8], Vec<u8>)> = vec![
+            (
+                b"a",
+                make_value_bytes_with_expiry(
+                    vec![Some(Column::new(ValueType::Put, b"new".to_vec()))],
+                    num_columns,
+                    Some(now - 1),
+                ),
+            ),
+            (
+                b"a",
+                make_value_bytes_with_expiry(
+                    vec![Some(Column::new(ValueType::Put, b"old".to_vec()))],
+                    num_columns,
+                    None,
+                ),
+            ),
+            (
+                b"b",
+                make_value_bytes_with_expiry(
+                    vec![Some(Column::new(ValueType::Put, b"b_new".to_vec()))],
+                    num_columns,
+                    Some(now - 1),
+                ),
+            ),
+            (
+                b"b",
+                make_value_bytes_with_expiry(
+                    vec![Some(Column::new(ValueType::Put, b"b_old".to_vec()))],
+                    num_columns,
+                    Some(now - 1),
+                ),
+            ),
+            (
+                b"c",
+                make_value_bytes_with_expiry(
+                    vec![Some(Column::new(ValueType::Put, b"c".to_vec()))],
+                    num_columns,
+                    None,
+                ),
+            ),
+        ];
+
+        let iter = MockIterator::new(entries);
+        let mut dedup = DeduplicatingIterator::new(iter, num_columns, ttl_provider.clone());
+        dedup.seek_to_first().unwrap();
+
+        let mut results = vec![];
+        while dedup.valid() {
+            let (k, v) = dedup.current().unwrap().unwrap();
+            let decoded = decode_value(&v, num_columns).unwrap();
+            results.push((k, decoded));
+            dedup.next().unwrap();
+        }
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0.as_ref(), b"a");
+        assert_eq!(results[0].1.columns()[0].as_ref().unwrap().data(), b"old");
+        assert_eq!(results[1].0.as_ref(), b"c");
+        assert_eq!(results[1].1.columns()[0].as_ref().unwrap().data(), b"c");
     }
 
     #[test]
@@ -513,7 +621,11 @@ mod tests {
         let merging_iter = MergingIterator::new(vec![iter1, iter2]);
 
         // Wrap with DeduplicatingIterator
-        let mut dedup = DeduplicatingIterator::new(merging_iter, num_columns);
+        let mut dedup = DeduplicatingIterator::new(
+            merging_iter,
+            num_columns,
+            Arc::new(TTLProvider::disabled()),
+        );
         dedup.seek_to_first().unwrap();
 
         let mut results = vec![];

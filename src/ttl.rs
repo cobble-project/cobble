@@ -13,6 +13,7 @@ pub struct TtlConfig {
     pub default_ttl_seconds: Option<u32>,
 }
 
+#[derive(Clone)]
 pub struct TTLProvider {
     enabled: bool,
     default_ttl: Option<u32>,
@@ -25,6 +26,14 @@ impl TTLProvider {
             enabled: config.enabled,
             default_ttl: config.default_ttl_seconds,
             time_provider,
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            default_ttl: None,
+            time_provider: Arc::new(crate::time::SystemTimeProvider),
         }
     }
 
@@ -47,6 +56,11 @@ impl TTLProvider {
             Some(ts) => self.time_provider.now_seconds() >= *ts,
             None => false,
         }
+    }
+
+    /// Expose current time for helpers.
+    pub(crate) fn now_seconds(&self) -> u32 {
+        self.time_provider.now_seconds()
     }
 }
 

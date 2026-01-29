@@ -22,7 +22,7 @@ pub struct Db {
     memtable_manager: MemtableManager,
     num_columns: usize,
     time_provider: Arc<dyn TimeProvider>,
-    ttl_provider: TTLProvider,
+    ttl_provider: Arc<TTLProvider>,
 }
 
 impl Db {
@@ -33,7 +33,17 @@ impl Db {
         let fs = registry.get_or_register(config.path.clone())?;
         let file_manager = Arc::new(FileManager::with_defaults(fs)?);
         let db_state = Arc::new(DbStateHandle::new());
-        let mut lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
+        let time_provider = config.time_provider.create();
+        let ttl_provider = Arc::new(TTLProvider::new(
+            &TtlConfig {
+                enabled: config.ttl_enabled,
+                default_ttl_seconds: config.default_ttl_seconds,
+            },
+            Arc::clone(&time_provider),
+        ));
+
+        let mut lsm_tree =
+            LSMTree::with_state_and_ttl(Arc::clone(&db_state), Arc::clone(&ttl_provider));
         if config.block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
@@ -85,16 +95,6 @@ impl Db {
             },
         )?;
 
-        // Time provider and TTL config
-        let time_provider = config.time_provider.create();
-        let ttl_provider = crate::ttl::TTLProvider::new(
-            &TtlConfig {
-                enabled: config.ttl_enabled,
-                default_ttl_seconds: config.default_ttl_seconds,
-            },
-            Arc::clone(&time_provider),
-        );
-
         Ok(Self {
             file_manager,
             lsm_tree,
@@ -135,7 +135,6 @@ impl Db {
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         let mut pending: std::collections::BTreeMap<Vec<u8>, Value> =
             std::collections::BTreeMap::new();
-        let expired_at = self.ttl_provider.get_expiration_timestamp(None);
         for (key_and_seq, op) in batch.ops {
             let column_idx = key_and_seq.column as usize;
             if column_idx >= self.num_columns {
@@ -144,10 +143,19 @@ impl Db {
                     column_idx, self.num_columns
                 )));
             }
-            let column = match op {
-                WriteOp::Put(_, value) => Column::new(ValueType::Put, value.to_vec()),
-                WriteOp::Delete(_) => Column::new(ValueType::Delete, Vec::new()),
-                WriteOp::Merge(_, value) => Column::new(ValueType::Merge, value.to_vec()),
+            let (column, expired_at) = match op {
+                WriteOp::Put(_, value, ttl_secs) => (
+                    Column::new(ValueType::Put, value.to_vec()),
+                    self.ttl_provider.get_expiration_timestamp(ttl_secs),
+                ),
+                WriteOp::Delete(_) => (
+                    Column::new(ValueType::Delete, Vec::new()),
+                    self.ttl_provider.get_expiration_timestamp(None),
+                ),
+                WriteOp::Merge(_, value, ttl_secs) => (
+                    Column::new(ValueType::Merge, value.to_vec()),
+                    self.ttl_provider.get_expiration_timestamp(ttl_secs),
+                ),
             };
             let mut columns = vec![None; self.num_columns];
             columns[column_idx] = Some(column);
@@ -228,10 +236,16 @@ impl Db {
             values.push(value);
         }
 
+        let values: Vec<Value> = values
+            .into_iter()
+            .filter(|v| !self.ttl_provider.expired(&v.expired_at))
+            .rev()
+            .collect();
+
         if values.is_empty() {
             return Ok(None);
         }
-        let mut iter = values.into_iter().rev();
+        let mut iter = values.into_iter();
         let mut merged = iter.next().expect("values not empty");
         for newer in iter {
             merged = merged.merge(newer);
@@ -248,6 +262,11 @@ impl Db {
                 })
                 .collect(),
         ))
+    }
+
+    /// Set the current time for TTL evaluation (manual time provider only).
+    pub fn set_time(&self, next: u32) {
+        self.time_provider.set_time(next);
     }
 }
 

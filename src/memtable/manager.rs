@@ -131,6 +131,7 @@ impl MemtableManager {
             Arc::clone(&lsm_tree),
             Arc::clone(&db_state),
             reclaimer.clone(),
+            lsm_tree.ttl_provider(),
         )?;
         Ok(Self {
             state,
@@ -163,6 +164,7 @@ impl MemtableManager {
         lsm_tree: Arc<LSMTree>,
         db_state: Arc<DbStateHandle>,
         reclaimer: MemtableReclaimer,
+        ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Result<(tokio::runtime::Runtime, mpsc::UnboundedSender<FlushJob>)> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .thread_name("cobble-flush")
@@ -177,12 +179,14 @@ impl MemtableManager {
         let file_builder_factory_clone = Arc::clone(&file_builder_factory);
         let lsm_tree_clone = Arc::clone(&lsm_tree);
         let _db_state_clone = Arc::clone(&db_state);
+        let ttl_provider_clone = Arc::clone(&ttl_provider);
         let _reclaimer_clone = reclaimer;
         runtime.spawn(async move {
             while let Some(job) = flush_rx.recv().await {
                 trace!("memtable flush start seq={}", job.seq);
                 let file_manager = Arc::clone(&file_manager_clone);
                 let file_builder_factory = Arc::clone(&file_builder_factory_clone);
+                let ttl_provider = Arc::clone(&ttl_provider_clone);
                 let handle = tokio::task::spawn_blocking(move || {
                     flush_memtable(
                         job.seq,
@@ -190,6 +194,7 @@ impl MemtableManager {
                         file_manager,
                         file_builder_factory,
                         num_columns,
+                        ttl_provider,
                     )
                 });
                 let (result, _memtable, completed_seq) = match handle.await {
@@ -519,12 +524,16 @@ fn flush_memtable(
     file_manager: Arc<FileManager>,
     file_builder_factory: Arc<FileBuilderFactory>,
     num_columns: usize,
+    ttl_provider: Arc<crate::ttl::TTLProvider>,
 ) -> (Result<MemtableFlushResult>, Arc<HashMemtable>, u64) {
     let result = (|| {
         let (file_id, writer) = file_manager.create_data_file()?;
         let mut builder = (file_builder_factory)(Box::new(writer));
-        let mut dedup_iter =
-            DeduplicatingIterator::new(PrimedIterator::new(memtable.iter()), num_columns);
+        let mut dedup_iter = DeduplicatingIterator::new(
+            PrimedIterator::new(memtable.iter()),
+            num_columns,
+            ttl_provider,
+        );
         dedup_iter.seek_to_first()?;
         while dedup_iter.valid() {
             if let Some((key, value)) = dedup_iter.current()? {

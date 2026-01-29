@@ -65,6 +65,7 @@ impl CompactionWorker {
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         data_file_type: crate::data_file::DataFileType,
+        ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>> {
         if sorted_runs.is_empty() {
             return None;
@@ -75,6 +76,7 @@ impl CompactionWorker {
             Arc::clone(&self.file_manager),
             Arc::clone(&self.file_builder_factory),
             data_file_type,
+            ttl_provider,
         );
         Some(self.submit(task))
     }

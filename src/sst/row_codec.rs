@@ -96,7 +96,7 @@ fn bitmap_size(num_columns: usize) -> usize {
 /// Encodes a Value to bytes with optional columns.
 ///
 /// The number of columns is provided by the caller (from SST metadata).
-/// Layout: `[presence_bitmap][present_columns...]`
+/// Layout: `[expired_at: u32][presence_bitmap][present_columns...]`
 ///
 /// - `presence_bitmap`: A bitmap indicating which columns are present.
 ///   (Omitted when `num_columns == 1` as a single absent column means invalid value)
@@ -118,7 +118,7 @@ pub(crate) fn encode_value(value: &Value, num_columns: usize) -> Bytes {
         .count();
 
     // Calculate total size (last column saves 4 bytes by omitting data_len)
-    let mut total_size = bmp_size;
+    let mut total_size = 4 + bmp_size; // expired_at + bitmap
     for col in columns.iter().take(num_columns).flatten() {
         total_size += 1 + 4 + col.data().len(); // value_type + data_len + data
     }
@@ -128,6 +128,9 @@ pub(crate) fn encode_value(value: &Value, num_columns: usize) -> Bytes {
     }
 
     let mut buf = BytesMut::with_capacity(total_size);
+
+    // Write expiration timestamp (seconds since epoch, 0 if None)
+    buf.put_u32_le(value.expired_at().unwrap_or(0));
 
     // Write presence bitmap (only if num_columns > 1)
     if bmp_size > 0 {
@@ -167,18 +170,26 @@ pub(crate) fn encode_value(value: &Value, num_columns: usize) -> Bytes {
 /// # Returns
 /// A Value containing optional columns, where `None` indicates an absent column.
 pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Value> {
-    let bmp_size = bitmap_size(num_columns);
-
-    if data.len() < bmp_size {
+    if data.len() < 4 {
         return Err(Error::IoError(format!(
-            "Value data too small: expected at least {} bytes for bitmap, got {}",
-            bmp_size,
+            "Value data too small: expected at least 4 bytes for expired_at, got {}",
             data.len()
         )));
     }
+    let mut buf = data;
+    let expired_at = buf.get_u32_le();
+    let bmp_size = bitmap_size(num_columns);
 
-    let bitmap = &data[..bmp_size];
-    let mut buf = &data[bmp_size..];
+    if buf.len() < bmp_size {
+        return Err(Error::IoError(format!(
+            "Value data too small: expected at least {} bytes for bitmap, got {}",
+            bmp_size,
+            buf.len()
+        )));
+    }
+
+    let bitmap = &buf[..bmp_size];
+    let mut buf = &buf[bmp_size..];
 
     // First pass: determine which columns are present and find the last one
     let mut presence = Vec::with_capacity(num_columns);
@@ -243,7 +254,12 @@ pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Value> {
         }
     }
 
-    Ok(Value::new(columns))
+    let expired_at = if expired_at == 0 {
+        None
+    } else {
+        Some(expired_at)
+    };
+    Ok(Value::new_with_expired_at(columns, expired_at))
 }
 
 /// Decodes a Value but only materializes columns requested by `decode_columns`.
@@ -255,6 +271,15 @@ pub(crate) fn decode_value_masked(
     decode_mask: &[u8],
     mut terminal_mask: Option<&mut [u8]>,
 ) -> Result<Value> {
+    if data.len() < 4 {
+        return Err(Error::IoError(format!(
+            "Value data too small: expected at least 4 bytes for expired_at, got {}",
+            data.len()
+        )));
+    }
+    let mut buf = data;
+    let expired_at = buf.get_u32_le();
+
     let mask_size = bitmap_size(num_columns).max(1);
     if decode_mask.len() < mask_size {
         return Err(Error::IoError(format!(
@@ -265,16 +290,16 @@ pub(crate) fn decode_value_masked(
     }
 
     let bmp_size = bitmap_size(num_columns);
-    if data.len() < bmp_size {
+    if buf.len() < bmp_size {
         return Err(Error::IoError(format!(
             "Value data too small: expected at least {} bytes for bitmap, got {}",
             bmp_size,
-            data.len()
+            buf.len()
         )));
     }
 
-    let bitmap = &data[..bmp_size];
-    let mut buf = &data[bmp_size..];
+    let bitmap = &buf[..bmp_size];
+    let mut buf = &buf[bmp_size..];
     let mut last_present_idx = None;
     if num_columns == 1 {
         last_present_idx = Some(0);
@@ -356,7 +381,12 @@ pub(crate) fn decode_value_masked(
         }
     }
 
-    Ok(Value::new(columns))
+    let expired_at = if expired_at == 0 {
+        None
+    } else {
+        Some(expired_at)
+    };
+    Ok(Value::new_with_expired_at(columns, expired_at))
 }
 
 /// Returns the encoded size of a Value in bytes.
@@ -374,7 +404,9 @@ pub(crate) fn value_encoded_size(value: &Value, num_columns: usize) -> usize {
         .take(num_columns)
         .filter(|c| c.is_some())
         .count();
-    let mut size = bmp_size;
+
+    // 4 bytes for expired_at + bitmap size (always include expired_at header)
+    let mut size = 4 + bmp_size;
     for col in columns.iter().take(num_columns).flatten() {
         size += 1 + 4 + col.data().len(); // value_type + data_len + data
     }
@@ -456,12 +488,13 @@ mod tests {
 
         let encoded = encode_value(&value, 2);
 
+        // Expired_at: 4 bytes
         // Bitmap size: 1 byte for 2 columns
         // Column 1: 1 + 4 + 5 = 10
         // Column 2 (last): 1 + 5 = 6 (data_len omitted)
-        // Total: 1 + 10 + 6 = 17
-        assert_eq!(encoded.len(), 17);
-        assert_eq!(value_encoded_size(&value, 2), 17);
+        // Total: 4 + 1 + 10 + 6 = 21
+        assert_eq!(encoded.len(), 21);
+        assert_eq!(value_encoded_size(&value, 2), 21);
 
         let decoded = decode_value(&encoded, 2).unwrap();
         let cols = decoded.columns();
@@ -485,10 +518,11 @@ mod tests {
 
         let encoded = encode_value(&value, 3);
 
+        // Expired_at: 4 bytes
         // Bitmap size: 1 byte for 3 columns
         // Only column 0 is present (and is last): 1 + 7 = 8 (data_len omitted)
-        // Total: 1 + 8 = 9
-        assert_eq!(encoded.len(), 9);
+        // Total: 4 + 1 + 8 = 13
+        assert_eq!(encoded.len(), 13);
 
         let decoded = decode_value(&encoded, 3).unwrap();
         let cols = decoded.columns();
@@ -507,8 +541,9 @@ mod tests {
 
         let encoded = encode_value(&value, 4);
 
+        // Expired_at: 4 bytes
         // Bitmap size: 1 byte for 4 columns, no column data
-        assert_eq!(encoded.len(), 1);
+        assert_eq!(encoded.len(), 5);
 
         let decoded = decode_value(&encoded, 4).unwrap();
         let cols = decoded.columns();
@@ -528,11 +563,12 @@ mod tests {
 
         let encoded = encode_value(&value, 16);
 
+        // Expired_at: 4 bytes
         // Bitmap size: 2 bytes for 16 columns
         // 2 non-last columns: 2 * (1 + 4 + 1) = 12
         // Last column (idx 15): 1 + 1 = 2 (data_len omitted)
-        // Total: 2 + 12 + 2 = 16
-        assert_eq!(encoded.len(), 16);
+        // Total: 4 + 2 + 12 + 2 = 20
+        assert_eq!(encoded.len(), 20);
 
         let decoded = decode_value(&encoded, 16).unwrap();
         let cols = decoded.columns();
@@ -571,10 +607,12 @@ mod tests {
 
         let encoded = encode_value(&value, 1);
 
+        // Expired_at: 4 bytes
         // No bitmap for single column, and data_len omitted (last column)
         // 1 (value_type) + 6 (data) = 7
-        assert_eq!(encoded.len(), 7);
-        assert_eq!(value_encoded_size(&value, 1), 7);
+        // Total: 4 + 7 = 11
+        assert_eq!(encoded.len(), 11);
+        assert_eq!(value_encoded_size(&value, 1), 11);
 
         let decoded = decode_value(&encoded, 1).unwrap();
         let cols = decoded.columns();

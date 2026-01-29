@@ -28,6 +28,7 @@ pub struct CompactionTask {
     file_builder_factory: Arc<FileBuilderFactory>,
     /// The data file type for output files.
     data_file_type: DataFileType,
+    ttl_provider: Arc<crate::ttl::TTLProvider>,
 }
 
 impl CompactionTask {
@@ -44,6 +45,7 @@ impl CompactionTask {
         file_manager: Arc<FileManager>,
         file_builder_factory: Arc<FileBuilderFactory>,
         data_file_type: DataFileType,
+        ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Self {
         Self {
             sorted_runs,
@@ -51,6 +53,7 @@ impl CompactionTask {
             file_manager,
             file_builder_factory,
             data_file_type,
+            ttl_provider,
         }
     }
 
@@ -61,6 +64,10 @@ impl CompactionTask {
 
     pub fn output_level(&self) -> u8 {
         self.output_level
+    }
+
+    pub fn ttl_provider(&self) -> Arc<crate::ttl::TTLProvider> {
+        Arc::clone(&self.ttl_provider)
     }
 }
 
@@ -219,7 +226,8 @@ impl CompactionExecutor {
         let merging_iter = MergingIterator::new(all_iters);
 
         // Create deduplicating iterator
-        let mut dedup_iter = DeduplicatingIterator::new(merging_iter, options.num_columns);
+        let mut dedup_iter =
+            DeduplicatingIterator::new(merging_iter, options.num_columns, task.ttl_provider());
         dedup_iter.seek_to_first()?;
 
         // Collect output files
@@ -435,6 +443,7 @@ mod tests {
             Arc::clone(&file_manager),
             factory,
             DataFileType::SSTable,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -550,6 +559,7 @@ mod tests {
             Arc::clone(&file_manager),
             factory,
             DataFileType::SSTable,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -673,6 +683,7 @@ mod tests {
             Arc::clone(&file_manager),
             factory,
             DataFileType::SSTable,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -731,6 +742,7 @@ mod tests {
             Arc::clone(&file_manager),
             factory,
             DataFileType::SSTable,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
         );
 
         let executor = CompactionExecutor::with_defaults().unwrap();

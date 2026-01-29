@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 
 #[derive(PartialEq, Clone)]
 pub(crate) enum WriteOp {
-    Put(Bytes, Bytes),
+    Put(Bytes, Bytes, Option<u32>),
     Delete(Bytes),
-    Merge(Bytes, Bytes),
+    Merge(Bytes, Bytes, Option<u32>),
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -36,6 +36,14 @@ impl WriteBatch {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
+        self.put_with_ttl(key, column, value, None);
+    }
+
+    pub fn put_with_ttl<K, V>(&mut self, key: K, column: u16, value: V, ttl_seconds: Option<u32>)
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
         let key_and_seq = KeyAndSeq {
             key: Bytes::copy_from_slice(key.as_ref()),
             column,
@@ -44,6 +52,7 @@ impl WriteBatch {
         let write_op = WriteOp::Put(
             key_and_seq.key.clone(),
             Bytes::copy_from_slice(value.as_ref()),
+            ttl_seconds,
         );
         self.ops.insert(key_and_seq, write_op);
         self.current_seq += 1;
@@ -68,6 +77,14 @@ impl WriteBatch {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
+        self.merge_with_ttl(key, column, value, None);
+    }
+
+    pub fn merge_with_ttl<K, V>(&mut self, key: K, column: u16, value: V, ttl_seconds: Option<u32>)
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
         let key_and_seq = KeyAndSeq {
             key: Bytes::copy_from_slice(key.as_ref()),
             column,
@@ -76,6 +93,7 @@ impl WriteBatch {
         let write_op = WriteOp::Merge(
             key_and_seq.key.clone(),
             Bytes::copy_from_slice(value.as_ref()),
+            ttl_seconds,
         );
         self.ops.insert(key_and_seq, write_op);
         self.current_seq += 1;

@@ -1,4 +1,5 @@
 //! Time provider abstractions for TTL.
+use log::error;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,10 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub trait TimeProvider: Send + Sync {
     /// Returns current time in seconds since UNIX epoch.
     fn now_seconds(&self) -> u32;
+
+    /// Sets the current time to `next` if supported.
+    fn set_time(&self, next: u32);
 }
 
 /// System time provider backed by `SystemTime`.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SystemTimeProvider;
 
 impl TimeProvider for SystemTimeProvider {
@@ -19,6 +23,11 @@ impl TimeProvider for SystemTimeProvider {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0)
+    }
+
+    fn set_time(&self, _next: u32) {
+        // No-op for system time provider.
+        error!("Cannot set time on SystemTimeProvider");
     }
 }
 
@@ -57,6 +66,10 @@ impl Default for ManualTimeProvider {
 impl TimeProvider for ManualTimeProvider {
     fn now_seconds(&self) -> u32 {
         self.watermark.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_time(&self, next: u32) {
+        self.set_time(next);
     }
 }
 

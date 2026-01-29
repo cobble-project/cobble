@@ -180,8 +180,8 @@ impl Value {
             merged_columns.push(merged);
         }
 
-        // Prefer expiration from the newer value if present.
-        let merged_expired_at = newer.expired_at.or(self.expired_at);
+        // Prefer expiration from the newer value
+        let merged_expired_at = newer.expired_at;
 
         Value::new_with_expired_at(merged_columns, merged_expired_at)
     }

@@ -13,6 +13,8 @@ use log::debug;
 use std::sync::{Arc, Mutex};
 
 use crate::db_state::{DbState, DbStateHandle};
+use crate::ttl::TTLProvider;
+
 #[derive(Clone)]
 pub(crate) struct Level {
     pub(crate) ordinal: u8,
@@ -33,6 +35,7 @@ pub(crate) struct LSMTree {
     db_state: Arc<DbStateHandle>,
     block_cache: Option<BlockCache>,
     state: Mutex<LSMTreeState>,
+    ttl_provider: Arc<crate::ttl::TTLProvider>,
 }
 
 struct LSMTreeState {
@@ -126,6 +129,13 @@ impl Default for LSMTree {
 
 impl LSMTree {
     pub(crate) fn with_state(db_state: Arc<DbStateHandle>) -> Self {
+        Self::with_state_and_ttl(db_state, Arc::new(TTLProvider::disabled()))
+    }
+
+    pub(crate) fn with_state_and_ttl(
+        db_state: Arc<DbStateHandle>,
+        ttl_provider: Arc<TTLProvider>,
+    ) -> Self {
         Self {
             db_state,
             block_cache: None,
@@ -140,6 +150,7 @@ impl LSMTree {
                 pending_compaction: false,
                 compaction_worker: None,
             }),
+            ttl_provider,
         }
     }
 
@@ -333,6 +344,10 @@ impl LSMTree {
         state.pending_compaction = true;
     }
 
+    pub(crate) fn ttl_provider(&self) -> Arc<crate::ttl::TTLProvider> {
+        Arc::clone(&self.ttl_provider)
+    }
+
     fn maybe_trigger_compaction_locked(&self, state: &mut LSMTreeState) {
         if state.pending_compaction {
             return;
@@ -365,6 +380,7 @@ impl LSMTree {
             runs,
             plan.output_level,
             crate::data_file::DataFileType::SSTable,
+            self.ttl_provider(),
         ) {
             state.pending_compaction = true;
             std::mem::drop(handle);
@@ -459,48 +475,18 @@ impl LSMTree {
         for level in snapshot.lsm_version.levels.iter() {
             if level.tiered {
                 for file in level.files.iter().rev() {
-                    if let Some(max_seq) = max_seq
-                        && file.seq >= max_seq
-                    {
-                        continue;
-                    }
-                    let reader = file_manager.open_data_file_reader(file.file_id)?;
-                    let mut iter = SSTIterator::with_cache(
-                        Box::new(reader),
-                        file.file_id,
-                        SSTIteratorOptions {
-                            num_columns,
-                            ..SSTIteratorOptions::default()
-                        },
-                        self.block_cache.clone(),
+                    let should_continue = self.get_values_in_one_file(
+                        file,
+                        file_manager,
+                        encoded_key,
+                        num_columns,
+                        terminal_mask.as_deref_mut(),
+                        &mut decode_mask,
+                        max_seq,
+                        &mut values,
                     )?;
-                    iter.seek(encoded_key)?;
-                    if iter.valid()
-                        && let Some(current_key) = iter.key()?
-                        && current_key.as_ref() == encoded_key
-                        && let Some(value_bytes) = iter.value()?
-                    {
-                        let value = decode_value_masked(
-                            &value_bytes,
-                            num_columns,
-                            &decode_mask,
-                            terminal_mask.as_deref_mut(),
-                        )?;
-                        let should_stop = num_columns > 1 && value.is_terminal();
-                        if let Some(ref mask) = terminal_mask {
-                            for (idx, mask_byte) in mask.iter().enumerate().take(mask_size) {
-                                decode_mask[idx] &= !*mask_byte;
-                            }
-                            if mask_size > 0 {
-                                let last_bits = (num_columns - 1) % 8 + 1;
-                                let last_mask = (1u8 << last_bits) - 1;
-                                decode_mask[mask_size - 1] &= last_mask;
-                            }
-                        }
-                        values.push(value);
-                        if should_stop {
-                            return Ok(values);
-                        }
+                    if !should_continue {
+                        return Ok(values);
                     }
                 }
             } else {
@@ -510,43 +496,18 @@ impl LSMTree {
                     {
                         continue;
                     }
-                    let reader = file_manager.open_data_file_reader(file.file_id)?;
-                    let mut iter = SSTIterator::with_cache(
-                        Box::new(reader),
-                        file.file_id,
-                        SSTIteratorOptions {
-                            num_columns,
-                            ..SSTIteratorOptions::default()
-                        },
-                        self.block_cache.clone(),
+                    let should_continue = self.get_values_in_one_file(
+                        file,
+                        file_manager,
+                        encoded_key,
+                        num_columns,
+                        terminal_mask.as_deref_mut(),
+                        &mut decode_mask,
+                        max_seq,
+                        &mut values,
                     )?;
-                    iter.seek(encoded_key)?;
-                    if iter.valid()
-                        && let Some(current_key) = iter.key()?
-                        && current_key.as_ref() == encoded_key
-                        && let Some(value_bytes) = iter.value()?
-                    {
-                        let value = decode_value_masked(
-                            &value_bytes,
-                            num_columns,
-                            &decode_mask,
-                            terminal_mask.as_deref_mut(),
-                        )?;
-                        let should_stop = num_columns > 1 && value.is_terminal();
-                        if let Some(ref mask) = terminal_mask {
-                            for (idx, mask_byte) in mask.iter().enumerate().take(mask_size) {
-                                decode_mask[idx] &= !*mask_byte;
-                            }
-                            if mask_size > 0 {
-                                let last_bits = (num_columns - 1) % 8 + 1;
-                                let last_mask = (1u8 << last_bits) - 1;
-                                decode_mask[mask_size - 1] &= last_mask;
-                            }
-                        }
-                        values.push(value);
-                        if should_stop {
-                            return Ok(values);
-                        }
+                    if !should_continue {
+                        return Ok(values);
                     }
                     break;
                 }
@@ -554,6 +515,69 @@ impl LSMTree {
         }
 
         Ok(values)
+    }
+
+    /// Get values from one data file for the given encoded key.
+    /// Returns Ok(true) if the caller should continue to the next file,
+    /// or Ok(false) if the caller should stop.
+    #[allow(clippy::too_many_arguments)]
+    fn get_values_in_one_file(
+        &self,
+        file: &Arc<DataFile>,
+        file_manager: &Arc<FileManager>,
+        encoded_key: &[u8],
+        num_columns: usize,
+        mut terminal_mask: Option<&mut [u8]>,
+        decode_mask: &mut [u8],
+        max_seq: Option<u64>,
+        out_values: &mut Vec<Value>,
+    ) -> Result<bool> {
+        let mask_size = decode_mask.len();
+        if let Some(max_seq) = max_seq
+            && file.seq >= max_seq
+        {
+            return Ok(true);
+        }
+        let reader = file_manager.open_data_file_reader(file.file_id)?;
+        let mut iter = SSTIterator::with_cache(
+            Box::new(reader),
+            file.file_id,
+            SSTIteratorOptions {
+                num_columns,
+                ..SSTIteratorOptions::default()
+            },
+            self.block_cache.clone(),
+        )?;
+        iter.seek(encoded_key)?;
+        if iter.valid()
+            && let Some(current_key) = iter.key()?
+            && current_key.as_ref() == encoded_key
+            && let Some(value_bytes) = iter.value()?
+        {
+            let value = decode_value_masked(
+                &value_bytes,
+                num_columns,
+                decode_mask,
+                terminal_mask.as_deref_mut(),
+            )?;
+            if self.ttl_provider.expired(&value.expired_at) {
+                return Ok(false);
+            }
+            let should_stop = num_columns > 1 && value.is_terminal();
+            if let Some(ref mask) = terminal_mask {
+                for (idx, mask_byte) in mask.iter().enumerate().take(mask_size) {
+                    decode_mask[idx] &= !*mask_byte;
+                }
+                if mask_size > 0 {
+                    let last_bits = (num_columns - 1) % 8 + 1;
+                    let last_mask = (1u8 << last_bits) - 1;
+                    decode_mask[mask_size - 1] &= last_mask;
+                }
+            }
+            out_values.push(value);
+            return Ok(!should_stop);
+        }
+        Ok(true)
     }
 }
 
