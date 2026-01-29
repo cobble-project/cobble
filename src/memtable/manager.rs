@@ -9,7 +9,7 @@ use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator};
 use crate::lsm::LSMTree;
 use crate::memtable::Memtable;
-use crate::memtable::hash::HashMemtable;
+use crate::memtable::hash::{HashMemtable, MemtableReclaimer};
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use log::{debug, trace, warn};
 use tokio::runtime::Runtime;
@@ -50,13 +50,15 @@ pub(crate) struct MemtableManager {
     num_columns: usize,
     lsm_tree: Arc<LSMTree>,
     db_state: Arc<DbStateHandle>,
+    memtable_capacity: usize,
+    reclaimer: MemtableReclaimer,
     write_stall_limit: usize,
     flush_tx: Mutex<Option<mpsc::UnboundedSender<FlushJob>>>,
     runtime: Mutex<Option<Runtime>>,
 }
 
 struct MemtableManagerState {
-    free_buffers: Vec<Vec<u8>>,
+    free_budget: u64,
     in_flight: usize,
     next_seq: u64,
     #[cfg(test)]
@@ -90,12 +92,8 @@ impl MemtableManager {
                 "buffer_count must be greater than 0".to_string(),
             ));
         }
-        let mut buffers = Vec::with_capacity(options.buffer_count);
-        for _ in 0..options.buffer_count {
-            buffers.push(vec![0u8; options.memtable_capacity]);
-        }
         let state = MemtableManagerState {
-            free_buffers: buffers,
+            free_budget: (options.buffer_count as u64) * (options.memtable_capacity as u64),
             in_flight: 0,
             next_seq: 0,
             #[cfg(test)]
@@ -103,14 +101,25 @@ impl MemtableManager {
         };
         let state = Arc::new(Mutex::new(state));
         let buffer_ready = Arc::new(Condvar::new());
+        let db_state = lsm_tree.db_state();
+        let reclaimer = Self::make_reclaimer(
+            Arc::clone(&state),
+            Arc::clone(&buffer_ready),
+            Arc::clone(&db_state),
+            options.memtable_capacity,
+        );
         let file_builder_factory = options
             .file_builder_factory
             .unwrap_or_else(|| Arc::new(make_sst_builder_factory(options.sst_options.clone())));
-        let db_state = lsm_tree.db_state();
         {
             // init the first active buffer
-            let mut state = state.lock().unwrap();
-            Self::make_active_buffer(&mut state, &db_state);
+            let mut state_guard = state.lock().unwrap();
+            Self::make_active_buffer(
+                &mut state_guard,
+                &db_state,
+                options.memtable_capacity,
+                &reclaimer,
+            );
         }
         // Initialize the flush runtime
         let (runtime, flush_tx) = Self::init_flush_runtime(
@@ -121,6 +130,7 @@ impl MemtableManager {
             options.num_columns,
             Arc::clone(&lsm_tree),
             Arc::clone(&db_state),
+            reclaimer.clone(),
         )?;
         Ok(Self {
             state,
@@ -130,6 +140,8 @@ impl MemtableManager {
             num_columns: options.num_columns,
             lsm_tree,
             db_state,
+            memtable_capacity: options.memtable_capacity,
+            reclaimer,
             write_stall_limit: options.write_stall_limit,
             flush_tx: Mutex::new(Some(flush_tx)),
             runtime: Mutex::new(Some(runtime)),
@@ -141,6 +153,7 @@ impl MemtableManager {
     }
 
     /// Initializes the flush runtime and returns the runtime and flush sender.
+    #[allow(clippy::too_many_arguments)]
     fn init_flush_runtime(
         state: Arc<Mutex<MemtableManagerState>>,
         buffer_ready: Arc<Condvar>,
@@ -149,6 +162,7 @@ impl MemtableManager {
         num_columns: usize,
         lsm_tree: Arc<LSMTree>,
         db_state: Arc<DbStateHandle>,
+        reclaimer: MemtableReclaimer,
     ) -> Result<(tokio::runtime::Runtime, mpsc::UnboundedSender<FlushJob>)> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .thread_name("cobble-flush")
@@ -158,11 +172,12 @@ impl MemtableManager {
             .map_err(|e| Error::IoError(format!("Failed to create tokio runtime: {}", e)))?;
         let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<FlushJob>();
         let state_clone = Arc::clone(&state);
-        let buffer_ready_clone = Arc::clone(&buffer_ready);
+        let _buffer_ready_clone = Arc::clone(&buffer_ready);
         let file_manager_clone = Arc::clone(&file_manager);
         let file_builder_factory_clone = Arc::clone(&file_builder_factory);
         let lsm_tree_clone = Arc::clone(&lsm_tree);
-        let db_state_clone = Arc::clone(&db_state);
+        let _db_state_clone = Arc::clone(&db_state);
+        let _reclaimer_clone = reclaimer;
         runtime.spawn(async move {
             while let Some(job) = flush_rx.recv().await {
                 trace!("memtable flush start seq={}", job.seq);
@@ -177,7 +192,7 @@ impl MemtableManager {
                         num_columns,
                     )
                 });
-                let (result, memtable, completed_seq) = match handle.await {
+                let (result, _memtable, completed_seq) = match handle.await {
                     Ok(result) => result,
                     Err(err) => (
                         Err(Error::IoError(format!("Flush task failed: {}", err))),
@@ -187,7 +202,6 @@ impl MemtableManager {
                 };
                 let mut state = state_clone.lock().unwrap();
                 state.in_flight = state.in_flight.saturating_sub(1);
-                let mut reclaim_buffer = false;
                 match result {
                     Ok(res) => {
                         debug!(
@@ -195,7 +209,6 @@ impl MemtableManager {
                             res.seq, res.data_file.file_id, res.data_file.size
                         );
                         lsm_tree_clone.add_level0_files(res.seq, vec![Arc::clone(&res.data_file)]);
-                        reclaim_buffer = true;
                         #[cfg(test)]
                         state.flush_results.push(Ok(res));
                     }
@@ -209,17 +222,6 @@ impl MemtableManager {
                         }
                     }
                 }
-                if reclaim_buffer {
-                    let buffer = match Arc::try_unwrap(memtable) {
-                        Ok(memtable) => memtable.into_buffer(),
-                        Err(_) => Vec::new(),
-                    };
-                    if !buffer.is_empty() {
-                        state.free_buffers.push(buffer);
-                    }
-                    Self::make_active_buffer(&mut state, &db_state_clone);
-                }
-                buffer_ready_clone.notify_all();
             }
         });
         Ok((runtime, flush_tx))
@@ -227,16 +229,25 @@ impl MemtableManager {
 
     /// Makes an active memtable from a free buffer if none exists.
     /// Assumes the caller holds the lock on the state.
-    fn make_active_buffer(state: &mut MemtableManagerState, db_state: &DbStateHandle) {
+    fn make_active_buffer(
+        state: &mut MemtableManagerState,
+        db_state: &Arc<DbStateHandle>,
+        memtable_capacity: usize,
+        reclaimer: &MemtableReclaimer,
+    ) {
         let _guard = db_state.lock();
         let snapshot = db_state.load();
-        if snapshot.active.is_none() && !state.free_buffers.is_empty() {
-            let buffer = state.free_buffers.pop().expect("free buffer exists");
+        if snapshot.active.is_none() && state.free_budget >= memtable_capacity as u64 {
+            let buffer = vec![0u8; memtable_capacity];
+            state.free_budget = state.free_budget.saturating_sub(buffer.len() as u64);
             let seq = state.next_seq;
             state.next_seq += 1;
             let active = Arc::new(Mutex::new(ActiveMemtable {
                 seq,
-                memtable: Some(HashMemtable::with_buffer(buffer)),
+                memtable: Some(HashMemtable::with_buffer_and_reclaimer(
+                    buffer,
+                    reclaimer.clone(),
+                )),
             }));
             db_state.cas_mutate(snapshot.seq_id, |db_state, snapshot| {
                 DbState::new(
@@ -247,6 +258,45 @@ impl MemtableManager {
                 )
             });
         }
+    }
+
+    /// Creates a memtable reclaimer closure.
+    /// The reclaimer adds the returned buffer size back to the free budget
+    /// and attempts to create a new active memtable if none exists.
+    fn make_reclaimer(
+        state: Arc<Mutex<MemtableManagerState>>,
+        buffer_ready: Arc<Condvar>,
+        db_state: Arc<DbStateHandle>,
+        memtable_capacity: usize,
+    ) -> MemtableReclaimer {
+        let state = Arc::downgrade(&state);
+        let buffer_ready = Arc::downgrade(&buffer_ready);
+        let db_state = Arc::downgrade(&db_state);
+        Arc::new(move |returned| {
+            // upgrade weak references
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let Some(buffer_ready) = buffer_ready.upgrade() else {
+                return;
+            };
+            let Some(db_state) = db_state.upgrade() else {
+                return;
+            };
+            let mut guard = state.lock().unwrap();
+            guard.free_budget = guard.free_budget.saturating_add(returned);
+            // reuse the same reclaimer since it captures nothing by reference
+            let reclaimer = Self::make_reclaimer(
+                Arc::clone(&state),
+                Arc::clone(&buffer_ready),
+                Arc::clone(&db_state),
+                memtable_capacity,
+            );
+            // try to make a new active buffer
+            Self::make_active_buffer(&mut guard, &db_state, memtable_capacity, &reclaimer);
+            // notify waiters
+            buffer_ready.notify_all();
+        })
     }
 
     pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -286,7 +336,7 @@ impl MemtableManager {
     /// processing values without returning byte copy.
     ///
     /// Returns the minimum sequence number among the memtables searched.
-    pub(crate) fn get_all<F>(&self, key: &[u8], mut f: F) -> Result<Option<u64>>
+    pub(crate) fn get_all<F>(&self, key: &[u8], f: F) -> Result<Option<u64>>
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
@@ -354,7 +404,12 @@ impl MemtableManager {
                 DbState::new(db_state, snapshot.lsm_version.clone(), None, immutables)
             });
         drop(guard);
-        Self::make_active_buffer(&mut state, &self.db_state);
+        Self::make_active_buffer(
+            &mut state,
+            &self.db_state,
+            self.memtable_capacity,
+            &self.reclaimer,
+        );
         state.in_flight += 1;
         drop(state);
 
@@ -399,7 +454,12 @@ impl MemtableManager {
             && sender.send(FlushJob { seq, memtable }).is_err()
         {
             let mut state = self.state.lock().unwrap();
-            Self::make_active_buffer(&mut state, &self.db_state);
+            Self::make_active_buffer(
+                &mut state,
+                &self.db_state,
+                self.memtable_capacity,
+                &self.reclaimer,
+            );
             state.in_flight = state.in_flight.saturating_sub(1);
             #[cfg(test)]
             state
@@ -408,7 +468,12 @@ impl MemtableManager {
             self.buffer_ready.notify_all();
         } else if sender.is_none() {
             let mut state = self.state.lock().unwrap();
-            Self::make_active_buffer(&mut state, &self.db_state);
+            Self::make_active_buffer(
+                &mut state,
+                &self.db_state,
+                self.memtable_capacity,
+                &self.reclaimer,
+            );
             state.in_flight = state.in_flight.saturating_sub(1);
             #[cfg(test)]
             state
@@ -668,7 +733,7 @@ mod tests {
         assert_eq!(lsm_tree.level_files(0).len(), 1);
         {
             let state = manager.state.lock().unwrap();
-            assert_eq!(state.free_buffers.len(), 1);
+            assert!(state.free_budget >= 256);
         }
 
         let v2 = encode_value(

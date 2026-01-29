@@ -3,6 +3,10 @@ use bytes::{Buf, BufMut, Bytes};
 use crate::error::{Error, Result};
 use crate::iterator::KvIterator;
 use crate::memtable::Memtable;
+use std::sync::Arc;
+
+/// Type alias for memtable reclaimer function.
+pub(crate) type MemtableReclaimer = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// Hash-indexed memtable storing both entries and bucketed index inside one contiguous buffer.
 pub(crate) struct HashMemtable {
@@ -11,6 +15,7 @@ pub(crate) struct HashMemtable {
     index_cursor: usize,
     bucket_base: usize,
     bucket_count: usize,
+    reclaimer: Option<MemtableReclaimer>,
 }
 
 pub(crate) struct MemtableValueIter<'a> {
@@ -52,7 +57,14 @@ impl HashMemtable {
             index_cursor: bucket_base,
             bucket_base,
             bucket_count,
+            reclaimer: None,
         }
+    }
+
+    pub(crate) fn with_buffer_and_reclaimer(buffer: Vec<u8>, reclaimer: MemtableReclaimer) -> Self {
+        let mut memtable = Self::with_buffer(buffer);
+        memtable.reclaimer = Some(reclaimer);
+        memtable
     }
 
     fn with_capacity_and_buckets(capacity: usize, bucket_count: usize) -> Self {
@@ -71,6 +83,7 @@ impl HashMemtable {
             index_cursor: bucket_base,
             bucket_base,
             bucket_count,
+            reclaimer: None,
         }
     }
 
@@ -157,10 +170,6 @@ impl HashMemtable {
 
     fn bucket_index_from_hash(&self, hash: u64) -> usize {
         (hash as usize) % self.bucket_count
-    }
-
-    pub(crate) fn into_buffer(self) -> Vec<u8> {
-        self.buffer
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -290,6 +299,14 @@ impl<'a> Iterator for MemtableValueIter<'a> {
             }
         }
         None
+    }
+}
+
+impl Drop for HashMemtable {
+    fn drop(&mut self) {
+        if let Some(reclaimer) = &self.reclaimer {
+            reclaimer(self.buffer.len() as u64);
+        }
     }
 }
 
