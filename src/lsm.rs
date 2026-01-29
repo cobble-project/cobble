@@ -407,6 +407,26 @@ impl LSMTree {
         file_manager: &Arc<FileManager>,
         encoded_key: &[u8],
         num_columns: usize,
+        terminal_mask: Option<&mut [u8]>,
+        max_seq: Option<u64>,
+    ) -> Result<Vec<Value>> {
+        let snapshot = self.db_state.load();
+        self.get_with_snapshot(
+            file_manager,
+            snapshot,
+            encoded_key,
+            num_columns,
+            terminal_mask,
+            max_seq,
+        )
+    }
+
+    pub(crate) fn get_with_snapshot(
+        &self,
+        file_manager: &Arc<FileManager>,
+        snapshot: Arc<DbState>,
+        encoded_key: &[u8],
+        num_columns: usize,
         mut terminal_mask: Option<&mut [u8]>,
         max_seq: Option<u64>,
     ) -> Result<Vec<Value>> {
@@ -436,7 +456,7 @@ impl LSMTree {
             }
         }
 
-        for level in self.db_state.load().lsm_version.levels.iter() {
+        for level in snapshot.lsm_version.levels.iter() {
             if level.tiered {
                 for file in level.files.iter().rev() {
                     if let Some(max_seq) = max_seq

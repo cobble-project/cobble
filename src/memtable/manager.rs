@@ -136,6 +136,10 @@ impl MemtableManager {
         })
     }
 
+    pub(crate) fn db_state(&self) -> Arc<DbStateHandle> {
+        Arc::clone(&self.db_state)
+    }
+
     /// Initializes the flush runtime and returns the runtime and flush sender.
     fn init_flush_runtime(
         state: Arc<Mutex<MemtableManagerState>>,
@@ -286,8 +290,21 @@ impl MemtableManager {
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
-        let mut min_seq = u64::MAX;
         let snapshot = self.db_state.load();
+        self.get_all_with_snapshot(snapshot, key, f)
+    }
+
+    /// Same as [`get_all`] but uses the provided `DbState` snapshot to ensure a consistent view.
+    pub(crate) fn get_all_with_snapshot<F>(
+        &self,
+        snapshot: Arc<DbState>,
+        key: &[u8],
+        mut f: F,
+    ) -> Result<Option<u64>>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let mut min_seq = u64::MAX;
         if let Some(active) = &snapshot.active {
             let active = active.lock().unwrap();
             let memtable = active.memtable.as_ref().expect("active memtable exists");
@@ -297,9 +314,13 @@ impl MemtableManager {
             }
             drop(active);
         }
-        if let Some(front) = snapshot.immutables.front() {
-            min_seq = min_seq.min(front.seq);
-        }
+        min_seq = min_seq.min(
+            snapshot
+                .immutables
+                .front()
+                .map(|m| m.seq)
+                .unwrap_or(min_seq),
+        );
         for immutable in snapshot.immutables.iter().rev() {
             for value in immutable.memtable.get_all(key) {
                 f(value)?;

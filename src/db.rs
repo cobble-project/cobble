@@ -185,11 +185,16 @@ impl Db {
         let lookup_key = Key::new(0, key.to_vec());
         let encoded_key = encode_key(&lookup_key);
 
+        let snapshot = self.memtable_manager.db_state().load();
         let mut values: Vec<Value> = Vec::new();
-        let memtable_min_seq = self.memtable_manager.get_all(encoded_key.as_ref(), |raw| {
-            values.push(decode_value(raw, self.num_columns)?);
-            Ok(())
-        })?;
+        let memtable_min_seq = self.memtable_manager.get_all_with_snapshot(
+            Arc::clone(&snapshot),
+            encoded_key.as_ref(),
+            |raw| {
+                values.push(decode_value(raw, self.num_columns)?);
+                Ok(())
+            },
+        )?;
         let mut terminal_mask = if self.num_columns == 1 {
             None
         } else {
@@ -205,8 +210,9 @@ impl Db {
         };
         let mut should_stop =
             self.num_columns > 1 && values.last().is_some_and(|value| value.is_terminal());
-        let lsm_values = self.lsm_tree.get(
+        let lsm_values = self.lsm_tree.get_with_snapshot(
             &self.file_manager,
+            Arc::clone(&snapshot),
             encoded_key.as_ref(),
             self.num_columns,
             terminal_mask.as_deref_mut(),
