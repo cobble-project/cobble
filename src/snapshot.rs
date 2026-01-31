@@ -1,7 +1,8 @@
 //! Snapshot manager and manifest encoding for LSM state.
+use crate::data_file::DataFile;
 use crate::db_state::DbState;
 use crate::error::{Error, Result};
-use crate::file::{BufferedWriter, FileManager, SequentialWriteFile};
+use crate::file::{BufferedWriter, FileManager, SequentialWriteFile, TrackedFile};
 use crate::lsm::Level;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -14,6 +15,8 @@ pub(crate) struct DbSnapshot {
     pub id: u64,
     pub manifest_path: String,
     pub levels: Vec<Level>,
+    pub data_files: Vec<Arc<DataFile>>,
+    pub tracked_files: Vec<Arc<TrackedFile>>,
     pub finished: bool,
 }
 
@@ -47,6 +50,8 @@ impl DbSnapshot {
             id,
             manifest_path,
             levels: vec![],
+            data_files: Vec::new(),
+            tracked_files: Vec::new(),
             finished: false,
         }
     }
@@ -123,11 +128,22 @@ impl SnapshotManager {
 
     pub(crate) fn finish_snapshot(&self, id: u64, db_state: &Arc<DbState>) -> bool {
         let mut state = self.state.lock().unwrap();
-        if let Some(snapshot) = state.snapshots.get_mut(&id) {
-            snapshot.levels = db_state.lsm_version.levels.clone();
-            return true;
-        }
-        false
+        let Some(snapshot) = state.snapshots.get_mut(&id) else {
+            return false;
+        };
+        snapshot.levels = db_state.lsm_version.levels.clone();
+        snapshot.data_files = db_state
+            .lsm_version
+            .levels
+            .iter()
+            .flat_map(|level| level.files.iter().cloned())
+            .collect();
+        snapshot.tracked_files = snapshot
+            .data_files
+            .iter()
+            .filter_map(|file| self.file_manager.data_file_ref(file.file_id).ok())
+            .collect();
+        true
     }
 
     /// Write the snapshot manifest for the given id.
@@ -148,6 +164,24 @@ impl SnapshotManager {
         buffered.close()?;
         snapshot.finished = true;
         Ok(())
+    }
+
+    pub(crate) fn expire_snapshot(&self, id: u64) -> Result<bool> {
+        let snapshot = {
+            let mut state = self.state.lock().unwrap();
+            state.snapshots.remove(&id)
+        };
+        if let Some(snapshot) = snapshot {
+            self.file_manager
+                .remove_metadata_file(&snapshot_manifest_name(id))?;
+            snapshot.tracked_files.iter().for_each(|file| {
+                file.dereference();
+            })
+        } else {
+            return Ok(false);
+        };
+
+        Ok(true)
     }
 
     /// Enqueue a manifest materialization job on the background worker.

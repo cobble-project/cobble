@@ -201,6 +201,11 @@ impl Db {
         Ok(db_snapshot.id)
     }
 
+    /// Expire a snapshot and release its file references.
+    pub fn expire_snapshot(&self, snapshot_id: u64) -> Result<bool> {
+        self.snapshot_manager.expire_snapshot(snapshot_id)
+    }
+
     /// Lookup a key across the memtable and LSM levels.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
         let lookup_key = Key::new(0, key.to_vec());

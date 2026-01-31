@@ -16,7 +16,7 @@ use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use uuid::Uuid;
 
 /// A unique identifier for data files managed by the FileManager.
@@ -50,6 +50,8 @@ pub struct TrackedFile {
     fs: Arc<dyn FileSystem>,
     /// Whether to delete the file when this TrackedFile is dropped.
     delete_on_drop: AtomicBool,
+    /// Count of explicit references to this file (e.g., from snapshots).
+    explicit_refs: AtomicU32,
 }
 
 impl TrackedFile {
@@ -59,6 +61,7 @@ impl TrackedFile {
             path,
             fs,
             delete_on_drop: AtomicBool::new(true),
+            explicit_refs: AtomicU32::new(0),
         }
     }
 
@@ -76,11 +79,21 @@ impl TrackedFile {
     pub fn path(&self) -> &str {
         &self.path
     }
+
+    pub fn reference(&self) {
+        self.explicit_refs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dereference(&self) {
+        self.explicit_refs.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Drop for TrackedFile {
     fn drop(&mut self) {
-        if self.delete_on_drop.load(Ordering::SeqCst) {
+        if self.delete_on_drop.load(Ordering::SeqCst)
+            && self.explicit_refs.load(Ordering::SeqCst) == 0
+        {
             // Attempt to delete the file, ignore errors
             let _ = self.fs.delete(&self.path);
         }
@@ -403,6 +416,18 @@ impl FileManager {
         Ok(TrackedReader::new(reader, Arc::clone(&tracked)))
     }
 
+    /// Returns the tracked data file reference.
+    pub(crate) fn data_file_ref(&self, file_id: FileId) -> Result<Arc<TrackedFile>> {
+        let tracked = self.data_files.get(&file_id).ok_or_else(|| {
+            Error::IoError(format!(
+                "Data file {} is not tracked by FileManager",
+                file_id
+            ))
+        })?;
+        tracked.reference();
+        Ok(Arc::clone(&tracked))
+    }
+
     /// Returns the path for a data file.
     pub fn get_data_file_path(&self, file_id: FileId) -> Option<String> {
         self.data_files.get(&file_id).map(|f| f.path().to_string())
@@ -423,37 +448,9 @@ impl FileManager {
         self.data_files.contains_key(&file_id)
     }
 
-    /// Marks a data file for deletion. The file will be deleted when all
-    /// references to it (readers/writers) are dropped.
-    ///
-    /// If `remove_from_tracking` is true, the file is also removed from the
-    /// FileManager's tracking map. This means no new readers can be opened.
-    pub fn mark_data_file_for_deletion(&self, file_id: FileId, remove_from_tracking: bool) {
-        if let Some(tracked) = self.data_files.get(&file_id) {
-            tracked.mark_for_deletion();
-        }
-        if remove_from_tracking {
-            self.data_files.remove(&file_id);
-        }
-    }
-
-    /// Removes a data file from tracking and optionally deletes it from disk immediately.
-    ///
-    /// If `delete_from_disk` is true, the file is deleted immediately.
-    /// If false, the file remains on disk but is no longer tracked.
-    pub fn remove_data_file(&self, file_id: FileId, delete_from_disk: bool) -> Result<()> {
-        if let Some((_, tracked)) = self.data_files.remove(&file_id)
-            && delete_from_disk
-        {
-            // If we're the last reference, this will delete on drop
-            // But if there are other references, mark it for deletion
-            if Arc::strong_count(&tracked) > 1 {
-                tracked.mark_for_deletion();
-            } else {
-                // We're the last reference, delete immediately
-                self.fs.delete(tracked.path())?;
-            }
-        }
+    /// Removes a data file from tracking.
+    pub fn remove_data_file(&self, file_id: FileId) -> Result<()> {
+        self.data_files.remove(&file_id);
         Ok(())
     }
 
@@ -543,16 +540,8 @@ impl FileManager {
     }
 
     /// Removes a metadata file from tracking and optionally deletes it from disk.
-    pub fn remove_metadata_file(&self, name: &str, delete_from_disk: bool) -> Result<()> {
-        if let Some((_, tracked)) = self.metadata_files.remove(name)
-            && delete_from_disk
-        {
-            if Arc::strong_count(&tracked) > 1 {
-                tracked.mark_for_deletion();
-            } else {
-                self.fs.delete(tracked.path())?;
-            }
-        }
+    pub fn remove_metadata_file(&self, name: &str) -> Result<()> {
+        self.metadata_files.remove(name);
         Ok(())
     }
 
@@ -662,8 +651,33 @@ mod tests {
         assert!(fs.exists(&path).unwrap());
 
         // Remove with delete
-        fm.remove_data_file(file_id, true).unwrap();
+        fm.remove_data_file(file_id).unwrap();
         assert!(!fm.has_data_file(file_id));
+        assert!(!fs.exists(&path).unwrap());
+
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_file_manager_remove_data_file_with_snapshot_ref() {
+        let (fs, fm) = create_test_file_manager();
+
+        let (file_id, mut writer) = fm.create_data_file().unwrap();
+        writer.write(b"data").unwrap();
+        writer.close().unwrap();
+        drop(writer);
+
+        let tracked = fm.data_file_ref(file_id).unwrap();
+        let path = fm.get_data_file_path(file_id).unwrap();
+
+        fm.remove_data_file(file_id).unwrap();
+        assert!(!fm.has_data_file(file_id));
+        assert!(fs.exists(&path).unwrap());
+
+        tracked.dereference();
+        assert!(fs.exists(&path).unwrap());
+        drop(tracked);
         assert!(!fs.exists(&path).unwrap());
 
         cleanup_test_root();
@@ -688,7 +702,7 @@ mod tests {
         assert_eq!(&data[..], b"manifest data");
 
         // Remove it
-        fm.remove_metadata_file("manifest", true).unwrap();
+        fm.remove_metadata_file("manifest").unwrap();
         assert!(!fm.has_metadata_file("manifest"));
 
         cleanup_test_root();

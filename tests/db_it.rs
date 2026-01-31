@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use cobble::{CompactionPolicyKind, Config, Db, TimeProviderKind, WriteBatch};
+use std::path::Path;
 
 fn cleanup_test_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
@@ -15,6 +16,16 @@ fn wait_for_manifest(root: &str, path: &str) -> String {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     std::fs::read_to_string(full_path).expect("read manifest")
+}
+
+fn wait_for_missing(path: &str) {
+    for _ in 0..50 {
+        if !Path::new(path).exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!Path::new(path).exists(), "path still exists: {}", path);
 }
 
 #[test]
@@ -181,6 +192,35 @@ fn test_db_snapshot_creates_manifest() {
     assert!(manifest.contains("\"levels\""));
     assert!(manifest.contains("\"path\":\"data/"));
     assert!(manifest_path.contains("SNAPSHOT-"));
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_expire_snapshot_releases_manifest() {
+    let root = "/tmp/db_snapshot_expire";
+    cleanup_test_root(root);
+    let config = Config {
+        path: format!("file://{}", root),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"k1", 0, b"v1".to_vec());
+    db.write_batch(batch).unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let manifest_path = format!("{}/meta/SNAPSHOT-{}", root, snapshot_id);
+    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", snapshot_id));
+
+    assert!(db.expire_snapshot(snapshot_id).unwrap());
+    wait_for_missing(&manifest_path);
 
     cleanup_test_root(root);
 }
