@@ -73,13 +73,15 @@ impl DbStateHandle {
 
     pub(crate) fn cas_mutate<F>(&self, expected: u64, f: F) -> bool
     where
-        F: FnOnce(&DbStateHandle, &DbState) -> DbState,
+        F: FnOnce(&DbStateHandle, &DbState) -> Option<DbState>,
     {
         let current = self.load();
         if current.seq_id != expected {
             return false;
         }
-        let new_version = f(self, &current);
+        let Some(new_version) = f(self, &current) else {
+            return true;
+        };
         self.store(new_version);
         true
     }

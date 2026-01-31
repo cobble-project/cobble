@@ -17,6 +17,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use uuid::Uuid;
 
 /// A unique identifier for data files managed by the FileManager.
 pub type FileId = u64;
@@ -152,6 +153,70 @@ impl SequentialWriteFile for TrackedWriter {
     }
 }
 
+pub struct AtomicMetadataWriter {
+    temp_path: String,
+    final_name: String,
+    final_path: String,
+    writer: Option<TrackedWriter>,
+    fs: Arc<dyn FileSystem>,
+    metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
+}
+
+impl AtomicMetadataWriter {
+    fn new(
+        temp_path: String,
+        final_name: String,
+        final_path: String,
+        writer: TrackedWriter,
+        fs: Arc<dyn FileSystem>,
+        metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
+    ) -> Self {
+        Self {
+            temp_path,
+            final_name,
+            final_path,
+            writer: Some(writer),
+            fs,
+            metadata_files,
+        }
+    }
+
+    fn finalize(&mut self) -> Result<()> {
+        let Some(writer) = self.writer.take() else {
+            return Ok(());
+        };
+        let mut writer = writer;
+        writer.close()?;
+        self.fs.rename(&self.temp_path, &self.final_path)?;
+        let tracked = Arc::new(TrackedFile::new(
+            self.final_path.clone(),
+            Arc::clone(&self.fs),
+        ));
+        self.metadata_files
+            .insert(self.final_name.clone(), Arc::clone(&tracked));
+        Ok(())
+    }
+}
+
+impl File for AtomicMetadataWriter {
+    fn close(&mut self) -> Result<(), Error> {
+        self.finalize()
+    }
+
+    fn size(&self) -> usize {
+        self.writer.as_ref().map(|w| w.size()).unwrap_or(0)
+    }
+}
+
+impl SequentialWriteFile for AtomicMetadataWriter {
+    fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+        match self.writer.as_mut() {
+            Some(writer) => writer.write(data),
+            None => Err(Error::IoError("Atomic writer already closed".to_string())),
+        }
+    }
+}
+
 /// File manager for managing files in a KV storage engine.
 ///
 /// The FileManager is responsible for managing both metadata files and data files.
@@ -166,7 +231,7 @@ pub struct FileManager {
     /// Map of file ID to tracked file information for data files.
     data_files: DashMap<FileId, Arc<TrackedFile>>,
     /// Map of filename to tracked file information for metadata files.
-    metadata_files: DashMap<String, Arc<TrackedFile>>,
+    metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
 }
 
 impl FileManager {
@@ -187,7 +252,7 @@ impl FileManager {
             options,
             next_file_id: AtomicU64::new(1), // Start from 1, 0 is reserved
             data_files: DashMap::new(),
-            metadata_files: DashMap::new(),
+            metadata_files: Arc::new(DashMap::new()),
         })
     }
 
@@ -343,6 +408,16 @@ impl FileManager {
         self.data_files.get(&file_id).map(|f| f.path().to_string())
     }
 
+    /// Returns the path for a metadata file.
+    pub fn get_metadata_file_path(&self, name: &str) -> Option<String> {
+        self.metadata_files.get(name).map(|f| f.path().to_string())
+    }
+
+    /// Returns the expected path for a metadata file, even if not tracked yet.
+    pub fn metadata_path(&self, name: &str) -> String {
+        self.metadata_file_path(name)
+    }
+
     /// Checks if a data file is tracked by the FileManager.
     pub fn has_data_file(&self, file_id: FileId) -> bool {
         self.data_files.contains_key(&file_id)
@@ -399,16 +474,21 @@ impl FileManager {
     /// Creates a new metadata file for writing.
     ///
     /// Metadata files are identified by their name rather than a numeric ID.
-    pub fn create_metadata_file(&self, name: &str) -> Result<TrackedWriter> {
-        let path = self.metadata_file_path(name);
-        let writer = self.fs.open_write(&path)?;
+    pub fn create_metadata_file(&self, name: &str) -> Result<AtomicMetadataWriter> {
+        let final_path = self.metadata_file_path(name);
+        let temp_path = format!("{}.tmp-{}", final_path, Uuid::new_v4());
+        let writer = self.fs.open_write(&temp_path)?;
 
-        // Track the file
-        let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.fs)));
-        self.metadata_files
-            .insert(name.to_string(), Arc::clone(&tracked));
-
-        Ok(TrackedWriter::new(writer, tracked))
+        let tracked = Arc::new(TrackedFile::new(temp_path.clone(), Arc::clone(&self.fs)));
+        let tracked_writer = TrackedWriter::new(writer, tracked);
+        Ok(AtomicMetadataWriter::new(
+            temp_path,
+            name.to_string(),
+            final_path,
+            tracked_writer,
+            Arc::clone(&self.fs),
+            Arc::clone(&self.metadata_files),
+        ))
     }
 
     /// Registers an existing metadata file with the FileManager.

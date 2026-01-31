@@ -153,10 +153,13 @@ dependencies = [
  "log",
  "log4rs",
  "opendal",
+ "serde",
+ "serde_json",
  "serial_test",
  "thiserror",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]

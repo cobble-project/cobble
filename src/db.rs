@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 use crate::file::{FileManager, FileSystemRegistry};
 use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
+use crate::snapshot::SnapshotManager;
 use crate::sst::SSTWriterOptions;
 use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value, encode_key, encode_value};
@@ -20,6 +21,7 @@ pub struct Db {
     file_manager: Arc<FileManager>,
     lsm_tree: Arc<LSMTree>,
     memtable_manager: MemtableManager,
+    snapshot_manager: SnapshotManager,
     num_columns: usize,
     time_provider: Arc<dyn TimeProvider>,
     ttl_provider: Arc<TTLProvider>,
@@ -96,9 +98,10 @@ impl Db {
         )?;
 
         Ok(Self {
-            file_manager,
+            file_manager: Arc::clone(&file_manager),
             lsm_tree,
             memtable_manager,
+            snapshot_manager: SnapshotManager::new(Arc::clone(&file_manager)),
             num_columns: config.num_columns,
             time_provider,
             ttl_provider,
@@ -185,7 +188,17 @@ impl Db {
     pub fn close(&self) -> Result<()> {
         self.memtable_manager.close()?;
         self.lsm_tree.shutdown_compaction();
+        self.snapshot_manager.close()?;
         Ok(())
+    }
+
+    /// Flush the active memtable and capture an LSM snapshot with a manifest.
+    /// The manifest is materialized asynchronously after the flush completes.
+    pub fn snapshot(&self) -> Result<u64> {
+        let db_snapshot = self.snapshot_manager.create_snapshot();
+        self.memtable_manager
+            .flush_snapshot(db_snapshot.id, self.snapshot_manager.clone())?;
+        Ok(db_snapshot.id)
     }
 
     /// Lookup a key across the memtable and LSM levels.

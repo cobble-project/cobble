@@ -13,6 +13,7 @@ mod format;
 mod iterator;
 mod lsm;
 mod memtable;
+mod snapshot;
 mod sst;
 mod time;
 mod ttl;

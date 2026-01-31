@@ -176,7 +176,7 @@ impl LSMTree {
         state: &mut LSMTreeState,
         edit: VersionEdit,
         fix: impl Fn(&mut DbState),
-    ) {
+    ) -> Arc<DbState> {
         let guard = self.db_state.lock();
         let snapshot = self.db_state.load();
         let mut new_levels = snapshot.lsm_version.levels.clone();
@@ -256,8 +256,9 @@ impl LSMTree {
                     snapshot.immutables.clone(),
                 );
                 fix(&mut new_db_state);
-                new_db_state
+                Some(new_db_state)
             });
+        let snapshot = self.db_state.load();
         drop(guard);
         debug!(
             "{}. {}",
@@ -265,15 +266,16 @@ impl LSMTree {
             VersionSummary(&self.db_state.load().lsm_version)
         );
         self.maybe_trigger_compaction_locked(state);
+        snapshot
     }
 
     pub(crate) fn add_level0_files(
         &self,
         to_remove_memtable_seq: u64,
         new_files: Vec<Arc<DataFile>>,
-    ) {
+    ) -> Arc<DbState> {
         if new_files.is_empty() {
-            return;
+            panic!("cannot add empty new files");
         }
         let edit = VersionEdit {
             level_edits: vec![LevelEdit {
@@ -287,7 +289,7 @@ impl LSMTree {
             db_state
                 .immutables
                 .retain(|imm| imm.seq != to_remove_memtable_seq);
-        });
+        })
     }
 
     pub(crate) fn level_files(&self, level: u8) -> Vec<Arc<DataFile>> {

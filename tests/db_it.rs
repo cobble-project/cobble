@@ -6,6 +6,17 @@ fn cleanup_test_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
 }
 
+fn wait_for_manifest(root: &str, path: &str) -> String {
+    let full_path = format!("{}/{}", root, path);
+    for _ in 0..50 {
+        if let Ok(contents) = std::fs::read_to_string(&full_path) {
+            return contents;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::read_to_string(full_path).expect("read manifest")
+}
+
 #[test]
 #[serial_test::serial(file)]
 fn test_db_put_get_large_dataset() {
@@ -140,6 +151,36 @@ fn test_db_ttl_default_ttl_with_manual_time() {
     // Move to expiry boundary
     db.set_time(5_005);
     assert!(db.get(b"foo").unwrap().is_none());
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_creates_manifest() {
+    let root = "/tmp/db_snapshot_manifest";
+    cleanup_test_root(root);
+    let config = Config {
+        path: format!("file://{}", root),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"k1", 0, b"v1".to_vec());
+    db.write_batch(batch).unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let manifest_path = format!("meta/SNAPSHOT-{}", snapshot_id);
+    let manifest = wait_for_manifest(root, &manifest_path);
+    assert!(manifest.contains("\"id\":"));
+    assert!(manifest.contains("\"levels\""));
+    assert!(manifest.contains("\"path\":\"data/"));
+    assert!(manifest_path.contains("SNAPSHOT-"));
 
     cleanup_test_root(root);
 }

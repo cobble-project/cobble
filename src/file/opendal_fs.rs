@@ -79,6 +79,12 @@ impl FileSystem for OpendalFileSystem {
             .map_err(|e| Error::IoError(format!("Failed to create directory {}: {}", path, e)))
     }
 
+    fn rename(&self, from: &str, to: &str) -> Result<()> {
+        self.runtime
+            .block_on(async { self.op.rename(from, to).await })
+            .map_err(|e| Error::IoError(format!("Failed to rename {} to {}: {}", from, to, e)))
+    }
+
     fn open_read(&self, path: &str) -> Result<Box<dyn RandomAccessFile>> {
         self.runtime.block_on(async {
             // Get file metadata to retrieve size
