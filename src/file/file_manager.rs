@@ -541,7 +541,18 @@ impl FileManager {
 
     /// Removes a metadata file from tracking and optionally deletes it from disk.
     pub fn remove_metadata_file(&self, name: &str) -> Result<()> {
-        self.metadata_files.remove(name);
+        if let Some((_, tracked)) = self.metadata_files.remove(name) {
+            if Arc::strong_count(&tracked) > 1 {
+                tracked.mark_for_deletion();
+            } else {
+                self.fs.delete(tracked.path())?;
+            }
+            return Ok(());
+        }
+        let path = self.metadata_file_path(name);
+        if self.fs.exists(&path)? {
+            self.fs.delete(&path)?;
+        }
         Ok(())
     }
 

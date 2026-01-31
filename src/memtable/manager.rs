@@ -29,6 +29,7 @@ pub(crate) struct MemtableManagerOptions {
     pub(crate) file_builder_factory: Option<Arc<FileBuilderFactory>>,
     pub(crate) num_columns: usize,
     pub(crate) write_stall_limit: usize,
+    pub(crate) auto_snapshot_manager: Option<SnapshotManager>,
 }
 
 impl Default for MemtableManagerOptions {
@@ -40,6 +41,7 @@ impl Default for MemtableManagerOptions {
             file_builder_factory: None,
             num_columns: 1,
             write_stall_limit: 8,
+            auto_snapshot_manager: None,
         }
     }
 }
@@ -58,6 +60,7 @@ pub(crate) struct MemtableManager {
     write_stall_limit: usize,
     flush_tx: Mutex<Option<mpsc::Sender<FlushJob>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    auto_snapshot_manager: Option<SnapshotManager>,
 }
 
 struct MemtableManagerState {
@@ -73,9 +76,9 @@ struct FlushJob {
     snapshot: Option<SnapshotCompletion>,
 }
 
-struct SnapshotCompletion {
-    snapshot_id: u64,
-    manager: SnapshotManager,
+pub(crate) struct SnapshotCompletion {
+    pub(crate) snapshot_id: u64,
+    pub(crate) manager: SnapshotManager,
 }
 
 pub(crate) struct ActiveMemtable {
@@ -153,6 +156,7 @@ impl MemtableManager {
             write_stall_limit: options.write_stall_limit,
             flush_tx: Mutex::new(Some(flush_tx)),
             worker: Mutex::new(Some(worker)),
+            auto_snapshot_manager: options.auto_snapshot_manager,
         })
     }
 
@@ -240,6 +244,7 @@ impl MemtableManager {
             let _ = snapshot_job
                 .manager
                 .schedule_materialize(snapshot_job.snapshot_id);
+            let _ = snapshot_job.manager.process_retention();
         }
     }
 
@@ -396,7 +401,14 @@ impl MemtableManager {
     }
 
     pub(crate) fn flush_active(&self) -> Result<Option<u64>> {
-        self.flush_active_internal(None)
+        let auto_snapshot = self
+            .auto_snapshot_manager
+            .as_ref()
+            .map(|manager| SnapshotCompletion {
+                snapshot_id: manager.create_snapshot().id,
+                manager: manager.clone(),
+            });
+        self.flush_active_internal(auto_snapshot)
     }
 
     pub(crate) fn flush_snapshot(&self, snapshot_id: u64, manager: SnapshotManager) -> Result<()> {
@@ -663,6 +675,7 @@ mod tests {
                 file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
+                ..MemtableManagerOptions::default()
             },
         )
         .unwrap();
@@ -746,6 +759,7 @@ mod tests {
                 file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
+                ..MemtableManagerOptions::default()
             },
         )
         .unwrap();

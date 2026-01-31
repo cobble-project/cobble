@@ -48,6 +48,11 @@ pub struct Config {
     pub log_console: bool,
     /// Log level filter (trace, debug, info, warn, error, off).
     pub log_level: log::LevelFilter,
+    /// Automatically take a snapshot on every successful flush.
+    pub snapshot_on_flush: bool,
+    /// Auto-expire snapshots after this many newer snapshots are completed.
+    /// None disables auto-expiration.
+    pub snapshot_retention: Option<usize>,
 }
 
 impl Default for Config {
@@ -71,6 +76,8 @@ impl Default for Config {
             log_path: None,
             log_console: false,
             log_level: log::LevelFilter::Info,
+            snapshot_on_flush: false,
+            snapshot_retention: None,
         }
     }
 }

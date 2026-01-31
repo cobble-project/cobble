@@ -6,6 +6,7 @@ use crate::file::{BufferedWriter, FileManager, SequentialWriteFile, TrackedFile}
 use crate::lsm::Level;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
@@ -60,6 +61,7 @@ impl DbSnapshot {
 pub(crate) struct SnapshotManager {
     file_manager: Arc<FileManager>,
     state: Arc<Mutex<SnapshotManagerState>>,
+    retention: Option<usize>,
     /// Background worker for manifest materialization.
     materialize_tx: Arc<Mutex<Option<mpsc::Sender<u64>>>>,
     materialize_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -70,6 +72,7 @@ impl Clone for SnapshotManager {
         Self {
             file_manager: Arc::clone(&self.file_manager),
             state: Arc::clone(&self.state),
+            retention: self.retention,
             materialize_tx: Arc::clone(&self.materialize_tx),
             materialize_worker: Arc::clone(&self.materialize_worker),
         }
@@ -79,16 +82,21 @@ impl Clone for SnapshotManager {
 struct SnapshotManagerState {
     next_id: u64,
     snapshots: BTreeMap<u64, DbSnapshot>,
+    completed: Vec<u64>,
+    retained: HashSet<u64>,
 }
 
 impl SnapshotManager {
-    pub(crate) fn new(file_manager: Arc<FileManager>) -> Self {
+    pub(crate) fn new(file_manager: Arc<FileManager>, retention: Option<usize>) -> Self {
         Self {
             file_manager,
             state: Arc::new(Mutex::new(SnapshotManagerState {
                 next_id: 0,
                 snapshots: BTreeMap::new(),
+                completed: Vec::new(),
+                retained: HashSet::new(),
             })),
+            retention,
             materialize_tx: Arc::new(Mutex::new(None)),
             materialize_worker: Arc::new(Mutex::new(None)),
         }
@@ -143,7 +151,38 @@ impl SnapshotManager {
             .iter()
             .filter_map(|file| self.file_manager.data_file_ref(file.file_id).ok())
             .collect();
+        state.completed.push(id);
         true
+    }
+
+    pub(crate) fn retain_snapshot(&self, id: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !state.snapshots.contains_key(&id) {
+            return false;
+        }
+        state.retained.insert(id);
+        true
+    }
+
+    pub(crate) fn process_retention(&self) -> Result<()> {
+        let mut to_expire = Vec::new();
+        {
+            let mut state = self.state.lock().unwrap();
+            let Some(retention) = self.retention else {
+                return Ok(());
+            };
+            if state.completed.len() <= retention {
+                return Ok(());
+            }
+            let keep_from = state.completed.len().saturating_sub(retention);
+            to_expire.extend(state.completed.drain(..keep_from));
+        }
+        for id in to_expire {
+            if !self.retain_snapshot(id) {
+                let _ = self.expire_snapshot(id)?;
+            }
+        }
+        Ok(())
     }
 
     /// Write the snapshot manifest for the given id.
@@ -169,18 +208,19 @@ impl SnapshotManager {
     pub(crate) fn expire_snapshot(&self, id: u64) -> Result<bool> {
         let snapshot = {
             let mut state = self.state.lock().unwrap();
+            state.completed.retain(|completed| *completed != id);
+            state.retained.remove(&id);
             state.snapshots.remove(&id)
         };
-        if let Some(snapshot) = snapshot {
-            self.file_manager
-                .remove_metadata_file(&snapshot_manifest_name(id))?;
-            snapshot.tracked_files.iter().for_each(|file| {
-                file.dereference();
-            })
-        } else {
+        let Some(snapshot) = snapshot else {
             return Ok(false);
         };
-
+        self.file_manager
+            .remove_metadata_file(&snapshot_manifest_name(id))?;
+        snapshot
+            .tracked_files
+            .iter()
+            .for_each(|file| file.dereference());
         Ok(true)
     }
 

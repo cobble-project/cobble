@@ -84,6 +84,8 @@ impl Db {
         lsm_tree.configure_compaction(compaction_options, Some(Arc::clone(&compaction_worker)));
 
         // Memtable manager setup
+        let snapshot_manager =
+            SnapshotManager::new(Arc::clone(&file_manager), config.snapshot_retention);
         let memtable_manager = MemtableManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
@@ -94,6 +96,11 @@ impl Db {
                 file_builder_factory: None,
                 num_columns: config.num_columns,
                 write_stall_limit: config.resolved_write_stall_limit(),
+                auto_snapshot_manager: if config.snapshot_on_flush {
+                    Some(snapshot_manager.clone())
+                } else {
+                    None
+                },
             },
         )?;
 
@@ -101,7 +108,7 @@ impl Db {
             file_manager: Arc::clone(&file_manager),
             lsm_tree,
             memtable_manager,
-            snapshot_manager: SnapshotManager::new(Arc::clone(&file_manager)),
+            snapshot_manager,
             num_columns: config.num_columns,
             time_provider,
             ttl_provider,
@@ -204,6 +211,11 @@ impl Db {
     /// Expire a snapshot and release its file references.
     pub fn expire_snapshot(&self, snapshot_id: u64) -> Result<bool> {
         self.snapshot_manager.expire_snapshot(snapshot_id)
+    }
+
+    /// Retain a snapshot to avoid auto-expiration.
+    pub fn retain_snapshot(&self, snapshot_id: u64) -> bool {
+        self.snapshot_manager.retain_snapshot(snapshot_id)
     }
 
     /// Lookup a key across the memtable and LSM levels.

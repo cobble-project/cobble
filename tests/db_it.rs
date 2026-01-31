@@ -104,6 +104,7 @@ fn test_db_ttl_put_get_with_manual_time() {
         log_path: None,
         log_console: false,
         log_level: log::LevelFilter::Info,
+        ..Config::default()
     };
     let db = Db::open(config).unwrap();
 
@@ -148,6 +149,7 @@ fn test_db_ttl_default_ttl_with_manual_time() {
         log_path: None,
         log_console: false,
         log_level: log::LevelFilter::Info,
+        ..Config::default()
     };
     let db = Db::open(config).unwrap();
 
@@ -221,6 +223,85 @@ fn test_db_expire_snapshot_releases_manifest() {
 
     assert!(db.expire_snapshot(snapshot_id).unwrap());
     wait_for_missing(&manifest_path);
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_auto_expire() {
+    let root = "/tmp/db_snapshot_auto_expire";
+    cleanup_test_root(root);
+    let config = Config {
+        path: format!("file://{}", root),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        snapshot_retention: Some(1),
+        snapshot_on_flush: true,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"k1", 0, b"v1".to_vec());
+    db.write_batch(batch).unwrap();
+
+    let first_id = db.snapshot().unwrap();
+    let _first_path = format!("{}/meta/SNAPSHOT-{}", root, first_id);
+    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", first_id));
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"k2", 0, b"v2".to_vec());
+    db.write_batch(batch).unwrap();
+
+    let second_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", second_id));
+
+    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", first_id));
+    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", second_id));
+    assert!(db.expire_snapshot(first_id).unwrap());
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_retain_skips_auto_expire() {
+    let root = "/tmp/db_snapshot_retain_auto";
+    cleanup_test_root(root);
+    let config = Config {
+        path: format!("file://{}", root),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        snapshot_retention: Some(1),
+        snapshot_on_flush: true,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"k1", 0, b"v1".to_vec());
+    db.write_batch(batch).unwrap();
+
+    let first_id = db.snapshot().unwrap();
+    let _first_path = format!("{}/meta/SNAPSHOT-{}", root, first_id);
+    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", first_id));
+    assert!(db.retain_snapshot(first_id));
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"k2", 0, b"v2".to_vec());
+    db.write_batch(batch).unwrap();
+
+    let second_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", second_id));
+
+    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", first_id));
+    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", second_id));
+    assert!(db.expire_snapshot(first_id).unwrap());
 
     cleanup_test_root(root);
 }
