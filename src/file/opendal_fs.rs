@@ -79,6 +79,15 @@ impl FileSystem for OpendalFileSystem {
             .map_err(|e| Error::IoError(format!("Failed to create directory {}: {}", path, e)))
     }
 
+    fn delete_async(&self, path: &str) -> Result<()> {
+        let path = path.to_string();
+        let op = self.op.clone();
+        self.runtime.spawn(async move {
+            let _ = op.delete(&path).await;
+        });
+        Ok(())
+    }
+
     fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.runtime
             .block_on(async { self.op.rename(from, to).await })

@@ -8,7 +8,7 @@
 use crate::compaction::CompactionConfig;
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
-use crate::file::FileManager;
+use crate::file::{FileManager, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
 use crate::lsm::{LevelEdit, VersionEdit};
@@ -269,6 +269,7 @@ impl CompactionExecutor {
                         start_key: first_key,
                         end_key: last_key,
                         file_id,
+                        tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                         seq: max_seq,
                         size: file_size,
                     }));
@@ -294,6 +295,7 @@ impl CompactionExecutor {
                 start_key: first_key,
                 end_key: last_key,
                 file_id,
+                tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                 seq: max_seq,
                 size: file_size,
             }));
@@ -345,7 +347,7 @@ impl CompactionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{FileManagerOptions, FileSystemRegistry};
+    use crate::file::{FileManagerOptions, FileSystemRegistry, TrackedFileId};
     use crate::sst::row_codec::encode_value;
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::Value;
@@ -361,7 +363,7 @@ mod tests {
     }
 
     fn create_test_sst(
-        file_manager: &FileManager,
+        file_manager: &Arc<FileManager>,
         entries: Vec<(&[u8], &[u8])>,
     ) -> Result<Arc<DataFile>> {
         let (file_id, writer_file) = file_manager.create_data_file()?;
@@ -378,6 +380,7 @@ mod tests {
             start_key: first_key,
             end_key: last_key,
             file_id,
+            tracked_id: TrackedFileId::new(file_manager, file_id),
             seq: 0,
             size: file_size,
         }))
@@ -659,6 +662,7 @@ mod tests {
             start_key: first_key,
             end_key: last_key,
             file_id,
+            tracked_id: TrackedFileId::new(&file_manager, file_id),
             seq: 0,
             size: file_size,
         });

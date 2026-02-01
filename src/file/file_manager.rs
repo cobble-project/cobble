@@ -15,8 +15,8 @@ use crate::file::file_system::FileSystem;
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use uuid::Uuid;
 
 /// A unique identifier for data files managed by the FileManager.
@@ -89,13 +89,43 @@ impl TrackedFile {
     }
 }
 
+/// Handle that keeps a data file id tracked by the FileManager.
+pub struct TrackedFileId {
+    file_id: FileId,
+    file_manager: Weak<FileManager>,
+}
+
+impl TrackedFileId {
+    pub fn new(file_manager: &Arc<FileManager>, file_id: FileId) -> Arc<Self> {
+        Arc::new(Self {
+            file_id,
+            file_manager: Arc::downgrade(file_manager),
+        })
+    }
+
+    pub fn detached(file_id: FileId) -> Arc<Self> {
+        Arc::new(Self {
+            file_id,
+            file_manager: Weak::new(),
+        })
+    }
+}
+
+impl Drop for TrackedFileId {
+    fn drop(&mut self) {
+        if let Some(file_manager) = self.file_manager.upgrade() {
+            let _ = file_manager.remove_data_file(self.file_id);
+        }
+    }
+}
+
 impl Drop for TrackedFile {
     fn drop(&mut self) {
         if self.delete_on_drop.load(Ordering::SeqCst)
             && self.explicit_refs.load(Ordering::SeqCst) == 0
         {
             // Attempt to delete the file, ignore errors
-            let _ = self.fs.delete(&self.path);
+            let _ = self.fs.delete_async(&self.path);
         }
     }
 }
@@ -449,7 +479,7 @@ impl FileManager {
     }
 
     /// Removes a data file from tracking.
-    pub fn remove_data_file(&self, file_id: FileId) -> Result<()> {
+    pub(crate) fn remove_data_file(&self, file_id: FileId) -> Result<()> {
         self.data_files.remove(&file_id);
         Ok(())
     }
@@ -570,8 +600,22 @@ impl FileManager {
     }
 }
 
+pub(crate) mod test_utils {
+    use crate::file::file_system::FileSystem;
+    use std::sync::Arc;
+
+    pub(crate) fn wait_for_file_deletion(fs: &Arc<dyn FileSystem>, path: &str) {
+        for _ in 0..50 {
+            if !fs.exists(path).unwrap() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::file::FileSystemRegistry;
     use crate::file::files::File;
@@ -664,6 +708,7 @@ mod tests {
         // Remove with delete
         fm.remove_data_file(file_id).unwrap();
         assert!(!fm.has_data_file(file_id));
+        test_utils::wait_for_file_deletion(&fs, &path);
         assert!(!fs.exists(&path).unwrap());
 
         cleanup_test_root();
@@ -689,6 +734,7 @@ mod tests {
         tracked.dereference();
         assert!(fs.exists(&path).unwrap());
         drop(tracked);
+        test_utils::wait_for_file_deletion(&fs, &path);
         assert!(!fs.exists(&path).unwrap());
 
         cleanup_test_root();

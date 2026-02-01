@@ -1,6 +1,7 @@
-use crate::file::FileId;
+use crate::file::{FileId, TrackedFileId};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataFileType {
@@ -38,6 +39,8 @@ pub struct DataFile {
     pub end_key: Vec<u8>,
     /// Unique file identifier assigned by the FileManager.
     pub file_id: FileId,
+    /// Handle for removing the file when LSM drops references.
+    pub(crate) tracked_id: Arc<TrackedFileId>,
     /// Maximum sequence id for data contained in this file.
     pub seq: u64,
     /// Size of the file in bytes.

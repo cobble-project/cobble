@@ -588,7 +588,7 @@ mod tests {
     use super::*;
     use crate::data_file::DataFileType;
     use crate::db_state::{DbState, DbStateHandle};
-    use crate::file::{FileId, FileManager, FileSystemRegistry};
+    use crate::file::{FileId, FileManager, FileSystemRegistry, TrackedFileId};
     use crate::sst::row_codec::{encode_key, encode_value};
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::{Column, Key, Value, ValueType};
@@ -604,6 +604,7 @@ mod tests {
                 start_key: start.to_vec(),
                 end_key: end.to_vec(),
                 file_id: id,
+                tracked_id: TrackedFileId::detached(id),
                 seq: 0,
                 size: 0, // Test file, size doesn't matter
             })
@@ -619,6 +620,7 @@ mod tests {
                 start_key: start.to_vec(),
                 end_key: end.to_vec(),
                 file_id: id,
+                tracked_id: TrackedFileId::detached(id),
                 seq: 0,
                 size,
             })
@@ -630,7 +632,7 @@ mod tests {
     }
 
     fn create_test_sst(
-        file_manager: &FileManager,
+        file_manager: &Arc<FileManager>,
         seq: u64,
         entries: Vec<(&[u8], &[u8])>,
     ) -> Result<Arc<DataFile>> {
@@ -652,6 +654,7 @@ mod tests {
             start_key: first_key,
             end_key: last_key,
             file_id,
+            tracked_id: TrackedFileId::new(file_manager, file_id),
             seq,
             size: file_size,
         }))
@@ -725,6 +728,62 @@ mod tests {
         assert_eq!(level1.files[0].start_key, b"d1");
         assert_eq!(level1.files[1].start_key, b"e");
         assert_eq!(level1.files[2].start_key, b"g");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_lsm_edit_removes_data_file() {
+        let root = "/tmp/lsm_edit_remove_file";
+        cleanup_test_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let file_manager = Arc::new(FileManager::with_defaults(fs.clone()).unwrap());
+        let num_columns = 1;
+        let to_remove = create_test_sst(
+            &file_manager,
+            1,
+            vec![(b"k1", &make_value_bytes(b"value", num_columns))],
+        )
+        .unwrap();
+        let file_id = to_remove.file_id;
+        let path = file_manager.get_data_file_path(file_id).unwrap();
+        assert!(fs.exists(&path).unwrap());
+
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(DbState {
+            seq_id: 0,
+            lsm_version: LSMTreeVersion {
+                levels: vec![Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: vec![Arc::clone(&to_remove)],
+                }],
+            },
+            active: None,
+            immutables: Vec::new().into(),
+        });
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
+        lsm_tree.apply_edit(VersionEdit {
+            level_edits: vec![LevelEdit {
+                level: 0,
+                removed_files: vec![Arc::clone(&to_remove)],
+                new_files: Vec::new(),
+            }],
+        });
+        assert!(lsm_tree.level_files(0).is_empty());
+        drop(to_remove);
+
+        crate::file::test_utils::wait_for_file_deletion(&fs, &path);
+        for _ in 0..50 {
+            if !fs.exists(&path).unwrap() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!fs.exists(&path).unwrap());
+        cleanup_test_root(root);
     }
 
     #[test]

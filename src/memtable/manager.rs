@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{DbState, DbStateHandle};
 use crate::error::{Error, Result};
-use crate::file::FileManager;
+use crate::file::{FileManager, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator};
 use crate::lsm::LSMTree;
@@ -579,6 +579,7 @@ fn flush_memtable(
             start_key,
             end_key,
             file_id,
+            tracked_id: TrackedFileId::new(&file_manager, file_id),
             size: file_size,
             seq,
         };

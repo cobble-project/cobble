@@ -16,6 +16,8 @@ pub trait FileSystem: Send + Sync {
 
     fn delete(&self, path: &str) -> Result<()>;
 
+    fn delete_async(&self, path: &str) -> Result<()>;
+
     fn rename(&self, from: &str, to: &str) -> Result<()>;
 
     fn open_read(&self, path: &str) -> Result<Box<dyn RandomAccessFile>>;

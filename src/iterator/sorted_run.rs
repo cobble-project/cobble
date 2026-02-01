@@ -230,6 +230,7 @@ where
 mod tests {
     use super::*;
     use crate::data_file::DataFileType;
+    use crate::file::TrackedFileId;
     use crate::iterator::mock_iterator::MockIterator;
 
     fn create_data_file(id: u64, start: &[u8], end: &[u8]) -> Arc<DataFile> {
@@ -238,6 +239,7 @@ mod tests {
             start_key: start.to_vec(),
             end_key: end.to_vec(),
             file_id: id,
+            tracked_id: TrackedFileId::detached(id),
             seq: 0,
             size: 0,
         })
