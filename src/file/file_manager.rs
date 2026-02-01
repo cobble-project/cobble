@@ -65,6 +65,16 @@ impl TrackedFile {
         }
     }
 
+    /// Creates a new TrackedFile that never deletes on drop.
+    fn readonly(path: String, fs: Arc<dyn FileSystem>) -> Self {
+        Self {
+            path,
+            fs,
+            delete_on_drop: AtomicBool::new(false),
+            explicit_refs: AtomicU32::new(0),
+        }
+    }
+
     /// Marks the file for deletion when this TrackedFile is dropped.
     pub fn mark_for_deletion(&self) {
         self.delete_on_drop.store(true, Ordering::SeqCst);
@@ -348,11 +358,10 @@ impl FileManager {
         let file_id = self.allocate_file_id();
         let path = self.data_file_path(file_id);
 
-        let writer = self.fs.open_write(&path)?;
-
         // Track the file
         let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.fs)));
         self.data_files.insert(file_id, Arc::clone(&tracked));
+        let writer = self.fs.open_write(tracked.path())?;
 
         Ok((file_id, TrackedWriter::new(writer, tracked)))
     }
@@ -369,12 +378,13 @@ impl FileManager {
             )));
         }
 
-        let path = self.data_file_path(file_id);
-        let writer = self.fs.open_write(&path)?;
-
         // Track the file
-        let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.fs)));
+        let tracked = Arc::new(TrackedFile::new(
+            self.data_file_path(file_id),
+            Arc::clone(&self.fs),
+        ));
         self.data_files.insert(file_id, Arc::clone(&tracked));
+        let writer = self.fs.open_write(tracked.path())?;
 
         // Update next_file_id if necessary
         let mut current = self.next_file_id.load(Ordering::SeqCst);
@@ -407,10 +417,9 @@ impl FileManager {
         }
 
         // Track the file if not already tracked
-        if !self.data_files.contains_key(&file_id) {
-            let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.fs)));
-            self.data_files.insert(file_id, tracked);
-        }
+        self.data_files
+            .entry(file_id)
+            .or_insert_with(|| Arc::new(TrackedFile::new(path, Arc::clone(&self.fs))));
 
         // Update next_file_id if necessary
         let mut current = self.next_file_id.load(Ordering::SeqCst);
@@ -551,6 +560,28 @@ impl FileManager {
 
         let reader = self.fs.open_read(tracked.path())?;
         Ok(TrackedReader::new(reader, Arc::clone(&tracked)))
+    }
+
+    /// Opens a metadata file for reading without tracking it.
+    pub fn open_metadata_file_reader_untracked(
+        &self,
+        name: &str,
+    ) -> Result<Box<dyn RandomAccessFile>> {
+        let path = self.metadata_file_path(name);
+        self.fs.open_read(&path)
+    }
+
+    /// Registers an existing data file without deleting it on drop.
+    pub fn register_data_file_readonly(&self, file_id: FileId, path: String) -> Result<()> {
+        if !self.fs.exists(&path)? {
+            return Err(Error::IoError(format!(
+                "Data file {} does not exist at path: {}",
+                file_id, path
+            )));
+        }
+        let tracked = Arc::new(TrackedFile::readonly(path, Arc::clone(&self.fs)));
+        self.data_files.entry(file_id).or_insert_with(|| tracked);
+        Ok(())
     }
 
     /// Checks if a metadata file exists.

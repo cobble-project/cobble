@@ -14,6 +14,7 @@ use log::info;
 use std::sync::Arc;
 
 use crate::db_state::DbStateHandle;
+use crate::read_only_db::ReadOnlyDb;
 use crate::ttl::{TTLProvider, TtlConfig};
 
 /// Public database interface.
@@ -216,6 +217,12 @@ impl Db {
     /// Retain a snapshot to avoid auto-expiration.
     pub fn retain_snapshot(&self, snapshot_id: u64) -> bool {
         self.snapshot_manager.retain_snapshot(snapshot_id)
+    }
+
+    /// Open a read-only view from a snapshot manifest.
+    pub fn open_read_only(config: Config, snapshot_id: u64) -> Result<ReadOnlyDb> {
+        Self::init_logging(&config);
+        ReadOnlyDb::open(config, snapshot_id)
     }
 
     /// Lookup a key across the memtable and LSM levels.

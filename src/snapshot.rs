@@ -4,7 +4,7 @@ use crate::db_state::DbState;
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, FileManager, SequentialWriteFile, TrackedFile};
 use crate::lsm::Level;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, mpsc};
@@ -21,28 +21,28 @@ pub(crate) struct DbSnapshot {
     pub finished: bool,
 }
 
-#[derive(Serialize)]
-struct ManifestSnapshot {
-    id: u64,
-    levels: Vec<ManifestLevel>,
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ManifestSnapshot {
+    pub(crate) id: u64,
+    pub(crate) levels: Vec<ManifestLevel>,
 }
 
-#[derive(Serialize)]
-struct ManifestLevel {
-    ordinal: u8,
-    tiered: bool,
-    files: Vec<ManifestFile>,
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ManifestLevel {
+    pub(crate) ordinal: u8,
+    pub(crate) tiered: bool,
+    pub(crate) files: Vec<ManifestFile>,
 }
 
-#[derive(Serialize)]
-struct ManifestFile {
-    file_id: u64,
-    file_type: &'static str,
-    seq: u64,
-    size: usize,
-    start_key: String,
-    end_key: String,
-    path: Option<String>,
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ManifestFile {
+    pub(crate) file_id: u64,
+    pub(crate) file_type: String,
+    pub(crate) seq: u64,
+    pub(crate) size: usize,
+    pub(crate) start_key: String,
+    pub(crate) end_key: String,
+    pub(crate) path: Option<String>,
 }
 
 impl DbSnapshot {
@@ -266,7 +266,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                     .iter()
                     .map(|file| ManifestFile {
                         file_id: file.file_id,
-                        file_type: file.file_type.as_str(),
+                        file_type: file.file_type.as_str().to_string(),
                         seq: file.seq,
                         size: file.size,
                         start_key: to_hex(&file.start_key),
@@ -292,6 +292,42 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn snapshot_manifest_name(id: u64) -> String {
+pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<ManifestSnapshot> {
+    serde_json::from_slice(bytes)
+        .map_err(|err| Error::IoError(format!("Failed to decode manifest: {}", err)))
+}
+
+pub(crate) fn from_hex(hex: &str) -> Result<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(Error::IoError(format!(
+            "Invalid hex string length: {}",
+            hex.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let hi = hex_value(bytes[idx])?;
+        let lo = hex_value(bytes[idx + 1])?;
+        out.push((hi << 4) | lo);
+        idx += 2;
+    }
+    Ok(out)
+}
+
+fn hex_value(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(10 + (byte - b'a')),
+        b'A'..=b'F' => Ok(10 + (byte - b'A')),
+        _ => Err(Error::IoError(format!(
+            "Invalid hex character: {}",
+            byte as char
+        ))),
+    }
+}
+
+pub(crate) fn snapshot_manifest_name(id: u64) -> String {
     format!("SNAPSHOT-{}", id)
 }
