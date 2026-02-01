@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use cobble::{CompactionPolicyKind, Config, Db, TimeProviderKind, WriteBatch};
+use cobble::{CompactionPolicyKind, Config, Db, MetricValue, TimeProviderKind, WriteBatch};
 use std::path::Path;
 
 fn cleanup_test_root(path: &str) {
@@ -225,6 +225,61 @@ fn test_db_snapshot_read_only_get() {
     let value = ro.get(b"k1").unwrap().expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_metrics_list() {
+    let root = "/tmp/db_metrics_list";
+    cleanup_test_root(root);
+    let config = Config {
+        path: format!("file://{}", root),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"k1", 0, b"v1".to_vec());
+    db.write_batch(batch).unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", snapshot_id));
+
+    let metrics = db.metrics();
+    let db_id = db.id();
+    let matches_db = |labels: &[(String, String)]| {
+        labels
+            .iter()
+            .any(|(key, value)| key == "db_id" && value == db_id)
+    };
+
+    let flushes = metrics
+        .iter()
+        .find(|sample| sample.name == "memtable_flushes_total" && matches_db(&sample.labels));
+    assert!(flushes.is_some());
+    if let Some(sample) = flushes {
+        match &sample.value {
+            MetricValue::Counter(value) => assert!(*value >= 1),
+            _ => panic!("expected counter"),
+        }
+    }
+
+    let bytes = metrics
+        .iter()
+        .find(|sample| sample.name == "memtable_flush_bytes_total" && matches_db(&sample.labels));
+    assert!(bytes.is_some());
+    if let Some(sample) = bytes {
+        match &sample.value {
+            MetricValue::Counter(value) => assert!(*value > 0),
+            _ => panic!("expected counter"),
+        }
+    }
 
     cleanup_test_root(root);
 }

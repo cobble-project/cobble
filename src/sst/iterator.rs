@@ -6,9 +6,12 @@ use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, Value};
 use bytes::Bytes;
+use metrics::counter;
 
 #[derive(Clone)]
 pub(crate) struct SSTIteratorOptions {
+    /// Optional database ID for metrics labeling.
+    pub metrics_db_id: Option<String>,
     /// Size of the block cache in bytes.
     /// If zero, block caching is disabled.
     pub block_cache_size: usize,
@@ -27,6 +30,7 @@ impl Default for SSTIteratorOptions {
         Self {
             block_cache_size: 64 * 1024 * 1024, // 64 MB
             num_columns: 1,
+            metrics_db_id: None,
         }
     }
 }
@@ -98,6 +102,10 @@ impl SSTIterator {
         Ok(SSTIteratorTestCache { inner })
     }
 
+    fn metrics_db_id(&self) -> &str {
+        self.options.metrics_db_id.as_deref().unwrap_or("unknown")
+    }
+
     fn read_footer(file: &dyn RandomAccessFile) -> Result<Footer> {
         // Read footer from the end of the file using the file size
         let file_size = file.size();
@@ -162,14 +170,33 @@ impl SSTIterator {
             file_id: self.file_id,
             block_id: block_idx as u32,
         };
+        let db_id = self.metrics_db_id().to_string();
         let block = if let Some(cache) = &self.block_cache {
             if let Some(block) = cache.get(&cache_key) {
+                counter!(
+                    "block_cache_hits_total",
+                    "kind" => "sst",
+                    "db_id" => db_id.clone()
+                )
+                .increment(1);
                 block
             } else {
+                counter!(
+                    "block_cache_misses_total",
+                    "kind" => "sst",
+                    "db_id" => db_id.clone()
+                )
+                .increment(1);
                 let data = self.file.read_at(offset, size)?;
                 let mut block = Block::decode(data)?;
                 block.set_block_id(block_idx as u32);
                 cache.insert(cache_key, block.clone());
+                counter!(
+                    "block_cache_inserts_total",
+                    "kind" => "sst",
+                    "db_id" => db_id.clone()
+                )
+                .increment(1);
                 block
             }
         } else {

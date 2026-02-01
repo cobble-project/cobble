@@ -15,6 +15,7 @@ use crate::memtable::hash::{HashMemtable, MemtableReclaimer};
 use crate::snapshot::SnapshotManager;
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use log::{debug, trace, warn};
+use metrics::counter;
 
 #[derive(Clone)]
 pub(crate) struct MemtableFlushResult {
@@ -23,6 +24,7 @@ pub(crate) struct MemtableFlushResult {
 }
 
 pub(crate) struct MemtableManagerOptions {
+    pub(crate) db_id: String,
     pub(crate) memtable_capacity: usize,
     pub(crate) buffer_count: usize,
     pub(crate) sst_options: SSTWriterOptions,
@@ -35,6 +37,7 @@ pub(crate) struct MemtableManagerOptions {
 impl Default for MemtableManagerOptions {
     fn default() -> Self {
         Self {
+            db_id: String::new(),
             memtable_capacity: 1024 * 1024,
             buffer_count: 2,
             sst_options: SSTWriterOptions::default(),
@@ -61,6 +64,7 @@ pub(crate) struct MemtableManager {
     flush_tx: Mutex<Option<mpsc::Sender<FlushJob>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     auto_snapshot_manager: Option<SnapshotManager>,
+    db_id: String,
 }
 
 struct MemtableManagerState {
@@ -157,6 +161,7 @@ impl MemtableManager {
             flush_tx: Mutex::new(Some(flush_tx)),
             worker: Mutex::new(Some(worker)),
             auto_snapshot_manager: options.auto_snapshot_manager,
+            db_id: options.db_id,
         })
     }
 
@@ -186,6 +191,9 @@ impl MemtableManager {
             .name("cobble-flush".to_string())
             .spawn(move || {
                 while let Ok(job) = flush_rx.recv() {
+                    let db_id = lsm_tree_clone
+                        .db_id()
+                        .unwrap_or_else(|| "unknown".to_string());
                     if let Some(memtable) = job.memtable {
                         trace!("memtable flush start seq={}", job.seq);
                         let (result, _memtable, completed_seq) = flush_memtable(
@@ -204,6 +212,10 @@ impl MemtableManager {
                                     "memtable flush complete seq={} file_id={} size={}",
                                     res.seq, res.data_file.file_id, res.data_file.size
                                 );
+                                counter!("memtable_flushes_total", "db_id" => db_id.clone())
+                                    .increment(1);
+                                counter!("memtable_flush_bytes_total", "db_id" => db_id.clone())
+                                    .increment(res.data_file.size as u64);
                                 let snapshot = lsm_tree_clone
                                     .add_level0_files(res.seq, vec![Arc::clone(&res.data_file)]);
                                 let flush_result = Ok(MemtableFlushResult {
@@ -526,6 +538,7 @@ impl MemtableManager {
     ) -> std::sync::MutexGuard<'a, ()> {
         while Self::should_write_stall_with_snapshot(&self.db_state.load(), self.write_stall_limit)
         {
+            counter!("write_stall_waits_total", "db_id" => self.db_id.clone()).increment(1);
             guard = self.db_state.wait_for_change(guard);
         }
         guard

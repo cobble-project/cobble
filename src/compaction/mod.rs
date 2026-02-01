@@ -70,7 +70,12 @@ impl CompactionWorker {
         if sorted_runs.is_empty() {
             return None;
         }
+        let db_id = self
+            .file_manager
+            .db_id()
+            .unwrap_or_else(|| "unknown".to_string());
         let task = CompactionTask::new(
+            db_id,
             sorted_runs,
             output_level,
             Arc::clone(&self.file_manager),

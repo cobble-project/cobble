@@ -14,11 +14,13 @@ use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, Sorted
 use crate::lsm::{LevelEdit, VersionEdit};
 use crate::sst::SSTIteratorOptions;
 use log::trace;
+use metrics::counter;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 /// A compaction task describes the input and output parameters for a compaction.
 pub struct CompactionTask {
+    db_id: String,
     /// The sorted runs to compact.
     sorted_runs: Vec<SortedRun>,
     output_level: u8,
@@ -40,6 +42,7 @@ impl CompactionTask {
     /// * `file_builder_factory` - Factory function for creating FileBuilder instances
     /// * `data_file_type` - The data file type for output files
     pub fn new(
+        db_id: String,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         file_manager: Arc<FileManager>,
@@ -48,6 +51,7 @@ impl CompactionTask {
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Self {
         Self {
+            db_id,
             sorted_runs,
             output_level,
             file_manager,
@@ -68,6 +72,10 @@ impl CompactionTask {
 
     pub fn ttl_provider(&self) -> Arc<crate::ttl::TTLProvider> {
         Arc::clone(&self.ttl_provider)
+    }
+
+    pub fn db_id(&self) -> &str {
+        &self.db_id
     }
 }
 
@@ -197,11 +205,13 @@ impl CompactionExecutor {
         // Create iterators for all files in all sorted runs
         // We iterate files from all sorted runs, with earlier runs (newer data) coming first
         let sst_options = SSTIteratorOptions {
+            metrics_db_id: Some(task.db_id.clone()),
             num_columns: options.num_columns,
             ..SSTIteratorOptions::default()
         };
 
         let mut all_iters: Vec<Box<dyn KvIterator>> = Vec::new();
+        let mut read_bytes = 0u64;
         for run in &task.sorted_runs {
             for file in run.files() {
                 let reader = task.file_manager.open_data_file_reader(file.file_id)?;
@@ -211,8 +221,11 @@ impl CompactionExecutor {
                     sst_options.clone(),
                 )?;
                 all_iters.push(Box::new(iter));
+                read_bytes = read_bytes.saturating_add(file.size as u64);
             }
         }
+        counter!("compaction_read_bytes_total", "db_id" => task.db_id.clone())
+            .increment(read_bytes);
 
         let max_seq = task
             .sorted_runs
@@ -232,6 +245,7 @@ impl CompactionExecutor {
 
         // Collect output files
         let mut output_files: Vec<Arc<DataFile>> = Vec::new();
+        let mut written_bytes = 0u64;
 
         // Process entries and write to output files using the FileBuilder trait
         let mut current_builder: Option<Box<dyn FileBuilder>> = None;
@@ -273,6 +287,7 @@ impl CompactionExecutor {
                         seq: max_seq,
                         size: file_size,
                     }));
+                    written_bytes = written_bytes.saturating_add(file_size as u64);
                 }
             }
 
@@ -299,7 +314,10 @@ impl CompactionExecutor {
                 seq: max_seq,
                 size: file_size,
             }));
+            written_bytes = written_bytes.saturating_add(file_size as u64);
         }
+        counter!("compaction_write_bytes_total", "db_id" => task.db_id.clone())
+            .increment(written_bytes);
 
         // Create version edits
         let mut level_edits: std::collections::BTreeMap<u8, LevelEdit> =
@@ -441,6 +459,7 @@ mod tests {
             num_columns: options.num_columns,
         });
         let task = CompactionTask::new(
+            "test".to_string(),
             vec![run1, run2],
             1,
             Arc::clone(&file_manager),
@@ -557,6 +576,7 @@ mod tests {
             num_columns: options.num_columns,
         });
         let task = CompactionTask::new(
+            "test".to_string(),
             vec![run1, run2],
             1,
             Arc::clone(&file_manager),
@@ -682,6 +702,7 @@ mod tests {
             num_columns: options.num_columns,
         });
         let task = CompactionTask::new(
+            "test".to_string(),
             vec![run],
             1,
             Arc::clone(&file_manager),
@@ -741,6 +762,7 @@ mod tests {
             num_columns: options.num_columns,
         });
         let task = CompactionTask::new(
+            "test".to_string(),
             vec![],
             1,
             Arc::clone(&file_manager),

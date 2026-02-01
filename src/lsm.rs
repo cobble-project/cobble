@@ -36,6 +36,7 @@ pub(crate) struct LSMTree {
     block_cache: Option<BlockCache>,
     state: Mutex<LSMTreeState>,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
+    db_id: Option<String>,
 }
 
 struct LSMTreeState {
@@ -151,6 +152,7 @@ impl LSMTree {
                 compaction_worker: None,
             }),
             ttl_provider,
+            db_id: None,
         }
     }
 
@@ -316,6 +318,14 @@ impl LSMTree {
 
     pub(crate) fn set_block_cache(&mut self, block_cache: Option<BlockCache>) {
         self.block_cache = block_cache;
+    }
+
+    pub(crate) fn set_db_id(&mut self, db_id: String) {
+        self.db_id = Some(db_id);
+    }
+
+    pub(crate) fn db_id(&self) -> Option<String> {
+        self.db_id.clone()
     }
 
     pub(crate) fn shutdown_compaction(&self) {
@@ -546,6 +556,7 @@ impl LSMTree {
             file.file_id,
             SSTIteratorOptions {
                 num_columns,
+                metrics_db_id: self.db_id.clone(),
                 ..SSTIteratorOptions::default()
             },
             self.block_cache.clone(),

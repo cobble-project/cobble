@@ -12,13 +12,16 @@ use crate::{Config, TimeProvider};
 use bytes::Bytes;
 use log::info;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::db_state::DbStateHandle;
+use crate::metrics_registry;
 use crate::read_only_db::ReadOnlyDb;
 use crate::ttl::{TTLProvider, TtlConfig};
 
 /// Public database interface.
 pub struct Db {
+    id: String,
     file_manager: Arc<FileManager>,
     lsm_tree: Arc<LSMTree>,
     memtable_manager: MemtableManager,
@@ -32,9 +35,13 @@ impl Db {
     /// Open a database with the provided configuration.
     pub fn open(config: Config) -> Result<Self> {
         Self::init_logging(&config);
+        metrics_registry::init_metrics();
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(config.path.clone())?;
-        let file_manager = Arc::new(FileManager::with_defaults(fs)?);
+        let mut file_manager = FileManager::with_defaults(fs)?;
+        let id = Uuid::new_v4().to_string();
+        file_manager.set_db_id(id.clone());
+        let file_manager = Arc::new(file_manager);
         let db_state = Arc::new(DbStateHandle::new());
         let time_provider = config.time_provider.create();
         let ttl_provider = Arc::new(TTLProvider::new(
@@ -50,6 +57,7 @@ impl Db {
         if config.block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
+        lsm_tree.set_db_id(id.clone());
         let lsm_tree = Arc::new(lsm_tree);
         let sst_options = SSTWriterOptions {
             num_columns: config.num_columns,
@@ -102,10 +110,12 @@ impl Db {
                 } else {
                     None
                 },
+                db_id: id.clone(),
             },
         )?;
 
         Ok(Self {
+            id,
             file_manager: Arc::clone(&file_manager),
             lsm_tree,
             memtable_manager,
@@ -114,6 +124,15 @@ impl Db {
             time_provider,
             ttl_provider,
         })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Return the metrics samples for this database.
+    pub fn metrics(&self) -> Vec<crate::MetricSample> {
+        metrics_registry::snapshot_metrics(Some(&self.id))
     }
 
     fn init_logging(config: &Config) {

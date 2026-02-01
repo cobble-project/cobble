@@ -15,6 +15,7 @@ use crate::file::file_system::FileSystem;
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
 use bytes::Bytes;
 use dashmap::DashMap;
+use metrics::gauge;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use uuid::Uuid;
@@ -207,6 +208,7 @@ impl SequentialWriteFile for TrackedWriter {
 }
 
 pub struct AtomicMetadataWriter {
+    db_id: Option<String>,
     temp_path: String,
     final_name: String,
     final_path: String,
@@ -217,6 +219,7 @@ pub struct AtomicMetadataWriter {
 
 impl AtomicMetadataWriter {
     fn new(
+        db_id: Option<String>,
         temp_path: String,
         final_name: String,
         final_path: String,
@@ -225,6 +228,7 @@ impl AtomicMetadataWriter {
         metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
     ) -> Self {
         Self {
+            db_id,
             temp_path,
             final_name,
             final_path,
@@ -247,6 +251,8 @@ impl AtomicMetadataWriter {
         ));
         self.metadata_files
             .insert(self.final_name.clone(), Arc::clone(&tracked));
+        let db_id = self.db_id.clone().unwrap_or_else(|| "unknown".to_string());
+        gauge!("metadata_files_tracked", "db_id" => db_id).set(self.metadata_files.len() as f64);
         Ok(())
     }
 }
@@ -275,6 +281,8 @@ impl SequentialWriteFile for AtomicMetadataWriter {
 /// The FileManager is responsible for managing both metadata files and data files.
 /// It provides file ID assignment, reader caching, and file lifecycle management.
 pub struct FileManager {
+    /// Optional database ID for metrics labeling.
+    db_id: Option<String>,
     /// The underlying file system.
     fs: Arc<dyn FileSystem>,
     /// Configuration options.
@@ -301,6 +309,7 @@ impl FileManager {
         }
 
         Ok(Self {
+            db_id: None,
             fs,
             options,
             next_file_id: AtomicU64::new(1), // Start from 1, 0 is reserved
@@ -312,6 +321,15 @@ impl FileManager {
     /// Creates a new FileManager with default options.
     pub fn with_defaults(fs: Arc<dyn FileSystem>) -> Result<Self> {
         Self::new(fs, FileManagerOptions::default())
+    }
+
+    /// Sets the database ID to label metrics.
+    pub fn set_db_id(&mut self, db_id: String) {
+        self.db_id = Some(db_id);
+    }
+
+    pub fn db_id(&self) -> Option<String> {
+        self.db_id.clone()
     }
 
     /// Sets the starting file ID counter.
@@ -361,6 +379,7 @@ impl FileManager {
         // Track the file
         let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.fs)));
         self.data_files.insert(file_id, Arc::clone(&tracked));
+        self.report_data_files_gauge();
         let writer = self.fs.open_write(tracked.path())?;
 
         Ok((file_id, TrackedWriter::new(writer, tracked)))
@@ -384,6 +403,7 @@ impl FileManager {
             Arc::clone(&self.fs),
         ));
         self.data_files.insert(file_id, Arc::clone(&tracked));
+        self.report_data_files_gauge();
         let writer = self.fs.open_write(tracked.path())?;
 
         // Update next_file_id if necessary
@@ -420,6 +440,7 @@ impl FileManager {
         self.data_files
             .entry(file_id)
             .or_insert_with(|| Arc::new(TrackedFile::new(path, Arc::clone(&self.fs))));
+        self.report_data_files_gauge();
 
         // Update next_file_id if necessary
         let mut current = self.next_file_id.load(Ordering::SeqCst);
@@ -490,6 +511,7 @@ impl FileManager {
     /// Removes a data file from tracking.
     pub(crate) fn remove_data_file(&self, file_id: FileId) -> Result<()> {
         self.data_files.remove(&file_id);
+        self.report_data_files_gauge();
         Ok(())
     }
 
@@ -518,6 +540,7 @@ impl FileManager {
         let tracked = Arc::new(TrackedFile::new(temp_path.clone(), Arc::clone(&self.fs)));
         let tracked_writer = TrackedWriter::new(writer, tracked);
         Ok(AtomicMetadataWriter::new(
+            self.db_id.clone(),
             temp_path,
             name.to_string(),
             final_path,
@@ -541,6 +564,7 @@ impl FileManager {
         if !self.metadata_files.contains_key(name) {
             let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.fs)));
             self.metadata_files.insert(name.to_string(), tracked);
+            self.report_metadata_files_gauge();
         }
 
         Ok(())
@@ -581,6 +605,7 @@ impl FileManager {
         }
         let tracked = Arc::new(TrackedFile::readonly(path, Arc::clone(&self.fs)));
         self.data_files.entry(file_id).or_insert_with(|| tracked);
+        self.report_data_files_gauge();
         Ok(())
     }
 
@@ -597,6 +622,7 @@ impl FileManager {
         }
         if remove_from_tracking {
             self.metadata_files.remove(name);
+            self.report_metadata_files_gauge();
         }
     }
 
@@ -608,6 +634,7 @@ impl FileManager {
             } else {
                 self.fs.delete(tracked.path())?;
             }
+            self.report_metadata_files_gauge();
             return Ok(());
         }
         let path = self.metadata_file_path(name);
@@ -615,6 +642,16 @@ impl FileManager {
             self.fs.delete(&path)?;
         }
         Ok(())
+    }
+
+    fn report_data_files_gauge(&self) {
+        let db_id = self.db_id.clone().unwrap_or_else(|| "unknown".to_string());
+        gauge!("data_files_tracked", "db_id" => db_id).set(self.data_files.len() as f64);
+    }
+
+    fn report_metadata_files_gauge(&self) {
+        let db_id = self.db_id.clone().unwrap_or_else(|| "unknown".to_string());
+        gauge!("metadata_files_tracked", "db_id" => db_id).set(self.metadata_files.len() as f64);
     }
 
     /// Returns the number of tracked metadata files.

@@ -4,6 +4,7 @@ use crate::db_state::DbStateHandle;
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager, FileSystemRegistry};
 use crate::lsm::{LSMTree, LSMTreeVersion, Level};
+use crate::metrics_registry;
 use crate::snapshot::{ManifestSnapshot, decode_manifest, from_hex, snapshot_manifest_name};
 use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::encode_key;
@@ -12,9 +13,11 @@ use crate::r#type::{Key, Value, ValueType};
 use bytes::Bytes;
 use std::str::FromStr;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// Read-only database that serves data from a snapshot manifest.
 pub struct ReadOnlyDb {
+    id: String,
     file_manager: Arc<FileManager>,
     lsm_tree: Arc<LSMTree>,
     num_columns: usize,
@@ -26,7 +29,11 @@ impl ReadOnlyDb {
     pub fn open(config: Config, snapshot_id: u64) -> Result<Self> {
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(config.path.clone())?;
-        let file_manager = Arc::new(FileManager::with_defaults(fs)?);
+        metrics_registry::init_metrics();
+        let mut file_manager = FileManager::with_defaults(fs)?;
+        let id = Uuid::new_v4().to_string();
+        file_manager.set_db_id(id.clone());
+        let file_manager = Arc::new(file_manager);
         let time_provider = config.time_provider.create();
         let ttl_provider = Arc::new(TTLProvider::new(
             &TtlConfig {
@@ -53,13 +60,24 @@ impl ReadOnlyDb {
         if config.block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
+        lsm_tree.set_db_id(id.clone());
         let lsm_tree = Arc::new(lsm_tree);
         Ok(Self {
+            id,
             file_manager,
             lsm_tree,
             num_columns: config.num_columns,
             ttl_provider,
         })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Return the metrics samples for this database.
+    pub fn metrics(&self) -> Vec<crate::MetricSample> {
+        metrics_registry::snapshot_metrics(Some(&self.id))
     }
 
     pub(crate) fn build_levels_from_manifest(

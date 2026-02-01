@@ -10,6 +10,7 @@ dashmap = "6.1.0"
 foyer = "0.22.3"
 log = "0.4.28"
 log4rs = "1.3.0"
+metrics = "0.22.3"
 opendal = { version = "0.54.0", features = ["services-fs", "services-oss", "services-s3"] }
 serial_test = "3.3.1"
 thiserror = "2.0.16"

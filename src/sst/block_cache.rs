@@ -60,6 +60,7 @@ mod tests {
             reader_file,
             7,
             SSTIteratorOptions {
+                metrics_db_id: None,
                 block_cache_size: 0,
                 num_columns: 1,
             },
