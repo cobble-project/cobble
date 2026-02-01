@@ -191,6 +191,7 @@ fn test_db_snapshot_creates_manifest() {
     let manifest_path = format!("meta/SNAPSHOT-{}", snapshot_id);
     let manifest = wait_for_manifest(root, &manifest_path);
     assert!(manifest.contains("\"id\":"));
+    assert!(manifest.contains("\"seq_id\":"));
     assert!(manifest.contains("\"levels\""));
     assert!(manifest.contains("\"path\":\"data/"));
     assert!(manifest_path.contains("SNAPSHOT-"));
@@ -225,6 +226,45 @@ fn test_db_snapshot_read_only_get() {
     let value = ro.get(b"k1").unwrap().expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_open_from_snapshot_allows_writes() {
+    let root = "/tmp/db_snapshot_write";
+    cleanup_test_root(root);
+    let config = Config {
+        path: format!("file://{}", root),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        ..Config::default()
+    };
+    let db = Db::open(config.clone()).unwrap();
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"k1", 0, b"v1".to_vec());
+    db.write_batch(batch).unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", snapshot_id));
+    db.close().unwrap();
+
+    let writable = Db::open_from_snapshot(config, snapshot_id).unwrap();
+    let mut batch = WriteBatch::new();
+    batch.put(b"k2", 0, b"v2".to_vec());
+    writable.write_batch(batch).unwrap();
+
+    let value = writable.get(b"k1").unwrap().expect("value present");
+    let col = value[0].as_ref().unwrap();
+    assert_eq!(col.as_ref(), b"v1");
+
+    let value = writable.get(b"k2").unwrap().expect("value present");
+    let col = value[0].as_ref().unwrap();
+    assert_eq!(col.as_ref(), b"v2");
 
     cleanup_test_root(root);
 }

@@ -1,12 +1,13 @@
 //! Snapshot manager and manifest encoding for LSM state.
-use crate::data_file::DataFile;
+use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::DbState;
 use crate::error::{Error, Result};
-use crate::file::{BufferedWriter, FileManager, SequentialWriteFile, TrackedFile};
+use crate::file::{BufferedWriter, FileManager, SequentialWriteFile, TrackedFile, TrackedFileId};
 use crate::lsm::Level;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
@@ -18,12 +19,14 @@ pub(crate) struct DbSnapshot {
     pub levels: Vec<Level>,
     pub data_files: Vec<Arc<DataFile>>,
     pub tracked_files: Vec<Arc<TrackedFile>>,
+    pub seq_id: u64,
     pub finished: bool,
 }
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
     pub(crate) id: u64,
+    pub(crate) seq_id: u64,
     pub(crate) levels: Vec<ManifestLevel>,
 }
 
@@ -53,6 +56,7 @@ impl DbSnapshot {
             levels: vec![],
             data_files: Vec::new(),
             tracked_files: Vec::new(),
+            seq_id: 0,
             finished: false,
         }
     }
@@ -146,6 +150,7 @@ impl SnapshotManager {
             .iter()
             .flat_map(|level| level.files.iter().cloned())
             .collect();
+        snapshot.seq_id = db_state.seq_id;
         snapshot.tracked_files = snapshot
             .data_files
             .iter()
@@ -255,6 +260,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
 ) -> Result<()> {
     let manifest = ManifestSnapshot {
         id: snapshot.id,
+        seq_id: snapshot.seq_id,
         levels: snapshot
             .levels
             .iter()
@@ -295,6 +301,47 @@ fn to_hex(bytes: &[u8]) -> String {
 pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<ManifestSnapshot> {
     serde_json::from_slice(bytes)
         .map_err(|err| Error::IoError(format!("Failed to decode manifest: {}", err)))
+}
+
+pub(crate) fn build_levels_from_manifest(
+    file_manager: &Arc<FileManager>,
+    manifest: ManifestSnapshot,
+    read_only: bool,
+) -> Result<Vec<Level>> {
+    let mut levels = Vec::with_capacity(manifest.levels.len());
+    for level in manifest.levels {
+        let mut files = Vec::with_capacity(level.files.len());
+        for file in level.files {
+            let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
+            let start_key = from_hex(&file.start_key)?;
+            let end_key = from_hex(&file.end_key)?;
+            let path = file
+                .path
+                .unwrap_or_else(|| format!("data/{}.{}", file.file_id, file_type.as_str()));
+            let tracked_id = if read_only {
+                file_manager.register_data_file_readonly(file.file_id, path)?;
+                TrackedFileId::detached(file.file_id)
+            } else {
+                file_manager.register_data_file(file.file_id, path)?;
+                TrackedFileId::new(file_manager, file.file_id)
+            };
+            files.push(Arc::new(DataFile {
+                file_type,
+                start_key,
+                end_key,
+                file_id: file.file_id,
+                tracked_id,
+                seq: file.seq,
+                size: file.size,
+            }));
+        }
+        levels.push(Level {
+            ordinal: level.ordinal,
+            tiered: level.tiered,
+            files,
+        });
+    }
+    Ok(levels)
 }
 
 pub(crate) fn from_hex(hex: &str) -> Result<Vec<u8>> {

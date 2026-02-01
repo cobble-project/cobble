@@ -2,7 +2,9 @@ use crate::error::{Error, Result};
 use crate::file::{FileManager, FileSystemRegistry};
 use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
-use crate::snapshot::SnapshotManager;
+use crate::snapshot::{
+    SnapshotManager, build_levels_from_manifest, decode_manifest, snapshot_manifest_name,
+};
 use crate::sst::SSTWriterOptions;
 use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value, encode_key, encode_value};
@@ -43,87 +45,7 @@ impl Db {
         file_manager.set_db_id(id.clone());
         let file_manager = Arc::new(file_manager);
         let db_state = Arc::new(DbStateHandle::new());
-        let time_provider = config.time_provider.create();
-        let ttl_provider = Arc::new(TTLProvider::new(
-            &TtlConfig {
-                enabled: config.ttl_enabled,
-                default_ttl_seconds: config.default_ttl_seconds,
-            },
-            Arc::clone(&time_provider),
-        ));
-
-        let mut lsm_tree =
-            LSMTree::with_state_and_ttl(Arc::clone(&db_state), Arc::clone(&ttl_provider));
-        if config.block_cache_size > 0 {
-            lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
-        }
-        lsm_tree.set_db_id(id.clone());
-        let lsm_tree = Arc::new(lsm_tree);
-        let sst_options = SSTWriterOptions {
-            num_columns: config.num_columns,
-            ..SSTWriterOptions::default()
-        };
-
-        // Compaction setup
-        let compaction_options = crate::compaction::CompactionConfig {
-            policy: config.compaction_policy,
-            l0_file_limit: config.l0_file_limit,
-            l1_base_bytes: config.l1_base_bytes,
-            level_size_multiplier: config.level_size_multiplier,
-            max_level: config.max_level,
-            num_columns: config.num_columns,
-            target_file_size: config.base_file_size,
-            ..crate::compaction::CompactionConfig::default()
-        };
-        let compaction_factory = crate::compaction::make_sst_builder_factory(sst_options.clone());
-        let compaction_worker = Arc::new(crate::compaction::CompactionWorker::new(
-            crate::compaction::CompactionExecutor::new(compaction_options)?,
-            Arc::clone(&compaction_factory),
-            Arc::clone(&file_manager),
-            Arc::downgrade(&lsm_tree),
-        ));
-        info!(
-            "db compaction configured: l0_limit={} l1_base={} multiplier={} max_level={} target_file_size={}",
-            compaction_options.l0_file_limit,
-            compaction_options.l1_base_bytes,
-            compaction_options.level_size_multiplier,
-            compaction_options.max_level,
-            compaction_options.target_file_size
-        );
-        lsm_tree.configure_compaction(compaction_options, Some(Arc::clone(&compaction_worker)));
-
-        // Memtable manager setup
-        let snapshot_manager =
-            SnapshotManager::new(Arc::clone(&file_manager), config.snapshot_retention);
-        let memtable_manager = MemtableManager::new(
-            Arc::clone(&file_manager),
-            Arc::clone(&lsm_tree),
-            MemtableManagerOptions {
-                memtable_capacity: config.memtable_capacity,
-                buffer_count: config.memtable_buffer_count,
-                sst_options,
-                file_builder_factory: None,
-                num_columns: config.num_columns,
-                write_stall_limit: config.resolved_write_stall_limit(),
-                auto_snapshot_manager: if config.snapshot_on_flush {
-                    Some(snapshot_manager.clone())
-                } else {
-                    None
-                },
-                db_id: id.clone(),
-            },
-        )?;
-
-        Ok(Self {
-            id,
-            file_manager: Arc::clone(&file_manager),
-            lsm_tree,
-            memtable_manager,
-            snapshot_manager,
-            num_columns: config.num_columns,
-            time_provider,
-            ttl_provider,
-        })
+        Self::open_with_state(config, file_manager, db_state, id, 0)
     }
 
     pub fn id(&self) -> &str {
@@ -242,6 +164,132 @@ impl Db {
     pub fn open_read_only(config: Config, snapshot_id: u64) -> Result<ReadOnlyDb> {
         Self::init_logging(&config);
         ReadOnlyDb::open(config, snapshot_id)
+    }
+
+    /// Open a writable database initialized from a snapshot manifest.
+    pub fn open_from_snapshot(config: Config, snapshot_id: u64) -> Result<Self> {
+        Self::init_logging(&config);
+        metrics_registry::init_metrics();
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(config.path.clone())?;
+        let mut file_manager = FileManager::with_defaults(fs)?;
+        let id = Uuid::new_v4().to_string();
+        file_manager.set_db_id(id.clone());
+        let file_manager = Arc::new(file_manager);
+
+        let manifest_name = snapshot_manifest_name(snapshot_id);
+        let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
+        let bytes = reader.read_at(0, reader.size())?;
+        let manifest = decode_manifest(bytes.as_ref())?;
+        let max_file_seq = manifest
+            .levels
+            .iter()
+            .flat_map(|level| level.files.iter().map(|file| file.seq))
+            .max()
+            .unwrap_or(0);
+        let max_seq = manifest.seq_id;
+        let levels = build_levels_from_manifest(&file_manager, manifest, false)?;
+
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(crate::db_state::DbState {
+            seq_id: max_seq,
+            lsm_version: crate::lsm::LSMTreeVersion { levels },
+            active: None,
+            immutables: Vec::new().into(),
+        });
+        let initial_file_seq = max_file_seq.saturating_add(1);
+        Self::open_with_state(config, file_manager, db_state, id, initial_file_seq)
+    }
+
+    fn open_with_state(
+        config: Config,
+        file_manager: Arc<FileManager>,
+        db_state: Arc<DbStateHandle>,
+        id: String,
+        initial_file_seq: u64,
+    ) -> Result<Self> {
+        let time_provider = config.time_provider.create();
+        let ttl_provider = Arc::new(TTLProvider::new(
+            &TtlConfig {
+                enabled: config.ttl_enabled,
+                default_ttl_seconds: config.default_ttl_seconds,
+            },
+            Arc::clone(&time_provider),
+        ));
+
+        let mut lsm_tree =
+            LSMTree::with_state_and_ttl(Arc::clone(&db_state), Arc::clone(&ttl_provider));
+        if config.block_cache_size > 0 {
+            lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
+        }
+        lsm_tree.set_db_id(id.clone());
+        let lsm_tree = Arc::new(lsm_tree);
+        let sst_options = SSTWriterOptions {
+            num_columns: config.num_columns,
+            ..SSTWriterOptions::default()
+        };
+
+        // Compaction setup
+        let compaction_options = crate::compaction::CompactionConfig {
+            policy: config.compaction_policy,
+            l0_file_limit: config.l0_file_limit,
+            l1_base_bytes: config.l1_base_bytes,
+            level_size_multiplier: config.level_size_multiplier,
+            max_level: config.max_level,
+            num_columns: config.num_columns,
+            target_file_size: config.base_file_size,
+            ..crate::compaction::CompactionConfig::default()
+        };
+        let compaction_factory = crate::compaction::make_sst_builder_factory(sst_options.clone());
+        let compaction_worker = Arc::new(crate::compaction::CompactionWorker::new(
+            crate::compaction::CompactionExecutor::new(compaction_options)?,
+            Arc::clone(&compaction_factory),
+            Arc::clone(&file_manager),
+            Arc::downgrade(&lsm_tree),
+        ));
+        info!(
+            "db compaction configured: l0_limit={} l1_base={} multiplier={} max_level={} target_file_size={}",
+            compaction_options.l0_file_limit,
+            compaction_options.l1_base_bytes,
+            compaction_options.level_size_multiplier,
+            compaction_options.max_level,
+            compaction_options.target_file_size
+        );
+        lsm_tree.configure_compaction(compaction_options, Some(Arc::clone(&compaction_worker)));
+
+        // Memtable manager setup
+        let snapshot_manager =
+            SnapshotManager::new(Arc::clone(&file_manager), config.snapshot_retention);
+        let memtable_manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: config.memtable_capacity,
+                buffer_count: config.memtable_buffer_count,
+                sst_options,
+                file_builder_factory: None,
+                num_columns: config.num_columns,
+                write_stall_limit: config.resolved_write_stall_limit(),
+                initial_seq: initial_file_seq,
+                auto_snapshot_manager: if config.snapshot_on_flush {
+                    Some(snapshot_manager.clone())
+                } else {
+                    None
+                },
+                db_id: id.clone(),
+            },
+        )?;
+
+        Ok(Self {
+            id,
+            file_manager: Arc::clone(&file_manager),
+            lsm_tree,
+            memtable_manager,
+            snapshot_manager,
+            num_columns: config.num_columns,
+            time_provider,
+            ttl_provider,
+        })
     }
 
     /// Lookup a key across the memtable and LSM levels.

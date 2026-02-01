@@ -25,6 +25,7 @@ pub(crate) struct MemtableFlushResult {
 
 pub(crate) struct MemtableManagerOptions {
     pub(crate) db_id: String,
+    pub(crate) initial_seq: u64,
     pub(crate) memtable_capacity: usize,
     pub(crate) buffer_count: usize,
     pub(crate) sst_options: SSTWriterOptions,
@@ -38,6 +39,7 @@ impl Default for MemtableManagerOptions {
     fn default() -> Self {
         Self {
             db_id: String::new(),
+            initial_seq: 0,
             memtable_capacity: 1024 * 1024,
             buffer_count: 2,
             sst_options: SSTWriterOptions::default(),
@@ -110,7 +112,7 @@ impl MemtableManager {
         let state = MemtableManagerState {
             free_budget: (options.buffer_count as u64) * (options.memtable_capacity as u64),
             in_flight: 0,
-            next_seq: 0,
+            next_seq: options.initial_seq,
             flush_results: BTreeMap::new(),
         };
         let state = Arc::new(Mutex::new(state));
@@ -683,6 +685,7 @@ mod tests {
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
             MemtableManagerOptions {
+                initial_seq: 0,
                 memtable_capacity: 256,
                 buffer_count: 2,
                 sst_options: SSTWriterOptions::default(),
@@ -767,6 +770,7 @@ mod tests {
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
             MemtableManagerOptions {
+                initial_seq: 0,
                 memtable_capacity: 256,
                 buffer_count: 2,
                 sst_options: SSTWriterOptions::default(),
