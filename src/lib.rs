@@ -10,6 +10,7 @@ mod db_state;
 mod error;
 mod file;
 mod format;
+mod governance;
 mod iterator;
 mod lsm;
 mod memtable;

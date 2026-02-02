@@ -17,6 +17,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::db_state::DbStateHandle;
+use crate::governance::{GovernanceManager, create_manifest_lock_provider};
 use crate::metrics_registry;
 use crate::read_only_db::ReadOnlyDb;
 use crate::ttl::{TTLProvider, TtlConfig};
@@ -35,13 +36,22 @@ pub struct Db {
 
 impl Db {
     /// Open a database with the provided configuration.
+    #[allow(clippy::single_range_in_vec_init)]
     pub fn open(config: Config) -> Result<Self> {
         Self::init_logging(&config);
         metrics_registry::init_metrics();
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(config.path.clone())?;
-        let mut file_manager = FileManager::with_defaults(fs)?;
         let id = Uuid::new_v4().to_string();
+
+        // register the governance db id
+        let governance = GovernanceManager::new(
+            Arc::clone(&fs),
+            create_manifest_lock_provider(Arc::clone(&fs), &config)?,
+        );
+        governance.insert_and_publish(&id, vec![0u16..1u16], 1)?;
+
+        let mut file_manager = FileManager::with_db_id(Arc::clone(&fs), &id)?;
         file_manager.set_db_id(id.clone());
         let file_manager = Arc::new(file_manager);
         let db_state = Arc::new(DbStateHandle::new());
@@ -161,20 +171,19 @@ impl Db {
     }
 
     /// Open a read-only view from a snapshot manifest.
-    pub fn open_read_only(config: Config, snapshot_id: u64) -> Result<ReadOnlyDb> {
+    pub fn open_read_only(config: Config, snapshot_id: u64, db_id: String) -> Result<ReadOnlyDb> {
         Self::init_logging(&config);
-        ReadOnlyDb::open(config, snapshot_id)
+        ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id)
     }
 
     /// Open a writable database initialized from a snapshot manifest.
-    pub fn open_from_snapshot(config: Config, snapshot_id: u64) -> Result<Self> {
+    pub fn open_from_snapshot(config: Config, snapshot_id: u64, db_id: String) -> Result<Self> {
         Self::init_logging(&config);
         metrics_registry::init_metrics();
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(config.path.clone())?;
-        let mut file_manager = FileManager::with_defaults(fs)?;
-        let id = Uuid::new_v4().to_string();
-        file_manager.set_db_id(id.clone());
+        let mut file_manager = FileManager::with_db_id(Arc::clone(&fs), &db_id)?;
+        file_manager.set_db_id(db_id.clone());
         let file_manager = Arc::new(file_manager);
 
         let manifest_name = snapshot_manifest_name(snapshot_id);
@@ -198,7 +207,7 @@ impl Db {
             immutables: Vec::new().into(),
         });
         let initial_file_seq = max_file_seq.saturating_add(1);
-        Self::open_with_state(config, file_manager, db_state, id, initial_file_seq)
+        Self::open_with_state(config, file_manager, db_state, db_id, initial_file_seq)
     }
 
     fn open_with_state(

@@ -323,6 +323,19 @@ impl FileManager {
         Self::new(fs, FileManagerOptions::default())
     }
 
+    /// Creates a new FileManager rooted at a database-specific subdirectory.
+    pub fn with_db_id(fs: Arc<dyn FileSystem>, db_id: &str) -> Result<Self> {
+        if !fs.exists(db_id)? {
+            fs.create_dir(db_id)?;
+        }
+        let options = FileManagerOptions {
+            data_dir: format!("{}/data", db_id),
+            metadata_dir: format!("{}/snapshot", db_id),
+            ..FileManagerOptions::default()
+        };
+        Self::new(fs, options)
+    }
+
     /// Sets the database ID to label metrics.
     pub fn set_db_id(&mut self, db_id: String) {
         self.db_id = Some(db_id);

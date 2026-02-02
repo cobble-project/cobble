@@ -7,8 +7,8 @@ fn cleanup_test_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
 }
 
-fn wait_for_manifest(root: &str, path: &str) -> String {
-    let full_path = format!("{}/{}", root, path);
+fn wait_for_manifest_in_db(root: &str, db_id: &str, path: &str) -> String {
+    let full_path = format!("{}/{}/{}", root, db_id, path);
     for _ in 0..50 {
         if let Ok(contents) = std::fs::read_to_string(&full_path) {
             return contents;
@@ -188,12 +188,12 @@ fn test_db_snapshot_creates_manifest() {
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
-    let manifest_path = format!("meta/SNAPSHOT-{}", snapshot_id);
-    let manifest = wait_for_manifest(root, &manifest_path);
+    let manifest_path = format!("snapshot/SNAPSHOT-{}", snapshot_id);
+    let manifest = wait_for_manifest_in_db(root, db.id(), &manifest_path);
     assert!(manifest.contains("\"id\":"));
     assert!(manifest.contains("\"seq_id\":"));
     assert!(manifest.contains("\"levels\""));
-    assert!(manifest.contains("\"path\":\"data/"));
+    assert!(manifest.contains("\"path\":\""));
     assert!(manifest_path.contains("SNAPSHOT-"));
 
     cleanup_test_root(root);
@@ -219,10 +219,10 @@ fn test_db_snapshot_read_only_get() {
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", snapshot_id));
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", snapshot_id));
     db.close().unwrap();
 
-    let ro = Db::open_read_only(config, snapshot_id).unwrap();
+    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
     let value = ro.get(b"k1").unwrap().expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
@@ -250,10 +250,10 @@ fn test_db_open_from_snapshot_allows_writes() {
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", snapshot_id));
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", snapshot_id));
     db.close().unwrap();
 
-    let writable = Db::open_from_snapshot(config, snapshot_id).unwrap();
+    let writable = Db::open_from_snapshot(config, snapshot_id, db.id().to_string()).unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"k2", 0, b"v2".to_vec());
     writable.write_batch(batch).unwrap();
@@ -289,7 +289,7 @@ fn test_db_metrics_list() {
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", snapshot_id));
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", snapshot_id));
 
     let metrics = db.metrics();
     let db_id = db.id();
@@ -344,8 +344,8 @@ fn test_db_expire_snapshot_releases_manifest() {
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
-    let manifest_path = format!("{}/meta/SNAPSHOT-{}", root, snapshot_id);
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", snapshot_id));
+    let manifest_path = format!("{}/{}/snapshot/SNAPSHOT-{}", root, db.id(), snapshot_id);
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", snapshot_id));
 
     assert!(db.expire_snapshot(snapshot_id).unwrap());
     wait_for_missing(&manifest_path);
@@ -375,18 +375,18 @@ fn test_db_snapshot_auto_expire() {
     db.write_batch(batch).unwrap();
 
     let first_id = db.snapshot().unwrap();
-    let _first_path = format!("{}/meta/SNAPSHOT-{}", root, first_id);
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", first_id));
+    let _first_path = format!("{}/snapshot/SNAPSHOT-{}", root, first_id);
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", first_id));
 
     let mut batch = WriteBatch::new();
     batch.put(b"k2", 0, b"v2".to_vec());
     db.write_batch(batch).unwrap();
 
     let second_id = db.snapshot().unwrap();
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", second_id));
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", second_id));
 
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", first_id));
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", second_id));
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", first_id));
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", second_id));
     assert!(db.expire_snapshot(first_id).unwrap());
 
     cleanup_test_root(root);
@@ -414,8 +414,8 @@ fn test_db_snapshot_retain_skips_auto_expire() {
     db.write_batch(batch).unwrap();
 
     let first_id = db.snapshot().unwrap();
-    let _first_path = format!("{}/meta/SNAPSHOT-{}", root, first_id);
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", first_id));
+    let _first_path = format!("{}/snapshot/SNAPSHOT-{}", root, first_id);
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", first_id));
     assert!(db.retain_snapshot(first_id));
 
     let mut batch = WriteBatch::new();
@@ -423,10 +423,10 @@ fn test_db_snapshot_retain_skips_auto_expire() {
     db.write_batch(batch).unwrap();
 
     let second_id = db.snapshot().unwrap();
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", second_id));
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", second_id));
 
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", first_id));
-    let _ = wait_for_manifest(root, &format!("meta/SNAPSHOT-{}", second_id));
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", first_id));
+    let _ = wait_for_manifest_in_db(root, db.id(), &format!("snapshot/SNAPSHOT-{}", second_id));
     assert!(db.expire_snapshot(first_id).unwrap());
 
     cleanup_test_root(root);

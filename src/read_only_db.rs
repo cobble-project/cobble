@@ -23,14 +23,18 @@ pub struct ReadOnlyDb {
 }
 
 impl ReadOnlyDb {
-    /// Open a read-only view from a snapshot manifest.
-    pub fn open(config: Config, snapshot_id: u64) -> Result<Self> {
+    /// Open a read-only view from a snapshot manifest scoped to a database id.
+    pub fn open_with_db_id(
+        config: Config,
+        snapshot_id: u64,
+        snapshot_db_id: String,
+    ) -> Result<Self> {
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(config.path.clone())?;
         metrics_registry::init_metrics();
-        let mut file_manager = FileManager::with_defaults(fs)?;
-        let id = Uuid::new_v4().to_string();
-        file_manager.set_db_id(id.clone());
+        let db_id = Uuid::new_v4().to_string();
+        let mut file_manager = FileManager::with_db_id(Arc::clone(&fs), &snapshot_db_id)?;
+        file_manager.set_db_id(db_id.clone());
         let file_manager = Arc::new(file_manager);
         let time_provider = config.time_provider.create();
         let ttl_provider = Arc::new(TTLProvider::new(
@@ -58,10 +62,10 @@ impl ReadOnlyDb {
         if config.block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
-        lsm_tree.set_db_id(id.clone());
+        lsm_tree.set_db_id(db_id.clone());
         let lsm_tree = Arc::new(lsm_tree);
         Ok(Self {
-            id,
+            id: db_id,
             file_manager,
             lsm_tree,
             num_columns: config.num_columns,
