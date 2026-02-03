@@ -5,20 +5,36 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 pub const SST_FILE_MAGIC: u32 = 0x53535431; // "SST1"
 
 /// Footer structure at the end of SST file
-/// Layout: [index_block_offset: u64][index_block_size: u64][magic: u32]
-pub const FOOTER_SIZE: usize = 20; // 8 + 8 + 4
+/// Layout: [index_block_offset: u64][index_block_size: u64]
+///         [filter_block_offset: u64][filter_block_size: u64]
+///         [flags: u32][magic: u32]
+pub const FOOTER_SIZE: usize = 40; // 8 + 8 + 8 + 8 + 4 + 4
+
+const FOOTER_FLAG_FILTER_PRESENT: u32 = 0x1;
 
 #[derive(Debug, Clone)]
 pub struct Footer {
     pub index_block_offset: u64,
     pub index_block_size: u64,
+    pub filter_block_offset: u64,
+    pub filter_block_size: u64,
+    pub filter_present: bool,
 }
 
 impl Footer {
-    pub fn new(index_block_offset: u64, index_block_size: u64) -> Self {
+    pub fn new(
+        index_block_offset: u64,
+        index_block_size: u64,
+        filter_block_offset: u64,
+        filter_block_size: u64,
+        filter_present: bool,
+    ) -> Self {
         Self {
             index_block_offset,
             index_block_size,
+            filter_block_offset,
+            filter_block_size,
+            filter_present,
         }
     }
 
@@ -26,6 +42,14 @@ impl Footer {
         let mut buf = BytesMut::with_capacity(FOOTER_SIZE);
         buf.put_u64_le(self.index_block_offset);
         buf.put_u64_le(self.index_block_size);
+        buf.put_u64_le(self.filter_block_offset);
+        buf.put_u64_le(self.filter_block_size);
+        let flags = if self.filter_present {
+            FOOTER_FLAG_FILTER_PRESENT
+        } else {
+            0
+        };
+        buf.put_u32_le(flags);
         buf.put_u32_le(SST_FILE_MAGIC);
         buf.freeze()
     }
@@ -42,6 +66,9 @@ impl Footer {
         let mut buf = data;
         let index_block_offset = buf.get_u64_le();
         let index_block_size = buf.get_u64_le();
+        let filter_block_offset = buf.get_u64_le();
+        let filter_block_size = buf.get_u64_le();
+        let flags = buf.get_u32_le();
         let magic = buf.get_u32_le();
 
         if magic != SST_FILE_MAGIC {
@@ -54,6 +81,9 @@ impl Footer {
         Ok(Self {
             index_block_offset,
             index_block_size,
+            filter_block_offset,
+            filter_block_size,
+            filter_present: (flags & FOOTER_FLAG_FILTER_PRESENT) != 0,
         })
     }
 }
@@ -261,13 +291,16 @@ mod tests {
 
     #[test]
     fn test_footer_encode_decode() {
-        let footer = Footer::new(100, 200);
+        let footer = Footer::new(100, 200, 300, 400, true);
         let encoded = footer.encode();
         assert_eq!(encoded.len(), FOOTER_SIZE);
 
         let decoded = Footer::decode(&encoded).unwrap();
         assert_eq!(decoded.index_block_offset, 100);
         assert_eq!(decoded.index_block_size, 200);
+        assert_eq!(decoded.filter_block_offset, 300);
+        assert_eq!(decoded.filter_block_size, 400);
+        assert!(decoded.filter_present);
     }
 
     #[test]

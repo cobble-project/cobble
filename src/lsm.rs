@@ -557,11 +557,16 @@ impl LSMTree {
             SSTIteratorOptions {
                 num_columns,
                 metrics_db_id: self.db_id.clone(),
+                bloom_filter_enabled: true,
                 ..SSTIteratorOptions::default()
             },
             self.block_cache.clone(),
         )?;
-        iter.seek(encoded_key)?;
+        if iter.may_contain(encoded_key)? {
+            iter.seek(encoded_key)?;
+        } else {
+            return Ok(true);
+        }
         if iter.valid()
             && let Some(current_key) = iter.key()?
             && current_key.as_ref() == encoded_key
@@ -652,6 +657,8 @@ mod tests {
             writer_file,
             SSTWriterOptions {
                 num_columns: 1,
+                bloom_filter_enabled: true,
+                bloom_bits_per_key: 10,
                 ..SSTWriterOptions::default()
             },
         );
@@ -811,9 +818,15 @@ mod tests {
             l1_base_bytes: 1,
             level_size_multiplier: 1,
             max_level: 3,
+            bloom_filter_enabled: true,
+            bloom_bits_per_key: 10,
             ..crate::compaction::CompactionConfig::default()
         };
-        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions::default());
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            bloom_filter_enabled: config.bloom_filter_enabled,
+            bloom_bits_per_key: config.bloom_bits_per_key,
+            ..SSTWriterOptions::default()
+        });
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(DbState {
             seq_id: 0,

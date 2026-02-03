@@ -687,7 +687,13 @@ mod tests {
         // Write SST file with encoded Key/Value
         {
             let writer_file = fs.open_write("codec_test.sst").unwrap();
-            let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTWriterOptions::default()
+                },
+            );
 
             writer
                 .add(&encode_key(&key1), &encode_value(&value1, num_columns))
@@ -705,8 +711,15 @@ mod tests {
         // Read SST file and decode Key/Value
         {
             let reader_file = fs.open_read("codec_test.sst").unwrap();
-            let mut iter =
-                SSTIterator::with_file_id(reader_file, 0, SSTIteratorOptions::default()).unwrap();
+            let mut iter = SSTIterator::with_file_id(
+                reader_file,
+                0,
+                SSTIteratorOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTIteratorOptions::default()
+                },
+            )
+            .unwrap();
 
             iter.seek_to_first().unwrap();
 
@@ -787,7 +800,13 @@ mod tests {
         // Write SST file
         {
             let writer_file = fs.open_write("codec_seek_test.sst").unwrap();
-            let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTWriterOptions::default()
+                },
+            );
 
             writer
                 .add(&encode_key(&key1), &encode_value(&value, num_columns))
@@ -805,8 +824,15 @@ mod tests {
         // Read and seek using encoded key
         {
             let reader_file = fs.open_read("codec_seek_test.sst").unwrap();
-            let mut iter =
-                SSTIterator::with_file_id(reader_file, 0, SSTIteratorOptions::default()).unwrap();
+            let mut iter = SSTIterator::with_file_id(
+                reader_file,
+                0,
+                SSTIteratorOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTIteratorOptions::default()
+                },
+            )
+            .unwrap();
 
             // Seek to second key
             let seek_key = Key::new(1, b"bbb".to_vec());
@@ -847,6 +873,8 @@ mod tests {
                     block_size: 200, // Small block size to force multiple blocks
                     buffer_size: 8192,
                     num_columns,
+                    bloom_filter_enabled: true,
+                    bloom_bits_per_key: 10,
                 },
             );
 
@@ -871,8 +899,15 @@ mod tests {
         // Read and verify all entries
         {
             let reader_file = fs.open_read("codec_blocks_test.sst").unwrap();
-            let mut iter =
-                SSTIterator::with_file_id(reader_file, 0, SSTIteratorOptions::default()).unwrap();
+            let mut iter = SSTIterator::with_file_id(
+                reader_file,
+                0,
+                SSTIteratorOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTIteratorOptions::default()
+                },
+            )
+            .unwrap();
 
             iter.seek_to_first().unwrap();
 

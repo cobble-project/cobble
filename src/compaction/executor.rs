@@ -207,6 +207,7 @@ impl CompactionExecutor {
         let sst_options = SSTIteratorOptions {
             metrics_db_id: Some(task.db_id.clone()),
             num_columns: options.num_columns,
+            bloom_filter_enabled: options.bloom_filter_enabled,
             ..SSTIteratorOptions::default()
         };
 
@@ -385,7 +386,13 @@ mod tests {
         entries: Vec<(&[u8], &[u8])>,
     ) -> Result<Arc<DataFile>> {
         let (file_id, writer_file) = file_manager.create_data_file()?;
-        let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+        let mut writer = SSTWriter::new(
+            writer_file,
+            SSTWriterOptions {
+                bloom_filter_enabled: true,
+                ..SSTWriterOptions::default()
+            },
+        );
 
         for (key, value) in entries {
             writer.add(key, value)?;
@@ -449,6 +456,8 @@ mod tests {
         let options = CompactionConfig {
             num_columns,
             target_file_size: 1024 * 1024, // 1MB - all entries fit in one file
+            bloom_filter_enabled: true,
+            bloom_bits_per_key: 10,
             ..Default::default()
         };
 
@@ -457,6 +466,8 @@ mod tests {
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
+            bloom_filter_enabled: options.bloom_filter_enabled,
+            bloom_bits_per_key: options.bloom_bits_per_key,
         });
         let task = CompactionTask::new(
             "test".to_string(),
@@ -495,7 +506,10 @@ mod tests {
         let mut iter = crate::sst::SSTIterator::with_file_id(
             Box::new(reader),
             first_file.file_id,
-            crate::sst::SSTIteratorOptions::default(),
+            crate::sst::SSTIteratorOptions {
+                bloom_filter_enabled: true,
+                ..crate::sst::SSTIteratorOptions::default()
+            },
         )
         .unwrap();
         iter.seek_to_first().unwrap();
@@ -566,6 +580,8 @@ mod tests {
 
         let options = CompactionConfig {
             num_columns,
+            bloom_filter_enabled: true,
+            bloom_bits_per_key: 10,
             ..Default::default()
         };
 
@@ -574,6 +590,8 @@ mod tests {
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
+            bloom_filter_enabled: options.bloom_filter_enabled,
+            bloom_bits_per_key: options.bloom_bits_per_key,
         });
         let task = CompactionTask::new(
             "test".to_string(),
@@ -608,6 +626,7 @@ mod tests {
             Box::new(reader),
             result.new_files()[0].file_id,
             crate::sst::SSTIteratorOptions {
+                bloom_filter_enabled: true,
                 num_columns,
                 ..Default::default()
             },
@@ -670,7 +689,13 @@ mod tests {
         }
 
         let (file_id, writer_file) = file_manager.create_data_file().unwrap();
-        let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+        let mut writer = SSTWriter::new(
+            writer_file,
+            SSTWriterOptions {
+                bloom_filter_enabled: true,
+                ..SSTWriterOptions::default()
+            },
+        );
 
         for (key, value) in &entries {
             writer.add(key, value).unwrap();
@@ -692,6 +717,8 @@ mod tests {
         let options = CompactionConfig {
             num_columns,
             target_file_size: 500, // Very small to force multiple files
+            bloom_filter_enabled: true,
+            bloom_bits_per_key: 10,
             ..Default::default()
         };
 
@@ -700,6 +727,8 @@ mod tests {
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
+            bloom_filter_enabled: options.bloom_filter_enabled,
+            bloom_bits_per_key: options.bloom_bits_per_key,
         });
         let task = CompactionTask::new(
             "test".to_string(),
@@ -760,6 +789,8 @@ mod tests {
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
+            bloom_filter_enabled: options.bloom_filter_enabled,
+            bloom_bits_per_key: options.bloom_bits_per_key,
         });
         let task = CompactionTask::new(
             "test".to_string(),

@@ -42,6 +42,8 @@ mod tests {
                     block_size: 64,
                     buffer_size: 8192,
                     num_columns: 1,
+                    bloom_filter_enabled: true,
+                    bloom_bits_per_key: 10,
                 },
             );
 
@@ -63,6 +65,7 @@ mod tests {
                 metrics_db_id: None,
                 block_cache_size: 0,
                 num_columns: 1,
+                bloom_filter_enabled: true,
             },
             cache,
         )

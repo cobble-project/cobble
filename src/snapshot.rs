@@ -2,7 +2,9 @@
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::DbState;
 use crate::error::{Error, Result};
-use crate::file::{BufferedWriter, FileManager, SequentialWriteFile, TrackedFile, TrackedFileId};
+use crate::file::{
+    BufferedWriter, File, FileManager, SequentialWriteFile, TrackedFile, TrackedFileId,
+};
 use crate::lsm::Level;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

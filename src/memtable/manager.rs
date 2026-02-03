@@ -42,7 +42,10 @@ impl Default for MemtableManagerOptions {
             initial_seq: 0,
             memtable_capacity: 1024 * 1024,
             buffer_count: 2,
-            sst_options: SSTWriterOptions::default(),
+            sst_options: SSTWriterOptions {
+                bloom_filter_enabled: true,
+                ..SSTWriterOptions::default()
+            },
             file_builder_factory: None,
             num_columns: 1,
             write_stall_limit: 8,
@@ -654,6 +657,8 @@ fn make_sst_builder_factory(options: SSTWriterOptions) -> FileBuilderFactory {
                 block_size: options.block_size,
                 buffer_size: options.buffer_size,
                 num_columns: options.num_columns,
+                bloom_filter_enabled: options.bloom_filter_enabled,
+                bloom_bits_per_key: options.bloom_bits_per_key,
             },
         )) as Box<dyn FileBuilder>
     })
@@ -688,7 +693,10 @@ mod tests {
                 initial_seq: 0,
                 memtable_capacity: 256,
                 buffer_count: 2,
-                sst_options: SSTWriterOptions::default(),
+                sst_options: SSTWriterOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTWriterOptions::default()
+                },
                 file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
@@ -729,7 +737,10 @@ mod tests {
         let mut iter = SSTIterator::with_file_id(
             Box::new(reader),
             data_file.file_id,
-            SSTIteratorOptions::default(),
+            SSTIteratorOptions {
+                bloom_filter_enabled: true,
+                ..SSTIteratorOptions::default()
+            },
         )
         .unwrap();
         iter.seek_to_first().unwrap();
@@ -773,7 +784,10 @@ mod tests {
                 initial_seq: 0,
                 memtable_capacity: 256,
                 buffer_count: 2,
-                sst_options: SSTWriterOptions::default(),
+                sst_options: SSTWriterOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTWriterOptions::default()
+                },
                 file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,

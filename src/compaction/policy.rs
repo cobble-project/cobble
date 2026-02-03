@@ -18,6 +18,8 @@ pub(crate) struct CompactionConfig {
     pub(crate) buffer_size: usize,
     pub(crate) num_columns: usize,
     pub(crate) target_file_size: usize,
+    pub(crate) bloom_filter_enabled: bool,
+    pub(crate) bloom_bits_per_key: u32,
 }
 
 impl Default for CompactionConfig {
@@ -32,6 +34,8 @@ impl Default for CompactionConfig {
             buffer_size: 8192,
             num_columns: 1,
             target_file_size: 64 * 1024 * 1024,
+            bloom_filter_enabled: false,
+            bloom_bits_per_key: 10,
         }
     }
 }
@@ -402,6 +406,8 @@ mod tests {
             l1_base_bytes: 10,
             level_size_multiplier: 10,
             max_level: 3,
+            bloom_filter_enabled: true,
+            bloom_bits_per_key: 10,
             ..CompactionConfig::default()
         };
         let level1 = Level {
@@ -435,6 +441,8 @@ mod tests {
             l1_base_bytes: 10,
             level_size_multiplier: 10,
             max_level: 3,
+            bloom_filter_enabled: true,
+            bloom_bits_per_key: 10,
             ..CompactionConfig::default()
         };
         let level1 = Level {

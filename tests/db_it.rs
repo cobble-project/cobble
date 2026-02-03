@@ -49,6 +49,7 @@ fn test_db_put_get_large_dataset() {
         log_path: None,
         log_console: true,
         log_level: log::LevelFilter::Debug,
+        sst_bloom_filter_enabled: true,
         ..Config::default()
     };
     let db = Db::open(config).unwrap();
@@ -104,6 +105,7 @@ fn test_db_ttl_put_get_with_manual_time() {
         log_path: None,
         log_console: false,
         log_level: log::LevelFilter::Info,
+        sst_bloom_filter_enabled: true,
         ..Config::default()
     };
     let db = Db::open(config).unwrap();
@@ -149,6 +151,7 @@ fn test_db_ttl_default_ttl_with_manual_time() {
         log_path: None,
         log_console: false,
         log_level: log::LevelFilter::Info,
+        sst_bloom_filter_enabled: true,
         ..Config::default()
     };
     let db = Db::open(config).unwrap();
@@ -179,6 +182,7 @@ fn test_db_snapshot_creates_manifest() {
         memtable_buffer_count: 2,
         num_columns: 1,
         block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
         ..Config::default()
     };
     let db = Db::open(config).unwrap();
@@ -210,6 +214,7 @@ fn test_db_snapshot_read_only_get() {
         memtable_buffer_count: 2,
         num_columns: 1,
         block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
         ..Config::default()
     };
     let db = Db::open(config.clone()).unwrap();
@@ -241,6 +246,7 @@ fn test_db_open_from_snapshot_allows_writes() {
         memtable_buffer_count: 2,
         num_columns: 1,
         block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
         ..Config::default()
     };
     let db = Db::open(config.clone()).unwrap();
@@ -280,6 +286,7 @@ fn test_db_metrics_list() {
         memtable_buffer_count: 2,
         num_columns: 1,
         block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
         ..Config::default()
     };
     let db = Db::open(config).unwrap();
@@ -366,6 +373,7 @@ fn test_db_snapshot_auto_expire() {
         block_cache_size: 0,
         snapshot_retention: Some(1),
         snapshot_on_flush: true,
+        sst_bloom_filter_enabled: true,
         ..Config::default()
     };
     let db = Db::open(config).unwrap();
@@ -405,6 +413,7 @@ fn test_db_snapshot_retain_skips_auto_expire() {
         block_cache_size: 0,
         snapshot_retention: Some(1),
         snapshot_on_flush: true,
+        sst_bloom_filter_enabled: true,
         ..Config::default()
     };
     let db = Db::open(config).unwrap();

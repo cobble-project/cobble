@@ -151,13 +151,30 @@ impl<W: SequentialWriteFile> BufferedWriter<W> {
         Ok(())
     }
 
-    pub fn close(mut self) -> Result<(), Error> {
-        self.flush()?;
+    pub fn offset(&self) -> usize {
+        self.offset + self.buffer.len()
+    }
+}
+
+impl<W: SequentialWriteFile> File for BufferedWriter<W> {
+    fn close(&mut self) -> Result<(), Error> {
+        if !self.buffer.is_empty() {
+            let data = self.buffer.split();
+            let len = data.len();
+            self.inner.write(&data)?;
+            self.offset += len;
+        }
         self.inner.close()
     }
 
-    pub fn offset(&self) -> usize {
-        self.offset + self.buffer.len()
+    fn size(&self) -> usize {
+        self.offset()
+    }
+}
+
+impl<W: SequentialWriteFile> SequentialWriteFile for BufferedWriter<W> {
+    fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+        BufferedWriter::write(self, data)
     }
 }
 

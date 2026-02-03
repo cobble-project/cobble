@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
 use crate::iterator::KvIterator;
 use crate::sst::block_cache::{BlockCache, BlockCacheKey};
+use crate::sst::bloom::BloomFilter;
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, Value};
@@ -18,6 +19,8 @@ pub(crate) struct SSTIteratorOptions {
     /// Number of columns in the value schema.
     /// Used for decoding values with the row codec.
     pub num_columns: usize,
+    /// Whether to use bloom filter for point lookups.
+    pub bloom_filter_enabled: bool,
 }
 
 #[cfg(test)]
@@ -31,6 +34,7 @@ impl Default for SSTIteratorOptions {
             block_cache_size: 64 * 1024 * 1024, // 64 MB
             num_columns: 1,
             metrics_db_id: None,
+            bloom_filter_enabled: false,
         }
     }
 }
@@ -41,6 +45,8 @@ pub(crate) struct SSTIterator {
     file_id: u64,
     footer: Footer,
     index_block: Block,
+    bloom_filter: Option<BloomFilter>,
+    bloom_filter_loaded: bool,
     current_data_block: Option<Block>,
     current_block_idx: usize,
     current_entry_idx: usize,
@@ -77,12 +83,13 @@ impl SSTIterator {
         )?;
         let mut index_block = Block::decode(index_data)?;
         index_block.set_block_id(u32::MAX);
-
         Ok(Self {
             file,
             file_id,
             footer,
             index_block,
+            bloom_filter: None,
+            bloom_filter_loaded: false,
             current_data_block: None,
             current_block_idx: 0,
             current_entry_idx: 0,
@@ -146,6 +153,33 @@ impl SSTIterator {
         self.current_block_idx = block_idx;
         self.load_data_block(block_idx)?;
         self.seek_in_current_block(target)?;
+        Ok(())
+    }
+
+    pub(crate) fn may_contain(&mut self, key: &[u8]) -> Result<bool> {
+        if !self.options.bloom_filter_enabled || !self.footer.filter_present {
+            return Ok(true);
+        }
+        self.ensure_bloom_filter_loaded()?;
+        Ok(self
+            .bloom_filter
+            .as_ref()
+            .is_some_and(|filter| filter.may_contain(key)))
+    }
+
+    fn ensure_bloom_filter_loaded(&mut self) -> Result<()> {
+        if self.bloom_filter_loaded {
+            return Ok(());
+        }
+        self.bloom_filter_loaded = true;
+        if !self.options.bloom_filter_enabled || !self.footer.filter_present {
+            return Ok(());
+        }
+        let filter_data = self.file.read_at(
+            self.footer.filter_block_offset as usize,
+            self.footer.filter_block_size as usize,
+        )?;
+        self.bloom_filter = Some(BloomFilter::decode(filter_data)?);
         Ok(())
     }
 
@@ -390,7 +424,13 @@ mod tests {
         // Write SST file
         {
             let writer_file = fs.open_write("test.sst").unwrap();
-            let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTWriterOptions::default()
+                },
+            );
 
             writer.add(b"key1", b"value1").unwrap();
             writer.add(b"key2", b"value2").unwrap();
@@ -402,8 +442,15 @@ mod tests {
         // Read SST file
         {
             let reader_file = fs.open_read("test.sst").unwrap();
-            let mut iter =
-                SSTIterator::with_file_id(reader_file, 0, SSTIteratorOptions::default()).unwrap();
+            let mut iter = SSTIterator::with_file_id(
+                reader_file,
+                0,
+                SSTIteratorOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTIteratorOptions::default()
+                },
+            )
+            .unwrap();
 
             iter.seek_to_first().unwrap();
 
@@ -447,7 +494,13 @@ mod tests {
         // Write SST file
         {
             let writer_file = fs.open_write("test_seek.sst").unwrap();
-            let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTWriterOptions::default()
+                },
+            );
 
             writer.add(b"key1", b"value1").unwrap();
             writer.add(b"key3", b"value3").unwrap();
@@ -460,8 +513,15 @@ mod tests {
         // Read and seek
         {
             let reader_file = fs.open_read("test_seek.sst").unwrap();
-            let mut iter =
-                SSTIterator::with_file_id(reader_file, 0, SSTIteratorOptions::default()).unwrap();
+            let mut iter = SSTIterator::with_file_id(
+                reader_file,
+                0,
+                SSTIteratorOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTIteratorOptions::default()
+                },
+            )
+            .unwrap();
 
             // Seek to exact key
             iter.seek(b"key3").unwrap();
@@ -508,6 +568,7 @@ mod tests {
                 writer_file,
                 SSTWriterOptions {
                     num_columns,
+                    bloom_filter_enabled: true,
                     ..SSTWriterOptions::default()
                 },
             );
@@ -544,6 +605,7 @@ mod tests {
                 reader_file,
                 0,
                 SSTIteratorOptions {
+                    bloom_filter_enabled: true,
                     num_columns,
                     ..SSTIteratorOptions::default()
                 },
@@ -600,6 +662,7 @@ mod tests {
                 reader_file,
                 0,
                 SSTIteratorOptions {
+                    bloom_filter_enabled: true,
                     num_columns,
                     ..SSTIteratorOptions::default()
                 },

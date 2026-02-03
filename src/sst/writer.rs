@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
-use crate::file::{BufferedWriter, SequentialWriteFile};
+use crate::file::{BufferedWriter, File, SequentialWriteFile};
 use crate::format::FileBuilder;
+use crate::sst::bloom::BloomFilterBuilder;
 use crate::sst::format::{BlockBuilder, Footer};
 use crate::sst::row_codec::{encode_key, encode_value};
 use crate::r#type::{Key, Value};
@@ -13,6 +14,10 @@ pub struct SSTWriterOptions {
     /// Number of columns in the value schema.
     /// Used for encoding values with the row codec.
     pub num_columns: usize,
+    /// Enable bloom filter generation for SST files.
+    pub bloom_filter_enabled: bool,
+    /// Bits per key for bloom filter when enabled.
+    pub bloom_bits_per_key: u32,
 }
 
 impl Default for SSTWriterOptions {
@@ -21,6 +26,8 @@ impl Default for SSTWriterOptions {
             block_size: 4096,
             buffer_size: 8192,
             num_columns: 1,
+            bloom_filter_enabled: false,
+            bloom_bits_per_key: 10,
         }
     }
 }
@@ -31,6 +38,7 @@ pub struct SSTWriter<W: SequentialWriteFile> {
     options: SSTWriterOptions,
     data_block_builder: BlockBuilder,
     index_block_builder: BlockBuilder,
+    bloom_filter_builder: Option<BloomFilterBuilder>,
     first_key: Option<Vec<u8>>,
     last_key: Vec<u8>,
     current_block_first_key: Option<Vec<u8>>,
@@ -42,12 +50,18 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         let buffered_writer = BufferedWriter::new(writer, options.buffer_size);
         let data_block_builder = BlockBuilder::new(options.block_size);
         let index_block_builder = BlockBuilder::new(options.block_size);
+        let bloom_filter_builder = if options.bloom_filter_enabled {
+            Some(BloomFilterBuilder::new(options.bloom_bits_per_key))
+        } else {
+            None
+        };
 
         Self {
             writer: buffered_writer,
             options,
             data_block_builder,
             index_block_builder,
+            bloom_filter_builder,
             first_key: None,
             last_key: Vec::new(),
             current_block_first_key: None,
@@ -78,6 +92,9 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
 
         // Add to current data block
         self.data_block_builder.add(key, value);
+        if let Some(builder) = &mut self.bloom_filter_builder {
+            builder.add(key);
+        }
         self.last_key = key.to_vec();
 
         // Check if we should finish the current block
@@ -162,8 +179,24 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         // Write index block
         self.writer.write(&index_encoded)?;
 
+        // Write bloom filter block if enabled
+        let filter_enabled = self.bloom_filter_builder.is_some();
+        let (filter_offset, filter_size) = if let Some(builder) = self.bloom_filter_builder.take() {
+            let offset = self.writer.offset();
+            let size = builder.write_to(&mut self.writer)?;
+            (offset as u64, size as u64)
+        } else {
+            (0u64, 0u64)
+        };
+
         // Write footer
-        let footer = Footer::new(index_offset as u64, index_size as u64);
+        let footer = Footer::new(
+            index_offset as u64,
+            index_size as u64,
+            filter_offset,
+            filter_size,
+            filter_enabled,
+        );
         let footer_encoded = footer.encode();
         self.writer.write(&footer_encoded)?;
 
@@ -171,7 +204,8 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         let file_size = self.writer.offset();
 
         // Flush and close
-        self.writer.close()?;
+        let mut writer = self.writer;
+        writer.close()?;
 
         Ok((first_key, last_key, file_size))
     }
@@ -244,7 +278,13 @@ mod tests {
             .unwrap();
 
         let writer_file = fs.open_write("test.sst").unwrap();
-        let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+        let mut writer = SSTWriter::new(
+            writer_file,
+            SSTWriterOptions {
+                bloom_filter_enabled: true,
+                ..SSTWriterOptions::default()
+            },
+        );
 
         writer.add(b"key1", b"value1").unwrap();
         writer.add(b"key2", b"value2").unwrap();
@@ -267,7 +307,13 @@ mod tests {
             .unwrap();
 
         let writer_file = fs.open_write("test_order.sst").unwrap();
-        let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+        let mut writer = SSTWriter::new(
+            writer_file,
+            SSTWriterOptions {
+                bloom_filter_enabled: true,
+                ..SSTWriterOptions::default()
+            },
+        );
 
         writer.add(b"key1", b"value1").unwrap();
 
@@ -294,6 +340,8 @@ mod tests {
                 block_size: 100, // Small block size to force multiple blocks
                 buffer_size: 8192,
                 num_columns: 1,
+                bloom_filter_enabled: true,
+                bloom_bits_per_key: 10,
             },
         );
 

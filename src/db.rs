@@ -235,6 +235,8 @@ impl Db {
         let lsm_tree = Arc::new(lsm_tree);
         let sst_options = SSTWriterOptions {
             num_columns: config.num_columns,
+            bloom_filter_enabled: config.sst_bloom_filter_enabled,
+            bloom_bits_per_key: config.sst_bloom_bits_per_key,
             ..SSTWriterOptions::default()
         };
 
@@ -247,6 +249,8 @@ impl Db {
             max_level: config.max_level,
             num_columns: config.num_columns,
             target_file_size: config.base_file_size,
+            bloom_filter_enabled: config.sst_bloom_filter_enabled,
+            bloom_bits_per_key: config.sst_bloom_bits_per_key,
             ..crate::compaction::CompactionConfig::default()
         };
         let compaction_factory = crate::compaction::make_sst_builder_factory(sst_options.clone());
@@ -408,6 +412,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            sst_bloom_filter_enabled: true,
             ..Config::default()
         };
         let db = Db::open(config).unwrap();
@@ -438,6 +443,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            sst_bloom_filter_enabled: true,
             ..Config::default()
         };
         let db = Db::open(config).unwrap();
@@ -468,6 +474,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            sst_bloom_filter_enabled: true,
             ..Config::default()
         };
         let db = Db::open(config).unwrap();
@@ -505,6 +512,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            sst_bloom_filter_enabled: true,
             ..Config::default()
         };
         let db = Db::open(config).unwrap();
@@ -542,6 +550,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            sst_bloom_filter_enabled: true,
             ..Config::default()
         };
         let db = Db::open(config).unwrap();
@@ -575,6 +584,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 1,
+            sst_bloom_filter_enabled: true,
             ..Config::default()
         };
         let db = Db::open(config).unwrap();
@@ -608,6 +618,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 2,
+            sst_bloom_filter_enabled: true,
             ..Config::default()
         };
         let db = Db::open(config).unwrap();
@@ -644,6 +655,7 @@ mod tests {
             memtable_capacity: 128,
             memtable_buffer_count: 2,
             num_columns: 2,
+            sst_bloom_filter_enabled: true,
             ..Config::default()
         };
         let db = Db::open(config).unwrap();
