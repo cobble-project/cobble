@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
 use crate::iterator::KvIterator;
-use crate::sst::block_cache::{BlockCache, BlockCacheKey};
+use crate::sst::block_cache::{BlockCache, BlockCacheKey, CachedBlock};
 use crate::sst::bloom::BloomFilter;
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
@@ -59,6 +59,13 @@ impl SSTIterator {
         Self::with_file_id(file, 0, options)
     }
 
+    fn get_db_id(options: &SSTIteratorOptions) -> String {
+        options
+            .metrics_db_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
     pub fn with_file_id(
         file: Box<dyn RandomAccessFile>,
         file_id: u64,
@@ -77,12 +84,53 @@ impl SSTIterator {
         let footer = Self::read_footer(&*file)?;
 
         // Read index block
-        let index_data = file.read_at(
-            footer.index_block_offset as usize,
-            footer.index_block_size as usize,
-        )?;
-        let mut index_block = Block::decode(index_data)?;
-        index_block.set_block_id(u32::MAX);
+        let index_block = if let Some(cache) = &block_cache {
+            let cache_key = BlockCacheKey {
+                file_id,
+                block_id: u32::MAX,
+            };
+            if let Some(cached) = cache.get(&cache_key) {
+                counter!(
+                    "block_cache_hits_total",
+                    "file" => "sst",
+                    "kind" => "index",
+                    "db_id" => Self::get_db_id(&options)
+                )
+                .increment(1);
+                match cached {
+                    CachedBlock::Block(block) => block,
+                    CachedBlock::BloomFilter(_) => {
+                        return Err(Error::IoError(
+                            "Index block cache entry invalid".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                counter!(
+                    "block_cache_misses_total",
+                    "file" => "sst",
+                    "kind" => "index",
+                    "db_id" => Self::get_db_id(&options)
+                )
+                .increment(1);
+                let index_data = file.read_at(
+                    footer.index_block_offset as usize,
+                    footer.index_block_size as usize,
+                )?;
+                let mut index_block = Block::decode(index_data)?;
+                index_block.set_block_id(u32::MAX);
+                cache.insert(cache_key, CachedBlock::Block(index_block.clone()));
+                index_block
+            }
+        } else {
+            let index_data = file.read_at(
+                footer.index_block_offset as usize,
+                footer.index_block_size as usize,
+            )?;
+            let mut index_block = Block::decode(index_data)?;
+            index_block.set_block_id(u32::MAX);
+            index_block
+        };
         Ok(Self {
             file,
             file_id,
@@ -175,11 +223,52 @@ impl SSTIterator {
         if !self.options.bloom_filter_enabled || !self.footer.filter_present {
             return Ok(());
         }
-        let filter_data = self.file.read_at(
-            self.footer.filter_block_offset as usize,
-            self.footer.filter_block_size as usize,
-        )?;
-        self.bloom_filter = Some(BloomFilter::decode(filter_data)?);
+        let filter = if let Some(cache) = &self.block_cache {
+            let cache_key = BlockCacheKey {
+                file_id: self.file_id,
+                block_id: u32::MAX - 1,
+            };
+            let db_id = self.metrics_db_id().to_string();
+            if let Some(cached) = cache.get(&cache_key) {
+                counter!(
+                    "block_cache_hits_total",
+                    "file" => "sst",
+                    "kind" => "filter",
+                    "db_id" => db_id.clone()
+                )
+                .increment(1);
+                match cached {
+                    CachedBlock::BloomFilter(filter) => filter,
+                    CachedBlock::Block(_) => {
+                        return Err(Error::IoError(
+                            "Bloom filter cache entry invalid".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                counter!(
+                    "block_cache_misses_total",
+                    "file" => "sst",
+                    "kind" => "filter",
+                    "db_id" => db_id.clone()
+                )
+                .increment(1);
+                let filter_data = self.file.read_at(
+                    self.footer.filter_block_offset as usize,
+                    self.footer.filter_block_size as usize,
+                )?;
+                let filter = BloomFilter::decode(filter_data)?;
+                cache.insert(cache_key, CachedBlock::BloomFilter(filter.clone()));
+                filter
+            }
+        } else {
+            let filter_data = self.file.read_at(
+                self.footer.filter_block_offset as usize,
+                self.footer.filter_block_size as usize,
+            )?;
+            BloomFilter::decode(filter_data)?
+        };
+        self.bloom_filter = Some(filter);
         Ok(())
     }
 
@@ -206,31 +295,31 @@ impl SSTIterator {
         };
         let db_id = self.metrics_db_id().to_string();
         let block = if let Some(cache) = &self.block_cache {
-            if let Some(block) = cache.get(&cache_key) {
+            if let Some(cached) = cache.get(&cache_key) {
                 counter!(
                     "block_cache_hits_total",
-                    "kind" => "sst",
+                    "file" => "sst",
+                    "kind" => "data",
                     "db_id" => db_id.clone()
                 )
                 .increment(1);
-                block
+                match cached {
+                    CachedBlock::Block(block) => block,
+                    CachedBlock::BloomFilter(_) => {
+                        return Err(Error::IoError("Block cache entry invalid".to_string()));
+                    }
+                }
             } else {
                 counter!(
                     "block_cache_misses_total",
-                    "kind" => "sst",
+                    "file" => "sst",
+                    "kind" => "data",
                     "db_id" => db_id.clone()
                 )
                 .increment(1);
                 let data = self.file.read_at(offset, size)?;
                 let mut block = Block::decode(data)?;
                 block.set_block_id(block_idx as u32);
-                cache.insert(cache_key, block.clone());
-                counter!(
-                    "block_cache_inserts_total",
-                    "kind" => "sst",
-                    "db_id" => db_id.clone()
-                )
-                .increment(1);
                 block
             }
         } else {

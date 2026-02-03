@@ -59,6 +59,11 @@ impl BloomFilter {
     pub fn is_empty(&self) -> bool {
         self.num_bits == 0 || self.data.is_empty()
     }
+
+    pub fn size_in_bytes(&self) -> usize {
+        // header is u64 + u32
+        12 + self.data.len()
+    }
 }
 
 pub struct BloomFilterBuilder {

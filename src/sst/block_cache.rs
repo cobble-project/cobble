@@ -1,8 +1,24 @@
 use crate::cache::{CacheHandle, FoyerCache};
+use crate::sst::bloom::BloomFilter;
 use crate::sst::format::Block;
 use std::sync::Arc;
 
-pub type BlockCache = Arc<dyn CacheHandle<BlockCacheKey, Block>>;
+#[derive(Clone)]
+pub enum CachedBlock {
+    Block(Block),
+    BloomFilter(BloomFilter),
+}
+
+impl CachedBlock {
+    pub fn size_in_bytes(&self) -> usize {
+        match self {
+            CachedBlock::Block(block) => block.size_in_bytes(),
+            CachedBlock::BloomFilter(filter) => filter.size_in_bytes(),
+        }
+    }
+}
+
+pub type BlockCache = Arc<dyn CacheHandle<BlockCacheKey, CachedBlock>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct BlockCacheKey {
@@ -11,7 +27,9 @@ pub struct BlockCacheKey {
 }
 
 pub fn new_block_cache(capacity: usize) -> BlockCache {
-    Arc::new(FoyerCache::new(capacity, |_, v: &Block| v.size_in_bytes()))
+    Arc::new(FoyerCache::new(capacity, |_, v: &CachedBlock| {
+        v.size_in_bytes()
+    }))
 }
 
 #[cfg(test)]
@@ -20,8 +38,7 @@ mod tests {
 
     use crate::cache::MockCache;
     use crate::file::FileSystemRegistry;
-    use crate::sst::block_cache::{BlockCache, BlockCacheKey};
-    use crate::sst::format::Block;
+    use crate::sst::block_cache::{BlockCache, BlockCacheKey, CachedBlock};
     use crate::sst::iterator::{SSTIterator, SSTIteratorOptions};
     use crate::sst::writer::{SSTWriter, SSTWriterOptions};
 
@@ -56,7 +73,7 @@ mod tests {
         }
 
         let reader_file = fs.open_read("cached.sst").unwrap();
-        let mock_cache = Arc::new(MockCache::<BlockCacheKey, Block>::default());
+        let mock_cache = Arc::new(MockCache::<BlockCacheKey, CachedBlock>::default());
         let cache: BlockCache = mock_cache.clone();
         let mut iter = SSTIterator::with_cache_test(
             reader_file,
