@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
 use crate::iterator::KvIterator;
-use crate::sst::block_cache::{BlockCache, BlockCacheKey, CachedBlock};
+use crate::sst::block_cache::{BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock};
 use crate::sst::bloom::BloomFilter;
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
@@ -45,9 +45,12 @@ pub(crate) struct SSTIterator {
     file_id: u64,
     footer: Footer,
     index_block: Block,
+    index_partitions: Vec<(u64, u64)>,
     bloom_filter: Option<BloomFilter>,
-    bloom_filter_loaded: bool,
+    bloom_filter_partition_idx: Option<usize>,
     current_data_block: Option<Block>,
+    current_index_partition_idx: usize,
+    current_index_partition: Option<Block>,
     current_block_idx: usize,
     current_entry_idx: usize,
     options: SSTIteratorOptions,
@@ -87,7 +90,8 @@ impl SSTIterator {
         let index_block = if let Some(cache) = &block_cache {
             let cache_key = BlockCacheKey {
                 file_id,
-                block_id: u32::MAX,
+                block_id: footer.index_block_offset,
+                kind: BlockCacheKind::IndexTop,
             };
             if let Some(cached) = cache.get(&cache_key) {
                 counter!(
@@ -131,14 +135,36 @@ impl SSTIterator {
             index_block.set_block_id(u32::MAX);
             index_block
         };
+        let mut index_partitions = Vec::with_capacity(index_block.offsets_len());
+        if footer.partitioned_index {
+            for idx in 0..index_block.offsets_len() {
+                let (_, value) = index_block.get(idx)?;
+                if value.len() != 16 {
+                    return Err(Error::IoError("Invalid index partition entry".to_string()));
+                }
+                let offset = u64::from_le_bytes(value[0..8].try_into().unwrap());
+                let size = u64::from_le_bytes(value[8..16].try_into().unwrap());
+                if size == 0 {
+                    return Err(Error::IoError("Index partition size is zero".to_string()));
+                }
+                index_partitions.push((offset, size));
+            }
+        } else if footer.index_block_size > 0 {
+            index_partitions.push((footer.index_block_offset, footer.index_block_size));
+        } else {
+            return Err(Error::IoError("Index block size is zero".to_string()));
+        }
         Ok(Self {
             file,
             file_id,
             footer,
             index_block,
+            index_partitions,
             bloom_filter: None,
-            bloom_filter_loaded: false,
+            bloom_filter_partition_idx: None,
             current_data_block: None,
+            current_index_partition_idx: 0,
+            current_index_partition: None,
             current_block_idx: 0,
             current_entry_idx: 0,
             options,
@@ -188,110 +214,159 @@ impl SSTIterator {
 
     /// Seek to the first key >= target
     pub fn seek(&mut self, target: &[u8]) -> Result<()> {
-        if self.index_block.is_empty() {
+        if self.index_partitions.is_empty() {
             self.current_data_block = None;
             return Ok(());
         }
-        let left = self.index_block.lower_bound(target)?;
-        let block_idx = if left == self.index_block.len() {
-            left.saturating_sub(1)
-        } else {
-            left
-        };
+        if !self.footer.partitioned_index {
+            if self.index_block.is_empty() {
+                self.current_data_block = None;
+                return Ok(());
+            }
+            self.current_index_partition_idx = 0;
+            self.current_index_partition = Some(self.index_block.clone());
+            let block_idx = self.index_block.valid_lower_bound(target)?;
+            self.current_block_idx = block_idx;
+            let partition = self.index_block.clone();
+            self.load_data_block_from_partition(&partition, block_idx)?;
+            self.seek_in_current_block(target)?;
+            return Ok(());
+        }
+
+        let partition_idx = self.index_block.valid_lower_bound(target)?;
+        let partition = self.load_index_partition(partition_idx)?;
+        let block_idx = partition.valid_lower_bound(target)?;
         self.current_block_idx = block_idx;
-        self.load_data_block(block_idx)?;
+        self.load_data_block_from_partition(&partition, block_idx)?;
         self.seek_in_current_block(target)?;
         Ok(())
     }
 
     pub(crate) fn may_contain(&mut self, key: &[u8]) -> Result<bool> {
-        if !self.options.bloom_filter_enabled || !self.footer.filter_present {
+        if !self.options.bloom_filter_enabled
+            || !self.footer.filter_present
+            || self.footer.filter_block_size == 0
+        {
             return Ok(true);
         }
-        self.ensure_bloom_filter_loaded()?;
+        if self.index_partitions.is_empty() {
+            return Ok(true);
+        }
+        let partition_idx = if self.footer.partitioned_index {
+            if self.index_block.is_empty() {
+                return Ok(true);
+            }
+            self.index_block.valid_lower_bound(key)?
+        } else {
+            0
+        };
+        self.ensure_bloom_filter_loaded(partition_idx)?;
         Ok(self
             .bloom_filter
             .as_ref()
             .is_some_and(|filter| filter.may_contain(key)))
     }
 
-    fn ensure_bloom_filter_loaded(&mut self) -> Result<()> {
-        if self.bloom_filter_loaded {
+    fn ensure_bloom_filter_loaded(&mut self, partition_idx: usize) -> Result<()> {
+        if self.bloom_filter_partition_idx == Some(partition_idx) {
             return Ok(());
         }
-        self.bloom_filter_loaded = true;
-        if !self.options.bloom_filter_enabled || !self.footer.filter_present {
-            return Ok(());
+        let filter = self.load_filter_partition(partition_idx)?;
+        self.bloom_filter = Some(filter);
+        self.bloom_filter_partition_idx = Some(partition_idx);
+        Ok(())
+    }
+
+    fn load_index_partition(&mut self, partition_idx: usize) -> Result<Block> {
+        if partition_idx >= self.index_partitions.len() {
+            return Err(Error::IoError(format!(
+                "Index partition out of bounds: {}",
+                partition_idx
+            )));
         }
-        let filter = if let Some(cache) = &self.block_cache {
-            let cache_key = BlockCacheKey {
-                file_id: self.file_id,
-                block_id: u32::MAX - 1,
-            };
-            let db_id = self.metrics_db_id().to_string();
+        if let Some(block) = self.current_index_partition.as_ref()
+            && self.current_index_partition_idx == partition_idx
+        {
+            return Ok(block.clone());
+        }
+        let (offset, size) = self.index_partitions[partition_idx];
+        let cache_key = BlockCacheKey {
+            file_id: self.file_id,
+            block_id: offset,
+            kind: if self.footer.partitioned_index {
+                BlockCacheKind::IndexPartition
+            } else {
+                BlockCacheKind::IndexTop
+            },
+        };
+        let db_id = self.metrics_db_id().to_string();
+        let block = if let Some(cache) = &self.block_cache {
             if let Some(cached) = cache.get(&cache_key) {
                 counter!(
                     "block_cache_hits_total",
                     "file" => "sst",
-                    "kind" => "filter",
+                    "kind" => "index",
                     "db_id" => db_id.clone()
                 )
                 .increment(1);
                 match cached {
-                    CachedBlock::BloomFilter(filter) => filter,
-                    CachedBlock::Block(_) => {
-                        return Err(Error::IoError(
-                            "Bloom filter cache entry invalid".to_string(),
-                        ));
+                    CachedBlock::Block(block) => block,
+                    CachedBlock::BloomFilter(_) => {
+                        return Err(Error::IoError("Index partition cache invalid".to_string()));
                     }
                 }
             } else {
                 counter!(
                     "block_cache_misses_total",
                     "file" => "sst",
-                    "kind" => "filter",
+                    "kind" => "index",
                     "db_id" => db_id.clone()
                 )
                 .increment(1);
-                let filter_data = self.file.read_at(
-                    self.footer.filter_block_offset as usize,
-                    self.footer.filter_block_size as usize,
-                )?;
-                let filter = BloomFilter::decode(filter_data)?;
-                cache.insert(cache_key, CachedBlock::BloomFilter(filter.clone()));
-                filter
+                let data = self.file.read_at(offset as usize, size as usize)?;
+                let mut block = Block::decode(data)?;
+                block.set_block_id(partition_idx as u32);
+                cache.insert(cache_key, CachedBlock::Block(block.clone()));
+                block
             }
         } else {
-            let filter_data = self.file.read_at(
-                self.footer.filter_block_offset as usize,
-                self.footer.filter_block_size as usize,
-            )?;
-            BloomFilter::decode(filter_data)?
+            let data = self.file.read_at(offset as usize, size as usize)?;
+            let mut block = Block::decode(data)?;
+            block.set_block_id(partition_idx as u32);
+            block
         };
-        self.bloom_filter = Some(filter);
-        Ok(())
+        self.current_index_partition_idx = partition_idx;
+        self.current_index_partition = Some(block.clone());
+        Ok(block)
     }
 
-    fn load_data_block(&mut self, block_idx: usize) -> Result<()> {
-        if block_idx >= self.index_block.len() {
+    fn load_data_block_from_partition(
+        &mut self,
+        partition: &Block,
+        block_idx: usize,
+    ) -> Result<()> {
+        if block_idx >= partition.offsets_len() {
             return Err(Error::IoError(format!(
                 "Block index out of bounds: {}",
                 block_idx
             )));
         }
 
-        let (_, value) = self.index_block.get(block_idx)?;
-        // Index block value format: [offset: u64][size: u64]
+        let (_, value) = partition.get(block_idx)?;
         if value.len() != 16 {
             return Err(Error::IoError("Invalid index entry".to_string()));
         }
 
         let offset = u64::from_le_bytes(value[0..8].try_into().unwrap()) as usize;
         let size = u64::from_le_bytes(value[8..16].try_into().unwrap()) as usize;
+        if size == 0 {
+            return Err(Error::IoError("Data block size is zero".to_string()));
+        }
 
         let cache_key = BlockCacheKey {
             file_id: self.file_id,
-            block_id: block_idx as u32,
+            block_id: offset as u64,
+            kind: BlockCacheKind::Data,
         };
         let db_id = self.metrics_db_id().to_string();
         let block = if let Some(cache) = &self.block_cache {
@@ -334,6 +409,142 @@ impl SSTIterator {
         Ok(())
     }
 
+    /// Load the filter index block.
+    /// Used for partitioned filter index.
+    fn load_filter_index(&mut self) -> Result<Block> {
+        let cache_key = BlockCacheKey {
+            file_id: self.file_id,
+            block_id: self.footer.filter_block_offset,
+            kind: BlockCacheKind::FilterIndex,
+        };
+        let db_id = self.metrics_db_id().to_string();
+        let block = if let Some(cache) = &self.block_cache {
+            if let Some(cached) = cache.get(&cache_key) {
+                counter!(
+                    "block_cache_hits_total",
+                    "file" => "sst",
+                    "kind" => "filter",
+                    "db_id" => db_id.clone()
+                )
+                .increment(1);
+                match cached {
+                    CachedBlock::Block(block) => block,
+                    CachedBlock::BloomFilter(_) => {
+                        return Err(Error::IoError("Filter index cache invalid".to_string()));
+                    }
+                }
+            } else {
+                counter!(
+                    "block_cache_misses_total",
+                    "file" => "sst",
+                    "kind" => "filter",
+                    "db_id" => db_id.clone()
+                )
+                .increment(1);
+                let data = self.file.read_at(
+                    self.footer.filter_block_offset as usize,
+                    self.footer.filter_block_size as usize,
+                )?;
+                let mut block = Block::decode(data)?;
+                block.set_block_id(u32::MAX - 1);
+                cache.insert(cache_key, CachedBlock::Block(block.clone()));
+                block
+            }
+        } else {
+            let data = self.file.read_at(
+                self.footer.filter_block_offset as usize,
+                self.footer.filter_block_size as usize,
+            )?;
+            let mut block = Block::decode(data)?;
+            block.set_block_id(u32::MAX - 1);
+            block
+        };
+        Ok(block)
+    }
+
+    /// Load the bloom filter for the given partition index.
+    /// If the SST file does not use partitioned filters, the same filter is returned for any partition index.
+    fn load_filter_partition(&mut self, partition_idx: usize) -> Result<BloomFilter> {
+        if self.footer.partitioned_index {
+            let filter_index = self.load_filter_index()?;
+            if partition_idx >= filter_index.offsets_len() {
+                return Err(Error::IoError(format!(
+                    "Filter partition out of bounds: {}",
+                    partition_idx
+                )));
+            }
+            let (_, value) = filter_index.get(partition_idx)?;
+            if value.len() != 16 {
+                return Err(Error::IoError("Invalid filter index entry".to_string()));
+            }
+            let offset = u64::from_le_bytes(value[0..8].try_into().unwrap()) as usize;
+            let size = u64::from_le_bytes(value[8..16].try_into().unwrap()) as usize;
+            if size == 0 {
+                return Err(Error::IoError("Filter partition size is zero".to_string()));
+            }
+            let cache_key = BlockCacheKey {
+                file_id: self.file_id,
+                block_id: offset as u64,
+                kind: BlockCacheKind::FilterPartition,
+            };
+            return self.load_filter(cache_key, offset, size);
+        }
+
+        let offset = self.footer.filter_block_offset as usize;
+        let size = self.footer.filter_block_size as usize;
+        if size == 0 {
+            return Err(Error::IoError("Filter block size is zero".to_string()));
+        }
+        let cache_key = BlockCacheKey {
+            file_id: self.file_id,
+            block_id: self.footer.filter_block_offset,
+            kind: BlockCacheKind::FilterPartition,
+        };
+        self.load_filter(cache_key, offset, size)
+    }
+
+    /// Load bloom filter block from file or cache.
+    fn load_filter(
+        &self,
+        cache_key: BlockCacheKey,
+        offset: usize,
+        size: usize,
+    ) -> Result<BloomFilter> {
+        let filter = if let Some(cache) = &self.block_cache {
+            if let Some(cached) = cache.get(&cache_key) {
+                counter!(
+                    "block_cache_hits_total",
+                    "file" => "sst",
+                    "kind" => "filter",
+                    "db_id" => self.metrics_db_id().to_string(),
+                )
+                .increment(1);
+                match cached {
+                    CachedBlock::BloomFilter(filter) => filter,
+                    CachedBlock::Block(_) => {
+                        return Err(Error::IoError("Filter cache entry invalid".to_string()));
+                    }
+                }
+            } else {
+                counter!(
+                    "block_cache_misses_total",
+                    "file" => "sst",
+                    "kind" => "filter",
+                    "db_id" => self.metrics_db_id().to_string(),
+                )
+                .increment(1);
+                let filter_data = self.file.read_at(offset, size)?;
+                let filter = BloomFilter::decode(filter_data)?;
+                cache.insert(cache_key, CachedBlock::BloomFilter(filter.clone()));
+                filter
+            }
+        } else {
+            let filter_data = self.file.read_at(offset, size)?;
+            BloomFilter::decode(filter_data)?
+        };
+        Ok(filter)
+    }
+
     fn seek_in_current_block(&mut self, target: &[u8]) -> Result<()> {
         if let Some(block) = &self.current_data_block {
             self.current_entry_idx = block.lower_bound(target)?;
@@ -343,13 +554,28 @@ impl SSTIterator {
 
     /// Move to the first entry
     pub fn seek_to_first(&mut self) -> Result<()> {
-        if self.index_block.is_empty() {
+        if self.index_partitions.is_empty() {
             self.current_data_block = None;
             return Ok(());
         }
 
+        if !self.footer.partitioned_index {
+            if self.index_block.is_empty() {
+                self.current_data_block = None;
+                return Ok(());
+            }
+            self.current_index_partition_idx = 0;
+            self.current_index_partition = Some(self.index_block.clone());
+            self.current_block_idx = 0;
+            let partition = self.index_block.clone();
+            self.load_data_block_from_partition(&partition, 0)?;
+            self.current_entry_idx = 0;
+            return Ok(());
+        }
+
+        let partition = self.load_index_partition(0)?;
         self.current_block_idx = 0;
-        self.load_data_block(0)?;
+        self.load_data_block_from_partition(&partition, 0)?;
         self.current_entry_idx = 0;
         Ok(())
     }
@@ -357,7 +583,7 @@ impl SSTIterator {
     /// Get the current key-value pair
     pub fn current(&self) -> Result<Option<(Bytes, Bytes)>> {
         if let Some(block) = &self.current_data_block
-            && self.current_entry_idx < block.len()
+            && self.current_entry_idx < block.offsets_len()
         {
             let (key, value) = block.get(self.current_entry_idx)?;
             return Ok(Some((key, value)));
@@ -368,7 +594,7 @@ impl SSTIterator {
     /// Get the current key only
     pub fn key(&self) -> Result<Option<Bytes>> {
         if let Some(block) = &self.current_data_block
-            && self.current_entry_idx < block.len()
+            && self.current_entry_idx < block.offsets_len()
         {
             let (key, _) = block.get(self.current_entry_idx)?;
             return Ok(Some(key));
@@ -379,7 +605,7 @@ impl SSTIterator {
     /// Get the current value only
     pub fn value(&self) -> Result<Option<Bytes>> {
         if let Some(block) = &self.current_data_block
-            && self.current_entry_idx < block.len()
+            && self.current_entry_idx < block.offsets_len()
         {
             let (_, value) = block.get(self.current_entry_idx)?;
             return Ok(Some(value));
@@ -392,18 +618,37 @@ impl SSTIterator {
         if let Some(block) = &self.current_data_block {
             self.current_entry_idx += 1;
 
-            if self.current_entry_idx >= block.len() {
+            if self.current_entry_idx >= block.offsets_len() {
                 // Move to next block
                 self.current_block_idx += 1;
-                if self.current_block_idx < self.index_block.len() {
-                    self.load_data_block(self.current_block_idx)?;
+                let reuse_partition = self.current_index_partition.is_some()
+                    && self.current_block_idx
+                        < self
+                            .current_index_partition
+                            .as_ref()
+                            .map(|partition| partition.offsets_len())
+                            .unwrap_or(0);
+                if reuse_partition {
+                    let partition = self.current_index_partition.clone().unwrap();
+                    self.load_data_block_from_partition(&partition, self.current_block_idx)?;
                     self.current_entry_idx = 0;
                     return Ok(true);
-                } else {
-                    // No more blocks
+                }
+                if !self.footer.partitioned_index {
                     self.current_data_block = None;
                     return Ok(false);
                 }
+                let next_partition_idx = self.current_index_partition_idx + 1;
+                if next_partition_idx < self.index_partitions.len() {
+                    let partition = self.load_index_partition(next_partition_idx)?;
+                    self.current_block_idx = 0;
+                    self.load_data_block_from_partition(&partition, 0)?;
+                    self.current_entry_idx = 0;
+                    return Ok(true);
+                }
+                // No more blocks
+                self.current_data_block = None;
+                return Ok(false);
             }
 
             Ok(true)
@@ -418,7 +663,7 @@ impl SSTIterator {
             && self
                 .current_data_block
                 .as_ref()
-                .map(|b| self.current_entry_idx < b.len())
+                .map(|b| self.current_entry_idx < b.offsets_len())
                 .unwrap_or(false)
     }
 
@@ -499,7 +744,26 @@ impl SSTIteratorTestCache {
 mod tests {
     use super::*;
     use crate::file::FileSystemRegistry;
+    use crate::sst::bloom::{BloomFilter, BloomFilterBuilder};
     use crate::sst::writer::{SSTWriter, SSTWriterOptions};
+
+    fn build_filter(bits_per_key: u32, keys: &[&[u8]]) -> BloomFilter {
+        let mut builder = BloomFilterBuilder::new(bits_per_key);
+        for key in keys {
+            builder.add(key);
+        }
+        builder.finish()
+    }
+
+    fn find_missing_key(prefix: &str, filter: &BloomFilter) -> Vec<u8> {
+        for idx in 0..1000 {
+            let candidate = format!("{}{}", prefix, idx);
+            if !filter.may_contain(candidate.as_bytes()) {
+                return candidate.into_bytes();
+            }
+        }
+        panic!("unable to find missing key not in filter");
+    }
 
     #[test]
     #[serial_test::serial(file)]
@@ -569,6 +833,115 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all("/tmp/sst_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_iterator_may_contain_single_level() {
+        let _ = std::fs::remove_dir_all("/tmp/sst_filter_single_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/sst_filter_single_test".to_string())
+            .unwrap();
+
+        let keys: [&[u8]; 3] = [b"key1", b"key2", b"key3"];
+        let bits_per_key = 100;
+        let filter = build_filter(bits_per_key, &keys);
+        let missing_key = find_missing_key("missing_", &filter);
+
+        {
+            let writer_file = fs.open_write("filter_single.sst").unwrap();
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    bloom_filter_enabled: true,
+                    bloom_bits_per_key: bits_per_key,
+                    partitioned_index: false,
+                    ..SSTWriterOptions::default()
+                },
+            );
+
+            for key in keys {
+                writer.add(key, b"value").unwrap();
+            }
+
+            writer.finish().unwrap();
+        }
+
+        {
+            let reader_file = fs.open_read("filter_single.sst").unwrap();
+            let mut iter = SSTIterator::with_file_id(
+                reader_file,
+                0,
+                SSTIteratorOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTIteratorOptions::default()
+                },
+            )
+            .unwrap();
+
+            assert!(iter.may_contain(b"key2").unwrap());
+            assert!(!iter.may_contain(&missing_key).unwrap());
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_filter_single_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_iterator_may_contain_partitioned() {
+        let _ = std::fs::remove_dir_all("/tmp/sst_filter_partitioned_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/sst_filter_partitioned_test".to_string())
+            .unwrap();
+
+        let keys: [&[u8]; 4] = [b"key000", b"key001", b"key002", b"key003"];
+        let bits_per_key = 100;
+        let partition0_filter = build_filter(bits_per_key, &[keys[0]]);
+        assert!(!partition0_filter.may_contain(keys[3]));
+        let partition3_filter = build_filter(bits_per_key, &[keys[3]]);
+        let missing_key = find_missing_key("key003_missing_", &partition3_filter);
+
+        let value = vec![b'v'; 64];
+        {
+            let writer_file = fs.open_write("filter_partitioned.sst").unwrap();
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    block_size: 32,
+                    buffer_size: 8192,
+                    num_columns: 1,
+                    bloom_filter_enabled: true,
+                    bloom_bits_per_key: bits_per_key,
+                    partitioned_index: true,
+                },
+            );
+
+            for key in keys {
+                writer.add(key, &value).unwrap();
+            }
+
+            writer.finish().unwrap();
+        }
+
+        {
+            let reader_file = fs.open_read("filter_partitioned.sst").unwrap();
+            let mut iter = SSTIterator::with_file_id(
+                reader_file,
+                0,
+                SSTIteratorOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTIteratorOptions::default()
+                },
+            )
+            .unwrap();
+
+            assert!(iter.may_contain(b"key003").unwrap());
+            assert!(!iter.may_contain(&missing_key).unwrap());
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_filter_partitioned_test");
     }
 
     #[test]

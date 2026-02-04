@@ -21,9 +21,19 @@ impl CachedBlock {
 pub type BlockCache = Arc<dyn CacheHandle<BlockCacheKey, CachedBlock>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum BlockCacheKind {
+    Data,
+    IndexPartition,
+    IndexTop,
+    FilterPartition,
+    FilterIndex,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct BlockCacheKey {
     pub file_id: u64,
-    pub block_id: u32,
+    pub block_id: u64,
+    pub kind: BlockCacheKind,
 }
 
 pub fn new_block_cache(capacity: usize) -> BlockCache {
@@ -61,6 +71,7 @@ mod tests {
                     num_columns: 1,
                     bloom_filter_enabled: true,
                     bloom_bits_per_key: 10,
+                    partitioned_index: false,
                 },
             );
 

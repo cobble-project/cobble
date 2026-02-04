@@ -8,6 +8,14 @@ use crate::r#type::{Key, Value};
 use bytes::{BufMut, BytesMut};
 
 #[derive(Clone)]
+struct DataBlockMeta {
+    first_key: Vec<u8>,
+    offset: u64,
+    size: u64,
+    key_hashes: Vec<u64>,
+}
+
+#[derive(Clone)]
 pub struct SSTWriterOptions {
     pub block_size: usize,
     pub buffer_size: usize,
@@ -18,6 +26,8 @@ pub struct SSTWriterOptions {
     pub bloom_filter_enabled: bool,
     /// Bits per key for bloom filter when enabled.
     pub bloom_bits_per_key: u32,
+    /// Enable two-level index/filter blocks.
+    pub partitioned_index: bool,
 }
 
 impl Default for SSTWriterOptions {
@@ -28,6 +38,7 @@ impl Default for SSTWriterOptions {
             num_columns: 1,
             bloom_filter_enabled: false,
             bloom_bits_per_key: 10,
+            partitioned_index: false,
         }
     }
 }
@@ -37,19 +48,17 @@ pub struct SSTWriter<W: SequentialWriteFile> {
     writer: BufferedWriter<W>,
     options: SSTWriterOptions,
     data_block_builder: BlockBuilder,
-    index_block_builder: BlockBuilder,
     bloom_filter_builder: Option<BloomFilterBuilder>,
     first_key: Option<Vec<u8>>,
     last_key: Vec<u8>,
     current_block_first_key: Option<Vec<u8>>,
-    pending_data_blocks: Vec<(Vec<u8>, u64, u64)>, // (first_key, offset, size)
+    pending_data_blocks: Vec<DataBlockMeta>,
 }
 
 impl<W: SequentialWriteFile> SSTWriter<W> {
     pub fn new(writer: W, options: SSTWriterOptions) -> Self {
         let buffered_writer = BufferedWriter::new(writer, options.buffer_size);
         let data_block_builder = BlockBuilder::new(options.block_size);
-        let index_block_builder = BlockBuilder::new(options.block_size);
         let bloom_filter_builder = if options.bloom_filter_enabled {
             Some(BloomFilterBuilder::new(options.bloom_bits_per_key))
         } else {
@@ -60,7 +69,6 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             writer: buffered_writer,
             options,
             data_block_builder,
-            index_block_builder,
             bloom_filter_builder,
             first_key: None,
             last_key: Vec::new(),
@@ -140,8 +148,19 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         self.writer.write(&encoded)?;
 
         // Remember block info for index
-        self.pending_data_blocks
-            .push((first_key, offset as u64, size as u64));
+        let mut key_hashes = Vec::new();
+        if let Some(builder) = &mut self.bloom_filter_builder
+            && self.options.partitioned_index
+        {
+            // For partitioned index, we need to collect key hashes per data block
+            key_hashes = builder.drain_recent_hashes();
+        }
+        self.pending_data_blocks.push(DataBlockMeta {
+            first_key,
+            offset: offset as u64,
+            size: size as u64,
+            key_hashes,
+        });
 
         Ok(())
     }
@@ -159,43 +178,151 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             self.finish_data_block(block_first_key)?;
         }
 
-        // Build index block
-        for (fk, offset, size) in &self.pending_data_blocks {
-            let mut value = BytesMut::with_capacity(16);
-            value.put_u64_le(*offset);
-            value.put_u64_le(*size);
-            self.index_block_builder.add(fk, &value);
+        if !self.options.partitioned_index {
+            // Write single-level index
+            let mut index_builder = BlockBuilder::new(self.options.block_size);
+
+            for meta in &self.pending_data_blocks {
+                let mut value = BytesMut::with_capacity(16);
+                value.put_u64_le(meta.offset);
+                value.put_u64_le(meta.size);
+                index_builder.add(&meta.first_key, &value);
+            }
+
+            // Write index block
+            let index_offset = self.writer.offset();
+            let index_size = index_builder.write_to(&mut self.writer)?;
+            // Write bloom filter block if enabled
+            let (filter_offset, filter_size, filter_enabled) =
+                if let Some(filter_builder) = &mut self.bloom_filter_builder {
+                    let filter_offset = self.writer.offset();
+                    let filter_size = filter_builder.write_to(&mut self.writer)?;
+                    (filter_offset as u64, filter_size as u64, filter_size > 0)
+                } else {
+                    (0u64, 0u64, false)
+                };
+
+            // Write footer
+            let footer = Footer::new(
+                index_offset as u64,
+                index_size as u64,
+                filter_offset,
+                filter_size,
+                filter_enabled,
+                false,
+            );
+            let footer_encoded = footer.encode();
+            self.writer.write(&footer_encoded)?;
+
+            let file_size = self.writer.offset();
+            let mut writer = self.writer;
+            writer.close()?;
+
+            return Ok((first_key, last_key, file_size));
         }
 
-        let index_builder = std::mem::replace(
-            &mut self.index_block_builder,
-            BlockBuilder::new(self.options.block_size),
-        );
-        let index_block = index_builder.build();
-        let index_encoded = index_block.encode();
-        let index_offset = self.writer.offset();
-        let index_size = index_encoded.len();
+        // Write two-level index
+        let mut index_top_builder = BlockBuilder::new(self.options.block_size);
+        let mut filter_index_builder = BlockBuilder::new(self.options.block_size);
 
-        // Write index block
-        self.writer.write(&index_encoded)?;
+        let mut index_builder = BlockBuilder::new(self.options.block_size);
+        let mut index_partition_first_key: Option<&Vec<u8>> = None;
+        // Current bloom filter builder for the partition, maybe optional if bloom filter is disabled
+        let mut current_filter_builder = self
+            .bloom_filter_builder
+            .as_ref()
+            .map(|_| BloomFilterBuilder::new(self.options.bloom_bits_per_key));
 
-        // Write bloom filter block if enabled
-        let filter_enabled = self.bloom_filter_builder.is_some();
-        let (filter_offset, filter_size) = if let Some(builder) = self.bloom_filter_builder.take() {
-            let offset = self.writer.offset();
-            let size = builder.write_to(&mut self.writer)?;
-            (offset as u64, size as u64)
+        // Build index and filter blocks for each data block
+        for meta in &self.pending_data_blocks {
+            if index_partition_first_key.is_none() {
+                index_partition_first_key = Some(&meta.first_key);
+            }
+
+            let mut value = BytesMut::with_capacity(16);
+            value.put_u64_le(meta.offset);
+            value.put_u64_le(meta.size);
+            index_builder.add(&meta.first_key, &value);
+
+            if let Some(filter_builder) = &mut current_filter_builder {
+                filter_builder.extend_hashes(&meta.key_hashes);
+            }
+
+            // Finish one partition if needed
+            if index_builder.should_finish() {
+                let index_offset = self.writer.offset();
+                let index_size = index_builder.write_to(&mut self.writer)?;
+                let first_key = index_partition_first_key
+                    .take()
+                    .expect("There should be at least one key");
+                let mut top_value = BytesMut::with_capacity(16);
+                top_value.put_u64_le(index_offset as u64);
+                top_value.put_u64_le(index_size as u64);
+                index_top_builder.add(first_key, &top_value);
+                index_builder.clear();
+
+                if let Some(filter_builder) = &mut current_filter_builder {
+                    let filter_offset = self.writer.offset();
+                    let filter_size = filter_builder.write_to(&mut self.writer)?;
+                    if filter_size > 0 {
+                        let mut filter_value = BytesMut::with_capacity(16);
+                        filter_value.put_u64_le(filter_offset as u64);
+                        filter_value.put_u64_le(filter_size as u64);
+                        filter_index_builder.add(first_key, &filter_value);
+                    }
+                    *filter_builder = BloomFilterBuilder::new(self.options.bloom_bits_per_key);
+                }
+            }
+        }
+
+        // Finish any remaining index partition
+        if !index_builder.is_empty() {
+            let index_offset = self.writer.offset();
+            let index_size = index_builder.write_to(&mut self.writer)?;
+            let first_key = index_partition_first_key
+                .take()
+                .expect("There should be at least one key");
+            let mut top_value = BytesMut::with_capacity(16);
+            top_value.put_u64_le(index_offset as u64);
+            top_value.put_u64_le(index_size as u64);
+            index_top_builder.add(first_key, &top_value);
+
+            if let Some(filter_builder) = &mut current_filter_builder {
+                let filter_offset = self.writer.offset();
+                let filter_size = filter_builder.write_to(&mut self.writer)?;
+                if filter_size > 0 {
+                    let mut filter_value = BytesMut::with_capacity(16);
+                    filter_value.put_u64_le(filter_offset as u64);
+                    filter_value.put_u64_le(filter_size as u64);
+                    filter_index_builder.add(first_key, &filter_value);
+                }
+            }
+        }
+
+        // Write filter index block if enabled and not empty
+        let filter_enabled =
+            self.bloom_filter_builder.is_some() && !filter_index_builder.is_empty();
+        let (filter_index_offset, filter_index_size) = if filter_enabled {
+            let filter_index_offset = self.writer.offset();
+            let filter_index_size = filter_index_builder.write_to(&mut self.writer)?;
+            (filter_index_offset, filter_index_size)
         } else {
-            (0u64, 0u64)
+            (0usize, 0usize)
         };
+        // Write top-level index block
+        let index_top_offset = self.writer.offset();
+        let index_top_size = index_top_builder.write_to(&mut self.writer)?;
+        let filter_offset = filter_index_offset as u64;
+        let filter_size = filter_index_size as u64;
 
         // Write footer
         let footer = Footer::new(
-            index_offset as u64,
-            index_size as u64,
+            index_top_offset as u64,
+            index_top_size as u64,
             filter_offset,
             filter_size,
             filter_enabled,
+            self.options.partitioned_index,
         );
         let footer_encoded = footer.encode();
         self.writer.write(&footer_encoded)?;
@@ -342,6 +469,7 @@ mod tests {
                 num_columns: 1,
                 bloom_filter_enabled: true,
                 bloom_bits_per_key: 10,
+                partitioned_index: false,
             },
         );
 

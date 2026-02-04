@@ -659,6 +659,7 @@ fn make_sst_builder_factory(options: SSTWriterOptions) -> FileBuilderFactory {
                 num_columns: options.num_columns,
                 bloom_filter_enabled: options.bloom_filter_enabled,
                 bloom_bits_per_key: options.bloom_bits_per_key,
+                partitioned_index: options.partitioned_index,
             },
         )) as Box<dyn FileBuilder>
     })

@@ -40,6 +40,8 @@ pub struct Config {
     pub sst_bloom_filter_enabled: bool,
     /// Bits per key for SST bloom filter when enabled.
     pub sst_bloom_bits_per_key: u32,
+    /// Whether to enable two-level index and filter blocks in SST files.
+    pub sst_partitioned_index: bool,
     /// Whether TTL is enabled. If false, TTL metadata is ignored.
     pub ttl_enabled: bool,
     /// Default TTL duration (in seconds). None means no expiration by default.
@@ -76,6 +78,7 @@ impl Default for Config {
             base_file_size: 64 * 1024 * 1024,
             sst_bloom_filter_enabled: false,
             sst_bloom_bits_per_key: 10,
+            sst_partitioned_index: false,
             ttl_enabled: false,
             default_ttl_seconds: None,
             time_provider: TimeProviderKind::default(),

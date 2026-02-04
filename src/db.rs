@@ -237,6 +237,7 @@ impl Db {
             num_columns: config.num_columns,
             bloom_filter_enabled: config.sst_bloom_filter_enabled,
             bloom_bits_per_key: config.sst_bloom_bits_per_key,
+            partitioned_index: config.sst_partitioned_index,
             ..SSTWriterOptions::default()
         };
 
@@ -251,6 +252,7 @@ impl Db {
             target_file_size: config.base_file_size,
             bloom_filter_enabled: config.sst_bloom_filter_enabled,
             bloom_bits_per_key: config.sst_bloom_bits_per_key,
+            partitioned_index: config.sst_partitioned_index,
             ..crate::compaction::CompactionConfig::default()
         };
         let compaction_factory = crate::compaction::make_sst_builder_factory(sst_options.clone());

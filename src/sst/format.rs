@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::file::SequentialWriteFile;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Magic number at the end of SST file for validation
@@ -11,6 +12,7 @@ pub const SST_FILE_MAGIC: u32 = 0x53535431; // "SST1"
 pub const FOOTER_SIZE: usize = 40; // 8 + 8 + 8 + 8 + 4 + 4
 
 const FOOTER_FLAG_FILTER_PRESENT: u32 = 0x1;
+const FOOTER_FLAG_PARTITIONED_INDEX: u32 = 0x2;
 
 #[derive(Debug, Clone)]
 pub struct Footer {
@@ -19,6 +21,7 @@ pub struct Footer {
     pub filter_block_offset: u64,
     pub filter_block_size: u64,
     pub filter_present: bool,
+    pub partitioned_index: bool,
 }
 
 impl Footer {
@@ -28,6 +31,7 @@ impl Footer {
         filter_block_offset: u64,
         filter_block_size: u64,
         filter_present: bool,
+        partitioned_index: bool,
     ) -> Self {
         Self {
             index_block_offset,
@@ -35,6 +39,7 @@ impl Footer {
             filter_block_offset,
             filter_block_size,
             filter_present,
+            partitioned_index,
         }
     }
 
@@ -44,11 +49,13 @@ impl Footer {
         buf.put_u64_le(self.index_block_size);
         buf.put_u64_le(self.filter_block_offset);
         buf.put_u64_le(self.filter_block_size);
-        let flags = if self.filter_present {
-            FOOTER_FLAG_FILTER_PRESENT
-        } else {
-            0
-        };
+        let mut flags = 0;
+        if self.filter_present {
+            flags |= FOOTER_FLAG_FILTER_PRESENT;
+        }
+        if self.partitioned_index {
+            flags |= FOOTER_FLAG_PARTITIONED_INDEX;
+        }
         buf.put_u32_le(flags);
         buf.put_u32_le(SST_FILE_MAGIC);
         buf.freeze()
@@ -84,6 +91,7 @@ impl Footer {
             filter_block_offset,
             filter_block_size,
             filter_present: (flags & FOOTER_FLAG_FILTER_PRESENT) != 0,
+            partitioned_index: (flags & FOOTER_FLAG_PARTITIONED_INDEX) != 0,
         })
     }
 }
@@ -204,7 +212,7 @@ impl Block {
         Ok((key, value))
     }
 
-    pub fn len(&self) -> usize {
+    pub fn offsets_len(&self) -> usize {
         self.offsets.len()
     }
 
@@ -212,9 +220,9 @@ impl Block {
         self.offsets.is_empty()
     }
 
-    pub fn lower_bound(&self, target: &[u8]) -> Result<usize> {
+    pub(crate) fn lower_bound(&self, target: &[u8]) -> Result<usize> {
         let mut left = 0;
-        let mut right = self.len();
+        let mut right = self.offsets_len();
         while left < right {
             let mid = (left + right) / 2;
             let (key, _) = self.get(mid)?;
@@ -224,6 +232,15 @@ impl Block {
             }
         }
         Ok(left)
+    }
+
+    pub(crate) fn valid_lower_bound(&self, target: &[u8]) -> Result<usize> {
+        let left = self.lower_bound(target)?;
+        if left == self.offsets_len() {
+            Ok(left.saturating_sub(1))
+        } else {
+            Ok(left)
+        }
     }
 
     pub(crate) fn size_in_bytes(&self) -> usize {
@@ -269,6 +286,19 @@ impl BlockBuilder {
         !self.is_empty() && self.estimated_size() >= self.target_size
     }
 
+    pub fn write_to<W: SequentialWriteFile>(&self, writer: &mut W) -> Result<usize> {
+        let size = self.estimated_size();
+        writer.write(&(self.offsets.len() as u32).to_le_bytes())?;
+        let data_bytes = self.data.as_ref();
+        if !data_bytes.is_empty() {
+            writer.write(data_bytes)?;
+        }
+        for offset in &self.offsets {
+            writer.write(&offset.to_le_bytes())?;
+        }
+        Ok(size)
+    }
+
     pub fn build(self) -> Block {
         let size_in_bytes = 4 + self.data.len() + self.offsets.len() * 4;
         Block {
@@ -291,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_footer_encode_decode() {
-        let footer = Footer::new(100, 200, 300, 400, true);
+        let footer = Footer::new(100, 200, 300, 400, true, false);
         let encoded = footer.encode();
         assert_eq!(encoded.len(), FOOTER_SIZE);
 
@@ -301,6 +331,7 @@ mod tests {
         assert_eq!(decoded.filter_block_offset, 300);
         assert_eq!(decoded.filter_block_size, 400);
         assert!(decoded.filter_present);
+        assert!(!decoded.partitioned_index);
     }
 
     #[test]
@@ -311,12 +342,12 @@ mod tests {
         builder.add(b"key3", b"value3");
 
         let block = builder.build();
-        assert_eq!(block.len(), 3);
+        assert_eq!(block.offsets_len(), 3);
 
         let encoded = block.encode();
         let decoded = Block::decode(encoded).unwrap();
 
-        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.offsets_len(), 3);
 
         let (key, value) = decoded.get(0).unwrap();
         assert_eq!(&key[..], b"key1");

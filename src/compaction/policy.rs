@@ -20,6 +20,7 @@ pub(crate) struct CompactionConfig {
     pub(crate) target_file_size: usize,
     pub(crate) bloom_filter_enabled: bool,
     pub(crate) bloom_bits_per_key: u32,
+    pub(crate) partitioned_index: bool,
 }
 
 impl Default for CompactionConfig {
@@ -36,6 +37,7 @@ impl Default for CompactionConfig {
             target_file_size: 64 * 1024 * 1024,
             bloom_filter_enabled: false,
             bloom_bits_per_key: 10,
+            partitioned_index: false,
         }
     }
 }

@@ -659,6 +659,7 @@ mod tests {
                 num_columns: 1,
                 bloom_filter_enabled: true,
                 bloom_bits_per_key: 10,
+                partitioned_index: false,
                 ..SSTWriterOptions::default()
             },
         );
@@ -820,11 +821,13 @@ mod tests {
             max_level: 3,
             bloom_filter_enabled: true,
             bloom_bits_per_key: 10,
+            partitioned_index: false,
             ..crate::compaction::CompactionConfig::default()
         };
         let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
             bloom_filter_enabled: config.bloom_filter_enabled,
             bloom_bits_per_key: config.bloom_bits_per_key,
+            partitioned_index: config.partitioned_index,
             ..SSTWriterOptions::default()
         });
         let db_state = Arc::new(DbStateHandle::new());

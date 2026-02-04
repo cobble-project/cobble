@@ -66,24 +66,36 @@ impl BloomFilter {
     }
 }
 
-pub struct BloomFilterBuilder {
+pub(crate) struct BloomFilterBuilder {
     bits_per_key: u32,
     hashes: Vec<u64>,
 }
 
 impl BloomFilterBuilder {
-    pub fn new(bits_per_key: u32) -> Self {
+    pub(crate) fn new(bits_per_key: u32) -> Self {
         Self {
             bits_per_key: bits_per_key.max(1),
             hashes: Vec::new(),
         }
     }
 
-    pub fn add(&mut self, key: &[u8]) {
-        self.hashes.push(hash_key(key));
+    pub(crate) fn add(&mut self, key: &[u8]) {
+        self.add_hash(hash_key(key));
     }
 
-    pub fn finish(self) -> BloomFilter {
+    pub(crate) fn add_hash(&mut self, hash: u64) {
+        self.hashes.push(hash);
+    }
+
+    pub(crate) fn extend_hashes(&mut self, hashes: &[u64]) {
+        self.hashes.extend_from_slice(hashes);
+    }
+
+    pub(crate) fn drain_recent_hashes(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.hashes)
+    }
+
+    pub(crate) fn finish(self) -> BloomFilter {
         if self.hashes.is_empty() {
             return BloomFilter {
                 num_bits: 0,
@@ -112,7 +124,7 @@ impl BloomFilterBuilder {
         }
     }
 
-    pub fn write_to<W: SequentialWriteFile>(self, writer: &mut W) -> Result<usize> {
+    pub(crate) fn write_to<W: SequentialWriteFile>(&mut self, writer: &mut W) -> Result<usize> {
         if self.hashes.is_empty() {
             return Ok(0);
         }
@@ -123,7 +135,7 @@ impl BloomFilterBuilder {
         let num_hashes = optimal_num_hashes(self.bits_per_key);
         let data_len = num_bits.div_ceil(8) as usize;
         let mut data = vec![0u8; data_len];
-        for hash in self.hashes {
+        for &hash in &self.hashes {
             let (h1, h2) = expand_hash(hash);
             for i in 0..num_hashes {
                 let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) % num_bits;
@@ -135,6 +147,7 @@ impl BloomFilterBuilder {
         buf[4..12].copy_from_slice(&num_bits.to_le_bytes());
         writer.write(&buf)?;
         writer.write(&data)?;
+        self.hashes.clear();
         Ok(12 + data_len)
     }
 }
@@ -144,7 +157,7 @@ fn optimal_num_hashes(bits_per_key: u32) -> u32 {
     k.max(1)
 }
 
-fn hash_key(key: &[u8]) -> u64 {
+pub(crate) fn hash_key(key: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325;
     for &b in key {
         hash ^= b as u64;

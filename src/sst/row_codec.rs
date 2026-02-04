@@ -875,6 +875,7 @@ mod tests {
                     num_columns,
                     bloom_filter_enabled: true,
                     bloom_bits_per_key: 10,
+                    partitioned_index: false,
                 },
             );
 

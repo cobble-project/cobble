@@ -202,20 +202,19 @@ impl CompactionExecutor {
     }
 
     fn run_compaction(task: CompactionTask, options: CompactionConfig) -> Result<CompactionResult> {
-        // Create iterators for all files in all sorted runs
-        // We iterate files from all sorted runs, with earlier runs (newer data) coming first
-        let sst_options = SSTIteratorOptions {
-            metrics_db_id: Some(task.db_id.clone()),
-            num_columns: options.num_columns,
-            bloom_filter_enabled: options.bloom_filter_enabled,
-            ..SSTIteratorOptions::default()
-        };
-
         let mut all_iters: Vec<Box<dyn KvIterator>> = Vec::new();
         let mut read_bytes = 0u64;
         for run in &task.sorted_runs {
             for file in run.files() {
                 let reader = task.file_manager.open_data_file_reader(file.file_id)?;
+                // Create iterators for all files in all sorted runs
+                // We iterate files from all sorted runs, with earlier runs (newer data) coming first
+                let sst_options = SSTIteratorOptions {
+                    metrics_db_id: Some(task.db_id.clone()),
+                    num_columns: options.num_columns,
+                    bloom_filter_enabled: options.bloom_filter_enabled,
+                    ..SSTIteratorOptions::default()
+                };
                 let iter = crate::sst::SSTIterator::with_file_id(
                     Box::new(reader),
                     file.file_id,
@@ -468,6 +467,7 @@ mod tests {
             num_columns: options.num_columns,
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
+            partitioned_index: options.partitioned_index,
         });
         let task = CompactionTask::new(
             "test".to_string(),
@@ -592,6 +592,7 @@ mod tests {
             num_columns: options.num_columns,
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
+            partitioned_index: options.partitioned_index,
         });
         let task = CompactionTask::new(
             "test".to_string(),
@@ -729,6 +730,7 @@ mod tests {
             num_columns: options.num_columns,
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
+            partitioned_index: options.partitioned_index,
         });
         let task = CompactionTask::new(
             "test".to_string(),
@@ -791,6 +793,7 @@ mod tests {
             num_columns: options.num_columns,
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
+            partitioned_index: options.partitioned_index,
         });
         let task = CompactionTask::new(
             "test".to_string(),
