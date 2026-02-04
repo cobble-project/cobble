@@ -2,6 +2,7 @@
 
 use crate::error::Result;
 use crate::file::SequentialWriteFile;
+use bytes::Bytes;
 
 /// A trait for building output files (SST, etc.).
 ///
@@ -13,8 +14,8 @@ pub trait FileBuilder {
     /// Keys must be added in sorted order.
     fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
 
-    /// Finishes building the file and returns (first_key, last_key, file_size).
-    fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>, usize)>;
+    /// Finishes building the file and returns (first_key, last_key, file_size, footer_bytes).
+    fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>, usize, Bytes)>;
 
     /// Returns the current offset (bytes written) in the file.
     fn offset(&self) -> usize;

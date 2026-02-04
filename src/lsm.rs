@@ -561,6 +561,7 @@ impl LSMTree {
                 ..SSTIteratorOptions::default()
             },
             self.block_cache.clone(),
+            file.meta_bytes.clone(),
         )?;
         if iter.may_contain(encoded_key)? {
             iter.seek(encoded_key)?;
@@ -623,6 +624,7 @@ mod tests {
                 tracked_id: TrackedFileId::detached(id),
                 seq: 0,
                 size: 0, // Test file, size doesn't matter
+                meta_bytes: None,
             })
         }
     }
@@ -639,6 +641,7 @@ mod tests {
                 tracked_id: TrackedFileId::detached(id),
                 seq: 0,
                 size,
+                meta_bytes: None,
             })
         }
     }
@@ -667,7 +670,7 @@ mod tests {
             let encoded_key = encode_key(&Key::new(0, key.to_vec()));
             writer.add(encoded_key.as_ref(), value)?;
         }
-        let (first_key, last_key, file_size) = writer.finish_with_range()?;
+        let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
         Ok(Arc::new(DataFile {
             file_type: DataFileType::SSTable,
             start_key: first_key,
@@ -676,6 +679,7 @@ mod tests {
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq,
             size: file_size,
+            meta_bytes: Some(footer_bytes),
         }))
     }
 

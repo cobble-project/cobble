@@ -591,7 +591,7 @@ fn flush_memtable(
             }
             dedup_iter.next()?;
         }
-        let (start_key, end_key, file_size) = builder.finish()?;
+        let (start_key, end_key, file_size, footer_bytes) = builder.finish()?;
         let data_file = DataFile {
             file_type: DataFileType::SSTable,
             start_key,
@@ -600,6 +600,7 @@ fn flush_memtable(
             tracked_id: TrackedFileId::new(&file_manager, file_id),
             size: file_size,
             seq,
+            meta_bytes: Some(footer_bytes),
         };
         Ok(MemtableFlushResult {
             data_file: Arc::new(data_file),
@@ -735,13 +736,15 @@ mod tests {
         let reader = file_manager
             .open_data_file_reader(data_file.file_id)
             .unwrap();
-        let mut iter = SSTIterator::with_file_id(
+        let mut iter = SSTIterator::with_cache(
             Box::new(reader),
             data_file.file_id,
             SSTIteratorOptions {
                 bloom_filter_enabled: true,
                 ..SSTIteratorOptions::default()
             },
+            None,
+            data_file.meta_bytes.clone(),
         )
         .unwrap();
         iter.seek_to_first().unwrap();

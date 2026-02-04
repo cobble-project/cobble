@@ -711,13 +711,15 @@ mod tests {
         // Read SST file and decode Key/Value
         {
             let reader_file = fs.open_read("codec_test.sst").unwrap();
-            let mut iter = SSTIterator::with_file_id(
+            let mut iter = SSTIterator::with_cache(
                 reader_file,
                 0,
                 SSTIteratorOptions {
                     bloom_filter_enabled: true,
                     ..SSTIteratorOptions::default()
                 },
+                None,
+                None,
             )
             .unwrap();
 
@@ -824,13 +826,15 @@ mod tests {
         // Read and seek using encoded key
         {
             let reader_file = fs.open_read("codec_seek_test.sst").unwrap();
-            let mut iter = SSTIterator::with_file_id(
+            let mut iter = SSTIterator::with_cache(
                 reader_file,
                 0,
                 SSTIteratorOptions {
                     bloom_filter_enabled: true,
                     ..SSTIteratorOptions::default()
                 },
+                None,
+                None,
             )
             .unwrap();
 
@@ -900,13 +904,15 @@ mod tests {
         // Read and verify all entries
         {
             let reader_file = fs.open_read("codec_blocks_test.sst").unwrap();
-            let mut iter = SSTIterator::with_file_id(
+            let mut iter = SSTIterator::with_cache(
                 reader_file,
                 0,
                 SSTIteratorOptions {
                     bloom_filter_enabled: true,
                     ..SSTIteratorOptions::default()
                 },
+                None,
+                None,
             )
             .unwrap();
 

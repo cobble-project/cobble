@@ -75,7 +75,7 @@ impl SSTIterator {
         file_id: u64,
         options: SSTIteratorOptions,
     ) -> Result<Self> {
-        Self::with_cache(file, file_id, options, None)
+        Self::with_cache(file, file_id, options, None, None)
     }
 
     pub fn with_cache(
@@ -83,9 +83,14 @@ impl SSTIterator {
         file_id: u64,
         options: SSTIteratorOptions,
         block_cache: Option<BlockCache>,
+        footer_bytes: Option<Bytes>,
     ) -> Result<Self> {
         // Read footer
-        let footer = Self::read_footer(&*file)?;
+        let footer = if let Some(bytes) = footer_bytes {
+            Self::decode_footer_bytes(bytes)?
+        } else {
+            Self::read_footer(&*file)?
+        };
 
         // Read index block
         let index_block = if let Some(cache) = &block_cache {
@@ -181,7 +186,7 @@ impl SSTIterator {
         options: SSTIteratorOptions,
         block_cache: BlockCache,
     ) -> Result<SSTIteratorTestCache> {
-        let inner = Self::with_cache(file, file_id, options, Some(block_cache))?;
+        let inner = Self::with_cache(file, file_id, options, Some(block_cache), None)?;
         Ok(SSTIteratorTestCache { inner })
     }
 
@@ -202,7 +207,10 @@ impl SSTIterator {
 
         let footer_offset = file_size - FOOTER_SIZE;
         let data = file.read_at(footer_offset, FOOTER_SIZE)?;
+        Self::decode_footer_bytes(data)
+    }
 
+    fn decode_footer_bytes(data: Bytes) -> Result<Footer> {
         if data.len() != FOOTER_SIZE {
             return Err(Error::IoError(format!(
                 "Failed to read complete footer: expected {} bytes, got {}",
@@ -210,7 +218,6 @@ impl SSTIterator {
                 data.len()
             )));
         }
-
         Footer::decode(&data)
     }
 
@@ -801,13 +808,15 @@ mod tests {
         // Read SST file
         {
             let reader_file = fs.open_read("test.sst").unwrap();
-            let mut iter = SSTIterator::with_file_id(
+            let mut iter = SSTIterator::with_cache(
                 reader_file,
                 0,
                 SSTIteratorOptions {
                     bloom_filter_enabled: true,
                     ..SSTIteratorOptions::default()
                 },
+                None,
+                None,
             )
             .unwrap();
 
@@ -876,13 +885,15 @@ mod tests {
 
         {
             let reader_file = fs.open_read("filter_single.sst").unwrap();
-            let mut iter = SSTIterator::with_file_id(
+            let mut iter = SSTIterator::with_cache(
                 reader_file,
                 0,
                 SSTIteratorOptions {
                     bloom_filter_enabled: true,
                     ..SSTIteratorOptions::default()
                 },
+                None,
+                None,
             )
             .unwrap();
 
@@ -933,13 +944,15 @@ mod tests {
 
         {
             let reader_file = fs.open_read("filter_partitioned.sst").unwrap();
-            let mut iter = SSTIterator::with_file_id(
+            let mut iter = SSTIterator::with_cache(
                 reader_file,
                 0,
                 SSTIteratorOptions {
                     bloom_filter_enabled: true,
                     ..SSTIteratorOptions::default()
                 },
+                None,
+                None,
             )
             .unwrap();
 
@@ -981,13 +994,15 @@ mod tests {
         // Read and seek
         {
             let reader_file = fs.open_read("test_seek.sst").unwrap();
-            let mut iter = SSTIterator::with_file_id(
+            let mut iter = SSTIterator::with_cache(
                 reader_file,
                 0,
                 SSTIteratorOptions {
                     bloom_filter_enabled: true,
                     ..SSTIteratorOptions::default()
                 },
+                None,
+                None,
             )
             .unwrap();
 
@@ -1069,7 +1084,7 @@ mod tests {
         // Read SST file using typed Key/Value API
         {
             let reader_file = fs.open_read("typed.sst").unwrap();
-            let mut iter = SSTIterator::with_file_id(
+            let mut iter = SSTIterator::with_cache(
                 reader_file,
                 0,
                 SSTIteratorOptions {
@@ -1077,6 +1092,8 @@ mod tests {
                     num_columns,
                     ..SSTIteratorOptions::default()
                 },
+                None,
+                None,
             )
             .unwrap();
 
@@ -1126,7 +1143,7 @@ mod tests {
         // Test seek_key
         {
             let reader_file = fs.open_read("typed.sst").unwrap();
-            let mut iter = SSTIterator::with_file_id(
+            let mut iter = SSTIterator::with_cache(
                 reader_file,
                 0,
                 SSTIteratorOptions {
@@ -1134,6 +1151,8 @@ mod tests {
                     num_columns,
                     ..SSTIteratorOptions::default()
                 },
+                None,
+                None,
             )
             .unwrap();
 

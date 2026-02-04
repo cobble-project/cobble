@@ -335,6 +335,7 @@ pub(crate) fn build_levels_from_manifest(
                 tracked_id,
                 seq: file.seq,
                 size: file.size,
+                meta_bytes: None,
             }));
         }
         levels.push(Level {

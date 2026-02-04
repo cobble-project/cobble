@@ -1,4 +1,5 @@
 use crate::file::{FileId, TrackedFileId};
+use bytes::Bytes;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -45,4 +46,6 @@ pub struct DataFile {
     pub seq: u64,
     /// Size of the file in bytes.
     pub size: usize,
+    /// Optional cached meta bytes to avoid re-reading from disk.
+    pub meta_bytes: Option<Bytes>,
 }

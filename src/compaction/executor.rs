@@ -215,10 +215,12 @@ impl CompactionExecutor {
                     bloom_filter_enabled: options.bloom_filter_enabled,
                     ..SSTIteratorOptions::default()
                 };
-                let iter = crate::sst::SSTIterator::with_file_id(
+                let iter = crate::sst::SSTIterator::with_cache(
                     Box::new(reader),
                     file.file_id,
                     sst_options.clone(),
+                    None,
+                    file.meta_bytes.clone(),
                 )?;
                 all_iters.push(Box::new(iter));
                 read_bytes = read_bytes.saturating_add(file.size as u64);
@@ -272,7 +274,7 @@ impl CompactionExecutor {
                 if builder.offset() >= options.target_file_size {
                     let file_id = current_file_id.take().unwrap();
                     let builder = current_builder.take().unwrap();
-                    let (first_key, last_key, file_size) = builder.finish()?;
+                    let (first_key, last_key, file_size, footer_bytes) = builder.finish()?;
                     trace!(
                         "compaction output file level={} file_id={} size={}",
                         task.output_level, file_id, file_size
@@ -286,6 +288,7 @@ impl CompactionExecutor {
                         tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                         seq: max_seq,
                         size: file_size,
+                        meta_bytes: Some(footer_bytes),
                     }));
                     written_bytes = written_bytes.saturating_add(file_size as u64);
                 }
@@ -299,7 +302,7 @@ impl CompactionExecutor {
             && !builder.is_empty()
         {
             let file_id = current_file_id.take().unwrap();
-            let (first_key, last_key, file_size) = builder.finish()?;
+            let (first_key, last_key, file_size, footer_bytes) = builder.finish()?;
             trace!(
                 "compaction output file level={} file_id={} size={}",
                 task.output_level, file_id, file_size
@@ -313,6 +316,7 @@ impl CompactionExecutor {
                 tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                 seq: max_seq,
                 size: file_size,
+                meta_bytes: Some(footer_bytes),
             }));
             written_bytes = written_bytes.saturating_add(file_size as u64);
         }
@@ -397,7 +401,7 @@ mod tests {
             writer.add(key, value)?;
         }
 
-        let (first_key, last_key, file_size) = writer.finish_with_range()?;
+        let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
 
         Ok(Arc::new(DataFile {
             file_type: DataFileType::SSTable,
@@ -407,6 +411,7 @@ mod tests {
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq: 0,
             size: file_size,
+            meta_bytes: Some(footer_bytes),
         }))
     }
 
@@ -503,13 +508,15 @@ mod tests {
         let reader = file_manager
             .open_data_file_reader(first_file.file_id)
             .unwrap();
-        let mut iter = crate::sst::SSTIterator::with_file_id(
+        let mut iter = crate::sst::SSTIterator::with_cache(
             Box::new(reader),
             first_file.file_id,
             crate::sst::SSTIteratorOptions {
                 bloom_filter_enabled: true,
                 ..crate::sst::SSTIteratorOptions::default()
             },
+            None,
+            first_file.meta_bytes.clone(),
         )
         .unwrap();
         iter.seek_to_first().unwrap();
@@ -623,7 +630,7 @@ mod tests {
         let reader = file_manager
             .open_data_file_reader(result.new_files()[0].file_id)
             .unwrap();
-        let mut iter = crate::sst::SSTIterator::with_file_id(
+        let mut iter = crate::sst::SSTIterator::with_cache(
             Box::new(reader),
             result.new_files()[0].file_id,
             crate::sst::SSTIteratorOptions {
@@ -631,6 +638,8 @@ mod tests {
                 num_columns,
                 ..Default::default()
             },
+            None,
+            result.new_files()[0].meta_bytes.clone(),
         )
         .unwrap();
 
@@ -701,7 +710,7 @@ mod tests {
         for (key, value) in &entries {
             writer.add(key, value).unwrap();
         }
-        let (first_key, last_key, file_size) = writer.finish_with_range().unwrap();
+        let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range().unwrap();
 
         let file = Arc::new(DataFile {
             file_type: DataFileType::SSTable,
@@ -711,6 +720,7 @@ mod tests {
             tracked_id: TrackedFileId::new(&file_manager, file_id),
             seq: 0,
             size: file_size,
+            meta_bytes: Some(footer_bytes),
         });
 
         let run = SortedRun::new(0, vec![file]);

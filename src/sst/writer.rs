@@ -5,7 +5,7 @@ use crate::sst::bloom::BloomFilterBuilder;
 use crate::sst::format::{BlockBuilder, Footer};
 use crate::sst::row_codec::{encode_key, encode_value};
 use crate::r#type::{Key, Value};
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 #[derive(Clone)]
 struct DataBlockMeta {
@@ -165,9 +165,9 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         Ok(())
     }
 
-    /// Finish writing the SST file and return (first_key, last_key).
+    /// Finish writing the SST file and return (first_key, last_key, file_size, footer_bytes).
     /// This writes the index block and footer, and returns the key range.
-    fn finish_internal(mut self) -> Result<(Vec<u8>, Vec<u8>, usize)> {
+    fn finish_internal(mut self) -> Result<(Vec<u8>, Vec<u8>, usize, Bytes)> {
         // Capture first/last keys before finishing
         let first_key = self.first_key.clone().unwrap_or_default();
         let last_key = self.last_key.clone();
@@ -218,7 +218,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             let mut writer = self.writer;
             writer.close()?;
 
-            return Ok((first_key, last_key, file_size));
+            return Ok((first_key, last_key, file_size, footer_encoded));
         }
 
         // Write two-level index
@@ -334,7 +334,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         let mut writer = self.writer;
         writer.close()?;
 
-        Ok((first_key, last_key, file_size))
+        Ok((first_key, last_key, file_size, footer_encoded))
     }
 
     /// Finish writing the SST file
@@ -344,9 +344,9 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         Ok(())
     }
 
-    /// Finish writing the SST file and return (first_key, last_key, file_size).
+    /// Finish writing the SST file and return (first_key, last_key, file_size, footer_bytes).
     /// This writes the index block and footer, and returns the key range and total file size.
-    pub fn finish_with_range(self) -> Result<(Vec<u8>, Vec<u8>, usize)> {
+    pub fn finish_with_range(self) -> Result<(Vec<u8>, Vec<u8>, usize, Bytes)> {
         self.finish_internal()
     }
 
@@ -377,7 +377,7 @@ impl<W: SequentialWriteFile + 'static> FileBuilder for SSTWriter<W> {
         SSTWriter::add(self, key, value)
     }
 
-    fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>, usize)> {
+    fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>, usize, Bytes)> {
         (*self).finish_with_range()
     }
 

@@ -42,6 +42,7 @@ pub fn create_iterator(
                 file.file_id,
                 options.sst_options.clone(),
                 options.block_cache.clone(),
+                file.meta_bytes.clone(),
             )?;
             Ok(Box::new(iter))
         }
