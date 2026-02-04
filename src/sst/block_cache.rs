@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub enum CachedBlock {
-    Block(Block),
-    BloomFilter(BloomFilter),
+    Block(Arc<Block>),
+    BloomFilter(Arc<BloomFilter>),
 }
 
 impl CachedBlock {

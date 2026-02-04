@@ -8,6 +8,7 @@ use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, Value};
 use bytes::Bytes;
 use metrics::counter;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct SSTIteratorOptions {
@@ -44,13 +45,13 @@ pub(crate) struct SSTIterator {
     file: Box<dyn RandomAccessFile>,
     file_id: u64,
     footer: Footer,
-    index_block: Block,
+    index_block: Arc<Block>,
     index_partitions: Vec<(u64, u64)>,
-    bloom_filter: Option<BloomFilter>,
+    bloom_filter: Option<Arc<BloomFilter>>,
     bloom_filter_partition_idx: Option<usize>,
-    current_data_block: Option<Block>,
+    current_data_block: Option<Arc<Block>>,
     current_index_partition_idx: usize,
-    current_index_partition: Option<Block>,
+    current_index_partition: Option<Arc<Block>>,
     current_block_idx: usize,
     current_entry_idx: usize,
     options: SSTIteratorOptions,
@@ -123,6 +124,7 @@ impl SSTIterator {
                 )?;
                 let mut index_block = Block::decode(index_data)?;
                 index_block.set_block_id(u32::MAX);
+                let index_block = Arc::new(index_block);
                 cache.insert(cache_key, CachedBlock::Block(index_block.clone()));
                 index_block
             }
@@ -133,7 +135,7 @@ impl SSTIterator {
             )?;
             let mut index_block = Block::decode(index_data)?;
             index_block.set_block_id(u32::MAX);
-            index_block
+            Arc::new(index_block)
         };
         let mut index_partitions = Vec::with_capacity(index_block.offsets_len());
         if footer.partitioned_index {
@@ -277,7 +279,7 @@ impl SSTIterator {
         Ok(())
     }
 
-    fn load_index_partition(&mut self, partition_idx: usize) -> Result<Block> {
+    fn load_index_partition(&mut self, partition_idx: usize) -> Result<Arc<Block>> {
         if partition_idx >= self.index_partitions.len() {
             return Err(Error::IoError(format!(
                 "Index partition out of bounds: {}",
@@ -326,6 +328,7 @@ impl SSTIterator {
                 let data = self.file.read_at(offset as usize, size as usize)?;
                 let mut block = Block::decode(data)?;
                 block.set_block_id(partition_idx as u32);
+                let block = Arc::new(block);
                 cache.insert(cache_key, CachedBlock::Block(block.clone()));
                 block
             }
@@ -333,7 +336,7 @@ impl SSTIterator {
             let data = self.file.read_at(offset as usize, size as usize)?;
             let mut block = Block::decode(data)?;
             block.set_block_id(partition_idx as u32);
-            block
+            Arc::new(block)
         };
         self.current_index_partition_idx = partition_idx;
         self.current_index_partition = Some(block.clone());
@@ -342,7 +345,7 @@ impl SSTIterator {
 
     fn load_data_block_from_partition(
         &mut self,
-        partition: &Block,
+        partition: &Arc<Block>,
         block_idx: usize,
     ) -> Result<()> {
         if block_idx >= partition.offsets_len() {
@@ -395,13 +398,15 @@ impl SSTIterator {
                 let data = self.file.read_at(offset, size)?;
                 let mut block = Block::decode(data)?;
                 block.set_block_id(block_idx as u32);
+                let block = Arc::new(block);
+                cache.insert(cache_key, CachedBlock::Block(block.clone()));
                 block
             }
         } else {
             let data = self.file.read_at(offset, size)?;
             let mut block = Block::decode(data)?;
             block.set_block_id(block_idx as u32);
-            block
+            Arc::new(block)
         };
         self.current_data_block = Some(block);
         self.current_entry_idx = 0;
@@ -411,7 +416,7 @@ impl SSTIterator {
 
     /// Load the filter index block.
     /// Used for partitioned filter index.
-    fn load_filter_index(&mut self) -> Result<Block> {
+    fn load_filter_index(&mut self) -> Result<Arc<Block>> {
         let cache_key = BlockCacheKey {
             file_id: self.file_id,
             block_id: self.footer.filter_block_offset,
@@ -447,6 +452,7 @@ impl SSTIterator {
                 )?;
                 let mut block = Block::decode(data)?;
                 block.set_block_id(u32::MAX - 1);
+                let block = Arc::new(block);
                 cache.insert(cache_key, CachedBlock::Block(block.clone()));
                 block
             }
@@ -457,14 +463,14 @@ impl SSTIterator {
             )?;
             let mut block = Block::decode(data)?;
             block.set_block_id(u32::MAX - 1);
-            block
+            Arc::new(block)
         };
         Ok(block)
     }
 
     /// Load the bloom filter for the given partition index.
     /// If the SST file does not use partitioned filters, the same filter is returned for any partition index.
-    fn load_filter_partition(&mut self, partition_idx: usize) -> Result<BloomFilter> {
+    fn load_filter_partition(&mut self, partition_idx: usize) -> Result<Arc<BloomFilter>> {
         if self.footer.partitioned_index {
             let filter_index = self.load_filter_index()?;
             if partition_idx >= filter_index.offsets_len() {
@@ -509,7 +515,7 @@ impl SSTIterator {
         cache_key: BlockCacheKey,
         offset: usize,
         size: usize,
-    ) -> Result<BloomFilter> {
+    ) -> Result<Arc<BloomFilter>> {
         let filter = if let Some(cache) = &self.block_cache {
             if let Some(cached) = cache.get(&cache_key) {
                 counter!(
@@ -534,13 +540,13 @@ impl SSTIterator {
                 )
                 .increment(1);
                 let filter_data = self.file.read_at(offset, size)?;
-                let filter = BloomFilter::decode(filter_data)?;
+                let filter = Arc::new(BloomFilter::decode(filter_data)?);
                 cache.insert(cache_key, CachedBlock::BloomFilter(filter.clone()));
                 filter
             }
         } else {
             let filter_data = self.file.read_at(offset, size)?;
-            BloomFilter::decode(filter_data)?
+            Arc::new(BloomFilter::decode(filter_data)?)
         };
         Ok(filter)
     }
