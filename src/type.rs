@@ -3,7 +3,7 @@ use bytes::Bytes;
 pub(crate) struct Key {
     /// Logical namespace / group identifier.
     /// Used to partition the keyspace (e.g., different logical groups or column families).
-    group: u16,
+    bucket: u16,
 
     /// Raw key bytes.
     /// The caller decides the encoding (prefixes, big-endian integers, varints, etc.).
@@ -42,15 +42,15 @@ pub(crate) struct Value {
 impl Key {
     /// Creates a new `Key`.
     ///
-    /// \- `group`: logical namespace / group id
+    /// \- `bucket`: logical namespace / group id
     /// \- `data`: raw key bytes
-    pub(crate) fn new(group: u16, data: Vec<u8>) -> Self {
-        Self { group, data }
+    pub(crate) fn new(bucket: u16, data: Vec<u8>) -> Self {
+        Self { bucket, data }
     }
 
     /// Returns the group identifier.
-    pub(crate) fn group(&self) -> u16 {
-        self.group
+    pub(crate) fn bucket(&self) -> u16 {
+        self.bucket
     }
 
     /// Returns the raw key bytes.

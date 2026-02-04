@@ -1103,7 +1103,7 @@ mod tests {
             assert!(iter.valid());
             let (key, value) = iter.current_kv().unwrap().unwrap();
             let cols = value.columns();
-            assert_eq!(key.group(), 1);
+            assert_eq!(key.bucket(), 1);
             assert_eq!(key.data(), b"user:1");
             assert!(cols[0].is_some());
             assert_eq!(cols[0].as_ref().unwrap().data(), b"Alice");
@@ -1116,7 +1116,7 @@ mod tests {
             let key = iter.current_key().unwrap().unwrap();
             let value = iter.current_value().unwrap().unwrap();
             let cols = value.columns();
-            assert_eq!(key.group(), 1);
+            assert_eq!(key.bucket(), 1);
             assert_eq!(key.data(), b"user:2");
             assert!(cols[0].is_some());
             assert_eq!(cols[0].as_ref().unwrap().data(), b"Bob");
@@ -1127,7 +1127,7 @@ mod tests {
             assert!(iter.valid());
             let (key, value) = iter.current_kv().unwrap().unwrap();
             let cols = value.columns();
-            assert_eq!(key.group(), 2);
+            assert_eq!(key.bucket(), 2);
             assert_eq!(key.data(), b"order:100");
             assert!(cols[0].is_some());
             assert!(matches!(

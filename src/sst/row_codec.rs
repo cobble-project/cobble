@@ -52,7 +52,7 @@ pub(crate) fn decode_value_type(byte: u8) -> Result<ValueType> {
 pub(crate) fn encode_key(key: &Key) -> Bytes {
     let size = 2 + key.data().len();
     let mut buf = BytesMut::with_capacity(size);
-    buf.put_u16_le(key.group());
+    buf.put_u16_le(key.bucket());
     buf.put_slice(key.data());
     buf.freeze()
 }
@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(key_encoded_size(&key), 13);
 
         let decoded = decode_key(&encoded).unwrap();
-        assert_eq!(decoded.group(), 42);
+        assert_eq!(decoded.bucket(), 42);
         assert_eq!(decoded.data(), b"hello world");
     }
 
@@ -443,7 +443,7 @@ mod tests {
         assert_eq!(encoded.len(), 2);
 
         let decoded = decode_key(&encoded).unwrap();
-        assert_eq!(decoded.group(), 0);
+        assert_eq!(decoded.bucket(), 0);
         assert_eq!(decoded.data(), b"");
     }
 
@@ -453,7 +453,7 @@ mod tests {
         let encoded = encode_key(&key);
 
         let decoded = decode_key(&encoded).unwrap();
-        assert_eq!(decoded.group(), u16::MAX);
+        assert_eq!(decoded.bucket(), u16::MAX);
         assert_eq!(decoded.data(), b"test");
     }
 
@@ -628,7 +628,7 @@ mod tests {
         let key = Key::new(1234, large_data.clone());
         let encoded_key = encode_key(&key);
         let decoded_key = decode_key(&encoded_key).unwrap();
-        assert_eq!(decoded_key.group(), 1234);
+        assert_eq!(decoded_key.bucket(), 1234);
         assert_eq!(decoded_key.data(), large_data.as_slice());
 
         let col = Column::new(ValueType::Put, large_data.clone());
@@ -732,7 +732,7 @@ mod tests {
             let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
             let decoded_cols = decoded_value.columns();
 
-            assert_eq!(decoded_key.group(), 1);
+            assert_eq!(decoded_key.bucket(), 1);
             assert_eq!(decoded_key.data(), b"user:1");
             assert_eq!(decoded_cols.len(), 2);
             assert!(decoded_cols[0].is_some());
@@ -751,7 +751,7 @@ mod tests {
             let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
             let decoded_cols = decoded_value.columns();
 
-            assert_eq!(decoded_key.group(), 1);
+            assert_eq!(decoded_key.bucket(), 1);
             assert_eq!(decoded_key.data(), b"user:2");
             assert!(decoded_cols[0].is_some());
             assert_eq!(decoded_cols[0].as_ref().unwrap().data(), b"Bob");
@@ -765,7 +765,7 @@ mod tests {
             let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
             let decoded_cols = decoded_value.columns();
 
-            assert_eq!(decoded_key.group(), 2);
+            assert_eq!(decoded_key.bucket(), 2);
             assert_eq!(decoded_key.data(), b"order:100");
             assert!(decoded_cols[0].is_none());
             assert!(decoded_cols[1].is_none());
@@ -845,7 +845,7 @@ mod tests {
 
             let (key_bytes, _) = iter.current().unwrap().unwrap();
             let decoded_key = decode_key(&key_bytes).unwrap();
-            assert_eq!(decoded_key.group(), 1);
+            assert_eq!(decoded_key.bucket(), 1);
             assert_eq!(decoded_key.data(), b"bbb");
         }
 
@@ -925,7 +925,7 @@ mod tests {
                 let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
                 let decoded_cols = decoded_value.columns();
 
-                assert_eq!(decoded_key.group(), count as u16);
+                assert_eq!(decoded_key.bucket(), count as u16);
                 assert_eq!(decoded_key.data(), format!("key{:04}", count).as_bytes());
 
                 assert!(decoded_cols[0].is_some());
