@@ -13,6 +13,7 @@ mod format;
 mod governance;
 mod iterator;
 mod lsm;
+mod maintainer;
 mod memtable;
 mod metrics_registry;
 mod read_only_db;
