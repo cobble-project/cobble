@@ -23,6 +23,8 @@ pub trait FileSystem: Send + Sync {
     fn open_read(&self, path: &str) -> Result<Box<dyn RandomAccessFile>>;
 
     fn open_write(&self, path: &str) -> Result<Box<dyn SequentialWriteFile>>;
+
+    fn last_modified(&self, path: &str) -> Result<Option<u64>>;
 }
 
 pub struct FileSystemRegistry {

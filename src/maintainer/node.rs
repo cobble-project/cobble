@@ -103,7 +103,7 @@ impl MaintainerNode {
 
     /// Materialize a global snapshot manifest and update the pointer.
     pub fn materialize_global_snapshot(&self, snapshot: &GlobalSnapshotManifest) -> Result<()> {
-        let manifest_path = global_snapshot_manifest_path(SNAPSHOT_DIR, snapshot.id);
+        let manifest_path = global_snapshot_manifest_path(snapshot.id);
         let writer = self.fs.open_write(&manifest_path)?;
         let mut buffered = BufferedWriter::new(writer, 8192);
         encode_global_manifest(&mut buffered, snapshot)?;
@@ -114,7 +114,7 @@ impl MaintainerNode {
 
     /// Load a global snapshot manifest by id.
     pub fn load_global_snapshot(&self, snapshot_id: u64) -> Result<GlobalSnapshotManifest> {
-        let manifest_path = global_snapshot_manifest_path(SNAPSHOT_DIR, snapshot_id);
+        let manifest_path = global_snapshot_manifest_path(snapshot_id);
         let reader = self.fs.open_read(&manifest_path)?;
         let bytes = reader.read_at(0, reader.size())?;
         decode_global_manifest(bytes.as_ref())
@@ -138,8 +138,16 @@ impl MaintainerNode {
     }
 }
 
-fn global_snapshot_manifest_path(snapshot_dir: &str, snapshot_id: u64) -> String {
-    format!("{}/{}", snapshot_dir, snapshot_manifest_name(snapshot_id))
+pub(crate) fn global_snapshot_current_path() -> String {
+    format!("{}/{}", SNAPSHOT_DIR, CURRENT_POINTER_NAME)
+}
+
+pub(crate) fn global_snapshot_manifest_path(snapshot_id: u64) -> String {
+    format!("{}/{}", SNAPSHOT_DIR, snapshot_manifest_name(snapshot_id))
+}
+
+pub(crate) fn global_snapshot_manifest_path_by_pointer(pointer: &str) -> String {
+    format!("{}/{}", SNAPSHOT_DIR, pointer)
 }
 
 fn parse_snapshot_id(name: &str) -> Result<u64> {

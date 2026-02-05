@@ -134,6 +134,13 @@ impl FileSystem for OpendalFileSystem {
             }
         })
     }
+
+    fn last_modified(&self, path: &str) -> Result<Option<u64>> {
+        self.runtime
+            .block_on(async { self.op.stat(path).await })
+            .map(|meta| meta.last_modified().map(|ts| ts.timestamp() as u64))
+            .map_err(|e| Error::IoError(format!("Failed to stat {}: {}", path, e)))
+    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use crate::file::{File, FileManager, FileSystemRegistry};
 use crate::lsm::{LSMTree, LSMTreeVersion};
 use crate::metrics_registry;
 use crate::snapshot::{build_levels_from_manifest, decode_manifest, snapshot_manifest_name};
-use crate::sst::block_cache::new_block_cache;
+use crate::sst::block_cache::{BlockCache, new_block_cache};
 use crate::sst::row_codec::encode_key;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::r#type::{Key, Value, ValueType};
@@ -28,6 +28,15 @@ impl ReadOnlyDb {
         config: Config,
         snapshot_id: u64,
         snapshot_db_id: String,
+    ) -> Result<Self> {
+        Self::open_with_db_id_and_cache(config, snapshot_id, snapshot_db_id, None)
+    }
+
+    pub fn open_with_db_id_and_cache(
+        config: Config,
+        snapshot_id: u64,
+        snapshot_db_id: String,
+        block_cache: Option<BlockCache>,
     ) -> Result<Self> {
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(config.path.clone())?;
@@ -59,7 +68,9 @@ impl ReadOnlyDb {
         });
         let mut lsm_tree =
             LSMTree::with_state_and_ttl(Arc::clone(&db_state), Arc::clone(&ttl_provider));
-        if config.block_cache_size > 0 {
+        if let Some(block_cache) = block_cache {
+            lsm_tree.set_block_cache(Some(block_cache));
+        } else if config.block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
         lsm_tree.set_db_id(db_id.clone());
