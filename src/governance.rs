@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-const MANIFEST_POINTER_NAME: &str = "MANIFEST";
-const MANIFEST_LOCK_NAME: &str = "MANIFEST.lock";
+use crate::paths::{GOVERNANCE_MANIFEST_POINTER_NAME, governance_manifest_lock_path};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GovernanceEntry {
@@ -132,7 +131,7 @@ impl GovernanceManager {
         if !fs.exists(&root_dir)? {
             fs.create_dir(&root_dir)?;
         }
-        let lock_path = format!("{}/{}", root_dir, MANIFEST_LOCK_NAME);
+        let lock_path = governance_manifest_lock_path(&root_dir);
         let lock_provider = Arc::new(FileManifestLockProvider::new(Arc::clone(&fs), lock_path));
         Ok(Self::new(fs, lock_provider))
     }
@@ -200,17 +199,17 @@ impl GovernanceManager {
         manifest_writer.write(&manifest_bytes)?;
         manifest_writer.close()?;
 
-        let mut pointer_writer = self.fs.open_write(MANIFEST_POINTER_NAME)?;
+        let mut pointer_writer = self.fs.open_write(GOVERNANCE_MANIFEST_POINTER_NAME)?;
         pointer_writer.write(manifest_name.as_bytes())?;
         pointer_writer.close()?;
         Ok(manifest_name)
     }
 
     fn load_current(&self) -> Result<Option<GovernanceManifest>> {
-        if !self.fs.exists(MANIFEST_POINTER_NAME)? {
+        if !self.fs.exists(GOVERNANCE_MANIFEST_POINTER_NAME)? {
             return Ok(None);
         }
-        let reader = self.fs.open_read(MANIFEST_POINTER_NAME)?;
+        let reader = self.fs.open_read(GOVERNANCE_MANIFEST_POINTER_NAME)?;
         let bytes = reader.read_at(0, reader.size())?;
         let manifest_name = String::from_utf8(bytes.to_vec())
             .map_err(|err| Error::IoError(format!("Invalid manifest pointer: {}", err)))?;

@@ -16,6 +16,7 @@ mod lsm;
 mod maintainer;
 mod memtable;
 mod metrics_registry;
+pub mod paths;
 mod read_only_db;
 mod read_proxy;
 mod snapshot;

@@ -379,5 +379,5 @@ fn hex_value(byte: u8) -> Result<u8> {
 }
 
 pub(crate) fn snapshot_manifest_name(id: u64) -> String {
-    format!("SNAPSHOT-{}", id)
+    crate::paths::snapshot_manifest_relative_path(id)
 }

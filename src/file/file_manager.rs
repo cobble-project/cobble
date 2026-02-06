@@ -13,6 +13,7 @@
 use crate::error::{Error, Result};
 use crate::file::file_system::FileSystem;
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
+use crate::paths::{DATA_DIR, SNAPSHOT_DIR};
 use bytes::Bytes;
 use dashmap::DashMap;
 use metrics::gauge;
@@ -25,10 +26,8 @@ pub type FileId = u64;
 
 /// Configuration options for the FileManager.
 pub struct FileManagerOptions {
-    /// Directory path for data files (relative to the file system root).
-    pub data_dir: String,
-    /// Directory path for metadata files (relative to the file system root).
-    pub metadata_dir: String,
+    /// Base directory for file storage (relative to the file system root).
+    pub base_dir: String,
     /// File extension for data files (e.g., "sst").
     pub data_file_extension: String,
 }
@@ -36,8 +35,7 @@ pub struct FileManagerOptions {
 impl Default for FileManagerOptions {
     fn default() -> Self {
         Self {
-            data_dir: "data".to_string(),
-            metadata_dir: "meta".to_string(),
+            base_dir: "".to_string(),
             data_file_extension: "sst".to_string(),
         }
     }
@@ -298,14 +296,27 @@ pub struct FileManager {
 impl FileManager {
     /// Creates a new FileManager with the given file system and options.
     ///
-    /// This will create the data and metadata directories if they don't exist.
+    /// This will create the data and snapshot directories if they don't exist.
     pub fn new(fs: Arc<dyn FileSystem>, options: FileManagerOptions) -> Result<Self> {
         // Create directories if they don't exist
-        if !fs.exists(&options.data_dir)? {
-            fs.create_dir(&options.data_dir)?;
+        if !options.base_dir.is_empty() && !fs.exists(&options.base_dir)? {
+            fs.create_dir(&options.base_dir)?;
         }
-        if !fs.exists(&options.metadata_dir)? {
-            fs.create_dir(&options.metadata_dir)?;
+        let data_dir = if options.base_dir.is_empty() {
+            DATA_DIR.to_string()
+        } else {
+            format!("{}/{}", options.base_dir, DATA_DIR)
+        };
+        if !fs.exists(&data_dir)? {
+            fs.create_dir(&data_dir)?;
+        }
+        let snapshot_dir = if options.base_dir.is_empty() {
+            SNAPSHOT_DIR.to_string()
+        } else {
+            format!("{}/{}", options.base_dir, SNAPSHOT_DIR)
+        };
+        if !fs.exists(&snapshot_dir)? {
+            fs.create_dir(&snapshot_dir)?;
         }
 
         Ok(Self {
@@ -329,8 +340,7 @@ impl FileManager {
             fs.create_dir(db_id)?;
         }
         let options = FileManagerOptions {
-            data_dir: format!("{}/data", db_id),
-            metadata_dir: format!("{}/snapshot", db_id),
+            base_dir: db_id.to_string(),
             ..FileManagerOptions::default()
         };
         Self::new(fs, options)
@@ -366,14 +376,18 @@ impl FileManager {
     /// Generates the path for a data file with the given ID.
     fn data_file_path(&self, file_id: FileId) -> String {
         format!(
-            "{}/{}.{}",
-            self.options.data_dir, file_id, self.options.data_file_extension
+            "{}/{}/{}.{}",
+            self.options.base_dir, DATA_DIR, file_id, self.options.data_file_extension
         )
     }
 
     /// Generates the path for a metadata file with the given name.
     fn metadata_file_path(&self, name: &str) -> String {
-        format!("{}/{}", self.options.metadata_dir, name)
+        if self.options.base_dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, name)
+        }
     }
 
     // =========================================================================

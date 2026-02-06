@@ -3,14 +3,14 @@ use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, FileSystem, FileSystemRegistry, SequentialWriteFile};
 use crate::maintainer::MaintainerConfig;
 use crate::maintainer::file::MetadataWriter;
-use crate::snapshot::snapshot_manifest_name;
+use crate::paths::{
+    SNAPSHOT_DIR, bucket_snapshot_manifest_path, global_snapshot_current_path,
+    global_snapshot_manifest_path, snapshot_manifest_name,
+};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-const CURRENT_POINTER_NAME: &str = "CURRENT";
-const SNAPSHOT_DIR: &str = "snapshot";
 
 /// Bucket snapshot reference input.
 #[derive(Clone, Debug)]
@@ -76,11 +76,7 @@ impl MaintainerNode {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut bucket_refs = Vec::with_capacity(bucket_snapshots.len());
         for bucket in bucket_snapshots {
-            let manifest_path = format!(
-                "{}/snapshot/{}",
-                &bucket.db_id,
-                snapshot_manifest_name(bucket.snapshot_id)
-            );
+            let manifest_path = bucket_snapshot_manifest_path(&bucket.db_id, bucket.snapshot_id);
             if !self.fs.exists(&manifest_path)? {
                 return Err(Error::IoError(format!(
                     "Bucket snapshot manifest not found: {}",
@@ -130,24 +126,12 @@ impl MaintainerNode {
     }
 
     fn publish_manifest_pointer(&self, manifest_name: &str) -> Result<()> {
-        let pointer_path = format!("{}/{}", SNAPSHOT_DIR, CURRENT_POINTER_NAME);
+        let pointer_path = global_snapshot_current_path();
         let mut writer = MetadataWriter::new(pointer_path, &self.fs)?;
         writer.write(manifest_name.as_bytes())?;
         writer.close()?;
         Ok(())
     }
-}
-
-pub(crate) fn global_snapshot_current_path() -> String {
-    format!("{}/{}", SNAPSHOT_DIR, CURRENT_POINTER_NAME)
-}
-
-pub(crate) fn global_snapshot_manifest_path(snapshot_id: u64) -> String {
-    format!("{}/{}", SNAPSHOT_DIR, snapshot_manifest_name(snapshot_id))
-}
-
-pub(crate) fn global_snapshot_manifest_path_by_pointer(pointer: &str) -> String {
-    format!("{}/{}", SNAPSHOT_DIR, pointer)
 }
 
 fn parse_snapshot_id(name: &str) -> Result<u64> {
@@ -177,7 +161,7 @@ fn decode_global_manifest(bytes: &[u8]) -> Result<GlobalSnapshotManifest> {
 }
 
 fn load_latest_snapshot_id(fs: &Arc<dyn FileSystem>) -> Result<Option<u64>> {
-    let pointer_path = format!("{}/{}", SNAPSHOT_DIR, CURRENT_POINTER_NAME);
+    let pointer_path = global_snapshot_current_path();
     if !fs.exists(&pointer_path)? {
         return Ok(None);
     }
@@ -196,6 +180,7 @@ fn load_latest_snapshot_id(fs: &Arc<dyn FileSystem>) -> Result<Option<u64>> {
 mod tests {
     use super::*;
     use crate::file::FileSystemRegistry;
+    use crate::paths::bucket_snapshot_dir;
 
     fn cleanup_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
@@ -203,10 +188,9 @@ mod tests {
 
     fn write_bucket_snapshot(fs: Arc<dyn FileSystem>, db_id: &str, snapshot_id: u64) {
         fs.create_dir(db_id).unwrap();
-        let snapshot_dir = format!("{}/snapshot", db_id);
+        let snapshot_dir = bucket_snapshot_dir(db_id);
         fs.create_dir(&snapshot_dir).unwrap();
-        let manifest_name = snapshot_manifest_name(snapshot_id);
-        let path = format!("{}/{}", snapshot_dir, manifest_name);
+        let path = bucket_snapshot_manifest_path(db_id, snapshot_id);
         let mut writer = fs.open_write(&path).unwrap();
         writer.write(b"{}").unwrap();
         writer.close().unwrap();

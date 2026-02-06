@@ -1,9 +1,11 @@
 use crate::error::{Error, Result};
 use crate::file::{File, FileSystem, FileSystemRegistry};
-use crate::maintainer::{
-    GlobalSnapshotManifest, global_snapshot_current_path, global_snapshot_manifest_path_by_pointer,
+use crate::maintainer::GlobalSnapshotManifest;
+#[cfg(test)]
+use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
+use crate::paths::{
+    global_snapshot_current_path, global_snapshot_manifest_path_by_pointer, snapshot_manifest_name,
 };
-use crate::snapshot::snapshot_manifest_name;
 use crate::sst::block_cache::{BlockCache, new_block_cache};
 use crate::{Config, ReadOnlyDb};
 use bytes::Bytes;
@@ -14,8 +16,6 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const SNAPSHOT_DIR: &str = "snapshot";
-const CURRENT_POINTER_NAME: &str = "CURRENT";
 const DEFAULT_RELOAD_TOLERANCE: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
@@ -363,9 +363,7 @@ fn validate_range(range: &Range<u16>, total_buckets: u16) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::maintainer::{
-        BucketSnapshotInput, MaintainerConfig, MaintainerNode, global_snapshot_current_path,
-    };
+    use crate::maintainer::{BucketSnapshotInput, MaintainerConfig, MaintainerNode};
     use std::path::Path;
 
     fn cleanup_root(path: &str) {
@@ -374,10 +372,9 @@ mod tests {
 
     fn wait_for_manifest_in_db(root: &str, db_id: &str, snapshot_id: u64) {
         let full_path = format!(
-            "{}/{}/snapshot/{}",
+            "{}/{}",
             root,
-            db_id,
-            snapshot_manifest_name(snapshot_id)
+            bucket_snapshot_manifest_path(db_id, snapshot_id)
         );
         for _ in 0..50 {
             if Path::new(&full_path).exists() {
@@ -398,10 +395,10 @@ mod tests {
         db_id: &str,
         snapshot_id: u64,
     ) {
-        let snapshot_dir = format!("{}/snapshot", db_id);
+        let snapshot_dir = bucket_snapshot_dir(db_id);
+        let manifest_path = bucket_snapshot_manifest_path(db_id, snapshot_id);
         let _ = fs.create_dir(db_id);
         let _ = fs.create_dir(&snapshot_dir);
-        let manifest_path = format!("{}/{}", snapshot_dir, snapshot_manifest_name(snapshot_id));
         let mut writer = fs.open_write(&manifest_path).unwrap();
         let manifest = format!("{{\"id\":{},\"seq_id\":0,\"levels\":[]}}", snapshot_id);
         writer.write(manifest.as_bytes()).unwrap();
