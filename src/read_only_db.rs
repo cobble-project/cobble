@@ -1,7 +1,7 @@
 use crate::Config;
 use crate::db_state::DbStateHandle;
 use crate::error::Result;
-use crate::file::{File, FileManager, FileSystemRegistry};
+use crate::file::{File, FileManager};
 use crate::lsm::{LSMTree, LSMTreeVersion};
 use crate::metrics_registry;
 use crate::snapshot::{build_levels_from_manifest, decode_manifest, snapshot_manifest_name};
@@ -38,11 +38,9 @@ impl ReadOnlyDb {
         snapshot_db_id: String,
         block_cache: Option<BlockCache>,
     ) -> Result<Self> {
-        let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(config.path.clone())?;
         metrics_registry::init_metrics();
         let db_id = Uuid::new_v4().to_string();
-        let mut file_manager = FileManager::with_db_id(Arc::clone(&fs), &snapshot_db_id)?;
+        let mut file_manager = FileManager::from_config(&config, &snapshot_db_id)?;
         file_manager.set_db_id(db_id.clone());
         let file_manager = Arc::new(file_manager);
         let time_provider = config.time_provider.create();

@@ -1,14 +1,16 @@
+use crate::VolumeDescriptor;
+
 /// Config for opening the maintainer node.
 #[derive(Clone, Debug)]
 pub struct MaintainerConfig {
-    /// Filesystem path for shared snapshot storage.
-    pub path: String,
+    /// Storage volume descriptors for snapshot storage.
+    pub volumes: Vec<VolumeDescriptor>,
 }
 
 impl Default for MaintainerConfig {
     fn default() -> Self {
         Self {
-            path: "file:///tmp/".into(),
+            volumes: VolumeDescriptor::single_volume("file:///tmp/cobble".to_string()),
         }
     }
 }

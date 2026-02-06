@@ -1,3 +1,4 @@
+use crate::VolumeDescriptor;
 use crate::error::Result;
 use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::file::opendal_fs::OpendalFileSystem;
@@ -6,7 +7,7 @@ use std::sync::Arc;
 use url::Url;
 
 pub trait FileSystem: Send + Sync {
-    fn init(url: &Url) -> Result<Self>
+    fn init(url: &Url, access_id: Option<String>, access_key: Option<String>) -> Result<Self>
     where
         Self: Sized;
 
@@ -39,12 +40,29 @@ impl FileSystemRegistry {
     }
 
     pub fn get_or_register(&self, name: String) -> Result<Arc<dyn FileSystem>> {
+        let url = Url::parse(name.as_str())?;
+        let name = url.to_string();
         if let Some(fs) = self.registered.get(&name) {
             return Ok(Arc::clone(&fs));
         }
-        let url = Url::parse(name.as_str())?;
 
-        let fs: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::init(&url)?);
+        let fs: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::init(&url, None, None)?);
+        self.registered.insert(name.clone(), Arc::clone(&fs));
+        Ok(fs)
+    }
+
+    pub fn get_or_register_volume(&self, volume: &VolumeDescriptor) -> Result<Arc<dyn FileSystem>> {
+        let url = Url::parse(volume.base_dir.as_str())?;
+        let name = url.to_string();
+        if let Some(fs) = self.registered.get(&name) {
+            return Ok(Arc::clone(&fs));
+        }
+
+        let fs: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::init(
+            &url,
+            volume.access_id.clone(),
+            volume.secret_key.clone(),
+        )?);
         self.registered.insert(name.clone(), Arc::clone(&fs));
         Ok(fs)
     }

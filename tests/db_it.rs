@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use cobble::paths::bucket_snapshot_manifest_path;
-use cobble::{CompactionPolicyKind, Config, Db, MetricValue, TimeProviderKind, WriteBatch};
+use cobble::{
+    CompactionPolicyKind, Config, Db, MetricValue, TimeProviderKind, VolumeDescriptor, WriteBatch,
+};
 use std::path::Path;
 
 fn cleanup_test_root(path: &str) {
@@ -39,7 +41,7 @@ fn test_db_put_get_large_dataset() {
     let root = "/tmp/db_it_large_put_get";
     cleanup_test_root(root);
     let config = Config {
-        path: format!("file://{}", root),
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         memtable_capacity: 4 * 1024 * 1024,
         memtable_buffer_count: 2,
         num_columns: 1,
@@ -92,7 +94,7 @@ fn test_db_ttl_put_get_with_manual_time() {
     cleanup_test_root(root);
 
     let config = Config {
-        path: format!("file://{}", root),
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         memtable_capacity: 4 * 1024 * 1024,
         memtable_buffer_count: 2,
         num_columns: 1,
@@ -138,7 +140,6 @@ fn test_db_ttl_default_ttl_with_manual_time() {
     cleanup_test_root(root);
 
     let config = Config {
-        path: format!("file://{}", root),
         memtable_capacity: 4 * 1024 * 1024,
         memtable_buffer_count: 2,
         num_columns: 1,
@@ -157,6 +158,7 @@ fn test_db_ttl_default_ttl_with_manual_time() {
         log_console: false,
         log_level: log::LevelFilter::Info,
         sst_bloom_filter_enabled: true,
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         ..Config::default()
     };
     let db = Db::open(config).unwrap();
@@ -182,7 +184,7 @@ fn test_db_snapshot_creates_manifest() {
     let root = "/tmp/db_snapshot_manifest";
     cleanup_test_root(root);
     let config = Config {
-        path: format!("file://{}", root),
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         memtable_capacity: 128,
         memtable_buffer_count: 2,
         num_columns: 1,
@@ -212,7 +214,7 @@ fn test_db_snapshot_read_only_get() {
     let root = "/tmp/db_snapshot_readonly";
     cleanup_test_root(root);
     let config = Config {
-        path: format!("file://{}", root),
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         memtable_capacity: 128,
         memtable_buffer_count: 2,
         num_columns: 1,
@@ -244,7 +246,7 @@ fn test_db_open_from_snapshot_allows_writes() {
     let root = "/tmp/db_snapshot_write";
     cleanup_test_root(root);
     let config = Config {
-        path: format!("file://{}", root),
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         memtable_capacity: 128,
         memtable_buffer_count: 2,
         num_columns: 1,
@@ -284,7 +286,7 @@ fn test_db_metrics_list() {
     let root = "/tmp/db_metrics_list";
     cleanup_test_root(root);
     let config = Config {
-        path: format!("file://{}", root),
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         memtable_capacity: 128,
         memtable_buffer_count: 2,
         num_columns: 1,
@@ -340,7 +342,7 @@ fn test_db_expire_snapshot_releases_manifest() {
     let root = "/tmp/db_snapshot_expire";
     cleanup_test_root(root);
     let config = Config {
-        path: format!("file://{}", root),
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         memtable_capacity: 128,
         memtable_buffer_count: 2,
         num_columns: 1,
@@ -373,7 +375,7 @@ fn test_db_snapshot_auto_expire() {
     let root = "/tmp/db_snapshot_auto_expire";
     cleanup_test_root(root);
     let config = Config {
-        path: format!("file://{}", root),
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         memtable_capacity: 128,
         memtable_buffer_count: 2,
         num_columns: 1,
@@ -412,7 +414,7 @@ fn test_db_snapshot_retain_skips_auto_expire() {
     let root = "/tmp/db_snapshot_retain_auto";
     cleanup_test_root(root);
     let config = Config {
-        path: format!("file://{}", root),
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         memtable_capacity: 128,
         memtable_buffer_count: 2,
         num_columns: 1,

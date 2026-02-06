@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::paths::{GOVERNANCE_MANIFEST_POINTER_NAME, governance_manifest_lock_path};
+use crate::paths::{
+    GOVERNANCE_MANIFEST_LOCK_NAME, GOVERNANCE_MANIFEST_POINTER_NAME, governance_manifest_lock_path,
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GovernanceEntry {
@@ -105,12 +107,10 @@ impl ManifestLockProvider for FileManifestLockProvider {
 
 pub(crate) fn create_manifest_lock_provider(
     fs: Arc<dyn FileSystem>,
-    config: &Config,
+    _config: &Config,
 ) -> Result<Arc<dyn ManifestLockProvider>> {
-    Ok(Arc::new(FileManifestLockProvider::new(
-        fs,
-        config.path.clone(),
-    )))
+    let lock_path = GOVERNANCE_MANIFEST_LOCK_NAME.to_string();
+    Ok(Arc::new(FileManifestLockProvider::new(fs, lock_path)))
 }
 
 /// Manager for governance manifests with lock coordination.

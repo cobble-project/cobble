@@ -47,12 +47,29 @@ pub struct MaintainerNode {
 impl MaintainerNode {
     pub fn open(config: MaintainerConfig) -> Result<Self> {
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(config.path.clone())?;
+        let volumes = if config.volumes.is_empty() {
+            vec![crate::config::VolumeDescriptor::new(
+                "file:///tmp/".into(),
+                vec![
+                    crate::config::VolumeUsageKind::PrimaryData,
+                    crate::config::VolumeUsageKind::Meta,
+                ],
+            )]
+        } else {
+            config.volumes.clone()
+        };
+        let meta_volume = volumes
+            .iter()
+            .find(|volume| volume.supports(crate::config::VolumeUsageKind::Meta))
+            .unwrap_or_else(|| volumes.first().expect("default volume exists"));
+        let fs = registry.get_or_register_volume(meta_volume)?;
         // ensure snapshot directory exists
         if !fs.exists(SNAPSHOT_DIR)? {
             fs.create_dir(SNAPSHOT_DIR)?;
         }
-        let config = MaintainerConfig { path: config.path };
+        let config = MaintainerConfig {
+            volumes: config.volumes,
+        };
         // determine next snapshot id, load from current pointer
         let next_id = load_latest_snapshot_id(&fs)?.map_or(0, |id| id + 1);
         Ok(Self {
@@ -209,7 +226,13 @@ mod tests {
         write_bucket_snapshot(Arc::clone(&fs), "db-b", 2);
 
         let node = MaintainerNode::open(MaintainerConfig {
-            path: format!("file://{}", root),
+            volumes: vec![crate::config::VolumeDescriptor::new(
+                format!("file://{}", root),
+                vec![
+                    crate::config::VolumeUsageKind::PrimaryData,
+                    crate::config::VolumeUsageKind::Meta,
+                ],
+            )],
         })
         .unwrap();
 

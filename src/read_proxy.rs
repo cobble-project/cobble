@@ -1,3 +1,4 @@
+use crate::config::VolumeUsageKind;
 use crate::error::{Error, Result};
 use crate::file::{File, FileSystem, FileSystemRegistry};
 use crate::maintainer::GlobalSnapshotManifest;
@@ -7,7 +8,7 @@ use crate::paths::{
     global_snapshot_current_path, global_snapshot_manifest_path_by_pointer, snapshot_manifest_name,
 };
 use crate::sst::block_cache::{BlockCache, new_block_cache};
-use crate::{Config, ReadOnlyDb};
+use crate::{Config, ReadOnlyDb, VolumeDescriptor};
 use bytes::Bytes;
 use serde_json::Error as SerdeError;
 use std::collections::{HashMap, VecDeque};
@@ -20,7 +21,7 @@ const DEFAULT_RELOAD_TOLERANCE: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct ReadProxyConfig {
-    pub path: String,
+    pub volumes: Vec<VolumeDescriptor>,
     pub pin_partition_in_memory_count: usize,
     pub block_cache_size: usize,
     pub reload_tolerance: Duration,
@@ -29,7 +30,7 @@ pub struct ReadProxyConfig {
 impl Default for ReadProxyConfig {
     fn default() -> Self {
         Self {
-            path: "file:///tmp/".into(),
+            volumes: VolumeDescriptor::single_volume("file://tmp/".to_string()),
             pin_partition_in_memory_count: 1,
             block_cache_size: 512 * 1024 * 1024,
             reload_tolerance: DEFAULT_RELOAD_TOLERANCE,
@@ -125,11 +126,20 @@ pub struct ReadProxy {
 impl ReadProxy {
     pub fn open(read_config: ReadProxyConfig, global_snapshot_id: u64) -> Result<Self> {
         let config = Config {
-            path: read_config.path.clone(),
+            volumes: read_config.volumes.clone(),
             ..Config::default()
         };
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(config.path.clone())?;
+        let volumes = if config.volumes.is_empty() {
+            return Err(Error::ConfigError("No volumes configured".to_string()));
+        } else {
+            config.volumes.clone()
+        };
+        let meta_volume = volumes
+            .iter()
+            .find(|volume| volume.supports(VolumeUsageKind::Meta))
+            .unwrap_or_else(|| volumes.first().expect("No meta volume exists"));
+        let fs = registry.get_or_register_volume(meta_volume)?;
         let manifest_name = snapshot_manifest_name(global_snapshot_id);
         let global_snapshot = load_global_snapshot_by_name(&fs, &manifest_name)?;
         let bucket_map = build_bucket_map(&global_snapshot)?;
@@ -155,17 +165,26 @@ impl ReadProxy {
 
     pub fn open_current(read_config: ReadProxyConfig) -> Result<Self> {
         let config = Config {
-            path: read_config.path.clone(),
+            volumes: read_config.volumes.clone(),
             ..Config::default()
         };
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(config.path.clone())?;
+        let volumes = if config.volumes.is_empty() {
+            return Err(Error::ConfigError("No volumes configured".to_string()));
+        } else {
+            config.volumes.clone()
+        };
+        let meta_volume = volumes
+            .iter()
+            .find(|volume| volume.supports(VolumeUsageKind::Meta))
+            .unwrap_or_else(|| volumes.first().expect("default volume exists"));
+        let fs = registry.get_or_register_volume(meta_volume)?;
         let (pointer, modified) = read_manifest_pointer(&fs, None)?
             .ok_or_else(|| Error::IoError("Global snapshot pointer missing".to_string()))?;
         let global_snapshot = load_global_snapshot_by_name(&fs, &pointer)?;
         let bucket_map = build_bucket_map(&global_snapshot)?;
-        let block_cache = if config.block_cache_size > 0 {
-            Some(new_block_cache(config.block_cache_size))
+        let block_cache = if read_config.block_cache_size > 0 {
+            Some(new_block_cache(read_config.block_cache_size))
         } else {
             None
         };
@@ -363,6 +382,7 @@ fn validate_range(range: &Range<u16>, total_buckets: u16) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VolumeDescriptor;
     use crate::maintainer::{BucketSnapshotInput, MaintainerConfig, MaintainerNode};
     use std::path::Path;
 
@@ -438,7 +458,7 @@ mod tests {
         create_bucket_manifest(Arc::clone(&fs), root, &db_b, snap_b);
 
         let maintainer = MaintainerNode::open(MaintainerConfig {
-            path: format!("file://{}", root),
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         })
         .unwrap();
         let global = maintainer
@@ -462,7 +482,7 @@ mod tests {
         wait_for_pointer(root, global.id);
 
         let mut proxy = ReadProxy::open_current(ReadProxyConfig {
-            path: format!("file://{}", root),
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             ..ReadProxyConfig::default()
         })
         .unwrap();
@@ -507,7 +527,7 @@ mod tests {
         create_bucket_manifest(Arc::clone(&fs), root, &db_b, snap_b);
 
         let maintainer = MaintainerNode::open(MaintainerConfig {
-            path: format!("file://{}", root),
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         })
         .unwrap();
         let global_a = maintainer
@@ -524,7 +544,7 @@ mod tests {
         wait_for_pointer(root, global_a.id);
 
         let mut proxy = ReadProxy::open_current(ReadProxyConfig {
-            path: format!("file://{}", root),
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             ..ReadProxyConfig::default()
         })
         .unwrap();

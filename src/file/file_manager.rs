@@ -10,16 +10,21 @@
 //! - Closing and deleting files when no longer needed
 //! - Creating files for writing and assigning file IDs
 
+use crate::Config;
+use crate::config::VolumeUsageKind;
 use crate::error::{Error, Result};
-use crate::file::file_system::FileSystem;
+use crate::file::file_system::{FileSystem, FileSystemRegistry};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
-use crate::paths::{DATA_DIR, SNAPSHOT_DIR};
 use bytes::Bytes;
 use dashmap::DashMap;
 use metrics::gauge;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use uuid::Uuid;
+
+const DATA_DIR: &str = "data";
+const SNAPSHOT_DIR: &str = "snapshot";
+const SNAPSHOT_PREFIX: &str = "snapshot/";
 
 /// A unique identifier for data files managed by the FileManager.
 pub type FileId = u64;
@@ -334,16 +339,28 @@ impl FileManager {
         Self::new(fs, FileManagerOptions::default())
     }
 
-    /// Creates a new FileManager rooted at a database-specific subdirectory.
-    pub fn with_db_id(fs: Arc<dyn FileSystem>, db_id: &str) -> Result<Self> {
-        if !fs.exists(db_id)? {
-            fs.create_dir(db_id)?;
+    pub fn from_config(config: &Config, db_id: &str) -> Result<Self> {
+        let registry = FileSystemRegistry::new();
+        let volumes = if config.volumes.is_empty() {
+            return Err(Error::ConfigError("No volumes configured".to_string()));
+        } else {
+            config.volumes.clone()
+        };
+        let mut data_volume = None;
+        for volume in &volumes {
+            if data_volume.is_none() && volume.supports(VolumeUsageKind::PrimaryData) {
+                data_volume = Some(volume);
+            }
         }
+        let data_volume = data_volume.ok_or_else(|| {
+            Error::ConfigError("No volume configured for primary data storage".to_string())
+        })?;
+        let data_fs = registry.get_or_register_volume(data_volume)?;
         let options = FileManagerOptions {
             base_dir: db_id.to_string(),
             ..FileManagerOptions::default()
         };
-        Self::new(fs, options)
+        Self::new(data_fs, options)
     }
 
     /// Sets the database ID to label metrics.

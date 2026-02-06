@@ -14,7 +14,7 @@ pub struct OpendalFileSystem {
 }
 
 impl FileSystem for OpendalFileSystem {
-    fn init(url: &Url) -> Result<Self> {
+    fn init(url: &Url, access_id: Option<String>, access_key: Option<String>) -> Result<Self> {
         let scheme = Scheme::from_str(match url.scheme().to_lowercase().as_str() {
             "file" => "fs",
             other => other,
@@ -30,12 +30,13 @@ impl FileSystem for OpendalFileSystem {
             _ => {
                 /* other schemes will be handled below */
                 let host = url.host_str().unwrap_or("");
-                let access_id = url.username();
-                let access_key = url.password().unwrap_or("");
+                let access_id = access_id.unwrap_or_else(|| url.username().to_string());
+                let access_key =
+                    access_key.unwrap_or_else(|| url.password().unwrap_or("").to_string());
                 let bucket = url.path().trim_start_matches('/');
                 options.insert("host".to_string(), host.to_string());
-                options.insert("access_id".to_string(), access_id.to_string());
-                options.insert("access_key".to_string(), access_key.to_string());
+                options.insert("access_id".to_string(), access_id);
+                options.insert("access_key".to_string(), access_key);
                 options.insert("bucket".to_string(), bucket.to_string());
                 options.insert("root".to_string(), url.path().to_string());
             }
@@ -157,7 +158,7 @@ mod test {
     #[serial_test::serial(file)]
     fn test_opendal_fs_basic() {
         cleanup_test_root();
-        let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap());
+        let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None);
         assert!(fs.is_ok());
         let fs = fs.unwrap();
         assert!(!fs.exists("example").unwrap());
@@ -172,7 +173,7 @@ mod test {
     #[serial_test::serial(file)]
     fn test_opendal_read_write() {
         cleanup_test_root();
-        let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap());
+        let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None);
         assert!(fs.is_ok());
         let fs = fs.unwrap();
         assert!(!fs.exists("example").unwrap());

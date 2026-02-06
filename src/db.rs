@@ -40,18 +40,27 @@ impl Db {
     pub fn open(config: Config) -> Result<Self> {
         Self::init_logging(&config);
         metrics_registry::init_metrics();
-        let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(config.path.clone())?;
         let id = Uuid::new_v4().to_string();
 
         // register the governance db id
+        let registry = FileSystemRegistry::new();
+        let volumes = if config.volumes.is_empty() {
+            return Err(Error::ConfigError("No volumes configured".to_string()));
+        } else {
+            config.volumes.clone()
+        };
+        let meta_volume = volumes
+            .iter()
+            .find(|volume| volume.supports(crate::config::VolumeUsageKind::Meta))
+            .unwrap_or_else(|| volumes.first().expect("No meta volume exists."));
+        let governance_fs = registry.get_or_register_volume(meta_volume)?;
         let governance = GovernanceManager::new(
-            Arc::clone(&fs),
-            create_manifest_lock_provider(Arc::clone(&fs), &config)?,
+            Arc::clone(&governance_fs),
+            create_manifest_lock_provider(Arc::clone(&governance_fs), &config)?,
         );
         governance.insert_and_publish(&id, vec![0u16..1u16], 1)?;
 
-        let mut file_manager = FileManager::with_db_id(Arc::clone(&fs), &id)?;
+        let mut file_manager = FileManager::from_config(&config, &id)?;
         file_manager.set_db_id(id.clone());
         let file_manager = Arc::new(file_manager);
         let db_state = Arc::new(DbStateHandle::new());
@@ -180,9 +189,7 @@ impl Db {
     pub fn open_from_snapshot(config: Config, snapshot_id: u64, db_id: String) -> Result<Self> {
         Self::init_logging(&config);
         metrics_registry::init_metrics();
-        let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(config.path.clone())?;
-        let mut file_manager = FileManager::with_db_id(Arc::clone(&fs), &db_id)?;
+        let mut file_manager = FileManager::from_config(&config, &db_id)?;
         file_manager.set_db_id(db_id.clone());
         let file_manager = Arc::new(file_manager);
 
@@ -398,10 +405,22 @@ impl Drop for Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VolumeDescriptor;
     use serial_test::serial;
 
     fn cleanup_test_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn config_with_small_memtable(path: &str) -> Config {
+        Config {
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 1,
+            sst_bloom_filter_enabled: true,
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", path)),
+            ..Config::default()
+        }
     }
 
     #[test]
@@ -409,14 +428,7 @@ mod tests {
     fn test_db_write_batch_triggers_flush() {
         let root = "/tmp/db_write_batch_flush";
         cleanup_test_root(root);
-        let config = Config {
-            path: format!("file://{}", root),
-            memtable_capacity: 128,
-            memtable_buffer_count: 2,
-            num_columns: 1,
-            sst_bloom_filter_enabled: true,
-            ..Config::default()
-        };
+        let config = config_with_small_memtable(root);
         let db = Db::open(config).unwrap();
         let mut batch = WriteBatch::new();
         batch.put(b"k1", 0, vec![b'a'; 64]);
@@ -440,14 +452,7 @@ mod tests {
     fn test_db_write_batch_put_coalesces_with_flush() {
         let root = "/tmp/db_write_batch_put";
         cleanup_test_root(root);
-        let config = Config {
-            path: format!("file://{}", root),
-            memtable_capacity: 128,
-            memtable_buffer_count: 2,
-            num_columns: 1,
-            sst_bloom_filter_enabled: true,
-            ..Config::default()
-        };
+        let config = config_with_small_memtable(root);
         let db = Db::open(config).unwrap();
         let mut batch = WriteBatch::new();
         batch.put(b"k1", 0, b"old".to_vec());
@@ -471,14 +476,7 @@ mod tests {
     fn test_db_get_prefers_newer_l0_file() {
         let root = "/tmp/db_get_newer_l0";
         cleanup_test_root(root);
-        let config = Config {
-            path: format!("file://{}", root),
-            memtable_capacity: 128,
-            memtable_buffer_count: 2,
-            num_columns: 1,
-            sst_bloom_filter_enabled: true,
-            ..Config::default()
-        };
+        let config = config_with_small_memtable(root);
         let db = Db::open(config).unwrap();
 
         let mut batch = WriteBatch::new();
@@ -509,14 +507,7 @@ mod tests {
     fn test_db_get_merges_across_l0_files() {
         let root = "/tmp/db_get_merge_l0";
         cleanup_test_root(root);
-        let config = Config {
-            path: format!("file://{}", root),
-            memtable_capacity: 128,
-            memtable_buffer_count: 2,
-            num_columns: 1,
-            sst_bloom_filter_enabled: true,
-            ..Config::default()
-        };
+        let config = config_with_small_memtable(root);
         let db = Db::open(config).unwrap();
 
         let mut batch = WriteBatch::new();
@@ -547,14 +538,7 @@ mod tests {
     fn test_db_get_memtable_overlaps_l0_value() {
         let root = "/tmp/db_get_memtable_overlaps_l0";
         cleanup_test_root(root);
-        let config = Config {
-            path: format!("file://{}", root),
-            memtable_capacity: 128,
-            memtable_buffer_count: 2,
-            num_columns: 1,
-            sst_bloom_filter_enabled: true,
-            ..Config::default()
-        };
+        let config = config_with_small_memtable(root);
         let db = Db::open(config).unwrap();
 
         let mut batch = WriteBatch::new();
@@ -581,14 +565,7 @@ mod tests {
     fn test_db_get_memtable_merges_with_l0_value() {
         let root = "/tmp/db_get_memtable_merge_l0";
         cleanup_test_root(root);
-        let config = Config {
-            path: format!("file://{}", root),
-            memtable_capacity: 128,
-            memtable_buffer_count: 2,
-            num_columns: 1,
-            sst_bloom_filter_enabled: true,
-            ..Config::default()
-        };
+        let config = config_with_small_memtable(root);
         let db = Db::open(config).unwrap();
 
         let mut batch = WriteBatch::new();
@@ -616,12 +593,8 @@ mod tests {
         let root = "/tmp/db_multi_column_override";
         cleanup_test_root(root);
         let config = Config {
-            path: format!("file://{}", root),
-            memtable_capacity: 128,
-            memtable_buffer_count: 2,
             num_columns: 2,
-            sst_bloom_filter_enabled: true,
-            ..Config::default()
+            ..config_with_small_memtable(root)
         };
         let db = Db::open(config).unwrap();
 
@@ -653,12 +626,8 @@ mod tests {
         let root = "/tmp/db_multi_column_merge_l0";
         cleanup_test_root(root);
         let config = Config {
-            path: format!("file://{}", root),
-            memtable_capacity: 128,
-            memtable_buffer_count: 2,
             num_columns: 2,
-            sst_bloom_filter_enabled: true,
-            ..Config::default()
+            ..config_with_small_memtable(root)
         };
         let db = Db::open(config).unwrap();
 

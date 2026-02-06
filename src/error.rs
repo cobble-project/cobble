@@ -9,6 +9,8 @@ pub enum Error {
     IoError(String),
     #[error("Memtable full: needed {needed} bytes but only {remaining} remaining.")]
     MemtableFull { needed: usize, remaining: usize },
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

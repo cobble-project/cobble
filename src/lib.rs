@@ -26,8 +26,7 @@ mod ttl;
 mod r#type;
 mod write_batch;
 
-pub use config::CompactionPolicyKind;
-pub use config::Config;
+pub use config::{CompactionPolicyKind, Config, VolumeDescriptor, VolumeUsageKind};
 pub use db::Db;
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
 pub use read_only_db::ReadOnlyDb;
