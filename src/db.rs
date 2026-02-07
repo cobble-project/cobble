@@ -179,6 +179,27 @@ impl Db {
         self.snapshot_manager.retain_snapshot(snapshot_id)
     }
 
+    /// Build a BucketSnapshotInput for a given snapshot id.
+    pub fn bucket_snapshot_input(
+        &self,
+        snapshot_id: u64,
+        ranges: Vec<std::ops::Range<u16>>,
+    ) -> Result<crate::maintainer::BucketSnapshotInput> {
+        let manifest_name = snapshot_manifest_name(snapshot_id);
+        let manifest_path = self
+            .file_manager
+            .get_metadata_file_full_path(&manifest_name)
+            .ok_or_else(|| {
+                Error::IoError(format!("Snapshot manifest not tracked: {}", manifest_name))
+            })?;
+        Ok(crate::maintainer::BucketSnapshotInput {
+            ranges,
+            db_id: self.id.clone(),
+            snapshot_id,
+            manifest_path,
+        })
+    }
+
     /// Open a read-only view from a snapshot manifest.
     pub fn open_read_only(config: Config, snapshot_id: u64, db_id: String) -> Result<ReadOnlyDb> {
         Self::init_logging(&config);

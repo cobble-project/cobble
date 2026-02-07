@@ -390,7 +390,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
-    fn wait_for_manifest_in_db(root: &str, db_id: &str, snapshot_id: u64) {
+    fn wait_for_manifest_in_db(root: &str, db_id: &str, snapshot_id: u64) -> String {
         let full_path = format!(
             "{}/{}",
             root,
@@ -398,7 +398,7 @@ mod tests {
         );
         for _ in 0..50 {
             if Path::new(&full_path).exists() {
-                return;
+                return full_path;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -407,6 +407,7 @@ mod tests {
             "manifest missing at {}",
             full_path
         );
+        format!("file://{}", full_path)
     }
 
     fn create_bucket_manifest(
@@ -414,7 +415,7 @@ mod tests {
         root: &str,
         db_id: &str,
         snapshot_id: u64,
-    ) {
+    ) -> String {
         let snapshot_dir = bucket_snapshot_dir(db_id);
         let manifest_path = bucket_snapshot_manifest_path(db_id, snapshot_id);
         let _ = fs.create_dir(db_id);
@@ -423,7 +424,7 @@ mod tests {
         let manifest = format!("{{\"id\":{},\"seq_id\":0,\"levels\":[]}}", snapshot_id);
         writer.write(manifest.as_bytes()).unwrap();
         writer.close().unwrap();
-        wait_for_manifest_in_db(root, db_id, snapshot_id);
+        wait_for_manifest_in_db(root, db_id, snapshot_id)
     }
 
     fn wait_for_pointer(root: &str, snapshot_id: u64) {
@@ -454,8 +455,8 @@ mod tests {
         let db_b = "db-b".to_string();
         let snap_a = 1;
         let snap_b = 2;
-        create_bucket_manifest(Arc::clone(&fs), root, &db_a, snap_a);
-        create_bucket_manifest(Arc::clone(&fs), root, &db_b, snap_b);
+        let path_a = create_bucket_manifest(Arc::clone(&fs), root, &db_a, snap_a);
+        let path_b = create_bucket_manifest(Arc::clone(&fs), root, &db_b, snap_b);
 
         let maintainer = MaintainerNode::open(MaintainerConfig {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
@@ -469,11 +470,13 @@ mod tests {
                         ranges: vec![0u16..2u16],
                         db_id: db_a.clone(),
                         snapshot_id: snap_a,
+                        manifest_path: path_a,
                     },
                     BucketSnapshotInput {
                         ranges: vec![2u16..4u16],
                         db_id: db_b.clone(),
                         snapshot_id: snap_b,
+                        manifest_path: path_b,
                     },
                 ],
             )
@@ -523,8 +526,8 @@ mod tests {
         let db_b = "db-b".to_string();
         let snap_a = 10;
         let snap_b = 20;
-        create_bucket_manifest(Arc::clone(&fs), root, &db_a, snap_a);
-        create_bucket_manifest(Arc::clone(&fs), root, &db_b, snap_b);
+        let path_a = create_bucket_manifest(Arc::clone(&fs), root, &db_a, snap_a);
+        let path_b = create_bucket_manifest(Arc::clone(&fs), root, &db_b, snap_b);
 
         let maintainer = MaintainerNode::open(MaintainerConfig {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
@@ -537,6 +540,7 @@ mod tests {
                     ranges: vec![0u16..4u16],
                     db_id: db_a.clone(),
                     snapshot_id: snap_a,
+                    manifest_path: path_a,
                 }],
             )
             .unwrap();
@@ -562,6 +566,7 @@ mod tests {
                     ranges: vec![0u16..4u16],
                     db_id: db_b.clone(),
                     snapshot_id: snap_b,
+                    manifest_path: path_b,
                 }],
             )
             .unwrap();

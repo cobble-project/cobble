@@ -333,9 +333,11 @@ pub struct AtomicMetadataWriter {
     writer: Option<TrackedWriter>,
     fs: Arc<dyn FileSystem>,
     metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
+    volume: Option<Arc<VolumeState>>,
 }
 
 impl AtomicMetadataWriter {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         db_id: Option<String>,
         temp_path: String,
@@ -344,6 +346,7 @@ impl AtomicMetadataWriter {
         writer: TrackedWriter,
         fs: Arc<dyn FileSystem>,
         metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
+        volume: Option<Arc<VolumeState>>,
     ) -> Self {
         Self {
             db_id,
@@ -353,6 +356,7 @@ impl AtomicMetadataWriter {
             writer: Some(writer),
             fs,
             metadata_files,
+            volume,
         }
     }
 
@@ -366,7 +370,7 @@ impl AtomicMetadataWriter {
         let tracked = Arc::new(TrackedFile::new(
             self.final_path.clone(),
             Arc::clone(&self.fs),
-            None,
+            self.volume.clone(),
         ));
         self.metadata_files
             .insert(self.final_name.clone(), Arc::clone(&tracked));
@@ -402,8 +406,8 @@ impl SequentialWriteFile for AtomicMetadataWriter {
 pub struct FileManager {
     /// Optional database ID for metrics labeling.
     db_id: Option<String>,
-    /// The file system used for metadata files.
-    meta_fs: Arc<dyn FileSystem>,
+    /// The metadata volume for metadata files.
+    meta_volume: DataVolume,
     /// Ordered data volumes by priority (high to low).
     data_volumes: Vec<DataVolume>,
     /// Configuration options.
@@ -516,10 +520,13 @@ impl FileManager {
         for volume in &data_volumes {
             Self::ensure_volume_dirs(&volume.state.fs, &options)?;
         }
-        let meta_fs = Arc::clone(&data_volumes[0].state.fs);
+        let meta_volume = DataVolume {
+            state: Arc::clone(&data_volumes[0].state),
+            priority: data_volumes[0].priority,
+        };
         Ok(Self {
             db_id: None,
-            meta_fs,
+            meta_volume,
             data_volumes,
             options,
             next_file_id: AtomicU64::new(1), // Start from 1, 0 is reserved
@@ -778,6 +785,11 @@ impl FileManager {
         self.metadata_files.get(name).map(|f| f.path().to_string())
     }
 
+    /// Returns the full path for a metadata file, including the volume base directory if known.
+    pub fn get_metadata_file_full_path(&self, name: &str) -> Option<String> {
+        self.metadata_files.get(name).map(|f| f.absolute_path())
+    }
+
     /// Returns the expected path for a metadata file, even if not tracked yet.
     pub fn metadata_path(&self, name: &str) -> String {
         self.metadata_file_path(name)
@@ -815,12 +827,12 @@ impl FileManager {
     pub fn create_metadata_file(&self, name: &str) -> Result<AtomicMetadataWriter> {
         let final_path = self.metadata_file_path(name);
         let temp_path = format!("{}.tmp-{}", final_path, Uuid::new_v4());
-        let writer = self.meta_fs.open_write(&temp_path)?;
+        let writer = self.meta_volume.state.fs.open_write(&temp_path)?;
 
         let tracked = Arc::new(TrackedFile::new(
             temp_path.clone(),
-            Arc::clone(&self.meta_fs),
-            None,
+            Arc::clone(&self.meta_volume.state.fs),
+            Some(Arc::clone(&self.meta_volume.state)),
         ));
         let tracked_writer = TrackedWriter::new(writer, tracked);
         Ok(AtomicMetadataWriter::new(
@@ -829,15 +841,16 @@ impl FileManager {
             name.to_string(),
             final_path,
             tracked_writer,
-            Arc::clone(&self.meta_fs),
+            Arc::clone(&self.meta_volume.state.fs),
             Arc::clone(&self.metadata_files),
+            Some(Arc::clone(&self.meta_volume.state)),
         ))
     }
 
     /// Registers an existing metadata file with the FileManager.
     pub fn register_metadata_file(&self, name: &str, path: String) -> Result<()> {
         // Verify the file exists
-        if !self.meta_fs.exists(&path)? {
+        if !self.meta_volume.state.fs.exists(&path)? {
             return Err(Error::IoError(format!(
                 "Metadata file {} does not exist at path: {}",
                 name, path
@@ -846,7 +859,11 @@ impl FileManager {
 
         // Track the file if not already tracked
         if !self.metadata_files.contains_key(name) {
-            let tracked = Arc::new(TrackedFile::new(path, Arc::clone(&self.meta_fs), None));
+            let tracked = Arc::new(TrackedFile::new(
+                path,
+                Arc::clone(&self.meta_volume.state.fs),
+                Some(Arc::clone(&self.meta_volume.state)),
+            ));
             self.metadata_files.insert(name.to_string(), tracked);
             self.report_metadata_files_gauge();
         }
@@ -866,7 +883,7 @@ impl FileManager {
             ))
         })?;
 
-        let reader = self.meta_fs.open_read(tracked.path())?;
+        let reader = self.meta_volume.state.fs.open_read(tracked.path())?;
         Ok(TrackedReader::new(reader, Arc::clone(&tracked)))
     }
 
@@ -876,7 +893,7 @@ impl FileManager {
         name: &str,
     ) -> Result<Box<dyn RandomAccessFile>> {
         let path = self.metadata_file_path(name);
-        self.meta_fs.open_read(&path)
+        self.meta_volume.state.fs.open_read(&path)
     }
 
     /// Registers an existing data file without deleting it on drop.
@@ -923,14 +940,14 @@ impl FileManager {
             if Arc::strong_count(&tracked) > 1 {
                 tracked.mark_for_deletion();
             } else {
-                self.meta_fs.delete(tracked.path())?;
+                self.meta_volume.state.fs.delete(tracked.path())?;
             }
             self.report_metadata_files_gauge();
             return Ok(());
         }
         let path = self.metadata_file_path(name);
-        if self.meta_fs.exists(&path)? {
-            self.meta_fs.delete(&path)?;
+        if self.meta_volume.state.fs.exists(&path)? {
+            self.meta_volume.state.fs.delete(&path)?;
         }
         Ok(())
     }

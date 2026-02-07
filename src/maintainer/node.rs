@@ -5,8 +5,8 @@ use crate::file::{BufferedWriter, File, FileSystem, FileSystemRegistry, Sequenti
 use crate::maintainer::MaintainerConfig;
 use crate::maintainer::file::MetadataWriter;
 use crate::paths::{
-    SNAPSHOT_DIR, bucket_snapshot_manifest_path, global_snapshot_current_path,
-    global_snapshot_manifest_path, snapshot_manifest_name,
+    SNAPSHOT_DIR, global_snapshot_current_path, global_snapshot_manifest_path,
+    snapshot_manifest_name,
 };
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
@@ -19,6 +19,7 @@ pub struct BucketSnapshotInput {
     pub ranges: Vec<Range<u16>>,
     pub db_id: String,
     pub snapshot_id: u64,
+    pub manifest_path: String,
 }
 
 /// Bucket snapshot reference stored in a global manifest.
@@ -90,18 +91,17 @@ impl MaintainerNode {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut bucket_refs = Vec::with_capacity(bucket_snapshots.len());
         for bucket in bucket_snapshots {
-            let manifest_path = bucket_snapshot_manifest_path(&bucket.db_id, bucket.snapshot_id);
-            if !self.fs.exists(&manifest_path)? {
-                return Err(Error::IoError(format!(
-                    "Bucket snapshot manifest not found: {}",
-                    manifest_path
+            if bucket.manifest_path.is_empty() {
+                return Err(Error::ConfigError(format!(
+                    "Bucket snapshot manifest path missing for {}:{}",
+                    bucket.db_id, bucket.snapshot_id
                 )));
             }
             bucket_refs.push(BucketSnapshotRef {
                 ranges: bucket.ranges,
                 db_id: bucket.db_id,
                 snapshot_id: bucket.snapshot_id,
-                manifest_path,
+                manifest_path: bucket.manifest_path,
             });
         }
         Ok(GlobalSnapshotManifest {
@@ -194,13 +194,18 @@ fn load_latest_snapshot_id(fs: &Arc<dyn FileSystem>) -> Result<Option<u64>> {
 mod tests {
     use super::*;
     use crate::file::FileSystemRegistry;
-    use crate::paths::bucket_snapshot_dir;
+    use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
 
     fn cleanup_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
     }
 
-    fn write_bucket_snapshot(fs: Arc<dyn FileSystem>, db_id: &str, snapshot_id: u64) {
+    fn write_bucket_snapshot(
+        fs: Arc<dyn FileSystem>,
+        root: &str,
+        db_id: &str,
+        snapshot_id: u64,
+    ) -> String {
         fs.create_dir(db_id).unwrap();
         let snapshot_dir = bucket_snapshot_dir(db_id);
         fs.create_dir(&snapshot_dir).unwrap();
@@ -208,6 +213,7 @@ mod tests {
         let mut writer = fs.open_write(&path).unwrap();
         writer.write(b"{}").unwrap();
         writer.close().unwrap();
+        format!("file://{}/{}", root, path)
     }
 
     #[test]
@@ -219,8 +225,8 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", root))
             .unwrap();
-        write_bucket_snapshot(Arc::clone(&fs), "db-a", 1);
-        write_bucket_snapshot(Arc::clone(&fs), "db-b", 2);
+        let path_a = write_bucket_snapshot(Arc::clone(&fs), root, "db-a", 1);
+        let path_b = write_bucket_snapshot(Arc::clone(&fs), root, "db-b", 2);
 
         let node = MaintainerNode::open(MaintainerConfig {
             volumes: vec![crate::config::VolumeDescriptor::new(
@@ -241,11 +247,13 @@ mod tests {
                         ranges: vec![0u16..2u16],
                         db_id: "db-a".to_string(),
                         snapshot_id: 1,
+                        manifest_path: path_a.clone(),
                     },
                     BucketSnapshotInput {
                         ranges: vec![2u16..4u16],
                         db_id: "db-b".to_string(),
                         snapshot_id: 2,
+                        manifest_path: path_b.clone(),
                     },
                 ],
             )
@@ -255,6 +263,8 @@ mod tests {
         let loaded = node.load_current_global_snapshot().unwrap().unwrap();
         assert_eq!(loaded.id, snapshot.id);
         assert_eq!(loaded.bucket_snapshots, snapshot.bucket_snapshots);
+        assert_eq!(loaded.bucket_snapshots[0].manifest_path, path_a);
+        assert_eq!(loaded.bucket_snapshots[1].manifest_path, path_b);
 
         cleanup_root(root);
     }
