@@ -14,3 +14,11 @@ impl Default for MaintainerConfig {
         }
     }
 }
+
+impl MaintainerConfig {
+    pub fn from_config(config: &crate::Config) -> Self {
+        Self {
+            volumes: config.volumes.clone(),
+        }
+    }
+}

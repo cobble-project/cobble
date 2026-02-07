@@ -17,8 +17,6 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const DEFAULT_RELOAD_TOLERANCE: Duration = Duration::from_secs(10);
-
 #[derive(Clone, Debug)]
 pub struct ReadProxyConfig {
     pub volumes: Vec<VolumeDescriptor>,
@@ -33,7 +31,18 @@ impl Default for ReadProxyConfig {
             volumes: VolumeDescriptor::single_volume("file:///tmp/".to_string()),
             pin_partition_in_memory_count: 1,
             block_cache_size: 512 * 1024 * 1024,
-            reload_tolerance: DEFAULT_RELOAD_TOLERANCE,
+            reload_tolerance: Duration::from_secs(10),
+        }
+    }
+}
+
+impl ReadProxyConfig {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            volumes: config.volumes.clone(),
+            pin_partition_in_memory_count: config.read_proxy.pin_partition_in_memory_count,
+            block_cache_size: config.read_proxy.block_cache_size,
+            reload_tolerance: Duration::from_secs(config.read_proxy.reload_tolerance_seconds),
         }
     }
 }

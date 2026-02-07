@@ -74,7 +74,8 @@ impl TimeProvider for ManualTimeProvider {
 }
 
 /// Time provider selection for configuration.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TimeProviderKind {
     /// Use system time.
     #[default]
