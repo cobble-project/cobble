@@ -279,7 +279,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                         size: file.size,
                         start_key: to_hex(&file.start_key),
                         end_key: to_hex(&file.end_key),
-                        path: file_manager.get_data_file_path(file.file_id),
+                        path: file_manager.get_data_file_full_path(file.file_id),
                     })
                     .collect(),
             })

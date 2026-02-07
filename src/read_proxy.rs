@@ -30,7 +30,7 @@ pub struct ReadProxyConfig {
 impl Default for ReadProxyConfig {
     fn default() -> Self {
         Self {
-            volumes: VolumeDescriptor::single_volume("file://tmp/".to_string()),
+            volumes: VolumeDescriptor::single_volume("file:///tmp/".to_string()),
             pin_partition_in_memory_count: 1,
             block_cache_size: 512 * 1024 * 1024,
             reload_tolerance: DEFAULT_RELOAD_TOLERANCE,

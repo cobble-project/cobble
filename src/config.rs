@@ -15,8 +15,12 @@ pub enum CompactionPolicyKind {
 pub enum VolumeUsageKind {
     // Metadata storage (manifests, snapshots, etc).
     Meta = 0,
-    // Primary data storage (SST files, write-ahead log).
-    PrimaryData = 1,
+    // Primary data storage with the highest priority (SST files, write-ahead log).
+    PrimaryDataPriorityHigh = 1,
+    // Primary data storage with medium priority (SST files, write-ahead log).
+    PrimaryDataPriorityMedium = 2,
+    // Primary data storage with low priority (SST files, write-ahead log).
+    PrimaryDataPriorityLow = 3,
     // Block cache storage. e.g. foryer cache files.
     Cache = 5,
 }
@@ -61,7 +65,10 @@ impl VolumeDescriptor {
     pub fn single_volume(base_dir: String) -> Vec<Self> {
         vec![Self::new(
             base_dir,
-            vec![VolumeUsageKind::PrimaryData, VolumeUsageKind::Meta],
+            vec![
+                VolumeUsageKind::PrimaryDataPriorityHigh,
+                VolumeUsageKind::Meta,
+            ],
         )]
     }
 

@@ -369,7 +369,7 @@ impl CompactionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{FileManagerOptions, FileSystemRegistry, TrackedFileId};
+    use crate::file::{FileSystemRegistry, TrackedFileId};
     use crate::sst::row_codec::encode_value;
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::Value;
@@ -426,8 +426,7 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let file_manager =
-            Arc::new(FileManager::new(Arc::clone(&fs), FileManagerOptions::default()).unwrap());
+        let file_manager = Arc::new(FileManager::with_defaults(Arc::clone(&fs)).unwrap());
 
         let num_columns = 1;
 
@@ -555,8 +554,7 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let file_manager =
-            Arc::new(FileManager::new(Arc::clone(&fs), FileManagerOptions::default()).unwrap());
+        let file_manager = Arc::new(FileManager::with_defaults(Arc::clone(&fs)).unwrap());
 
         let num_columns = 1;
 
@@ -682,8 +680,7 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let file_manager =
-            Arc::new(FileManager::new(Arc::clone(&fs), FileManagerOptions::default()).unwrap());
+        let file_manager = Arc::new(FileManager::with_defaults(Arc::clone(&fs)).unwrap());
 
         let num_columns = 1;
 
@@ -791,8 +788,7 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let file_manager =
-            Arc::new(FileManager::new(Arc::clone(&fs), FileManagerOptions::default()).unwrap());
+        let file_manager = Arc::new(FileManager::with_defaults(Arc::clone(&fs)).unwrap());
 
         let options = CompactionConfig::default();
 

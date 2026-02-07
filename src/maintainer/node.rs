@@ -1,4 +1,5 @@
 //! Maintainer node for global snapshot manifests.
+use crate::error::Error::IoError;
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, FileSystem, FileSystemRegistry, SequentialWriteFile};
 use crate::maintainer::MaintainerConfig;
@@ -48,20 +49,16 @@ impl MaintainerNode {
     pub fn open(config: MaintainerConfig) -> Result<Self> {
         let registry = FileSystemRegistry::new();
         let volumes = if config.volumes.is_empty() {
-            vec![crate::config::VolumeDescriptor::new(
-                "file:///tmp/".into(),
-                vec![
-                    crate::config::VolumeUsageKind::PrimaryData,
-                    crate::config::VolumeUsageKind::Meta,
-                ],
-            )]
+            return Err(IoError(
+                "No volumes configured for maintainer node".to_string(),
+            ));
         } else {
             config.volumes.clone()
         };
         let meta_volume = volumes
             .iter()
             .find(|volume| volume.supports(crate::config::VolumeUsageKind::Meta))
-            .unwrap_or_else(|| volumes.first().expect("default volume exists"));
+            .unwrap_or_else(|| volumes.first().expect("No meta volume exists"));
         let fs = registry.get_or_register_volume(meta_volume)?;
         // ensure snapshot directory exists
         if !fs.exists(SNAPSHOT_DIR)? {
@@ -229,7 +226,7 @@ mod tests {
             volumes: vec![crate::config::VolumeDescriptor::new(
                 format!("file://{}", root),
                 vec![
-                    crate::config::VolumeUsageKind::PrimaryData,
+                    crate::config::VolumeUsageKind::PrimaryDataPriorityHigh,
                     crate::config::VolumeUsageKind::Meta,
                 ],
             )],
