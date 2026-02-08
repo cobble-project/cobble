@@ -254,7 +254,7 @@ impl CompactionExecutor {
         let mut current_file_id: Option<u64> = None;
 
         while dedup_iter.valid() {
-            let (key, value) = match dedup_iter.current()? {
+            let (key, value) = match dedup_iter.current_slice()? {
                 Some(kv) => kv,
                 None => break,
             };
@@ -268,7 +268,7 @@ impl CompactionExecutor {
 
             // Add entry to current file
             if let Some(ref mut builder) = current_builder {
-                builder.add(&key, &value)?;
+                builder.add(key, value)?;
 
                 // Check if we should close this file and start a new one
                 if builder.offset() >= options.target_file_size {

@@ -146,9 +146,25 @@ where
         }
     }
 
+    fn key_slice(&self) -> Result<Option<&[u8]>> {
+        if let Some(idx) = self.current_idx {
+            self.iterators[idx].key_slice()
+        } else {
+            Ok(None)
+        }
+    }
+
     fn value(&self) -> Result<Option<Bytes>> {
         if let Some(idx) = self.current_idx {
             self.iterators[idx].value()
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn value_slice(&self) -> Result<Option<&[u8]>> {
+        if let Some(idx) = self.current_idx {
+            self.iterators[idx].value_slice()
         } else {
             Ok(None)
         }

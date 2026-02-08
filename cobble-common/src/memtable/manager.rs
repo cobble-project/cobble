@@ -586,8 +586,10 @@ fn flush_memtable(
         );
         dedup_iter.seek_to_first()?;
         while dedup_iter.valid() {
-            if let Some((key, value)) = dedup_iter.current()? {
-                builder.add(key.as_ref(), value.as_ref())?;
+            if let (Some(key), Some(value)) =
+                (dedup_iter.key_slice()?, dedup_iter.value_slice()?)
+            {
+                builder.add(key, value)?;
             }
             dedup_iter.next()?;
         }
@@ -648,8 +650,16 @@ where
         self.inner.key()
     }
 
+    fn key_slice(&self) -> Result<Option<&[u8]>> {
+        self.inner.key_slice()
+    }
+
     fn value(&self) -> Result<Option<Bytes>> {
         self.inner.value()
+    }
+
+    fn value_slice(&self) -> Result<Option<&[u8]>> {
+        self.inner.value_slice()
     }
 }
 

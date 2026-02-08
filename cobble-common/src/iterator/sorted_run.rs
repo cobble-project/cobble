@@ -217,9 +217,25 @@ where
         }
     }
 
+    fn key_slice(&self) -> Result<Option<&[u8]>> {
+        if let Some(iter) = &self.current_iter {
+            iter.key_slice()
+        } else {
+            Ok(None)
+        }
+    }
+
     fn value(&self) -> Result<Option<Bytes>> {
         if let Some(iter) = &self.current_iter {
             iter.value()
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn value_slice(&self) -> Result<Option<&[u8]>> {
+        if let Some(iter) = &self.current_iter {
+            iter.value_slice()
         } else {
             Ok(None)
         }

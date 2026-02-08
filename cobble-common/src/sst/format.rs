@@ -212,6 +212,50 @@ impl Block {
         Ok((key, value))
     }
 
+    pub fn get_slices(&self, idx: usize) -> Result<(&[u8], &[u8])> {
+        if idx >= self.offsets.len() {
+            return Err(Error::IoError(format!(
+                "Index out of bounds: {} >= {}",
+                idx,
+                self.offsets.len()
+            )));
+        }
+
+        let offset = self.offsets[idx] as usize;
+        let data = self.data.as_ref();
+        if offset + 4 > data.len() {
+            return Err(Error::IoError("Corrupted block entry".to_string()));
+        }
+
+        let key_len = u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .expect("slice length checked"),
+        ) as usize;
+        let key_start = offset + 4;
+        let key_end = key_start + key_len;
+        if key_end > data.len() {
+            return Err(Error::IoError("Corrupted key data".to_string()));
+        }
+
+        if key_end + 4 > data.len() {
+            return Err(Error::IoError("Corrupted value length".to_string()));
+        }
+
+        let value_len = u32::from_le_bytes(
+            data[key_end..key_end + 4]
+                .try_into()
+                .expect("slice length checked"),
+        ) as usize;
+        let value_start = key_end + 4;
+        let value_end = value_start + value_len;
+        if value_end > data.len() {
+            return Err(Error::IoError("Corrupted value data".to_string()));
+        }
+
+        Ok((&data[key_start..key_end], &data[value_start..value_end]))
+    }
+
     pub fn offsets_len(&self) -> usize {
         self.offsets.len()
     }

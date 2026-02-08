@@ -60,9 +60,25 @@ impl<'a> KvIterator<'a> for MockIterator {
         }
     }
 
+    fn key_slice(&self) -> crate::error::Result<Option<&[u8]>> {
+        if self.valid() {
+            Ok(Some(self.entries[self.index].0.as_ref()))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn value(&self) -> crate::error::Result<Option<Bytes>> {
         if self.valid() {
             Ok(Some(self.entries[self.index].1.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn value_slice(&self) -> crate::error::Result<Option<&[u8]>> {
+        if self.valid() {
+            Ok(Some(self.entries[self.index].1.as_ref()))
         } else {
             Ok(None)
         }

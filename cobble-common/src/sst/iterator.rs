@@ -737,8 +737,28 @@ impl<'a> KvIterator<'a> for SSTIterator {
         SSTIterator::key(self)
     }
 
+    fn key_slice(&self) -> Result<Option<&[u8]>> {
+        if let Some(block) = &self.current_data_block
+            && self.current_entry_idx < block.offsets_len()
+        {
+            let (key, _) = block.get_slices(self.current_entry_idx)?;
+            return Ok(Some(key));
+        }
+        Ok(None)
+    }
+
     fn value(&self) -> Result<Option<Bytes>> {
         SSTIterator::value(self)
+    }
+
+    fn value_slice(&self) -> Result<Option<&[u8]>> {
+        if let Some(block) = &self.current_data_block
+            && self.current_entry_idx < block.offsets_len()
+        {
+            let (_, value) = block.get_slices(self.current_entry_idx)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
     }
 }
 

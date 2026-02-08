@@ -26,21 +26,27 @@ pub(crate) struct MemtableValueIter<'a> {
     bucket: usize,
 }
 
-#[derive(PartialEq, Eq, Ord)]
+#[derive(PartialEq, Eq)]
 struct KVPair<'a> {
     key: &'a[u8],
     value: &'a[u8],
     offset: usize,
 }
 
-impl PartialOrd for KVPair<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+impl Ord for KVPair<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
         let ord = self.key.cmp(other.key);
         if ord == Ordering::Equal {
-            Some(self.offset.cmp(&other.offset))
+            other.offset.cmp(&self.offset)
         } else {
-            Some(ord)
+            ord
         }
+    }
+}
+
+impl PartialOrd for KVPair<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -48,8 +54,8 @@ pub(crate) struct MemtableKvIterator<'a> {
     mem: &'a HashMemtable,
     key_values: Vec<KVPair<'a>>,
     key_idx: usize,
-    current_key: Option<Bytes>,
-    current_value: Option<Bytes>,
+    current_key: Option<&'a [u8]>,
+    current_value: Option<&'a [u8]>,
 }
 
 impl HashMemtable {
@@ -350,8 +356,8 @@ impl<'a> KvIterator<'a> for MemtableKvIterator<'a> {
         }
         let key_value = &self.key_values[self.key_idx];
         self.key_idx += 1;
-        self.current_key = Some(Bytes::copy_from_slice(key_value.key));
-        self.current_value = Some(Bytes::copy_from_slice(key_value.value));
+        self.current_key = Some(key_value.key);
+        self.current_value = Some(key_value.value);
         Ok(true)
     }
 
@@ -360,11 +366,23 @@ impl<'a> KvIterator<'a> for MemtableKvIterator<'a> {
     }
 
     fn key(&self) -> Result<Option<Bytes>> {
-        Ok(self.current_key.clone())
+        Ok(self
+            .current_key
+            .map(|key| Bytes::copy_from_slice(key)))
+    }
+
+    fn key_slice(&self) -> Result<Option<&[u8]>> {
+        Ok(self.current_key)
     }
 
     fn value(&self) -> Result<Option<Bytes>> {
-        Ok(self.current_value.clone())
+        Ok(self
+            .current_value
+            .map(|value| Bytes::copy_from_slice(value)))
+    }
+
+    fn value_slice(&self) -> Result<Option<&[u8]>> {
+        Ok(self.current_value)
     }
 }
 

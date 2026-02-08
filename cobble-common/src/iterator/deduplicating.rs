@@ -167,8 +167,16 @@ where
         Ok(self.current_key.clone())
     }
 
+    fn key_slice(&self) -> Result<Option<&[u8]>> {
+        Ok(self.current_key.as_deref())
+    }
+
     fn value(&self) -> Result<Option<Bytes>> {
         Ok(self.current_value.clone())
+    }
+
+    fn value_slice(&self) -> Result<Option<&[u8]>> {
+        Ok(self.current_value.as_deref())
     }
 }
 

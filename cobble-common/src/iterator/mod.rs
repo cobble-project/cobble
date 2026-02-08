@@ -44,9 +44,17 @@ pub(crate) trait KvIterator<'a>: 'a {
     /// Returns `None` if the iterator is not valid.
     fn key(&self) -> Result<Option<Bytes>>;
 
+    /// Get the current key as a temporary slice.
+    /// Returns `None` if the iterator is not valid.
+    fn key_slice(&self) -> Result<Option<&[u8]>>;
+
     /// Get the current value.
     /// Returns `None` if the iterator is not valid.
     fn value(&self) -> Result<Option<Bytes>>;
+
+    /// Get the current value as a temporary slice.
+    /// Returns `None` if the iterator is not valid.
+    fn value_slice(&self) -> Result<Option<&[u8]>>;
 
     /// Get the current key-value pair.
     /// Returns `None` if the iterator is not valid.
@@ -56,6 +64,20 @@ pub(crate) trait KvIterator<'a>: 'a {
         }
         let key = self.key()?;
         let value = self.value()?;
+        match (key, value) {
+            (Some(k), Some(v)) => Ok(Some((k, v))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Get the current key-value pair as temporary slices.
+    /// Returns `None` if the iterator is not valid.
+    fn current_slice(&self) -> Result<Option<(&[u8], &[u8])>> {
+        if !self.valid() {
+            return Ok(None);
+        }
+        let key = self.key_slice()?;
+        let value = self.value_slice()?;
         match (key, value) {
             (Some(k), Some(v)) => Ok(Some((k, v))),
             _ => Ok(None),
@@ -85,7 +107,15 @@ impl<'a> KvIterator<'a> for Box<dyn for<'b> KvIterator<'b>> {
         (**self).key()
     }
 
+    fn key_slice(&self) -> Result<Option<&[u8]>> {
+        (**self).key_slice()
+    }
+
     fn value(&self) -> Result<Option<Bytes>> {
         (**self).value()
+    }
+
+    fn value_slice(&self) -> Result<Option<&[u8]>> {
+        (**self).value_slice()
     }
 }
