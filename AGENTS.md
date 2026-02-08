@@ -7,6 +7,12 @@ This repository is a Rust + Cargo project implementing an LSM-style KV storage e
 - Keep build, formatting, linting, and tests passing.
 - Follow the repository's PR title and description conventions.
 
+## Workspace Organization
+- The project is organized as a Cargo workspace.
+- The main crate is `cobble`, located in the `cobble-common/`
+- Other crates include:
+  - `cobble-bench`: Benchmarking tools.
+
 ## How to Test
 - Run all tests: `cargo test`
 - Run a subset: `cargo test <pattern>` (e.g., `cargo test row_codec`)

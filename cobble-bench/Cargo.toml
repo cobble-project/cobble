@@ -1,0 +1,9 @@
+[package]
+name = "cobble-bench"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+cobble = { path = "../cobble-common" }
+rand_core = "0.10.0"
+rand_xorshift = "0.5.0"
