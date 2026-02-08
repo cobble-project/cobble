@@ -22,7 +22,7 @@ pub(crate) trait Memtable {
     where
         Self: 'a;
 
-    type KvIter<'a>: KvIterator
+    type KvIter<'a>: KvIterator<'a>
     where
         Self: 'a;
 }

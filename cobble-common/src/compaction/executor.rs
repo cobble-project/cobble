@@ -202,7 +202,7 @@ impl CompactionExecutor {
     }
 
     fn run_compaction(task: CompactionTask, options: CompactionConfig) -> Result<CompactionResult> {
-        let mut all_iters: Vec<Box<dyn KvIterator>> = Vec::new();
+        let mut all_iters: Vec<Box<dyn for<'a> KvIterator<'a>>> = Vec::new();
         let mut read_bytes = 0u64;
         for run in &task.sorted_runs {
             for file in run.files() {

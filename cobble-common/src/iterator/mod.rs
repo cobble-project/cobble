@@ -26,7 +26,7 @@ use bytes::Bytes;
 /// A trait for key-value iterators.
 /// This provides a common interface for iterating over sorted key-value pairs
 /// from various sources (e.g., SST files, memtables).
-pub(crate) trait KvIterator {
+pub(crate) trait KvIterator<'a>: 'a {
     /// Seek to the first key >= target.
     fn seek(&mut self, target: &[u8]) -> Result<()>;
 
@@ -63,8 +63,8 @@ pub(crate) trait KvIterator {
     }
 }
 
-/// Implement KvIterator for Box<dyn KvIterator> to support dynamic dispatch.
-impl KvIterator for Box<dyn KvIterator> {
+/// Implement KvIterator for Box<dyn for<'a> KvIterator<'a>> to support dynamic dispatch.
+impl<'a> KvIterator<'a> for Box<dyn for<'b> KvIterator<'b>> {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
         (**self).seek(target)
     }

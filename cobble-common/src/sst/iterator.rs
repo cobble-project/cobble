@@ -716,7 +716,7 @@ impl SSTIterator {
     }
 }
 
-impl KvIterator for SSTIterator {
+impl<'a> KvIterator<'a> for SSTIterator {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
         SSTIterator::seek(self, target)
     }

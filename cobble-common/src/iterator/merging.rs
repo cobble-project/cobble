@@ -44,7 +44,7 @@ impl Ord for HeapEntry {
 ///
 /// This is commonly used in LSM-tree implementations to merge data from
 /// multiple levels or runs during reads or compaction.
-pub struct MergingIterator<I: KvIterator> {
+pub struct MergingIterator<I> {
     /// The child iterators being merged.
     iterators: Vec<I>,
     /// The min-heap for efficient minimum key selection.
@@ -53,7 +53,7 @@ pub struct MergingIterator<I: KvIterator> {
     current_idx: Option<usize>,
 }
 
-impl<I: KvIterator> MergingIterator<I> {
+impl<I> MergingIterator<I> {
     /// Create a new MergingIterator from a list of child iterators.
     pub fn new(iterators: Vec<I>) -> Self {
         Self {
@@ -64,7 +64,10 @@ impl<I: KvIterator> MergingIterator<I> {
     }
 
     /// Rebuild the heap with all valid iterators.
-    fn rebuild_heap(&mut self) -> Result<()> {
+    fn rebuild_heap<'a>(&mut self) -> Result<()>
+    where
+        I: KvIterator<'a>,
+    {
         self.heap.clear();
 
         for (idx, iter) in self.iterators.iter().enumerate() {
@@ -80,7 +83,10 @@ impl<I: KvIterator> MergingIterator<I> {
     }
 }
 
-impl<I: KvIterator> KvIterator for MergingIterator<I> {
+impl<'a, I> KvIterator<'a> for MergingIterator<I>
+where
+    I: KvIterator<'a>,
+{
     fn seek(&mut self, target: &[u8]) -> Result<()> {
         // Seek all iterators to the target
         for iter in &mut self.iterators {

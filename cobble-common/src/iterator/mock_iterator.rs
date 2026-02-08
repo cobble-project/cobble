@@ -24,7 +24,7 @@ impl MockIterator {
     }
 }
 
-impl KvIterator for MockIterator {
+impl<'a> KvIterator<'a> for MockIterator {
     fn seek(&mut self, target: &[u8]) -> crate::error::Result<()> {
         self.index = self
             .entries

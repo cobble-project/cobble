@@ -85,7 +85,7 @@ impl SortedRun {
     /// The `create_iterator` function is used to create an iterator for each file.
     pub fn iter<I, F>(&self, create_iterator: F) -> SortedRunIterator<I, F>
     where
-        I: KvIterator,
+        I: for<'a> KvIterator<'a>,
         F: Fn(&DataFile) -> Result<I>,
     {
         SortedRunIterator::new(self.files.clone(), create_iterator)
@@ -96,7 +96,7 @@ impl SortedRun {
 /// This iterator traverses all files in the sorted run in order.
 pub struct SortedRunIterator<I, F>
 where
-    I: KvIterator,
+    I: for<'a> KvIterator<'a>,
     F: Fn(&DataFile) -> Result<I>,
 {
     /// The data files in this sorted run.
@@ -111,7 +111,7 @@ where
 
 impl<I, F> SortedRunIterator<I, F>
 where
-    I: KvIterator,
+    I: for<'a> KvIterator<'a>,
     F: Fn(&DataFile) -> Result<I>,
 {
     fn new(files: Vec<Arc<DataFile>>, create_iterator: F) -> Self {
@@ -137,10 +137,10 @@ where
     }
 }
 
-impl<I, F> KvIterator for SortedRunIterator<I, F>
+impl<'a, I, F> KvIterator<'a> for SortedRunIterator<I, F>
 where
-    I: KvIterator,
-    F: Fn(&DataFile) -> Result<I>,
+    I: for<'b> KvIterator<'b>,
+    F: Fn(&DataFile) -> Result<I> + 'a,
 {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
         // Binary search for the first file whose end_key >= target

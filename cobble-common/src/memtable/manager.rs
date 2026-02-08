@@ -610,17 +610,20 @@ fn flush_memtable(
     (result, memtable, seq)
 }
 
-struct PrimedIterator<I: KvIterator> {
+struct PrimedIterator<I> {
     inner: I,
 }
 
-impl<I: KvIterator> PrimedIterator<I> {
+impl<I> PrimedIterator<I> {
     fn new(inner: I) -> Self {
         Self { inner }
     }
 }
 
-impl<I: KvIterator> KvIterator for PrimedIterator<I> {
+impl<'a, I> KvIterator<'a> for PrimedIterator<I>
+where
+    I: KvIterator<'a>,
+{
     fn seek(&mut self, target: &[u8]) -> Result<()> {
         self.inner.seek(target)?;
         let _ = self.inner.next()?;

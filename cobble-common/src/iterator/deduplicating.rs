@@ -22,7 +22,7 @@ use std::sync::Arc;
 /// The wrapped iterator must already produce keys in sorted order
 /// (typically a `MergingIterator`), with entries from newer sources
 /// appearing before entries from older sources when keys are equal.
-pub struct DeduplicatingIterator<I: KvIterator> {
+pub struct DeduplicatingIterator<I> {
     /// The underlying iterator (typically a MergingIterator).
     inner: I,
     /// Number of columns in the value schema.
@@ -35,7 +35,7 @@ pub struct DeduplicatingIterator<I: KvIterator> {
     ttl_provider: Arc<TTLProvider>,
 }
 
-impl<I: KvIterator> DeduplicatingIterator<I> {
+impl<I> DeduplicatingIterator<I> {
     /// Creates a new `DeduplicatingIterator` wrapping the given iterator.
     ///
     /// # Arguments
@@ -59,7 +59,10 @@ impl<I: KvIterator> DeduplicatingIterator<I> {
     /// The iterator is expected to return entries in order where newer entries
     /// come before older entries for the same key. We collect all values and
     /// then merge from oldest to newest, so that newer values override older ones.
-    fn collect_and_merge(&mut self) -> Result<()> {
+    fn collect_and_merge<'a>(&mut self) -> Result<()>
+    where
+        I: KvIterator<'a>,
+    {
         loop {
             if !self.inner.valid() {
                 self.current_key = None;
@@ -129,7 +132,10 @@ impl<I: KvIterator> DeduplicatingIterator<I> {
     }
 }
 
-impl<I: KvIterator> KvIterator for DeduplicatingIterator<I> {
+impl<'a, I> KvIterator<'a> for DeduplicatingIterator<I>
+where
+    I: KvIterator<'a>,
+{
     fn seek(&mut self, target: &[u8]) -> Result<()> {
         self.inner.seek(target)?;
         self.collect_and_merge()

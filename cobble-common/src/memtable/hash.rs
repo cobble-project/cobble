@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use bytes::{Buf, BufMut, Bytes};
 
 use crate::error::{Error, Result};
@@ -25,11 +26,28 @@ pub(crate) struct MemtableValueIter<'a> {
     bucket: usize,
 }
 
+#[derive(PartialEq, Eq, Ord)]
+struct KVPair<'a> {
+    key: &'a[u8],
+    value: &'a[u8],
+    offset: usize,
+}
+
+impl PartialOrd for KVPair<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let ord = self.key.cmp(other.key);
+        if ord == Ordering::Equal {
+            Some(self.offset.cmp(&other.offset))
+        } else {
+            Some(ord)
+        }
+    }
+}
+
 pub(crate) struct MemtableKvIterator<'a> {
     mem: &'a HashMemtable,
-    keys: Vec<Vec<u8>>,
+    key_values: Vec<KVPair<'a>>,
     key_idx: usize,
-    current_values: Option<MemtableValueIter<'a>>,
     current_key: Option<Bytes>,
     current_value: Option<Bytes>,
 }
@@ -235,7 +253,7 @@ impl Memtable for HashMemtable {
     /// Returns an iterator over all key-value pairs ordered by key bytes ascending.
     /// For duplicate keys, values are yielded in reverse insertion order (latest first).
     fn iter(&self) -> MemtableKvIterator<'_> {
-        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut key_values: Vec<KVPair> = Vec::new();
         let mut offset = 0;
         while offset < self.data_end {
             if offset + 8 > self.data_end {
@@ -247,18 +265,14 @@ impl Memtable for HashMemtable {
             if key_len + value_len > slice.remaining() {
                 break;
             }
-            let key_bytes = slice.copy_to_bytes(key_len);
-            if !keys.iter().any(|k| k.as_slice() == key_bytes.as_ref()) {
-                keys.push(key_bytes.to_vec());
-            }
+            key_values.push(KVPair { key: &slice[..key_len], value: &slice[key_len..key_len + value_len], offset });
             offset += Self::entry_size(key_len, value_len);
         }
-        keys.sort();
+        key_values.sort();
         MemtableKvIterator {
             mem: self,
-            keys,
+            key_values,
             key_idx: 0,
-            current_values: None,
             current_key: None,
             current_value: None,
         }
@@ -310,13 +324,12 @@ impl Drop for HashMemtable {
     }
 }
 
-impl KvIterator for MemtableKvIterator<'_> {
+impl<'a> KvIterator<'a> for MemtableKvIterator<'a> {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
-        match self.keys.binary_search_by(|k| k.as_slice().cmp(target)) {
+        match self.key_values.binary_search_by(|k| (*k).key.cmp(target)) {
             Ok(idx) => self.key_idx = idx,
             Err(idx) => self.key_idx = idx,
         }
-        self.current_values = None;
         self.current_key = None;
         self.current_value = None;
         Ok(())
@@ -324,33 +337,22 @@ impl KvIterator for MemtableKvIterator<'_> {
 
     fn seek_to_first(&mut self) -> Result<()> {
         self.key_idx = 0;
-        self.current_values = None;
         self.current_key = None;
         self.current_value = None;
         Ok(())
     }
 
     fn next(&mut self) -> Result<bool> {
-        loop {
-            if let Some(ref mut vals) = self.current_values
-                && let Some(v) = vals.next()
-            {
-                let key_bytes = Bytes::copy_from_slice(self.keys[self.key_idx - 1].as_slice());
-                self.current_key = Some(key_bytes);
-                self.current_value = Some(Bytes::copy_from_slice(v));
-                return Ok(true);
-            }
-            if self.key_idx >= self.keys.len() {
-                self.current_key = None;
-                self.current_value = None;
-                return Ok(false);
-            }
-            let key = &self.keys[self.key_idx];
-            self.key_idx += 1;
-            let iter = self.mem.get_all(key);
-            self.current_values = Some(iter);
-            // continue loop to fetch first value for this key
+        if self.key_idx >= self.key_values.len() {
+            self.current_key = None;
+            self.current_value = None;
+            return Ok(false);
         }
+        let key_value = &self.key_values[self.key_idx];
+        self.key_idx += 1;
+        self.current_key = Some(Bytes::copy_from_slice(key_value.key));
+        self.current_value = Some(Bytes::copy_from_slice(key_value.value));
+        Ok(true)
     }
 
     fn valid(&self) -> bool {

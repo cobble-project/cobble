@@ -33,7 +33,7 @@ pub fn create_iterator(
     file: &DataFile,
     file_manager: &Arc<FileManager>,
     options: &IteratorFactoryOptions,
-) -> Result<Box<dyn KvIterator>> {
+) -> Result<Box<dyn for<'a> KvIterator<'a>>> {
     match file.file_type {
         DataFileType::SSTable => {
             let reader = file_manager.open_data_file_reader(file.file_id)?;
@@ -63,6 +63,6 @@ pub fn create_iterator(
 pub fn make_iterator_factory(
     file_manager: Arc<FileManager>,
     options: IteratorFactoryOptions,
-) -> impl Fn(&DataFile) -> Result<Box<dyn KvIterator>> {
+) -> impl Fn(&DataFile) -> Result<Box<dyn for<'a> KvIterator<'a>>> {
     move |file: &DataFile| create_iterator(file, &file_manager, &options)
 }
