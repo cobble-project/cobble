@@ -387,7 +387,11 @@ impl LSMTree {
             return;
         }
         debug!("trigger compaction plan {}", plan);
-        let runs = build_runs_for_plan(&levels_snapshot.lsm_version.levels, &plan);
+        let runs = build_runs_for_plan(
+            &levels_snapshot.lsm_version.levels,
+            &plan,
+            &state.compaction_config,
+        );
         if let Some(handle) = worker.submit_runs(
             runs,
             plan.output_level,

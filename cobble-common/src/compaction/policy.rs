@@ -103,42 +103,34 @@ impl CompactionPolicy for RoundRobinPolicy {
         if levels.is_empty() {
             return None;
         }
-        let first_level = pick_first_level(levels, &config);
-        if first_level.is_some() {
-            return first_level;
-        }
+        let input_level = levels
+            .iter()
+            .rev()
+            .filter(|level| level.ordinal > 0 && level.ordinal < config.max_level)
+            .find(|level| {
+                let threshold = level_threshold(
+                    config.l1_base_bytes,
+                    config.level_size_multiplier,
+                    level.ordinal,
+                );
+                if threshold == 0 {
+                    return false;
+                }
+                let level_size: usize = level.files.iter().map(|file| file.size).sum();
+                level_size > threshold
+            });
 
-        let mut best_level: Option<u8> = None;
-        let mut best_ratio = 1.0;
-
-        for level in levels {
-            if level.ordinal == 0 || level.ordinal >= config.max_level {
-                continue;
+        let level = if let Some(input_level) = input_level {
+            input_level
+        } else {
+            let first_level = pick_first_level(levels, &config);
+            if first_level.is_some() {
+                return first_level;
             }
-            let threshold = level_threshold(
-                config.l1_base_bytes,
-                config.level_size_multiplier,
-                level.ordinal,
-            );
-            if threshold == 0 {
-                continue;
-            }
-            let level_size: usize = level.files.iter().map(|file| file.size).sum();
-            let ratio = level_size as f64 / threshold as f64;
-            if ratio > 1.0 && ratio > best_ratio {
-                best_ratio = ratio;
-                best_level = Some(level.ordinal);
-            }
-        }
-
-        let selected = best_level?;
-        if selected >= config.max_level {
             return None;
-        }
-        let level = levels.iter().find(|level| level.ordinal == selected)?;
-        if level.files.is_empty() {
-            return None;
-        }
+        };
+
+        let selected = level.ordinal;
         let mut sorted = level.files.clone();
         sorted.sort_by_key(|file| file.file_id);
         let last_file_id = self
@@ -188,57 +180,53 @@ impl CompactionPolicy for MinOverlapPolicy {
         if levels.is_empty() {
             return None;
         }
-        let first_level = pick_first_level(levels, &config);
-        if first_level.is_some() {
-            return first_level;
-        }
 
-        let mut best: Option<(usize, u64, usize)> = None;
-        let max_level = levels
+        let input_level = levels
             .iter()
-            .map(|level| level.ordinal as usize)
-            .max()
-            .unwrap_or(0);
-        for level in 1..=max_level.saturating_sub(1) {
-            if level as u8 >= config.max_level {
-                continue;
-            }
-            let threshold = level_threshold(
-                config.l1_base_bytes,
-                config.level_size_multiplier,
-                level as u8,
-            );
-            if threshold == 0 {
-                continue;
-            }
-            let Some(input_level) = levels.iter().find(|item| item.ordinal == level as u8) else {
-                continue;
-            };
-            let level_size: usize = input_level.files.iter().map(|file| file.size).sum();
-            if level_size <= threshold {
-                continue;
-            }
-            let output_level = levels.iter().find(|item| item.ordinal == level as u8 + 1);
-            if output_level.is_none() {
-                continue;
-            }
-            let output_files = output_level
-                .map(|item| item.files.as_slice())
-                .unwrap_or_default();
-            for file in &input_level.files {
-                let overlap_bytes = overlap_size(file, output_files);
-                let candidate = (overlap_bytes, file.file_id, level);
-                if best
-                    .as_ref()
-                    .is_none_or(|current| compare_overlap(candidate, *current) == Ordering::Less)
-                {
-                    best = Some(candidate);
+            .rev()
+            .filter(|level| level.ordinal > 0 && level.ordinal < config.max_level)
+            .find(|level| {
+                let threshold = level_threshold(
+                    config.l1_base_bytes,
+                    config.level_size_multiplier,
+                    level.ordinal,
+                );
+                if threshold == 0 {
+                    return false;
                 }
+                let level_size: usize = level.files.iter().map(|file| file.size).sum();
+                level_size > threshold
+            });
+
+        let input_level = if let Some(input_level) = input_level {
+            input_level
+        } else {
+            let first_level = pick_first_level(levels, &config);
+            if first_level.is_some() {
+                return first_level;
+            }
+            return None;
+        };
+
+        let selected_level = input_level.ordinal as usize;
+        let output_level = levels
+            .iter()
+            .find(|item| item.ordinal == selected_level as u8 + 1);
+        let output_files: &[Arc<DataFile>] =
+            output_level.map(|level| level.files.as_slice()).unwrap_or(&[]);
+        let mut best: Option<(usize, u64, usize)> = None;
+        for file in &input_level.files {
+            let overlap_bytes = overlap_size(file, output_files);
+            let candidate = (overlap_bytes, file.file_id, selected_level);
+            if best
+                .as_ref()
+                .is_none_or(|current| compare_overlap(candidate, *current) == Ordering::Less)
+            {
+                best = Some(candidate);
             }
         }
 
-        let (overlap, base_file_id, level) = best?;
-        let _ = overlap;
+        let (_, base_file_id, level) = best?;
         let input_file = levels
             .iter()
             .find(|item| item.ordinal == level as u8)
@@ -260,7 +248,11 @@ impl CompactionPolicy for MinOverlapPolicy {
     }
 }
 
-pub(crate) fn build_runs_for_plan(levels: &[Level], plan: &CompactionPlan) -> Vec<SortedRun> {
+pub(crate) fn build_runs_for_plan(
+    levels: &[Level],
+    plan: &CompactionPlan,
+    config: &CompactionConfig,
+) -> Vec<SortedRun> {
     if levels.is_empty() {
         return Vec::new();
     }
@@ -274,18 +266,107 @@ pub(crate) fn build_runs_for_plan(levels: &[Level], plan: &CompactionPlan) -> Ve
     let Some(input_level) = input_level else {
         return runs;
     };
+    let mut output_range: Option<(usize, usize)>;
+    let mut output_files_opt: Option<Vec<Arc<DataFile>>> = None;
     let input_files = if input_level.tiered {
         input_level.files.clone()
-    } else if let Some(input_file) = input_level
-        .files
-        .iter()
-        .filter(|file| file.file_id >= plan.base_file_id)
-        .min_by_key(|file| file.file_id)
-        .cloned()
-    {
-        vec![input_file]
     } else {
-        Vec::new()
+        let base_file_info = input_level
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| file.file_id >= plan.base_file_id)
+            .min_by_key(|(_, file)| file.file_id);
+        let Some((base_idx, base_file)) = base_file_info else {
+            return Vec::new();
+        };
+        let mut min_idx = base_idx;
+        let mut max_idx = base_idx;
+        let mut selected_bytes = base_file.size;
+        let threshold = level_threshold(
+            config.l1_base_bytes,
+            config.level_size_multiplier,
+            input_level.ordinal,
+        );
+        let output_candidates: &[Arc<DataFile>] = output_level
+            .map(|level| level.files.as_slice())
+            .unwrap_or(&[]);
+        output_range = overlap_range_for_file(base_file, output_candidates);
+        if threshold > 0 {
+            let level_size: usize = input_level.files.iter().map(|file| file.size).sum();
+            let target_bytes = level_size.saturating_sub(threshold);
+            if target_bytes > 0 && selected_bytes < target_bytes {
+                while selected_bytes < target_bytes {
+                    let left_idx = min_idx.checked_sub(1);
+                    let right_idx = if max_idx + 1 < input_level.files.len() {
+                        Some(max_idx + 1)
+                    } else {
+                        None
+                    };
+                    if left_idx.is_none() && right_idx.is_none() {
+                        break;
+                    }
+                    let left_overlaps = left_idx.map(|idx| {
+                        output_range
+                            .map(|(start, end)| {
+                                output_candidates[start..=end].iter().any(|output_file| {
+                                    file_overlap(&input_level.files[idx], output_file)
+                                })
+                            })
+                            .unwrap_or(false)
+                    });
+                    let right_overlaps = right_idx.map(|idx| {
+                        output_range
+                            .map(|(start, end)| {
+                                output_candidates[start..=end].iter().any(|output_file| {
+                                    file_overlap(&input_level.files[idx], output_file)
+                                })
+                            })
+                            .unwrap_or(false)
+                    });
+                    let next_idx = match (left_idx, right_idx, left_overlaps, right_overlaps) {
+                        (Some(left), Some(_right), Some(true), Some(false)) => left,
+                        (Some(_left), Some(right), Some(false), Some(true)) => right,
+                        (Some(left), Some(right), _, _) => {
+                            if input_level.files[left].file_id <= input_level.files[right].file_id {
+                                left
+                            } else {
+                                right
+                            }
+                        }
+                        (Some(left), None, _, _) => left,
+                        (None, Some(right), _, _) => right,
+                        (None, None, _, _) => break,
+                    };
+                    if next_idx < min_idx {
+                        min_idx = next_idx;
+                    } else if next_idx > max_idx {
+                        max_idx = next_idx;
+                    }
+                    selected_bytes =
+                        selected_bytes.saturating_add(input_level.files[next_idx].size);
+                    if let Some(range) =
+                        overlap_range_for_file(&input_level.files[next_idx], output_candidates)
+                    {
+                        output_range = Some(match output_range {
+                            Some((start, end)) => (start.min(range.0), end.max(range.1)),
+                            None => range,
+                        });
+                    }
+                }
+            }
+        }
+        let selected_files: Vec<Arc<DataFile>> = (min_idx..=max_idx)
+            .map(|idx| Arc::clone(&input_level.files[idx]))
+            .collect();
+        if let Some(output_level) = output_level
+            && output_level.ordinal != 0
+            && plan.input_level != plan.output_level
+        {
+            output_files_opt =
+                output_range.map(|(start, end)| output_level.files[start..=end].to_vec());
+        }
+        selected_files
     };
     if input_files.is_empty() {
         return runs;
@@ -303,7 +384,9 @@ pub(crate) fn build_runs_for_plan(levels: &[Level], plan: &CompactionPlan) -> Ve
     if output_level.ordinal == 0 || plan.input_level == plan.output_level {
         // No output level or same level compaction (e.g., level 0 compaction)
     } else {
-        let output_files = if input_level.tiered {
+        let output_files: Vec<Arc<DataFile>> = if let Some(output_files) = output_files_opt {
+            output_files
+        } else if input_level.tiered {
             let (start_key, end_key) = input_files.iter().fold(
                 (
                     input_files[0].start_key.as_slice(),
@@ -325,11 +408,7 @@ pub(crate) fn build_runs_for_plan(levels: &[Level], plan: &CompactionPlan) -> Ve
                 .cloned()
                 .collect()
         } else {
-            let input_file = input_files
-                .iter()
-                .min_by_key(|file| file.file_id)
-                .expect("input_files not empty");
-            overlapping_files(input_file, &output_level.files).unwrap_or_default()
+            Vec::new()
         };
         if !output_files.is_empty() {
             runs.push(SortedRun::new(plan.output_level, output_files));
@@ -344,6 +423,27 @@ fn overlap_size(file: &DataFile, candidates: &[Arc<DataFile>]) -> usize {
         .filter(|candidate| file_overlap(file, candidate))
         .map(|candidate| candidate.size)
         .sum()
+}
+
+fn overlap_range_for_file(file: &DataFile, candidates: &[Arc<DataFile>]) -> Option<(usize, usize)> {
+    let mut start: Option<usize> = None;
+    let mut end: Option<usize> = None;
+    for (idx, candidate) in candidates.iter().enumerate() {
+        if file_overlap(file, candidate) {
+            if start.is_none() {
+                start = Some(idx);
+            }
+            end = Some(idx);
+            continue;
+        }
+        if candidate.start_key.as_slice() > file.end_key.as_slice() {
+            break;
+        }
+    }
+    match (start, end) {
+        (Some(start), Some(end)) => Some((start, end)),
+        _ => None,
+    }
 }
 
 fn overlapping_files(file: &DataFile, candidates: &[Arc<DataFile>]) -> Option<Vec<Arc<DataFile>>> {
@@ -443,7 +543,7 @@ mod tests {
             l0_file_limit: 4,
             l1_base_bytes: 10,
             level_size_multiplier: 10,
-            max_level: 3,
+            max_level: 4,
             bloom_filter_enabled: true,
             bloom_bits_per_key: 10,
             ..CompactionConfig::default()
@@ -456,7 +556,188 @@ mod tests {
         let level2 = Level {
             ordinal: 2,
             tiered: false,
-            files: vec![make_file(3, b"a", b"z", 10), make_file(4, b"g", b"h", 200)],
+            files: vec![make_file(3, b"a", b"f", 60), make_file(4, b"g", b"h", 60)],
+        };
+        let level3 = Level {
+            ordinal: 3,
+            tiered: false,
+            files: vec![make_file(5, b"a", b"z", 10), make_file(6, b"g", b"h", 200)],
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let mut policy = MinOverlapPolicy::new();
+        let plan = policy
+            .pick(&vec![level0, level1, level2, level3], config)
+            .expect("plan");
+        assert_eq!(plan.input_level, 2);
+        assert_eq!(plan.base_file_id, 3);
+        assert!(!plan.trivial_move);
+    }
+
+    #[test]
+    fn test_build_runs_for_plan_expands_input() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 10,
+            level_size_multiplier: 10,
+            max_level: 3,
+            ..CompactionConfig::default()
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![
+                make_file(1, b"a", b"b", 6),
+                make_file(2, b"c", b"d", 6),
+                make_file(3, b"e", b"f", 6),
+            ],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let plan = CompactionPlan {
+            input_level: 1,
+            output_level: 2,
+            base_file_id: 1,
+            trivial_move: false,
+        };
+        let runs = build_runs_for_plan(&[level1, level2], &plan, &config);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len(), 2);
+        let file_ids: Vec<u64> = runs[0].files().iter().map(|file| file.file_id).collect();
+        assert_eq!(file_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_build_runs_for_plan_prefers_output_overlap() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 10,
+            level_size_multiplier: 10,
+            max_level: 3,
+            ..CompactionConfig::default()
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![
+                make_file(1, b"a", b"b", 6),
+                make_file(2, b"c", b"d", 6),
+                make_file(3, b"e", b"f", 6),
+            ],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: vec![make_file(4, b"c", b"f", 5)],
+        };
+        let plan = CompactionPlan {
+            input_level: 1,
+            output_level: 2,
+            base_file_id: 2,
+            trivial_move: false,
+        };
+        let runs = build_runs_for_plan(&[level1, level2], &plan, &config);
+        assert_eq!(runs.len(), 2);
+        let file_ids: Vec<u64> = runs[0].files().iter().map(|file| file.file_id).collect();
+        assert_eq!(file_ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_round_robin_prefers_deeper_level() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 10,
+            level_size_multiplier: 1,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![make_file(1, b"a", b"b", 12)],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: vec![make_file(2, b"c", b"d", 12)],
+        };
+        let level3 = Level {
+            ordinal: 3,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let mut policy = RoundRobinPolicy::new();
+        let plan = policy
+            .pick(&vec![level0, level1, level2, level3], config)
+            .expect("plan");
+        assert_eq!(plan.input_level, 2);
+    }
+
+    #[test]
+    fn test_min_overlap_prefers_deeper_level() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 10,
+            level_size_multiplier: 1,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![make_file(1, b"a", b"b", 12)],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: vec![make_file(2, b"c", b"e", 12)],
+        };
+        let level3 = Level {
+            ordinal: 3,
+            tiered: false,
+            files: vec![make_file(3, b"c", b"d", 5)],
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let mut policy = MinOverlapPolicy::new();
+        let plan = policy
+            .pick(&vec![level0, level1, level2, level3], config)
+            .expect("plan");
+        assert_eq!(plan.input_level, 2);
+    }
+
+    #[test]
+    fn test_min_overlap_prefers_deeper_level_without_output() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 10,
+            level_size_multiplier: 1,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![make_file(1, b"a", b"b", 12)],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: vec![make_file(2, b"c", b"d", 12)],
         };
         let level0 = Level {
             ordinal: 0,
@@ -467,8 +748,6 @@ mod tests {
         let plan = policy
             .pick(&vec![level0, level1, level2], config)
             .expect("plan");
-        assert_eq!(plan.input_level, 1);
-        assert_eq!(plan.base_file_id, 1);
-        assert!(!plan.trivial_move);
+        assert_eq!(plan.input_level, 2);
     }
 }
