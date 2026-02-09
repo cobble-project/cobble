@@ -2,42 +2,6 @@ use crate::error::Result;
 use crate::iterator::KvIterator;
 use bytes::Bytes;
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-
-/// A wrapper for iterator entries in the heap.
-/// This stores the current key and the index of the iterator.
-struct HeapEntry {
-    /// The current key from the iterator.
-    key: Bytes,
-    /// The index of the iterator in the iterators vector.
-    iter_idx: usize,
-}
-
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.iter_idx == other.iter_idx
-    }
-}
-
-impl Eq for HeapEntry {}
-
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse ordering for min-heap behavior
-        // First compare by key (smaller key has higher priority)
-        // Then by iterator index (smaller index has higher priority for stability)
-        match other.key.cmp(&self.key) {
-            Ordering::Equal => other.iter_idx.cmp(&self.iter_idx),
-            ord => ord,
-        }
-    }
-}
 
 /// A merging iterator that combines multiple sorted iterators into a single
 /// globally ordered iterator.
@@ -47,8 +11,8 @@ impl Ord for HeapEntry {
 pub struct MergingIterator<I> {
     /// The child iterators being merged.
     iterators: Vec<I>,
-    /// The min-heap for efficient minimum key selection.
-    heap: BinaryHeap<HeapEntry>,
+    /// The min-heap of iterator indices for efficient minimum key selection.
+    heap: Vec<usize>,
     /// The index of the current (smallest) iterator.
     current_idx: Option<usize>,
 }
@@ -58,7 +22,7 @@ impl<I> MergingIterator<I> {
     pub fn new(iterators: Vec<I>) -> Self {
         Self {
             iterators,
-            heap: BinaryHeap::new(),
+            heap: Vec::new(),
             current_idx: None,
         }
     }
@@ -68,19 +32,108 @@ impl<I> MergingIterator<I> {
     where
         I: KvIterator<'a>,
     {
-        self.heap.clear();
-
+        let mut indices = Vec::new();
         for (idx, iter) in self.iterators.iter().enumerate() {
-            if iter.valid()
-                && let Some(key) = iter.key()?
-            {
-                self.heap.push(HeapEntry { key, iter_idx: idx });
+            if iter.valid() && iter.key_slice()?.is_some() {
+                indices.push(idx);
             }
         }
 
-        self.current_idx = self.heap.peek().map(|e| e.iter_idx);
+        self.heap.clear();
+        for idx in indices {
+            self.push_heap(idx)?;
+        }
+
+        self.current_idx = self.heap.first().copied();
         Ok(())
     }
+
+    fn compare_iters<'a>(&self, left_idx: usize, right_idx: usize) -> Result<Ordering>
+    where
+        I: KvIterator<'a>,
+    {
+        let left = self.iterators[left_idx].key_slice()?;
+        let right = self.iterators[right_idx].key_slice()?;
+        let ord = match (left, right) {
+            (Some(left), Some(right)) => left.cmp(right),
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (None, None) => Ordering::Equal,
+        };
+        if ord == Ordering::Equal {
+            Ok(left_idx.cmp(&right_idx))
+        } else {
+            Ok(ord)
+        }
+    }
+
+    fn push_heap<'a>(&mut self, idx: usize) -> Result<()>
+    where
+        I: KvIterator<'a>,
+    {
+        self.heap.push(idx);
+        self.sift_up(self.heap.len().saturating_sub(1))
+    }
+
+    fn pop_heap<'a>(&mut self) -> Result<Option<usize>>
+    where
+        I: KvIterator<'a>,
+    {
+        let Some(last) = self.heap.pop() else {
+            return Ok(None);
+        };
+        if self.heap.is_empty() {
+            return Ok(Some(last));
+        }
+        let min = self.heap[0];
+        self.heap[0] = last;
+        self.sift_down(0)?;
+        Ok(Some(min))
+    }
+
+    fn sift_up<'a>(&mut self, mut idx: usize) -> Result<()>
+    where
+        I: KvIterator<'a>,
+    {
+        while idx > 0 {
+            let parent = (idx - 1) / 2;
+            if self.compare_iters(self.heap[idx], self.heap[parent])? == Ordering::Less {
+                self.heap.swap(idx, parent);
+                idx = parent;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn sift_down<'a>(&mut self, mut idx: usize) -> Result<()>
+    where
+        I: KvIterator<'a>,
+    {
+        let len = self.heap.len();
+        loop {
+            let left = idx * 2 + 1;
+            let right = left + 1;
+            if left >= len {
+                break;
+            }
+            let mut smallest = left;
+            if right < len
+                && self.compare_iters(self.heap[right], self.heap[left])? == Ordering::Less
+            {
+                smallest = right;
+            }
+            if self.compare_iters(self.heap[smallest], self.heap[idx])? == Ordering::Less {
+                self.heap.swap(idx, smallest);
+                idx = smallest;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
 }
 
 impl<'a, I> KvIterator<'a> for MergingIterator<I>
@@ -109,27 +162,23 @@ where
 
     fn next(&mut self) -> Result<bool> {
         // Pop the current minimum from the heap
-        let Some(entry) = self.heap.pop() else {
+        let Some(iter_idx) = self.pop_heap()? else {
             self.current_idx = None;
             return Ok(false);
         };
-
-        let iter_idx = entry.iter_idx;
 
         // Advance the iterator that had the minimum
         if let Some(iter) = self.iterators.get_mut(iter_idx) {
             iter.next()?;
 
             // Re-add to heap if still valid
-            if iter.valid()
-                && let Some(key) = iter.key()?
-            {
-                self.heap.push(HeapEntry { key, iter_idx });
+            if iter.valid() && iter.key_slice()?.is_some() {
+                self.push_heap(iter_idx)?;
             }
         }
 
         // Update current_idx to the new minimum
-        self.current_idx = self.heap.peek().map(|e| e.iter_idx);
+        self.current_idx = self.heap.first().copied();
 
         Ok(self.current_idx.is_some())
     }

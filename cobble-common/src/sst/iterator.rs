@@ -8,6 +8,7 @@ use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, Value};
 use bytes::Bytes;
 use metrics::counter;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -56,6 +57,11 @@ pub(crate) struct SSTIterator {
     current_entry_idx: usize,
     options: SSTIteratorOptions,
     block_cache: Option<BlockCache>,
+    cached_block_id: Cell<Option<u32>>,
+    cached_entry_idx: Cell<Option<usize>>,
+    // Use RefCell to allow interior mutability for cached bytes, which can be shared as slices.
+    cached_key_bytes: RefCell<Option<Bytes>>,
+    cached_value_bytes: RefCell<Option<Bytes>>,
 }
 
 impl SSTIterator {
@@ -176,6 +182,10 @@ impl SSTIterator {
             current_entry_idx: 0,
             options,
             block_cache,
+            cached_block_id: Cell::new(None),
+            cached_entry_idx: Cell::new(None),
+            cached_key_bytes: RefCell::new(None),
+            cached_value_bytes: RefCell::new(None),
         })
     }
 
@@ -225,11 +235,13 @@ impl SSTIterator {
     pub fn seek(&mut self, target: &[u8]) -> Result<()> {
         if self.index_partitions.is_empty() {
             self.current_data_block = None;
+            self.clear_cached_entry();
             return Ok(());
         }
         if !self.footer.partitioned_index {
             if self.index_block.is_empty() {
                 self.current_data_block = None;
+                self.clear_cached_entry();
                 return Ok(());
             }
             self.current_index_partition_idx = 0;
@@ -417,6 +429,7 @@ impl SSTIterator {
         };
         self.current_data_block = Some(block);
         self.current_entry_idx = 0;
+        self.clear_cached_entry();
 
         Ok(())
     }
@@ -558,10 +571,46 @@ impl SSTIterator {
         Ok(filter)
     }
 
+    fn clear_cached_entry(&self) {
+        self.cached_block_id.set(None);
+        self.cached_entry_idx.set(None);
+        *self.cached_key_bytes.borrow_mut() = None;
+        *self.cached_value_bytes.borrow_mut() = None;
+    }
+
+    fn ensure_cached_bytes(&self) -> Result<()> {
+        if let Some(block) = &self.current_data_block
+            && self.current_entry_idx < block.offsets_len()
+        {
+            let block_id = block.block_id();
+            let cached_same_entry = self.cached_block_id.get() == Some(block_id)
+                && self.cached_entry_idx.get() == Some(self.current_entry_idx);
+            if cached_same_entry {
+                let has_key = self.cached_key_bytes.borrow().is_some();
+                let has_value = self.cached_value_bytes.borrow().is_some();
+                if has_key && has_value {
+                    return Ok(());
+                }
+            } else {
+                *self.cached_key_bytes.borrow_mut() = None;
+                *self.cached_value_bytes.borrow_mut() = None;
+            }
+            let (key, value) = block.get_bytes(self.current_entry_idx)?;
+            self.cached_block_id.set(Some(block_id));
+            self.cached_entry_idx.set(Some(self.current_entry_idx));
+            *self.cached_key_bytes.borrow_mut() = Some(key);
+            *self.cached_value_bytes.borrow_mut() = Some(value);
+            return Ok(());
+        }
+        self.clear_cached_entry();
+        Ok(())
+    }
+
     fn seek_in_current_block(&mut self, target: &[u8]) -> Result<()> {
         if let Some(block) = &self.current_data_block {
             self.current_entry_idx = block.lower_bound(target)?;
         }
+        self.clear_cached_entry();
         Ok(())
     }
 
@@ -569,12 +618,14 @@ impl SSTIterator {
     pub fn seek_to_first(&mut self) -> Result<()> {
         if self.index_partitions.is_empty() {
             self.current_data_block = None;
+            self.clear_cached_entry();
             return Ok(());
         }
 
         if !self.footer.partitioned_index {
             if self.index_block.is_empty() {
                 self.current_data_block = None;
+                self.clear_cached_entry();
                 return Ok(());
             }
             self.current_index_partition_idx = 0;
@@ -645,10 +696,12 @@ impl SSTIterator {
                     let partition = self.current_index_partition.clone().unwrap();
                     self.load_data_block_from_partition(&partition, self.current_block_idx)?;
                     self.current_entry_idx = 0;
+                    self.clear_cached_entry();
                     return Ok(true);
                 }
                 if !self.footer.partitioned_index {
                     self.current_data_block = None;
+                    self.clear_cached_entry();
                     return Ok(false);
                 }
                 let next_partition_idx = self.current_index_partition_idx + 1;
@@ -657,13 +710,16 @@ impl SSTIterator {
                     self.current_block_idx = 0;
                     self.load_data_block_from_partition(&partition, 0)?;
                     self.current_entry_idx = 0;
+                    self.clear_cached_entry();
                     return Ok(true);
                 }
                 // No more blocks
                 self.current_data_block = None;
+                self.clear_cached_entry();
                 return Ok(false);
             }
 
+            self.clear_cached_entry();
             Ok(true)
         } else {
             Ok(false)
@@ -738,11 +794,14 @@ impl<'a> KvIterator<'a> for SSTIterator {
     }
 
     fn key_slice(&self) -> Result<Option<&[u8]>> {
-        if let Some(block) = &self.current_data_block
-            && self.current_entry_idx < block.offsets_len()
-        {
-            let (key, _) = block.get_slices(self.current_entry_idx)?;
-            return Ok(Some(key));
+        self.ensure_cached_bytes()?;
+        let cached = self.cached_key_bytes.borrow();
+        if let Some(bytes) = cached.as_ref() {
+            let ptr = bytes.as_ptr();
+            let len = bytes.len();
+            drop(cached);
+            // SAFETY: cached bytes live as long as the iterator entry remains unchanged.
+            return Ok(Some(unsafe { std::slice::from_raw_parts(ptr, len) }));
         }
         Ok(None)
     }
@@ -752,11 +811,14 @@ impl<'a> KvIterator<'a> for SSTIterator {
     }
 
     fn value_slice(&self) -> Result<Option<&[u8]>> {
-        if let Some(block) = &self.current_data_block
-            && self.current_entry_idx < block.offsets_len()
-        {
-            let (_, value) = block.get_slices(self.current_entry_idx)?;
-            return Ok(Some(value));
+        self.ensure_cached_bytes()?;
+        let cached = self.cached_value_bytes.borrow();
+        if let Some(bytes) = cached.as_ref() {
+            let ptr = bytes.as_ptr();
+            let len = bytes.len();
+            drop(cached);
+            // SAFETY: cached bytes live as long as the iterator entry remains unchanged.
+            return Ok(Some(unsafe { std::slice::from_raw_parts(ptr, len) }));
         }
         Ok(None)
     }

@@ -212,7 +212,7 @@ impl Block {
         Ok((key, value))
     }
 
-    pub fn get_slices(&self, idx: usize) -> Result<(&[u8], &[u8])> {
+    pub fn get_bytes(&self, idx: usize) -> Result<(Bytes, Bytes)> {
         if idx >= self.offsets.len() {
             return Err(Error::IoError(format!(
                 "Index out of bounds: {} >= {}",
@@ -253,7 +253,10 @@ impl Block {
             return Err(Error::IoError("Corrupted value data".to_string()));
         }
 
-        Ok((&data[key_start..key_end], &data[value_start..value_end]))
+        Ok((
+            self.data.slice(key_start..key_end),
+            self.data.slice(value_start..value_end),
+        ))
     }
 
     pub fn offsets_len(&self) -> usize {

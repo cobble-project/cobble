@@ -71,42 +71,39 @@ impl<I> DeduplicatingIterator<I> {
             }
 
             // Get the first key-value pair
-            let key = self.inner.key()?;
-            let value_bytes = self.inner.value()?;
-
-            let (Some(key), Some(value_bytes)) = (key, value_bytes) else {
+            let current = self.inner.current_slice()?;
+            let Some((key_slice, value_slice)) = current else {
                 self.current_key = None;
                 self.current_value = None;
                 return Ok(());
             };
 
-            let current_key = key;
+            let current_key = Bytes::copy_from_slice(key_slice);
 
             // Collect all values with the same key, skipping expired ones
             let mut values = Vec::new();
-            let value = decode_value(&value_bytes, self.num_columns)?;
+            let value = decode_value(value_slice, self.num_columns)?;
             if !self.ttl_provider.expired(&value.expired_at) {
                 values.push(value);
             }
 
             // Advance to next entry and check for same key
             while self.inner.next()? {
-                let next_key = self.inner.key()?;
-                if let Some(ref nk) = next_key {
-                    if nk.as_ref() != current_key.as_ref() {
-                        // Different key, stop collecting
-                        break;
-                    }
-
-                    // Same key, collect the value
-                    if let Some(next_value_bytes) = self.inner.value()? {
-                        let value = decode_value(&next_value_bytes, self.num_columns)?;
-                        if !self.ttl_provider.expired(&value.expired_at) {
-                            values.push(value);
-                        }
-                    }
-                } else {
+                let next_key = self.inner.key_slice()?;
+                let Some(next_key) = next_key else {
                     break;
+                };
+                if next_key != current_key.as_ref() {
+                    // Different key, stop collecting
+                    break;
+                }
+
+                // Same key, collect the value
+                if let Some(next_value_bytes) = self.inner.value_slice()? {
+                    let value = decode_value(next_value_bytes, self.num_columns)?;
+                    if !self.ttl_provider.expired(&value.expired_at) {
+                        values.push(value);
+                    }
                 }
             }
 
