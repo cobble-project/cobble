@@ -133,7 +133,6 @@ impl<I> MergingIterator<I> {
         }
         Ok(())
     }
-
 }
 
 impl<'a, I> KvIterator<'a> for MergingIterator<I>

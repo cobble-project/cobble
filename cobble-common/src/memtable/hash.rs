@@ -1,5 +1,5 @@
-use std::cmp::Ordering;
 use bytes::{Buf, BufMut, Bytes};
+use std::cmp::Ordering;
 
 use crate::error::{Error, Result};
 use crate::iterator::KvIterator;
@@ -28,8 +28,8 @@ pub(crate) struct MemtableValueIter<'a> {
 
 #[derive(PartialEq, Eq)]
 struct KVPair<'a> {
-    key: &'a[u8],
-    value: &'a[u8],
+    key: &'a [u8],
+    value: &'a [u8],
     offset: usize,
 }
 
@@ -271,7 +271,11 @@ impl Memtable for HashMemtable {
             if key_len + value_len > slice.remaining() {
                 break;
             }
-            key_values.push(KVPair { key: &slice[..key_len], value: &slice[key_len..key_len + value_len], offset });
+            key_values.push(KVPair {
+                key: &slice[..key_len],
+                value: &slice[key_len..key_len + value_len],
+                offset,
+            });
             offset += Self::entry_size(key_len, value_len);
         }
         key_values.sort();
@@ -332,7 +336,7 @@ impl Drop for HashMemtable {
 
 impl<'a> KvIterator<'a> for MemtableKvIterator<'a> {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
-        match self.key_values.binary_search_by(|k| (*k).key.cmp(target)) {
+        match self.key_values.binary_search_by(|k| k.key.cmp(target)) {
             Ok(idx) => self.key_idx = idx,
             Err(idx) => self.key_idx = idx,
         }
@@ -366,9 +370,7 @@ impl<'a> KvIterator<'a> for MemtableKvIterator<'a> {
     }
 
     fn key(&self) -> Result<Option<Bytes>> {
-        Ok(self
-            .current_key
-            .map(|key| Bytes::copy_from_slice(key)))
+        Ok(self.current_key.map(Bytes::copy_from_slice))
     }
 
     fn key_slice(&self) -> Result<Option<&[u8]>> {
@@ -376,9 +378,7 @@ impl<'a> KvIterator<'a> for MemtableKvIterator<'a> {
     }
 
     fn value(&self) -> Result<Option<Bytes>> {
-        Ok(self
-            .current_value
-            .map(|value| Bytes::copy_from_slice(value)))
+        Ok(self.current_value.map(Bytes::copy_from_slice))
     }
 
     fn value_slice(&self) -> Result<Option<&[u8]>> {

@@ -1,3 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["cobble-bench","cobble-common"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"

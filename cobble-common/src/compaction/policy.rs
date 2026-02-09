@@ -212,8 +212,9 @@ impl CompactionPolicy for MinOverlapPolicy {
         let output_level = levels
             .iter()
             .find(|item| item.ordinal == selected_level as u8 + 1);
-        let output_files: &[Arc<DataFile>] =
-            output_level.map(|level| level.files.as_slice()).unwrap_or(&[]);
+        let output_files: &[Arc<DataFile>] = output_level
+            .map(|level| level.files.as_slice())
+            .unwrap_or(&[]);
         let mut best: Option<(usize, u64, usize)> = None;
         for file in &input_level.files {
             let overlap_bytes = overlap_size(file, output_files);

@@ -1,11 +1,12 @@
-use rand_core::SeedableRng;
 use cobble::{Config, Db, VolumeDescriptor, WriteBatch};
+use log::LevelFilter::Debug;
+use rand_core::Rng;
+use rand_core::SeedableRng;
+use rand_xorshift::XorShiftRng;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use rand_core::Rng;
-use rand_xorshift::XorShiftRng;
 
 const DEFAULT_KEY_COUNT: u64 = 100_000_000;
 const DEFAULT_BATCH_SIZE: usize = 1_000;
@@ -135,6 +136,7 @@ impl KeyGenerator for RandomKeyGenerator {
         if self.index >= self.key_count {
             return None;
         }
+        self.index += 1;
         self.rng.fill_bytes(self.buffer.as_mut_slice());
         Some(self.buffer.as_slice())
     }
@@ -142,8 +144,12 @@ impl KeyGenerator for RandomKeyGenerator {
 
 fn run(args: Args) -> Result<(), String> {
     prepare_db_dir(&args.db_path)?;
-    let mut config = Config::default();
-    config.volumes = VolumeDescriptor::single_volume(format!("file://{}", args.db_path.display()));
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", args.db_path.display())),
+        log_level: Debug,
+        log_console: true,
+        ..Config::default()
+    };
     let db = Db::open(config).map_err(|err| format!("Failed to open db: {err}"))?;
 
     println!(
@@ -174,7 +180,7 @@ fn run(args: Args) -> Result<(), String> {
             batch_count = 0;
         }
 
-        if inserted % progress_every == 0 {
+        if inserted.is_multiple_of(progress_every) {
             let elapsed = start.elapsed();
             let seconds = elapsed.as_secs_f64().max(1e-9);
             let rate = inserted as f64 / seconds;

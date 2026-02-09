@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 cobble = { path = "../cobble-common" }
+log = "0.4.29"
 rand_core = "0.10.0"
 rand_xorshift = "0.5.0"

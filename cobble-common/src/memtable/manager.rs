@@ -586,9 +586,7 @@ fn flush_memtable(
         );
         dedup_iter.seek_to_first()?;
         while dedup_iter.valid() {
-            if let (Some(key), Some(value)) =
-                (dedup_iter.key_slice()?, dedup_iter.value_slice()?)
-            {
+            if let (Some(key), Some(value)) = (dedup_iter.key_slice()?, dedup_iter.value_slice()?) {
                 builder.add(key, value)?;
             }
             dedup_iter.next()?;
