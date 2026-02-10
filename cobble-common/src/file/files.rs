@@ -1,5 +1,7 @@
 use crate::error::Error;
 use bytes::{Bytes, BytesMut};
+use std::sync::{Arc, Mutex};
+use tokio::task::JoinHandle;
 
 pub trait File {
     fn close(&mut self) -> Result<(), Error>;
@@ -8,8 +10,21 @@ pub trait File {
     fn size(&self) -> usize;
 }
 
-pub trait RandomAccessFile: File {
+pub trait RandomAccessFile: File + Send + Sync + 'static {
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error>;
+
+    /// Asynchronously read a chunk of data at the specified offset and size.
+    /// Returns a JoinHandle that resolves to the read data or an error.
+    /// This allows for prefetching data in the background while processing other tasks.
+    fn read_at_async(
+        self: Arc<Self>,
+        offset: usize,
+        size: usize,
+    ) -> JoinHandle<Result<Bytes, Error>> {
+        let handle = tokio::runtime::Handle::try_current()
+            .expect("Read-ahead requires an active tokio runtime");
+        handle.spawn_blocking(move || self.read_at(offset, size))
+    }
 }
 
 pub trait SequentialWriteFile: File {
@@ -95,6 +110,146 @@ impl<R: RandomAccessFile> BufferedReader<R> {
         // Return the requested slice
         let end = size.min(self.buffer.len());
         Ok(self.buffer.slice(0..end))
+    }
+}
+
+struct PrefetchState {
+    offset: usize,
+    handle: JoinHandle<Result<Bytes, Error>>,
+}
+
+struct ReadAheadState {
+    buffer: Bytes,
+    buffer_offset: usize,
+    prefetch: Option<PrefetchState>,
+}
+
+/// A read-ahead buffered reader for sequential random access reads.
+/// It buffers a fixed-size window and asynchronously prefetches the next window.
+pub struct ReadAheadBufferedReader<R: RandomAccessFile> {
+    inner: Arc<R>,
+    buffer_size: usize,
+    file_size: usize,
+    state: Mutex<ReadAheadState>,
+}
+
+impl<R: RandomAccessFile> ReadAheadBufferedReader<R> {
+    pub fn new(inner: R, buffer_size: usize) -> Self {
+        let file_size = inner.size();
+        Self {
+            inner: Arc::new(inner),
+            buffer_size,
+            file_size,
+            state: Mutex::new(ReadAheadState {
+                buffer: Bytes::new(),
+                buffer_offset: 0,
+                prefetch: None,
+            }),
+        }
+    }
+
+    fn join_prefetch(&self, prefetch: PrefetchState) -> Result<Bytes, Error> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| Error::IoError("Read-ahead requires a tokio runtime".to_string()))?;
+        handle
+            .block_on(prefetch.handle)
+            .map_err(|e| Error::IoError(format!("Read-ahead task failed: {}", e)))?
+    }
+
+    fn schedule_prefetch(&self, state: &mut ReadAheadState, offset: usize) {
+        if offset >= self.file_size || self.buffer_size == 0 {
+            return;
+        }
+        if let Some(existing) = &state.prefetch
+            && !existing.handle.is_finished()
+        {
+            return;
+        }
+        let size = self.buffer_size.min(self.file_size.saturating_sub(offset));
+        if size == 0 {
+            return;
+        }
+        let handle = Arc::clone(&self.inner).read_at_async(offset, size);
+        state.prefetch = Some(PrefetchState { offset, handle });
+    }
+
+    pub fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
+        if size == 0 {
+            return Ok(Bytes::new());
+        }
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::IoError("Read-ahead state lock poisoned".to_string()))?;
+            let buffer_end = state.buffer_offset + state.buffer.len();
+            if offset >= state.buffer_offset && offset + size <= buffer_end {
+                let start = offset - state.buffer_offset;
+                return Ok(state.buffer.slice(start..start + size));
+            }
+            if let Some(prefetch) = state.prefetch.take() {
+                if offset >= prefetch.offset && offset < prefetch.offset + self.buffer_size {
+                    drop(state);
+                    let prefetch_offset = prefetch.offset;
+                    let buffer = self.join_prefetch(prefetch)?;
+                    let mut state = self.state.lock().map_err(|_| {
+                        Error::IoError("Read-ahead state lock poisoned".to_string())
+                    })?;
+                    state.buffer_offset = prefetch_offset;
+                    state.buffer = buffer;
+                    let buffer_end = state.buffer_offset + state.buffer.len();
+                    if offset + size <= buffer_end {
+                        let next_offset = state.buffer_offset + state.buffer.len();
+                        self.schedule_prefetch(&mut state, next_offset);
+                        let start = offset - state.buffer_offset;
+                        return Ok(state.buffer.slice(start..start + size));
+                    }
+                } else if !prefetch.handle.is_finished() {
+                    state.prefetch = Some(prefetch);
+                }
+            }
+        }
+
+        let read_size = self.buffer_size.max(size);
+        let remaining = self.inner.size().saturating_sub(offset);
+        let read_size = read_size.min(remaining);
+        let buffer = self.inner.read_at(offset, read_size)?;
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::IoError("Read-ahead state lock poisoned".to_string()))?;
+        state.buffer_offset = offset;
+        state.buffer = buffer;
+        let next_offset = state.buffer_offset + state.buffer.len();
+        self.schedule_prefetch(&mut state, next_offset);
+        let buffer_end = state.buffer_offset + state.buffer.len();
+        if offset + size <= buffer_end {
+            let start = offset - state.buffer_offset;
+            Ok(state.buffer.slice(start..start + size))
+        } else {
+            Err(Error::IoError("Read-ahead buffer underrun".to_string()))
+        }
+    }
+}
+
+impl<R: RandomAccessFile> File for ReadAheadBufferedReader<R> {
+    fn close(&mut self) -> Result<(), Error> {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.close()
+        } else {
+            Ok(())
+        }
+    }
+
+    fn size(&self) -> usize {
+        self.file_size
+    }
+}
+
+impl<R: RandomAccessFile> RandomAccessFile for ReadAheadBufferedReader<R> {
+    fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
+        ReadAheadBufferedReader::read_at(self, offset, size)
     }
 }
 

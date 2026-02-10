@@ -281,6 +281,7 @@ impl Db {
             bloom_filter_enabled: config.sst_bloom_filter_enabled,
             bloom_bits_per_key: config.sst_bloom_bits_per_key,
             partitioned_index: config.sst_partitioned_index,
+            read_ahead_enabled: config.compaction_read_ahead_enabled,
             ..crate::compaction::CompactionConfig::default()
         };
         let compaction_factory = crate::compaction::make_sst_builder_factory(sst_options.clone());

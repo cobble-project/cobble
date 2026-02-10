@@ -35,6 +35,27 @@ impl RandomAccessFile for OpendalRandomAccessFile {
                 ))
             })
     }
+
+    fn read_at_async(
+        self: Arc<Self>,
+        offset: usize,
+        size: usize,
+    ) -> tokio::task::JoinHandle<Result<Bytes>> {
+        let reader = self.reader.clone();
+        let runtime = Arc::clone(&self.runtime);
+        runtime.spawn(async move {
+            reader
+                .read(offset as u64..(offset + size) as u64)
+                .await
+                .map(|data| data.to_bytes())
+                .map_err(|e| {
+                    Error::IoError(format!(
+                        "Failed to read at offset {} size {}: {}",
+                        offset, size, e
+                    ))
+                })
+        })
+    }
 }
 
 pub(crate) struct OpendalSequentialWriteFile {

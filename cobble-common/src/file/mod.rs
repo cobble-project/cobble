@@ -15,5 +15,6 @@ pub use self::file_manager::{
 pub use self::file_system::{FileSystem, FileSystemRegistry};
 #[allow(unused_imports)]
 pub use self::files::{
-    BufferedReader, BufferedWriter, File, RandomAccessFile, SequentialWriteFile,
+    BufferedReader, BufferedWriter, File, RandomAccessFile, ReadAheadBufferedReader,
+    SequentialWriteFile,
 };

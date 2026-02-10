@@ -8,7 +8,7 @@
 use crate::compaction::CompactionConfig;
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
-use crate::file::{FileManager, TrackedFileId};
+use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
 use crate::lsm::{LevelEdit, VersionEdit};
@@ -204,9 +204,19 @@ impl CompactionExecutor {
     fn run_compaction(task: CompactionTask, options: CompactionConfig) -> Result<CompactionResult> {
         let mut all_iters: Vec<Box<dyn for<'a> KvIterator<'a>>> = Vec::new();
         let mut read_bytes = 0u64;
+        let use_read_ahead =
+            options.read_ahead_enabled && tokio::runtime::Handle::try_current().is_ok();
         for run in &task.sorted_runs {
             for file in run.files() {
                 let reader = task.file_manager.open_data_file_reader(file.file_id)?;
+                let reader: Box<dyn crate::file::RandomAccessFile> = if use_read_ahead {
+                    Box::new(ReadAheadBufferedReader::new(
+                        reader,
+                        options.read_buffer_size,
+                    ))
+                } else {
+                    Box::new(reader)
+                };
                 // Create iterators for all files in all sorted runs
                 // We iterate files from all sorted runs, with earlier runs (newer data) coming first
                 let sst_options = SSTIteratorOptions {
@@ -216,7 +226,7 @@ impl CompactionExecutor {
                     ..SSTIteratorOptions::default()
                 };
                 let iter = crate::sst::SSTIterator::with_cache(
-                    Box::new(reader),
+                    reader,
                     file.file_id,
                     sst_options.clone(),
                     None,

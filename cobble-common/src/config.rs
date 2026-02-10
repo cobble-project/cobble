@@ -196,6 +196,8 @@ pub struct Config {
     pub max_level: u8,
     /// Compaction policy to use.
     pub compaction_policy: CompactionPolicyKind,
+    /// Enable read-ahead buffering for compaction reads.
+    pub compaction_read_ahead_enabled: bool,
     /// Size of the block cache in bytes. If zero, cache is disabled.
     pub block_cache_size: usize,
     /// Read proxy configuration overrides.
@@ -240,6 +242,7 @@ impl Default for Config {
             level_size_multiplier: 10,
             max_level: 6,
             compaction_policy: CompactionPolicyKind::RoundRobin,
+            compaction_read_ahead_enabled: true,
             block_cache_size: 64 * 1024 * 1024,
             read_proxy: ReadProxyConfigEntry::default(),
             base_file_size: 64 * 1024 * 1024,
@@ -357,6 +360,7 @@ mod tests {
             log_level: log::LevelFilter::Debug,
             snapshot_on_flush: true,
             snapshot_retention: Some(3),
+            compaction_read_ahead_enabled: false,
         };
 
         let serialized = serde_json::to_string(&config).expect("Cannot serialize config");
