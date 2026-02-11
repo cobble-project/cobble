@@ -97,6 +97,7 @@ impl VolumeState {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DataVolume {
     state: Arc<VolumeState>,
     priority: VolumePriority,
@@ -172,6 +173,10 @@ impl TrackedFile {
     /// Marks the file for deletion when this TrackedFile is dropped.
     pub fn mark_for_deletion(&self) {
         self.delete_on_drop.store(true, Ordering::SeqCst);
+    }
+
+    pub fn mark_for_retention(&self) {
+        self.delete_on_drop.store(false, Ordering::SeqCst);
     }
 
     /// Returns true if the file is marked for deletion on drop.
@@ -545,6 +550,16 @@ impl FileManager {
     }
 
     pub fn from_config(config: &Config, db_id: &str) -> Result<Self> {
+        let data_volumes = Self::data_volumes_from_config(config)?;
+        let options = FileManagerOptions {
+            base_dir: db_id.to_string(),
+            base_file_size: config.base_file_size,
+            ..FileManagerOptions::default()
+        };
+        Self::new(data_volumes, options)
+    }
+
+    pub(crate) fn data_volumes_from_config(config: &Config) -> Result<Vec<DataVolume>> {
         let registry = FileSystemRegistry::new();
         let volumes = if config.volumes.is_empty() {
             return Err(Error::ConfigError("No volumes configured".to_string()));
@@ -580,12 +595,7 @@ impl FileManager {
                 "No volume configured for primary data storage".to_string(),
             ));
         }
-        let options = FileManagerOptions {
-            base_dir: db_id.to_string(),
-            base_file_size: config.base_file_size,
-            ..FileManagerOptions::default()
-        };
-        Self::new(data_volumes, options)
+        Ok(data_volumes)
     }
 
     /// Sets the database ID to label metrics.
@@ -610,16 +620,28 @@ impl FileManager {
         self.next_file_id.load(Ordering::SeqCst)
     }
 
+    /// Reserves a contiguous range of file IDs without creating files.
+    pub(crate) fn reserve_data_file_ids(&self, count: usize) -> Vec<FileId> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let start = self.next_file_id.fetch_add(count as u64, Ordering::SeqCst);
+        (start..start + count as u64).collect()
+    }
+
     /// Generates a new unique file ID.
     fn allocate_file_id(&self) -> FileId {
         self.next_file_id.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Generates the path for a data file with the given ID.
-    fn data_file_path(&self, file_id: FileId) -> String {
+    pub(crate) fn data_file_path(&self, _file_id: FileId) -> String {
         format!(
             "{}/{}/{}.{}",
-            self.options.base_dir, DATA_DIR, file_id, self.options.data_file_extension
+            self.options.base_dir,
+            DATA_DIR,
+            Uuid::new_v4(),
+            self.options.data_file_extension
         )
     }
 
@@ -738,6 +760,16 @@ impl FileManager {
             }
         }
 
+        Ok(())
+    }
+
+    /// Marks a data file as read-only, preventing it from being deleted on drop.
+    pub(crate) fn make_data_file_readonly(&self, file_id: FileId) -> Result<()> {
+        let tracked = self
+            .data_files
+            .get(&file_id)
+            .ok_or_else(|| Error::IoError(format!("Data file {} is not tracked", file_id)))?;
+        tracked.mark_for_retention();
         Ok(())
     }
 

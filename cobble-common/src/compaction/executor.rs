@@ -30,7 +30,11 @@ pub struct CompactionTask {
     file_builder_factory: Arc<FileBuilderFactory>,
     /// The data file type for output files.
     data_file_type: DataFileType,
+    /// TTL provider for compaction to determine if entries are expired and can be dropped.
     ttl_provider: Arc<crate::ttl::TTLProvider>,
+    /// Whether to create output files in read-only mode.
+    /// This is used for remote compaction workers where we want to write files.
+    output_files_readonly: bool,
 }
 
 impl CompactionTask {
@@ -58,7 +62,13 @@ impl CompactionTask {
             file_builder_factory,
             data_file_type,
             ttl_provider,
+            output_files_readonly: false,
         }
+    }
+
+    pub fn with_readonly_outputs(mut self) -> Self {
+        self.output_files_readonly = true;
+        self
     }
 
     /// Returns the sorted runs in this task.
@@ -108,20 +118,28 @@ impl CompactionResult {
 ///
 /// The executor uses tokio's runtime for async task execution in a thread pool.
 pub struct CompactionExecutor {
-    runtime: Option<Runtime>,
+    runtime: Option<Arc<Runtime>>,
     options: CompactionConfig,
 }
 
 impl CompactionExecutor {
     /// Creates a new compaction executor with the given options and its own runtime.
     pub fn new(options: CompactionConfig) -> Result<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .thread_name("cobble-compaction")
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .map_err(|e| crate::error::Error::IoError(e.to_string()))?;
+        Self::new_with_runtime(
+            options,
+            Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .thread_name("cobble-compaction")
+                    .worker_threads(options.max_threads.max(1))
+                    .enable_all()
+                    .build()
+                    .map_err(|e| crate::error::Error::IoError(e.to_string()))?,
+            ),
+        )
+    }
 
+    /// Creates a new compaction executor with the given options and thread count.
+    pub fn new_with_runtime(options: CompactionConfig, runtime: Arc<Runtime>) -> Result<Self> {
         Ok(Self {
             runtime: Some(runtime),
             options,
@@ -196,7 +214,9 @@ impl CompactionExecutor {
     }
 
     pub fn shutdown(&mut self) {
-        if let Some(runtime) = self.runtime.take() {
+        if let Some(runtime) = self.runtime.take()
+            && let Ok(runtime) = Arc::try_unwrap(runtime)
+        {
             runtime.shutdown_timeout(std::time::Duration::from_secs(5));
         }
     }
@@ -372,6 +392,13 @@ impl CompactionExecutor {
             output_files.len(),
             output_bytes
         );
+        if task.output_files_readonly {
+            // If files were created in read-only mode, we need to mark them as read-only
+            // after writing is complete so they can be opened by other processes.
+            for file in &output_files {
+                task.file_manager.make_data_file_readonly(file.file_id)?;
+            }
+        }
         Ok(CompactionResult::new(output_files, edit))
     }
 }

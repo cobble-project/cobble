@@ -5,7 +5,6 @@ use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::snapshot::{
     SnapshotManager, build_levels_from_manifest, decode_manifest, snapshot_manifest_name,
 };
-use crate::sst::SSTWriterOptions;
 use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value, encode_key, encode_value};
 use crate::r#type::{Column, Key, Value, ValueType};
@@ -14,6 +13,7 @@ use crate::{Config, TimeProvider};
 use bytes::Bytes;
 use log::info;
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::db_state::DbStateHandle;
@@ -21,6 +21,7 @@ use crate::governance::{GovernanceManager, create_manifest_lock_provider};
 use crate::metrics_registry;
 use crate::read_only_db::ReadOnlyDb;
 use crate::ttl::{TTLProvider, TtlConfig};
+use crate::util::init_logging;
 
 /// Public database interface.
 pub struct Db {
@@ -38,7 +39,7 @@ impl Db {
     /// Open a database with the provided configuration.
     #[allow(clippy::single_range_in_vec_init)]
     pub fn open(config: Config) -> Result<Self> {
-        Self::init_logging(&config);
+        init_logging(&config);
         metrics_registry::init_metrics();
         let id = Uuid::new_v4().to_string();
 
@@ -74,32 +75,6 @@ impl Db {
     /// Return the metrics samples for this database.
     pub fn metrics(&self) -> Vec<crate::MetricSample> {
         metrics_registry::snapshot_metrics(Some(&self.id))
-    }
-
-    fn init_logging(config: &Config) {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| {
-            let mut builder = log4rs::Config::builder();
-            let mut root = log4rs::config::Root::builder();
-            if config.log_console {
-                let stdout = log4rs::append::console::ConsoleAppender::builder().build();
-                builder = builder.appender(
-                    log4rs::config::Appender::builder().build("stdout", Box::new(stdout)),
-                );
-                root = root.appender("stdout");
-            }
-            if let Some(ref path) = config.log_path {
-                let file = log4rs::append::file::FileAppender::builder()
-                    .build(path)
-                    .unwrap();
-                builder = builder
-                    .appender(log4rs::config::Appender::builder().build("file", Box::new(file)));
-                root = root.appender("file");
-            }
-            let root = root.build(config.log_level);
-            let config = builder.build(root).unwrap();
-            let _ = log4rs::init_config(config);
-        });
     }
 
     /// Write a batch of operations to the database.
@@ -202,13 +177,13 @@ impl Db {
 
     /// Open a read-only view from a snapshot manifest.
     pub fn open_read_only(config: Config, snapshot_id: u64, db_id: String) -> Result<ReadOnlyDb> {
-        Self::init_logging(&config);
+        init_logging(&config);
         ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id)
     }
 
     /// Open a writable database initialized from a snapshot manifest.
     pub fn open_from_snapshot(config: Config, snapshot_id: u64, db_id: String) -> Result<Self> {
-        Self::init_logging(&config);
+        init_logging(&config);
         metrics_registry::init_metrics();
         let mut file_manager = FileManager::from_config(&config, &db_id)?;
         file_manager.set_db_id(db_id.clone());
@@ -246,13 +221,11 @@ impl Db {
         initial_file_seq: u64,
     ) -> Result<Self> {
         let time_provider = config.time_provider.create();
-        let ttl_provider = Arc::new(TTLProvider::new(
-            &TtlConfig {
-                enabled: config.ttl_enabled,
-                default_ttl_seconds: config.default_ttl_seconds,
-            },
-            Arc::clone(&time_provider),
-        ));
+        let ttl_config = TtlConfig {
+            enabled: config.ttl_enabled,
+            default_ttl_seconds: config.default_ttl_seconds,
+        };
+        let ttl_provider = Arc::new(TTLProvider::new(&ttl_config, Arc::clone(&time_provider)));
 
         let mut lsm_tree =
             LSMTree::with_state_and_ttl(Arc::clone(&db_state), Arc::clone(&ttl_provider));
@@ -261,36 +234,29 @@ impl Db {
         }
         lsm_tree.set_db_id(id.clone());
         let lsm_tree = Arc::new(lsm_tree);
-        let sst_options = SSTWriterOptions {
-            num_columns: config.num_columns,
-            bloom_filter_enabled: config.sst_bloom_filter_enabled,
-            bloom_bits_per_key: config.sst_bloom_bits_per_key,
-            partitioned_index: config.sst_partitioned_index,
-            ..SSTWriterOptions::default()
-        };
+        let sst_options = crate::compaction::build_sst_writer_options(&config);
 
         // Compaction setup
-        let compaction_options = crate::compaction::CompactionConfig {
-            policy: config.compaction_policy,
-            l0_file_limit: config.l0_file_limit,
-            l1_base_bytes: config.l1_base_bytes,
-            level_size_multiplier: config.level_size_multiplier,
-            max_level: config.max_level,
-            num_columns: config.num_columns,
-            target_file_size: config.base_file_size,
-            bloom_filter_enabled: config.sst_bloom_filter_enabled,
-            bloom_bits_per_key: config.sst_bloom_bits_per_key,
-            partitioned_index: config.sst_partitioned_index,
-            read_ahead_enabled: config.compaction_read_ahead_enabled,
-            ..crate::compaction::CompactionConfig::default()
-        };
+        let compaction_options = crate::compaction::build_compaction_config(&config);
         let compaction_factory = crate::compaction::make_sst_builder_factory(sst_options.clone());
-        let compaction_worker = Arc::new(crate::compaction::CompactionWorker::new(
-            crate::compaction::CompactionExecutor::new(compaction_options)?,
-            Arc::clone(&compaction_factory),
-            Arc::clone(&file_manager),
-            Arc::downgrade(&lsm_tree),
-        ));
+        let compaction_worker: Arc<dyn crate::compaction::CompactionWorker> =
+            if let Some(address) = config.compaction_remote_addr.as_ref() {
+                Arc::new(crate::compaction::RemoteCompactionWorker::new(
+                    address.clone(),
+                    Arc::clone(&file_manager),
+                    Arc::downgrade(&lsm_tree),
+                    sst_options.clone(),
+                    ttl_config.clone(),
+                    Duration::from_millis(config.compaction_remote_timeout_ms),
+                )?)
+            } else {
+                Arc::new(crate::compaction::LocalCompactionWorker::new(
+                    crate::compaction::CompactionExecutor::new(compaction_options)?,
+                    Arc::clone(&compaction_factory),
+                    Arc::clone(&file_manager),
+                    Arc::downgrade(&lsm_tree),
+                ))
+            };
         info!(
             "db compaction configured: l0_limit={} l1_base={} multiplier={} max_level={} target_file_size={}",
             compaction_options.l0_file_limit,

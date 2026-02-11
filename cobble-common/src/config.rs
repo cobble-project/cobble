@@ -198,6 +198,12 @@ pub struct Config {
     pub compaction_policy: CompactionPolicyKind,
     /// Enable read-ahead buffering for compaction reads.
     pub compaction_read_ahead_enabled: bool,
+    /// Optional remote compaction worker address (host:port). If set, use remote compaction.
+    pub compaction_remote_addr: Option<String>,
+    /// Remote compaction worker thread pool size.
+    pub compaction_threads: usize,
+    /// Remote compaction network timeout in milliseconds.
+    pub compaction_remote_timeout_ms: u64,
     /// Size of the block cache in bytes. If zero, cache is disabled.
     pub block_cache_size: usize,
     /// Read proxy configuration overrides.
@@ -243,6 +249,9 @@ impl Default for Config {
             max_level: 6,
             compaction_policy: CompactionPolicyKind::RoundRobin,
             compaction_read_ahead_enabled: true,
+            compaction_remote_addr: None,
+            compaction_threads: 4,
+            compaction_remote_timeout_ms: 300_000,
             block_cache_size: 64 * 1024 * 1024,
             read_proxy: ReadProxyConfigEntry::default(),
             base_file_size: 64 * 1024 * 1024,
@@ -361,6 +370,9 @@ mod tests {
             snapshot_on_flush: true,
             snapshot_retention: Some(3),
             compaction_read_ahead_enabled: false,
+            compaction_remote_addr: Some("127.0.0.1:9999".to_string()),
+            compaction_threads: 6,
+            compaction_remote_timeout_ms: 120_000,
         };
 
         let serialized = serde_json::to_string(&config).expect("Cannot serialize config");

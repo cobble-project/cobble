@@ -23,6 +23,7 @@ pub(crate) struct CompactionConfig {
     pub(crate) bloom_filter_enabled: bool,
     pub(crate) bloom_bits_per_key: u32,
     pub(crate) partitioned_index: bool,
+    pub(crate) max_threads: usize,
 }
 
 impl Default for CompactionConfig {
@@ -42,6 +43,7 @@ impl Default for CompactionConfig {
             bloom_filter_enabled: false,
             bloom_bits_per_key: 10,
             partitioned_index: false,
+            max_threads: 4,
         }
     }
 }

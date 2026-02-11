@@ -44,7 +44,7 @@ struct LSMTreeState {
     compaction_config: CompactionConfig,
     compaction_policy: Box<dyn CompactionPolicy>,
     pending_compaction: bool,
-    compaction_worker: Option<Arc<CompactionWorker>>,
+    compaction_worker: Option<Arc<dyn CompactionWorker>>,
 }
 
 #[derive(Clone)]
@@ -308,7 +308,7 @@ impl LSMTree {
     pub(crate) fn configure_compaction(
         &self,
         config: CompactionConfig,
-        worker: Option<Arc<CompactionWorker>>,
+        worker: Option<Arc<dyn CompactionWorker>>,
     ) {
         let mut state = self.state.lock().unwrap();
         state.compaction_config = config;
@@ -330,9 +330,7 @@ impl LSMTree {
 
     pub(crate) fn shutdown_compaction(&self) {
         let mut state = self.state.lock().unwrap();
-        if let Some(worker) = state.compaction_worker.take()
-            && let Ok(worker) = Arc::try_unwrap(worker)
-        {
+        if let Some(worker) = state.compaction_worker.take() {
             worker.shutdown();
         }
         state.compaction_worker = None;
@@ -867,12 +865,13 @@ mod tests {
             immutables: Vec::new().into(),
         });
         let lsm_tree = Arc::new(LSMTree::with_state(Arc::clone(&db_state)));
-        let worker = Arc::new(crate::compaction::CompactionWorker::new(
-            crate::compaction::CompactionExecutor::new(config).unwrap(),
-            factory,
-            Arc::clone(&file_manager),
-            Arc::downgrade(&lsm_tree),
-        ));
+        let worker: Arc<dyn crate::compaction::CompactionWorker> =
+            Arc::new(crate::compaction::LocalCompactionWorker::new(
+                crate::compaction::CompactionExecutor::new(config).unwrap(),
+                factory,
+                Arc::clone(&file_manager),
+                Arc::downgrade(&lsm_tree),
+            ));
         lsm_tree.configure_compaction(config, Some(Arc::clone(&worker)));
         let target = lsm_tree
             .db_state

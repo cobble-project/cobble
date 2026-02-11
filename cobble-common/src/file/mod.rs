@@ -5,6 +5,8 @@ mod opendal_file;
 mod opendal_fs;
 
 #[allow(unused_imports)]
+pub(crate) use self::file_manager::DataVolume;
+#[allow(unused_imports)]
 pub(crate) use self::file_manager::test_utils;
 #[allow(unused_imports)]
 pub use self::file_manager::{

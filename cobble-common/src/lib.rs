@@ -24,8 +24,10 @@ mod sst;
 mod time;
 mod ttl;
 mod r#type;
+mod util;
 mod write_batch;
 
+pub use compaction::RemoteCompactionServer;
 pub use config::{CompactionPolicyKind, Config, VolumeDescriptor, VolumeUsageKind};
 pub use db::Db;
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
