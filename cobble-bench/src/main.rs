@@ -20,6 +20,7 @@ struct Args {
     db_path: PathBuf,
     seed: u64,
     key_len: usize,
+    remote_compactor: Option<String>,
 }
 
 impl Default for Args {
@@ -30,6 +31,7 @@ impl Default for Args {
             db_path: PathBuf::from(DEFAULT_DB_PATH),
             seed: DEFAULT_SEED,
             key_len: DEFAULT_KEY_LEN,
+            remote_compactor: None,
         }
     }
 }
@@ -49,7 +51,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "Usage: cobble-bench [--keys <count>] [--batch-size <size>] [--db-path <path>] [--seed <seed>] [--key-len <bytes>]"
+    "Usage: cobble-bench [--keys <count>] [--batch-size <size>] [--db-path <path>] [--seed <seed>] [--key-len <bytes>] [--remote-compactor <host:port>]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -71,6 +73,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--key-len" | "--key-length" => {
                 args.key_len = parse_value(&mut iter, "--key-len")?;
+            }
+            "--remote-compactor" => {
+                args.remote_compactor = Some(parse_string(&mut iter, "--remote-compactor")?);
             }
             "-h" | "--help" => {
                 println!("{}", usage());
@@ -146,6 +151,7 @@ fn run(args: Args) -> Result<(), String> {
     prepare_db_dir(&args.db_path)?;
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", args.db_path.display())),
+        compaction_remote_addr: args.remote_compactor.clone(),
         log_level: Debug,
         log_console: true,
         ..Config::default()
@@ -153,12 +159,13 @@ fn run(args: Args) -> Result<(), String> {
     let db = Db::open(config).map_err(|err| format!("Failed to open db: {err}"))?;
 
     println!(
-        "bulk load: keys={} batch_size={} key_len={} db_path={} seed={}",
+        "bulk load: keys={} batch_size={} key_len={} db_path={} seed={} remote_compactor={}",
         args.key_count,
         args.batch_size,
         args.key_len,
         args.db_path.display(),
-        args.seed
+        args.seed,
+        args.remote_compactor.as_deref().unwrap_or("local")
     );
 
     let progress_every = (args.key_count / 100).max(1);
