@@ -12,6 +12,7 @@ This repository is a Rust + Cargo project implementing an LSM-style KV storage e
 - The main crate is `cobble`, located in the `cobble-common/`
 - Other crates include:
   - `cobble-bench`: Benchmarking tools.
+  - `cobble-cli`: Command-line interface for interacting with the database.
 
 ## How to Test
 - Run all tests: `cargo test`

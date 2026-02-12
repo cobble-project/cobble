@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["cobble-bench","cobble-common"]
+members = ["cobble-bench", "cobble-cli","cobble-common"]
 
 [profile.release]
 opt-level = 3

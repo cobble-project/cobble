@@ -1,0 +1,8 @@
+[package]
+name = "cobble-cli"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+cobble = { path = "../cobble-common" }
+log = "0.4.29"

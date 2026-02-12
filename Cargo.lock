@@ -199,6 +199,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cobble-cli"
+version = "0.0.1"
+dependencies = [
+ "cobble",
+ "log",
+]
+
+[[package]]
 name = "config"
 version = "0.15.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
