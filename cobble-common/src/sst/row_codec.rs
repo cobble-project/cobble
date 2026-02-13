@@ -122,6 +122,94 @@ fn bitmap_size(num_columns: usize) -> usize {
     }
 }
 
+fn value_type_is_terminal(byte: u8) -> Result<bool> {
+    match byte {
+        0 | 1 => Ok(true),
+        2 => Ok(false),
+        _ => Err(Error::IoError(format!("Invalid ValueType: {}", byte))),
+    }
+}
+
+pub(crate) fn value_expired_at(data: &[u8]) -> Result<Option<u32>> {
+    if data.len() < 4 {
+        return Err(Error::IoError(format!(
+            "Value data too small: expected at least 4 bytes for expired_at, got {}",
+            data.len()
+        )));
+    }
+    let mut buf = data;
+    let expired_at = buf.get_u32_le();
+    if expired_at == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(expired_at))
+    }
+}
+
+pub(crate) fn value_is_terminal(data: &[u8], num_columns: usize) -> Result<bool> {
+    if data.len() < 4 {
+        return Err(Error::IoError(format!(
+            "Value data too small: expected at least 4 bytes for expired_at, got {}",
+            data.len()
+        )));
+    }
+    let mut buf = &data[4..];
+    let bmp_size = bitmap_size(num_columns);
+    if buf.len() < bmp_size {
+        return Err(Error::IoError(format!(
+            "Value data too small: expected at least {} bytes for bitmap, got {}",
+            bmp_size,
+            buf.len()
+        )));
+    }
+    let bitmap = &buf[..bmp_size];
+    buf = &buf[bmp_size..];
+
+    if num_columns > 1 {
+        for i in 0..num_columns {
+            let is_present = (bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if !is_present {
+                return Ok(false);
+            }
+        }
+    }
+
+    for i in 0..num_columns {
+        if buf.remaining() < 1 {
+            return Err(Error::IoError(format!(
+                "Column {} data corrupted: not enough bytes for value_type",
+                i
+            )));
+        }
+        let value_type = buf.get_u8();
+        if !value_type_is_terminal(value_type)? {
+            return Ok(false);
+        }
+        if i < num_columns.saturating_sub(1) {
+            if buf.remaining() < 4 {
+                return Err(Error::IoError(format!(
+                    "Column {} data corrupted: not enough bytes for length",
+                    i
+                )));
+            }
+            let data_len = buf.get_u32_le() as usize;
+            if buf.remaining() < data_len {
+                return Err(Error::IoError(format!(
+                    "Column {} data corrupted: expected {} bytes, got {}",
+                    i,
+                    data_len,
+                    buf.remaining()
+                )));
+            }
+            buf = &buf[data_len..];
+        } else {
+            buf = &buf[buf.len()..];
+        }
+    }
+
+    Ok(true)
+}
+
 /// Encodes a Value to bytes with optional columns.
 ///
 /// The number of columns is provided by the caller (from SST metadata).

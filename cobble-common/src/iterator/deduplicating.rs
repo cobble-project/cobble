@@ -6,7 +6,7 @@
 
 use crate::error::Result;
 use crate::iterator::KvIterator;
-use crate::sst::row_codec::{decode_value, encode_value};
+use crate::sst::row_codec::{decode_value, encode_value, value_expired_at, value_is_terminal};
 use crate::ttl::TTLProvider;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -33,6 +33,33 @@ pub struct DeduplicatingIterator<I> {
     current_value: Option<Bytes>,
     /// TTL provider to evaluate expiration.
     ttl_provider: Arc<TTLProvider>,
+}
+
+/// Collects a value slice into the values vector or selects it as the final value.
+/// This function checks for expiration and terminal status.
+fn collect_value(
+    value_slice: &[u8],
+    num_columns: usize,
+    ttl_provider: &TTLProvider,
+    values: &mut Vec<Bytes>,
+    selected_value: &mut Option<Bytes>,
+    stop_collecting: &mut bool,
+) -> Result<()> {
+    let expired_at = value_expired_at(value_slice)?;
+    if ttl_provider.expired(&expired_at) {
+        return Ok(());
+    }
+    let is_terminal = value_is_terminal(value_slice, num_columns)?;
+    if selected_value.is_none() && values.is_empty() && is_terminal {
+        *selected_value = Some(Bytes::copy_from_slice(value_slice));
+        *stop_collecting = true;
+        return Ok(());
+    }
+    values.push(Bytes::copy_from_slice(value_slice));
+    if is_terminal {
+        *stop_collecting = true;
+    }
+    Ok(())
 }
 
 impl<I> DeduplicatingIterator<I> {
@@ -80,12 +107,18 @@ impl<I> DeduplicatingIterator<I> {
 
             let current_key = Bytes::copy_from_slice(key_slice);
 
-            // Collect all values with the same key, skipping expired ones
-            let mut values = Vec::new();
-            let value = decode_value(value_slice, self.num_columns)?;
-            if !self.ttl_provider.expired(&value.expired_at) {
-                values.push(value);
-            }
+            let mut values: Vec<Bytes> = Vec::new();
+            let mut selected_value: Option<Bytes> = None;
+            let mut stop_collecting = false;
+
+            collect_value(
+                value_slice,
+                self.num_columns,
+                &self.ttl_provider,
+                &mut values,
+                &mut selected_value,
+                &mut stop_collecting,
+            )?;
 
             // Advance to next entry and check for same key
             while self.inner.next()? {
@@ -97,14 +130,27 @@ impl<I> DeduplicatingIterator<I> {
                     // Different key, stop collecting
                     break;
                 }
+                if stop_collecting {
+                    continue;
+                }
 
                 // Same key, collect the value
                 if let Some(next_value_bytes) = self.inner.value_slice()? {
-                    let value = decode_value(next_value_bytes, self.num_columns)?;
-                    if !self.ttl_provider.expired(&value.expired_at) {
-                        values.push(value);
-                    }
+                    collect_value(
+                        next_value_bytes,
+                        self.num_columns,
+                        &self.ttl_provider,
+                        &mut values,
+                        &mut selected_value,
+                        &mut stop_collecting,
+                    )?;
                 }
+            }
+
+            if let Some(value) = selected_value {
+                self.current_key = Some(current_key);
+                self.current_value = Some(value);
+                return Ok(());
             }
 
             if values.is_empty() {
@@ -115,8 +161,10 @@ impl<I> DeduplicatingIterator<I> {
             // Merge from oldest to newest (reverse order)
             // The last value in the list is the oldest, the first is the newest
             let mut values_iter = values.into_iter().rev();
-            let mut merged_value = values_iter.next().expect("values is non-empty");
+            let first = values_iter.next().expect("values is non-empty");
+            let mut merged_value = decode_value(first.as_ref(), self.num_columns)?;
             for newer_value in values_iter {
+                let newer_value = decode_value(newer_value.as_ref(), self.num_columns)?;
                 merged_value = merged_value.merge(newer_value);
             }
 
