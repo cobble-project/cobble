@@ -57,7 +57,7 @@ pub(crate) struct SSTIterator {
     current_entry_idx: usize,
     options: SSTIteratorOptions,
     block_cache: Option<BlockCache>,
-    cached_block_id: Cell<Option<u32>>,
+    cache_valid: Cell<bool>,
     cached_entry_idx: Cell<Option<usize>>,
     // Use RefCell to allow interior mutability for cached bytes, which can be shared as slices.
     cached_key_bytes: RefCell<Option<Bytes>>,
@@ -182,7 +182,7 @@ impl SSTIterator {
             current_entry_idx: 0,
             options,
             block_cache,
-            cached_block_id: Cell::new(None),
+            cache_valid: Cell::new(false),
             cached_entry_idx: Cell::new(None),
             cached_key_bytes: RefCell::new(None),
             cached_value_bytes: RefCell::new(None),
@@ -572,34 +572,24 @@ impl SSTIterator {
     }
 
     fn clear_cached_entry(&self) {
-        self.cached_block_id.set(None);
+        self.cache_valid.set(false);
         self.cached_entry_idx.set(None);
         *self.cached_key_bytes.borrow_mut() = None;
         *self.cached_value_bytes.borrow_mut() = None;
     }
 
     fn ensure_cached_bytes(&self) -> Result<()> {
+        if self.cache_valid.get() {
+            return Ok(());
+        }
         if let Some(block) = &self.current_data_block
             && self.current_entry_idx < block.offsets_len()
         {
-            let block_id = block.block_id();
-            let cached_same_entry = self.cached_block_id.get() == Some(block_id)
-                && self.cached_entry_idx.get() == Some(self.current_entry_idx);
-            if cached_same_entry {
-                let has_key = self.cached_key_bytes.borrow().is_some();
-                let has_value = self.cached_value_bytes.borrow().is_some();
-                if has_key && has_value {
-                    return Ok(());
-                }
-            } else {
-                *self.cached_key_bytes.borrow_mut() = None;
-                *self.cached_value_bytes.borrow_mut() = None;
-            }
             let (key, value) = block.get_bytes(self.current_entry_idx)?;
-            self.cached_block_id.set(Some(block_id));
             self.cached_entry_idx.set(Some(self.current_entry_idx));
             *self.cached_key_bytes.borrow_mut() = Some(key);
             *self.cached_value_bytes.borrow_mut() = Some(value);
+            self.cache_valid.set(true);
             return Ok(());
         }
         self.clear_cached_entry();
