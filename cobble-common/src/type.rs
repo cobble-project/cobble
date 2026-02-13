@@ -11,6 +11,14 @@ pub(crate) struct Key {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct RefKey<'a> {
+    /// Logical namespace / group identifier.
+    bucket: u16,
+    /// Raw key bytes.
+    data: &'a [u8],
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum ValueType {
     /// Upsert semantics: insert or overwrite an existing value.
     Put,
@@ -31,10 +39,26 @@ pub(crate) struct Column {
     data: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RefColumn<'a> {
+    /// Write semantics of this column (Put/Delete/Merge).
+    pub(crate) value_type: ValueType,
+    /// Raw column bytes.
+    data: &'a [u8],
+}
+
 pub(crate) struct Value {
     /// A value may consist of multiple logical columns/fields.
     /// Each column is optional and may be absent within a value.
     pub(crate) columns: Vec<Option<Column>>,
+    /// Optional expiration timestamp (seconds since epoch).
+    pub(crate) expired_at: Option<u32>,
+}
+
+pub(crate) struct RefValue<'a> {
+    /// A value may consist of multiple logical columns/fields.
+    /// Each column is optional and may be absent within a value.
+    pub(crate) columns: Vec<Option<RefColumn<'a>>>,
     /// Optional expiration timestamp (seconds since epoch).
     pub(crate) expired_at: Option<u32>,
 }
@@ -56,6 +80,24 @@ impl Key {
     /// Returns the raw key bytes.
     pub(crate) fn data(&self) -> &[u8] {
         &self.data
+    }
+}
+
+impl<'a> RefKey<'a> {
+    pub(crate) fn new(bucket: u16, data: &'a [u8]) -> Self {
+        Self { bucket, data }
+    }
+
+    pub(crate) fn bucket(&self) -> u16 {
+        self.bucket
+    }
+
+    pub(crate) fn data(&self) -> &[u8] {
+        self.data
+    }
+
+    pub(crate) fn encoded_len(&self) -> usize {
+        2 + self.data.len()
     }
 }
 
@@ -93,6 +135,20 @@ impl Column {
                 self
             }
         }
+    }
+}
+
+impl<'a> RefColumn<'a> {
+    pub(crate) fn new(value_type: ValueType, data: &'a [u8]) -> Self {
+        Self { value_type, data }
+    }
+
+    pub(crate) fn value_type(&self) -> &ValueType {
+        &self.value_type
+    }
+
+    pub(crate) fn data(&self) -> &[u8] {
+        self.data
     }
 }
 
@@ -184,6 +240,52 @@ impl Value {
         let merged_expired_at = newer.expired_at;
 
         Value::new_with_expired_at(merged_columns, merged_expired_at)
+    }
+}
+
+impl<'a> RefValue<'a> {
+    pub(crate) fn new(columns: Vec<Option<RefColumn<'a>>>) -> Self {
+        Self::new_with_expired_at(columns, None)
+    }
+
+    pub(crate) fn new_with_expired_at(
+        columns: Vec<Option<RefColumn<'a>>>,
+        expired_at: Option<u32>,
+    ) -> Self {
+        Self {
+            columns,
+            expired_at,
+        }
+    }
+
+    pub(crate) fn columns(&self) -> &[Option<RefColumn<'a>>] {
+        &self.columns
+    }
+
+    pub(crate) fn expired_at(&self) -> Option<u32> {
+        self.expired_at
+    }
+
+    pub(crate) fn encoded_len(&self, num_columns: usize) -> usize {
+        let bmp_size = if num_columns <= 1 {
+            0
+        } else {
+            num_columns.div_ceil(8)
+        };
+        let present_count = self
+            .columns
+            .iter()
+            .take(num_columns)
+            .filter(|c| c.is_some())
+            .count();
+        let mut size = 4 + bmp_size;
+        for col in self.columns.iter().take(num_columns).flatten() {
+            size += 1 + 4 + col.data().len();
+        }
+        if present_count > 0 {
+            size -= 4;
+        }
+        size
     }
 }
 

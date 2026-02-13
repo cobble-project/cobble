@@ -14,6 +14,7 @@ use crate::memtable::Memtable;
 use crate::memtable::hash::{HashMemtable, MemtableReclaimer};
 use crate::snapshot::SnapshotManager;
 use crate::sst::{SSTWriter, SSTWriterOptions};
+use crate::r#type::{RefKey, RefValue};
 use log::{debug, trace, warn};
 use metrics::counter;
 
@@ -356,6 +357,39 @@ impl MemtableManager {
             let mut active = active.lock().unwrap();
             let memtable = active.memtable.as_mut().expect("active memtable exists");
             match memtable.put(key, value) {
+                Ok(()) => return Ok(()),
+                Err(Error::MemtableFull { needed, remaining }) => {
+                    if memtable.is_empty() {
+                        return Err(Error::MemtableFull { needed, remaining });
+                    }
+                    drop(active);
+                    self.flush_active()?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Puts a key-value pair into the active memtable using reference types to avoid extra copy.
+    pub(crate) fn put_ref(&self, key: &RefKey<'_>, value: &RefValue<'_>) -> Result<()> {
+        loop {
+            // Wait for an active memtable to be available.
+            if self.db_state.load().active.is_none() {
+                let mut state = self.state.lock().unwrap();
+                while self.db_state.load().active.is_none() {
+                    state = self.buffer_ready.wait(state).unwrap();
+                }
+                drop(state);
+            }
+            let active = self
+                .db_state
+                .load()
+                .active
+                .clone()
+                .expect("active memtable exists");
+            let mut active = active.lock().unwrap();
+            let memtable = active.memtable.as_mut().expect("active memtable exists");
+            match memtable.put_ref(key, value, self.num_columns) {
                 Ok(()) => return Ok(()),
                 Err(Error::MemtableFull { needed, remaining }) => {
                     if memtable.is_empty() {

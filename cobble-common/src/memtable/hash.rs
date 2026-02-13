@@ -4,6 +4,8 @@ use std::cmp::Ordering;
 use crate::error::{Error, Result};
 use crate::iterator::KvIterator;
 use crate::memtable::Memtable;
+use crate::sst::row_codec::{encode_key_ref_into, encode_value_ref_into};
+use crate::r#type::{RefKey, RefValue};
 use std::sync::Arc;
 
 /// Type alias for memtable reclaimer function.
@@ -166,6 +168,44 @@ impl HashMemtable {
         start
     }
 
+    fn write_data_ref(
+        &mut self,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+        key_len: usize,
+        value_len: usize,
+    ) -> (usize, usize) {
+        let start = self.data_end;
+        let end = start + Self::entry_size(key_len, value_len);
+        let mut slice = &mut self.buffer[start..end];
+        slice.put_u32(key_len as u32);
+        slice.put_u32(value_len as u32);
+        encode_key_ref_into(key, &mut slice);
+        encode_value_ref_into(value, num_columns, &mut slice);
+        self.data_end = end;
+        (start, start + 8)
+    }
+
+    pub(crate) fn put_ref(
+        &mut self,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+    ) -> Result<()> {
+        let key_len = key.encoded_len();
+        let value_len = value.encoded_len(num_columns);
+        let data_len = Self::entry_size(key_len, value_len);
+        self.has_space(data_len)?;
+        let (data_offset, key_offset) =
+            self.write_data_ref(key, value, num_columns, key_len, value_len);
+        let hash = Self::hash_key(&self.buffer[key_offset..key_offset + key_len]);
+        let bucket = self.bucket_index_from_hash(hash);
+        let node_off = self.write_index(bucket, hash, data_offset as u32);
+        self.set_bucket_head(bucket, node_off);
+        Ok(())
+    }
+
     fn bucket_head(&self, bucket: usize) -> u32 {
         let pos = self.bucket_base + bucket * 4;
         let mut slice = &self.buffer[pos..pos + 4];
@@ -211,6 +251,15 @@ impl Memtable for HashMemtable {
         let node_off = self.write_index(bucket, hash, data_offset as u32);
         self.set_bucket_head(bucket, node_off);
         Ok(())
+    }
+
+    fn put_ref(
+        &mut self,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+    ) -> Result<()> {
+        HashMemtable::put_ref(self, key, value, num_columns)
     }
 
     fn get(&self, key: &[u8]) -> Option<&[u8]> {

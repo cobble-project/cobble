@@ -23,7 +23,7 @@
 //! - Last present column: `[value_type: u8][data: bytes]` (data_len is omitted and calculated from remaining bytes)
 
 use crate::error::{Error, Result};
-use crate::r#type::{Column, Key, Value, ValueType};
+use crate::r#type::{Column, Key, RefColumn, RefKey, RefValue, Value, ValueType};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Encodes a ValueType to a single byte.
@@ -45,6 +45,31 @@ pub(crate) fn decode_value_type(byte: u8) -> Result<ValueType> {
     }
 }
 
+trait ColumnRef {
+    fn value_type(&self) -> &ValueType;
+    fn data(&self) -> &[u8];
+}
+
+impl ColumnRef for Column {
+    fn value_type(&self) -> &ValueType {
+        self.value_type()
+    }
+
+    fn data(&self) -> &[u8] {
+        self.data()
+    }
+}
+
+impl<'a> ColumnRef for RefColumn<'a> {
+    fn value_type(&self) -> &ValueType {
+        self.value_type()
+    }
+
+    fn data(&self) -> &[u8] {
+        self.data()
+    }
+}
+
 /// Encodes a Key to bytes.
 ///
 /// Layout: `[group: u16][data: bytes]`
@@ -52,9 +77,13 @@ pub(crate) fn decode_value_type(byte: u8) -> Result<ValueType> {
 pub(crate) fn encode_key(key: &Key) -> Bytes {
     let size = 2 + key.data().len();
     let mut buf = BytesMut::with_capacity(size);
+    encode_key_ref_into(&RefKey::new(key.bucket(), key.data()), &mut buf);
+    buf.freeze()
+}
+
+pub(crate) fn encode_key_ref_into(key: &RefKey<'_>, buf: &mut impl BufMut) {
     buf.put_u16_le(key.bucket());
     buf.put_slice(key.data());
-    buf.freeze()
 }
 
 /// Decodes a Key from bytes.
@@ -107,8 +136,27 @@ fn bitmap_size(num_columns: usize) -> usize {
 /// * `value` - The Value to encode containing optional columns.
 /// * `num_columns` - Total number of columns (from SST metadata).
 pub(crate) fn encode_value(value: &Value, num_columns: usize) -> Bytes {
+    let total_size = value_encoded_size_columns(value.columns(), num_columns);
+    let mut buf = BytesMut::with_capacity(total_size);
+    encode_value_columns_into(value.columns(), value.expired_at(), num_columns, &mut buf);
+    buf.freeze()
+}
+
+pub(crate) fn encode_value_ref_into(
+    value: &RefValue<'_>,
+    num_columns: usize,
+    buf: &mut impl BufMut,
+) {
+    encode_value_columns_into(value.columns(), value.expired_at(), num_columns, buf);
+}
+
+fn encode_value_columns_into<C: ColumnRef>(
+    columns: &[Option<C>],
+    expired_at: Option<u32>,
+    num_columns: usize,
+    buf: &mut impl BufMut,
+) {
     let bmp_size = bitmap_size(num_columns);
-    let columns = value.columns();
 
     // Count present columns to identify the last one
     let present_count = columns
@@ -117,20 +165,8 @@ pub(crate) fn encode_value(value: &Value, num_columns: usize) -> Bytes {
         .filter(|c| c.is_some())
         .count();
 
-    // Calculate total size (last column saves 4 bytes by omitting data_len)
-    let mut total_size = 4 + bmp_size; // expired_at + bitmap
-    for col in columns.iter().take(num_columns).flatten() {
-        total_size += 1 + 4 + col.data().len(); // value_type + data_len + data
-    }
-    // Subtract 4 bytes for the last column's data_len if there's at least one present column
-    if present_count > 0 {
-        total_size -= 4;
-    }
-
-    let mut buf = BytesMut::with_capacity(total_size);
-
     // Write expiration timestamp (seconds since epoch, 0 if None)
-    buf.put_u32_le(value.expired_at().unwrap_or(0));
+    buf.put_u32_le(expired_at.unwrap_or(0));
 
     // Write presence bitmap (only if num_columns > 1)
     if bmp_size > 0 {
@@ -154,8 +190,6 @@ pub(crate) fn encode_value(value: &Value, num_columns: usize) -> Bytes {
         }
         buf.put_slice(col.data());
     }
-
-    buf.freeze()
 }
 
 /// Decodes a Value from bytes with optional columns.
@@ -397,8 +431,11 @@ pub(crate) fn decode_value_masked(
 /// * `value` - The Value containing optional columns.
 /// * `num_columns` - Total number of columns (from SST metadata).
 pub(crate) fn value_encoded_size(value: &Value, num_columns: usize) -> usize {
+    value_encoded_size_columns(value.columns(), num_columns)
+}
+
+fn value_encoded_size_columns<C: ColumnRef>(columns: &[Option<C>], num_columns: usize) -> usize {
     let bmp_size = bitmap_size(num_columns);
-    let columns = value.columns();
     let present_count = columns
         .iter()
         .take(num_columns)

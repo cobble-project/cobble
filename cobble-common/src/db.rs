@@ -7,7 +7,7 @@ use crate::snapshot::{
 };
 use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value, encode_key, encode_value};
-use crate::r#type::{Column, Key, Value, ValueType};
+use crate::r#type::{Column, Key, RefColumn, RefKey, RefValue, Value, ValueType};
 use crate::write_batch::{WriteBatch, WriteOp};
 use crate::{Config, TimeProvider};
 use bytes::Bytes;
@@ -75,6 +75,28 @@ impl Db {
     /// Return the metrics samples for this database.
     pub fn metrics(&self) -> Vec<crate::MetricSample> {
         metrics_registry::snapshot_metrics(Some(&self.id))
+    }
+
+    /// Insert a single key/value pair into the given column.
+    pub fn put<K, V>(&self, key: K, column: u16, value: V) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let column_idx = column as usize;
+        if column_idx >= self.num_columns {
+            return Err(Error::IoError(format!(
+                "Column index {} exceeds num_columns {}",
+                column_idx, self.num_columns
+            )));
+        }
+        let column = RefColumn::new(ValueType::Put, value.as_ref());
+        let expired_at = self.ttl_provider.get_expiration_timestamp(None);
+        let mut columns: Vec<Option<RefColumn<'_>>> = vec![None; self.num_columns];
+        columns[column_idx] = Some(column);
+        let record = RefValue::new_with_expired_at(columns, expired_at);
+        let key = RefKey::new(0, key.as_ref());
+        self.memtable_manager.put_ref(&key, &record)
     }
 
     /// Write a batch of operations to the database.

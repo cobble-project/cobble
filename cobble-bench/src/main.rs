@@ -1,4 +1,4 @@
-use cobble::{Config, Db, VolumeDescriptor, WriteBatch};
+use cobble::{Config, Db, VolumeDescriptor};
 use log::LevelFilter::Debug;
 use rand_core::Rng;
 use rand_core::SeedableRng;
@@ -9,14 +9,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const DEFAULT_KEY_COUNT: u64 = 100_000_000;
-const DEFAULT_BATCH_SIZE: usize = 1_000;
 const DEFAULT_DB_PATH: &str = "/tmp/cobble-bench/bulk-load";
 const DEFAULT_SEED: u64 = 0x6a09e667f3bcc909;
 const DEFAULT_KEY_LEN: usize = 8;
 
 struct Args {
     key_count: u64,
-    batch_size: usize,
     db_path: PathBuf,
     seed: u64,
     key_len: usize,
@@ -27,7 +25,6 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             key_count: DEFAULT_KEY_COUNT,
-            batch_size: DEFAULT_BATCH_SIZE,
             db_path: PathBuf::from(DEFAULT_DB_PATH),
             seed: DEFAULT_SEED,
             key_len: DEFAULT_KEY_LEN,
@@ -51,7 +48,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "Usage: cobble-bench [--keys <count>] [--batch-size <size>] [--db-path <path>] [--seed <seed>] [--key-len <bytes>] [--remote-compactor <host:port>]"
+    "Usage: cobble-bench [--keys <count>] [--db-path <path>] [--seed <seed>] [--key-len <bytes>] [--remote-compactor <host:port>]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -61,9 +58,6 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--keys" => {
                 args.key_count = parse_value(&mut iter, "--keys")?;
-            }
-            "--batch-size" => {
-                args.batch_size = parse_value(&mut iter, "--batch-size")?;
             }
             "--db-path" => {
                 args.db_path = PathBuf::from(parse_string(&mut iter, "--db-path")?);
@@ -88,9 +82,6 @@ fn parse_args() -> Result<Args, String> {
     }
     if args.key_count == 0 {
         return Err("Key count must be greater than 0.".to_string());
-    }
-    if args.batch_size == 0 {
-        return Err("Batch size must be greater than 0.".to_string());
     }
     if args.key_len < 8 {
         return Err("Key length must be at least 8 bytes.".to_string());
@@ -159,9 +150,8 @@ fn run(args: Args) -> Result<(), String> {
     let db = Db::open(config).map_err(|err| format!("Failed to open db: {err}"))?;
 
     println!(
-        "bulk load: keys={} batch_size={} key_len={} db_path={} seed={} remote_compactor={}",
+        "bulk load: keys={} key_len={} db_path={} seed={} remote_compactor={}",
         args.key_count,
-        args.batch_size,
         args.key_len,
         args.db_path.display(),
         args.seed,
@@ -170,22 +160,13 @@ fn run(args: Args) -> Result<(), String> {
 
     let progress_every = (args.key_count / 100).max(1);
     let start = Instant::now();
-    let mut batch = WriteBatch::new();
-    let mut batch_count = 0usize;
     let mut inserted = 0u64;
     let mut generator = RandomKeyGenerator::new(args.key_count, args.key_len, args.seed);
 
     while let Some(key_bytes) = generator.next_key() {
-        batch.put(key_bytes, 0, key_bytes);
-        batch_count += 1;
+        db.put(key_bytes, 0, key_bytes)
+            .map_err(|err| format!("Write failed at key {}: {err}", inserted + 1))?;
         inserted += 1;
-
-        if batch_count >= args.batch_size {
-            db.write_batch(batch)
-                .map_err(|err| format!("Write failed at key {inserted}: {err}"))?;
-            batch = WriteBatch::new();
-            batch_count = 0;
-        }
 
         if inserted.is_multiple_of(progress_every) {
             let elapsed = start.elapsed();
@@ -198,11 +179,6 @@ fn run(args: Args) -> Result<(), String> {
                 rate
             );
         }
-    }
-
-    if batch_count > 0 {
-        db.write_batch(batch)
-            .map_err(|err| format!("Write failed at key {inserted}: {err}"))?;
     }
 
     let elapsed = start.elapsed();
