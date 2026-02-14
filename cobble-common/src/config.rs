@@ -1,3 +1,4 @@
+use crate::SstCompressionAlgorithm;
 use crate::time::TimeProviderKind;
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -216,6 +217,8 @@ pub struct Config {
     pub sst_bloom_bits_per_key: u32,
     /// Whether to enable two-level index and filter blocks in SST files.
     pub sst_partitioned_index: bool,
+    /// Compression algorithm per level (index by level number).
+    pub sst_compression_by_level: Vec<SstCompressionAlgorithm>,
     /// Whether TTL is enabled. If false, TTL metadata is ignored.
     pub ttl_enabled: bool,
     /// Default TTL duration (in seconds). None means no expiration by default.
@@ -258,6 +261,11 @@ impl Default for Config {
             sst_bloom_filter_enabled: false,
             sst_bloom_bits_per_key: 10,
             sst_partitioned_index: false,
+            sst_compression_by_level: vec![
+                SstCompressionAlgorithm::None,
+                SstCompressionAlgorithm::None,
+                SstCompressionAlgorithm::Lz4,
+            ],
             ttl_enabled: false,
             default_ttl_seconds: None,
             time_provider: TimeProviderKind::default(),
@@ -323,11 +331,31 @@ impl Config {
             _ => default_limit,
         }
     }
+
+    pub(crate) fn sst_compression_for_level(&self, level: u8) -> SstCompressionAlgorithm {
+        if self.sst_compression_by_level.is_empty() {
+            return if level >= 2 {
+                SstCompressionAlgorithm::Lz4
+            } else {
+                SstCompressionAlgorithm::None
+            };
+        }
+        let idx = level as usize;
+        if idx < self.sst_compression_by_level.len() {
+            self.sst_compression_by_level[idx]
+        } else {
+            *self
+                .sst_compression_by_level
+                .last()
+                .expect("compression config not empty")
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Config, ReadProxyConfigEntry, VolumeDescriptor, VolumeUsageKind};
+    use crate::SstCompressionAlgorithm;
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::Builder;
@@ -361,6 +389,11 @@ mod tests {
             sst_bloom_filter_enabled: true,
             sst_bloom_bits_per_key: 11,
             sst_partitioned_index: true,
+            sst_compression_by_level: vec![
+                SstCompressionAlgorithm::None,
+                SstCompressionAlgorithm::None,
+                SstCompressionAlgorithm::Lz4,
+            ],
             ttl_enabled: true,
             default_ttl_seconds: Some(120),
             time_provider: crate::time::TimeProviderKind::Manual,

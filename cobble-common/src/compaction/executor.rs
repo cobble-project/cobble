@@ -503,12 +503,14 @@ mod tests {
 
         // Create and execute compaction
         let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            metrics_db_id: None,
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            compression: crate::SstCompressionAlgorithm::None,
         });
         let task = CompactionTask::new(
             "test".to_string(),
@@ -629,12 +631,14 @@ mod tests {
 
         // Create and execute compaction
         let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            metrics_db_id: None,
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            compression: crate::SstCompressionAlgorithm::None,
         });
         let task = CompactionTask::new(
             "test".to_string(),
@@ -769,12 +773,14 @@ mod tests {
 
         // Create compaction with very small target file size to force multiple output files
         let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            metrics_db_id: None,
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            compression: crate::SstCompressionAlgorithm::None,
         });
         let task = CompactionTask::new(
             "test".to_string(),
@@ -831,12 +837,14 @@ mod tests {
 
         // Create compaction with no sorted runs
         let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            metrics_db_id: None,
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            compression: crate::SstCompressionAlgorithm::None,
         });
         let task = CompactionTask::new(
             "test".to_string(),

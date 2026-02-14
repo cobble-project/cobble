@@ -256,27 +256,26 @@ impl Db {
         }
         lsm_tree.set_db_id(id.clone());
         let lsm_tree = Arc::new(lsm_tree);
-        let sst_options = crate::compaction::build_sst_writer_options(&config);
-
+        let mut sst_options = crate::compaction::build_sst_writer_options(&config, 0);
+        sst_options.metrics_db_id = Some(id.clone());
         // Compaction setup
         let compaction_options = crate::compaction::build_compaction_config(&config);
-        let compaction_factory = crate::compaction::make_sst_builder_factory(sst_options.clone());
         let compaction_worker: Arc<dyn crate::compaction::CompactionWorker> =
             if let Some(address) = config.compaction_remote_addr.as_ref() {
                 Arc::new(crate::compaction::RemoteCompactionWorker::new(
                     address.clone(),
                     Arc::clone(&file_manager),
                     Arc::downgrade(&lsm_tree),
-                    sst_options.clone(),
+                    config.clone(),
                     ttl_config.clone(),
                     Duration::from_millis(config.compaction_remote_timeout_ms),
                 )?)
             } else {
                 Arc::new(crate::compaction::LocalCompactionWorker::new(
                     crate::compaction::CompactionExecutor::new(compaction_options)?,
-                    Arc::clone(&compaction_factory),
                     Arc::clone(&file_manager),
                     Arc::downgrade(&lsm_tree),
+                    config.clone(),
                 ))
             };
         info!(

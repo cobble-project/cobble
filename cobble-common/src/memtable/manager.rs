@@ -108,6 +108,10 @@ impl MemtableManager {
         lsm_tree: Arc<LSMTree>,
         options: MemtableManagerOptions,
     ) -> Result<Self> {
+        let mut options = options;
+        if options.sst_options.metrics_db_id.is_none() && !options.db_id.is_empty() {
+            options.sst_options.metrics_db_id = Some(options.db_id.clone());
+        }
         if options.buffer_count == 0 {
             return Err(Error::IoError(
                 "buffer_count must be greater than 0".to_string(),
@@ -700,12 +704,14 @@ fn make_sst_builder_factory(options: SSTWriterOptions) -> FileBuilderFactory {
         Box::new(SSTWriter::new(
             writer,
             SSTWriterOptions {
+                metrics_db_id: options.metrics_db_id.clone(),
                 block_size: options.block_size,
                 buffer_size: options.buffer_size,
                 num_columns: options.num_columns,
                 bloom_filter_enabled: options.bloom_filter_enabled,
                 bloom_bits_per_key: options.bloom_bits_per_key,
                 partitioned_index: options.partitioned_index,
+                compression: options.compression,
             },
         )) as Box<dyn FileBuilder>
     })

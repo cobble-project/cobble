@@ -42,6 +42,7 @@ struct RemoteSstOptions {
     bloom_filter_enabled: bool,
     bloom_bits_per_key: u32,
     partitioned_index: bool,
+    compression: crate::SstCompressionAlgorithm,
 }
 
 impl RemoteSstOptions {
@@ -53,17 +54,20 @@ impl RemoteSstOptions {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            compression: options.compression,
         }
     }
 
     fn into_sst_options(self) -> SSTWriterOptions {
         SSTWriterOptions {
+            metrics_db_id: None,
             block_size: self.block_size,
             buffer_size: self.buffer_size,
             num_columns: self.num_columns,
             bloom_filter_enabled: self.bloom_filter_enabled,
             bloom_bits_per_key: self.bloom_bits_per_key,
             partitioned_index: self.partitioned_index,
+            compression: self.compression,
         }
     }
 }
@@ -223,7 +227,7 @@ pub(crate) struct RemoteCompactionWorker {
     address: String,
     file_manager: Arc<FileManager>,
     lsm_tree: Weak<LSMTree>,
-    sst_options: RemoteSstOptions,
+    config: Config,
     ttl_config: TtlConfig,
     runtime: Mutex<Option<Runtime>>,
     remote_timeout: Duration,
@@ -234,7 +238,7 @@ impl RemoteCompactionWorker {
         address: String,
         file_manager: Arc<FileManager>,
         lsm_tree: Weak<LSMTree>,
-        sst_options: SSTWriterOptions,
+        config: Config,
         ttl_config: TtlConfig,
         remote_timeout: Duration,
     ) -> Result<Self> {
@@ -248,7 +252,7 @@ impl RemoteCompactionWorker {
             address,
             file_manager,
             lsm_tree,
-            sst_options: RemoteSstOptions::from_sst_options(&sst_options),
+            config,
             ttl_config,
             runtime: Mutex::new(Some(runtime)),
             remote_timeout,
@@ -275,12 +279,13 @@ impl RemoteCompactionWorker {
             .iter()
             .map(|run| RemoteSortedRun::from_sorted_run(run, &self.file_manager))
             .collect::<Result<Vec<_>>>()?;
+        let sst_options = super::build_sst_writer_options(&self.config, output_level);
         Ok(RemoteCompactionRequest {
             request_id: None,
             db_id,
             output_level,
             data_file_type: data_file_type.to_string(),
-            sst_options: self.sst_options.clone(),
+            sst_options: RemoteSstOptions::from_sst_options(&sst_options),
             ttl_config: RemoteTtlConfig {
                 enabled: self.ttl_config.enabled,
                 default_ttl_seconds: self.ttl_config.default_ttl_seconds,
@@ -457,7 +462,8 @@ impl RemoteCompactionServer {
         let file_manager = Self::file_manager_for_with(config, &data_volumes, &request.db_id)?;
         let data_file_type =
             DataFileType::from_str(&request.data_file_type).map_err(Error::IoError)?;
-        let sst_options = request.sst_options.into_sst_options();
+        let mut sst_options = request.sst_options.into_sst_options();
+        sst_options.metrics_db_id = Some(request.db_id.clone());
         let file_builder_factory = super::make_sst_builder_factory(sst_options);
         let sorted_runs = request
             .runs
@@ -653,7 +659,7 @@ mod tests {
         let mut file_manager = FileManager::from_config(&config, &db_id).unwrap();
         file_manager.set_db_id(db_id.clone());
         let file_manager = Arc::new(file_manager);
-        let sst_options = build_sst_writer_options(&config);
+        let sst_options = build_sst_writer_options(&config, 0);
         let value_payload = vec![b'x'; 128];
         let num_columns = sst_options.num_columns;
 
@@ -698,7 +704,7 @@ mod tests {
         let lsm_tree = Arc::new(LSMTree::with_state(Arc::clone(&db_state)));
 
         let remote_timeout = Duration::from_millis(config.compaction_remote_timeout_ms);
-        let server = Arc::new(RemoteCompactionServer::new(config).unwrap());
+        let server = Arc::new(RemoteCompactionServer::new(config.clone()).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server_thread = {
@@ -714,7 +720,7 @@ mod tests {
             addr.to_string(),
             Arc::clone(&file_manager),
             Arc::downgrade(&lsm_tree),
-            sst_options,
+            config.clone(),
             TtlConfig {
                 enabled: false,
                 default_ttl_seconds: None,

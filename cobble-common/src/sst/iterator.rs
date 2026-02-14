@@ -3,6 +3,7 @@ use crate::file::RandomAccessFile;
 use crate::iterator::KvIterator;
 use crate::sst::block_cache::{BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock};
 use crate::sst::bloom::BloomFilter;
+use crate::sst::compression::decode_block_bytes;
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, Value};
@@ -415,7 +416,8 @@ impl SSTIterator {
                 )
                 .increment(1);
                 let data = self.file.read_at(offset, size)?;
-                let mut block = Block::decode(data)?;
+                let decoded = decode_block_bytes(data)?;
+                let mut block = Block::decode(decoded)?;
                 block.set_block_id(block_idx as u32);
                 let block = Arc::new(block);
                 cache.insert(cache_key, CachedBlock::Block(block.clone()));
@@ -423,7 +425,8 @@ impl SSTIterator {
             }
         } else {
             let data = self.file.read_at(offset, size)?;
-            let mut block = Block::decode(data)?;
+            let decoded = decode_block_bytes(data)?;
+            let mut block = Block::decode(decoded)?;
             block.set_block_id(block_idx as u32);
             Arc::new(block)
         };
@@ -924,6 +927,54 @@ mod tests {
 
     #[test]
     #[serial_test::serial(file)]
+    fn test_sst_iterator_with_compression() {
+        let _ = std::fs::remove_dir_all("/tmp/sst_compressed_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/sst_compressed_test".to_string())
+            .unwrap();
+
+        {
+            let writer_file = fs.open_write("compressed.sst").unwrap();
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    bloom_filter_enabled: true,
+                    compression: crate::SstCompressionAlgorithm::Lz4,
+                    ..SSTWriterOptions::default()
+                },
+            );
+
+            writer.add(b"key1", b"value1").unwrap();
+            writer.add(b"key2", b"value2").unwrap();
+            writer.finish().unwrap();
+        }
+
+        {
+            let reader_file = fs.open_read("compressed.sst").unwrap();
+            let mut iter = SSTIterator::with_cache(
+                reader_file,
+                0,
+                SSTIteratorOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTIteratorOptions::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+            iter.seek_to_first().unwrap();
+            let (key, value) = iter.current().unwrap().unwrap();
+            assert_eq!(&key[..], b"key1");
+            assert_eq!(&value[..], b"value1");
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_compressed_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
     fn test_sst_iterator_may_contain_single_level() {
         let _ = std::fs::remove_dir_all("/tmp/sst_filter_single_test");
         let registry = FileSystemRegistry::new();
@@ -998,12 +1049,14 @@ mod tests {
             let mut writer = SSTWriter::new(
                 writer_file,
                 SSTWriterOptions {
+                    metrics_db_id: None,
                     block_size: 32,
                     buffer_size: 8192,
                     num_columns: 1,
                     bloom_filter_enabled: true,
                     bloom_bits_per_key: bits_per_key,
                     partitioned_index: true,
+                    compression: crate::SstCompressionAlgorithm::None,
                 },
             );
 

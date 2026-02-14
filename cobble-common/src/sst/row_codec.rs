@@ -999,12 +999,14 @@ mod tests {
             let mut writer = SSTWriter::new(
                 writer_file,
                 SSTWriterOptions {
+                    metrics_db_id: None,
                     block_size: 200, // Small block size to force multiple blocks
                     buffer_size: 8192,
                     num_columns,
                     bloom_filter_enabled: true,
                     bloom_bits_per_key: 10,
                     partitioned_index: false,
+                    compression: crate::SstCompressionAlgorithm::None,
                 },
             );
 

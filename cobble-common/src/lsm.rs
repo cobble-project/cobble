@@ -830,12 +830,7 @@ mod tests {
             partitioned_index: false,
             ..crate::compaction::CompactionConfig::default()
         };
-        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
-            bloom_filter_enabled: config.bloom_filter_enabled,
-            bloom_bits_per_key: config.bloom_bits_per_key,
-            partitioned_index: config.partitioned_index,
-            ..SSTWriterOptions::default()
-        });
+        let db_config = crate::Config::default();
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(DbState {
             seq_id: 0,
@@ -868,9 +863,9 @@ mod tests {
         let worker: Arc<dyn crate::compaction::CompactionWorker> =
             Arc::new(crate::compaction::LocalCompactionWorker::new(
                 crate::compaction::CompactionExecutor::new(config).unwrap(),
-                factory,
                 Arc::clone(&file_manager),
                 Arc::downgrade(&lsm_tree),
+                db_config,
             ));
         lsm_tree.configure_compaction(config, Some(Arc::clone(&worker)));
         let target = lsm_tree

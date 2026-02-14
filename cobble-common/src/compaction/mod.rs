@@ -40,23 +40,23 @@ pub(crate) trait CompactionWorker: Send + Sync {
 
 pub(crate) struct LocalCompactionWorker {
     executor: Mutex<CompactionExecutor>,
-    file_builder_factory: Arc<FileBuilderFactory>,
     file_manager: Arc<crate::file::FileManager>,
     lsm_tree: Weak<crate::lsm::LSMTree>,
+    config: crate::Config,
 }
 
 impl LocalCompactionWorker {
     pub(crate) fn new(
         executor: CompactionExecutor,
-        file_builder_factory: Arc<FileBuilderFactory>,
         file_manager: Arc<crate::file::FileManager>,
         lsm_tree: Weak<crate::lsm::LSMTree>,
+        config: crate::Config,
     ) -> Self {
         Self {
             executor: Mutex::new(executor),
-            file_builder_factory,
             file_manager,
             lsm_tree,
+            config,
         }
     }
 
@@ -86,12 +86,15 @@ impl LocalCompactionWorker {
             .file_manager
             .db_id()
             .unwrap_or_else(|| "unknown".to_string());
+        let mut sst_options = build_sst_writer_options(&self.config, output_level);
+        sst_options.metrics_db_id = Some(db_id.clone());
+        let file_builder_factory = make_sst_builder_factory(sst_options);
         let task = CompactionTask::new(
             db_id,
             sorted_runs,
             output_level,
             Arc::clone(&self.file_manager),
-            Arc::clone(&self.file_builder_factory),
+            file_builder_factory,
             data_file_type,
             ttl_provider,
         );
@@ -127,12 +130,13 @@ pub(crate) fn make_sst_builder_factory(options: SSTWriterOptions) -> Arc<FileBui
     }))
 }
 
-pub(crate) fn build_sst_writer_options(config: &crate::Config) -> SSTWriterOptions {
+pub(crate) fn build_sst_writer_options(config: &crate::Config, level: u8) -> SSTWriterOptions {
     SSTWriterOptions {
         num_columns: config.num_columns,
         bloom_filter_enabled: config.sst_bloom_filter_enabled,
         bloom_bits_per_key: config.sst_bloom_bits_per_key,
         partitioned_index: config.sst_partitioned_index,
+        compression: config.sst_compression_for_level(level),
         ..SSTWriterOptions::default()
     }
 }

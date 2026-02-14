@@ -33,5 +33,6 @@ pub use db::Db;
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
 pub use read_only_db::ReadOnlyDb;
 pub use read_proxy::{ReadProxy, ReadProxyConfig};
+pub use sst::SstCompressionAlgorithm;
 pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProviderKind};
 pub use write_batch::WriteBatch;

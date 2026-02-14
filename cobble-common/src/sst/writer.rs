@@ -2,10 +2,12 @@ use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, SequentialWriteFile};
 use crate::format::FileBuilder;
 use crate::sst::bloom::BloomFilterBuilder;
+use crate::sst::compression::{SstCompressionAlgorithm, write_block};
 use crate::sst::format::{BlockBuilder, Footer};
 use crate::sst::row_codec::{encode_key, encode_value};
 use crate::r#type::{Key, Value};
 use bytes::{BufMut, Bytes, BytesMut};
+use metrics::histogram;
 
 #[derive(Clone)]
 struct DataBlockMeta {
@@ -17,6 +19,8 @@ struct DataBlockMeta {
 
 #[derive(Clone)]
 pub struct SSTWriterOptions {
+    /// Optional database ID for metrics labeling.
+    pub metrics_db_id: Option<String>,
     pub block_size: usize,
     pub buffer_size: usize,
     /// Number of columns in the value schema.
@@ -28,17 +32,21 @@ pub struct SSTWriterOptions {
     pub bloom_bits_per_key: u32,
     /// Enable two-level index/filter blocks.
     pub partitioned_index: bool,
+    /// Compression algorithm for data blocks.
+    pub compression: SstCompressionAlgorithm,
 }
 
 impl Default for SSTWriterOptions {
     fn default() -> Self {
         Self {
+            metrics_db_id: None,
             block_size: 4096,
             buffer_size: 8192,
             num_columns: 1,
             bloom_filter_enabled: false,
             bloom_bits_per_key: 10,
             partitioned_index: false,
+            compression: SstCompressionAlgorithm::None,
         }
     }
 }
@@ -140,12 +148,13 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         let mut block = old_builder.build();
         let block_id = self.pending_data_blocks.len() as u32;
         block.set_block_id(block_id);
-        let encoded = block.encode();
-        let size = encoded.len();
         let offset = self.writer.offset();
+        let encoded = block.encode();
+        let raw_len = encoded.len();
 
         // Write the block
-        self.writer.write(&encoded)?;
+        let size = write_block(&mut self.writer, encoded, self.options.compression)?;
+        self.record_compression_ratio(raw_len, size);
 
         // Remember block info for index
         let mut key_hashes = Vec::new();
@@ -163,6 +172,24 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         });
 
         Ok(())
+    }
+
+    fn record_compression_ratio(&self, raw_len: usize, compressed_len: usize) {
+        if raw_len == 0 {
+            return;
+        }
+        let ratio = compressed_len as f64 / raw_len as f64;
+        let db_id = self
+            .options
+            .metrics_db_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        histogram!(
+            "sst_block_compression_ratio",
+            "db_id" => db_id,
+            "compression" => self.options.compression.label()
+        )
+        .record(ratio);
     }
 
     /// Finish writing the SST file and return (first_key, last_key, file_size, footer_bytes).
@@ -464,12 +491,14 @@ mod tests {
         let mut writer = SSTWriter::new(
             writer_file,
             SSTWriterOptions {
+                metrics_db_id: None,
                 block_size: 100, // Small block size to force multiple blocks
                 buffer_size: 8192,
                 num_columns: 1,
                 bloom_filter_enabled: true,
                 bloom_bits_per_key: 10,
                 partitioned_index: false,
+                compression: crate::SstCompressionAlgorithm::None,
             },
         );
 
