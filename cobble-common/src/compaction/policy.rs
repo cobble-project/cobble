@@ -363,6 +363,43 @@ pub(crate) fn build_runs_for_plan(
                 }
             }
         }
+        // We try to expand the selected input files to cover all overlapping files with the output
+        // level to maximize compaction efficiency.
+        if let Some(output_level) = output_level
+            && output_level.ordinal != 0
+            && plan.input_level != plan.output_level
+            && let Some((start, end)) = output_range
+        {
+            let output_files = &output_level.files[start..=end];
+            if let (Some(first), Some(last)) = (output_files.first(), output_files.last()) {
+                let output_start = first.start_key.as_slice();
+                let output_end = last.end_key.as_slice();
+                loop {
+                    let mut extended = false;
+                    if min_idx > 0 {
+                        let candidate = &input_level.files[min_idx - 1];
+                        if candidate.start_key.as_slice() >= output_start {
+                            min_idx -= 1;
+                            selected_bytes =
+                                selected_bytes.saturating_add(input_level.files[min_idx].size);
+                            extended = true;
+                        }
+                    }
+                    if max_idx + 1 < input_level.files.len() {
+                        let candidate = &input_level.files[max_idx + 1];
+                        if candidate.end_key.as_slice() <= output_end {
+                            max_idx += 1;
+                            selected_bytes =
+                                selected_bytes.saturating_add(input_level.files[max_idx].size);
+                            extended = true;
+                        }
+                    }
+                    if !extended {
+                        break;
+                    }
+                }
+            }
+        }
         let selected_files: Vec<Arc<DataFile>> = (min_idx..=max_idx)
             .map(|idx| Arc::clone(&input_level.files[idx]))
             .collect();
