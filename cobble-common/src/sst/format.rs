@@ -267,7 +267,7 @@ impl Block {
         self.offsets.is_empty()
     }
 
-    pub(crate) fn lower_bound(&self, target: &[u8]) -> Result<usize> {
+    pub(crate) fn find_equal_or_greater_idx(&self, target: &[u8]) -> Result<usize> {
         let mut left = 0;
         let mut right = self.offsets_len();
         while left < right {
@@ -275,19 +275,26 @@ impl Block {
             let (key, _) = self.get(mid)?;
             match key.as_ref().cmp(target) {
                 std::cmp::Ordering::Less => left = mid + 1,
-                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => right = mid,
+                std::cmp::Ordering::Greater => right = mid,
+                std::cmp::Ordering::Equal => return Ok(mid),
             }
         }
         Ok(left)
     }
 
-    pub(crate) fn valid_lower_bound(&self, target: &[u8]) -> Result<usize> {
-        let left = self.lower_bound(target)?;
-        if left == self.offsets_len() {
-            Ok(left.saturating_sub(1))
-        } else {
-            Ok(left)
+    pub(crate) fn find_lower_or_equal_idx(&self, target: &[u8]) -> Result<usize> {
+        let mut left = 0;
+        let mut right = self.offsets_len() - 1;
+        while left < right {
+            let mid = (left + right).div_ceil(2);
+            let (key, _) = self.get(mid)?;
+            match key.as_ref().cmp(target) {
+                std::cmp::Ordering::Less => left = mid,
+                std::cmp::Ordering::Greater => right = mid - 1,
+                std::cmp::Ordering::Equal => return Ok(mid),
+            }
         }
+        Ok(left)
     }
 
     pub(crate) fn size_in_bytes(&self) -> usize {

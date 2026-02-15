@@ -247,7 +247,7 @@ impl SSTIterator {
             }
             self.current_index_partition_idx = 0;
             self.current_index_partition = Some(self.index_block.clone());
-            let block_idx = self.index_block.valid_lower_bound(target)?;
+            let block_idx = self.index_block.find_lower_or_equal_idx(target)?;
             self.current_block_idx = block_idx;
             let partition = self.index_block.clone();
             self.load_data_block_from_partition(&partition, block_idx)?;
@@ -255,9 +255,9 @@ impl SSTIterator {
             return Ok(());
         }
 
-        let partition_idx = self.index_block.valid_lower_bound(target)?;
+        let partition_idx = self.index_block.find_lower_or_equal_idx(target)?;
         let partition = self.load_index_partition(partition_idx)?;
-        let block_idx = partition.valid_lower_bound(target)?;
+        let block_idx = partition.find_lower_or_equal_idx(target)?;
         self.current_block_idx = block_idx;
         self.load_data_block_from_partition(&partition, block_idx)?;
         self.seek_in_current_block(target)?;
@@ -278,7 +278,7 @@ impl SSTIterator {
             if self.index_block.is_empty() {
                 return Ok(true);
             }
-            self.index_block.valid_lower_bound(key)?
+            self.index_block.find_lower_or_equal_idx(key)?
         } else {
             0
         };
@@ -601,7 +601,7 @@ impl SSTIterator {
 
     fn seek_in_current_block(&mut self, target: &[u8]) -> Result<()> {
         if let Some(block) = &self.current_data_block {
-            self.current_entry_idx = block.lower_bound(target)?;
+            self.current_entry_idx = block.find_equal_or_greater_idx(target)?;
         }
         self.clear_cached_entry();
         Ok(())
@@ -1108,10 +1108,16 @@ mod tests {
                 },
             );
 
-            writer.add(b"key1", b"value1").unwrap();
-            writer.add(b"key3", b"value3").unwrap();
-            writer.add(b"key5", b"value5").unwrap();
-            writer.add(b"key7", b"value7").unwrap();
+            writer.add(b"key0001", b"value0001").unwrap();
+            writer.add(b"key0003", b"value0003").unwrap();
+            writer.add(b"key0005", b"value0005").unwrap();
+            writer.add(b"key0007", b"value0007").unwrap();
+            // fill more entries to ensure multiple blocks
+            for i in 0..1000 {
+                let key = format!("key{:04}", i * 2 + 10);
+                let value = format!("value{:04}", i * 2 + 10);
+                writer.add(key.as_bytes(), value.as_bytes()).unwrap();
+            }
 
             writer.finish().unwrap();
         }
@@ -1132,25 +1138,25 @@ mod tests {
             .unwrap();
 
             // Seek to exact key
-            iter.seek(b"key3").unwrap();
+            iter.seek(b"key0003").unwrap();
             assert!(iter.valid());
             let (key, value) = iter.current().unwrap().unwrap();
-            assert_eq!(&key[..], b"key3");
-            assert_eq!(&value[..], b"value3");
+            assert_eq!(&key[..], b"key0003");
+            assert_eq!(&value[..], b"value0003");
 
             // Seek to key between entries
-            iter.seek(b"key4").unwrap();
+            iter.seek(b"key0004").unwrap();
             assert!(iter.valid());
             let (key, value) = iter.current().unwrap().unwrap();
-            assert_eq!(&key[..], b"key5");
-            assert_eq!(&value[..], b"value5");
+            assert_eq!(&key[..], b"key0005");
+            assert_eq!(&value[..], b"value0005");
 
             // Seek to first
-            iter.seek(b"key0").unwrap();
+            iter.seek(b"key0000").unwrap();
             assert!(iter.valid());
             let (key, value) = iter.current().unwrap().unwrap();
-            assert_eq!(&key[..], b"key1");
-            assert_eq!(&value[..], b"value1");
+            assert_eq!(&key[..], b"key0001");
+            assert_eq!(&value[..], b"value0001");
         }
 
         let _ = std::fs::remove_dir_all("/tmp/sst_test");
