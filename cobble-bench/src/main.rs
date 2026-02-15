@@ -1,4 +1,4 @@
-use cobble::{Config, Db, VolumeDescriptor};
+use cobble::{Config, SingleNodeDb, VolumeDescriptor};
 use log::LevelFilter::Debug;
 use rand_core::Rng;
 use rand_core::SeedableRng;
@@ -147,7 +147,7 @@ fn run(args: Args) -> Result<(), String> {
         log_console: true,
         ..Config::default()
     };
-    let db = Db::open(config).map_err(|err| format!("Failed to open db: {err}"))?;
+    let db = SingleNodeDb::open(config, 1).map_err(|err| format!("Failed to open db: {err}"))?;
 
     println!(
         "bulk load: keys={} key_len={} db_path={} seed={} remote_compactor={}",

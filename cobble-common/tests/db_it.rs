@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::{
-    CompactionPolicyKind, Config, Db, MetricValue, ReadOptions, TimeProviderKind, VolumeDescriptor,
-    WriteBatch,
+    CompactionPolicyKind, Config, Db, MetricValue, ReadOptions, ReadProxy, ReadProxyConfig,
+    SingleNodeDb, TimeProviderKind, VolumeDescriptor, WriteBatch,
 };
 use std::path::Path;
 
@@ -380,6 +380,45 @@ fn test_db_snapshot_creates_manifest() {
     assert!(manifest.contains("\"levels\""));
     assert!(manifest.contains("\"path\":\""));
 
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_single_node_db_snapshot_updates_global_manifest() {
+    let root = "/tmp/single_node_db_snapshot";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = SingleNodeDb::open(config.clone(), 4).unwrap();
+
+    db.put(b"k1", 0, b"v1".to_vec()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let global_id = db
+        .snapshot_with_callback(move |result| {
+            let _ = tx.send(result);
+        })
+        .unwrap();
+    let callback_id = rx
+        .recv()
+        .expect("snapshot callback dropped")
+        .expect("snapshot materialized");
+    assert_eq!(global_id, callback_id);
+
+    let mut proxy = ReadProxy::open_current(ReadProxyConfig::from_config(&config)).unwrap();
+    let value = proxy
+        .get(0, b"k1", &ReadOptions::default())
+        .unwrap()
+        .expect("value present");
+    let col = value[0].as_ref().unwrap();
+    assert_eq!(col.as_ref(), b"v1");
     cleanup_test_root(root);
 }
 

@@ -3,7 +3,8 @@ use crate::file::{FileManager, FileSystemRegistry};
 use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::snapshot::{
-    SnapshotManager, build_levels_from_manifest, decode_manifest, snapshot_manifest_name,
+    SnapshotCallback, SnapshotManager, build_levels_from_manifest, decode_manifest,
+    snapshot_manifest_name,
 };
 use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value_masked, encode_key, encode_value};
@@ -325,6 +326,9 @@ impl Db {
     /// Close the database and flush pending state.
     pub fn close(&self) -> Result<()> {
         self.memtable_manager.close()?;
+        let _ = self
+            .snapshot_manager
+            .wait_for_materialization(Duration::from_secs(30));
         self.lsm_tree.shutdown_compaction();
         self.snapshot_manager.close()?;
         Ok(())
@@ -333,10 +337,21 @@ impl Db {
     /// Flush the active memtable and capture an LSM snapshot with a manifest.
     /// The manifest is materialized asynchronously after the flush completes.
     pub fn snapshot(&self) -> Result<u64> {
-        let db_snapshot = self.snapshot_manager.create_snapshot();
+        let db_snapshot = self.snapshot_manager.create_snapshot(None);
         self.memtable_manager
             .flush_snapshot(db_snapshot.id, self.snapshot_manager.clone())?;
         Ok(db_snapshot.id)
+    }
+
+    pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
+    where
+        F: Fn(Result<u64>) + Send + Sync + 'static,
+    {
+        let callback: SnapshotCallback = Arc::new(callback);
+        let snapshot = self.snapshot_manager.create_snapshot(Some(callback));
+        self.memtable_manager
+            .flush_snapshot(snapshot.id, self.snapshot_manager.clone())?;
+        Ok(snapshot.id)
     }
 
     /// Expire a snapshot and release its file references.

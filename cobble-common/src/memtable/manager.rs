@@ -460,7 +460,7 @@ impl MemtableManager {
             .auto_snapshot_manager
             .as_ref()
             .map(|manager| SnapshotCompletion {
-                snapshot_id: manager.create_snapshot().id,
+                snapshot_id: manager.create_snapshot(None).id,
                 manager: manager.clone(),
             });
         self.flush_active_internal(auto_snapshot)

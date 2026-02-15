@@ -83,12 +83,33 @@ impl MaintainerNode {
         total_buckets: u16,
         bucket_snapshots: Vec<BucketSnapshotInput>,
     ) -> Result<GlobalSnapshotManifest> {
+        let id = self.allocate_snapshot_id();
+        Self::build_global_snapshot(total_buckets, bucket_snapshots, id)
+    }
+
+    pub fn take_global_snapshot_with_id(
+        &self,
+        total_buckets: u16,
+        bucket_snapshots: Vec<BucketSnapshotInput>,
+        id: u64,
+    ) -> Result<GlobalSnapshotManifest> {
+        Self::build_global_snapshot(total_buckets, bucket_snapshots, id)
+    }
+
+    pub fn allocate_snapshot_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn build_global_snapshot(
+        total_buckets: u16,
+        bucket_snapshots: Vec<BucketSnapshotInput>,
+        id: u64,
+    ) -> Result<GlobalSnapshotManifest> {
         if bucket_snapshots.is_empty() {
             return Err(Error::IoError(
                 "bucket snapshots required to build global snapshot".to_string(),
             ));
         }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut bucket_refs = Vec::with_capacity(bucket_snapshots.len());
         for bucket in bucket_snapshots {
             if bucket.manifest_path.is_empty() {

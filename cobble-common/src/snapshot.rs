@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 /// Internal snapshot record tracked by the manager.
@@ -23,7 +23,10 @@ pub(crate) struct DbSnapshot {
     pub tracked_files: Vec<Arc<TrackedFile>>,
     pub seq_id: u64,
     pub finished: bool,
+    pub callback: Option<SnapshotCallback>,
 }
+
+pub(crate) type SnapshotCallback = Arc<dyn Fn(Result<u64>) + Send + Sync + 'static>;
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
@@ -51,7 +54,7 @@ pub(crate) struct ManifestFile {
 }
 
 impl DbSnapshot {
-    pub(crate) fn new(id: u64, manifest_path: String) -> Self {
+    pub(crate) fn new(id: u64, manifest_path: String, callback: Option<SnapshotCallback>) -> Self {
         Self {
             id,
             manifest_path,
@@ -60,6 +63,7 @@ impl DbSnapshot {
             tracked_files: Vec::new(),
             seq_id: 0,
             finished: false,
+            callback,
         }
     }
 }
@@ -71,6 +75,7 @@ pub(crate) struct SnapshotManager {
     /// Background worker for manifest materialization.
     materialize_tx: Arc<Mutex<Option<mpsc::Sender<u64>>>>,
     materialize_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+    materialize_done: Arc<Condvar>,
 }
 
 impl Clone for SnapshotManager {
@@ -81,6 +86,7 @@ impl Clone for SnapshotManager {
             retention: self.retention,
             materialize_tx: Arc::clone(&self.materialize_tx),
             materialize_worker: Arc::clone(&self.materialize_worker),
+            materialize_done: Arc::clone(&self.materialize_done),
         }
     }
 }
@@ -90,6 +96,7 @@ struct SnapshotManagerState {
     snapshots: BTreeMap<u64, DbSnapshot>,
     completed: Vec<u64>,
     retained: HashSet<u64>,
+    in_flight: usize,
 }
 
 impl SnapshotManager {
@@ -101,10 +108,12 @@ impl SnapshotManager {
                 snapshots: BTreeMap::new(),
                 completed: Vec::new(),
                 retained: HashSet::new(),
+                in_flight: 0,
             })),
             retention,
             materialize_tx: Arc::new(Mutex::new(None)),
             materialize_worker: Arc::new(Mutex::new(None)),
+            materialize_done: Arc::new(Condvar::new()),
         }
     }
 
@@ -130,12 +139,12 @@ impl SnapshotManager {
         Ok(())
     }
 
-    pub(crate) fn create_snapshot(&self) -> DbSnapshot {
+    pub(crate) fn create_snapshot(&self, callback: Option<SnapshotCallback>) -> DbSnapshot {
         let mut state = self.state.lock().unwrap();
         let id = state.next_id;
         state.next_id += 1;
         let manifest_path = self.file_manager.metadata_path(&snapshot_manifest_name(id));
-        let snapshot = DbSnapshot::new(id, manifest_path);
+        let snapshot = DbSnapshot::new(id, manifest_path, callback);
         state.snapshots.insert(id, snapshot.clone());
         snapshot
     }
@@ -194,22 +203,42 @@ impl SnapshotManager {
 
     /// Write the snapshot manifest for the given id.
     pub(crate) fn materialize(&self, id: u64) -> Result<()> {
-        let mut snapshot = {
-            let state = self.state.lock().unwrap();
-            state
+        let (snapshot, callback) = {
+            let mut state = self.state.lock().unwrap();
+            let snapshot = state.snapshots.get(&id).cloned();
+            let callback = state
                 .snapshots
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| Error::IoError(format!("Snapshot {} not found", id)))?
+                .get_mut(&id)
+                .and_then(|snapshot| snapshot.callback.take());
+            (snapshot, callback)
         };
-        let writer = self
-            .file_manager
-            .create_metadata_file(&snapshot_manifest_name(id))?;
-        let mut buffered = BufferedWriter::new(writer, 8192);
-        encode_manifest(&mut buffered, &snapshot, &self.file_manager)?;
-        buffered.close()?;
-        snapshot.finished = true;
-        Ok(())
+        let result = match snapshot {
+            Some(snapshot) => (|| {
+                let writer = self
+                    .file_manager
+                    .create_metadata_file(&snapshot_manifest_name(id))?;
+                let mut buffered = BufferedWriter::new(writer, 8192);
+                encode_manifest(&mut buffered, &snapshot, &self.file_manager)?;
+                buffered.close()?;
+                Ok(())
+            })(),
+            None => Err(Error::IoError(format!("Snapshot {} not found", id))),
+        };
+        if result.is_ok() {
+            let mut state = self.state.lock().unwrap();
+            if let Some(snapshot) = state.snapshots.get_mut(&id) {
+                snapshot.finished = true;
+            }
+        }
+        if let Some(callback) = callback {
+            callback(result.clone().map(|_| id));
+        }
+        let mut state = self.state.lock().unwrap();
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if state.in_flight == 0 {
+            self.materialize_done.notify_all();
+        }
+        result
     }
 
     pub(crate) fn expire_snapshot(&self, id: u64) -> Result<bool> {
@@ -234,12 +263,41 @@ impl SnapshotManager {
     /// Enqueue a manifest materialization job on the background worker.
     pub(crate) fn schedule_materialize(&self, id: u64) -> Result<()> {
         self.start_materializer()?;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.in_flight += 1;
+        }
         let tx_guard = self.materialize_tx.lock().unwrap();
         if let Some(tx) = tx_guard.as_ref() {
-            tx.send(id)
-                .map_err(|_| Error::IoError("Snapshot worker unavailable".to_string()))?;
+            if tx.send(id).is_err() {
+                let mut state = self.state.lock().unwrap();
+                state.in_flight = state.in_flight.saturating_sub(1);
+                if state.in_flight == 0 {
+                    self.materialize_done.notify_all();
+                }
+                return Err(Error::IoError("Snapshot worker unavailable".to_string()));
+            }
+        } else {
+            let mut state = self.state.lock().unwrap();
+            state.in_flight = state.in_flight.saturating_sub(1);
+            if state.in_flight == 0 {
+                self.materialize_done.notify_all();
+            }
+            return Err(Error::IoError("Snapshot worker unavailable".to_string()));
         }
         Ok(())
+    }
+
+    pub(crate) fn wait_for_materialization(&self, timeout: std::time::Duration) -> bool {
+        let guard = self.state.lock().unwrap();
+        if guard.in_flight == 0 {
+            return true;
+        }
+        let (guard, _) = self
+            .materialize_done
+            .wait_timeout_while(guard, timeout, |state| state.in_flight > 0)
+            .unwrap();
+        guard.in_flight == 0
     }
 
     /// Stop the background materializer worker.
