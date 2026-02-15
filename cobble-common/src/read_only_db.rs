@@ -1,3 +1,4 @@
+use crate::db::value_to_vec_of_columns;
 use crate::db_state::DbStateHandle;
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager};
@@ -7,7 +8,7 @@ use crate::snapshot::{build_levels_from_manifest, decode_manifest, snapshot_mani
 use crate::sst::block_cache::{BlockCache, new_block_cache};
 use crate::sst::row_codec::encode_key;
 use crate::ttl::{TTLProvider, TtlConfig};
-use crate::r#type::{Key, Value, ValueType};
+use crate::r#type::{Key, Value};
 use crate::{Config, ReadOptions};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -128,17 +129,6 @@ impl ReadOnlyDb {
         for newer in iter {
             merged = merged.merge(newer);
         }
-        Ok(Some(
-            merged
-                .columns
-                .into_iter()
-                .map(|col_opt| {
-                    col_opt.and_then(|col| match col.value_type() {
-                        ValueType::Put | ValueType::Merge => Some(Bytes::from(col)),
-                        ValueType::Delete => None,
-                    })
-                })
-                .collect(),
-        ))
+        value_to_vec_of_columns(merged)
     }
 }

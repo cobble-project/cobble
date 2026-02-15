@@ -128,6 +128,23 @@ impl ReadOptions {
     }
 }
 
+pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<Bytes>>>> {
+    let columns: Vec<Option<Bytes>> = value
+        .columns
+        .into_iter()
+        .map(|col_opt| {
+            col_opt.and_then(|col| match col.value_type() {
+                ValueType::Put | ValueType::Merge => Some(Bytes::from(col)),
+                ValueType::Delete => None,
+            })
+        })
+        .collect();
+    if columns.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    Ok(Some(columns))
+}
+
 impl Db {
     /// Open a database with the provided configuration.
     #[allow(clippy::single_range_in_vec_init)]
@@ -170,8 +187,15 @@ impl Db {
         metrics_registry::snapshot_metrics(Some(&self.id))
     }
 
-    /// Insert a single key/value pair into the given column.
-    pub fn put<K, V>(&self, key: K, column: u16, value: V) -> Result<()>
+    /// Internal helper to write a single column value with the given ValueType.
+    fn write_ref<K, V>(
+        &self,
+        key: K,
+        column: u16,
+        value_type: ValueType,
+        value: V,
+        ttl_seconds: Option<u32>,
+    ) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -183,13 +207,69 @@ impl Db {
                 column_idx, self.num_columns
             )));
         }
-        let column = RefColumn::new(ValueType::Put, value.as_ref());
-        let expired_at = self.ttl_provider.get_expiration_timestamp(None);
+        let column = RefColumn::new(value_type, value.as_ref());
+        let expired_at = self.ttl_provider.get_expiration_timestamp(ttl_seconds);
         let mut columns: Vec<Option<RefColumn<'_>>> = vec![None; self.num_columns];
         columns[column_idx] = Some(column);
         let record = RefValue::new_with_expired_at(columns, expired_at);
         let key = RefKey::new(0, key.as_ref());
         self.memtable_manager.put_ref(&key, &record)
+    }
+
+    /// Insert a single key/value pair into the given column.
+    pub fn put<K, V>(&self, key: K, column: u16, value: V) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.put_with_ttl(key, column, value, None)
+    }
+
+    /// Insert a single key/value pair into the given column with a TTL.
+    pub fn put_with_ttl<K, V>(
+        &self,
+        key: K,
+        column: u16,
+        value: V,
+        ttl_seconds: Option<u32>,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.write_ref(key, column, ValueType::Put, value, ttl_seconds)
+    }
+
+    /// Delete a single column value.
+    pub fn delete<K>(&self, key: K, column: u16) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.write_ref(key, column, ValueType::Delete, [], None)
+    }
+
+    /// Merge a value into the given column.
+    pub fn merge<K, V>(&self, key: K, column: u16, value: V) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.merge_with_ttl(key, column, value, None)
+    }
+
+    /// Merge a value into the given column with a TTL.
+    pub fn merge_with_ttl<K, V>(
+        &self,
+        key: K,
+        column: u16,
+        value: V,
+        ttl_seconds: Option<u32>,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.write_ref(key, column, ValueType::Merge, value, ttl_seconds)
     }
 
     /// Write a batch of operations to the database.
@@ -499,18 +579,7 @@ impl Db {
         for newer in iter {
             merged = merged.merge(newer);
         }
-        Ok(Some(
-            merged
-                .columns
-                .into_iter()
-                .map(|col_opt| {
-                    col_opt.and_then(|col| match col.value_type() {
-                        ValueType::Put | ValueType::Merge => Some(Bytes::from(col)),
-                        ValueType::Delete => None,
-                    })
-                })
-                .collect(),
-        ))
+        value_to_vec_of_columns(merged)
     }
 
     /// Set the current time for TTL evaluation (manual time provider only).

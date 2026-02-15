@@ -193,6 +193,77 @@ fn test_db_get_filters_columns() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_db_delete_with_large_values() {
+    let root = "/tmp/db_it_delete_large_values";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 4 * 1024,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+    let payload = vec![b'd'; 64];
+
+    db.put(b"key", 0, payload.clone()).unwrap();
+    for i in 0..200 {
+        let key = format!("fill{:02}", i);
+        db.put(key.as_bytes(), 0, payload.clone()).unwrap();
+    }
+    db.delete(b"key", 0).unwrap();
+    for i in 200..400 {
+        let key = format!("fill{:03}", i);
+        db.put(key.as_bytes(), 0, payload.clone()).unwrap();
+    }
+
+    assert!(db.get(b"key", &ReadOptions::default()).unwrap().is_none());
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_merge_with_large_values() {
+    let root = "/tmp/db_it_merge_large_values";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 4 * 1024,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+    let base = vec![b'a'; 64];
+    let suffix = vec![b'b'; 32];
+
+    db.put(b"key", 0, base.clone()).unwrap();
+    for i in 0..200 {
+        let key = format!("fill{:02}", i);
+        db.put(key.as_bytes(), 0, base.clone()).unwrap();
+    }
+    db.merge(b"key", 0, suffix.clone()).unwrap();
+    for i in 200..400 {
+        let key = format!("fill{:03}", i);
+        db.put(key.as_bytes(), 0, base.clone()).unwrap();
+    }
+
+    let value = db
+        .get(b"key", &ReadOptions::default())
+        .unwrap()
+        .expect("value present");
+    let mut expected = base;
+    expected.extend_from_slice(&suffix);
+    assert_eq!(value[0].as_ref().unwrap().as_ref(), expected.as_slice());
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_ttl_put_get_with_manual_time() {
     let root = "/tmp/db_it_ttl_manual";
     cleanup_test_root(root);
