@@ -29,7 +29,7 @@ mod write_batch;
 
 pub use compaction::RemoteCompactionServer;
 pub use config::{CompactionPolicyKind, Config, VolumeDescriptor, VolumeUsageKind};
-pub use db::Db;
+pub use db::{Db, ReadOptions};
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
 pub use read_only_db::ReadOnlyDb;
 pub use read_proxy::{ReadProxy, ReadProxyConfig};

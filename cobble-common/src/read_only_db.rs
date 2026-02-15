@@ -1,6 +1,5 @@
-use crate::Config;
 use crate::db_state::DbStateHandle;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::file::{File, FileManager};
 use crate::lsm::{LSMTree, LSMTreeVersion};
 use crate::metrics_registry;
@@ -9,6 +8,7 @@ use crate::sst::block_cache::{BlockCache, new_block_cache};
 use crate::sst::row_codec::encode_key;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::r#type::{Key, Value, ValueType};
+use crate::{Config, ReadOptions};
 use bytes::Bytes;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -92,13 +92,25 @@ impl ReadOnlyDb {
     }
 
     /// Lookup a key across the snapshot LSM levels.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
+    pub fn get(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Vec<Option<Bytes>>>> {
+        if let Some(max_index) = options.max_index()
+            && max_index >= self.num_columns
+        {
+            return Err(Error::IoError(format!(
+                "max_index {} in ReadOptions exceeds num_columns {}",
+                max_index, self.num_columns
+            )));
+        }
         let lookup_key = Key::new(0, key.to_vec());
         let encoded_key = encode_key(&lookup_key);
+        let masks = options.masks(self.num_columns);
+        let selected_mask = masks.selected_mask.as_deref();
         let lsm_values = self.lsm_tree.get(
             &self.file_manager,
             encoded_key.as_ref(),
             self.num_columns,
+            options.columns(),
+            selected_mask,
             None,
             None,
         )?;

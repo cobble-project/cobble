@@ -432,11 +432,14 @@ impl LSMTree {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn get(
         &self,
         file_manager: &Arc<FileManager>,
         encoded_key: &[u8],
         num_columns: usize,
+        selected_columns: Option<&[usize]>,
+        selected_mask: Option<&[u8]>,
         terminal_mask: Option<&mut [u8]>,
         max_seq: Option<u64>,
     ) -> Result<Vec<Value>> {
@@ -446,44 +449,45 @@ impl LSMTree {
             snapshot,
             encoded_key,
             num_columns,
+            selected_columns,
+            selected_mask,
             terminal_mask,
             max_seq,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn get_with_snapshot(
         &self,
         file_manager: &Arc<FileManager>,
         snapshot: Arc<DbState>,
         encoded_key: &[u8],
         num_columns: usize,
+        selected_columns: Option<&[usize]>,
+        selected_mask: Option<&[u8]>,
         mut terminal_mask: Option<&mut [u8]>,
         max_seq: Option<u64>,
     ) -> Result<Vec<Value>> {
         let mut values = Vec::new();
-        let mask_size = num_columns.div_ceil(8);
-        let mut decode_mask = vec![0u8; mask_size.max(1)];
-        if num_columns == 1 {
-            decode_mask[0] = 0x01;
-            terminal_mask = None;
-        } else if let Some(ref cols) = terminal_mask {
+        let mask_size = num_columns.div_ceil(8).max(1);
+        let last_bits = (num_columns - 1) % 8 + 1;
+        let last_mask = (1u8 << last_bits) - 1;
+        let mut decode_mask = vec![0xFF; mask_size];
+        decode_mask[mask_size - 1] &= last_mask;
+        if let Some(ref cols) = terminal_mask {
             for (idx, mask_byte) in cols.iter().enumerate().take(mask_size) {
-                decode_mask[idx] = !*mask_byte;
+                decode_mask[idx] &= !*mask_byte;
             }
-            if mask_size > 0 {
-                let last_bits = (num_columns - 1) % 8 + 1;
-                let last_mask = (1u8 << last_bits) - 1;
-                decode_mask[mask_size - 1] &= last_mask;
+            decode_mask[mask_size - 1] &= last_mask;
+        }
+        if let Some(mask) = selected_mask {
+            for (idx, mask_byte) in mask.iter().enumerate().take(mask_size) {
+                decode_mask[idx] &= *mask_byte;
             }
-        } else {
-            for mask in decode_mask.iter_mut().take(mask_size) {
-                *mask = 0xFF;
-            }
-            if mask_size > 0 {
-                let last_bits = (num_columns - 1) % 8 + 1;
-                let last_mask = (1u8 << last_bits) - 1;
-                decode_mask[mask_size - 1] = last_mask;
-            }
+            decode_mask[mask_size - 1] &= last_mask;
+        }
+        if num_columns == 1 {
+            terminal_mask = None;
         }
 
         for level in snapshot.lsm_version.levels.iter() {
@@ -494,6 +498,8 @@ impl LSMTree {
                         file_manager,
                         encoded_key,
                         num_columns,
+                        selected_columns,
+                        selected_mask,
                         terminal_mask.as_deref_mut(),
                         &mut decode_mask,
                         max_seq,
@@ -515,6 +521,8 @@ impl LSMTree {
                         file_manager,
                         encoded_key,
                         num_columns,
+                        selected_columns,
+                        selected_mask,
                         terminal_mask.as_deref_mut(),
                         &mut decode_mask,
                         max_seq,
@@ -541,6 +549,8 @@ impl LSMTree {
         file_manager: &Arc<FileManager>,
         encoded_key: &[u8],
         num_columns: usize,
+        selected_columns: Option<&[usize]>,
+        selected_mask: Option<&[u8]>,
         mut terminal_mask: Option<&mut [u8]>,
         decode_mask: &mut [u8],
         max_seq: Option<u64>,
@@ -584,6 +594,17 @@ impl LSMTree {
             if self.ttl_provider.expired(&value.expired_at) {
                 return Ok(false);
             }
+            if let (Some(mask), Some(selected_mask)) = (terminal_mask.as_deref_mut(), selected_mask)
+            {
+                for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {
+                    *mask_byte &= selected_mask[idx];
+                }
+            }
+            let value = if let Some(columns) = selected_columns {
+                value.select_columns(columns)
+            } else {
+                value
+            };
             let should_stop = num_columns > 1 && value.is_terminal();
             if let Some(ref mask) = terminal_mask {
                 for (idx, mask_byte) in mask.iter().enumerate().take(mask_size) {
@@ -937,6 +958,8 @@ mod tests {
                 encoded_key.as_ref(),
                 num_columns,
                 None,
+                None,
+                None,
                 Some(2),
             )
             .unwrap();
@@ -984,7 +1007,15 @@ mod tests {
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
         let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));
         let value = lsm_tree
-            .get(&file_manager, encoded_key.as_ref(), num_columns, None, None)
+            .get(
+                &file_manager,
+                encoded_key.as_ref(),
+                num_columns,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(value.len(), 2);
         assert_eq!(value[0].columns()[0].as_ref().unwrap().data(), b"new");

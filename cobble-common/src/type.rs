@@ -208,6 +208,15 @@ impl Value {
         mask
     }
 
+    pub(crate) fn select_columns(mut self, indices: &[usize]) -> Value {
+        let mut selected = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            let column = self.columns.get_mut(idx).and_then(|col_opt| col_opt.take());
+            selected.push(column);
+        }
+        Value::new_with_expired_at(selected, self.expired_at)
+    }
+
     /// Merges this value with a newer value, consuming both.
     ///
     /// Columns at the same position are merged according to their types:

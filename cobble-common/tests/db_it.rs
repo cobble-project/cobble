@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::{
-    CompactionPolicyKind, Config, Db, MetricValue, TimeProviderKind, VolumeDescriptor, WriteBatch,
+    CompactionPolicyKind, Config, Db, MetricValue, ReadOptions, TimeProviderKind, VolumeDescriptor,
+    WriteBatch,
 };
 use std::path::Path;
 
@@ -77,7 +78,10 @@ fn test_db_put_get_large_dataset() {
     }
 
     for (key, expected_value) in expected.iter() {
-        let value = db.get(key).unwrap().expect("Value present");
+        let value = db
+            .get(key, &ReadOptions::default())
+            .unwrap()
+            .expect("Value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), expected_value.as_slice());
     }
@@ -129,9 +133,59 @@ fn test_db_writebatch_get_large_dataset() {
     }
 
     for (key, expected_value) in expected.iter() {
-        let value = db.get(key).unwrap().expect("value present");
+        let value = db
+            .get(key, &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), expected_value.as_slice());
+    }
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_get_filters_columns() {
+    let root = "/tmp/db_it_get_filter_columns";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 4 * 1024,
+        memtable_buffer_count: 2,
+        num_columns: 3,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+
+    for i in 0..1000 {
+        let key = format!("key{:04}", i).into_bytes();
+        db.put(&key, 0, format!("v1:{:04}", i).into_bytes())
+            .expect("Put should succeed");
+        db.put(&key, 1, format!("v2:{:04}", i).into_bytes())
+            .expect("Put should succeed");
+        db.put(&key, 2, format!("v3:{:04}", i).into_bytes())
+            .expect("Put should succeed");
+    }
+
+    let options = ReadOptions::for_columns(vec![2, 0]);
+    for i in 0..1000 {
+        let key = format!("key{:04}", i).into_bytes();
+        let value = db
+            .get(&key, &options)
+            .unwrap()
+            .expect("Value should present");
+        assert_eq!(value.len(), 2);
+        assert_eq!(
+            value[0].as_ref().unwrap().as_ref(),
+            format!("v3:{:04}", i).into_bytes()
+        );
+        assert_eq!(
+            value[1].as_ref().unwrap().as_ref(),
+            format!("v1:{:04}", i).into_bytes()
+        );
     }
 
     cleanup_test_root(root);
@@ -173,12 +227,12 @@ fn test_db_ttl_put_get_with_manual_time() {
     db.write_batch(batch).unwrap();
 
     // At t=1000, value should be visible
-    let v = db.get(b"key").unwrap().unwrap();
+    let v = db.get(b"key", &ReadOptions::default()).unwrap().unwrap();
     assert_eq!(v[0].as_ref().unwrap().as_ref(), b"value");
 
     // Advance time past expiry
     db.set_time(1_011);
-    assert!(db.get(b"key").unwrap().is_none());
+    assert!(db.get(b"key", &ReadOptions::default()).unwrap().is_none());
 
     cleanup_test_root(root);
 }
@@ -219,11 +273,11 @@ fn test_db_ttl_default_ttl_with_manual_time() {
     db.write_batch(batch).unwrap();
 
     // Before expiry
-    assert!(db.get(b"foo").unwrap().is_some());
+    assert!(db.get(b"foo", &ReadOptions::default()).unwrap().is_some());
 
     // Move to expiry boundary
     db.set_time(5_005);
-    assert!(db.get(b"foo").unwrap().is_none());
+    assert!(db.get(b"foo", &ReadOptions::default()).unwrap().is_none());
 
     cleanup_test_root(root);
 }
@@ -283,7 +337,10 @@ fn test_db_snapshot_read_only_get() {
     db.close().unwrap();
 
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
-    let value = ro.get(b"k1").unwrap().expect("value present");
+    let value = ro
+        .get(b"k1", &ReadOptions::default())
+        .unwrap()
+        .expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
 
@@ -319,11 +376,17 @@ fn test_db_open_from_snapshot_allows_writes() {
     batch.put(b"k2", 0, b"v2".to_vec());
     writable.write_batch(batch).unwrap();
 
-    let value = writable.get(b"k1").unwrap().expect("value present");
+    let value = writable
+        .get(b"k1", &ReadOptions::default())
+        .unwrap()
+        .expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
 
-    let value = writable.get(b"k2").unwrap().expect("value present");
+    let value = writable
+        .get(b"k2", &ReadOptions::default())
+        .unwrap()
+        .expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v2");
 

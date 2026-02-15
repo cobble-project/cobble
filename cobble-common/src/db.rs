@@ -6,13 +6,13 @@ use crate::snapshot::{
     SnapshotManager, build_levels_from_manifest, decode_manifest, snapshot_manifest_name,
 };
 use crate::sst::block_cache::new_block_cache;
-use crate::sst::row_codec::{decode_value, encode_key, encode_value};
+use crate::sst::row_codec::{decode_value_masked, encode_key, encode_value};
 use crate::r#type::{Column, Key, RefColumn, RefKey, RefValue, Value, ValueType};
 use crate::write_batch::{WriteBatch, WriteOp};
 use crate::{Config, TimeProvider};
 use bytes::Bytes;
 use log::info;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -33,6 +33,99 @@ pub struct Db {
     num_columns: usize,
     time_provider: Arc<dyn TimeProvider>,
     ttl_provider: Arc<TTLProvider>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReadOptions {
+    pub column_indices: Option<Vec<usize>>,
+    max_index: Option<usize>,
+    cached_masks: Arc<Mutex<Option<ReadOptionsMasks>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReadOptionsMasks {
+    pub(crate) num_columns: usize,
+    pub(crate) selected_mask: Option<Arc<[u8]>>,
+    pub(crate) base_mask: Arc<[u8]>,
+}
+
+impl Default for ReadOptions {
+    fn default() -> Self {
+        Self {
+            column_indices: None,
+            max_index: None,
+            cached_masks: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl ReadOptions {
+    pub fn for_column(column_index: usize) -> Self {
+        Self::new_with_indices(Some(vec![column_index]))
+    }
+
+    pub fn for_columns(column_indices: Vec<usize>) -> Self {
+        Self::new_with_indices(Some(column_indices))
+    }
+
+    fn new_with_indices(column_indices: Option<Vec<usize>>) -> Self {
+        let max_index = column_indices
+            .as_ref()
+            .and_then(|indices| indices.iter().max().cloned());
+        Self {
+            column_indices,
+            max_index,
+            cached_masks: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn columns(&self) -> Option<&[usize]> {
+        self.column_indices.as_deref()
+    }
+
+    pub(crate) fn max_index(&self) -> Option<usize> {
+        self.max_index
+    }
+
+    pub(crate) fn masks(&self, num_columns: usize) -> ReadOptionsMasks {
+        let mut guard = self.cached_masks.lock().unwrap();
+        if guard
+            .as_ref()
+            .map(|mask| mask.num_columns != num_columns)
+            .unwrap_or(true)
+        {
+            *guard = Some(self.build_masks(num_columns));
+        }
+        guard.as_ref().expect("cached mask initialized").clone()
+    }
+
+    fn build_masks(&self, num_columns: usize) -> ReadOptionsMasks {
+        let mask_size = num_columns.div_ceil(8).max(1);
+        let last_bits = (num_columns - 1) % 8 + 1;
+        let last_mask = (1u8 << last_bits) - 1;
+        let selected_mask = self.column_indices.as_ref().map(|columns| {
+            let mut mask = vec![0u8; mask_size];
+            for &column_idx in columns {
+                if column_idx < num_columns {
+                    mask[column_idx / 8] |= 1 << (column_idx % 8);
+                }
+            }
+            mask[mask_size - 1] &= last_mask;
+            Arc::from(mask.into_boxed_slice())
+        });
+        let base_mask = if let Some(mask) = selected_mask.as_ref() {
+            Arc::clone(mask)
+        } else {
+            let mut mask = vec![0xFF; mask_size];
+            mask[mask_size - 1] &= last_mask;
+            Arc::from(mask.into_boxed_slice())
+        };
+        ReadOptionsMasks {
+            num_columns,
+            selected_mask,
+            base_mask,
+        }
+    }
 }
 
 impl Db {
@@ -324,33 +417,52 @@ impl Db {
     }
 
     /// Lookup a key across the memtable and LSM levels.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
+    pub fn get(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Vec<Option<Bytes>>>> {
+        if let Some(max_index) = options.max_index()
+            && max_index >= self.num_columns
+        {
+            return Err(Error::IoError(format!(
+                "max_index {} in ReadOptions exceeds num_columns {}",
+                max_index, self.num_columns
+            )));
+        }
         let lookup_key = Key::new(0, key.to_vec());
         let encoded_key = encode_key(&lookup_key);
+        let selected_columns = options.columns();
+        let masks = options.masks(self.num_columns);
+        let selected_mask = masks.selected_mask.as_deref();
+        let decode_mask = masks.base_mask.as_ref();
+        let mask_size = decode_mask.len();
 
+        let mut terminal_mask = if self.num_columns == 1 {
+            None
+        } else {
+            Some(vec![0u8; mask_size])
+        };
         let snapshot = self.memtable_manager.db_state().load();
         let mut values: Vec<Value> = Vec::new();
         let memtable_min_seq = self.memtable_manager.get_all_with_snapshot(
             Arc::clone(&snapshot),
             encoded_key.as_ref(),
             |raw| {
-                values.push(decode_value(raw, self.num_columns)?);
+                let mut value = decode_value_masked(
+                    raw,
+                    self.num_columns,
+                    decode_mask,
+                    terminal_mask.as_deref_mut(),
+                )?;
+                if let (Some(mask), Some(selected)) = (terminal_mask.as_mut(), selected_mask) {
+                    for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {
+                        *mask_byte &= selected[idx];
+                    }
+                }
+                if let Some(columns) = selected_columns {
+                    value = value.select_columns(columns);
+                }
+                values.push(value);
                 Ok(())
             },
         )?;
-        let mut terminal_mask = if self.num_columns == 1 {
-            None
-        } else {
-            let mask_size = self.num_columns.div_ceil(8).max(1);
-            let mut mask = vec![0u8; mask_size];
-            for value in &values {
-                let value_mask = value.terminal_mask();
-                for (idx, byte) in value_mask.iter().enumerate().take(mask_size) {
-                    mask[idx] |= *byte;
-                }
-            }
-            Some(mask)
-        };
         let mut should_stop =
             self.num_columns > 1 && values.last().is_some_and(|value| value.is_terminal());
         let lsm_values = self.lsm_tree.get_with_snapshot(
@@ -358,6 +470,8 @@ impl Db {
             Arc::clone(&snapshot),
             encoded_key.as_ref(),
             self.num_columns,
+            selected_columns,
+            selected_mask,
             terminal_mask.as_deref_mut(),
             memtable_min_seq,
         )?;
@@ -473,7 +587,10 @@ mod tests {
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
-        let value = db.get(b"k1").unwrap().expect("value present");
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"new");
 
@@ -504,7 +621,10 @@ mod tests {
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
-        let value = db.get(b"k1").unwrap().expect("value present");
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"new");
 
@@ -535,7 +655,10 @@ mod tests {
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
-        let value = db.get(b"k1").unwrap().expect("value present");
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"base_x");
 
@@ -562,7 +685,10 @@ mod tests {
         batch.put(b"k1", 0, b"new".to_vec());
         db.write_batch(batch).unwrap();
 
-        let value = db.get(b"k1").unwrap().expect("value present");
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"new");
 
@@ -589,7 +715,10 @@ mod tests {
         batch.merge(b"k1", 0, b"_x".to_vec());
         db.write_batch(batch).unwrap();
 
-        let value = db.get(b"k1").unwrap().expect("value present");
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"base_x");
 
@@ -620,7 +749,10 @@ mod tests {
         batch.put(b"k1", 1, b"c1-new".to_vec());
         db.write_batch(batch).unwrap();
 
-        let value = db.get(b"k1").unwrap().expect("value present");
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
         let col0 = value[0].as_ref().unwrap();
         let col1 = value[1].as_ref().unwrap();
         assert_eq!(col0.as_ref(), b"c0-old");
@@ -657,11 +789,41 @@ mod tests {
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
-        let value = db.get(b"k1").unwrap().expect("value present");
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
         let col0 = value[0].as_ref().unwrap();
         let col1 = value[1].as_ref().unwrap();
         assert_eq!(col0.as_ref(), b"c0");
         assert_eq!(col1.as_ref(), b"c1_x");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_get_with_column_index() {
+        let root = "/tmp/db_get_column_index";
+        cleanup_test_root(root);
+        let config = Config {
+            num_columns: 2,
+            ..config_with_small_memtable(root)
+        };
+        let db = Db::open(config).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, b"c0".to_vec());
+        batch.put(b"k1", 1, b"c1".to_vec());
+        db.write_batch(batch).unwrap();
+
+        let value = db
+            .get(b"k1", &ReadOptions::for_columns(vec![1, 0]))
+            .unwrap()
+            .expect("value present");
+        assert_eq!(value.len(), 2);
+        assert_eq!(value[0].as_ref().unwrap().as_ref(), b"c1");
+        assert_eq!(value[1].as_ref().unwrap().as_ref(), b"c0");
 
         cleanup_test_root(root);
     }
