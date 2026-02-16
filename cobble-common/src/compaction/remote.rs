@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 use crate::file::{DataVolume, FileId, FileManager, FileManagerOptions, TrackedFileId};
 use crate::iterator::SortedRun;
 use crate::lsm::{LSMTree, LevelEdit, VersionEdit};
+use crate::metrics_manager::MetricsManager;
 use crate::sst::SSTWriterOptions;
 use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
@@ -25,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use uuid::Uuid;
 
 const REMOTE_FILE_ID_START: u64 = u64::MAX / 2;
 
@@ -60,7 +62,7 @@ impl RemoteSstOptions {
 
     fn into_sst_options(self) -> SSTWriterOptions {
         SSTWriterOptions {
-            metrics_db_id: None,
+            metrics: None,
             block_size: self.block_size,
             buffer_size: self.buffer_size,
             num_columns: self.num_columns,
@@ -235,6 +237,7 @@ pub(crate) struct RemoteCompactionWorker {
     ttl_config: TtlConfig,
     runtime: Mutex<Option<Runtime>>,
     remote_timeout: Duration,
+    metrics_manager: Arc<MetricsManager>,
 }
 
 impl RemoteCompactionWorker {
@@ -245,6 +248,7 @@ impl RemoteCompactionWorker {
         config: Config,
         ttl_config: TtlConfig,
         remote_timeout: Duration,
+        metrics_manager: Arc<MetricsManager>,
     ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .thread_name("cobble-remote-compaction")
@@ -260,6 +264,7 @@ impl RemoteCompactionWorker {
             ttl_config,
             runtime: Mutex::new(Some(runtime)),
             remote_timeout,
+            metrics_manager,
         })
     }
 
@@ -275,10 +280,6 @@ impl RemoteCompactionWorker {
         data_file_type: DataFileType,
         ttl_provider: Arc<TTLProvider>,
     ) -> Result<RemoteCompactionRequest> {
-        let db_id = self
-            .file_manager
-            .db_id()
-            .unwrap_or_else(|| "unknown".to_string());
         let runs = sorted_runs
             .iter()
             .map(|run| RemoteSortedRun::from_sorted_run(run, &self.file_manager))
@@ -286,7 +287,7 @@ impl RemoteCompactionWorker {
         let sst_options = super::build_sst_writer_options(&self.config, output_level);
         Ok(RemoteCompactionRequest {
             request_id: None,
-            db_id,
+            db_id: self.metrics_manager.db_id().to_string(),
             output_level,
             data_file_type: data_file_type.to_string(),
             sst_options: RemoteSstOptions::from_sst_options(&sst_options),
@@ -379,6 +380,7 @@ pub struct RemoteCompactionServer {
     executor: Arc<CompactionExecutor>,
     data_volumes: Arc<Vec<DataVolume>>,
     request_id: Arc<AtomicU64>,
+    metrics_manager: Arc<MetricsManager>,
 }
 
 impl RemoteCompactionServer {
@@ -394,12 +396,14 @@ impl RemoteCompactionServer {
         );
         let executor = CompactionExecutor::new_with_runtime(compaction_config, runtime.clone())?;
         let data_volumes = FileManager::data_volumes_from_config(&config)?;
+        let metrics_manager = Arc::new(MetricsManager::new(Uuid::new_v4().to_string()));
         Ok(Self {
             config,
             runtime,
             executor: Arc::new(executor),
             data_volumes: Arc::new(data_volumes),
             request_id: Arc::new(AtomicU64::new(1)),
+            metrics_manager,
         })
     }
 
@@ -430,6 +434,7 @@ impl RemoteCompactionServer {
         let executor = Arc::clone(&self.executor);
         let data_volumes = Arc::clone(&self.data_volumes);
         let request_id_counter = Arc::clone(&self.request_id);
+        let metrics_manager = Arc::clone(&self.metrics_manager);
         self.runtime.spawn_blocking(move || {
             let request: Result<RemoteCompactionRequest> = read_message(&mut stream);
             if let Err(err) = &request {
@@ -446,6 +451,7 @@ impl RemoteCompactionServer {
                 &config,
                 executor.as_ref(),
                 data_volumes.clone(),
+                Arc::clone(&metrics_manager),
                 request,
             ) {
                 Ok(files) => RemoteCompactionResponse::ok(files),
@@ -461,13 +467,15 @@ impl RemoteCompactionServer {
         config: &Config,
         executor: &CompactionExecutor,
         data_volumes: Arc<Vec<DataVolume>>,
+        metrics_manager: Arc<MetricsManager>,
         request: RemoteCompactionRequest,
     ) -> Result<Vec<RemoteDataFile>> {
-        let file_manager = Self::file_manager_for_with(config, &data_volumes, &request.db_id)?;
+        let file_manager =
+            Self::file_manager_for_with(config, &data_volumes, &request.db_id, &metrics_manager)?;
         let data_file_type =
             DataFileType::from_str(&request.data_file_type).map_err(Error::IoError)?;
         let mut sst_options = request.sst_options.into_sst_options();
-        sst_options.metrics_db_id = Some(request.db_id.clone());
+        sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
         let file_builder_factory = super::make_sst_builder_factory(sst_options);
         let sorted_runs = request
             .runs
@@ -491,8 +499,11 @@ impl RemoteCompactionServer {
             },
             Arc::new(ManualTimeProvider::new(request.ttl_now_seconds)),
         ));
+        let compaction_metrics = metrics_manager.compaction_metrics();
+        let sst_metrics = metrics_manager.sst_iterator_metrics();
         let task = CompactionTask::new(
-            request.db_id,
+            compaction_metrics,
+            sst_metrics,
             sorted_runs,
             request.output_level,
             Arc::clone(&file_manager),
@@ -516,14 +527,15 @@ impl RemoteCompactionServer {
         config: &Config,
         data_volumes: &Arc<Vec<DataVolume>>,
         db_id: &str,
+        metrics_manager: &Arc<MetricsManager>,
     ) -> Result<Arc<FileManager>> {
         let options = FileManagerOptions {
             base_dir: db_id.to_string(),
             base_file_size: config.base_file_size,
             ..FileManagerOptions::default()
         };
-        let mut file_manager = FileManager::new(data_volumes.to_vec(), options)?;
-        file_manager.set_db_id(db_id.to_string());
+        let file_manager =
+            FileManager::new(data_volumes.to_vec(), options, Arc::clone(metrics_manager))?;
         file_manager.set_next_file_id(REMOTE_FILE_ID_START);
         Ok(Arc::new(file_manager))
     }
@@ -662,10 +674,12 @@ mod tests {
             ..Config::default()
         };
         let db_id = "remote-compaction-roundtrip".to_string();
-        let mut file_manager = FileManager::from_config(&config, &db_id).unwrap();
-        file_manager.set_db_id(db_id.clone());
-        let file_manager = Arc::new(file_manager);
-        let sst_options = build_sst_writer_options(&config, 0);
+        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
+        let file_manager = Arc::new(
+            FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
+        );
+        let mut sst_options = build_sst_writer_options(&config, 0);
+        sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
         let value_payload = vec![b'x'; 128];
         let num_columns = sst_options.num_columns;
 
@@ -707,7 +721,10 @@ mod tests {
             active: None,
             immutables: VecDeque::new(),
         });
-        let lsm_tree = Arc::new(LSMTree::with_state(Arc::clone(&db_state)));
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::clone(&db_state),
+            Arc::clone(&metrics_manager),
+        ));
 
         let remote_timeout = Duration::from_millis(config.compaction_remote_timeout_ms);
         let server = Arc::new(RemoteCompactionServer::new(config.clone()).unwrap());
@@ -732,6 +749,7 @@ mod tests {
                 default_ttl_seconds: None,
             },
             remote_timeout,
+            Arc::clone(&metrics_manager),
         )
         .unwrap();
 

@@ -3,6 +3,7 @@ use crate::error::{Error, Result};
 use crate::file::{File, FileSystem, FileSystemRegistry};
 use crate::lru::LruCache;
 use crate::maintainer::GlobalSnapshotManifest;
+use crate::metrics_manager::MetricsManager;
 #[cfg(test)]
 use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
 use crate::paths::{
@@ -15,6 +16,7 @@ use serde_json::Error as SerdeError;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub struct ReadProxyConfig {
@@ -60,6 +62,8 @@ pub struct ReadProxy {
     cache: LruCache<Arc<BucketSnapshotKey>, Arc<ReadOnlyDb>>,
     block_cache: Option<BlockCache>,
     fs: Arc<dyn FileSystem>,
+    db_id: String,
+    metrics_manager: Arc<MetricsManager>,
     last_pointer: Option<String>,
     last_pointer_modified: Option<u64>,
     auto_refresh: bool,
@@ -92,6 +96,8 @@ impl ReadProxy {
         } else {
             None
         };
+        let db_id = Uuid::new_v4().to_string();
+        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
         Ok(Self {
             config,
             global_snapshot,
@@ -99,6 +105,8 @@ impl ReadProxy {
             cache: LruCache::new(read_config.pin_partition_in_memory_count),
             block_cache,
             fs,
+            db_id,
+            metrics_manager,
             last_pointer: Some(manifest_name),
             last_pointer_modified: None,
             auto_refresh: false,
@@ -132,6 +140,8 @@ impl ReadProxy {
         } else {
             None
         };
+        let db_id = Uuid::new_v4().to_string();
+        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
         Ok(Self {
             config,
             global_snapshot,
@@ -139,6 +149,8 @@ impl ReadProxy {
             cache: LruCache::new(read_config.pin_partition_in_memory_count),
             block_cache,
             fs,
+            db_id,
+            metrics_manager,
             last_pointer: Some(pointer),
             last_pointer_modified: modified,
             auto_refresh: true,
@@ -184,11 +196,12 @@ impl ReadProxy {
         if let Some(db) = self.cache.get(key) {
             return Ok(Arc::clone(db));
         }
-        let db = Arc::new(ReadOnlyDb::open_with_db_id_and_cache(
+        let db = Arc::new(ReadOnlyDb::open_with_db_id_and_cache_with_metrics(
             self.config.clone(),
             key.snapshot_id,
             key.db_id.clone(),
             self.block_cache.clone(),
+            Arc::clone(&self.metrics_manager),
         )?);
         self.cache.insert(Arc::clone(key), Arc::clone(&db));
         Ok(db)

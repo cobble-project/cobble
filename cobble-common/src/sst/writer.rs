@@ -7,7 +7,7 @@ use crate::sst::format::{BlockBuilder, Footer};
 use crate::sst::row_codec::{encode_key, encode_value};
 use crate::r#type::{Key, Value};
 use bytes::{BufMut, Bytes, BytesMut};
-use metrics::histogram;
+use metrics::{Histogram, histogram};
 
 #[derive(Clone)]
 struct DataBlockMeta {
@@ -18,9 +18,26 @@ struct DataBlockMeta {
 }
 
 #[derive(Clone)]
+pub(crate) struct SSTWriterMetrics {
+    compression_ratio: Histogram,
+}
+
+impl SSTWriterMetrics {
+    pub(crate) fn new(db_id: &str, compression: SstCompressionAlgorithm) -> Self {
+        Self {
+            compression_ratio: histogram!(
+                "sst_block_compression_ratio",
+                "db_id" => db_id.to_string(),
+                "compression" => compression.label()
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct SSTWriterOptions {
-    /// Optional database ID for metrics labeling.
-    pub metrics_db_id: Option<String>,
+    /// Optional metrics handles to reuse across writers.
+    pub metrics: Option<SSTWriterMetrics>,
     pub block_size: usize,
     pub buffer_size: usize,
     /// Number of columns in the value schema.
@@ -39,7 +56,7 @@ pub struct SSTWriterOptions {
 impl Default for SSTWriterOptions {
     fn default() -> Self {
         Self {
-            metrics_db_id: None,
+            metrics: None,
             block_size: 4096,
             buffer_size: 8192,
             num_columns: 1,
@@ -55,6 +72,7 @@ impl Default for SSTWriterOptions {
 pub struct SSTWriter<W: SequentialWriteFile> {
     writer: BufferedWriter<W>,
     options: SSTWriterOptions,
+    metrics: SSTWriterMetrics,
     data_block_builder: BlockBuilder,
     bloom_filter_builder: Option<BloomFilterBuilder>,
     first_key: Option<Vec<u8>>,
@@ -67,6 +85,10 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
     pub fn new(writer: W, options: SSTWriterOptions) -> Self {
         let buffered_writer = BufferedWriter::new(writer, options.buffer_size);
         let data_block_builder = BlockBuilder::new(options.block_size);
+        let metrics = options
+            .metrics
+            .clone()
+            .unwrap_or_else(|| SSTWriterMetrics::new("unknown", options.compression));
         let bloom_filter_builder = if options.bloom_filter_enabled {
             Some(BloomFilterBuilder::new(options.bloom_bits_per_key))
         } else {
@@ -76,6 +98,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         Self {
             writer: buffered_writer,
             options,
+            metrics,
             data_block_builder,
             bloom_filter_builder,
             first_key: None,
@@ -179,17 +202,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             return;
         }
         let ratio = compressed_len as f64 / raw_len as f64;
-        let db_id = self
-            .options
-            .metrics_db_id
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        histogram!(
-            "sst_block_compression_ratio",
-            "db_id" => db_id,
-            "compression" => self.options.compression.label()
-        )
-        .record(ratio);
+        self.metrics.compression_ratio.record(ratio);
     }
 
     /// Finish writing the SST file and return (first_key, last_key, file_size, footer_bytes).
@@ -491,7 +504,7 @@ mod tests {
         let mut writer = SSTWriter::new(
             writer_file,
             SSTWriterOptions {
-                metrics_db_id: None,
+                metrics: None,
                 block_size: 100, // Small block size to force multiple blocks
                 buffer_size: 8192,
                 num_columns: 1,

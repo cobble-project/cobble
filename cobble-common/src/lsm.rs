@@ -5,9 +5,10 @@ use crate::compaction::{
 use crate::data_file::DataFile;
 use crate::error::Result;
 use crate::file::FileManager;
+use crate::metrics_manager::MetricsManager;
 use crate::sst::block_cache::BlockCache;
 use crate::sst::row_codec::decode_value_masked;
-use crate::sst::{SSTIterator, SSTIteratorOptions};
+use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 use crate::r#type::Value;
 use log::debug;
 use std::sync::{Arc, Mutex};
@@ -36,7 +37,7 @@ pub(crate) struct LSMTree {
     block_cache: Option<BlockCache>,
     state: Mutex<LSMTreeState>,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
-    db_id: Option<String>,
+    sst_metrics: Arc<SSTIteratorMetrics>,
 }
 
 struct LSMTreeState {
@@ -124,18 +125,25 @@ impl std::fmt::Display for VersionSummary<'_> {
 
 impl Default for LSMTree {
     fn default() -> Self {
-        Self::with_state(Arc::new(DbStateHandle::new()))
+        Self::with_state(
+            Arc::new(DbStateHandle::new()),
+            Arc::new(MetricsManager::new("unknown".to_string())),
+        )
     }
 }
 
 impl LSMTree {
-    pub(crate) fn with_state(db_state: Arc<DbStateHandle>) -> Self {
-        Self::with_state_and_ttl(db_state, Arc::new(TTLProvider::disabled()))
+    pub(crate) fn with_state(
+        db_state: Arc<DbStateHandle>,
+        metrics_manager: Arc<MetricsManager>,
+    ) -> Self {
+        Self::with_state_and_ttl(db_state, Arc::new(TTLProvider::disabled()), metrics_manager)
     }
 
     pub(crate) fn with_state_and_ttl(
         db_state: Arc<DbStateHandle>,
         ttl_provider: Arc<TTLProvider>,
+        metrics_manager: Arc<MetricsManager>,
     ) -> Self {
         Self {
             db_state,
@@ -152,7 +160,7 @@ impl LSMTree {
                 compaction_worker: None,
             }),
             ttl_provider,
-            db_id: None,
+            sst_metrics: metrics_manager.sst_iterator_metrics(),
         }
     }
 
@@ -320,12 +328,8 @@ impl LSMTree {
         self.block_cache = block_cache;
     }
 
-    pub(crate) fn set_db_id(&mut self, db_id: String) {
-        self.db_id = Some(db_id);
-    }
-
-    pub(crate) fn db_id(&self) -> Option<String> {
-        self.db_id.clone()
+    pub(crate) fn sst_metrics(&self) -> Arc<SSTIteratorMetrics> {
+        Arc::clone(&self.sst_metrics)
     }
 
     pub(crate) fn shutdown_compaction(&self) {
@@ -568,7 +572,7 @@ impl LSMTree {
             file.as_ref(),
             SSTIteratorOptions {
                 num_columns,
-                metrics_db_id: self.db_id.clone(),
+                metrics: Some(Arc::clone(&self.sst_metrics)),
                 bloom_filter_enabled: true,
                 ..SSTIteratorOptions::default()
             },
@@ -734,7 +738,8 @@ mod tests {
             active: None,
             immutables: Vec::new().into(),
         });
-        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
 
         // Create a version edit to remove one file from level 0 and add two new files
         let current_version = db_state.load().lsm_version.clone();
@@ -786,7 +791,9 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", root))
             .unwrap();
-        let file_manager = Arc::new(FileManager::with_defaults(fs.clone()).unwrap());
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs.clone(), Arc::clone(&metrics_manager)).unwrap());
         let num_columns = 1;
         let to_remove = create_test_sst(
             &file_manager,
@@ -811,7 +818,7 @@ mod tests {
             active: None,
             immutables: Vec::new().into(),
         });
-        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         lsm_tree.apply_edit(VersionEdit {
             level_edits: vec![LevelEdit {
                 level: 0,
@@ -842,7 +849,9 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", root))
             .unwrap();
-        let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-compaction-test".to_string()));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let config = crate::compaction::CompactionConfig {
             l1_base_bytes: 1,
             level_size_multiplier: 1,
@@ -881,13 +890,17 @@ mod tests {
             active: None,
             immutables: Vec::new().into(),
         });
-        let lsm_tree = Arc::new(LSMTree::with_state(Arc::clone(&db_state)));
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::clone(&db_state),
+            Arc::clone(&metrics_manager),
+        ));
         let worker: Arc<dyn crate::compaction::CompactionWorker> =
             Arc::new(crate::compaction::LocalCompactionWorker::new(
                 crate::compaction::CompactionExecutor::new(config).unwrap(),
                 Arc::clone(&file_manager),
                 Arc::downgrade(&lsm_tree),
                 db_config,
+                Arc::clone(&metrics_manager),
             ));
         lsm_tree.configure_compaction(config, Some(Arc::clone(&worker)));
         let target = lsm_tree
@@ -924,7 +937,9 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", root))
             .unwrap();
-        let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let num_columns = 1;
         let older = create_test_sst(
             &file_manager,
@@ -951,7 +966,7 @@ mod tests {
             active: None,
             immutables: Vec::new().into(),
         });
-        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));
         let value = lsm_tree
             .get(
@@ -978,7 +993,9 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", root))
             .unwrap();
-        let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let num_columns = 1;
         let older = create_test_sst(
             &file_manager,
@@ -1005,7 +1022,7 @@ mod tests {
             active: None,
             immutables: Vec::new().into(),
         });
-        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));
         let value = lsm_tree
             .get(

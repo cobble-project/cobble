@@ -66,7 +66,7 @@ mod tests {
             let mut writer = SSTWriter::new(
                 writer_file,
                 SSTWriterOptions {
-                    metrics_db_id: None,
+                    metrics: None,
                     block_size: 64,
                     buffer_size: 8192,
                     num_columns: 1,
@@ -92,7 +92,7 @@ mod tests {
             reader_file,
             7,
             SSTIteratorOptions {
-                metrics_db_id: None,
+                metrics: None,
                 block_cache_size: 0,
                 num_columns: 1,
                 bloom_filter_enabled: true,

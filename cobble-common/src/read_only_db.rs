@@ -3,6 +3,7 @@ use crate::db_state::DbStateHandle;
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager};
 use crate::lsm::{LSMTree, LSMTreeVersion};
+use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
 use crate::snapshot::{build_levels_from_manifest, decode_manifest, snapshot_manifest_name};
 use crate::sst::block_cache::{BlockCache, new_block_cache};
@@ -12,15 +13,14 @@ use crate::r#type::{Key, Value};
 use crate::{Config, ReadOptions};
 use bytes::Bytes;
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// Read-only database that serves data from a snapshot manifest.
 pub struct ReadOnlyDb {
-    id: String,
     file_manager: Arc<FileManager>,
     lsm_tree: Arc<LSMTree>,
     num_columns: usize,
     ttl_provider: Arc<TTLProvider>,
+    metrics_manager: Arc<MetricsManager>,
 }
 
 impl ReadOnlyDb {
@@ -39,10 +39,26 @@ impl ReadOnlyDb {
         snapshot_db_id: String,
         block_cache: Option<BlockCache>,
     ) -> Result<Self> {
+        let metrics_manager = Arc::new(MetricsManager::new(snapshot_db_id.clone()));
+        Self::open_with_db_id_and_cache_with_metrics(
+            config,
+            snapshot_id,
+            snapshot_db_id,
+            block_cache,
+            metrics_manager,
+        )
+    }
+
+    pub fn open_with_db_id_and_cache_with_metrics(
+        config: Config,
+        snapshot_id: u64,
+        snapshot_db_id: String,
+        block_cache: Option<BlockCache>,
+        metrics_manager: Arc<MetricsManager>,
+    ) -> Result<Self> {
         metrics_registry::init_metrics();
-        let db_id = Uuid::new_v4().to_string();
-        let mut file_manager = FileManager::from_config(&config, &snapshot_db_id)?;
-        file_manager.set_db_id(db_id.clone());
+        let file_manager =
+            FileManager::from_config(&config, &snapshot_db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let time_provider = config.time_provider.create();
         let ttl_provider = Arc::new(TTLProvider::new(
@@ -65,31 +81,33 @@ impl ReadOnlyDb {
             active: None,
             immutables: Vec::new().into(),
         });
-        let mut lsm_tree =
-            LSMTree::with_state_and_ttl(Arc::clone(&db_state), Arc::clone(&ttl_provider));
+        let mut lsm_tree = LSMTree::with_state_and_ttl(
+            Arc::clone(&db_state),
+            Arc::clone(&ttl_provider),
+            Arc::clone(&metrics_manager),
+        );
         if let Some(block_cache) = block_cache {
             lsm_tree.set_block_cache(Some(block_cache));
         } else if config.block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
-        lsm_tree.set_db_id(db_id.clone());
         let lsm_tree = Arc::new(lsm_tree);
         Ok(Self {
-            id: db_id,
             file_manager,
             lsm_tree,
             num_columns: config.num_columns,
             ttl_provider,
+            metrics_manager,
         })
     }
 
     pub fn id(&self) -> &str {
-        &self.id
+        self.metrics_manager.db_id()
     }
 
     /// Return the metrics samples for this database.
     pub fn metrics(&self) -> Vec<crate::MetricSample> {
-        metrics_registry::snapshot_metrics(Some(&self.id))
+        metrics_registry::snapshot_metrics(Some(self.metrics_manager.db_id()))
     }
 
     /// Lookup a key across the snapshot LSM levels.

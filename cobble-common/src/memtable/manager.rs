@@ -12,11 +12,12 @@ use crate::iterator::{DeduplicatingIterator, KvIterator};
 use crate::lsm::LSMTree;
 use crate::memtable::Memtable;
 use crate::memtable::hash::{HashMemtable, MemtableReclaimer};
+use crate::metrics_manager::MetricsManager;
 use crate::snapshot::SnapshotManager;
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use crate::r#type::{RefKey, RefValue};
 use log::{debug, trace, warn};
-use metrics::counter;
+use metrics::{Counter, counter};
 
 #[derive(Clone)]
 pub(crate) struct MemtableFlushResult {
@@ -25,7 +26,6 @@ pub(crate) struct MemtableFlushResult {
 }
 
 pub(crate) struct MemtableManagerOptions {
-    pub(crate) db_id: String,
     pub(crate) initial_seq: u64,
     pub(crate) memtable_capacity: usize,
     pub(crate) buffer_count: usize,
@@ -34,12 +34,30 @@ pub(crate) struct MemtableManagerOptions {
     pub(crate) num_columns: usize,
     pub(crate) write_stall_limit: usize,
     pub(crate) auto_snapshot_manager: Option<SnapshotManager>,
+    pub(crate) metrics_manager: Option<Arc<MetricsManager>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MemtableManagerMetrics {
+    flushes_total: Counter,
+    flush_bytes_total: Counter,
+    write_stall_waits_total: Counter,
+}
+
+impl MemtableManagerMetrics {
+    pub(crate) fn new(db_id: &str) -> Self {
+        let db_id = db_id.to_string();
+        Self {
+            flushes_total: counter!("memtable_flushes_total", "db_id" => db_id.clone()),
+            flush_bytes_total: counter!("memtable_flush_bytes_total", "db_id" => db_id.clone()),
+            write_stall_waits_total: counter!("write_stall_waits_total", "db_id" => db_id),
+        }
+    }
 }
 
 impl Default for MemtableManagerOptions {
     fn default() -> Self {
         Self {
-            db_id: String::new(),
             initial_seq: 0,
             memtable_capacity: 1024 * 1024,
             buffer_count: 2,
@@ -51,6 +69,7 @@ impl Default for MemtableManagerOptions {
             num_columns: 1,
             write_stall_limit: 8,
             auto_snapshot_manager: None,
+            metrics_manager: None,
         }
     }
 }
@@ -70,7 +89,7 @@ pub(crate) struct MemtableManager {
     flush_tx: Mutex<Option<mpsc::Sender<FlushJob>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     auto_snapshot_manager: Option<SnapshotManager>,
-    db_id: String,
+    metrics: MemtableManagerMetrics,
 }
 
 struct MemtableManagerState {
@@ -109,9 +128,6 @@ impl MemtableManager {
         options: MemtableManagerOptions,
     ) -> Result<Self> {
         let mut options = options;
-        if options.sst_options.metrics_db_id.is_none() && !options.db_id.is_empty() {
-            options.sst_options.metrics_db_id = Some(options.db_id.clone());
-        }
         if options.buffer_count == 0 {
             return Err(Error::IoError(
                 "buffer_count must be greater than 0".to_string(),
@@ -127,6 +143,17 @@ impl MemtableManager {
         let buffer_ready = Arc::new(Condvar::new());
         let flush_done = Arc::new(Condvar::new());
         let db_state = lsm_tree.db_state();
+        if let Some(manager) = &options.metrics_manager
+            && options.sst_options.metrics.is_none()
+        {
+            options.sst_options.metrics =
+                Some(manager.sst_writer_metrics(options.sst_options.compression));
+        }
+        let metrics = options
+            .metrics_manager
+            .as_ref()
+            .map(|manager| manager.memtable_metrics())
+            .unwrap_or_else(|| MemtableManagerMetrics::new("unknown"));
         let reclaimer = Self::make_reclaimer(
             Arc::clone(&state),
             Arc::clone(&buffer_ready),
@@ -155,6 +182,7 @@ impl MemtableManager {
             options.num_columns,
             Arc::clone(&lsm_tree),
             lsm_tree.ttl_provider(),
+            metrics.clone(),
         )?;
         Ok(Self {
             state,
@@ -171,7 +199,7 @@ impl MemtableManager {
             flush_tx: Mutex::new(Some(flush_tx)),
             worker: Mutex::new(Some(worker)),
             auto_snapshot_manager: options.auto_snapshot_manager,
-            db_id: options.db_id,
+            metrics,
         })
     }
 
@@ -189,6 +217,7 @@ impl MemtableManager {
         num_columns: usize,
         lsm_tree: Arc<LSMTree>,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
+        metrics: MemtableManagerMetrics,
     ) -> Result<(JoinHandle<()>, mpsc::Sender<FlushJob>)> {
         let (flush_tx, flush_rx) = mpsc::channel::<FlushJob>();
         let state_clone = Arc::clone(&state);
@@ -201,9 +230,6 @@ impl MemtableManager {
             .name("cobble-flush".to_string())
             .spawn(move || {
                 while let Ok(job) = flush_rx.recv() {
-                    let db_id = lsm_tree_clone
-                        .db_id()
-                        .unwrap_or_else(|| "unknown".to_string());
                     if let Some(memtable) = job.memtable {
                         trace!("memtable flush start seq={}", job.seq);
                         let (result, _memtable, completed_seq) = flush_memtable(
@@ -222,9 +248,9 @@ impl MemtableManager {
                                     "memtable flush complete seq={} file_id={} size={}",
                                     res.seq, res.data_file.file_id, res.data_file.size
                                 );
-                                counter!("memtable_flushes_total", "db_id" => db_id.clone())
-                                    .increment(1);
-                                counter!("memtable_flush_bytes_total", "db_id" => db_id.clone())
+                                metrics.flushes_total.increment(1);
+                                metrics
+                                    .flush_bytes_total
                                     .increment(res.data_file.size as u64);
                                 let snapshot = lsm_tree_clone
                                     .add_level0_files(res.seq, vec![Arc::clone(&res.data_file)]);
@@ -581,7 +607,7 @@ impl MemtableManager {
     ) -> std::sync::MutexGuard<'a, ()> {
         while Self::should_write_stall_with_snapshot(&self.db_state.load(), self.write_stall_limit)
         {
-            counter!("write_stall_waits_total", "db_id" => self.db_id.clone()).increment(1);
+            self.metrics.write_stall_waits_total.increment(1);
             guard = self.db_state.wait_for_change(guard);
         }
         guard
@@ -705,7 +731,7 @@ fn make_sst_builder_factory(options: SSTWriterOptions) -> FileBuilderFactory {
         Box::new(SSTWriter::new(
             writer,
             SSTWriterOptions {
-                metrics_db_id: options.metrics_db_id.clone(),
+                metrics: options.metrics.clone(),
                 block_size: options.block_size,
                 buffer_size: options.buffer_size,
                 num_columns: options.num_columns,
@@ -738,8 +764,13 @@ mod tests {
         let fs = registry
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
-        let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
-        let lsm_tree = Arc::new(crate::lsm::LSMTree::default());
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::new(DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
         let manager = MemtableManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
@@ -830,8 +861,13 @@ mod tests {
         let fs = registry
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
-        let file_manager = Arc::new(FileManager::with_defaults(fs).unwrap());
-        let lsm_tree = Arc::new(crate::lsm::LSMTree::default());
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(crate::lsm::LSMTree::with_state(
+            Arc::new(crate::db_state::DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
         let manager = MemtableManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),

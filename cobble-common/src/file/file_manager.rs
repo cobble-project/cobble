@@ -16,9 +16,10 @@ use crate::error::{Error, Result};
 use crate::file::file_system::{FileSystem, FileSystemRegistry};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
 use crate::lru::LruCache;
+use crate::metrics_manager::MetricsManager;
 use bytes::Bytes;
 use dashmap::DashMap;
-use metrics::gauge;
+use metrics::{Gauge, gauge};
 use rand::random;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -359,36 +360,36 @@ impl SequentialWriteFile for TrackedWriter {
 }
 
 pub struct AtomicMetadataWriter {
-    db_id: Option<String>,
     temp_path: String,
     final_name: String,
     final_path: String,
     writer: Option<TrackedWriter>,
     fs: Arc<dyn FileSystem>,
     metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
+    metadata_files_gauge: Gauge,
     volume: Option<Arc<VolumeState>>,
 }
 
 impl AtomicMetadataWriter {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        db_id: Option<String>,
         temp_path: String,
         final_name: String,
         final_path: String,
         writer: TrackedWriter,
         fs: Arc<dyn FileSystem>,
         metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
+        metadata_files_gauge: Gauge,
         volume: Option<Arc<VolumeState>>,
     ) -> Self {
         Self {
-            db_id,
             temp_path,
             final_name,
             final_path,
             writer: Some(writer),
             fs,
             metadata_files,
+            metadata_files_gauge,
             volume,
         }
     }
@@ -407,8 +408,8 @@ impl AtomicMetadataWriter {
         ));
         self.metadata_files
             .insert(self.final_name.clone(), Arc::clone(&tracked));
-        let db_id = self.db_id.clone().unwrap_or_else(|| "unknown".to_string());
-        gauge!("metadata_files_tracked", "db_id" => db_id).set(self.metadata_files.len() as f64);
+        self.metadata_files_gauge
+            .set(self.metadata_files.len() as f64);
         Ok(())
     }
 }
@@ -432,13 +433,28 @@ impl SequentialWriteFile for AtomicMetadataWriter {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct FileManagerMetrics {
+    data_files_tracked: Gauge,
+    metadata_files_tracked: Gauge,
+}
+
+impl FileManagerMetrics {
+    pub(crate) fn new(db_id: &str) -> Self {
+        let db_id = db_id.to_string();
+        Self {
+            data_files_tracked: gauge!("data_files_tracked", "db_id" => db_id.clone()),
+            metadata_files_tracked: gauge!("metadata_files_tracked", "db_id" => db_id),
+        }
+    }
+}
+
 /// File manager for managing files in a KV storage engine.
 ///
 /// The FileManager is responsible for managing both metadata files and data files.
 /// It provides file ID assignment, reader caching, and file lifecycle management.
 pub struct FileManager {
-    /// Optional database ID for metrics labeling.
-    db_id: Option<String>,
+    metrics: FileManagerMetrics,
     /// The metadata volume for metadata files.
     meta_volume: DataVolume,
     /// Ordered data volumes by priority (high to low).
@@ -545,7 +561,11 @@ impl FileManager {
     /// Creates a new FileManager with the given data volumes and options.
     ///
     /// This will create the data and snapshot directories if they don't exist.
-    pub fn new(data_volumes: Vec<DataVolume>, options: FileManagerOptions) -> Result<Self> {
+    pub fn new(
+        data_volumes: Vec<DataVolume>,
+        options: FileManagerOptions,
+        metrics_manager: Arc<MetricsManager>,
+    ) -> Result<Self> {
         if data_volumes.is_empty() {
             return Err(Error::ConfigError(
                 "No data volumes configured for FileManager".to_string(),
@@ -560,7 +580,7 @@ impl FileManager {
             priority: data_volumes[0].priority,
         };
         Ok(Self {
-            db_id: None,
+            metrics: metrics_manager.file_manager_metrics(),
             meta_volume,
             data_volumes,
             options,
@@ -572,22 +592,29 @@ impl FileManager {
     }
 
     /// Creates a new FileManager with default options.
-    pub fn with_defaults(fs: Arc<dyn FileSystem>) -> Result<Self> {
+    pub fn with_defaults(
+        fs: Arc<dyn FileSystem>,
+        metrics_manager: Arc<MetricsManager>,
+    ) -> Result<Self> {
         let volume = DataVolume {
             state: Arc::new(VolumeState::new(fs, None, None)),
             priority: VolumePriority::High,
         };
-        Self::new(vec![volume], FileManagerOptions::default())
+        Self::new(vec![volume], FileManagerOptions::default(), metrics_manager)
     }
 
-    pub fn from_config(config: &Config, db_id: &str) -> Result<Self> {
+    pub fn from_config(
+        config: &Config,
+        db_id: &str,
+        metrics_manager: Arc<MetricsManager>,
+    ) -> Result<Self> {
         let data_volumes = Self::data_volumes_from_config(config)?;
         let options = FileManagerOptions {
             base_dir: db_id.to_string(),
             base_file_size: config.base_file_size,
             ..FileManagerOptions::default()
         };
-        Self::new(data_volumes, options)
+        Self::new(data_volumes, options, metrics_manager)
     }
 
     pub(crate) fn data_volumes_from_config(config: &Config) -> Result<Vec<DataVolume>> {
@@ -627,15 +654,6 @@ impl FileManager {
             ));
         }
         Ok(data_volumes)
-    }
-
-    /// Sets the database ID to label metrics.
-    pub fn set_db_id(&mut self, db_id: String) {
-        self.db_id = Some(db_id);
-    }
-
-    pub fn db_id(&self) -> Option<String> {
-        self.db_id.clone()
     }
 
     /// Sets the starting file ID counter.
@@ -920,13 +938,13 @@ impl FileManager {
         ));
         let tracked_writer = TrackedWriter::new(writer, tracked);
         Ok(AtomicMetadataWriter::new(
-            self.db_id.clone(),
             temp_path,
             name.to_string(),
             final_path,
             tracked_writer,
             Arc::clone(&self.meta_volume.state.fs),
             Arc::clone(&self.metadata_files),
+            self.metrics.metadata_files_tracked.clone(),
             Some(Arc::clone(&self.meta_volume.state)),
         ))
     }
@@ -1037,13 +1055,15 @@ impl FileManager {
     }
 
     fn report_data_files_gauge(&self) {
-        let db_id = self.db_id.clone().unwrap_or_else(|| "unknown".to_string());
-        gauge!("data_files_tracked", "db_id" => db_id).set(self.data_files.len() as f64);
+        self.metrics
+            .data_files_tracked
+            .set(self.data_files.len() as f64);
     }
 
     fn report_metadata_files_gauge(&self) {
-        let db_id = self.db_id.clone().unwrap_or_else(|| "unknown".to_string());
-        gauge!("metadata_files_tracked", "db_id" => db_id).set(self.metadata_files.len() as f64);
+        self.metrics
+            .metadata_files_tracked
+            .set(self.metadata_files.len() as f64);
     }
 
     /// Returns the number of tracked metadata files.
@@ -1079,6 +1099,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::file::FileSystemRegistry;
     use crate::file::files::File;
+    use crate::metrics_manager::MetricsManager;
 
     static TEST_ROOT: &str = "file:///tmp/file_manager_test";
 
@@ -1090,7 +1111,8 @@ pub(crate) mod tests {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
-        let fm = FileManager::with_defaults(Arc::clone(&fs)).unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-test".to_string()));
+        let fm = FileManager::with_defaults(Arc::clone(&fs), metrics_manager).unwrap();
         (fs, fm)
     }
 
@@ -1354,7 +1376,8 @@ pub(crate) mod tests {
         let mut options = FileManagerOptions::default();
         options.base_dir = "db".to_string();
         options.base_file_size = 64;
-        let fm = FileManager::new(vec![high_volume, low_volume], options).unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-test".to_string()));
+        let fm = FileManager::new(vec![high_volume, low_volume], options, metrics_manager).unwrap();
 
         let (file_id1, mut writer1) = fm.create_data_file().unwrap();
         writer1.write(&vec![b'a'; 80]).unwrap();

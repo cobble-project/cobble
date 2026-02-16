@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 use crate::file::{FileManager, FileSystemRegistry};
 use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
+use crate::metrics_manager::MetricsManager;
 use crate::snapshot::{
     SnapshotCallback, SnapshotManager, build_levels_from_manifest, decode_manifest,
     snapshot_manifest_name,
@@ -153,6 +154,7 @@ impl Db {
         init_logging(&config);
         metrics_registry::init_metrics();
         let id = Uuid::new_v4().to_string();
+        let metrics_manager = Arc::new(MetricsManager::new(id.clone()));
 
         // register the governance db id
         let registry = FileSystemRegistry::new();
@@ -172,11 +174,10 @@ impl Db {
         );
         governance.insert_and_publish(&id, vec![0u16..1u16], 1)?;
 
-        let mut file_manager = FileManager::from_config(&config, &id)?;
-        file_manager.set_db_id(id.clone());
+        let file_manager = FileManager::from_config(&config, &id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let db_state = Arc::new(DbStateHandle::new());
-        Self::open_with_state(config, file_manager, db_state, id, 0)
+        Self::open_with_state(config, file_manager, db_state, id, 0, metrics_manager)
     }
 
     pub fn id(&self) -> &str {
@@ -395,8 +396,8 @@ impl Db {
     pub fn open_from_snapshot(config: Config, snapshot_id: u64, db_id: String) -> Result<Self> {
         init_logging(&config);
         metrics_registry::init_metrics();
-        let mut file_manager = FileManager::from_config(&config, &db_id)?;
-        file_manager.set_db_id(db_id.clone());
+        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
+        let file_manager = FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
 
         let manifest_name = snapshot_manifest_name(snapshot_id);
@@ -420,7 +421,14 @@ impl Db {
             immutables: Vec::new().into(),
         });
         let initial_file_seq = max_file_seq.saturating_add(1);
-        Self::open_with_state(config, file_manager, db_state, db_id, initial_file_seq)
+        Self::open_with_state(
+            config,
+            file_manager,
+            db_state,
+            db_id,
+            initial_file_seq,
+            metrics_manager,
+        )
     }
 
     fn open_with_state(
@@ -429,6 +437,7 @@ impl Db {
         db_state: Arc<DbStateHandle>,
         id: String,
         initial_file_seq: u64,
+        metrics_manager: Arc<MetricsManager>,
     ) -> Result<Self> {
         let time_provider = config.time_provider.create();
         let ttl_config = TtlConfig {
@@ -437,15 +446,17 @@ impl Db {
         };
         let ttl_provider = Arc::new(TTLProvider::new(&ttl_config, Arc::clone(&time_provider)));
 
-        let mut lsm_tree =
-            LSMTree::with_state_and_ttl(Arc::clone(&db_state), Arc::clone(&ttl_provider));
+        let mut lsm_tree = LSMTree::with_state_and_ttl(
+            Arc::clone(&db_state),
+            Arc::clone(&ttl_provider),
+            Arc::clone(&metrics_manager),
+        );
         if config.block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
-        lsm_tree.set_db_id(id.clone());
         let lsm_tree = Arc::new(lsm_tree);
         let mut sst_options = crate::compaction::build_sst_writer_options(&config, 0);
-        sst_options.metrics_db_id = Some(id.clone());
+        sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
         // Compaction setup
         let compaction_options = crate::compaction::build_compaction_config(&config);
         let compaction_worker: Arc<dyn crate::compaction::CompactionWorker> =
@@ -457,6 +468,7 @@ impl Db {
                     config.clone(),
                     ttl_config.clone(),
                     Duration::from_millis(config.compaction_remote_timeout_ms),
+                    Arc::clone(&metrics_manager),
                 )?)
             } else {
                 Arc::new(crate::compaction::LocalCompactionWorker::new(
@@ -464,6 +476,7 @@ impl Db {
                     Arc::clone(&file_manager),
                     Arc::downgrade(&lsm_tree),
                     config.clone(),
+                    Arc::clone(&metrics_manager),
                 ))
             };
         info!(
@@ -495,7 +508,7 @@ impl Db {
                 } else {
                     None
                 },
-                db_id: id.clone(),
+                metrics_manager: Some(Arc::clone(&metrics_manager)),
             },
         )?;
 

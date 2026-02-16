@@ -12,15 +12,16 @@ use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
 use crate::lsm::{LevelEdit, VersionEdit};
-use crate::sst::SSTIteratorOptions;
+use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions};
 use log::trace;
-use metrics::counter;
+use metrics::{Counter, counter};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 /// A compaction task describes the input and output parameters for a compaction.
 pub struct CompactionTask {
-    db_id: String,
+    metrics: Arc<CompactionTaskMetrics>,
+    sst_metrics: Arc<SSTIteratorMetrics>,
     /// The sorted runs to compact.
     sorted_runs: Vec<SortedRun>,
     output_level: u8,
@@ -37,6 +38,22 @@ pub struct CompactionTask {
     output_files_readonly: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct CompactionTaskMetrics {
+    read_bytes_total: Counter,
+    write_bytes_total: Counter,
+}
+
+impl CompactionTaskMetrics {
+    pub(crate) fn new(db_id: &str) -> Self {
+        let db_id = db_id.to_string();
+        Self {
+            read_bytes_total: counter!("compaction_read_bytes_total", "db_id" => db_id.clone()),
+            write_bytes_total: counter!("compaction_write_bytes_total", "db_id" => db_id),
+        }
+    }
+}
+
 impl CompactionTask {
     /// Creates a new compaction task.
     ///
@@ -45,8 +62,10 @@ impl CompactionTask {
     /// * `file_manager` - The file manager for reading input files and writing output files
     /// * `file_builder_factory` - Factory function for creating FileBuilder instances
     /// * `data_file_type` - The data file type for output files
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        db_id: String,
+        metrics: Arc<CompactionTaskMetrics>,
+        sst_metrics: Arc<SSTIteratorMetrics>,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         file_manager: Arc<FileManager>,
@@ -55,7 +74,8 @@ impl CompactionTask {
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Self {
         Self {
-            db_id,
+            metrics,
+            sst_metrics,
             sorted_runs,
             output_level,
             file_manager,
@@ -82,10 +102,6 @@ impl CompactionTask {
 
     pub fn ttl_provider(&self) -> Arc<crate::ttl::TTLProvider> {
         Arc::clone(&self.ttl_provider)
-    }
-
-    pub fn db_id(&self) -> &str {
-        &self.db_id
     }
 }
 
@@ -240,7 +256,7 @@ impl CompactionExecutor {
                 // Create iterators for all files in all sorted runs
                 // We iterate files from all sorted runs, with earlier runs (newer data) coming first
                 let sst_options = SSTIteratorOptions {
-                    metrics_db_id: Some(task.db_id.clone()),
+                    metrics: Some(Arc::clone(&task.sst_metrics)),
                     num_columns: options.num_columns,
                     bloom_filter_enabled: options.bloom_filter_enabled,
                     ..SSTIteratorOptions::default()
@@ -255,8 +271,7 @@ impl CompactionExecutor {
                 read_bytes = read_bytes.saturating_add(file.size as u64);
             }
         }
-        counter!("compaction_read_bytes_total", "db_id" => task.db_id.clone())
-            .increment(read_bytes);
+        task.metrics.read_bytes_total.increment(read_bytes);
 
         let max_seq = task
             .sorted_runs
@@ -353,8 +368,7 @@ impl CompactionExecutor {
             output_files.push(Arc::new(data_file));
             written_bytes = written_bytes.saturating_add(file_size as u64);
         }
-        counter!("compaction_write_bytes_total", "db_id" => task.db_id.clone())
-            .increment(written_bytes);
+        task.metrics.write_bytes_total.increment(written_bytes);
 
         // Create version edits
         let mut level_edits: std::collections::BTreeMap<u8, LevelEdit> =
@@ -410,6 +424,7 @@ impl CompactionExecutor {
 mod tests {
     use super::*;
     use crate::file::{FileSystemRegistry, TrackedFileId};
+    use crate::metrics_manager::MetricsManager;
     use crate::sst::row_codec::encode_value;
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::Value;
@@ -468,7 +483,10 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let file_manager = Arc::new(FileManager::with_defaults(Arc::clone(&fs)).unwrap());
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
 
         let num_columns = 1;
 
@@ -508,7 +526,7 @@ mod tests {
 
         // Create and execute compaction
         let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
-            metrics_db_id: None,
+            metrics: None,
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
@@ -517,8 +535,11 @@ mod tests {
             partitioned_index: options.partitioned_index,
             compression: crate::SstCompressionAlgorithm::None,
         });
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
         let task = CompactionTask::new(
-            "test".to_string(),
+            compaction_metrics,
+            sst_metrics,
             vec![run1, run2],
             1,
             Arc::clone(&file_manager),
@@ -597,7 +618,10 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let file_manager = Arc::new(FileManager::with_defaults(Arc::clone(&fs)).unwrap());
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
 
         let num_columns = 1;
 
@@ -635,7 +659,7 @@ mod tests {
 
         // Create and execute compaction
         let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
-            metrics_db_id: None,
+            metrics: None,
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
@@ -644,8 +668,11 @@ mod tests {
             partitioned_index: options.partitioned_index,
             compression: crate::SstCompressionAlgorithm::None,
         });
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
         let task = CompactionTask::new(
-            "test".to_string(),
+            compaction_metrics,
+            sst_metrics,
             vec![run1, run2],
             1,
             Arc::clone(&file_manager),
@@ -724,7 +751,10 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let file_manager = Arc::new(FileManager::with_defaults(Arc::clone(&fs)).unwrap());
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
 
         let num_columns = 1;
 
@@ -778,7 +808,7 @@ mod tests {
 
         // Create compaction with very small target file size to force multiple output files
         let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
-            metrics_db_id: None,
+            metrics: None,
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
@@ -787,8 +817,11 @@ mod tests {
             partitioned_index: options.partitioned_index,
             compression: crate::SstCompressionAlgorithm::None,
         });
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
         let task = CompactionTask::new(
-            "test".to_string(),
+            compaction_metrics,
+            sst_metrics,
             vec![run],
             1,
             Arc::clone(&file_manager),
@@ -836,13 +869,16 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let file_manager = Arc::new(FileManager::with_defaults(Arc::clone(&fs)).unwrap());
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
 
         let options = CompactionConfig::default();
 
         // Create compaction with no sorted runs
         let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
-            metrics_db_id: None,
+            metrics: None,
             block_size: options.block_size,
             buffer_size: options.buffer_size,
             num_columns: options.num_columns,
@@ -851,8 +887,11 @@ mod tests {
             partitioned_index: options.partitioned_index,
             compression: crate::SstCompressionAlgorithm::None,
         });
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
         let task = CompactionTask::new(
-            "test".to_string(),
+            compaction_metrics,
+            sst_metrics,
             vec![],
             1,
             Arc::clone(&file_manager),

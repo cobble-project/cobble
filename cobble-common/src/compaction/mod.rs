@@ -9,7 +9,9 @@ mod policy;
 mod remote;
 
 #[allow(unused_imports)]
-pub(crate) use executor::{CompactionExecutor, CompactionResult, CompactionTask};
+pub(crate) use executor::{
+    CompactionExecutor, CompactionResult, CompactionTask, CompactionTaskMetrics,
+};
 pub(crate) use policy::{
     CompactionConfig, CompactionPlan, CompactionPolicy, MinOverlapPolicy, RoundRobinPolicy,
     build_runs_for_plan,
@@ -23,6 +25,7 @@ pub(crate) use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::error::Result;
 use crate::iterator::SortedRun;
 use crate::lsm::VersionEdit;
+use crate::metrics_manager::MetricsManager;
 use crate::sst::SSTWriterOptions;
 use log::info;
 use std::sync::{Arc, Mutex, Weak};
@@ -43,6 +46,8 @@ pub(crate) struct LocalCompactionWorker {
     file_manager: Arc<crate::file::FileManager>,
     lsm_tree: Weak<crate::lsm::LSMTree>,
     config: crate::Config,
+    compaction_metrics: Arc<CompactionTaskMetrics>,
+    metrics_manager: Arc<MetricsManager>,
 }
 
 impl LocalCompactionWorker {
@@ -51,12 +56,16 @@ impl LocalCompactionWorker {
         file_manager: Arc<crate::file::FileManager>,
         lsm_tree: Weak<crate::lsm::LSMTree>,
         config: crate::Config,
+        metrics_manager: Arc<MetricsManager>,
     ) -> Self {
+        let compaction_metrics = metrics_manager.compaction_metrics();
         Self {
             executor: Mutex::new(executor),
             file_manager,
             lsm_tree,
             config,
+            compaction_metrics,
+            metrics_manager,
         }
     }
 
@@ -82,15 +91,20 @@ impl LocalCompactionWorker {
         if sorted_runs.is_empty() {
             return None;
         }
-        let db_id = self
-            .file_manager
-            .db_id()
-            .unwrap_or_else(|| "unknown".to_string());
+        let sst_metrics = self
+            .lsm_tree
+            .upgrade()
+            .map(|tree| tree.sst_metrics())
+            .unwrap_or_else(|| self.metrics_manager.sst_iterator_metrics());
         let mut sst_options = build_sst_writer_options(&self.config, output_level);
-        sst_options.metrics_db_id = Some(db_id.clone());
+        sst_options.metrics = Some(
+            self.metrics_manager
+                .sst_writer_metrics(sst_options.compression),
+        );
         let file_builder_factory = make_sst_builder_factory(sst_options);
         let task = CompactionTask::new(
-            db_id,
+            Arc::clone(&self.compaction_metrics),
+            sst_metrics,
             sorted_runs,
             output_level,
             Arc::clone(&self.file_manager),

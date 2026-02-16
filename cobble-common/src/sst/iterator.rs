@@ -9,14 +9,14 @@ use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, Value};
 use bytes::Bytes;
-use metrics::counter;
+use metrics::{Counter, counter};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct SSTIteratorOptions {
-    /// Optional database ID for metrics labeling.
-    pub metrics_db_id: Option<String>,
+    /// Optional metrics handles to reuse across iterators.
+    pub metrics: Option<Arc<SSTIteratorMetrics>>,
     /// Size of the block cache in bytes.
     /// If zero, block caching is disabled.
     pub block_cache_size: usize,
@@ -25,6 +25,60 @@ pub(crate) struct SSTIteratorOptions {
     pub num_columns: usize,
     /// Whether to use bloom filter for point lookups.
     pub bloom_filter_enabled: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct SSTIteratorMetrics {
+    index_hits: Counter,
+    index_misses: Counter,
+    data_hits: Counter,
+    data_misses: Counter,
+    filter_hits: Counter,
+    filter_misses: Counter,
+}
+
+impl SSTIteratorMetrics {
+    pub(crate) fn new(db_id: &str) -> Self {
+        let db_id = db_id.to_string();
+        Self {
+            index_hits: counter!(
+                "block_cache_hits_total",
+                "file" => "sst",
+                "kind" => "index",
+                "db_id" => db_id.clone()
+            ),
+            index_misses: counter!(
+                "block_cache_misses_total",
+                "file" => "sst",
+                "kind" => "index",
+                "db_id" => db_id.clone()
+            ),
+            data_hits: counter!(
+                "block_cache_hits_total",
+                "file" => "sst",
+                "kind" => "data",
+                "db_id" => db_id.clone()
+            ),
+            data_misses: counter!(
+                "block_cache_misses_total",
+                "file" => "sst",
+                "kind" => "data",
+                "db_id" => db_id.clone()
+            ),
+            filter_hits: counter!(
+                "block_cache_hits_total",
+                "file" => "sst",
+                "kind" => "filter",
+                "db_id" => db_id.clone()
+            ),
+            filter_misses: counter!(
+                "block_cache_misses_total",
+                "file" => "sst",
+                "kind" => "filter",
+                "db_id" => db_id
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -37,7 +91,7 @@ impl Default for SSTIteratorOptions {
         Self {
             block_cache_size: 64 * 1024 * 1024, // 64 MB
             num_columns: 1,
-            metrics_db_id: None,
+            metrics: None,
             bloom_filter_enabled: false,
         }
     }
@@ -59,6 +113,7 @@ pub(crate) struct SSTIterator {
     current_entry_idx: usize,
     options: SSTIteratorOptions,
     block_cache: Option<BlockCache>,
+    metrics: Arc<SSTIteratorMetrics>,
     cache_valid: Cell<bool>,
     cached_entry_idx: Cell<Option<usize>>,
     // Use RefCell to allow interior mutability for cached bytes, which can be shared as slices.
@@ -73,13 +128,6 @@ impl SSTIterator {
         options: SSTIteratorOptions,
     ) -> Result<Self> {
         Self::with_file_id(file, 0, options)
-    }
-
-    fn get_db_id(options: &SSTIteratorOptions) -> String {
-        options
-            .metrics_db_id
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string())
     }
 
     #[cfg(test)]
@@ -131,6 +179,10 @@ impl SSTIterator {
         block_cache: Option<BlockCache>,
         footer_bytes: Option<Bytes>,
     ) -> Result<(Self, Option<Bytes>)> {
+        let metrics = options
+            .metrics
+            .clone()
+            .unwrap_or_else(|| Arc::new(SSTIteratorMetrics::new("unknown")));
         // Read footer
         let (footer, cached_footer) = if let Some(bytes) = footer_bytes {
             (Self::decode_footer_bytes(bytes)?, None)
@@ -148,13 +200,7 @@ impl SSTIterator {
                 kind: BlockCacheKind::IndexTop,
             };
             if let Some(cached) = cache.get(&cache_key) {
-                counter!(
-                    "block_cache_hits_total",
-                    "file" => "sst",
-                    "kind" => "index",
-                    "db_id" => Self::get_db_id(&options)
-                )
-                .increment(1);
+                metrics.index_hits.increment(1);
                 match cached {
                     CachedBlock::Block(block) => block,
                     CachedBlock::BloomFilter(_) => {
@@ -164,13 +210,7 @@ impl SSTIterator {
                     }
                 }
             } else {
-                counter!(
-                    "block_cache_misses_total",
-                    "file" => "sst",
-                    "kind" => "index",
-                    "db_id" => Self::get_db_id(&options)
-                )
-                .increment(1);
+                metrics.index_misses.increment(1);
                 let index_data = file.read_at(
                     footer.index_block_offset as usize,
                     footer.index_block_size as usize,
@@ -225,6 +265,7 @@ impl SSTIterator {
                 current_entry_idx: 0,
                 options,
                 block_cache,
+                metrics,
                 cache_valid: Cell::new(false),
                 cached_entry_idx: Cell::new(None),
                 cached_key_bytes: RefCell::new(None),
@@ -243,10 +284,6 @@ impl SSTIterator {
     ) -> Result<SSTIteratorTestCache> {
         let inner = Self::with_cache(file, file_id, options, Some(block_cache), None)?;
         Ok(SSTIteratorTestCache { inner })
-    }
-
-    fn metrics_db_id(&self) -> &str {
-        self.options.metrics_db_id.as_deref().unwrap_or("unknown")
     }
 
     fn read_footer_bytes(file: &dyn RandomAccessFile) -> Result<Bytes> {
@@ -364,16 +401,9 @@ impl SSTIterator {
                 BlockCacheKind::IndexTop
             },
         };
-        let db_id = self.metrics_db_id().to_string();
         let block = if let Some(cache) = &self.block_cache {
             if let Some(cached) = cache.get(&cache_key) {
-                counter!(
-                    "block_cache_hits_total",
-                    "file" => "sst",
-                    "kind" => "index",
-                    "db_id" => db_id.clone()
-                )
-                .increment(1);
+                self.metrics.index_hits.increment(1);
                 match cached {
                     CachedBlock::Block(block) => block,
                     CachedBlock::BloomFilter(_) => {
@@ -381,13 +411,7 @@ impl SSTIterator {
                     }
                 }
             } else {
-                counter!(
-                    "block_cache_misses_total",
-                    "file" => "sst",
-                    "kind" => "index",
-                    "db_id" => db_id.clone()
-                )
-                .increment(1);
+                self.metrics.index_misses.increment(1);
                 let data = self.file.read_at(offset as usize, size as usize)?;
                 let mut block = Block::decode(data)?;
                 block.set_block_id(partition_idx as u32);
@@ -434,16 +458,9 @@ impl SSTIterator {
             block_id: offset as u64,
             kind: BlockCacheKind::Data,
         };
-        let db_id = self.metrics_db_id().to_string();
         let block = if let Some(cache) = &self.block_cache {
             if let Some(cached) = cache.get(&cache_key) {
-                counter!(
-                    "block_cache_hits_total",
-                    "file" => "sst",
-                    "kind" => "data",
-                    "db_id" => db_id.clone()
-                )
-                .increment(1);
+                self.metrics.data_hits.increment(1);
                 match cached {
                     CachedBlock::Block(block) => block,
                     CachedBlock::BloomFilter(_) => {
@@ -451,13 +468,7 @@ impl SSTIterator {
                     }
                 }
             } else {
-                counter!(
-                    "block_cache_misses_total",
-                    "file" => "sst",
-                    "kind" => "data",
-                    "db_id" => db_id.clone()
-                )
-                .increment(1);
+                self.metrics.data_misses.increment(1);
                 let data = self.file.read_at(offset, size)?;
                 let decoded = decode_block_bytes(data)?;
                 let mut block = Block::decode(decoded)?;
@@ -488,16 +499,9 @@ impl SSTIterator {
             block_id: self.footer.filter_block_offset,
             kind: BlockCacheKind::FilterIndex,
         };
-        let db_id = self.metrics_db_id().to_string();
         let block = if let Some(cache) = &self.block_cache {
             if let Some(cached) = cache.get(&cache_key) {
-                counter!(
-                    "block_cache_hits_total",
-                    "file" => "sst",
-                    "kind" => "filter",
-                    "db_id" => db_id.clone()
-                )
-                .increment(1);
+                self.metrics.filter_hits.increment(1);
                 match cached {
                     CachedBlock::Block(block) => block,
                     CachedBlock::BloomFilter(_) => {
@@ -505,13 +509,7 @@ impl SSTIterator {
                     }
                 }
             } else {
-                counter!(
-                    "block_cache_misses_total",
-                    "file" => "sst",
-                    "kind" => "filter",
-                    "db_id" => db_id.clone()
-                )
-                .increment(1);
+                self.metrics.filter_misses.increment(1);
                 let data = self.file.read_at(
                     self.footer.filter_block_offset as usize,
                     self.footer.filter_block_size as usize,
@@ -584,13 +582,7 @@ impl SSTIterator {
     ) -> Result<Arc<BloomFilter>> {
         let filter = if let Some(cache) = &self.block_cache {
             if let Some(cached) = cache.get(&cache_key) {
-                counter!(
-                    "block_cache_hits_total",
-                    "file" => "sst",
-                    "kind" => "filter",
-                    "db_id" => self.metrics_db_id().to_string(),
-                )
-                .increment(1);
+                self.metrics.filter_hits.increment(1);
                 match cached {
                     CachedBlock::BloomFilter(filter) => filter,
                     CachedBlock::Block(_) => {
@@ -598,13 +590,7 @@ impl SSTIterator {
                     }
                 }
             } else {
-                counter!(
-                    "block_cache_misses_total",
-                    "file" => "sst",
-                    "kind" => "filter",
-                    "db_id" => self.metrics_db_id().to_string(),
-                )
-                .increment(1);
+                self.metrics.filter_misses.increment(1);
                 let filter_data = self.file.read_at(offset, size)?;
                 let filter = Arc::new(BloomFilter::decode(filter_data)?);
                 cache.insert(cache_key, CachedBlock::BloomFilter(filter.clone()));
@@ -1092,7 +1078,7 @@ mod tests {
             let mut writer = SSTWriter::new(
                 writer_file,
                 SSTWriterOptions {
-                    metrics_db_id: None,
+                    metrics: None,
                     block_size: 32,
                     buffer_size: 8192,
                     num_columns: 1,

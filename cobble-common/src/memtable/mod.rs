@@ -7,7 +7,8 @@ use crate::r#type::{RefKey, RefValue};
 
 #[allow(unused_imports)]
 pub(crate) use manager::{
-    ActiveMemtable, ImmutableMemtable, MemtableFlushResult, MemtableManager, MemtableManagerOptions,
+    ActiveMemtable, ImmutableMemtable, MemtableFlushResult, MemtableManager,
+    MemtableManagerMetrics, MemtableManagerOptions,
 };
 
 /// Trait for memtable implementations.
