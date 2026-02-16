@@ -245,12 +245,11 @@ impl CompactionExecutor {
                     bloom_filter_enabled: options.bloom_filter_enabled,
                     ..SSTIteratorOptions::default()
                 };
-                let iter = crate::sst::SSTIterator::with_cache(
+                let iter = crate::sst::SSTIterator::with_cache_and_file(
                     reader,
-                    file.file_id,
+                    file.as_ref(),
                     sst_options.clone(),
                     None,
-                    file.meta_bytes.clone(),
                 )?;
                 all_iters.push(Box::new(iter));
                 read_bytes = read_bytes.saturating_add(file.size as u64);
@@ -310,7 +309,7 @@ impl CompactionExecutor {
                         task.output_level, file_id, file_size
                     );
 
-                    output_files.push(Arc::new(DataFile {
+                    let data_file = DataFile {
                         file_type: task.data_file_type,
                         start_key: first_key,
                         end_key: last_key,
@@ -318,8 +317,10 @@ impl CompactionExecutor {
                         tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                         seq: max_seq,
                         size: file_size,
-                        meta_bytes: Some(footer_bytes),
-                    }));
+                        meta_bytes: Default::default(),
+                    };
+                    data_file.set_meta_bytes(footer_bytes);
+                    output_files.push(Arc::new(data_file));
                     written_bytes = written_bytes.saturating_add(file_size as u64);
                 }
             }
@@ -338,7 +339,7 @@ impl CompactionExecutor {
                 task.output_level, file_id, file_size
             );
 
-            output_files.push(Arc::new(DataFile {
+            let data_file = DataFile {
                 file_type: task.data_file_type,
                 start_key: first_key,
                 end_key: last_key,
@@ -346,8 +347,10 @@ impl CompactionExecutor {
                 tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                 seq: max_seq,
                 size: file_size,
-                meta_bytes: Some(footer_bytes),
-            }));
+                meta_bytes: Default::default(),
+            };
+            data_file.set_meta_bytes(footer_bytes);
+            output_files.push(Arc::new(data_file));
             written_bytes = written_bytes.saturating_add(file_size as u64);
         }
         counter!("compaction_write_bytes_total", "db_id" => task.db_id.clone())
@@ -440,7 +443,7 @@ mod tests {
 
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
 
-        Ok(Arc::new(DataFile {
+        let data_file = DataFile {
             file_type: DataFileType::SSTable,
             start_key: first_key,
             end_key: last_key,
@@ -448,8 +451,10 @@ mod tests {
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq: 0,
             size: file_size,
-            meta_bytes: Some(footer_bytes),
-        }))
+            meta_bytes: Default::default(),
+        };
+        data_file.set_meta_bytes(footer_bytes);
+        Ok(Arc::new(data_file))
     }
 
     #[test]
@@ -546,15 +551,14 @@ mod tests {
         let reader = file_manager
             .open_data_file_reader(first_file.file_id)
             .unwrap();
-        let mut iter = crate::sst::SSTIterator::with_cache(
+        let mut iter = crate::sst::SSTIterator::with_cache_and_file(
             Box::new(reader),
-            first_file.file_id,
+            first_file,
             crate::sst::SSTIteratorOptions {
                 bloom_filter_enabled: true,
                 ..crate::sst::SSTIteratorOptions::default()
             },
             None,
-            first_file.meta_bytes.clone(),
         )
         .unwrap();
         iter.seek_to_first().unwrap();
@@ -669,16 +673,15 @@ mod tests {
         let reader = file_manager
             .open_data_file_reader(result.new_files()[0].file_id)
             .unwrap();
-        let mut iter = crate::sst::SSTIterator::with_cache(
+        let mut iter = crate::sst::SSTIterator::with_cache_and_file(
             Box::new(reader),
-            result.new_files()[0].file_id,
+            result.new_files()[0].as_ref(),
             crate::sst::SSTIteratorOptions {
                 bloom_filter_enabled: true,
                 num_columns,
                 ..Default::default()
             },
             None,
-            result.new_files()[0].meta_bytes.clone(),
         )
         .unwrap();
 
@@ -750,7 +753,7 @@ mod tests {
         }
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range().unwrap();
 
-        let file = Arc::new(DataFile {
+        let file = DataFile {
             file_type: DataFileType::SSTable,
             start_key: first_key,
             end_key: last_key,
@@ -758,8 +761,10 @@ mod tests {
             tracked_id: TrackedFileId::new(&file_manager, file_id),
             seq: 0,
             size: file_size,
-            meta_bytes: Some(footer_bytes),
-        });
+            meta_bytes: Default::default(),
+        };
+        file.set_meta_bytes(footer_bytes);
+        let file = Arc::new(file);
 
         let run = SortedRun::new(0, vec![file]);
 

@@ -1,3 +1,4 @@
+use crate::data_file::DataFile;
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
 use crate::iterator::KvIterator;
@@ -66,7 +67,11 @@ pub(crate) struct SSTIterator {
 }
 
 impl SSTIterator {
-    pub fn new(file: Box<dyn RandomAccessFile>, options: SSTIteratorOptions) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn new(
+        file: Box<dyn RandomAccessFile>,
+        options: SSTIteratorOptions,
+    ) -> Result<Self> {
         Self::with_file_id(file, 0, options)
     }
 
@@ -77,7 +82,8 @@ impl SSTIterator {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    pub fn with_file_id(
+    #[cfg(test)]
+    pub(crate) fn with_file_id(
         file: Box<dyn RandomAccessFile>,
         file_id: u64,
         options: SSTIteratorOptions,
@@ -85,18 +91,53 @@ impl SSTIterator {
         Self::with_cache(file, file_id, options, None, None)
     }
 
-    pub fn with_cache(
+    #[cfg(test)]
+    pub(crate) fn with_cache(
         file: Box<dyn RandomAccessFile>,
         file_id: u64,
         options: SSTIteratorOptions,
         block_cache: Option<BlockCache>,
         footer_bytes: Option<Bytes>,
     ) -> Result<Self> {
+        let (iter, _) =
+            Self::with_cache_and_footer_bytes(file, file_id, options, block_cache, footer_bytes)?;
+        Ok(iter)
+    }
+
+    pub(crate) fn with_cache_and_file(
+        file: Box<dyn RandomAccessFile>,
+        data_file: &DataFile,
+        options: SSTIteratorOptions,
+        block_cache: Option<BlockCache>,
+    ) -> Result<Self> {
+        let footer_bytes = data_file.meta_bytes();
+        let (iter, cached_footer) = Self::with_cache_and_footer_bytes(
+            file,
+            data_file.file_id,
+            options,
+            block_cache,
+            footer_bytes,
+        )?;
+        if let Some(bytes) = cached_footer {
+            data_file.set_meta_bytes(bytes);
+        }
+        Ok(iter)
+    }
+
+    fn with_cache_and_footer_bytes(
+        file: Box<dyn RandomAccessFile>,
+        file_id: u64,
+        options: SSTIteratorOptions,
+        block_cache: Option<BlockCache>,
+        footer_bytes: Option<Bytes>,
+    ) -> Result<(Self, Option<Bytes>)> {
         // Read footer
-        let footer = if let Some(bytes) = footer_bytes {
-            Self::decode_footer_bytes(bytes)?
+        let (footer, cached_footer) = if let Some(bytes) = footer_bytes {
+            (Self::decode_footer_bytes(bytes)?, None)
         } else {
-            Self::read_footer(&*file)?
+            let bytes = Self::read_footer_bytes(&*file)?;
+            let footer = Self::decode_footer_bytes(bytes.clone())?;
+            (footer, Some(bytes))
         };
 
         // Read index block
@@ -168,26 +209,29 @@ impl SSTIterator {
         } else {
             return Err(Error::IoError("Index block size is zero".to_string()));
         }
-        Ok(Self {
-            file,
-            file_id,
-            footer,
-            index_block,
-            index_partitions,
-            bloom_filter: None,
-            bloom_filter_partition_idx: None,
-            current_data_block: None,
-            current_index_partition_idx: 0,
-            current_index_partition: None,
-            current_block_idx: 0,
-            current_entry_idx: 0,
-            options,
-            block_cache,
-            cache_valid: Cell::new(false),
-            cached_entry_idx: Cell::new(None),
-            cached_key_bytes: RefCell::new(None),
-            cached_value_bytes: RefCell::new(None),
-        })
+        Ok((
+            Self {
+                file,
+                file_id,
+                footer,
+                index_block,
+                index_partitions,
+                bloom_filter: None,
+                bloom_filter_partition_idx: None,
+                current_data_block: None,
+                current_index_partition_idx: 0,
+                current_index_partition: None,
+                current_block_idx: 0,
+                current_entry_idx: 0,
+                options,
+                block_cache,
+                cache_valid: Cell::new(false),
+                cached_entry_idx: Cell::new(None),
+                cached_key_bytes: RefCell::new(None),
+                cached_value_bytes: RefCell::new(None),
+            },
+            cached_footer,
+        ))
     }
 
     #[cfg(test)]
@@ -205,7 +249,7 @@ impl SSTIterator {
         self.options.metrics_db_id.as_deref().unwrap_or("unknown")
     }
 
-    fn read_footer(file: &dyn RandomAccessFile) -> Result<Footer> {
+    fn read_footer_bytes(file: &dyn RandomAccessFile) -> Result<Bytes> {
         // Read footer from the end of the file using the file size
         let file_size = file.size();
 
@@ -217,8 +261,7 @@ impl SSTIterator {
         }
 
         let footer_offset = file_size - FOOTER_SIZE;
-        let data = file.read_at(footer_offset, FOOTER_SIZE)?;
-        Self::decode_footer_bytes(data)
+        file.read_at(footer_offset, FOOTER_SIZE)
     }
 
     fn decode_footer_bytes(data: Bytes) -> Result<Footer> {

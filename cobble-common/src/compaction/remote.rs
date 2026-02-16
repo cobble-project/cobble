@@ -95,7 +95,7 @@ impl RemoteDataFile {
             end_key: file.end_key.clone(),
             seq: file.seq,
             size: file.size,
-            meta_bytes: file.meta_bytes.as_ref().map(|bytes| bytes.to_vec()),
+            meta_bytes: file.meta_bytes().map(|bytes| bytes.to_vec()),
         }
     }
 
@@ -124,7 +124,7 @@ impl RemoteDataFile {
         } else {
             file_manager.register_data_file(file_id, path)?;
         }
-        Ok(Arc::new(DataFile {
+        let data_file = DataFile {
             file_type,
             start_key: self.start_key,
             end_key: self.end_key,
@@ -132,8 +132,12 @@ impl RemoteDataFile {
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq: self.seq,
             size: self.size,
-            meta_bytes: self.meta_bytes.map(Bytes::from),
-        }))
+            meta_bytes: Default::default(),
+        };
+        if let Some(bytes) = self.meta_bytes.map(Bytes::from) {
+            data_file.set_meta_bytes(bytes);
+        }
+        Ok(Arc::new(data_file))
     }
 }
 
@@ -631,7 +635,7 @@ mod tests {
         }
 
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
-        Ok(Arc::new(DataFile {
+        let data_file = DataFile {
             file_type: DataFileType::SSTable,
             start_key: first_key,
             end_key: last_key,
@@ -639,8 +643,10 @@ mod tests {
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq: 0,
             size: file_size,
-            meta_bytes: Some(footer_bytes),
-        }))
+            meta_bytes: Default::default(),
+        };
+        data_file.set_meta_bytes(footer_bytes);
+        Ok(Arc::new(data_file))
     }
 
     #[test]

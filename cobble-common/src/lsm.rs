@@ -563,9 +563,9 @@ impl LSMTree {
             return Ok(true);
         }
         let reader = file_manager.open_data_file_reader(file.file_id)?;
-        let mut iter = SSTIterator::with_cache(
+        let mut iter = SSTIterator::with_cache_and_file(
             Box::new(reader),
-            file.file_id,
+            file.as_ref(),
             SSTIteratorOptions {
                 num_columns,
                 metrics_db_id: self.db_id.clone(),
@@ -573,7 +573,6 @@ impl LSMTree {
                 ..SSTIteratorOptions::default()
             },
             self.block_cache.clone(),
-            file.meta_bytes.clone(),
         )?;
         if iter.may_contain(encoded_key)? {
             iter.seek(encoded_key)?;
@@ -647,7 +646,7 @@ mod tests {
                 tracked_id: TrackedFileId::detached(id),
                 seq: 0,
                 size: 0, // Test file, size doesn't matter
-                meta_bytes: None,
+                meta_bytes: Default::default(),
             })
         }
     }
@@ -664,7 +663,7 @@ mod tests {
                 tracked_id: TrackedFileId::detached(id),
                 seq: 0,
                 size,
-                meta_bytes: None,
+                meta_bytes: Default::default(),
             })
         }
     }
@@ -694,7 +693,7 @@ mod tests {
             writer.add(encoded_key.as_ref(), value)?;
         }
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
-        Ok(Arc::new(DataFile {
+        let data_file = DataFile {
             file_type: DataFileType::SSTable,
             start_key: first_key,
             end_key: last_key,
@@ -702,8 +701,10 @@ mod tests {
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq,
             size: file_size,
-            meta_bytes: Some(footer_bytes),
-        }))
+            meta_bytes: Default::default(),
+        };
+        data_file.set_meta_bytes(footer_bytes);
+        Ok(Arc::new(data_file))
     }
 
     fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {

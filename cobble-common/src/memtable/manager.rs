@@ -638,8 +638,9 @@ fn flush_memtable(
             tracked_id: TrackedFileId::new(&file_manager, file_id),
             size: file_size,
             seq,
-            meta_bytes: Some(footer_bytes),
+            meta_bytes: Default::default(),
         };
+        data_file.set_meta_bytes(footer_bytes);
         Ok(MemtableFlushResult {
             data_file: Arc::new(data_file),
             seq,
@@ -787,15 +788,14 @@ mod tests {
         let reader = file_manager
             .open_data_file_reader(data_file.file_id)
             .unwrap();
-        let mut iter = SSTIterator::with_cache(
+        let mut iter = SSTIterator::with_cache_and_file(
             Box::new(reader),
-            data_file.file_id,
+            data_file.as_ref(),
             SSTIteratorOptions {
                 bloom_filter_enabled: true,
                 ..SSTIteratorOptions::default()
             },
             None,
-            data_file.meta_bytes.clone(),
         )
         .unwrap();
         iter.seek_to_first().unwrap();

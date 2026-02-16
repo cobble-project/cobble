@@ -37,12 +37,11 @@ pub fn create_iterator(
     match file.file_type {
         DataFileType::SSTable => {
             let reader = file_manager.open_data_file_reader(file.file_id)?;
-            let iter = SSTIterator::with_cache(
+            let iter = SSTIterator::with_cache_and_file(
                 Box::new(reader),
-                file.file_id,
+                file,
                 options.sst_options.clone(),
                 options.block_cache.clone(),
-                file.meta_bytes.clone(),
             )?;
             Ok(Box::new(iter))
         }
