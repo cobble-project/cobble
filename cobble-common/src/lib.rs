@@ -12,6 +12,7 @@ mod file;
 mod format;
 mod governance;
 mod iterator;
+mod lru;
 mod lsm;
 mod maintainer;
 mod memtable;

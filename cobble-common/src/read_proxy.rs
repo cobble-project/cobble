@@ -1,6 +1,7 @@
 use crate::config::VolumeUsageKind;
 use crate::error::{Error, Result};
 use crate::file::{File, FileSystem, FileSystemRegistry};
+use crate::lru::LruCache;
 use crate::maintainer::GlobalSnapshotManifest;
 #[cfg(test)]
 use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
@@ -11,8 +12,6 @@ use crate::sst::block_cache::{BlockCache, new_block_cache};
 use crate::{Config, ReadOnlyDb, ReadOptions, VolumeDescriptor};
 use bytes::Bytes;
 use serde_json::Error as SerdeError;
-use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,70 +50,6 @@ impl ReadProxyConfig {
 struct BucketSnapshotKey {
     db_id: String,
     snapshot_id: u64,
-}
-
-struct LruCache<K, V> {
-    capacity: usize,
-    map: HashMap<K, V>,
-    order: VecDeque<K>,
-}
-
-impl<K, V> LruCache<K, V>
-where
-    K: Eq + Hash + Clone,
-{
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            map: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    fn get(&mut self, key: &K) -> Option<&V> {
-        if self.map.contains_key(key) {
-            self.touch(key);
-        }
-        self.map.get(key)
-    }
-
-    fn insert(&mut self, key: K, value: V) {
-        if self.capacity == 0 {
-            return;
-        }
-        if self.map.contains_key(&key) {
-            self.map.insert(key.clone(), value);
-            self.touch(&key);
-            return;
-        }
-        if self.map.len() == self.capacity
-            && let Some(old_key) = self.order.pop_back()
-        {
-            self.map.remove(&old_key);
-        }
-        self.order.push_front(key.clone());
-        self.map.insert(key, value);
-    }
-
-    fn contains_key(&self, key: &K) -> bool {
-        self.map.contains_key(key)
-    }
-
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    fn clear(&mut self) {
-        self.map.clear();
-        self.order.clear();
-    }
-
-    fn touch(&mut self, key: &K) {
-        if let Some(pos) = self.order.iter().position(|k| k == key) {
-            self.order.remove(pos);
-        }
-        self.order.push_front(key.clone());
-    }
 }
 
 /// Read proxy that routes reads to bucket snapshots and caches them with LRU eviction.

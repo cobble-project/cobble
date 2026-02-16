@@ -15,17 +15,45 @@ use crate::config::VolumeUsageKind;
 use crate::error::{Error, Result};
 use crate::file::file_system::{FileSystem, FileSystemRegistry};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
+use crate::lru::LruCache;
 use bytes::Bytes;
 use dashmap::DashMap;
 use metrics::gauge;
 use rand::random;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use uuid::Uuid;
 
 const DATA_DIR: &str = "data";
 const SNAPSHOT_DIR: &str = "snapshot";
 const DEFAULT_BASE_FILE_SIZE: usize = 64 * 1024 * 1024;
+const DEFAULT_READER_CACHE_CAPACITY: usize = 512;
+
+struct CachedRandomAccessFile {
+    inner: Arc<dyn RandomAccessFile>,
+}
+
+impl CachedRandomAccessFile {
+    fn new(inner: Arc<dyn RandomAccessFile>) -> Self {
+        Self { inner }
+    }
+}
+
+impl File for CachedRandomAccessFile {
+    fn close(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn size(&self) -> usize {
+        self.inner.size()
+    }
+}
+
+impl RandomAccessFile for CachedRandomAccessFile {
+    fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
+        self.inner.read_at(offset, size)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VolumePriority {
@@ -423,6 +451,8 @@ pub struct FileManager {
     data_files: DashMap<FileId, Arc<TrackedFile>>,
     /// Map of filename to tracked file information for metadata files.
     metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
+    /// LRU cache for open random access readers.
+    reader_cache: Mutex<LruCache<FileId, Arc<dyn RandomAccessFile>>>,
 }
 
 impl FileManager {
@@ -537,6 +567,7 @@ impl FileManager {
             next_file_id: AtomicU64::new(1), // Start from 1, 0 is reserved
             data_files: DashMap::new(),
             metadata_files: Arc::new(DashMap::new()),
+            reader_cache: Mutex::new(LruCache::new(DEFAULT_READER_CACHE_CAPACITY)),
         })
     }
 
@@ -785,8 +816,26 @@ impl FileManager {
                 file_id
             ))
         })?;
-
-        let reader = tracked.fs().open_read(tracked.path())?;
+        let cached = {
+            let mut cache = self
+                .reader_cache
+                .lock()
+                .map_err(|_| Error::IoError("Reader cache lock poisoned".to_string()))?;
+            cache.get(&file_id).map(Arc::clone)
+        };
+        let reader = if let Some(reader) = cached {
+            reader
+        } else {
+            let reader = tracked.fs().open_read(tracked.path())?;
+            let reader: Arc<dyn RandomAccessFile> = Arc::from(reader);
+            let mut cache = self
+                .reader_cache
+                .lock()
+                .map_err(|_| Error::IoError("Reader cache lock poisoned".to_string()))?;
+            cache.insert(file_id, Arc::clone(&reader));
+            reader
+        };
+        let reader = Box::new(CachedRandomAccessFile::new(reader));
         Ok(TrackedReader::new(reader, Arc::clone(&tracked)))
     }
 
@@ -835,6 +884,9 @@ impl FileManager {
     /// Removes a data file from tracking.
     pub(crate) fn remove_data_file(&self, file_id: FileId) -> Result<()> {
         self.data_files.remove(&file_id);
+        if let Ok(mut cache) = self.reader_cache.lock() {
+            cache.remove(&file_id);
+        }
         self.report_data_files_gauge();
         Ok(())
     }
