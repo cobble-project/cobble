@@ -3,6 +3,8 @@ mod file_system;
 mod files;
 mod opendal_file;
 mod opendal_fs;
+#[cfg(unix)]
+mod posix_fs;
 
 #[allow(unused_imports)]
 pub(crate) use self::file_manager::DataVolume;

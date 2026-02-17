@@ -2,6 +2,8 @@ use crate::VolumeDescriptor;
 use crate::error::Result;
 use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::file::opendal_fs::OpendalFileSystem;
+#[cfg(unix)]
+use crate::file::posix_fs::PosixFileSystem;
 use dashmap::DashMap;
 use std::sync::Arc;
 use url::Url;
@@ -46,6 +48,13 @@ impl FileSystemRegistry {
             return Ok(Arc::clone(&fs));
         }
 
+        #[cfg(unix)]
+        if url.scheme().eq_ignore_ascii_case("file") {
+            let fs: Arc<dyn FileSystem> = Arc::new(PosixFileSystem::init(&url, None, None)?);
+            self.registered.insert(name.clone(), Arc::clone(&fs));
+            return Ok(fs);
+        }
+
         let fs: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::init(&url, None, None)?);
         self.registered.insert(name.clone(), Arc::clone(&fs));
         Ok(fs)
@@ -56,6 +65,17 @@ impl FileSystemRegistry {
         let name = url.to_string();
         if let Some(fs) = self.registered.get(&name) {
             return Ok(Arc::clone(&fs));
+        }
+
+        #[cfg(unix)]
+        if url.scheme().eq_ignore_ascii_case("file") {
+            let fs: Arc<dyn FileSystem> = Arc::new(PosixFileSystem::init(
+                &url,
+                volume.access_id.clone(),
+                volume.secret_key.clone(),
+            )?);
+            self.registered.insert(name.clone(), Arc::clone(&fs));
+            return Ok(fs);
         }
 
         let fs: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::init(
