@@ -261,6 +261,10 @@ impl TrackedFileId {
         })
     }
 
+    pub fn file_id(&self) -> FileId {
+        self.file_id
+    }
+
     pub fn detached(file_id: FileId) -> Arc<Self> {
         Arc::new(Self {
             file_id,

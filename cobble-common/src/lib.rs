@@ -28,6 +28,7 @@ mod time;
 mod ttl;
 mod r#type;
 mod util;
+mod vlog;
 mod write_batch;
 
 pub use compaction::RemoteCompactionServer;
