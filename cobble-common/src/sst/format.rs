@@ -25,7 +25,7 @@ pub struct Footer {
 }
 
 impl Footer {
-    pub fn new(
+    pub(crate) fn new(
         index_block_offset: u64,
         index_block_size: u64,
         filter_block_offset: u64,
@@ -43,7 +43,7 @@ impl Footer {
         }
     }
 
-    pub fn encode(&self) -> Bytes {
+    pub(crate) fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(FOOTER_SIZE);
         buf.put_u64_le(self.index_block_offset);
         buf.put_u64_le(self.index_block_size);
@@ -61,7 +61,7 @@ impl Footer {
         buf.freeze()
     }
 
-    pub fn decode(data: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(data: &[u8]) -> Result<Self> {
         if data.len() != FOOTER_SIZE {
             return Err(Error::IoError(format!(
                 "Invalid footer size: expected {}, got {}",
@@ -108,7 +108,7 @@ pub struct Block {
 }
 
 impl Block {
-    pub fn encode(&self) -> Bytes {
+    pub(crate) fn encode(&self) -> Bytes {
         let offsets_size = self.offsets.len() * 4;
         let total_size = 4 + self.data.len() + offsets_size;
         let mut buf = BytesMut::with_capacity(total_size);
@@ -127,7 +127,7 @@ impl Block {
         buf.freeze()
     }
 
-    pub fn decode(data: Bytes) -> Result<Self> {
+    pub(crate) fn decode(data: Bytes) -> Result<Self> {
         if data.len() < 4 {
             return Err(Error::IoError("Block too small".to_string()));
         }
@@ -167,52 +167,15 @@ impl Block {
         })
     }
 
-    pub fn set_block_id(&mut self, block_id: u32) {
+    pub(crate) fn set_block_id(&mut self, block_id: u32) {
         self.block_id = block_id;
     }
 
-    pub fn block_id(&self) -> u32 {
+    pub(crate) fn block_id(&self) -> u32 {
         self.block_id
     }
 
-    pub fn get(&self, idx: usize) -> Result<(Bytes, Bytes)> {
-        if idx >= self.offsets.len() {
-            return Err(Error::IoError(format!(
-                "Index out of bounds: {} >= {}",
-                idx,
-                self.offsets.len()
-            )));
-        }
-
-        let offset = self.offsets[idx] as usize;
-        let mut buf = self.data.slice(offset..);
-
-        if buf.remaining() < 4 {
-            return Err(Error::IoError("Corrupted block entry".to_string()));
-        }
-
-        let key_len = buf.get_u32_le() as usize;
-        if buf.remaining() < key_len {
-            return Err(Error::IoError("Corrupted key data".to_string()));
-        }
-
-        let key = buf.copy_to_bytes(key_len);
-
-        if buf.remaining() < 4 {
-            return Err(Error::IoError("Corrupted value length".to_string()));
-        }
-
-        let value_len = buf.get_u32_le() as usize;
-        if buf.remaining() < value_len {
-            return Err(Error::IoError("Corrupted value data".to_string()));
-        }
-
-        let value = buf.copy_to_bytes(value_len);
-
-        Ok((key, value))
-    }
-
-    pub fn get_bytes(&self, idx: usize) -> Result<(Bytes, Bytes)> {
+    pub(crate) fn get(&self, idx: usize) -> Result<(Bytes, Bytes)> {
         if idx >= self.offsets.len() {
             return Err(Error::IoError(format!(
                 "Index out of bounds: {} >= {}",
@@ -259,11 +222,84 @@ impl Block {
         ))
     }
 
-    pub fn offsets_len(&self) -> usize {
+    pub(crate) fn key(&self, idx: usize) -> Result<Bytes> {
+        if idx >= self.offsets.len() {
+            return Err(Error::IoError(format!(
+                "Index out of bounds: {} >= {}",
+                idx,
+                self.offsets.len()
+            )));
+        }
+
+        let offset = self.offsets[idx] as usize;
+        let data = self.data.as_ref();
+        if offset + 4 > data.len() {
+            return Err(Error::IoError("Corrupted block entry".to_string()));
+        }
+
+        let key_len = u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .expect("slice length checked"),
+        ) as usize;
+        let key_start = offset + 4;
+        let key_end = key_start + key_len;
+        if key_end > data.len() {
+            return Err(Error::IoError("Corrupted key data".to_string()));
+        }
+
+        Ok(self.data.slice(key_start..key_end))
+    }
+
+    pub(crate) fn value(&self, idx: usize) -> Result<Bytes> {
+        if idx >= self.offsets.len() {
+            return Err(Error::IoError(format!(
+                "Index out of bounds: {} >= {}",
+                idx,
+                self.offsets.len()
+            )));
+        }
+
+        let offset = self.offsets[idx] as usize;
+        let data = self.data.as_ref();
+        if offset + 4 > data.len() {
+            return Err(Error::IoError("Corrupted block entry".to_string()));
+        }
+
+        let key_len = u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .expect("slice length checked"),
+        ) as usize;
+        let key_start = offset + 4;
+        let key_end = key_start + key_len;
+        if key_end > data.len() {
+            return Err(Error::IoError("Corrupted key data".to_string()));
+        }
+
+        if key_end + 4 > data.len() {
+            return Err(Error::IoError("Corrupted value length".to_string()));
+        }
+
+        let value_len = u32::from_le_bytes(
+            data[key_end..key_end + 4]
+                .try_into()
+                .expect("slice length checked"),
+        ) as usize;
+        let value_start = key_end + 4;
+        let value_end = value_start + value_len;
+        if value_end > data.len() {
+            return Err(Error::IoError("Corrupted value data".to_string()));
+        }
+
+        Ok(self.data.slice(value_start..value_end))
+    }
+
+    pub(crate) fn offsets_len(&self) -> usize {
         self.offsets.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.offsets.is_empty()
     }
 
@@ -272,7 +308,7 @@ impl Block {
         let mut right = self.offsets_len();
         while left < right {
             let mid = (left + right) / 2;
-            let (key, _) = self.get(mid)?;
+            let key = self.key(mid)?;
             match key.as_ref().cmp(target) {
                 std::cmp::Ordering::Less => left = mid + 1,
                 std::cmp::Ordering::Greater => right = mid,
@@ -287,7 +323,7 @@ impl Block {
         let mut right = self.offsets_len() - 1;
         while left < right {
             let mid = (left + right).div_ceil(2);
-            let (key, _) = self.get(mid)?;
+            let key = self.key(mid)?;
             match key.as_ref().cmp(target) {
                 std::cmp::Ordering::Less => left = mid,
                 std::cmp::Ordering::Greater => right = mid - 1,
@@ -310,7 +346,7 @@ pub struct BlockBuilder {
 }
 
 impl BlockBuilder {
-    pub fn new(target_size: usize) -> Self {
+    pub(crate) fn new(target_size: usize) -> Self {
         Self {
             data: BytesMut::new(),
             offsets: Vec::new(),
@@ -318,7 +354,7 @@ impl BlockBuilder {
         }
     }
 
-    pub fn add(&mut self, key: &[u8], value: &[u8]) {
+    pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) {
         let offset = self.data.len() as u32;
         self.offsets.push(offset);
 
@@ -328,19 +364,19 @@ impl BlockBuilder {
         self.data.put_slice(value);
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.offsets.is_empty()
     }
 
-    pub fn estimated_size(&self) -> usize {
+    pub(crate) fn estimated_size(&self) -> usize {
         4 + self.data.len() + self.offsets.len() * 4
     }
 
-    pub fn should_finish(&self) -> bool {
+    pub(crate) fn should_finish(&self) -> bool {
         !self.is_empty() && self.estimated_size() >= self.target_size
     }
 
-    pub fn write_to<W: SequentialWriteFile>(&self, writer: &mut W) -> Result<usize> {
+    pub(crate) fn write_to<W: SequentialWriteFile>(&self, writer: &mut W) -> Result<usize> {
         let size = self.estimated_size();
         writer.write(&(self.offsets.len() as u32).to_le_bytes())?;
         let data_bytes = self.data.as_ref();
@@ -353,7 +389,7 @@ impl BlockBuilder {
         Ok(size)
     }
 
-    pub fn build(self) -> Block {
+    pub(crate) fn build(self) -> Block {
         let size_in_bytes = 4 + self.data.len() + self.offsets.len() * 4;
         Block {
             data: self.data.freeze(),
@@ -363,7 +399,7 @@ impl BlockBuilder {
         }
     }
 
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.data.clear();
         self.offsets.clear();
     }

@@ -233,7 +233,7 @@ impl SSTIterator {
         let mut index_partitions = Vec::with_capacity(index_block.offsets_len());
         if footer.partitioned_index {
             for idx in 0..index_block.offsets_len() {
-                let (_, value) = index_block.get(idx)?;
+                let value = index_block.value(idx)?;
                 if value.len() != 16 {
                     return Err(Error::IoError("Invalid index partition entry".to_string()));
                 }
@@ -442,7 +442,7 @@ impl SSTIterator {
             )));
         }
 
-        let (_, value) = partition.get(block_idx)?;
+        let value = partition.value(block_idx)?;
         if value.len() != 16 {
             return Err(Error::IoError("Invalid index entry".to_string()));
         }
@@ -543,7 +543,7 @@ impl SSTIterator {
                     partition_idx
                 )));
             }
-            let (_, value) = filter_index.get(partition_idx)?;
+            let value = filter_index.value(partition_idx)?;
             if value.len() != 16 {
                 return Err(Error::IoError("Invalid filter index entry".to_string()));
             }
@@ -617,7 +617,7 @@ impl SSTIterator {
         if let Some(block) = &self.current_data_block
             && self.current_entry_idx < block.offsets_len()
         {
-            let (key, value) = block.get_bytes(self.current_entry_idx)?;
+            let (key, value) = block.get(self.current_entry_idx)?;
             self.cached_entry_idx.set(Some(self.current_entry_idx));
             *self.cached_key_bytes.borrow_mut() = Some(key);
             *self.cached_value_bytes.borrow_mut() = Some(value);
@@ -682,7 +682,7 @@ impl SSTIterator {
         if let Some(block) = &self.current_data_block
             && self.current_entry_idx < block.offsets_len()
         {
-            let (key, _) = block.get(self.current_entry_idx)?;
+            let key = block.key(self.current_entry_idx)?;
             return Ok(Some(key));
         }
         Ok(None)
@@ -693,7 +693,7 @@ impl SSTIterator {
         if let Some(block) = &self.current_data_block
             && self.current_entry_idx < block.offsets_len()
         {
-            let (_, value) = block.get(self.current_entry_idx)?;
+            let value = block.value(self.current_entry_idx)?;
             return Ok(Some(value));
         }
         Ok(None)
