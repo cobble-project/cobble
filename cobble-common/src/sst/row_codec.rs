@@ -28,21 +28,12 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Encodes a ValueType to a single byte.
 pub(crate) fn encode_value_type(vt: &ValueType) -> u8 {
-    match vt {
-        ValueType::Put => 0,
-        ValueType::Delete => 1,
-        ValueType::Merge => 2,
-    }
+    vt.encode_tag()
 }
 
 /// Decodes a ValueType from a single byte.
 pub(crate) fn decode_value_type(byte: u8) -> Result<ValueType> {
-    match byte {
-        0 => Ok(ValueType::Put),
-        1 => Ok(ValueType::Delete),
-        2 => Ok(ValueType::Merge),
-        _ => Err(Error::IoError(format!("Invalid ValueType: {}", byte))),
-    }
+    ValueType::decode_tag(byte)
 }
 
 trait ColumnRef {
@@ -123,11 +114,7 @@ fn bitmap_size(num_columns: usize) -> usize {
 }
 
 fn value_type_is_terminal(byte: u8) -> Result<bool> {
-    match byte {
-        0 | 1 => Ok(true),
-        2 => Ok(false),
-        _ => Err(Error::IoError(format!("Invalid ValueType: {}", byte))),
-    }
+    Ok(ValueType::decode_tag(byte)?.is_terminal())
 }
 
 pub(crate) fn value_expired_at(data: &[u8]) -> Result<Option<u32>> {
@@ -460,7 +447,7 @@ pub(crate) fn decode_value_masked(
             }
             let value_type = decode_value_type(buf.get_u8())?;
             if let Some(ref mut mask) = terminal_mask
-                && matches!(value_type, ValueType::Put | ValueType::Delete)
+                && value_type.is_terminal()
                 && let Some(byte) = mask.get_mut(i / 8)
             {
                 *byte |= 1 << (i % 8);
@@ -590,18 +577,46 @@ mod tests {
 
     #[test]
     fn test_value_type_encode_decode() {
-        assert_eq!(encode_value_type(&ValueType::Put), 0);
-        assert_eq!(encode_value_type(&ValueType::Delete), 1);
-        assert_eq!(encode_value_type(&ValueType::Merge), 2);
+        assert_eq!(encode_value_type(&ValueType::Put), 0b0000_0001);
+        assert_eq!(encode_value_type(&ValueType::Delete), 0b0001_0001);
+        assert_eq!(encode_value_type(&ValueType::Merge), 0b0000_0010);
+        assert_eq!(encode_value_type(&ValueType::PutSeparated), 0b0000_0101);
+        assert_eq!(encode_value_type(&ValueType::MergeSeparated), 0b0000_0110);
+        assert_eq!(
+            encode_value_type(&ValueType::MergeSeparatedArray),
+            0b0000_1110
+        );
 
-        assert!(matches!(decode_value_type(0).unwrap(), ValueType::Put));
-        assert!(matches!(decode_value_type(1).unwrap(), ValueType::Delete));
-        assert!(matches!(decode_value_type(2).unwrap(), ValueType::Merge));
+        assert!(matches!(
+            decode_value_type(0b0000_0001).unwrap(),
+            ValueType::Put
+        ));
+        assert!(matches!(
+            decode_value_type(0b0001_0001).unwrap(),
+            ValueType::Delete
+        ));
+        assert!(matches!(
+            decode_value_type(0b0000_0010).unwrap(),
+            ValueType::Merge
+        ));
+        assert!(matches!(
+            decode_value_type(0b0000_0101).unwrap(),
+            ValueType::PutSeparated
+        ));
+        assert!(matches!(
+            decode_value_type(0b0000_0110).unwrap(),
+            ValueType::MergeSeparated
+        ));
+        assert!(matches!(
+            decode_value_type(0b0000_1110).unwrap(),
+            ValueType::MergeSeparatedArray
+        ));
     }
 
     #[test]
     fn test_value_type_decode_invalid() {
-        assert!(decode_value_type(3).is_err());
+        assert!(decode_value_type(0).is_err());
+        assert!(decode_value_type(0b0000_0011).is_err());
         assert!(decode_value_type(255).is_err());
     }
 

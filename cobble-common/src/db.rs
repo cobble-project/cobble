@@ -136,7 +136,12 @@ pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<
         .into_iter()
         .map(|col_opt| {
             col_opt.and_then(|col| match col.value_type() {
-                ValueType::Put | ValueType::Merge => Some(Bytes::from(col)),
+                ValueType::Put
+                | ValueType::Merge
+                // TODO: Read from value log for separated values
+                | ValueType::PutSeparated
+                | ValueType::MergeSeparated
+                | ValueType::MergeSeparatedArray => Some(Bytes::from(col)),
                 ValueType::Delete => None,
             })
         })

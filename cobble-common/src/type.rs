@@ -1,4 +1,5 @@
-use bytes::Bytes;
+use crate::error::{Error, Result};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub(crate) struct Key {
     /// Logical namespace / group identifier.
@@ -18,17 +19,35 @@ pub(crate) struct RefKey<'a> {
     data: &'a [u8],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
 pub(crate) enum ValueType {
     /// Upsert semantics: insert or overwrite an existing value.
-    Put,
+    Put = 0b0000_0001,
 
     /// Tombstone semantics: marks a key/field as deleted.
-    Delete,
+    Delete = 0b0001_0001,
 
     /// Merge semantics: requires a merge operator during reads/compaction.
-    Merge,
+    Merge = 0b0000_0010,
+
+    /// Upsert semantics where payload references value-log storage.
+    PutSeparated = 0b0000_0101,
+
+    /// Merge semantics where payload references value-log storage.
+    MergeSeparated = 0b0000_0110,
+
+    /// Lazy merge chain for separated payloads during compaction.
+    MergeSeparatedArray = 0b0000_1110,
 }
+
+const VALUE_TYPE_TERMINAL_BIT: u8 = 0b0000_0001;
+const VALUE_TYPE_MERGE_BIT: u8 = 0b0000_0010;
+const VALUE_TYPE_SEPARATED_BIT: u8 = 0b0000_0100;
+const VALUE_TYPE_ARRAY_BIT: u8 = 0b0000_1000;
+
+// The anti-mask for merge-separated array items rejects Delete and Array variants.
+const VALUE_TYPE_MERGE_ARRAY_ITEM_ANTI_MASK: u8 = 0b0001_1000;
 
 #[derive(Clone)]
 pub(crate) struct Column {
@@ -83,6 +102,117 @@ impl Key {
     }
 }
 
+impl ValueType {
+    #[inline]
+    pub(crate) fn encode_tag(self) -> u8 {
+        self as u8
+    }
+
+    #[inline]
+    pub(crate) fn decode_tag(byte: u8) -> Result<Self> {
+        match byte {
+            x if x == ValueType::Put as u8 => Ok(ValueType::Put),
+            x if x == ValueType::Delete as u8 => Ok(ValueType::Delete),
+            x if x == ValueType::Merge as u8 => Ok(ValueType::Merge),
+            x if x == ValueType::PutSeparated as u8 => Ok(ValueType::PutSeparated),
+            x if x == ValueType::MergeSeparated as u8 => Ok(ValueType::MergeSeparated),
+            x if x == ValueType::MergeSeparatedArray as u8 => Ok(ValueType::MergeSeparatedArray),
+            _ => Err(Error::IoError(format!("Invalid ValueType: {}", byte))),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_terminal(self) -> bool {
+        self.encode_tag() & VALUE_TYPE_TERMINAL_BIT != 0
+    }
+
+    #[inline]
+    fn is_merge_separated_array_item(self) -> bool {
+        self.encode_tag() & VALUE_TYPE_MERGE_ARRAY_ITEM_ANTI_MASK == 0
+    }
+
+    #[inline]
+    fn uses_separated_storage(self) -> bool {
+        self.encode_tag() & VALUE_TYPE_SEPARATED_BIT != 0
+    }
+}
+
+pub(crate) fn decode_merge_separated_array(data: &[u8]) -> Result<Vec<RefColumn<'_>>> {
+    let mut columns = Vec::new();
+    let mut buf = data;
+    while buf.remaining() > 0 {
+        if buf.remaining() < 5 {
+            return Err(Error::IoError(format!(
+                "MergeSeparatedArray entry header too small: {}",
+                buf.remaining()
+            )));
+        }
+        let value_type = ValueType::decode_tag(buf.get_u8())?;
+        if !value_type.is_merge_separated_array_item() {
+            return Err(Error::IoError(format!(
+                "MergeSeparatedArray cannot contain nested type {:?}",
+                value_type
+            )));
+        }
+        let data_len = buf.get_u32_le() as usize;
+        if buf.remaining() < data_len {
+            return Err(Error::IoError(format!(
+                "MergeSeparatedArray entry truncated: expected {} bytes, got {}",
+                data_len,
+                buf.remaining()
+            )));
+        }
+        columns.push(RefColumn::new(value_type, &buf[..data_len]));
+        buf = &buf[data_len..];
+    }
+    Ok(columns)
+}
+
+pub(crate) fn encode_merge_separated_array(columns: &[RefColumn<'_>]) -> Result<Vec<u8>> {
+    let mut total_size = 0usize;
+    for column in columns {
+        match column.value_type {
+            ValueType::MergeSeparatedArray => {
+                total_size = total_size.checked_add(column.data().len()).ok_or_else(|| {
+                    Error::IoError("MergeSeparatedArray payload size overflow".to_string())
+                })?;
+            }
+            value_type if value_type.is_merge_separated_array_item() => {
+                total_size = total_size
+                    .checked_add(1 + 4 + column.data().len())
+                    .ok_or_else(|| {
+                        Error::IoError("MergeSeparatedArray payload size overflow".to_string())
+                    })?;
+            }
+            value_type => {
+                return Err(Error::IoError(format!(
+                    "MergeSeparatedArray cannot contain type {:?}",
+                    value_type
+                )));
+            }
+        }
+    }
+
+    let mut buf = BytesMut::with_capacity(total_size);
+    for column in columns {
+        match column.value_type {
+            ValueType::MergeSeparatedArray => buf.put_slice(column.data()),
+            value_type if value_type.is_merge_separated_array_item() => {
+                buf.put_u8(value_type.encode_tag());
+                buf.put_u32_le(column.data().len() as u32);
+                buf.put_slice(column.data());
+            }
+            value_type => {
+                return Err(Error::IoError(format!(
+                    "MergeSeparatedArray cannot contain type {:?}",
+                    value_type
+                )));
+            }
+        }
+    }
+    Ok(buf.to_vec())
+}
+
 impl<'a> RefKey<'a> {
     pub(crate) fn new(bucket: u16, data: &'a [u8]) -> Self {
         Self { bucket, data }
@@ -120,6 +250,10 @@ impl Column {
         &self.data
     }
 
+    fn as_ref_column(&self) -> RefColumn<'_> {
+        RefColumn::new(self.value_type, self.data())
+    }
+
     /// Merges this column with a newer column, consuming both.
     ///
     /// Merge semantics:
@@ -129,11 +263,36 @@ impl Column {
     /// This API takes ownership to minimize clones for performance.
     pub(crate) fn merge(mut self, newer: Column) -> Column {
         match newer.value_type {
-            ValueType::Put | ValueType::Delete => newer,
-            ValueType::Merge => {
+            ValueType::Put | ValueType::PutSeparated | ValueType::Delete => newer,
+            ValueType::Merge | ValueType::MergeSeparated | ValueType::MergeSeparatedArray => {
+                if (self.value_type.uses_separated_storage()
+                    || newer.value_type.uses_separated_storage())
+                    && self.value_type != ValueType::Delete
+                {
+                    return Self::merge_as_separated_array(self, newer)
+                        .expect("separated merge invariant violated");
+                }
                 self.data.extend_from_slice(&newer.data);
                 self
             }
+        }
+    }
+
+    fn merge_as_separated_array(self, newer: Column) -> Result<Column> {
+        let older = self.into_merge_separated_array_input()?;
+        let refs = [older.as_ref_column(), newer.as_ref_column()];
+        let encoded = encode_merge_separated_array(&refs)?;
+        Ok(Column::new(ValueType::MergeSeparatedArray, encoded))
+    }
+
+    fn into_merge_separated_array_input(self) -> Result<Column> {
+        match self.value_type {
+            ValueType::MergeSeparatedArray => Ok(self),
+            value_type if value_type.is_merge_separated_array_item() => Ok(self),
+            value_type => Err(Error::IoError(format!(
+                "Cannot encode {:?} into MergeSeparatedArray",
+                value_type
+            ))),
         }
     }
 }
@@ -186,22 +345,19 @@ impl Value {
 
     /// Checks if all columns are terminal (Put or Delete).
     pub(crate) fn is_terminal(&self) -> bool {
-        self.columns.iter().all(|col| {
-            matches!(
-                col.as_ref().map(|c| c.value_type()),
-                Some(ValueType::Put | ValueType::Delete)
-            )
-        })
+        self.columns
+            .iter()
+            .all(|col| col.as_ref().is_some_and(|c| c.value_type().is_terminal()))
     }
 
     pub(crate) fn terminal_mask(&self) -> Vec<u8> {
         let mask_size = self.columns.len().div_ceil(8).max(1);
         let mut mask = vec![0u8; mask_size];
         for (idx, col) in self.columns.iter().enumerate() {
-            if matches!(
-                col.as_ref().map(|c| c.value_type()),
-                Some(ValueType::Put | ValueType::Delete)
-            ) {
+            if col
+                .as_ref()
+                .is_some_and(|column| column.value_type().is_terminal())
+            {
                 mask[idx / 8] |= 1 << (idx % 8);
             }
         }
@@ -432,5 +588,82 @@ mod tests {
         assert_eq!(cols.len(), 2);
         assert!(cols[0].is_none());
         assert!(cols[1].is_none());
+    }
+
+    #[test]
+    fn test_encode_decode_merge_separated_array_flatten_nested() {
+        let nested_columns = vec![
+            Column::new(ValueType::PutSeparated, b"p1".to_vec()),
+            Column::new(ValueType::MergeSeparated, b"m1".to_vec()),
+        ];
+        let nested_refs: Vec<_> = nested_columns.iter().map(Column::as_ref_column).collect();
+        let nested = encode_merge_separated_array(&nested_refs).unwrap();
+        let encoded_columns = vec![
+            Column::new(ValueType::Put, b"inline".to_vec()),
+            Column::new(ValueType::MergeSeparatedArray, nested),
+            Column::new(ValueType::Merge, b"suffix".to_vec()),
+        ];
+        let encoded_refs: Vec<_> = encoded_columns.iter().map(Column::as_ref_column).collect();
+        let encoded = encode_merge_separated_array(&encoded_refs).unwrap();
+        let decoded = decode_merge_separated_array(&encoded).unwrap();
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(decoded[0].value_type, ValueType::Put);
+        assert_eq!(decoded[0].data(), b"inline");
+        assert_eq!(decoded[1].value_type, ValueType::PutSeparated);
+        assert_eq!(decoded[1].data(), b"p1");
+        assert_eq!(decoded[2].value_type, ValueType::MergeSeparated);
+        assert_eq!(decoded[2].data(), b"m1");
+        assert_eq!(decoded[3].value_type, ValueType::Merge);
+        assert_eq!(decoded[3].data(), b"suffix");
+    }
+
+    #[test]
+    fn test_decode_merge_separated_array_rejects_nested_type() {
+        let mut invalid = BytesMut::new();
+        invalid.put_u8(ValueType::MergeSeparatedArray.encode_tag());
+        invalid.put_u32_le(3);
+        invalid.put_slice(b"bad");
+        assert!(decode_merge_separated_array(&invalid).is_err());
+    }
+
+    #[test]
+    fn test_column_merge_with_separated_creates_array() {
+        let old = Column::new(ValueType::PutSeparated, b"p0".to_vec());
+        let new = Column::new(ValueType::MergeSeparated, b"m1".to_vec());
+        let merged = old.merge(new);
+        assert_eq!(merged.value_type, ValueType::MergeSeparatedArray);
+        let decoded = decode_merge_separated_array(merged.data()).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].value_type, ValueType::PutSeparated);
+        assert_eq!(decoded[0].data(), b"p0");
+        assert_eq!(decoded[1].value_type, ValueType::MergeSeparated);
+        assert_eq!(decoded[1].data(), b"m1");
+    }
+
+    #[test]
+    fn test_put_separated_is_terminal() {
+        let value = Value::new(vec![Some(Column::new(
+            ValueType::PutSeparated,
+            b"p".to_vec(),
+        ))]);
+        assert!(value.is_terminal());
+        assert_eq!(value.terminal_mask(), vec![0b0000_0001]);
+    }
+
+    #[test]
+    fn test_value_type_bit_semantics() {
+        assert_eq!(ValueType::Put.encode_tag() & VALUE_TYPE_TERMINAL_BIT, 1);
+        assert_eq!(
+            ValueType::Merge.encode_tag() & VALUE_TYPE_MERGE_BIT,
+            VALUE_TYPE_MERGE_BIT
+        );
+        assert_eq!(
+            ValueType::PutSeparated.encode_tag() & VALUE_TYPE_SEPARATED_BIT,
+            VALUE_TYPE_SEPARATED_BIT
+        );
+        assert_eq!(
+            ValueType::MergeSeparatedArray.encode_tag() & VALUE_TYPE_ARRAY_BIT,
+            VALUE_TYPE_ARRAY_BIT
+        );
     }
 }
