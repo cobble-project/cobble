@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, RandomAccessFile, SequentialWriteFile};
 use crate::file::{FileManager, TrackedFileId};
 use bytes::{Buf, Bytes, BytesMut};
-use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -18,6 +18,41 @@ pub(crate) struct VlogPointer {
 }
 
 pub(crate) type VlogFileSeq = u32;
+
+/// Represents the current version of the value log, tracking the mapping of file sequences to
+/// tracked file ids.
+#[derive(Clone, Default)]
+pub(crate) struct VlogVersion {
+    file_ids: HashMap<VlogFileSeq, Arc<TrackedFileId>>,
+}
+
+impl VlogVersion {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn apply_edit(&self, edit: VlogEdit) -> Self {
+        let mut file_ids = self.file_ids.clone();
+        for file_seq in edit.removed_files {
+            file_ids.remove(&file_seq);
+        }
+        for (file_seq, tracked_id) in edit.new_files {
+            file_ids.insert(file_seq, tracked_id);
+        }
+        Self { file_ids }
+    }
+
+    fn file_id(&self, file_seq: VlogFileSeq) -> Option<Arc<TrackedFileId>> {
+        self.file_ids.get(&file_seq).map(Arc::clone)
+    }
+}
+
+/// Represents an edit to the value log version, including new files added and old files removed.
+#[derive(Clone, Default)]
+pub(crate) struct VlogEdit {
+    new_files: Vec<(VlogFileSeq, Arc<TrackedFileId>)>,
+    removed_files: Vec<VlogFileSeq>,
+}
 
 /// A simple value log writer that appends values to a file and returns pointers for retrieval.
 pub(crate) struct VlogWriter<W: SequentialWriteFile> {
@@ -106,7 +141,6 @@ impl<R: RandomAccessFile> VlogReader<R> {
 /// The main value log store that manages multiple value log files and provides APIs for writing and reading values.
 pub(crate) struct VlogStore {
     file_manager: Arc<FileManager>,
-    file_ids: Arc<DashMap<VlogFileSeq, Arc<TrackedFileId>>>,
     buffer_size: usize,
     next_file_seq: AtomicU32,
 }
@@ -123,7 +157,6 @@ impl VlogStore {
     ) -> Self {
         Self {
             file_manager,
-            file_ids: Arc::new(DashMap::new()),
             buffer_size,
             next_file_seq: AtomicU32::new(start_seq),
         }
@@ -133,26 +166,31 @@ impl VlogStore {
         self.next_file_seq.fetch_add(1, Ordering::SeqCst)
     }
 
-    pub(crate) fn create_writer(&self) -> Result<VlogWriter<Box<dyn SequentialWriteFile>>> {
+    pub(crate) fn create_writer(
+        &self,
+    ) -> Result<(VlogWriter<Box<dyn SequentialWriteFile>>, VlogEdit)> {
         let file_seq = self.allocate_file_seq();
         let (file_id, writer) = self.file_manager.create_data_file()?;
         let tracked_id = TrackedFileId::new(&self.file_manager, file_id);
-        self.file_ids.insert(file_seq, tracked_id);
         let writer: Box<dyn SequentialWriteFile> = Box::new(writer);
-        Ok(VlogWriter::new(file_seq, writer, self.buffer_size))
+        let edit = VlogEdit {
+            new_files: vec![(file_seq, tracked_id)],
+            removed_files: Vec::new(),
+        };
+        Ok((VlogWriter::new(file_seq, writer, self.buffer_size), edit))
     }
 
-    pub(crate) fn read_pointer(&self, pointer: VlogPointer) -> Result<Bytes> {
-        let tracked_id = self
-            .file_ids
-            .get(&pointer.file_seq)
-            .map(|entry| Arc::clone(entry.value()))
-            .ok_or_else(|| {
-                Error::IoError(format!(
-                    "VLOG file seq {} is not registered",
-                    pointer.file_seq
-                ))
-            })?;
+    pub(crate) fn read_pointer(
+        &self,
+        version: &VlogVersion,
+        pointer: VlogPointer,
+    ) -> Result<Bytes> {
+        let tracked_id = version.file_id(pointer.file_seq).ok_or_else(|| {
+            Error::IoError(format!(
+                "VLOG file seq {} is not registered",
+                pointer.file_seq
+            ))
+        })?;
         let reader = self
             .file_manager
             .open_data_file_reader(tracked_id.file_id())?;
@@ -184,7 +222,9 @@ mod tests {
         let metrics_manager = Arc::new(MetricsManager::new("vlog-test".to_string()));
         let file_manager = Arc::new(FileManager::with_defaults(fs, metrics_manager).unwrap());
         let store = VlogStore::new(Arc::clone(&file_manager), 64);
-        let mut vlog = store.create_writer().unwrap();
+        let version = VlogVersion::new();
+        let (mut vlog, edit) = store.create_writer().unwrap();
+        let version = version.apply_edit(edit);
         let first = vlog.add_value(b"hello").unwrap();
         let second = vlog.add_value(b"world!").unwrap();
         let large = vec![b'a'; 2000];
@@ -193,9 +233,9 @@ mod tests {
         assert_eq!(second.offset, (VLOG_RECORD_HEADER_SIZE + 5) as u32);
         vlog.close().unwrap();
 
-        let first_value = store.read_pointer(first).unwrap();
-        let second_value = store.read_pointer(second).unwrap();
-        let third_value = store.read_pointer(third).unwrap();
+        let first_value = store.read_pointer(&version, first).unwrap();
+        let second_value = store.read_pointer(&version, second).unwrap();
+        let third_value = store.read_pointer(&version, third).unwrap();
         assert_eq!(&first_value[..], b"hello");
         assert_eq!(&second_value[..], b"world!");
         assert_eq!(&third_value[..], &large[..]);
@@ -209,7 +249,14 @@ mod tests {
         let metrics_manager = Arc::new(MetricsManager::new("vlog-test".to_string()));
         let file_manager = Arc::new(FileManager::with_defaults(fs, metrics_manager).unwrap());
         let store = VlogStore::with_start_seq(Arc::clone(&file_manager), 64, u32::MAX);
-        assert_eq!(store.allocate_file_seq(), u32::MAX);
-        assert_eq!(store.allocate_file_seq(), 0);
+        let version = VlogVersion::new();
+        let (mut vlog, edit) = store.create_writer().unwrap();
+        assert_eq!(vlog.file_seq(), u32::MAX);
+        vlog.close().unwrap();
+        let version = version.apply_edit(edit);
+        let (mut vlog, edit) = store.create_writer().unwrap();
+        assert_eq!(vlog.file_seq(), 0);
+        vlog.close().unwrap();
+        let _version = version.apply_edit(edit);
     }
 }
