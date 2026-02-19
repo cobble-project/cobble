@@ -428,10 +428,15 @@ mod tests {
     use crate::sst::row_codec::encode_value;
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::Value;
-    use crate::r#type::{Column, ValueType};
+    use crate::r#type::{Column, ValueType, decode_merge_separated_array};
 
     fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {
         let value = Value::new(vec![Some(Column::new(ValueType::Put, data.to_vec()))]);
+        encode_value(&value, num_columns).to_vec()
+    }
+
+    fn make_typed_value_bytes(value_type: ValueType, data: &[u8], num_columns: usize) -> Vec<u8> {
+        let value = Value::new(vec![Some(Column::new(value_type, data.to_vec()))]);
         encode_value(&value, num_columns).to_vec()
     }
 
@@ -736,6 +741,152 @@ mod tests {
         assert_eq!(&key[..], b"c");
         let decoded = crate::sst::row_codec::decode_value(&value, num_columns).unwrap();
         assert_eq!(decoded.columns()[0].as_ref().unwrap().data(), b"old_c");
+
+        cleanup_test_dir(test_dir);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_compaction_lazy_merge_with_separated_values() {
+        let test_dir = "/tmp/compaction_separated_merge_test";
+        cleanup_test_dir(test_dir);
+
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", test_dir))
+            .unwrap();
+
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
+
+        let num_columns = 1;
+        let old_put_separated = [0x11u8; 8];
+        let new_merge_separated_a = [0x22u8; 8];
+        let new_merge_separated_b = [0x33u8; 8];
+
+        // Newer run contains merge-separated values.
+        let file1 = create_test_sst(
+            &file_manager,
+            vec![
+                (
+                    b"a",
+                    &make_typed_value_bytes(
+                        ValueType::MergeSeparated,
+                        &new_merge_separated_a,
+                        num_columns,
+                    ),
+                ),
+                (
+                    b"b",
+                    &make_typed_value_bytes(
+                        ValueType::MergeSeparated,
+                        &new_merge_separated_b,
+                        num_columns,
+                    ),
+                ),
+            ],
+        )
+        .unwrap();
+
+        // Older run contains one separated base and one inline base.
+        let file2 = create_test_sst(
+            &file_manager,
+            vec![
+                (
+                    b"a",
+                    &make_typed_value_bytes(
+                        ValueType::PutSeparated,
+                        &old_put_separated,
+                        num_columns,
+                    ),
+                ),
+                (
+                    b"b",
+                    &make_typed_value_bytes(ValueType::Put, b"base_b", num_columns),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let run1 = SortedRun::new(0, vec![file1]);
+        let run2 = SortedRun::new(0, vec![file2]);
+
+        let options = CompactionConfig {
+            num_columns,
+            bloom_filter_enabled: true,
+            bloom_bits_per_key: 10,
+            ..Default::default()
+        };
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            metrics: None,
+            block_size: options.block_size,
+            buffer_size: options.buffer_size,
+            num_columns: options.num_columns,
+            bloom_filter_enabled: options.bloom_filter_enabled,
+            bloom_bits_per_key: options.bloom_bits_per_key,
+            partitioned_index: options.partitioned_index,
+            compression: crate::SstCompressionAlgorithm::None,
+        });
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
+        let task = CompactionTask::new(
+            compaction_metrics,
+            sst_metrics,
+            vec![run1, run2],
+            1,
+            Arc::clone(&file_manager),
+            factory,
+            DataFileType::SSTable,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
+        );
+        let executor = CompactionExecutor::new(options).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+
+        assert_eq!(result.new_files().len(), 1);
+        let reader = file_manager
+            .open_data_file_reader(result.new_files()[0].file_id)
+            .unwrap();
+        let mut iter = crate::sst::SSTIterator::with_cache_and_file(
+            Box::new(reader),
+            result.new_files()[0].as_ref(),
+            crate::sst::SSTIteratorOptions {
+                bloom_filter_enabled: true,
+                num_columns,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        iter.seek_to_first().unwrap();
+        assert!(iter.valid());
+        let (key, value) = iter.current().unwrap().unwrap();
+        assert_eq!(&key[..], b"a");
+        let decoded = crate::sst::row_codec::decode_value(&value, num_columns).unwrap();
+        let column = decoded.columns()[0].as_ref().unwrap();
+        assert_eq!(column.value_type, ValueType::MergeSeparatedArray);
+        let merged_items = decode_merge_separated_array(column.data()).unwrap();
+        assert_eq!(merged_items.len(), 2);
+        assert_eq!(merged_items[0].value_type, ValueType::PutSeparated);
+        assert_eq!(merged_items[0].data(), old_put_separated);
+        assert_eq!(merged_items[1].value_type, ValueType::MergeSeparated);
+        assert_eq!(merged_items[1].data(), new_merge_separated_a);
+
+        iter.next().unwrap();
+        assert!(iter.valid());
+        let (key, value) = iter.current().unwrap().unwrap();
+        assert_eq!(&key[..], b"b");
+        let decoded = crate::sst::row_codec::decode_value(&value, num_columns).unwrap();
+        let column = decoded.columns()[0].as_ref().unwrap();
+        assert_eq!(column.value_type, ValueType::MergeSeparatedArray);
+        let merged_items = decode_merge_separated_array(column.data()).unwrap();
+        assert_eq!(merged_items.len(), 2);
+        assert_eq!(merged_items[0].value_type, ValueType::Put);
+        assert_eq!(merged_items[0].data(), b"base_b");
+        assert_eq!(merged_items[1].value_type, ValueType::MergeSeparated);
+        assert_eq!(merged_items[1].data(), new_merge_separated_b);
 
         cleanup_test_dir(test_dir);
     }
