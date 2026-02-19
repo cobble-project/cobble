@@ -10,6 +10,7 @@ use crate::sst::block_cache::{BlockCache, new_block_cache};
 use crate::sst::row_codec::encode_key;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::r#type::{Key, Value};
+use crate::vlog::VlogVersion;
 use crate::{Config, ReadOptions};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -78,6 +79,7 @@ impl ReadOnlyDb {
         db_state.store(crate::db_state::DbState {
             seq_id: 0,
             lsm_version: LSMTreeVersion { levels },
+            vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
         });

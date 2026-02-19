@@ -8,8 +8,9 @@ use crate::snapshot::{
     snapshot_manifest_name,
 };
 use crate::sst::block_cache::new_block_cache;
-use crate::sst::row_codec::{decode_value_masked, encode_key, encode_value};
+use crate::sst::row_codec::{decode_value_masked, encode_key};
 use crate::r#type::{Column, Key, RefColumn, RefKey, RefValue, Value, ValueType};
+use crate::vlog::{VlogStore, VlogVersion};
 use crate::write_batch::{WriteBatch, WriteOp};
 use crate::{Config, TimeProvider};
 use bytes::Bytes;
@@ -31,6 +32,7 @@ pub struct Db {
     file_manager: Arc<FileManager>,
     lsm_tree: Arc<LSMTree>,
     memtable_manager: MemtableManager,
+    vlog_store: Arc<VlogStore>,
     snapshot_manager: SnapshotManager,
     num_columns: usize,
     time_provider: Arc<dyn TimeProvider>,
@@ -320,11 +322,18 @@ impl Db {
             }
         }
         for (raw_key, value) in pending {
-            let key = Key::new(0, raw_key);
-            let encoded_key = encode_key(&key);
-            let encoded_value = encode_value(&value, self.num_columns);
-            self.memtable_manager
-                .put(encoded_key.as_ref(), encoded_value.as_ref())?;
+            let key = RefKey::new(0, &raw_key);
+            let columns: Vec<Option<RefColumn<'_>>> = value
+                .columns()
+                .iter()
+                .map(|column| {
+                    column
+                        .as_ref()
+                        .map(|column| RefColumn::new(column.value_type, column.data()))
+                })
+                .collect();
+            let value_ref = RefValue::new_with_expired_at(columns, value.expired_at());
+            self.memtable_manager.put_ref(&key, &value_ref)?;
         }
         Ok(())
     }
@@ -422,6 +431,7 @@ impl Db {
         db_state.store(crate::db_state::DbState {
             seq_id: max_seq,
             lsm_version: crate::lsm::LSMTreeVersion { levels },
+            vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
         });
@@ -462,6 +472,11 @@ impl Db {
         let lsm_tree = Arc::new(lsm_tree);
         let mut sst_options = crate::compaction::build_sst_writer_options(&config, 0);
         sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
+        let vlog_store = Arc::new(VlogStore::new(
+            Arc::clone(&file_manager),
+            sst_options.buffer_size,
+            config.value_separation_threshold,
+        ));
         // Compaction setup
         let compaction_options = crate::compaction::build_compaction_config(&config);
         let compaction_worker: Arc<dyn crate::compaction::CompactionWorker> =
@@ -514,6 +529,7 @@ impl Db {
                     None
                 },
                 metrics_manager: Some(Arc::clone(&metrics_manager)),
+                vlog_store: Some(Arc::clone(&vlog_store)),
             },
         )?;
 
@@ -522,6 +538,7 @@ impl Db {
             file_manager: Arc::clone(&file_manager),
             lsm_tree,
             memtable_manager,
+            vlog_store,
             snapshot_manager,
             num_columns: config.num_columns,
             time_provider,
@@ -695,6 +712,105 @@ mod tests {
             .expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"new");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_rejects_separated_value_type_input() {
+        let root = "/tmp/db_reject_separated_input";
+        cleanup_test_root(root);
+        let db = Db::open(config_with_small_memtable(root)).unwrap();
+
+        for value_type in [
+            ValueType::PutSeparated,
+            ValueType::MergeSeparated,
+            ValueType::MergeSeparatedArray,
+        ] {
+            let err = db
+                .write_ref(b"k1", 0, value_type, b"value", None)
+                .unwrap_err();
+            assert!(matches!(err, Error::InputError(_)));
+        }
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_value_separation_get_from_memtable_before_flush() {
+        let root = "/tmp/db_value_separation_memtable";
+        cleanup_test_root(root);
+        let config = Config {
+            value_separation_threshold: 8,
+            ..config_with_small_memtable(root)
+        };
+        let db = Db::open(config).unwrap();
+        let large = b"value-larger-than-threshold";
+        db.put(b"k1", 0, large).unwrap();
+
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        assert_eq!(value[0].as_ref().unwrap().len(), 8);
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_value_separation_flush_and_get() {
+        use crate::sst::row_codec::decode_value;
+        use crate::sst::{SSTIterator, SSTIteratorOptions};
+
+        let root = "/tmp/db_value_separation";
+        cleanup_test_root(root);
+        let config = Config {
+            value_separation_threshold: 8,
+            ..config_with_small_memtable(root)
+        };
+        let db = Db::open(config).unwrap();
+        let large = b"value-larger-than-threshold";
+        db.put(b"k1", 0, large).unwrap();
+
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let level0 = db.lsm_tree.level_files(0);
+        assert_eq!(level0.len(), 1);
+        let data_file = Arc::clone(&level0[0]);
+        let reader = db
+            .file_manager
+            .open_data_file_reader(data_file.file_id)
+            .unwrap();
+        let mut iter = SSTIterator::with_cache_and_file(
+            Box::new(reader),
+            data_file.as_ref(),
+            SSTIteratorOptions {
+                bloom_filter_enabled: true,
+                ..SSTIteratorOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        iter.seek_to_first().unwrap();
+        let (_, raw_value) = iter.current().unwrap().unwrap();
+        let decoded = decode_value(&raw_value, 1).unwrap();
+        let column = decoded
+            .columns()
+            .first()
+            .and_then(|col| col.as_ref())
+            .expect("column present");
+        assert_eq!(column.value_type, ValueType::PutSeparated);
+        assert_eq!(column.data().len(), 8);
+
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        assert_eq!(value[0].as_ref().unwrap().len(), 8);
 
         cleanup_test_root(root);
     }

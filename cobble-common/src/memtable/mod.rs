@@ -1,5 +1,6 @@
 mod hash;
 mod manager;
+mod vlog;
 
 use crate::error::Result;
 use crate::iterator::KvIterator;

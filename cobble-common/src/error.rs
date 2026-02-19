@@ -11,6 +11,8 @@ pub enum Error {
     MemtableFull { needed: usize, remaining: usize },
     #[error("Configuration error: {0}")]
     ConfigError(String),
+    #[error("Input error: {0}")]
+    InputError(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

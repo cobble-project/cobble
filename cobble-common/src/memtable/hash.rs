@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use crate::error::{Error, Result};
 use crate::iterator::KvIterator;
 use crate::memtable::Memtable;
+use crate::memtable::vlog::{RewrittenValuePlan, encode_rewritten_value};
 use crate::sst::row_codec::{encode_key_ref_into, encode_value_ref_into};
 use crate::r#type::{RefKey, RefValue};
 use std::sync::Arc;
@@ -11,7 +12,13 @@ use std::sync::Arc;
 /// Type alias for memtable reclaimer function.
 pub(crate) type MemtableReclaimer = Arc<dyn Fn(u64) + Send + Sync>;
 
-/// Hash-indexed memtable storing both entries and bucketed index inside one contiguous buffer.
+/// Hash-indexed memtable storing entries, blobs, index nodes and bucket table in one buffer.
+///
+/// Layout:
+/// - `[0, data_end)`: encoded KV entries, appended left-to-right.
+/// - `[index_cursor, bucket_base)`: scratch area grown right-to-left by blob payloads and hash
+///   index nodes.
+/// - `[bucket_base, capacity)`: fixed bucket head table (`u32` offsets).
 pub(crate) struct HashMemtable {
     buffer: Vec<u8>,
     data_end: usize,
@@ -154,6 +161,35 @@ impl HashMemtable {
         Ok(())
     }
 
+    pub(crate) fn append_blob(&mut self, data: &[u8]) -> Result<usize> {
+        if self.data_end + data.len() > self.index_cursor {
+            return Err(Error::MemtableFull {
+                needed: data.len(),
+                remaining: self.index_cursor.saturating_sub(self.data_end),
+            });
+        }
+        let start = self.index_cursor - data.len();
+        self.buffer[start..self.index_cursor].copy_from_slice(data);
+        self.index_cursor = start;
+        Ok(start)
+    }
+
+    pub(crate) fn read_blob(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let end = offset.checked_add(len)?;
+        if offset < self.index_cursor || end > self.bucket_base {
+            return None;
+        }
+        Some(&self.buffer[offset..end])
+    }
+
+    pub(crate) fn blob_cursor_checkpoint(&self) -> usize {
+        self.index_cursor
+    }
+
+    pub(crate) fn rollback_blob_cursor(&mut self, checkpoint: usize) {
+        self.index_cursor = checkpoint;
+    }
+
     fn write_data(&mut self, key: &[u8], value: &[u8]) -> usize {
         let key_len = key.len() as u32;
         let value_len = value.len() as u32;
@@ -202,6 +238,32 @@ impl HashMemtable {
         let hash = Self::hash_key(&self.buffer[key_offset..key_offset + key_len]);
         let bucket = self.bucket_index_from_hash(hash);
         let node_off = self.write_index(bucket, hash, data_offset as u32);
+        self.set_bucket_head(bucket, node_off);
+        Ok(())
+    }
+
+    pub(crate) fn put_ref_rewritten(
+        &mut self,
+        key: &RefKey<'_>,
+        plan: &RewrittenValuePlan<'_>,
+        num_columns: usize,
+    ) -> Result<()> {
+        let value_len = plan.encoded_len(num_columns);
+        let key_len = key.encoded_len();
+        let data_len = Self::entry_size(key_len, value_len);
+        self.has_space(data_len)?;
+        let start = self.data_end;
+        let end = start + data_len;
+        let mut slice = &mut self.buffer[start..end];
+        slice.put_u32(key_len as u32);
+        slice.put_u32(value_len as u32);
+        encode_key_ref_into(key, &mut slice);
+        encode_rewritten_value(plan, num_columns, &mut slice[..value_len]);
+        self.data_end = end;
+        let key_offset = start + 8;
+        let hash = Self::hash_key(&self.buffer[key_offset..key_offset + key_len]);
+        let bucket = self.bucket_index_from_hash(hash);
+        let node_off = self.write_index(bucket, hash, start as u32);
         self.set_bucket_head(bucket, node_off);
         Ok(())
     }
@@ -526,5 +588,34 @@ mod tests {
             (Bytes::from("c"), Bytes::from("z1")),
         ];
         assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn blob_storage_does_not_affect_kv_iteration() {
+        let mut mem = HashMemtable::with_capacity(512);
+        mem.put(b"k1", b"v1").unwrap();
+        let blob_offset = mem.append_blob(b"blob-payload").unwrap();
+        mem.put(b"k2", b"v2").unwrap();
+
+        assert_eq!(
+            mem.read_blob(blob_offset, "blob-payload".len()).unwrap(),
+            b"blob-payload"
+        );
+
+        let mut iter = mem.iter();
+        iter.seek_to_first().unwrap();
+        let mut entries = Vec::new();
+        while iter.next().unwrap() {
+            let key = iter.key().unwrap().unwrap();
+            let value = iter.value().unwrap().unwrap();
+            entries.push((key, value));
+        }
+        assert_eq!(
+            entries,
+            vec![
+                (Bytes::from("k1"), Bytes::from("v1")),
+                (Bytes::from("k2"), Bytes::from("v2"))
+            ]
+        );
     }
 }

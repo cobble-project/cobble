@@ -223,6 +223,8 @@ pub struct Config {
     pub ttl_enabled: bool,
     /// Default TTL duration (in seconds). None means no expiration by default.
     pub default_ttl_seconds: Option<u32>,
+    /// Values larger than this threshold are marked for value-log separation.
+    pub value_separation_threshold: usize,
     /// Time provider to use for TTL.
     pub time_provider: TimeProviderKind,
     /// Optional log file path. If None, logs go to console only. Must be a local path.
@@ -268,6 +270,7 @@ impl Default for Config {
             ],
             ttl_enabled: false,
             default_ttl_seconds: None,
+            value_separation_threshold: usize::MAX,
             time_provider: TimeProviderKind::default(),
             log_path: None,
             log_console: false,
@@ -396,6 +399,7 @@ mod tests {
             ],
             ttl_enabled: true,
             default_ttl_seconds: Some(120),
+            value_separation_threshold: 4096,
             time_provider: crate::time::TimeProviderKind::Manual,
             log_path: Some("/tmp/cobble.log".to_string()),
             log_console: true,
@@ -432,6 +436,7 @@ mod tests {
         assert_eq!(decoded.time_provider, crate::time::TimeProviderKind::Manual);
         assert_eq!(decoded.log_level, log::LevelFilter::Debug);
         assert_eq!(decoded.snapshot_retention, Some(3));
+        assert_eq!(decoded.value_separation_threshold, 4096);
         assert_eq!(decoded.read_proxy.block_cache_size, 2048);
         assert_eq!(decoded.read_proxy.reload_tolerance_seconds, 5);
 

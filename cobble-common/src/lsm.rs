@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::db_state::{DbState, DbStateHandle};
 use crate::ttl::TTLProvider;
+use crate::vlog::VlogEdit;
 
 #[derive(Clone)]
 pub(crate) struct Level {
@@ -185,7 +186,7 @@ impl LSMTree {
         &self,
         state: &mut LSMTreeState,
         edit: VersionEdit,
-        fix: impl Fn(&mut DbState),
+        fix: impl FnOnce(&mut DbState),
     ) -> Arc<DbState> {
         let guard = self.db_state.lock();
         let snapshot = self.db_state.load();
@@ -262,6 +263,7 @@ impl LSMTree {
                     LSMTreeVersion {
                         levels: new_levels.clone(),
                     },
+                    snapshot.vlog_version.clone(),
                     snapshot.active.clone(),
                     snapshot.immutables.clone(),
                 );
@@ -283,6 +285,7 @@ impl LSMTree {
         &self,
         to_remove_memtable_seq: u64,
         new_files: Vec<Arc<DataFile>>,
+        vlog_edit: Option<VlogEdit>,
     ) -> Arc<DbState> {
         if new_files.is_empty() {
             panic!("cannot add empty new files");
@@ -295,10 +298,13 @@ impl LSMTree {
             }],
         };
         let mut state = self.state.lock().unwrap();
-        self.apply_edit_locked(&mut state, edit, |db_state| {
+        self.apply_edit_locked(&mut state, edit, move |db_state| {
             db_state
                 .immutables
                 .retain(|imm| imm.seq != to_remove_memtable_seq);
+            if let Some(edit) = vlog_edit {
+                db_state.vlog_version = db_state.vlog_version.apply_edit(edit);
+            }
         })
     }
 
@@ -635,6 +641,7 @@ mod tests {
     use crate::sst::row_codec::{encode_key, encode_value};
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::{Column, Key, Value, ValueType};
+    use crate::vlog::VlogVersion;
 
     static mut FILE_ID_COUNTER: FileId = 0;
 
@@ -735,6 +742,7 @@ mod tests {
                     },
                 ],
             },
+            vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
         });
@@ -815,6 +823,7 @@ mod tests {
                     files: vec![Arc::clone(&to_remove)],
                 }],
             },
+            vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
         });
@@ -887,6 +896,7 @@ mod tests {
                     },
                 ],
             },
+            vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
         });
@@ -963,6 +973,7 @@ mod tests {
                     files: vec![older, newer],
                 }],
             },
+            vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
         });
@@ -1019,6 +1030,7 @@ mod tests {
                     files: vec![older, newer],
                 }],
             },
+            vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
         });

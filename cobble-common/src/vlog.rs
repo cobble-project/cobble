@@ -10,11 +10,51 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 const VLOG_RECORD_HEADER_SIZE: usize = 4;
 const VLOG_READ_AHEAD_BYTES: usize = 1024;
+const VLOG_POINTER_SIZE: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct VlogPointer {
     file_seq: u32,
     offset: u32,
+}
+
+impl VlogPointer {
+    pub(crate) fn new(file_seq: VlogFileSeq, offset: u32) -> Self {
+        Self { file_seq, offset }
+    }
+
+    pub(crate) fn file_seq(self) -> VlogFileSeq {
+        self.file_seq
+    }
+
+    pub(crate) fn offset(self) -> u32 {
+        self.offset
+    }
+
+    pub(crate) fn to_bytes(self) -> [u8; VLOG_POINTER_SIZE] {
+        let mut bytes = [0u8; VLOG_POINTER_SIZE];
+        bytes[0..4].copy_from_slice(&self.file_seq.to_le_bytes());
+        bytes[4..].copy_from_slice(&self.offset.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() != VLOG_POINTER_SIZE {
+            return Err(Error::IoError(format!(
+                "Invalid VLOG pointer size: expected {}, got {}",
+                VLOG_POINTER_SIZE,
+                data.len()
+            )));
+        }
+        let mut file_seq = [0u8; 4];
+        file_seq.copy_from_slice(&data[..4]);
+        let mut offset = [0u8; 4];
+        offset.copy_from_slice(&data[4..]);
+        Ok(Self {
+            file_seq: u32::from_le_bytes(file_seq),
+            offset: u32::from_le_bytes(offset),
+        })
+    }
 }
 
 pub(crate) type VlogFileSeq = u32;
@@ -106,7 +146,14 @@ impl<R: RandomAccessFile> VlogReader<R> {
 
     fn read_value(&self, offset: u32) -> Result<Bytes> {
         let offset = offset as usize;
-        let read_size = VLOG_READ_AHEAD_BYTES;
+        let file_size = self.reader.size();
+        if offset >= file_size {
+            return Err(Error::IoError(format!(
+                "VLOG offset {} out of range {}",
+                offset, file_size
+            )));
+        }
+        let read_size = (file_size - offset).min(VLOG_READ_AHEAD_BYTES);
         let chunk = self.reader.read_at(offset, read_size)?;
         if chunk.len() < VLOG_RECORD_HEADER_SIZE {
             return Err(Error::IoError(format!(
@@ -114,8 +161,8 @@ impl<R: RandomAccessFile> VlogReader<R> {
                 chunk.len()
             )));
         }
-        let mut header_slice = chunk.as_ref();
-        let value_len = header_slice.get_u32_le() as usize;
+        let mut chunk_slice = chunk.as_ref();
+        let value_len = chunk_slice.get_u32_le() as usize;
         let available = chunk.len().saturating_sub(VLOG_RECORD_HEADER_SIZE);
         if value_len <= available {
             let start = VLOG_RECORD_HEADER_SIZE;
@@ -142,34 +189,52 @@ impl<R: RandomAccessFile> VlogReader<R> {
 pub(crate) struct VlogStore {
     file_manager: Arc<FileManager>,
     buffer_size: usize,
+    value_separation_threshold: usize,
     next_file_seq: AtomicU32,
 }
 
 impl VlogStore {
-    pub(crate) fn new(file_manager: Arc<FileManager>, buffer_size: usize) -> Self {
-        Self::with_start_seq(file_manager, buffer_size, 0)
+    pub(crate) fn new(
+        file_manager: Arc<FileManager>,
+        buffer_size: usize,
+        value_separation_threshold: usize,
+    ) -> Self {
+        Self::with_start_seq(file_manager, buffer_size, value_separation_threshold, 0)
     }
 
     fn with_start_seq(
         file_manager: Arc<FileManager>,
         buffer_size: usize,
+        value_separation_threshold: usize,
         start_seq: VlogFileSeq,
     ) -> Self {
         Self {
             file_manager,
             buffer_size,
+            value_separation_threshold,
             next_file_seq: AtomicU32::new(start_seq),
         }
     }
 
-    fn allocate_file_seq(&self) -> VlogFileSeq {
+    pub(crate) fn allocate_file_seq(&self) -> VlogFileSeq {
         self.next_file_seq.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub(crate) fn should_separate(&self, value_len: usize) -> bool {
+        value_len > self.value_separation_threshold
     }
 
     pub(crate) fn create_writer(
         &self,
     ) -> Result<(VlogWriter<Box<dyn SequentialWriteFile>>, VlogEdit)> {
         let file_seq = self.allocate_file_seq();
+        self.create_writer_for_seq(file_seq)
+    }
+
+    pub(crate) fn create_writer_for_seq(
+        &self,
+        file_seq: VlogFileSeq,
+    ) -> Result<(VlogWriter<Box<dyn SequentialWriteFile>>, VlogEdit)> {
         let (file_id, writer) = self.file_manager.create_data_file()?;
         let tracked_id = TrackedFileId::new(&self.file_manager, file_id);
         let writer: Box<dyn SequentialWriteFile> = Box::new(writer);
@@ -221,7 +286,7 @@ mod tests {
         let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("vlog-test".to_string()));
         let file_manager = Arc::new(FileManager::with_defaults(fs, metrics_manager).unwrap());
-        let store = VlogStore::new(Arc::clone(&file_manager), 64);
+        let store = VlogStore::new(Arc::clone(&file_manager), 64, usize::MAX);
         let version = VlogVersion::new();
         let (mut vlog, edit) = store.create_writer().unwrap();
         let version = version.apply_edit(edit);
@@ -248,7 +313,7 @@ mod tests {
         let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("vlog-test".to_string()));
         let file_manager = Arc::new(FileManager::with_defaults(fs, metrics_manager).unwrap());
-        let store = VlogStore::with_start_seq(Arc::clone(&file_manager), 64, u32::MAX);
+        let store = VlogStore::with_start_seq(Arc::clone(&file_manager), 64, usize::MAX, u32::MAX);
         let version = VlogVersion::new();
         let (mut vlog, edit) = store.create_writer().unwrap();
         assert_eq!(vlog.file_seq(), u32::MAX);
@@ -258,5 +323,16 @@ mod tests {
         assert_eq!(vlog.file_seq(), 0);
         vlog.close().unwrap();
         let _version = version.apply_edit(edit);
+    }
+
+    #[test]
+    fn test_should_separate() {
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("vlog-test".to_string()));
+        let file_manager = Arc::new(FileManager::with_defaults(fs, metrics_manager).unwrap());
+        let store = VlogStore::new(Arc::clone(&file_manager), 64, 8);
+        assert!(!store.should_separate(8));
+        assert!(store.should_separate(9));
     }
 }

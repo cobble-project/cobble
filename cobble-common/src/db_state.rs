@@ -1,5 +1,6 @@
 use crate::lsm::LSMTreeVersion;
 use crate::memtable::{ActiveMemtable, ImmutableMemtable};
+use crate::vlog::VlogVersion;
 use arc_swap::ArcSwap;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
@@ -8,6 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 pub(crate) struct DbState {
     pub(crate) seq_id: u64,
     pub(crate) lsm_version: LSMTreeVersion,
+    pub(crate) vlog_version: VlogVersion,
     pub(crate) active: Option<Arc<Mutex<ActiveMemtable>>>,
     pub(crate) immutables: VecDeque<ImmutableMemtable>,
 }
@@ -17,12 +19,14 @@ impl DbState {
     pub(crate) fn new(
         handle: &DbStateHandle,
         lsm_version: LSMTreeVersion,
+        vlog_version: VlogVersion,
         active_memtable: Option<Arc<Mutex<ActiveMemtable>>>,
         immutable_memtable: VecDeque<ImmutableMemtable>,
     ) -> Self {
         Self {
             seq_id: handle.allocate_seq_id(),
             lsm_version,
+            vlog_version,
             active: active_memtable,
             immutables: immutable_memtable,
         }
@@ -42,6 +46,7 @@ impl DbStateHandle {
             current: ArcSwap::from_pointee(DbState {
                 seq_id: 0,
                 lsm_version: LSMTreeVersion { levels: vec![] },
+                vlog_version: VlogVersion::new(),
                 active: None,
                 immutables: VecDeque::new(),
             }),

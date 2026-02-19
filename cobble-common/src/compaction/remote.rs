@@ -718,6 +718,7 @@ mod tests {
                     },
                 ],
             },
+            vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
         });
