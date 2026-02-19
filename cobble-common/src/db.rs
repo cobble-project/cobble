@@ -4,16 +4,17 @@ use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::metrics_manager::MetricsManager;
 use crate::snapshot::{
-    SnapshotCallback, SnapshotManager, build_levels_from_manifest, decode_manifest,
-    snapshot_manifest_name,
+    SnapshotCallback, SnapshotManager, build_levels_from_manifest,
+    build_vlog_version_from_manifest, decode_manifest, snapshot_manifest_name,
 };
 use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value_masked, encode_key};
+use crate::r#type::decode_merge_separated_array;
 use crate::r#type::{Column, Key, RefColumn, RefKey, RefValue, Value, ValueType};
-use crate::vlog::{VlogStore, VlogVersion};
+use crate::vlog::{VlogPointer, VlogStore};
 use crate::write_batch::{WriteBatch, WriteOp};
 use crate::{Config, TimeProvider};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use log::info;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -148,6 +149,74 @@ pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<
             })
         })
         .collect();
+    if columns.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    Ok(Some(columns))
+}
+
+/// Resolve a single column value, handling any value log pointers using the provided callback.
+fn resolve_column_with_vlog<F>(column: Column, resolve_pointer: &mut F) -> Result<Option<Bytes>>
+where
+    F: FnMut(VlogPointer) -> Result<Bytes>,
+{
+    match column.value_type {
+        ValueType::Delete => Ok(None),
+        ValueType::Put | ValueType::Merge => Ok(Some(Bytes::from(column))),
+        ValueType::PutSeparated | ValueType::MergeSeparated => {
+            let pointer = VlogPointer::from_bytes(column.data())?;
+            Ok(Some(resolve_pointer(pointer)?))
+        }
+        ValueType::MergeSeparatedArray => {
+            let items = decode_merge_separated_array(column.data())?;
+            let mut merged = BytesMut::new();
+            for item in items {
+                let item_value = match item.value_type {
+                    ValueType::Put | ValueType::Merge => Bytes::copy_from_slice(item.data()),
+                    ValueType::PutSeparated | ValueType::MergeSeparated => {
+                        let pointer = VlogPointer::from_bytes(item.data())?;
+                        resolve_pointer(pointer)?
+                    }
+                    ValueType::Delete | ValueType::MergeSeparatedArray => {
+                        return Err(Error::IoError(format!(
+                            "Invalid value type in MergeSeparatedArray: {:?}",
+                            item.value_type
+                        )));
+                    }
+                };
+                match item.value_type {
+                    ValueType::Put | ValueType::PutSeparated => {
+                        merged.clear();
+                        merged.extend_from_slice(&item_value);
+                    }
+                    ValueType::Merge | ValueType::MergeSeparated => {
+                        merged.extend_from_slice(&item_value);
+                    }
+                    ValueType::Delete | ValueType::MergeSeparatedArray => unreachable!(),
+                }
+            }
+            Ok(Some(merged.freeze()))
+        }
+    }
+}
+
+/// Convert a Value into a Vec of optional column values, resolving any value log pointers using
+/// the provided callback.
+pub(crate) fn value_to_vec_of_columns_with_vlog<F>(
+    value: Value,
+    mut resolve_pointer: F,
+) -> Result<Option<Vec<Option<Bytes>>>>
+where
+    F: FnMut(VlogPointer) -> Result<Bytes>,
+{
+    let mut columns = Vec::with_capacity(value.columns.len());
+    for column in value.columns {
+        let resolved = match column {
+            Some(column) => resolve_column_with_vlog(column, &mut resolve_pointer)?,
+            None => None,
+        };
+        columns.push(resolved);
+    }
     if columns.iter().all(Option::is_none) {
         return Ok(None);
     }
@@ -418,10 +487,12 @@ impl Db {
         let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
         let bytes = reader.read_at(0, reader.size())?;
         let manifest = decode_manifest(bytes.as_ref())?;
+        let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
         let max_file_seq = manifest
             .levels
             .iter()
             .flat_map(|level| level.files.iter().map(|file| file.seq))
+            .chain(manifest.vlog_files.iter().map(|file| file.file_seq as u64))
             .max()
             .unwrap_or(0);
         let max_seq = manifest.seq_id;
@@ -431,7 +502,7 @@ impl Db {
         db_state.store(crate::db_state::DbState {
             seq_id: max_seq,
             lsm_version: crate::lsm::LSMTreeVersion { levels },
-            vlog_version: VlogVersion::new(),
+            vlog_version,
             active: None,
             immutables: Vec::new().into(),
         });
@@ -629,7 +700,18 @@ impl Db {
         for newer in iter {
             merged = merged.merge(newer);
         }
-        value_to_vec_of_columns(merged)
+        value_to_vec_of_columns_with_vlog(merged, |pointer| {
+            match self
+                .vlog_store
+                .read_pointer(&snapshot.vlog_version, pointer)
+            {
+                Ok(value) => Ok(value),
+                Err(vlog_err) => self
+                    .memtable_manager
+                    .read_vlog_pointer_with_snapshot(Arc::clone(&snapshot), pointer)?
+                    .ok_or(vlog_err),
+            }
+        })
     }
 
     /// Set the current time for TTL evaluation (manual time provider only).
@@ -754,7 +836,7 @@ mod tests {
             .get(b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
-        assert_eq!(value[0].as_ref().unwrap().len(), 8);
+        assert_eq!(value[0].as_ref().unwrap().as_ref(), large);
 
         cleanup_test_root(root);
     }
@@ -810,7 +892,33 @@ mod tests {
             .get(b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
-        assert_eq!(value[0].as_ref().unwrap().len(), 8);
+        assert_eq!(value[0].as_ref().unwrap().as_ref(), large);
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_get_resolves_merge_separated_array() {
+        let root = "/tmp/db_get_merge_separated_array";
+        cleanup_test_root(root);
+        let config = Config {
+            value_separation_threshold: 4,
+            ..config_with_small_memtable(root)
+        };
+        let db = Db::open(config).unwrap();
+
+        db.put(b"k1", 0, b"base-separated").unwrap();
+        db.merge(b"k1", 0, b"-suffix-separated").unwrap();
+
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        assert_eq!(
+            value[0].as_ref().unwrap().as_ref(),
+            b"base-separated-suffix-separated"
+        );
 
         cleanup_test_root(root);
     }

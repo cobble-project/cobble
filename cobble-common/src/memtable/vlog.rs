@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use crate::memtable::hash::HashMemtable;
 use crate::r#type::{RefColumn, RefValue, ValueType};
 use crate::vlog::{VlogPointer, VlogStore, VlogWriter};
-use bytes::BufMut;
+use bytes::{BufMut, Bytes};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -175,6 +175,26 @@ impl MemtableVlogRecorder {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn read_pointer(
+        &self,
+        memtable: &HashMemtable,
+        pointer: VlogPointer,
+    ) -> Result<Option<Bytes>> {
+        if pointer.file_seq() != self.file_seq {
+            return Ok(None);
+        }
+        let Some((start, len)) = self.entries.get(&pointer.offset()) else {
+            return Ok(None);
+        };
+        let payload = memtable.read_blob(*start, *len).ok_or_else(|| {
+            Error::IoError(format!(
+                "VLOG recorder payload out of range at {} (len {})",
+                start, len
+            ))
+        })?;
+        Ok(Some(Bytes::copy_from_slice(payload)))
     }
 }
 

@@ -17,7 +17,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::snapshot::SnapshotManager;
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use crate::r#type::{RefKey, RefValue};
-use crate::vlog::{VlogEdit, VlogStore};
+use crate::vlog::{VlogEdit, VlogPointer, VlogStore};
 use log::{debug, trace, warn};
 use metrics::{Counter, counter};
 
@@ -576,6 +576,30 @@ impl MemtableManager {
             }
         }
         Ok(Some(min_seq))
+    }
+
+    pub(crate) fn read_vlog_pointer_with_snapshot(
+        &self,
+        snapshot: Arc<DbState>,
+        pointer: VlogPointer,
+    ) -> Result<Option<Bytes>> {
+        if let Some(active) = &snapshot.active {
+            let active = active.lock().unwrap();
+            if let (Some(memtable), Some(recorder)) =
+                (active.memtable.as_ref(), active.vlog_recorder.as_ref())
+                && let Some(value) = recorder.read_pointer(memtable, pointer)?
+            {
+                return Ok(Some(value));
+            }
+        }
+        for immutable in snapshot.immutables.iter().rev() {
+            if let Some(recorder) = immutable.vlog_recorder.as_ref()
+                && let Some(value) = recorder.read_pointer(immutable.memtable.as_ref(), pointer)?
+            {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn flush_active(&self) -> Result<Option<u64>> {
