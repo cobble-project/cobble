@@ -6,6 +6,7 @@ use crate::file::{
     BufferedWriter, File, FileManager, SequentialWriteFile, TrackedFile, TrackedFileId,
 };
 use crate::lsm::Level;
+use crate::vlog::VlogVersion;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -21,6 +22,7 @@ pub(crate) struct DbSnapshot {
     pub levels: Vec<Level>,
     pub data_files: Vec<Arc<DataFile>>,
     pub tracked_files: Vec<Arc<TrackedFile>>,
+    pub vlog_version: VlogVersion,
     pub seq_id: u64,
     pub finished: bool,
     pub callback: Option<SnapshotCallback>,
@@ -33,6 +35,8 @@ pub(crate) struct ManifestSnapshot {
     pub(crate) id: u64,
     pub(crate) seq_id: u64,
     pub(crate) levels: Vec<ManifestLevel>,
+    #[serde(default)]
+    pub(crate) vlog_files: Vec<ManifestVlogFile>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -50,7 +54,14 @@ pub(crate) struct ManifestFile {
     pub(crate) size: usize,
     pub(crate) start_key: String,
     pub(crate) end_key: String,
-    pub(crate) path: Option<String>,
+    pub(crate) path: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ManifestVlogFile {
+    pub(crate) file_seq: u32,
+    pub(crate) file_id: u64,
+    pub(crate) path: String,
 }
 
 impl DbSnapshot {
@@ -61,6 +72,7 @@ impl DbSnapshot {
             levels: vec![],
             data_files: Vec::new(),
             tracked_files: Vec::new(),
+            vlog_version: VlogVersion::new(),
             seq_id: 0,
             finished: false,
             callback,
@@ -167,6 +179,7 @@ impl SnapshotManager {
             .iter()
             .filter_map(|file| self.file_manager.data_file_ref(file.file_id).ok())
             .collect();
+        snapshot.vlog_version = db_state.vlog_version.clone();
         state.completed.push(id);
         true
     }
@@ -337,9 +350,23 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                         size: file.size,
                         start_key: to_hex(&file.start_key),
                         end_key: to_hex(&file.end_key),
-                        path: file_manager.get_data_file_full_path(file.file_id),
+                        path: file_manager
+                            .get_data_file_full_path(file.file_id)
+                            .expect("Unknown file ID"),
                     })
                     .collect(),
+            })
+            .collect(),
+        vlog_files: snapshot
+            .vlog_version
+            .files()
+            .into_iter()
+            .map(|(file_seq, tracked_id)| ManifestVlogFile {
+                file_seq,
+                file_id: tracked_id.file_id(),
+                path: file_manager
+                    .get_data_file_full_path(tracked_id.file_id())
+                    .expect("Unknown file ID"),
             })
             .collect(),
     };
@@ -375,14 +402,11 @@ pub(crate) fn build_levels_from_manifest(
             let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
             let start_key = from_hex(&file.start_key)?;
             let end_key = from_hex(&file.end_key)?;
-            let path = file
-                .path
-                .unwrap_or_else(|| format!("data/{}.{}", file.file_id, file_type.as_str()));
             let tracked_id = if read_only {
-                file_manager.register_data_file_readonly(file.file_id, path)?;
+                file_manager.register_data_file_readonly(file.file_id, file.path)?;
                 TrackedFileId::detached(file.file_id)
             } else {
-                file_manager.register_data_file(file.file_id, path)?;
+                file_manager.register_data_file(file.file_id, file.path)?;
                 TrackedFileId::new(file_manager, file.file_id)
             };
             files.push(Arc::new(DataFile {
@@ -403,6 +427,25 @@ pub(crate) fn build_levels_from_manifest(
         });
     }
     Ok(levels)
+}
+
+pub(crate) fn build_vlog_version_from_manifest(
+    file_manager: &Arc<FileManager>,
+    manifest: &ManifestSnapshot,
+    read_only: bool,
+) -> Result<VlogVersion> {
+    let mut files = Vec::with_capacity(manifest.vlog_files.len());
+    for vlog_file in &manifest.vlog_files {
+        let tracked_id = if read_only {
+            file_manager.register_data_file_readonly(vlog_file.file_id, vlog_file.path.clone())?;
+            TrackedFileId::detached(vlog_file.file_id)
+        } else {
+            file_manager.register_data_file(vlog_file.file_id, vlog_file.path.clone())?;
+            TrackedFileId::new(file_manager, vlog_file.file_id)
+        };
+        files.push((vlog_file.file_seq, tracked_id));
+    }
+    Ok(VlogVersion::from_files(files))
 }
 
 pub(crate) fn from_hex(hex: &str) -> Result<Vec<u8>> {

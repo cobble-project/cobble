@@ -1,16 +1,19 @@
-use crate::db::value_to_vec_of_columns;
+use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_state::DbStateHandle;
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager};
 use crate::lsm::{LSMTree, LSMTreeVersion};
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
-use crate::snapshot::{build_levels_from_manifest, decode_manifest, snapshot_manifest_name};
+use crate::snapshot::{
+    build_levels_from_manifest, build_vlog_version_from_manifest, decode_manifest,
+    snapshot_manifest_name,
+};
 use crate::sst::block_cache::{BlockCache, new_block_cache};
 use crate::sst::row_codec::encode_key;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::r#type::{Key, Value};
-use crate::vlog::VlogVersion;
+use crate::vlog::VlogStore;
 use crate::{Config, ReadOptions};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -19,6 +22,7 @@ use std::sync::Arc;
 pub struct ReadOnlyDb {
     file_manager: Arc<FileManager>,
     lsm_tree: Arc<LSMTree>,
+    vlog_store: Arc<VlogStore>,
     num_columns: usize,
     ttl_provider: Arc<TTLProvider>,
     metrics_manager: Arc<MetricsManager>,
@@ -73,13 +77,20 @@ impl ReadOnlyDb {
         let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
         let bytes = reader.read_at(0, reader.size())?;
         let manifest = decode_manifest(bytes.as_ref())?;
+        let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let levels = build_levels_from_manifest(&file_manager, manifest, true)?;
+        let sst_options = crate::compaction::build_sst_writer_options(&config, 0);
+        let vlog_store = Arc::new(VlogStore::new(
+            Arc::clone(&file_manager),
+            sst_options.buffer_size,
+            config.value_separation_threshold,
+        ));
 
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
             seq_id: 0,
             lsm_version: LSMTreeVersion { levels },
-            vlog_version: VlogVersion::new(),
+            vlog_version,
             active: None,
             immutables: Vec::new().into(),
         });
@@ -97,6 +108,7 @@ impl ReadOnlyDb {
         Ok(Self {
             file_manager,
             lsm_tree,
+            vlog_store,
             num_columns: config.num_columns,
             ttl_provider,
             metrics_manager,
@@ -149,6 +161,10 @@ impl ReadOnlyDb {
         for newer in iter {
             merged = merged.merge(newer);
         }
-        value_to_vec_of_columns(merged)
+        let snapshot = self.lsm_tree.db_state().load();
+        value_to_vec_of_columns_with_vlog(merged, |pointer| {
+            self.vlog_store
+                .read_pointer(&snapshot.vlog_version, pointer)
+        })
     }
 }

@@ -71,6 +71,18 @@ impl VlogVersion {
         Self::default()
     }
 
+    pub(crate) fn from_files(file_ids: Vec<(VlogFileSeq, Arc<TrackedFileId>)>) -> Self {
+        let file_ids = file_ids.into_iter().collect();
+        Self { file_ids }
+    }
+
+    pub(crate) fn files(&self) -> Vec<(VlogFileSeq, Arc<TrackedFileId>)> {
+        self.file_ids
+            .iter()
+            .map(|(seq, tracked_id)| (*seq, Arc::clone(tracked_id)))
+            .collect()
+    }
+
     pub(crate) fn apply_edit(&self, edit: VlogEdit) -> Self {
         let mut file_ids = self.file_ids.clone();
         for file_seq in edit.removed_files {

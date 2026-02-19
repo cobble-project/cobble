@@ -459,6 +459,43 @@ fn test_db_snapshot_read_only_get() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_db_snapshot_read_only_get_with_separated_value() {
+    let root = "/tmp/db_snapshot_readonly_separated";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        value_separation_threshold: 8,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config.clone()).unwrap();
+    let large = b"value-larger-than-threshold";
+
+    let mut batch = WriteBatch::new();
+    batch.put(b"k1", 0, large.to_vec());
+    db.write_batch(batch).unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    db.close().unwrap();
+
+    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    let value = ro
+        .get(b"k1", &ReadOptions::default())
+        .unwrap()
+        .expect("value present");
+    let col = value[0].as_ref().unwrap();
+    assert_eq!(col.as_ref(), large);
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_open_from_snapshot_allows_writes() {
     let root = "/tmp/db_snapshot_write";
     cleanup_test_root(root);
