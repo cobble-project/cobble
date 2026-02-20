@@ -55,6 +55,7 @@ pub(crate) struct ManifestFile {
     pub(crate) start_key: String,
     pub(crate) end_key: String,
     pub(crate) path: String,
+    pub(crate) has_separated_values: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -62,6 +63,7 @@ pub(crate) struct ManifestVlogFile {
     pub(crate) file_seq: u32,
     pub(crate) file_id: u64,
     pub(crate) path: String,
+    pub(crate) valid_entries: u64,
 }
 
 impl DbSnapshot {
@@ -353,20 +355,22 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                         path: file_manager
                             .get_data_file_full_path(file.file_id)
                             .expect("Unknown file ID"),
+                        has_separated_values: file.has_separated_values,
                     })
                     .collect(),
             })
             .collect(),
         vlog_files: snapshot
             .vlog_version
-            .files()
+            .files_with_entries()
             .into_iter()
-            .map(|(file_seq, tracked_id)| ManifestVlogFile {
+            .map(|(file_seq, tracked_id, valid_entries)| ManifestVlogFile {
                 file_seq,
                 file_id: tracked_id.file_id(),
                 path: file_manager
                     .get_data_file_full_path(tracked_id.file_id())
                     .expect("Unknown file ID"),
+                valid_entries,
             })
             .collect(),
     };
@@ -417,6 +421,7 @@ pub(crate) fn build_levels_from_manifest(
                 tracked_id,
                 seq: file.seq,
                 size: file.size,
+                has_separated_values: file.has_separated_values,
                 meta_bytes: Default::default(),
             }));
         }
@@ -443,9 +448,9 @@ pub(crate) fn build_vlog_version_from_manifest(
             file_manager.register_data_file(vlog_file.file_id, vlog_file.path.clone())?;
             TrackedFileId::new(file_manager, vlog_file.file_id)
         };
-        files.push((vlog_file.file_seq, tracked_id));
+        files.push((vlog_file.file_seq, tracked_id, vlog_file.valid_entries));
     }
-    Ok(VlogVersion::from_files(files))
+    Ok(VlogVersion::from_files_with_entries(files))
 }
 
 pub(crate) fn from_hex(hex: &str) -> Result<Vec<u8>> {

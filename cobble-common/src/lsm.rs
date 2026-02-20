@@ -178,8 +178,16 @@ impl LSMTree {
     }
 
     pub(crate) fn apply_edit(&self, edit: VersionEdit) {
+        self.apply_edit_with_vlog(edit, None);
+    }
+
+    pub(crate) fn apply_edit_with_vlog(&self, edit: VersionEdit, vlog_edit: Option<VlogEdit>) {
         let mut state = self.state.lock().unwrap();
-        self.apply_edit_locked(&mut state, edit, |_db_state| {});
+        self.apply_edit_locked(&mut state, edit, move |db_state| {
+            if let Some(vlog_edit) = vlog_edit {
+                db_state.vlog_version = db_state.vlog_version.apply_edit(vlog_edit);
+            }
+        });
     }
 
     fn apply_edit_locked(
@@ -657,6 +665,7 @@ mod tests {
                 tracked_id: TrackedFileId::detached(id),
                 seq: 0,
                 size: 0, // Test file, size doesn't matter
+                has_separated_values: false,
                 meta_bytes: Default::default(),
             })
         }
@@ -674,6 +683,7 @@ mod tests {
                 tracked_id: TrackedFileId::detached(id),
                 seq: 0,
                 size,
+                has_separated_values: false,
                 meta_bytes: Default::default(),
             })
         }
@@ -712,6 +722,7 @@ mod tests {
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq,
             size: file_size,
+            has_separated_values: false,
             meta_bytes: Default::default(),
         };
         data_file.set_meta_bytes(footer_bytes);

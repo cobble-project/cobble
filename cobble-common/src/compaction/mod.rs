@@ -71,10 +71,10 @@ impl LocalCompactionWorker {
 
     fn submit(&self, task: CompactionTask) -> tokio::task::JoinHandle<Result<CompactionResult>> {
         let lsm_tree = self.lsm_tree.clone();
-        let on_complete = Arc::new(move |edit: VersionEdit| {
+        let on_complete = Arc::new(move |edit: VersionEdit, vlog_edit| {
             if let Some(lsm_tree) = lsm_tree.upgrade() {
                 lsm_tree.on_compaction_complete();
-                lsm_tree.apply_edit(edit);
+                lsm_tree.apply_edit_with_vlog(edit, vlog_edit);
             }
         });
         let executor = self.executor.lock().unwrap();

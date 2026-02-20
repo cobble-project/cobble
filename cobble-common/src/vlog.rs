@@ -3,8 +3,11 @@
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, RandomAccessFile, SequentialWriteFile};
 use crate::file::{FileManager, TrackedFileId};
+use crate::r#type::{Column, ValueType, decode_merge_separated_array};
 use bytes::{Buf, Bytes, BytesMut};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -59,11 +62,17 @@ impl VlogPointer {
 
 pub(crate) type VlogFileSeq = u32;
 
+#[derive(Clone)]
+struct VlogTrackedFile {
+    tracked_id: Arc<TrackedFileId>,
+    valid_entries: u64,
+}
+
 /// Represents the current version of the value log, tracking the mapping of file sequences to
 /// tracked file ids.
 #[derive(Clone, Default)]
 pub(crate) struct VlogVersion {
-    file_ids: HashMap<VlogFileSeq, Arc<TrackedFileId>>,
+    files: HashMap<VlogFileSeq, VlogTrackedFile>,
 }
 
 impl VlogVersion {
@@ -71,39 +80,235 @@ impl VlogVersion {
         Self::default()
     }
 
-    pub(crate) fn from_files(file_ids: Vec<(VlogFileSeq, Arc<TrackedFileId>)>) -> Self {
-        let file_ids = file_ids.into_iter().collect();
-        Self { file_ids }
+    pub(crate) fn from_files_with_entries(
+        files: Vec<(VlogFileSeq, Arc<TrackedFileId>, u64)>,
+    ) -> Self {
+        Self {
+            files: files
+                .into_iter()
+                .map(|(seq, tracked_id, valid_entries)| {
+                    (
+                        seq,
+                        VlogTrackedFile {
+                            tracked_id,
+                            valid_entries,
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 
-    pub(crate) fn files(&self) -> Vec<(VlogFileSeq, Arc<TrackedFileId>)> {
-        self.file_ids
+    pub(crate) fn files_with_entries(&self) -> Vec<(VlogFileSeq, Arc<TrackedFileId>, u64)> {
+        self.files
             .iter()
-            .map(|(seq, tracked_id)| (*seq, Arc::clone(tracked_id)))
+            .map(|(seq, tracked)| (*seq, Arc::clone(&tracked.tracked_id), tracked.valid_entries))
             .collect()
     }
 
     pub(crate) fn apply_edit(&self, edit: VlogEdit) -> Self {
-        let mut file_ids = self.file_ids.clone();
+        let mut files = self.files.clone();
         for file_seq in edit.removed_files {
-            file_ids.remove(&file_seq);
+            files.remove(&file_seq);
         }
-        for (file_seq, tracked_id) in edit.new_files {
-            file_ids.insert(file_seq, tracked_id);
+        for (file_seq, tracked_id, initial_entries) in edit.new_files {
+            files.insert(
+                file_seq,
+                VlogTrackedFile {
+                    tracked_id,
+                    valid_entries: initial_entries,
+                },
+            );
         }
-        Self { file_ids }
+        for (file_seq, delta) in edit.entry_deltas {
+            let mut remove_file = false;
+            {
+                let Some(file) = files.get_mut(&file_seq) else {
+                    continue;
+                };
+                if delta.is_negative() {
+                    let removed = delta.unsigned_abs();
+                    if removed >= file.valid_entries {
+                        remove_file = true;
+                    } else {
+                        file.valid_entries -= removed;
+                    }
+                } else {
+                    file.valid_entries = file
+                        .valid_entries
+                        .checked_add(delta as u64)
+                        .expect("VLOG valid entry count overflow");
+                }
+            }
+            if remove_file {
+                files.remove(&file_seq);
+            }
+        }
+        Self { files }
     }
 
     fn file_id(&self, file_seq: VlogFileSeq) -> Option<Arc<TrackedFileId>> {
-        self.file_ids.get(&file_seq).map(Arc::clone)
+        self.files
+            .get(&file_seq)
+            .map(|tracked| Arc::clone(&tracked.tracked_id))
     }
 }
 
 /// Represents an edit to the value log version, including new files added and old files removed.
 #[derive(Clone, Default)]
 pub(crate) struct VlogEdit {
-    new_files: Vec<(VlogFileSeq, Arc<TrackedFileId>)>,
+    new_files: Vec<(VlogFileSeq, Arc<TrackedFileId>, u64)>,
     removed_files: Vec<VlogFileSeq>,
+    entry_deltas: HashMap<VlogFileSeq, i64>,
+}
+
+impl VlogEdit {
+    pub(crate) fn add_entry_delta(&mut self, file_seq: VlogFileSeq, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        *self.entry_deltas.entry(file_seq).or_insert(0) += delta;
+        if self.entry_deltas.get(&file_seq).copied() == Some(0) {
+            self.entry_deltas.remove(&file_seq);
+        }
+    }
+
+    pub(crate) fn entry_deltas(&self) -> Vec<(VlogFileSeq, i64)> {
+        self.entry_deltas
+            .iter()
+            .map(|(file_seq, delta)| (*file_seq, *delta))
+            .collect()
+    }
+
+    pub(crate) fn from_entry_deltas(entry_deltas: Vec<(VlogFileSeq, i64)>) -> Self {
+        let mut edit = Self::default();
+        for (file_seq, delta) in entry_deltas {
+            edit.add_entry_delta(file_seq, delta);
+        }
+        edit
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.new_files.is_empty() && self.removed_files.is_empty() && self.entry_deltas.is_empty()
+    }
+}
+
+pub(crate) type VlogMergeCollectorHandle = Rc<RefCell<VlogMergeCollector>>;
+pub(crate) type VlogMergeCallback = Box<dyn FnMut(Option<&Column>, Option<&Column>)>;
+
+#[derive(Default)]
+pub(crate) struct VlogMergeCollector {
+    has_separated_values: bool,
+    removed_entry_deltas: HashMap<VlogFileSeq, i64>,
+    error: Option<Error>,
+    track_removed_entries: bool,
+}
+
+impl VlogMergeCollector {
+    pub(crate) fn shared(track_removed_entries: bool) -> VlogMergeCollectorHandle {
+        Rc::new(RefCell::new(Self {
+            track_removed_entries,
+            ..Self::default()
+        }))
+    }
+
+    pub(crate) fn callback(handle: &VlogMergeCollectorHandle) -> VlogMergeCallback {
+        let handle = Rc::clone(handle);
+        Box::new(move |old_column, new_column| {
+            handle.borrow_mut().on_merge(old_column, new_column);
+        })
+    }
+
+    pub(crate) fn has_separated_values(&self) -> bool {
+        self.has_separated_values
+    }
+
+    pub(crate) fn reset_has_separated_values(&mut self) {
+        self.has_separated_values = false;
+    }
+
+    pub(crate) fn check_error(&mut self) -> Result<()> {
+        if let Some(err) = self.error.take() {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn removed_entry_deltas(&self) -> Vec<(VlogFileSeq, i64)> {
+        self.removed_entry_deltas
+            .iter()
+            .map(|(file_seq, delta)| (*file_seq, *delta))
+            .collect()
+    }
+
+    fn update_entry_delta(&mut self, file_seq: VlogFileSeq, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        *self.removed_entry_deltas.entry(file_seq).or_insert(0) += delta;
+        if self.removed_entry_deltas.get(&file_seq).copied() == Some(0) {
+            self.removed_entry_deltas.remove(&file_seq);
+        }
+    }
+
+    fn merge_result_has_separated(
+        old_column: Option<&Column>,
+        new_column: Option<&Column>,
+    ) -> bool {
+        let old_uses_separated =
+            old_column.is_some_and(|col| col.value_type().uses_separated_storage());
+        let new_uses_separated =
+            new_column.is_some_and(|col| col.value_type().uses_separated_storage());
+        let new_is_terminal = new_column.is_some_and(|col| col.value_type().is_terminal());
+        let old_is_delete = old_column.is_some_and(|col| *col.value_type() == ValueType::Delete);
+        match (old_column, new_column) {
+            (None, None) => false,
+            (Some(_), None) => old_uses_separated,
+            (None, Some(_)) => new_uses_separated,
+            (Some(_), Some(_)) if new_is_terminal => new_uses_separated,
+            (Some(_), Some(_)) => !old_is_delete && (old_uses_separated || new_uses_separated),
+        }
+    }
+
+    fn collect_removed_entries_from_column(&mut self, column: &Column) -> Result<()> {
+        match column.value_type() {
+            ValueType::PutSeparated | ValueType::MergeSeparated => {
+                let pointer = VlogPointer::from_bytes(column.data())?;
+                self.update_entry_delta(pointer.file_seq(), -1);
+            }
+            ValueType::MergeSeparatedArray => {
+                for item in decode_merge_separated_array(column.data())? {
+                    if item.value_type == ValueType::PutSeparated
+                        || item.value_type == ValueType::MergeSeparated
+                    {
+                        let pointer = VlogPointer::from_bytes(item.data())?;
+                        self.update_entry_delta(pointer.file_seq(), -1);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn on_merge(&mut self, old_column: Option<&Column>, new_column: Option<&Column>) {
+        if self.error.is_some() {
+            return;
+        }
+        if !self.has_separated_values && Self::merge_result_has_separated(old_column, new_column) {
+            self.has_separated_values = true;
+        }
+        if !self.track_removed_entries {
+            return;
+        }
+        if new_column.is_some_and(|col| col.value_type().is_terminal())
+            && let Some(old_column) = old_column
+            && let Err(err) = self.collect_removed_entries_from_column(old_column)
+        {
+            self.error = Some(err);
+        }
+    }
 }
 
 /// A simple value log writer that appends values to a file and returns pointers for retrieval.
@@ -251,8 +456,9 @@ impl VlogStore {
         let tracked_id = TrackedFileId::new(&self.file_manager, file_id);
         let writer: Box<dyn SequentialWriteFile> = Box::new(writer);
         let edit = VlogEdit {
-            new_files: vec![(file_seq, tracked_id)],
+            new_files: vec![(file_seq, tracked_id, 0)],
             removed_files: Vec::new(),
+            entry_deltas: HashMap::new(),
         };
         Ok((VlogWriter::new(file_seq, writer, self.buffer_size), edit))
     }
@@ -280,7 +486,7 @@ impl VlogStore {
 mod tests {
     use super::*;
     use crate::file::FileManager;
-    use crate::file::FileSystemRegistry;
+    use crate::file::{FileSystemRegistry, TrackedFileId};
     use crate::metrics_manager::MetricsManager;
     use std::sync::Arc;
 
@@ -346,5 +552,15 @@ mod tests {
         let store = VlogStore::new(Arc::clone(&file_manager), 64, 8);
         assert!(!store.should_separate(8));
         assert!(store.should_separate(9));
+    }
+
+    #[test]
+    fn test_vlog_version_removes_zero_valid_entry_file() {
+        let version =
+            VlogVersion::from_files_with_entries(vec![(7, TrackedFileId::detached(42), 1)]);
+        let mut edit = VlogEdit::default();
+        edit.add_entry_delta(7, -1);
+        let next = version.apply_edit(edit);
+        assert!(next.file_id(7).is_none());
     }
 }

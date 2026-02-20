@@ -8,8 +8,15 @@ use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::sst::row_codec::{decode_value, encode_value, value_expired_at, value_is_terminal};
 use crate::ttl::TTLProvider;
+use crate::r#type::Column;
 use bytes::Bytes;
 use std::sync::Arc;
+
+/// Callback type for column merges. The callback is invoked for every pair of merged columns,
+/// with the older column (if any) and the newer column (if any). And also the oldest first column
+/// is guaranteed to be called first as well, as callback(None, oldest_column) before any
+/// newer column is merged.
+type MergeCallback = Box<dyn FnMut(Option<&Column>, Option<&Column>)>;
 
 /// A deduplicating iterator that wraps another iterator and merges
 /// values with the same key.
@@ -33,6 +40,10 @@ pub struct DeduplicatingIterator<I> {
     current_value: Option<Bytes>,
     /// TTL provider to evaluate expiration.
     ttl_provider: Arc<TTLProvider>,
+    /// Callback invoked for every merged column pair (older, newer).
+    on_merge: Option<MergeCallback>,
+    /// Whether to allow terminal fast-path that skips collecting older versions.
+    allow_terminal_shortcut: bool,
 }
 
 /// Collects a value slice into the values vector or selects it as the final value.
@@ -41,6 +52,7 @@ fn collect_value(
     value_slice: &[u8],
     num_columns: usize,
     ttl_provider: &TTLProvider,
+    allow_terminal_shortcut: bool,
     values: &mut Vec<Bytes>,
     selected_value: &mut Option<Bytes>,
     stop_collecting: &mut bool,
@@ -50,7 +62,7 @@ fn collect_value(
         return Ok(());
     }
     let is_terminal = value_is_terminal(value_slice, num_columns)?;
-    if selected_value.is_none() && values.is_empty() && is_terminal {
+    if allow_terminal_shortcut && selected_value.is_none() && values.is_empty() && is_terminal {
         *selected_value = Some(Bytes::copy_from_slice(value_slice));
         *stop_collecting = true;
         return Ok(());
@@ -68,13 +80,21 @@ impl<I> DeduplicatingIterator<I> {
     /// # Arguments
     /// * `inner` - The underlying iterator to wrap.
     /// * `num_columns` - Number of columns in the value schema.
-    pub fn new(inner: I, num_columns: usize, ttl_provider: Arc<TTLProvider>) -> Self {
+    pub fn new(
+        inner: I,
+        num_columns: usize,
+        ttl_provider: Arc<TTLProvider>,
+        on_merge: Option<MergeCallback>,
+    ) -> Self {
+        let allow_terminal_shortcut = on_merge.is_none();
         Self {
             inner,
             num_columns,
             current_key: None,
             current_value: None,
             ttl_provider,
+            on_merge,
+            allow_terminal_shortcut,
         }
     }
 
@@ -90,6 +110,7 @@ impl<I> DeduplicatingIterator<I> {
     where
         I: KvIterator<'a>,
     {
+        let allow_terminal_shortcut = self.allow_terminal_shortcut;
         loop {
             if !self.inner.valid() {
                 self.current_key = None;
@@ -115,6 +136,7 @@ impl<I> DeduplicatingIterator<I> {
                 value_slice,
                 self.num_columns,
                 &self.ttl_provider,
+                allow_terminal_shortcut,
                 &mut values,
                 &mut selected_value,
                 &mut stop_collecting,
@@ -130,7 +152,7 @@ impl<I> DeduplicatingIterator<I> {
                     // Different key, stop collecting
                     break;
                 }
-                if stop_collecting {
+                if stop_collecting && allow_terminal_shortcut {
                     continue;
                 }
 
@@ -140,6 +162,7 @@ impl<I> DeduplicatingIterator<I> {
                         next_value_bytes,
                         self.num_columns,
                         &self.ttl_provider,
+                        allow_terminal_shortcut,
                         &mut values,
                         &mut selected_value,
                         &mut stop_collecting,
@@ -163,9 +186,24 @@ impl<I> DeduplicatingIterator<I> {
             let mut values_iter = values.into_iter().rev();
             let first = values_iter.next().expect("values is non-empty");
             let mut merged_value = decode_value(first.as_ref(), self.num_columns)?;
-            for newer_value in values_iter {
-                let newer_value = decode_value(newer_value.as_ref(), self.num_columns)?;
-                merged_value = merged_value.merge(newer_value);
+
+            if let Some(callback) = self.on_merge.as_deref_mut() {
+                // The first column is invoked with callback(None, first_column) to indicate it's the oldest column being merged.
+                for column in merged_value.columns() {
+                    if column.is_some() {
+                        callback(None, column.as_ref());
+                    }
+                }
+                // Then for each newer value, we invoke the callback for each column pair (older, newer) before merging.
+                for newer_value in values_iter {
+                    let newer_value = decode_value(newer_value.as_ref(), self.num_columns)?;
+                    merged_value = merged_value.merge_with_callback(newer_value, callback);
+                }
+            } else {
+                for newer_value in values_iter {
+                    let newer_value = decode_value(newer_value.as_ref(), self.num_columns)?;
+                    merged_value = merged_value.merge(newer_value);
+                }
             }
 
             // Encode the merged value
@@ -276,7 +314,7 @@ mod tests {
 
         let iter = MockIterator::new(entries);
         let mut dedup =
-            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()), None);
         dedup.seek_to_first().unwrap();
 
         let mut results = vec![];
@@ -324,7 +362,7 @@ mod tests {
 
         let iter = MockIterator::new(entries);
         let mut dedup =
-            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()), None);
         dedup.seek_to_first().unwrap();
 
         let mut results = vec![];
@@ -340,6 +378,45 @@ mod tests {
         // The newer "new" value merged with older "old" - since newer is Put, it replaces
         assert_eq!(results[0].1.columns()[0].as_ref().unwrap().data(), b"new");
         assert_eq!(results[1].0.as_ref(), b"b");
+    }
+
+    #[test]
+    fn test_deduplicating_merge_callback() {
+        let num_columns = 1;
+        let entries: Vec<(&[u8], Vec<u8>)> = vec![
+            (
+                b"a",
+                make_value_bytes(
+                    vec![Some(Column::new(ValueType::Put, b"new".to_vec()))],
+                    num_columns,
+                ),
+            ),
+            (
+                b"a",
+                make_value_bytes(
+                    vec![Some(Column::new(ValueType::PutSeparated, b"old".to_vec()))],
+                    num_columns,
+                ),
+            ),
+        ];
+        let iter = MockIterator::new(entries);
+        let overlapped = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let overlapped_for_callback = std::rc::Rc::clone(&overlapped);
+        let mut dedup = DeduplicatingIterator::new(
+            iter,
+            num_columns,
+            Arc::new(TTLProvider::disabled()),
+            Some(Box::new(move |old_column, _new_column| {
+                if let Some(old_column) = old_column {
+                    overlapped_for_callback
+                        .borrow_mut()
+                        .push(old_column.value_type);
+                }
+            })),
+        );
+        dedup.seek_to_first().unwrap();
+        assert!(dedup.valid());
+        assert_eq!(&*overlapped.borrow(), &[ValueType::PutSeparated]);
     }
 
     #[test]
@@ -366,7 +443,7 @@ mod tests {
 
         let iter = MockIterator::new(entries);
         let mut dedup =
-            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()), None);
         dedup.seek_to_first().unwrap();
 
         let (k, v) = dedup.current().unwrap().unwrap();
@@ -419,7 +496,7 @@ mod tests {
 
         let iter = MockIterator::new(entries);
         let mut dedup =
-            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()), None);
         dedup.seek_to_first().unwrap();
 
         let (k, v) = dedup.current().unwrap().unwrap();
@@ -456,7 +533,7 @@ mod tests {
 
         let iter = MockIterator::new(entries);
         let mut dedup =
-            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()), None);
         dedup.seek_to_first().unwrap();
 
         let (k, v) = dedup.current().unwrap().unwrap();
@@ -473,7 +550,8 @@ mod tests {
     #[test]
     fn test_deduplicating_empty() {
         let iter = MockIterator::new(Vec::<(&[u8], &[u8])>::new());
-        let mut dedup = DeduplicatingIterator::new(iter, 1, Arc::new(TTLProvider::disabled()));
+        let mut dedup =
+            DeduplicatingIterator::new(iter, 1, Arc::new(TTLProvider::disabled()), None);
         dedup.seek_to_first().unwrap();
 
         assert!(!dedup.valid());
@@ -509,7 +587,7 @@ mod tests {
 
         let iter = MockIterator::new(entries);
         let mut dedup =
-            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()), None);
 
         dedup.seek(b"b").unwrap();
         assert!(dedup.valid());
@@ -542,7 +620,7 @@ mod tests {
 
         let iter = MockIterator::new(entries);
         let mut dedup =
-            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()));
+            DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()), None);
         dedup.seek_to_first().unwrap();
 
         let (k, v) = dedup.current().unwrap().unwrap();
@@ -615,7 +693,7 @@ mod tests {
         ];
 
         let iter = MockIterator::new(entries);
-        let mut dedup = DeduplicatingIterator::new(iter, num_columns, ttl_provider.clone());
+        let mut dedup = DeduplicatingIterator::new(iter, num_columns, ttl_provider.clone(), None);
         dedup.seek_to_first().unwrap();
 
         let mut results = vec![];
@@ -684,6 +762,7 @@ mod tests {
             merging_iter,
             num_columns,
             Arc::new(TTLProvider::disabled()),
+            None,
         );
         dedup.seek_to_first().unwrap();
 

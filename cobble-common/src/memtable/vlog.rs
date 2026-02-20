@@ -121,6 +121,10 @@ impl MemtableVlogRecorder {
         !self.entries.is_empty()
     }
 
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
     pub(crate) fn file_seq(&self) -> u32 {
         self.file_seq
     }

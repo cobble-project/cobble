@@ -542,6 +542,7 @@ mod tests {
             tracked_id: TrackedFileId::detached(id),
             seq: 0,
             size,
+            has_separated_values: false,
             meta_bytes: Default::default(),
         })
     }

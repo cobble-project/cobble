@@ -46,6 +46,8 @@ pub struct DataFile {
     pub seq: u64,
     /// Size of the file in bytes.
     pub size: usize,
+    /// Whether this file contains separated value columns/pointers.
+    pub has_separated_values: bool,
     /// Optional cached meta bytes to avoid re-reading from disk.
     pub meta_bytes: OnceLock<Bytes>,
 }
@@ -57,5 +59,9 @@ impl DataFile {
 
     pub fn set_meta_bytes(&self, bytes: Bytes) {
         let _ = self.meta_bytes.set(bytes);
+    }
+
+    pub fn has_separated_values(&self) -> bool {
+        self.has_separated_values
     }
 }

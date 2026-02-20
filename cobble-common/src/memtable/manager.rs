@@ -17,7 +17,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::snapshot::SnapshotManager;
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use crate::r#type::{RefKey, RefValue};
-use crate::vlog::{VlogEdit, VlogPointer, VlogStore};
+use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
 use log::{debug, trace, warn};
 use metrics::{Counter, counter};
 
@@ -774,28 +774,47 @@ fn flush_memtable(
     if let Some(recorder) = vlog_recorder
         && recorder.has_entries()
     {
-        let (mut writer, edit) = vlog_store.create_writer_for_seq(recorder.file_seq())?;
+        let (mut writer, mut edit) = vlog_store.create_writer_for_seq(recorder.file_seq())?;
         recorder.flush_to_writer(memtable.as_ref(), &mut writer)?;
+        edit.add_entry_delta(recorder.file_seq(), recorder.entry_count() as i64);
         writer.close()?;
         vlog_edit = Some(edit);
     }
     // Step 2: Create a new data file and write all entries from the memtable into it using a deduplicating iterator.
     let (file_id, writer) = file_manager.create_data_file()?;
     let mut builder = (file_builder_factory)(Box::new(writer));
+    // Try to handle merges during flush if vlog edits are present
+    let merge_collector = vlog_edit.as_ref().map(|_| VlogMergeCollector::shared(true));
+    let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
     let mut dedup_iter = DeduplicatingIterator::new(
         PrimedIterator::new(memtable.iter()),
         num_columns,
         ttl_provider,
+        merge_callback,
     );
     dedup_iter.seek_to_first()?;
     while dedup_iter.valid() {
+        if let Some(collector) = merge_collector.as_ref() {
+            collector.borrow_mut().check_error()?;
+        }
         if let (Some(key), Some(value)) = (dedup_iter.key_slice()?, dedup_iter.value_slice()?) {
             builder.add(key, value)?;
         }
         dedup_iter.next()?;
     }
+    if let Some(collector) = merge_collector.as_ref() {
+        collector.borrow_mut().check_error()?;
+    }
+    if let (Some(edit), Some(collector)) = (&mut vlog_edit, merge_collector.as_ref()) {
+        for (file_seq, delta) in collector.borrow().removed_entry_deltas() {
+            edit.add_entry_delta(file_seq, delta);
+        }
+    }
     // Step 3: Finish the data file and construct the resulting `MemtableFlushResult`.
     let (start_key, end_key, file_size, footer_bytes) = builder.finish()?;
+    let has_separated_values = merge_collector
+        .as_ref()
+        .is_some_and(|collector| collector.borrow().has_separated_values());
     let data_file = DataFile {
         file_type: DataFileType::SSTable,
         start_key,
@@ -804,6 +823,7 @@ fn flush_memtable(
         tracked_id: TrackedFileId::new(&file_manager, file_id),
         size: file_size,
         seq,
+        has_separated_values,
         meta_bytes: Default::default(),
     };
     data_file.set_meta_bytes(footer_bytes);

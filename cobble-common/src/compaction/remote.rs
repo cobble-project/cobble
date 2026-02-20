@@ -14,6 +14,7 @@ use crate::sst::SSTWriterOptions;
 use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::util::init_logging;
+use crate::vlog::VlogEdit;
 use bytes::Bytes;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,7 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 const REMOTE_FILE_ID_START: u64 = u64::MAX / 2;
+type RemoteCompactionOutput = (Vec<RemoteDataFile>, Vec<(u32, i64)>);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RemoteTtlConfig {
@@ -84,6 +86,8 @@ struct RemoteDataFile {
     end_key: Vec<u8>,
     seq: u64,
     size: usize,
+    #[serde(default)]
+    has_separated_values: bool,
     meta_bytes: Option<Vec<u8>>,
 }
 
@@ -97,6 +101,7 @@ impl RemoteDataFile {
             end_key: file.end_key.clone(),
             seq: file.seq,
             size: file.size,
+            has_separated_values: file.has_separated_values,
             meta_bytes: file.meta_bytes().map(|bytes| bytes.to_vec()),
         }
     }
@@ -134,6 +139,7 @@ impl RemoteDataFile {
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq: self.seq,
             size: self.size,
+            has_separated_values: self.has_separated_values,
             meta_bytes: Default::default(),
         };
         if let Some(bytes) = self.meta_bytes.map(Bytes::from) {
@@ -200,13 +206,16 @@ impl fmt::Display for RemoteCompactionRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RemoteCompactionResponse {
     output_files: Vec<RemoteDataFile>,
+    #[serde(default)]
+    vlog_entry_deltas: Vec<(u32, i64)>,
     error: Option<String>,
 }
 
 impl RemoteCompactionResponse {
-    fn ok(output_files: Vec<RemoteDataFile>) -> Self {
+    fn ok(output_files: Vec<RemoteDataFile>, vlog_entry_deltas: Vec<(u32, i64)>) -> Self {
         Self {
             output_files,
+            vlog_entry_deltas,
             error: None,
         }
     }
@@ -214,6 +223,7 @@ impl RemoteCompactionResponse {
     fn err(message: impl Into<String>) -> Self {
         Self {
             output_files: Vec::new(),
+            vlog_entry_deltas: Vec::new(),
             error: Some(message.into()),
         }
     }
@@ -352,9 +362,13 @@ impl CompactionWorker for RemoteCompactionWorker {
                     .map(|(file, file_id)| file.into_data_file(&file_manager, file_id, false))
                     .collect::<Result<Vec<_>>>()?;
                 let edit = build_version_edit(&sorted_runs, output_level, output_files.clone());
+                let vlog_edit = {
+                    let edit = VlogEdit::from_entry_deltas(response.vlog_entry_deltas);
+                    (!edit.is_empty()).then_some(edit)
+                };
                 lsm_tree.on_compaction_complete();
-                lsm_tree.apply_edit(edit.clone());
-                Ok(CompactionResult::new(output_files, edit))
+                lsm_tree.apply_edit_with_vlog(edit.clone(), vlog_edit.clone());
+                Ok(CompactionResult::new(output_files, edit, vlog_edit))
             })();
             if result.is_err()
                 && let Some(lsm_tree) = lsm_tree.upgrade()
@@ -454,7 +468,9 @@ impl RemoteCompactionServer {
                 Arc::clone(&metrics_manager),
                 request,
             ) {
-                Ok(files) => RemoteCompactionResponse::ok(files),
+                Ok((files, vlog_entry_deltas)) => {
+                    RemoteCompactionResponse::ok(files, vlog_entry_deltas)
+                }
                 Err(err) => RemoteCompactionResponse::err(err.to_string()),
             };
             info!("Request={} complete with response={}", request_id, response);
@@ -469,7 +485,7 @@ impl RemoteCompactionServer {
         data_volumes: Arc<Vec<DataVolume>>,
         metrics_manager: Arc<MetricsManager>,
         request: RemoteCompactionRequest,
-    ) -> Result<Vec<RemoteDataFile>> {
+    ) -> Result<RemoteCompactionOutput> {
         let file_manager =
             Self::file_manager_for_with(config, &data_volumes, &request.db_id, &metrics_manager)?;
         let data_file_type =
@@ -516,11 +532,17 @@ impl RemoteCompactionServer {
         if let Err(e) = &result {
             warn!("Execution error: {}", e);
         }
-        result?
+        let result = result?;
+        let output_files = result
             .new_files()
             .iter()
             .map(|file| RemoteDataFile::from_data_file_with_manager(file, &file_manager))
-            .collect::<Result<Vec<_>>>()
+            .collect::<Result<Vec<_>>>()?;
+        let vlog_entry_deltas = result
+            .vlog_edit()
+            .map(|edit| edit.entry_deltas())
+            .unwrap_or_default();
+        Ok((output_files, vlog_entry_deltas))
     }
 
     fn file_manager_for_with(
@@ -655,6 +677,7 @@ mod tests {
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq: 0,
             size: file_size,
+            has_separated_values: false,
             meta_bytes: Default::default(),
         };
         data_file.set_meta_bytes(footer_bytes);

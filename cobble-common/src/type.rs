@@ -127,12 +127,12 @@ impl ValueType {
     }
 
     #[inline]
-    fn is_merge_separated_array_item(self) -> bool {
+    pub(crate) fn is_merge_separated_array_item(self) -> bool {
         self.encode_tag() & VALUE_TYPE_MERGE_ARRAY_ITEM_ANTI_MASK == 0
     }
 
     #[inline]
-    fn uses_separated_storage(self) -> bool {
+    pub(crate) fn uses_separated_storage(self) -> bool {
         self.encode_tag() & VALUE_TYPE_SEPARATED_BIT != 0
     }
 }
@@ -382,6 +382,13 @@ impl Value {
     /// The resulting value has the maximum number of columns from both values.
     /// This API takes ownership to minimize clones for performance.
     pub(crate) fn merge(self, newer: Value) -> Value {
+        self.merge_with_callback(newer, &mut |_, _| {})
+    }
+
+    pub(crate) fn merge_with_callback<F>(self, newer: Value, on_merge: &mut F) -> Value
+    where
+        F: FnMut(Option<&Column>, Option<&Column>) + ?Sized,
+    {
         let max_cols = self.columns.len().max(newer.columns.len());
         let mut merged_columns = Vec::with_capacity(max_cols);
 
@@ -393,9 +400,18 @@ impl Value {
             let newer_col = newer_iter.next().flatten();
 
             let merged = match (older_col, newer_col) {
-                (Some(old), Some(new)) => Some(old.merge(new)),
-                (Some(old), None) => Some(old),
-                (None, Some(new)) => Some(new),
+                (Some(old), Some(new)) => {
+                    on_merge(Some(&old), Some(&new));
+                    Some(old.merge(new))
+                }
+                (Some(old), None) => {
+                    on_merge(Some(&old), None);
+                    Some(old)
+                }
+                (None, Some(new)) => {
+                    on_merge(None, Some(&new));
+                    Some(new)
+                }
                 (None, None) => None,
             };
             merged_columns.push(merged);
@@ -664,6 +680,30 @@ mod tests {
         assert_eq!(
             ValueType::MergeSeparatedArray.encode_tag() & VALUE_TYPE_ARRAY_BIT,
             VALUE_TYPE_ARRAY_BIT
+        );
+    }
+
+    #[test]
+    fn test_value_merge_callback_invoked_with_empty_sides() {
+        let old = Value::new(vec![
+            Some(Column::new(ValueType::Put, b"old0".to_vec())),
+            None,
+        ]);
+        let new = Value::new(vec![
+            None,
+            Some(Column::new(ValueType::PutSeparated, b"p1".to_vec())),
+            None,
+        ]);
+        let mut seen = Vec::new();
+        let _ = old.merge_with_callback(new, &mut |old_col, new_col| {
+            seen.push((old_col.map(|c| c.value_type), new_col.map(|c| c.value_type)));
+        });
+        assert_eq!(
+            seen,
+            vec![
+                (Some(ValueType::Put), None),
+                (None, Some(ValueType::PutSeparated)),
+            ]
         );
     }
 }

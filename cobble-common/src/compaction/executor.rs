@@ -13,10 +13,13 @@ use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
 use crate::lsm::{LevelEdit, VersionEdit};
 use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions};
+use crate::vlog::{VlogEdit, VlogMergeCollector};
 use log::trace;
 use metrics::{Counter, counter};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
+
+type CompactionCompleteCallback = Arc<dyn Fn(VersionEdit, Option<VlogEdit>) + Send + Sync>;
 
 /// A compaction task describes the input and output parameters for a compaction.
 pub struct CompactionTask {
@@ -111,12 +114,21 @@ pub struct CompactionResult {
     /// Files are sorted by their key ranges (first key of each file is sorted).
     new_files: Vec<Arc<DataFile>>,
     edit: VersionEdit,
+    vlog_edit: Option<VlogEdit>,
 }
 
 impl CompactionResult {
     /// Creates a new compaction result.
-    pub fn new(new_files: Vec<Arc<DataFile>>, edit: VersionEdit) -> Self {
-        Self { new_files, edit }
+    pub fn new(
+        new_files: Vec<Arc<DataFile>>,
+        edit: VersionEdit,
+        vlog_edit: Option<VlogEdit>,
+    ) -> Self {
+        Self {
+            new_files,
+            edit,
+            vlog_edit,
+        }
     }
 
     /// Returns the new files created by compaction.
@@ -127,6 +139,10 @@ impl CompactionResult {
 
     pub fn edit(&self) -> &VersionEdit {
         &self.edit
+    }
+
+    pub fn vlog_edit(&self) -> Option<&VlogEdit> {
+        self.vlog_edit.as_ref()
     }
 }
 
@@ -202,7 +218,7 @@ impl CompactionExecutor {
     pub fn execute(
         &self,
         task: CompactionTask,
-        on_complete: Option<Arc<dyn Fn(VersionEdit) + Send + Sync>>,
+        on_complete: Option<CompactionCompleteCallback>,
     ) -> tokio::task::JoinHandle<Result<CompactionResult>> {
         let runtime = self.runtime.as_ref().expect("Executor has no runtime.");
         let options = self.options;
@@ -210,7 +226,7 @@ impl CompactionExecutor {
         runtime.spawn_blocking(move || {
             let result = Self::run_compaction(task, options)?;
             if let Some(callback) = on_complete {
-                callback(result.edit.clone());
+                callback(result.edit.clone(), result.vlog_edit.clone());
             }
             Ok(result)
         })
@@ -220,11 +236,11 @@ impl CompactionExecutor {
     pub fn execute_blocking(
         &self,
         task: CompactionTask,
-        on_complete: Option<Arc<dyn Fn(VersionEdit) + Send + Sync>>,
+        on_complete: Option<CompactionCompleteCallback>,
     ) -> Result<CompactionResult> {
         let result = Self::run_compaction(task, self.options)?;
         if let Some(callback) = on_complete {
-            callback(result.edit.clone());
+            callback(result.edit.clone(), result.vlog_edit.clone());
         }
         Ok(result)
     }
@@ -242,6 +258,12 @@ impl CompactionExecutor {
         let mut read_bytes = 0u64;
         let use_read_ahead =
             options.read_ahead_enabled && tokio::runtime::Handle::try_current().is_ok();
+        let sst_options = SSTIteratorOptions {
+            metrics: Some(Arc::clone(&task.sst_metrics)),
+            num_columns: options.num_columns,
+            bloom_filter_enabled: options.bloom_filter_enabled,
+            ..SSTIteratorOptions::default()
+        };
         for run in &task.sorted_runs {
             for file in run.files() {
                 let reader = task.file_manager.open_data_file_reader(file.file_id)?;
@@ -255,12 +277,6 @@ impl CompactionExecutor {
                 };
                 // Create iterators for all files in all sorted runs
                 // We iterate files from all sorted runs, with earlier runs (newer data) coming first
-                let sst_options = SSTIteratorOptions {
-                    metrics: Some(Arc::clone(&task.sst_metrics)),
-                    num_columns: options.num_columns,
-                    bloom_filter_enabled: options.bloom_filter_enabled,
-                    ..SSTIteratorOptions::default()
-                };
                 let iter = crate::sst::SSTIterator::with_cache_and_file(
                     reader,
                     file.as_ref(),
@@ -283,10 +299,21 @@ impl CompactionExecutor {
 
         // Create merging iterator
         let merging_iter = MergingIterator::new(all_iters);
+        let input_has_separated_values = task
+            .sorted_runs
+            .iter()
+            .flat_map(|run| run.files().iter())
+            .any(|file| file.has_separated_values());
+        let merge_collector = input_has_separated_values.then(|| VlogMergeCollector::shared(true));
+        let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
 
         // Create deduplicating iterator
-        let mut dedup_iter =
-            DeduplicatingIterator::new(merging_iter, options.num_columns, task.ttl_provider());
+        let mut dedup_iter = DeduplicatingIterator::new(
+            merging_iter,
+            options.num_columns,
+            task.ttl_provider(),
+            merge_callback,
+        );
         dedup_iter.seek_to_first()?;
 
         // Collect output files
@@ -298,6 +325,9 @@ impl CompactionExecutor {
         let mut current_file_id: Option<u64> = None;
 
         while dedup_iter.valid() {
+            if let Some(collector) = merge_collector.as_ref() {
+                collector.borrow_mut().check_error()?;
+            }
             let (key, value) = match dedup_iter.current_slice()? {
                 Some(kv) => kv,
                 None => break,
@@ -332,15 +362,24 @@ impl CompactionExecutor {
                         tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                         seq: max_seq,
                         size: file_size,
+                        has_separated_values: merge_collector
+                            .as_ref()
+                            .is_some_and(|collector| collector.borrow().has_separated_values()),
                         meta_bytes: Default::default(),
                     };
                     data_file.set_meta_bytes(footer_bytes);
                     output_files.push(Arc::new(data_file));
                     written_bytes = written_bytes.saturating_add(file_size as u64);
+                    if let Some(collector) = &merge_collector {
+                        collector.borrow_mut().reset_has_separated_values();
+                    }
                 }
             }
 
             dedup_iter.next()?;
+        }
+        if let Some(collector) = merge_collector.as_ref() {
+            collector.borrow_mut().check_error()?;
         }
 
         // Finish any remaining file
@@ -362,6 +401,9 @@ impl CompactionExecutor {
                 tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                 seq: max_seq,
                 size: file_size,
+                has_separated_values: merge_collector
+                    .as_ref()
+                    .is_some_and(|collector| collector.borrow().has_separated_values()),
                 meta_bytes: Default::default(),
             };
             data_file.set_meta_bytes(footer_bytes);
@@ -393,6 +435,15 @@ impl CompactionExecutor {
         let edit = VersionEdit {
             level_edits: level_edits.into_values().collect(),
         };
+        let mut vlog_edit = VlogEdit::default();
+        for (file_seq, delta) in merge_collector
+            .as_ref()
+            .map(|collector| collector.borrow().removed_entry_deltas())
+            .unwrap_or_default()
+        {
+            vlog_edit.add_entry_delta(file_seq, delta);
+        }
+        let vlog_edit = (!vlog_edit.is_empty()).then_some(vlog_edit);
         let output_bytes = output_files.iter().map(|file| file.size).sum::<usize>();
         trace!(
             "compaction complete output_level={} input_files={} input_bytes={} output_files={} output_bytes={}",
@@ -416,7 +467,7 @@ impl CompactionExecutor {
                 task.file_manager.make_data_file_readonly(file.file_id)?;
             }
         }
-        Ok(CompactionResult::new(output_files, edit))
+        Ok(CompactionResult::new(output_files, edit, vlog_edit))
     }
 }
 
@@ -471,6 +522,7 @@ mod tests {
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq: 0,
             size: file_size,
+            has_separated_values: true,
             meta_bytes: Default::default(),
         };
         data_file.set_meta_bytes(footer_bytes);
@@ -942,6 +994,7 @@ mod tests {
             tracked_id: TrackedFileId::new(&file_manager, file_id),
             seq: 0,
             size: file_size,
+            has_separated_values: false,
             meta_bytes: Default::default(),
         };
         file.set_meta_bytes(footer_bytes);
@@ -1059,6 +1112,64 @@ mod tests {
         // Should have no output files
         assert!(result.new_files().is_empty());
 
+        cleanup_test_dir(test_dir);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_compaction_tracks_vlog_entry_deletions_for_shadowed_values() {
+        let test_dir = "/tmp/compaction_vlog_entry_delta_test";
+        cleanup_test_dir(test_dir);
+
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", test_dir))
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
+        let num_columns = 1;
+        let pointer = crate::vlog::VlogPointer::new(9, 0);
+        let older = create_test_sst(
+            &file_manager,
+            vec![(
+                b"k",
+                &make_typed_value_bytes(ValueType::PutSeparated, &pointer.to_bytes(), num_columns),
+            )],
+        )
+        .unwrap();
+        let newer = create_test_sst(
+            &file_manager,
+            vec![(b"k", &make_value_bytes(b"inline", num_columns))],
+        )
+        .unwrap();
+
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions::default());
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
+        let task = CompactionTask::new(
+            compaction_metrics,
+            sst_metrics,
+            vec![
+                SortedRun::new(0, vec![newer]),
+                SortedRun::new(1, vec![older]),
+            ],
+            1,
+            Arc::clone(&file_manager),
+            factory,
+            DataFileType::SSTable,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
+        );
+        let executor = CompactionExecutor::with_defaults().unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+        let deltas: std::collections::HashMap<u32, i64> = result
+            .vlog_edit()
+            .unwrap()
+            .entry_deltas()
+            .into_iter()
+            .collect();
+        assert_eq!(deltas.get(&9).copied(), Some(-1));
         cleanup_test_dir(test_dir);
     }
 }
