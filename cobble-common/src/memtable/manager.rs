@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
 
 use crate::data_file::{DataFile, DataFileType};
@@ -499,8 +499,8 @@ impl MemtableManager {
             let rewrite_plan = match rewrite_result {
                 Ok(rewritten) => rewritten,
                 Err(err) => {
-                    active.restore_checkpoint(checkpoint);
-                    return Err(err);
+                    self.handle_memtable_put_error(&err, active, checkpoint)?;
+                    continue;
                 }
             };
             let put_result = {
@@ -513,19 +513,40 @@ impl MemtableManager {
             };
             match put_result {
                 Ok(()) => return Ok(()),
-                Err(Error::MemtableFull { needed, remaining }) => {
-                    active.restore_checkpoint(checkpoint);
-                    let memtable = active.memtable.as_ref().expect("active memtable exists");
-                    if memtable.is_empty() {
-                        return Err(Error::MemtableFull { needed, remaining });
-                    }
-                    drop(active);
-                    self.flush_active()?;
-                }
                 Err(err) => {
-                    active.restore_checkpoint(checkpoint);
-                    return Err(err);
+                    self.handle_memtable_put_error(&err, active, checkpoint)?;
                 }
+            }
+        }
+    }
+
+    fn handle_memtable_put_error(
+        &self,
+        err: &Error,
+        mut active: MutexGuard<ActiveMemtable>,
+        checkpoint: ActiveMemtableCheckpoint,
+    ) -> Result<()> {
+        match err {
+            Error::MemtableFull { needed, remaining } => {
+                if active
+                    .memtable
+                    .as_ref()
+                    .expect("active memtable exists")
+                    .is_empty()
+                {
+                    return Err(Error::MemtableFull {
+                        needed: *needed,
+                        remaining: *remaining,
+                    });
+                }
+                // flush active memtable and retry
+                drop(active);
+                self.flush_active()?;
+                Ok(())
+            }
+            _ => {
+                active.restore_checkpoint(checkpoint);
+                Err(err.clone())
             }
         }
     }
