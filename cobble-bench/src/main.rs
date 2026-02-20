@@ -12,11 +12,16 @@ const DEFAULT_KEY_COUNT: u64 = 100_000_000;
 const DEFAULT_DB_PATH: &str = "/tmp/cobble-bench/bulk-load";
 const DEFAULT_SEED: u64 = 0x6a09e667f3bcc909;
 const DEFAULT_KEY_LEN: usize = 8;
+const DEFAULT_VALUE_LEN: usize = 8;
+const SEPARATED_BULKLOAD_MIN_VALUE_LEN: usize = 1024;
+const SEPARATED_BULKLOAD_DEFAULT_VALUE_LEN: usize = 1024;
+const SEPARATED_BULKLOAD_THRESHOLD: usize = 512;
 const DEFAULT_READ_COUNT: Option<u64> = None;
 
 #[derive(Clone, Copy, Debug)]
 enum BenchMode {
     BulkLoad,
+    BulkLoadSeparated,
     RandomRead,
 }
 
@@ -25,6 +30,7 @@ struct Args {
     db_path: PathBuf,
     seed: u64,
     key_len: usize,
+    value_len: usize,
     remote_compactor: Option<String>,
     mode: BenchMode,
     read_count: Option<u64>,
@@ -37,6 +43,7 @@ impl Default for Args {
             db_path: PathBuf::from(DEFAULT_DB_PATH),
             seed: DEFAULT_SEED,
             key_len: DEFAULT_KEY_LEN,
+            value_len: DEFAULT_VALUE_LEN,
             remote_compactor: None,
             mode: BenchMode::BulkLoad,
             read_count: DEFAULT_READ_COUNT,
@@ -59,11 +66,12 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "Usage: cobble-bench [--mode <bulkload|randomread>] [--keys <count>] [--reads <count>] [--db-path <path>] [--seed <seed>] [--key-len <bytes>] [--remote-compactor <host:port>]"
+    "Usage: cobble-bench [--mode <bulkload|bulkload-separated|randomread>] [--keys <count>] [--reads <count>] [--db-path <path>] [--seed <seed>] [--key-len <bytes>] [--value-len <bytes>] [--remote-compactor <host:port>]"
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args::default();
+    let mut value_len_set = false;
     let mut iter = env::args().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -83,10 +91,11 @@ fn parse_args() -> Result<Args, String> {
                 let mode = parse_string(&mut iter, "--mode")?;
                 args.mode = match mode.as_str() {
                     "bulkload" => BenchMode::BulkLoad,
+                    "bulkload-separated" => BenchMode::BulkLoadSeparated,
                     "randomread" => BenchMode::RandomRead,
                     _ => {
                         return Err(format!(
-                            "Invalid mode: {mode}. Expected bulkload or randomread.\n{}",
+                            "Invalid mode: {mode}. Expected bulkload, bulkload-separated, or randomread.\n{}",
                             usage()
                         ));
                     }
@@ -94,6 +103,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--key-len" | "--key-length" => {
                 args.key_len = parse_value(&mut iter, "--key-len")?;
+            }
+            "--value-len" | "--value-length" => {
+                args.value_len = parse_value(&mut iter, "--value-len")?;
+                value_len_set = true;
             }
             "--remote-compactor" => {
                 args.remote_compactor = Some(parse_string(&mut iter, "--remote-compactor")?);
@@ -112,6 +125,24 @@ fn parse_args() -> Result<Args, String> {
     }
     if args.key_len < 8 {
         return Err("Key length must be at least 8 bytes.".to_string());
+    }
+    if !value_len_set {
+        args.value_len = if matches!(args.mode, BenchMode::BulkLoadSeparated) {
+            SEPARATED_BULKLOAD_DEFAULT_VALUE_LEN
+        } else {
+            args.key_len
+        };
+    }
+    if args.value_len == 0 {
+        return Err("Value length must be greater than 0.".to_string());
+    }
+    if matches!(args.mode, BenchMode::BulkLoadSeparated)
+        && args.value_len < SEPARATED_BULKLOAD_MIN_VALUE_LEN
+    {
+        return Err(format!(
+            "For bulkload-separated mode, value length must be at least {} bytes.",
+            SEPARATED_BULKLOAD_MIN_VALUE_LEN
+        ));
     }
     Ok(args)
 }
@@ -166,7 +197,10 @@ impl KeyGenerator for RandomKeyGenerator {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    if matches!(args.mode, BenchMode::BulkLoad) {
+    if matches!(
+        args.mode,
+        BenchMode::BulkLoad | BenchMode::BulkLoadSeparated
+    ) {
         prepare_db_dir(&args.db_path)?;
     } else if !args.db_path.exists() {
         return Err(format!(
@@ -174,23 +208,32 @@ fn run(args: Args) -> Result<(), String> {
             args.db_path.display()
         ));
     }
+    let value_separation_threshold = if matches!(args.mode, BenchMode::BulkLoadSeparated) {
+        SEPARATED_BULKLOAD_THRESHOLD
+    } else {
+        usize::MAX
+    };
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", args.db_path.display())),
         compaction_remote_addr: args.remote_compactor.clone(),
+        value_separation_threshold,
         log_level: Debug,
         log_console: true,
         ..Config::default()
     };
 
     match args.mode {
-        BenchMode::BulkLoad => {
+        BenchMode::BulkLoad | BenchMode::BulkLoadSeparated => {
             let db = SingleNodeDb::open(config.clone(), 1)
                 .map_err(|err| format!("Failed to open db: {err}"))?;
 
             println!(
-                "bulk load: keys={} key_len={} db_path={} seed={} remote_compactor={}",
+                "bulk load: mode={:?} keys={} key_len={} value_len={} separation_threshold={} db_path={} seed={} remote_compactor={}",
+                args.mode,
                 args.key_count,
                 args.key_len,
+                args.value_len,
+                value_separation_threshold,
                 args.db_path.display(),
                 args.seed,
                 args.remote_compactor.as_deref().unwrap_or("local")
@@ -200,9 +243,11 @@ fn run(args: Args) -> Result<(), String> {
             let start = Instant::now();
             let mut inserted = 0u64;
             let mut generator = RandomKeyGenerator::new(args.key_count, args.key_len, args.seed);
+            let mut value = vec![0u8; args.value_len];
 
             while let Some(key_bytes) = generator.next_key() {
-                db.put(key_bytes, 0, key_bytes)
+                fill_value_from_key(&mut value, key_bytes);
+                db.put(key_bytes, 0, &value)
                     .map_err(|err| format!("Write failed at key {}: {err}", inserted + 1))?;
                 inserted += 1;
 
@@ -302,4 +347,10 @@ fn prepare_db_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path)
         .map_err(|err| format!("Failed to create {}: {err}", path.display()))?;
     Ok(())
+}
+
+fn fill_value_from_key(value: &mut [u8], key: &[u8]) {
+    for (idx, byte) in value.iter_mut().enumerate() {
+        *byte = key[idx % key.len()];
+    }
 }
