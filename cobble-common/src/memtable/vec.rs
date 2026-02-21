@@ -6,6 +6,7 @@ use crate::memtable::{Memtable, MemtableReclaimer};
 use crate::sst::row_codec::{encode_key_ref_into, encode_value_ref_into};
 use crate::r#type::{RefKey, RefValue};
 use bytes::{Bytes, BytesMut};
+use std::collections::BTreeMap;
 
 pub(crate) type MemtableKvIterator<'a> = OrderedMemtableKvIterator<'a>;
 
@@ -136,11 +137,20 @@ impl Memtable for VecMemtable {
     }
 
     fn append_blob(&mut self, data: &[u8]) -> Result<usize> {
-        self.has_space(data.len())?;
+        let encoded_len = 4usize
+            .checked_add(data.len())
+            .ok_or_else(|| Error::IoError("VLOG encoded value length overflow".to_string()))?;
+        self.has_space(encoded_len)?;
         let offset = self.blobs.len();
+        self.blobs.extend_from_slice(
+            &(u32::try_from(data.len()).map_err(|_| {
+                Error::IoError(format!("VLOG value too large: {} bytes", data.len()))
+            })?)
+            .to_le_bytes(),
+        );
         self.blobs.extend_from_slice(data);
-        self.used_bytes += data.len();
-        Ok(offset)
+        self.used_bytes += encoded_len;
+        Ok(offset + 4)
     }
 
     fn read_blob(&self, offset: usize, len: usize) -> Option<&[u8]> {
@@ -149,6 +159,14 @@ impl Memtable for VecMemtable {
             return None;
         }
         Some(&self.blobs[offset..end])
+    }
+
+    fn flush_blobs_to_vlog_writer(
+        &self,
+        _entries: &BTreeMap<u32, (usize, usize)>,
+        writer: &mut crate::vlog::VlogWriter<Box<dyn crate::file::SequentialWriteFile>>,
+    ) -> Result<()> {
+        writer.write_encoded_records(&self.blobs)
     }
 
     fn blob_cursor_checkpoint(&self) -> usize {

@@ -161,24 +161,7 @@ impl MemtableVlogRecorder {
         memtable: &impl Memtable,
         writer: &mut VlogWriter<Box<dyn crate::file::SequentialWriteFile>>,
     ) -> Result<()> {
-        for (expected_offset, (start, len)) in &self.entries {
-            let payload = memtable.read_blob(*start, *len).ok_or_else(|| {
-                Error::IoError(format!(
-                    "VLOG recorder payload out of range at {} (len {})",
-                    start, len
-                ))
-            })?;
-            let pointer = writer.add_value(payload)?;
-            if pointer.file_seq() != self.file_seq || pointer.offset() != *expected_offset {
-                return Err(Error::IoError(format!(
-                    "VLOG pointer mismatch for seq {}: expected offset {}, got {}",
-                    self.file_seq,
-                    expected_offset,
-                    pointer.offset()
-                )));
-            }
-        }
-        Ok(())
+        memtable.flush_blobs_to_vlog_writer(&self.entries, writer)
     }
 
     pub(crate) fn read_pointer(

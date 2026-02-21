@@ -346,6 +346,10 @@ impl<W: SequentialWriteFile> VlogWriter<W> {
         })
     }
 
+    pub(crate) fn write_encoded_records(&mut self, encoded: &[u8]) -> Result<()> {
+        self.writer.write(encoded).map(|_| ())
+    }
+
     pub(crate) fn close(&mut self) -> Result<(), Error> {
         self.writer.close()
     }

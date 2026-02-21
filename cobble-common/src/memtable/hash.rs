@@ -8,6 +8,7 @@ use crate::memtable::vlog::{RewrittenValuePlan, encode_rewritten_value};
 use crate::memtable::{Memtable, MemtableReclaimer};
 use crate::sst::row_codec::{encode_key_ref_into, encode_value_ref_into};
 use crate::r#type::{RefKey, RefValue};
+use std::collections::BTreeMap;
 
 pub(crate) type MemtableKvIterator<'a> = OrderedMemtableKvIterator<'a>;
 
@@ -315,6 +316,25 @@ impl Memtable for HashMemtable {
             return None;
         }
         Some(&self.buffer[offset..end])
+    }
+
+    fn flush_blobs_to_vlog_writer(
+        &self,
+        entries: &BTreeMap<u32, (usize, usize)>,
+        writer: &mut crate::vlog::VlogWriter<Box<dyn crate::file::SequentialWriteFile>>,
+    ) -> Result<()> {
+        for (payload_start, payload_len) in entries.values() {
+            let payload = self
+                .read_blob(*payload_start, *payload_len)
+                .ok_or_else(|| {
+                    Error::IoError(format!(
+                        "VLOG recorder payload out of range at {} (len {})",
+                        payload_start, payload_len
+                    ))
+                })?;
+            writer.add_value(payload)?;
+        }
+        Ok(())
     }
 
     fn blob_cursor_checkpoint(&self) -> usize {

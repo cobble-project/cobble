@@ -10,6 +10,7 @@ use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::r#type::{RefKey, RefValue};
 pub(crate) use hash::HashMemtable;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 pub(crate) use vec::VecMemtable;
 
@@ -39,6 +40,11 @@ pub(crate) trait Memtable {
     fn is_empty(&self) -> bool;
     fn append_blob(&mut self, data: &[u8]) -> Result<usize>;
     fn read_blob(&self, offset: usize, len: usize) -> Option<&[u8]>;
+    fn flush_blobs_to_vlog_writer(
+        &self,
+        entries: &BTreeMap<u32, (usize, usize)>,
+        writer: &mut crate::vlog::VlogWriter<Box<dyn crate::file::SequentialWriteFile>>,
+    ) -> Result<()>;
     fn blob_cursor_checkpoint(&self) -> usize;
     fn rollback_blob_cursor(&mut self, checkpoint: usize);
 
@@ -208,6 +214,17 @@ impl Memtable for MemtableImpl {
         match self {
             Self::Hash(memtable) => memtable.read_blob(offset, len),
             Self::Vec(memtable) => memtable.read_blob(offset, len),
+        }
+    }
+
+    fn flush_blobs_to_vlog_writer(
+        &self,
+        entries: &BTreeMap<u32, (usize, usize)>,
+        writer: &mut crate::vlog::VlogWriter<Box<dyn crate::file::SequentialWriteFile>>,
+    ) -> Result<()> {
+        match self {
+            Self::Hash(memtable) => memtable.flush_blobs_to_vlog_writer(entries, writer),
+            Self::Vec(memtable) => memtable.flush_blobs_to_vlog_writer(entries, writer),
         }
     }
 
