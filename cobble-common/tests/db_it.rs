@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::{
-    CompactionPolicyKind, Config, Db, MetricValue, ReadOptions, ReadProxy, ReadProxyConfig,
-    SingleNodeDb, TimeProviderKind, VolumeDescriptor, WriteBatch,
+    CompactionPolicyKind, Config, Db, MemtableType, MetricValue, ReadOptions, ReadProxy,
+    ReadProxyConfig, SingleNodeDb, TimeProviderKind, VolumeDescriptor, WriteBatch,
 };
 use std::path::Path;
 
@@ -529,6 +529,87 @@ fn test_single_node_db_snapshot_updates_global_manifest() {
         .expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_read_only_get_with_vec_memtable() {
+    let root = "/tmp/db_snapshot_readonly_vec_memtable";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 256,
+        memtable_buffer_count: 2,
+        memtable_type: MemtableType::Vec,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config.clone()).unwrap();
+    let mut expected = HashMap::new();
+    for i in 0..128u32 {
+        let key = format!("k{:04}", i).into_bytes();
+        let value = format!("value-{:04}", i).into_bytes();
+        db.put(&key, 0, value.clone()).unwrap();
+        expected.insert(key, value);
+    }
+
+    let snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    db.close().unwrap();
+
+    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    for (key, expected_value) in expected.iter() {
+        let value = ro
+            .get(key, &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        let col = value[0].as_ref().unwrap();
+        assert_eq!(col.as_ref(), expected_value.as_slice());
+    }
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_read_only_get_with_vec_memtable_separated_values() {
+    let root = "/tmp/db_snapshot_readonly_vec_memtable_separated";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 256,
+        memtable_buffer_count: 2,
+        memtable_type: MemtableType::Vec,
+        num_columns: 1,
+        value_separation_threshold: 8,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config.clone()).unwrap();
+    let mut expected = HashMap::new();
+    for i in 0..64u32 {
+        let key = format!("k{:04}", i).into_bytes();
+        let value = vec![b'a' + (i % 26) as u8; 96];
+        db.put(&key, 0, value.clone()).unwrap();
+        expected.insert(key, value);
+    }
+
+    let snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    db.close().unwrap();
+
+    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    for (key, expected_value) in expected.iter() {
+        let value = ro
+            .get(key, &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        let col = value[0].as_ref().unwrap();
+        assert_eq!(col.as_ref(), expected_value.as_slice());
+    }
     cleanup_test_root(root);
 }
 

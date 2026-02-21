@@ -1,16 +1,15 @@
-use bytes::{Buf, BufMut, Bytes};
-use std::cmp::Ordering;
+//! Hash-indexed memtable implementation.
+//! This memtable organizes entries in a single buffer with a hash index for efficient lookups.
+use bytes::{Buf, BufMut};
 
 use crate::error::{Error, Result};
-use crate::iterator::KvIterator;
-use crate::memtable::Memtable;
+use crate::memtable::iter::OrderedMemtableKvIterator;
 use crate::memtable::vlog::{RewrittenValuePlan, encode_rewritten_value};
+use crate::memtable::{Memtable, MemtableReclaimer};
 use crate::sst::row_codec::{encode_key_ref_into, encode_value_ref_into};
 use crate::r#type::{RefKey, RefValue};
-use std::sync::Arc;
 
-/// Type alias for memtable reclaimer function.
-pub(crate) type MemtableReclaimer = Arc<dyn Fn(u64) + Send + Sync>;
+pub(crate) type MemtableKvIterator<'a> = OrderedMemtableKvIterator<'a>;
 
 /// Hash-indexed memtable storing entries, blobs, index nodes and bucket table in one buffer.
 ///
@@ -33,38 +32,6 @@ pub(crate) struct MemtableValueIter<'a> {
     key: Vec<u8>,
     next_node: u32,
     bucket: usize,
-}
-
-#[derive(PartialEq, Eq)]
-struct KVPair<'a> {
-    key: &'a [u8],
-    value: &'a [u8],
-    offset: usize,
-}
-
-impl Ord for KVPair<'_> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let ord = self.key.cmp(other.key);
-        if ord == Ordering::Equal {
-            other.offset.cmp(&self.offset)
-        } else {
-            ord
-        }
-    }
-}
-
-impl PartialOrd for KVPair<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-pub(crate) struct MemtableKvIterator<'a> {
-    mem: &'a HashMemtable,
-    key_values: Vec<KVPair<'a>>,
-    key_idx: usize,
-    current_key: Option<&'a [u8]>,
-    current_value: Option<&'a [u8]>,
 }
 
 impl HashMemtable {
@@ -161,35 +128,6 @@ impl HashMemtable {
         Ok(())
     }
 
-    pub(crate) fn append_blob(&mut self, data: &[u8]) -> Result<usize> {
-        if self.data_end + data.len() > self.index_cursor {
-            return Err(Error::MemtableFull {
-                needed: data.len(),
-                remaining: self.index_cursor.saturating_sub(self.data_end),
-            });
-        }
-        let start = self.index_cursor - data.len();
-        self.buffer[start..self.index_cursor].copy_from_slice(data);
-        self.index_cursor = start;
-        Ok(start)
-    }
-
-    pub(crate) fn read_blob(&self, offset: usize, len: usize) -> Option<&[u8]> {
-        let end = offset.checked_add(len)?;
-        if offset < self.index_cursor || end > self.bucket_base {
-            return None;
-        }
-        Some(&self.buffer[offset..end])
-    }
-
-    pub(crate) fn blob_cursor_checkpoint(&self) -> usize {
-        self.index_cursor
-    }
-
-    pub(crate) fn rollback_blob_cursor(&mut self, checkpoint: usize) {
-        self.index_cursor = checkpoint;
-    }
-
     fn write_data(&mut self, key: &[u8], value: &[u8]) -> usize {
         let key_len = key.len() as u32;
         let value_len = value.len() as u32;
@@ -223,51 +161,6 @@ impl HashMemtable {
         (start, start + 8)
     }
 
-    pub(crate) fn put_ref(
-        &mut self,
-        key: &RefKey<'_>,
-        value: &RefValue<'_>,
-        num_columns: usize,
-    ) -> Result<()> {
-        let key_len = key.encoded_len();
-        let value_len = value.encoded_len(num_columns);
-        let data_len = Self::entry_size(key_len, value_len);
-        self.has_space(data_len)?;
-        let (data_offset, key_offset) =
-            self.write_data_ref(key, value, num_columns, key_len, value_len);
-        let hash = Self::hash_key(&self.buffer[key_offset..key_offset + key_len]);
-        let bucket = self.bucket_index_from_hash(hash);
-        let node_off = self.write_index(bucket, hash, data_offset as u32);
-        self.set_bucket_head(bucket, node_off);
-        Ok(())
-    }
-
-    pub(crate) fn put_ref_rewritten(
-        &mut self,
-        key: &RefKey<'_>,
-        plan: &RewrittenValuePlan<'_>,
-        num_columns: usize,
-    ) -> Result<()> {
-        let value_len = plan.encoded_len(num_columns);
-        let key_len = key.encoded_len();
-        let data_len = Self::entry_size(key_len, value_len);
-        self.has_space(data_len)?;
-        let start = self.data_end;
-        let end = start + data_len;
-        let mut slice = &mut self.buffer[start..end];
-        slice.put_u32(key_len as u32);
-        slice.put_u32(value_len as u32);
-        encode_key_ref_into(key, &mut slice);
-        encode_rewritten_value(plan, num_columns, &mut slice[..value_len]);
-        self.data_end = end;
-        let key_offset = start + 8;
-        let hash = Self::hash_key(&self.buffer[key_offset..key_offset + key_len]);
-        let bucket = self.bucket_index_from_hash(hash);
-        let node_off = self.write_index(bucket, hash, start as u32);
-        self.set_bucket_head(bucket, node_off);
-        Ok(())
-    }
-
     fn bucket_head(&self, bucket: usize) -> u32 {
         let pos = self.bucket_base + bucket * 4;
         let mut slice = &self.buffer[pos..pos + 4];
@@ -297,10 +190,6 @@ impl HashMemtable {
     fn bucket_index_from_hash(&self, hash: u64) -> usize {
         (hash as usize) % self.bucket_count
     }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.data_end == 0
-    }
 }
 
 impl Memtable for HashMemtable {
@@ -321,7 +210,43 @@ impl Memtable for HashMemtable {
         value: &RefValue<'_>,
         num_columns: usize,
     ) -> Result<()> {
-        HashMemtable::put_ref(self, key, value, num_columns)
+        let key_len = key.encoded_len();
+        let value_len = value.encoded_len(num_columns);
+        let data_len = Self::entry_size(key_len, value_len);
+        self.has_space(data_len)?;
+        let (data_offset, key_offset) =
+            self.write_data_ref(key, value, num_columns, key_len, value_len);
+        let hash = Self::hash_key(&self.buffer[key_offset..key_offset + key_len]);
+        let bucket = self.bucket_index_from_hash(hash);
+        let node_off = self.write_index(bucket, hash, data_offset as u32);
+        self.set_bucket_head(bucket, node_off);
+        Ok(())
+    }
+
+    fn put_ref_rewritten(
+        &mut self,
+        key: &RefKey<'_>,
+        plan: &RewrittenValuePlan<'_>,
+        num_columns: usize,
+    ) -> Result<()> {
+        let value_len = plan.encoded_len(num_columns);
+        let key_len = key.encoded_len();
+        let data_len = Self::entry_size(key_len, value_len);
+        self.has_space(data_len)?;
+        let start = self.data_end;
+        let end = start + data_len;
+        let mut slice = &mut self.buffer[start..end];
+        slice.put_u32(key_len as u32);
+        slice.put_u32(value_len as u32);
+        encode_key_ref_into(key, &mut slice);
+        encode_rewritten_value(plan, num_columns, &mut slice[..value_len]);
+        self.data_end = end;
+        let key_offset = start + 8;
+        let hash = Self::hash_key(&self.buffer[key_offset..key_offset + key_len]);
+        let bucket = self.bucket_index_from_hash(hash);
+        let node_off = self.write_index(bucket, hash, start as u32);
+        self.set_bucket_head(bucket, node_off);
+        Ok(())
     }
 
     fn get(&self, key: &[u8]) -> Option<&[u8]> {
@@ -367,10 +292,43 @@ impl Memtable for HashMemtable {
         self.index_cursor.saturating_sub(self.data_end)
     }
 
+    fn is_empty(&self) -> bool {
+        self.data_end == 0
+    }
+
+    fn append_blob(&mut self, data: &[u8]) -> Result<usize> {
+        if self.data_end + data.len() > self.index_cursor {
+            return Err(Error::MemtableFull {
+                needed: data.len(),
+                remaining: self.index_cursor.saturating_sub(self.data_end),
+            });
+        }
+        let start = self.index_cursor - data.len();
+        self.buffer[start..self.index_cursor].copy_from_slice(data);
+        self.index_cursor = start;
+        Ok(start)
+    }
+
+    fn read_blob(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let end = offset.checked_add(len)?;
+        if offset < self.index_cursor || end > self.bucket_base {
+            return None;
+        }
+        Some(&self.buffer[offset..end])
+    }
+
+    fn blob_cursor_checkpoint(&self) -> usize {
+        self.index_cursor
+    }
+
+    fn rollback_blob_cursor(&mut self, checkpoint: usize) {
+        self.index_cursor = checkpoint;
+    }
+
     /// Returns an iterator over all key-value pairs ordered by key bytes ascending.
     /// For duplicate keys, values are yielded in reverse insertion order (latest first).
     fn iter(&self) -> MemtableKvIterator<'_> {
-        let mut key_values: Vec<KVPair> = Vec::new();
+        let mut entries: Vec<(&[u8], &[u8], usize)> = Vec::new();
         let mut offset = 0;
         while offset < self.data_end {
             if offset + 8 > self.data_end {
@@ -382,21 +340,14 @@ impl Memtable for HashMemtable {
             if key_len + value_len > slice.remaining() {
                 break;
             }
-            key_values.push(KVPair {
-                key: &slice[..key_len],
-                value: &slice[key_len..key_len + value_len],
+            entries.push((
+                &slice[..key_len],
+                &slice[key_len..key_len + value_len],
                 offset,
-            });
+            ));
             offset += Self::entry_size(key_len, value_len);
         }
-        key_values.sort();
-        MemtableKvIterator {
-            mem: self,
-            key_values,
-            key_idx: 0,
-            current_key: None,
-            current_value: None,
-        }
+        MemtableKvIterator::new(entries)
     }
 
     type ValueIter<'a>
@@ -445,61 +396,11 @@ impl Drop for HashMemtable {
     }
 }
 
-impl<'a> KvIterator<'a> for MemtableKvIterator<'a> {
-    fn seek(&mut self, target: &[u8]) -> Result<()> {
-        match self.key_values.binary_search_by(|k| k.key.cmp(target)) {
-            Ok(idx) => self.key_idx = idx,
-            Err(idx) => self.key_idx = idx,
-        }
-        self.current_key = None;
-        self.current_value = None;
-        Ok(())
-    }
-
-    fn seek_to_first(&mut self) -> Result<()> {
-        self.key_idx = 0;
-        self.current_key = None;
-        self.current_value = None;
-        Ok(())
-    }
-
-    fn next(&mut self) -> Result<bool> {
-        if self.key_idx >= self.key_values.len() {
-            self.current_key = None;
-            self.current_value = None;
-            return Ok(false);
-        }
-        let key_value = &self.key_values[self.key_idx];
-        self.key_idx += 1;
-        self.current_key = Some(key_value.key);
-        self.current_value = Some(key_value.value);
-        Ok(true)
-    }
-
-    fn valid(&self) -> bool {
-        self.current_key.is_some() && self.current_value.is_some()
-    }
-
-    fn key(&self) -> Result<Option<Bytes>> {
-        Ok(self.current_key.map(Bytes::copy_from_slice))
-    }
-
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
-        Ok(self.current_key)
-    }
-
-    fn value(&self) -> Result<Option<Bytes>> {
-        Ok(self.current_value.map(Bytes::copy_from_slice))
-    }
-
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        Ok(self.current_value)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iterator::KvIterator;
+    use bytes::Bytes;
 
     #[test]
     fn put_and_get() {

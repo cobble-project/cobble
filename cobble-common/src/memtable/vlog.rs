@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::memtable::hash::HashMemtable;
+use crate::memtable::Memtable;
 use crate::r#type::{RefColumn, RefValue, ValueType};
 use crate::vlog::{VlogPointer, VlogStore, VlogWriter};
 use bytes::{BufMut, Bytes};
@@ -140,7 +140,7 @@ impl MemtableVlogRecorder {
 
     pub(crate) fn append_value(
         &mut self,
-        memtable: &mut HashMemtable,
+        memtable: &mut impl Memtable,
         value: &[u8],
     ) -> Result<VlogPointer> {
         let value_len = u32::try_from(value.len())
@@ -158,7 +158,7 @@ impl MemtableVlogRecorder {
 
     pub(crate) fn flush_to_writer(
         &self,
-        memtable: &HashMemtable,
+        memtable: &impl Memtable,
         writer: &mut VlogWriter<Box<dyn crate::file::SequentialWriteFile>>,
     ) -> Result<()> {
         for (expected_offset, (start, len)) in &self.entries {
@@ -183,7 +183,7 @@ impl MemtableVlogRecorder {
 
     pub(crate) fn read_pointer(
         &self,
-        memtable: &HashMemtable,
+        memtable: &impl Memtable,
         pointer: VlogPointer,
     ) -> Result<Option<Bytes>> {
         if pointer.file_seq() != self.file_seq {
@@ -217,7 +217,7 @@ fn ensure_active_recorder<'a>(
 pub(crate) fn rewrite_ref_value_for_memtable<'a>(
     value: &'a RefValue<'a>,
     vlog_store: &Arc<VlogStore>,
-    memtable: &mut HashMemtable,
+    memtable: &mut impl Memtable,
     recorder: &mut Option<MemtableVlogRecorder>,
     num_columns: usize,
 ) -> Result<Option<RewrittenValuePlan<'a>>> {

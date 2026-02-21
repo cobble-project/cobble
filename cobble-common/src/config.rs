@@ -78,6 +78,15 @@ pub enum CompactionPolicyKind {
     MinOverlap,
 }
 
+/// Memtable implementation selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemtableType {
+    #[default]
+    Hash,
+    Vec,
+}
+
 /// Volume usage classification.
 /// Used to indicate which volumes support which kinds of data.
 #[repr(u8)]
@@ -182,6 +191,8 @@ pub struct Config {
     pub memtable_capacity: usize,
     /// Number of memtable buffers to keep in memory.
     pub memtable_buffer_count: usize,
+    /// Memtable implementation type.
+    pub memtable_type: MemtableType,
     /// Number of columns in the value schema.
     pub num_columns: usize,
     /// Maximum number of L0 files before triggering compaction.
@@ -246,6 +257,7 @@ impl Default for Config {
             volumes: VolumeDescriptor::single_volume("file:///tmp/cobble".to_string()),
             memtable_capacity: 64 * 1024 * 1024,
             memtable_buffer_count: 2,
+            memtable_type: MemtableType::Hash,
             num_columns: 1,
             l0_file_limit: 4,
             write_stall_limit: None,
@@ -357,7 +369,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ReadProxyConfigEntry, VolumeDescriptor, VolumeUsageKind};
+    use super::{Config, MemtableType, ReadProxyConfigEntry, VolumeDescriptor, VolumeUsageKind};
     use crate::SstCompressionAlgorithm;
     use std::io::Write;
     use std::path::PathBuf;
@@ -375,6 +387,7 @@ mod tests {
             )],
             memtable_capacity: 1024,
             memtable_buffer_count: 3,
+            memtable_type: MemtableType::Vec,
             num_columns: 2,
             l0_file_limit: 5,
             write_stall_limit: Some(12),
@@ -427,6 +440,7 @@ mod tests {
         assert!(decoded.volumes[0].supports(VolumeUsageKind::PrimaryDataPriorityHigh));
         assert!(decoded.volumes[0].supports(VolumeUsageKind::Meta));
         assert_eq!(decoded.memtable_capacity, 1024);
+        assert_eq!(decoded.memtable_type, MemtableType::Vec);
         assert_eq!(decoded.write_stall_limit, Some(12));
         assert_eq!(
             decoded.compaction_policy,

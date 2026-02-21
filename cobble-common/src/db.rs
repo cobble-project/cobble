@@ -589,6 +589,7 @@ impl Db {
             MemtableManagerOptions {
                 memtable_capacity: config.memtable_capacity,
                 buffer_count: config.memtable_buffer_count,
+                memtable_type: config.memtable_type,
                 sst_options,
                 file_builder_factory: None,
                 num_columns: config.num_columns,

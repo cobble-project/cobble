@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
 
+use crate::config::MemtableType;
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{DbState, DbStateHandle};
 use crate::error::{Error, Result};
@@ -10,9 +11,9 @@ use crate::file::{FileManager, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator};
 use crate::lsm::LSMTree;
-use crate::memtable::Memtable;
-use crate::memtable::hash::{HashMemtable, MemtableReclaimer};
 use crate::memtable::vlog::{MemtableVlogRecorder, rewrite_ref_value_for_memtable};
+use crate::memtable::{HashMemtable, VecMemtable};
+use crate::memtable::{Memtable, MemtableImpl, MemtableReclaimer};
 use crate::metrics_manager::MetricsManager;
 use crate::snapshot::SnapshotManager;
 use crate::sst::{SSTWriter, SSTWriterOptions};
@@ -35,6 +36,7 @@ pub(crate) struct MemtableManagerOptions {
     pub(crate) sst_options: SSTWriterOptions,
     pub(crate) file_builder_factory: Option<Arc<FileBuilderFactory>>,
     pub(crate) num_columns: usize,
+    pub(crate) memtable_type: MemtableType,
     pub(crate) write_stall_limit: usize,
     pub(crate) auto_snapshot_manager: Option<SnapshotManager>,
     pub(crate) metrics_manager: Option<Arc<MetricsManager>>,
@@ -71,6 +73,7 @@ impl Default for MemtableManagerOptions {
             },
             file_builder_factory: None,
             num_columns: 1,
+            memtable_type: MemtableType::Hash,
             write_stall_limit: 8,
             auto_snapshot_manager: None,
             metrics_manager: None,
@@ -90,6 +93,7 @@ pub(crate) struct MemtableManager {
     db_state: Arc<DbStateHandle>,
     vlog_store: Arc<VlogStore>,
     memtable_capacity: usize,
+    memtable_type: MemtableType,
     reclaimer: MemtableReclaimer,
     write_stall_limit: usize,
     flush_tx: Mutex<Option<mpsc::Sender<FlushJob>>>,
@@ -107,7 +111,7 @@ struct MemtableManagerState {
 
 struct FlushJob {
     seq: u64,
-    memtable: Option<Arc<HashMemtable>>,
+    memtable: Option<Arc<MemtableImpl>>,
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
     snapshot: Option<SnapshotCompletion>,
 }
@@ -119,7 +123,7 @@ pub(crate) struct SnapshotCompletion {
 
 pub(crate) struct ActiveMemtable {
     seq: u64,
-    memtable: Option<HashMemtable>,
+    memtable: Option<MemtableImpl>,
     vlog_recorder: Option<MemtableVlogRecorder>,
 }
 
@@ -132,7 +136,7 @@ struct ActiveMemtableCheckpoint {
 #[derive(Clone)]
 pub(crate) struct ImmutableMemtable {
     pub(crate) seq: u64,
-    memtable: Arc<HashMemtable>,
+    memtable: Arc<MemtableImpl>,
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
 }
 
@@ -199,6 +203,7 @@ impl MemtableManager {
             Arc::clone(&buffer_ready),
             Arc::clone(&db_state),
             options.memtable_capacity,
+            options.memtable_type,
         );
         let file_builder_factory = options
             .file_builder_factory
@@ -217,6 +222,7 @@ impl MemtableManager {
                 &mut state_guard,
                 &db_state,
                 options.memtable_capacity,
+                options.memtable_type,
                 &reclaimer,
             );
         }
@@ -243,6 +249,7 @@ impl MemtableManager {
             db_state,
             vlog_store,
             memtable_capacity: options.memtable_capacity,
+            memtable_type: options.memtable_type,
             reclaimer,
             write_stall_limit: options.write_stall_limit,
             flush_tx: Mutex::new(Some(flush_tx)),
@@ -286,7 +293,7 @@ impl MemtableManager {
                         let keep_memtable_alive = Arc::clone(&memtable);
                         let result = flush_memtable(
                             job.seq,
-                            memtable,
+                            memtable.as_ref(),
                             job.vlog_recorder,
                             Arc::clone(&file_manager_clone),
                             Arc::clone(&file_builder_factory_clone),
@@ -357,21 +364,31 @@ impl MemtableManager {
         state: &mut MemtableManagerState,
         db_state: &Arc<DbStateHandle>,
         memtable_capacity: usize,
+        memtable_type: MemtableType,
         reclaimer: &MemtableReclaimer,
     ) {
         let _guard = db_state.lock();
         let snapshot = db_state.load();
         if snapshot.active.is_none() && state.free_budget >= memtable_capacity as u64 {
-            let buffer = vec![0u8; memtable_capacity];
-            state.free_budget = state.free_budget.saturating_sub(buffer.len() as u64);
+            state.free_budget = state.free_budget.saturating_sub(memtable_capacity as u64);
             let seq = state.next_seq;
             state.next_seq += 1;
-            let active = Arc::new(Mutex::new(ActiveMemtable {
-                seq,
-                memtable: Some(HashMemtable::with_buffer_and_reclaimer(
-                    buffer,
+            let memtable = match memtable_type {
+                MemtableType::Hash => {
+                    let buffer = vec![0u8; memtable_capacity];
+                    MemtableImpl::Hash(HashMemtable::with_buffer_and_reclaimer(
+                        buffer,
+                        reclaimer.clone(),
+                    ))
+                }
+                MemtableType::Vec => MemtableImpl::Vec(VecMemtable::with_capacity_and_reclaimer(
+                    memtable_capacity,
                     reclaimer.clone(),
                 )),
+            };
+            let active = Arc::new(Mutex::new(ActiveMemtable {
+                seq,
+                memtable: Some(memtable),
                 vlog_recorder: None,
             }));
             db_state.cas_mutate(snapshot.seq_id, |db_state, snapshot| {
@@ -394,6 +411,7 @@ impl MemtableManager {
         buffer_ready: Arc<Condvar>,
         db_state: Arc<DbStateHandle>,
         memtable_capacity: usize,
+        memtable_type: MemtableType,
     ) -> MemtableReclaimer {
         let state = Arc::downgrade(&state);
         let buffer_ready = Arc::downgrade(&buffer_ready);
@@ -417,9 +435,16 @@ impl MemtableManager {
                 Arc::clone(&buffer_ready),
                 Arc::clone(&db_state),
                 memtable_capacity,
+                memtable_type,
             );
             // try to make a new active buffer
-            Self::make_active_buffer(&mut guard, &db_state, memtable_capacity, &reclaimer);
+            Self::make_active_buffer(
+                &mut guard,
+                &db_state,
+                memtable_capacity,
+                memtable_type,
+                &reclaimer,
+            );
             // notify waiters
             buffer_ready.notify_all();
         })
@@ -692,6 +717,7 @@ impl MemtableManager {
                 &mut state,
                 &self.db_state,
                 self.memtable_capacity,
+                self.memtable_type,
                 &self.reclaimer,
             );
             state.in_flight += 1;
@@ -782,7 +808,7 @@ impl Drop for MemtableManager {
 #[allow(clippy::too_many_arguments)]
 fn flush_memtable(
     seq: u64,
-    memtable: Arc<HashMemtable>,
+    memtable: &impl Memtable,
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
     file_manager: Arc<FileManager>,
     file_builder_factory: Arc<FileBuilderFactory>,
@@ -796,7 +822,7 @@ fn flush_memtable(
         && recorder.has_entries()
     {
         let (mut writer, mut edit) = vlog_store.create_writer_for_seq(recorder.file_seq())?;
-        recorder.flush_to_writer(memtable.as_ref(), &mut writer)?;
+        recorder.flush_to_writer(memtable, &mut writer)?;
         edit.add_entry_delta(recorder.file_seq(), recorder.entry_count() as i64);
         writer.close()?;
         vlog_edit = Some(edit);
@@ -927,6 +953,7 @@ fn make_sst_builder_factory(options: SSTWriterOptions) -> FileBuilderFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MemtableType;
     use crate::file::{FileManager, FileSystemRegistry};
     use crate::sst::row_codec::{decode_value, encode_value};
     use crate::sst::{SSTIterator, SSTIteratorOptions, SSTWriterOptions};
@@ -1159,6 +1186,55 @@ mod tests {
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
         assert_eq!(lsm_tree.level_files(0).len(), 2);
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_vec_memtable_triggers_flush_on_full() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(crate::lsm::LSMTree::with_state(
+            Arc::new(crate::db_state::DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
+        let manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                initial_seq: 0,
+                memtable_capacity: 192,
+                buffer_count: 2,
+                memtable_type: MemtableType::Vec,
+                sst_options: SSTWriterOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTWriterOptions::default()
+                },
+                file_builder_factory: None,
+                num_columns: 1,
+                write_stall_limit: 8,
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let num_columns = 1;
+        let encoded = encode_value(
+            &Value::new(vec![Some(Column::new(ValueType::Put, vec![b'v'; 96]))]),
+            num_columns,
+        );
+        manager.put(b"k1", &encoded).unwrap();
+        manager.put(b"k2", &encoded).unwrap();
+
+        let results = manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        assert_eq!(lsm_tree.level_files(0).len(), 1);
         cleanup_test_root();
     }
 }

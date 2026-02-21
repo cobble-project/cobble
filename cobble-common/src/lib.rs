@@ -32,7 +32,7 @@ mod vlog;
 mod write_batch;
 
 pub use compaction::RemoteCompactionServer;
-pub use config::{CompactionPolicyKind, Config, VolumeDescriptor, VolumeUsageKind};
+pub use config::{CompactionPolicyKind, Config, MemtableType, VolumeDescriptor, VolumeUsageKind};
 pub use db::{Db, ReadOptions};
 pub use metrics_manager::MetricsManager;
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
