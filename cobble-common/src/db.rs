@@ -291,7 +291,7 @@ impl Db {
         columns[column_idx] = Some(column);
         let record = RefValue::new_with_expired_at(columns, expired_at);
         let key = RefKey::new(0, key.as_ref());
-        self.memtable_manager.put_ref(&key, &record)
+        self.memtable_manager.put(&key, &record)
     }
 
     /// Insert a single key/value pair into the given column.
@@ -402,7 +402,7 @@ impl Db {
                 })
                 .collect();
             let value_ref = RefValue::new_with_expired_at(columns, value.expired_at());
-            self.memtable_manager.put_ref(&key, &value_ref)?;
+            self.memtable_manager.put(&key, &value_ref)?;
         }
         Ok(())
     }

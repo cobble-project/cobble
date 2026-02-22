@@ -4,7 +4,8 @@ use crate::memtable::iter::OrderedMemtableKvIterator;
 use crate::memtable::vlog::{RewrittenValuePlan, encode_rewritten_value};
 use crate::memtable::{Memtable, MemtableReclaimer};
 use crate::sst::row_codec::{encode_key_ref_into, encode_value_ref_into};
-use crate::r#type::{RefKey, RefValue};
+use crate::r#type::{RefKey, RefValue, ValueType};
+use crate::vlog::VlogStore;
 use bytes::{Bytes, BytesMut};
 use std::collections::BTreeMap;
 
@@ -46,6 +47,26 @@ impl VecMemtable {
 
     fn entry_size(key_len: usize, value_len: usize) -> usize {
         4 + 4 + key_len + value_len
+    }
+
+    pub(crate) fn estimate_capacity_for_ref(
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+        vlog_store: &VlogStore,
+    ) -> usize {
+        let key_len = key.encoded_len();
+        let value_len = value.encoded_len(num_columns);
+        let mut blob_bytes = 0usize;
+        for column in value.columns().iter().take(num_columns).flatten() {
+            if !matches!(column.value_type, ValueType::Put | ValueType::Merge) {
+                continue;
+            }
+            if vlog_store.should_separate(column.data().len()) {
+                blob_bytes = blob_bytes.saturating_add(4 + column.data().len());
+            }
+        }
+        Self::entry_size(key_len, value_len).saturating_add(blob_bytes)
     }
 
     fn has_space(&self, needed: usize) -> Result<()> {

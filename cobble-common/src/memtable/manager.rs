@@ -6,6 +6,7 @@ use std::thread::JoinHandle;
 use crate::config::MemtableType;
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{DbState, DbStateHandle};
+use crate::error::Error::InvalidState;
 use crate::error::{Error, Result};
 use crate::file::{FileManager, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
@@ -93,6 +94,7 @@ pub(crate) struct MemtableManager {
     db_state: Arc<DbStateHandle>,
     vlog_store: Arc<VlogStore>,
     memtable_capacity: usize,
+    total_budget: i64,
     memtable_type: MemtableType,
     reclaimer: MemtableReclaimer,
     write_stall_limit: usize,
@@ -103,7 +105,8 @@ pub(crate) struct MemtableManager {
 }
 
 struct MemtableManagerState {
-    free_budget: u64,
+    budget: i64,
+    allow_make_active_buffer_in_reclaimer: bool,
     in_flight: usize,
     next_seq: u64,
     flush_results: BTreeMap<u64, Result<MemtableFlushResult>>,
@@ -177,8 +180,12 @@ impl MemtableManager {
                 "buffer_count must be greater than 0".to_string(),
             ));
         }
+        let total_budget =
+            (options.buffer_count as u64).saturating_mul(options.memtable_capacity as u64);
+        let total_budget = total_budget.min(i64::MAX as u64) as i64;
         let state = MemtableManagerState {
-            free_budget: (options.buffer_count as u64) * (options.memtable_capacity as u64),
+            budget: total_budget,
+            allow_make_active_buffer_in_reclaimer: true,
             in_flight: 0,
             next_seq: options.initial_seq,
             flush_results: BTreeMap::new(),
@@ -224,6 +231,8 @@ impl MemtableManager {
                 options.memtable_capacity,
                 options.memtable_type,
                 &reclaimer,
+                total_budget,
+                false,
             );
         }
         // Initialize the flush worker
@@ -249,6 +258,7 @@ impl MemtableManager {
             db_state,
             vlog_store,
             memtable_capacity: options.memtable_capacity,
+            total_budget,
             memtable_type: options.memtable_type,
             reclaimer,
             write_stall_limit: options.write_stall_limit,
@@ -366,11 +376,20 @@ impl MemtableManager {
         memtable_capacity: usize,
         memtable_type: MemtableType,
         reclaimer: &MemtableReclaimer,
+        total_budget: i64,
+        allow_overcommit: bool,
     ) {
         let _guard = db_state.lock();
         let snapshot = db_state.load();
-        if snapshot.active.is_none() && state.free_budget >= memtable_capacity as u64 {
-            state.free_budget = state.free_budget.saturating_sub(memtable_capacity as u64);
+        let budget_need = (memtable_capacity as u64).min(i64::MAX as u64) as i64;
+        if snapshot.active.is_none() {
+            let has_budget = state.budget >= budget_need;
+            let can_overcommit =
+                allow_overcommit && budget_need > total_budget && state.in_flight == 0;
+            if !has_budget && !can_overcommit {
+                return;
+            }
+            state.budget -= budget_need;
             let seq = state.next_seq;
             state.next_seq += 1;
             let memtable = match memtable_type {
@@ -428,7 +447,8 @@ impl MemtableManager {
                 return;
             };
             let mut guard = state.lock().unwrap();
-            guard.free_budget = guard.free_budget.saturating_add(returned);
+            let returned_budget = returned.min(i64::MAX as u64) as i64;
+            guard.budget = guard.budget.saturating_add(returned_budget);
             // reuse the same reclaimer since it captures nothing by reference
             let reclaimer = Self::make_reclaimer(
                 Arc::clone(&state),
@@ -438,52 +458,24 @@ impl MemtableManager {
                 memtable_type,
             );
             // try to make a new active buffer
-            Self::make_active_buffer(
-                &mut guard,
-                &db_state,
-                memtable_capacity,
-                memtable_type,
-                &reclaimer,
-            );
+            if guard.allow_make_active_buffer_in_reclaimer {
+                Self::make_active_buffer(
+                    &mut guard,
+                    &db_state,
+                    memtable_capacity,
+                    memtable_type,
+                    &reclaimer,
+                    (memtable_capacity as u64).min(i64::MAX as u64) as i64,
+                    false,
+                );
+            }
             // notify waiters
             buffer_ready.notify_all();
         })
     }
 
-    pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        loop {
-            // Wait for an active memtable to be available.
-            if self.db_state.load().active.is_none() {
-                let mut state = self.state.lock().unwrap();
-                while self.db_state.load().active.is_none() {
-                    state = self.buffer_ready.wait(state).unwrap();
-                }
-                drop(state);
-            }
-            let active = self
-                .db_state
-                .load()
-                .active
-                .clone()
-                .expect("active memtable exists");
-            let mut active = active.lock().unwrap();
-            let memtable = active.memtable.as_mut().expect("active memtable exists");
-            match memtable.put(key, value) {
-                Ok(()) => return Ok(()),
-                Err(Error::MemtableFull { needed, remaining }) => {
-                    if memtable.is_empty() {
-                        return Err(Error::MemtableFull { needed, remaining });
-                    }
-                    drop(active);
-                    self.flush_active()?;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-    }
-
     /// Puts a key-value pair into the active memtable using reference types to avoid extra copy.
-    pub(crate) fn put_ref(&self, key: &RefKey<'_>, value: &RefValue<'_>) -> Result<()> {
+    pub(crate) fn put(&self, key: &RefKey<'_>, value: &RefValue<'_>) -> Result<()> {
         loop {
             // Wait for an active memtable to be available.
             if self.db_state.load().active.is_none() {
@@ -524,7 +516,7 @@ impl MemtableManager {
             let rewrite_plan = match rewrite_result {
                 Ok(rewritten) => rewritten,
                 Err(err) => {
-                    self.handle_memtable_put_error(&err, active, checkpoint)?;
+                    self.handle_memtable_put_error(&err, active, checkpoint, key, value)?;
                     continue;
                 }
             };
@@ -539,10 +531,81 @@ impl MemtableManager {
             match put_result {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    self.handle_memtable_put_error(&err, active, checkpoint)?;
+                    self.handle_memtable_put_error(&err, active, checkpoint, key, value)?;
                 }
             }
         }
+    }
+
+    fn allocate_one_key_value_special_vec_memtable_as_active(
+        &self,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+    ) -> Result<bool> {
+        let capacity = VecMemtable::estimate_capacity_for_ref(
+            key,
+            value,
+            self.num_columns,
+            self.vlog_store.as_ref(),
+        );
+        {
+            // Disallow other reclaimer calls to make active buffer
+            // while we are trying to allocate a special memtable.
+            let mut state = self.state.lock().unwrap();
+            state.allow_make_active_buffer_in_reclaimer = false;
+        }
+        {
+            // Release the current active memtable if exists to free up budget.
+            let _guard = self.db_state.lock();
+            let snapshot = self.db_state.load();
+            let Some(active) = snapshot.active.as_ref() else {
+                let mut state = self.state.lock().unwrap();
+                state.allow_make_active_buffer_in_reclaimer = true;
+                return Ok(false);
+            };
+            let mut active = active.lock().unwrap();
+            let old_memtable = active.memtable.take();
+            active.vlog_recorder = None;
+            drop(active);
+            self.db_state
+                .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
+                    Some(DbState::new(
+                        db_state,
+                        snapshot.lsm_version.clone(),
+                        snapshot.vlog_version.clone(),
+                        None,
+                        snapshot.immutables.clone(),
+                    ))
+                });
+            drop(old_memtable);
+        }
+        // Try to make a new active buffer with just enough capacity for the single key-value pair.
+        let mut state = self.state.lock().unwrap();
+        loop {
+            Self::make_active_buffer(
+                &mut state,
+                &self.db_state,
+                capacity,
+                MemtableType::Vec,
+                &self.reclaimer,
+                self.total_budget,
+                true,
+            );
+            if self.db_state.load().active.is_some() {
+                break;
+            }
+            if state.in_flight == 0 {
+                state.allow_make_active_buffer_in_reclaimer = true;
+                return Err(InvalidState(
+                    "failed to allocate special active vec memtable".to_string(),
+                ));
+            }
+            state = self.buffer_ready.wait(state).unwrap();
+        }
+        // Allow reclaimer to make active buffer again for future flushes.
+        state.allow_make_active_buffer_in_reclaimer = true;
+        drop(state);
+        Ok(true)
     }
 
     fn handle_memtable_put_error(
@@ -550,30 +613,35 @@ impl MemtableManager {
         err: &Error,
         mut active: MutexGuard<ActiveMemtable>,
         checkpoint: ActiveMemtableCheckpoint,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
     ) -> Result<()> {
         match err {
-            Error::MemtableFull { needed, remaining } => {
+            Error::MemtableFull {
+                needed: _needed,
+                remaining: _remaining,
+            } => {
+                active.restore_checkpoint(checkpoint);
                 if active
                     .memtable
                     .as_ref()
                     .expect("active memtable exists")
                     .is_empty()
                 {
-                    return Err(Error::MemtableFull {
-                        needed: *needed,
-                        remaining: *remaining,
-                    });
+                    drop(active);
+                    self.allocate_one_key_value_special_vec_memtable_as_active(key, value)?;
+                } else {
+                    // flush active memtable and retry
+                    drop(active);
+                    self.flush_active()?;
                 }
-                // flush active memtable and retry
-                drop(active);
-                self.flush_active()?;
-                Ok(())
             }
             _ => {
                 active.restore_checkpoint(checkpoint);
-                Err(err.clone())
+                return Err(err.clone());
             }
         }
+        Ok(())
     }
 
     /// Gets all values associated with the given key.
@@ -719,6 +787,8 @@ impl MemtableManager {
                 self.memtable_capacity,
                 self.memtable_type,
                 &self.reclaimer,
+                self.total_budget,
+                false,
             );
             state.in_flight += 1;
             FlushJob {
@@ -955,9 +1025,9 @@ mod tests {
     use super::*;
     use crate::config::MemtableType;
     use crate::file::{FileManager, FileSystemRegistry};
-    use crate::sst::row_codec::{decode_value, encode_value};
+    use crate::sst::row_codec::decode_value;
     use crate::sst::{SSTIterator, SSTIteratorOptions, SSTWriterOptions};
-    use crate::r#type::{Column, Value, ValueType};
+    use crate::r#type::ValueType;
     use crate::r#type::{RefColumn, RefKey, RefValue};
     use crate::vlog::VlogStore;
 
@@ -1000,22 +1070,15 @@ mod tests {
         .unwrap();
 
         let num_columns = 1;
-        let old = encode_value(
-            &Value::new(vec![Some(Column::new(ValueType::Put, b"old".to_vec()))]),
-            num_columns,
-        );
-        let new = encode_value(
-            &Value::new(vec![Some(Column::new(ValueType::Put, b"new".to_vec()))]),
-            num_columns,
-        );
-        let v1 = encode_value(
-            &Value::new(vec![Some(Column::new(ValueType::Put, b"v1".to_vec()))]),
-            num_columns,
-        );
+        let key_a = RefKey::new(0, b"a");
+        let key_b = RefKey::new(0, b"b");
+        let old = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"old"))]);
+        let new = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"new"))]);
+        let v1 = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"v1"))]);
 
-        manager.put(b"a", &old).unwrap();
-        manager.put(b"a", &new).unwrap();
-        manager.put(b"b", &v1).unwrap();
+        manager.put(&key_a, &old).unwrap();
+        manager.put(&key_a, &new).unwrap();
+        manager.put(&key_b, &v1).unwrap();
 
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
@@ -1055,8 +1118,8 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                (Bytes::from("a"), Bytes::from("new")),
-                (Bytes::from("b"), Bytes::from("v1"))
+                (Bytes::from_static(b"\0\0a"), Bytes::from("new")),
+                (Bytes::from_static(b"\0\0b"), Bytes::from("v1"))
             ]
         );
         cleanup_test_root();
@@ -1099,7 +1162,7 @@ mod tests {
             ValueType::Put,
             b"value-larger-than-threshold",
         ))]);
-        manager.put_ref(&key, &value).unwrap();
+        manager.put(&key, &value).unwrap();
 
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
@@ -1162,26 +1225,17 @@ mod tests {
         )
         .unwrap();
 
-        let num_columns = 1;
-        let v1 = encode_value(
-            &Value::new(vec![Some(Column::new(ValueType::Put, b"v1".to_vec()))]),
-            num_columns,
-        );
-        manager.put(b"k1", &v1).unwrap();
+        let key1 = RefKey::new(0, b"k1");
+        let v1 = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"v1"))]);
+        manager.put(&key1, &v1).unwrap();
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
         assert_eq!(lsm_tree.level_files(0).len(), 1);
-        {
-            let state = manager.state.lock().unwrap();
-            assert!(state.free_budget >= 256);
-        }
 
-        let v2 = encode_value(
-            &Value::new(vec![Some(Column::new(ValueType::Put, b"v2".to_vec()))]),
-            num_columns,
-        );
-        manager.put(b"k2", &v2).unwrap();
+        let key2 = RefKey::new(0, b"k2");
+        let v2 = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"v2"))]);
+        manager.put(&key2, &v2).unwrap();
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
@@ -1224,17 +1278,63 @@ mod tests {
         )
         .unwrap();
 
-        let num_columns = 1;
-        let encoded = encode_value(
-            &Value::new(vec![Some(Column::new(ValueType::Put, vec![b'v'; 96]))]),
-            num_columns,
-        );
-        manager.put(b"k1", &encoded).unwrap();
-        manager.put(b"k2", &encoded).unwrap();
+        let key1 = RefKey::new(0, b"k1");
+        let key2 = RefKey::new(0, b"k2");
+        let large_value = vec![b'v'; 96];
+        let value = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, &large_value))]);
+        manager.put(&key1, &value).unwrap();
+        manager.put(&key2, &value).unwrap();
 
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
         assert_eq!(lsm_tree.level_files(0).len(), 1);
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_oversized_put_ref_uses_special_vec_memtable_and_can_overcommit_budget() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(crate::lsm::LSMTree::with_state(
+            Arc::new(crate::db_state::DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
+        let manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                initial_seq: 0,
+                memtable_capacity: 128,
+                buffer_count: 1,
+                memtable_type: MemtableType::Hash,
+                file_builder_factory: None,
+                num_columns: 1,
+                write_stall_limit: 8,
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let key = RefKey::new(0, b"k1");
+        let big_value = vec![b'x'; 1024];
+        let value = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, &big_value))]);
+        manager.put(&key, &value).unwrap();
+        manager.flush_active().unwrap();
+
+        let results = manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        assert_eq!(lsm_tree.level_files(0).len(), 1);
+
+        let state = manager.state.lock().unwrap();
+        assert_eq!(state.in_flight, 0);
+        assert_eq!(state.budget, 0);
         cleanup_test_root();
     }
 }

@@ -13,6 +13,8 @@ pub enum Error {
     ConfigError(String),
     #[error("Input error: {0}")]
     InputError(String),
+    #[error("Internal state error: {0}")]
+    InvalidState(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
