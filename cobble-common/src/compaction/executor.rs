@@ -266,7 +266,12 @@ impl CompactionExecutor {
         };
         for run in &task.sorted_runs {
             for file in run.files() {
-                let reader = task.file_manager.open_data_file_reader(file.file_id)?;
+                read_bytes = read_bytes.saturating_add(file.size as u64);
+            }
+            let file_manager = Arc::clone(&task.file_manager);
+            let sst_options = sst_options.clone();
+            let run_iter = run.iter(move |file| {
+                let reader = file_manager.open_data_file_reader(file.file_id)?;
                 let reader: Box<dyn crate::file::RandomAccessFile> = if use_read_ahead {
                     Box::new(ReadAheadBufferedReader::new(
                         reader,
@@ -275,17 +280,15 @@ impl CompactionExecutor {
                 } else {
                     Box::new(reader)
                 };
-                // Create iterators for all files in all sorted runs
-                // We iterate files from all sorted runs, with earlier runs (newer data) coming first
                 let iter = crate::sst::SSTIterator::with_cache_and_file(
                     reader,
-                    file.as_ref(),
+                    file,
                     sst_options.clone(),
                     None,
                 )?;
-                all_iters.push(Box::new(iter));
-                read_bytes = read_bytes.saturating_add(file.size as u64);
-            }
+                Ok(Box::new(iter) as Box<dyn for<'a> KvIterator<'a>>)
+            });
+            all_iters.push(Box::new(run_iter));
         }
         task.metrics.read_bytes_total.increment(read_bytes);
 
