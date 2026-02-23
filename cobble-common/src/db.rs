@@ -1,3 +1,4 @@
+use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::error::{Error, Result};
 use crate::file::{FileManager, FileSystemRegistry};
 use crate::lsm::LSMTree;
@@ -13,10 +14,10 @@ use crate::r#type::decode_merge_separated_array;
 use crate::r#type::{Column, Key, RefColumn, RefKey, RefValue, Value, ValueType};
 use crate::vlog::{VlogPointer, VlogStore};
 use crate::write_batch::{WriteBatch, WriteOp};
-use crate::{Config, TimeProvider};
+use crate::{Config, ReadOptions, ScanOptions, TimeProvider};
 use bytes::{Bytes, BytesMut};
 use log::info;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -38,99 +39,6 @@ pub struct Db {
     num_columns: usize,
     time_provider: Arc<dyn TimeProvider>,
     ttl_provider: Arc<TTLProvider>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ReadOptions {
-    pub column_indices: Option<Vec<usize>>,
-    max_index: Option<usize>,
-    cached_masks: Arc<Mutex<Option<ReadOptionsMasks>>>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ReadOptionsMasks {
-    pub(crate) num_columns: usize,
-    pub(crate) selected_mask: Option<Arc<[u8]>>,
-    pub(crate) base_mask: Arc<[u8]>,
-}
-
-impl Default for ReadOptions {
-    fn default() -> Self {
-        Self {
-            column_indices: None,
-            max_index: None,
-            cached_masks: Arc::new(Mutex::new(None)),
-        }
-    }
-}
-
-impl ReadOptions {
-    pub fn for_column(column_index: usize) -> Self {
-        Self::new_with_indices(Some(vec![column_index]))
-    }
-
-    pub fn for_columns(column_indices: Vec<usize>) -> Self {
-        Self::new_with_indices(Some(column_indices))
-    }
-
-    fn new_with_indices(column_indices: Option<Vec<usize>>) -> Self {
-        let max_index = column_indices
-            .as_ref()
-            .and_then(|indices| indices.iter().max().cloned());
-        Self {
-            column_indices,
-            max_index,
-            cached_masks: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub(crate) fn columns(&self) -> Option<&[usize]> {
-        self.column_indices.as_deref()
-    }
-
-    pub(crate) fn max_index(&self) -> Option<usize> {
-        self.max_index
-    }
-
-    pub(crate) fn masks(&self, num_columns: usize) -> ReadOptionsMasks {
-        let mut guard = self.cached_masks.lock().unwrap();
-        if guard
-            .as_ref()
-            .map(|mask| mask.num_columns != num_columns)
-            .unwrap_or(true)
-        {
-            *guard = Some(self.build_masks(num_columns));
-        }
-        guard.as_ref().expect("cached mask initialized").clone()
-    }
-
-    fn build_masks(&self, num_columns: usize) -> ReadOptionsMasks {
-        let mask_size = num_columns.div_ceil(8).max(1);
-        let last_bits = (num_columns - 1) % 8 + 1;
-        let last_mask = (1u8 << last_bits) - 1;
-        let selected_mask = self.column_indices.as_ref().map(|columns| {
-            let mut mask = vec![0u8; mask_size];
-            for &column_idx in columns {
-                if column_idx < num_columns {
-                    mask[column_idx / 8] |= 1 << (column_idx % 8);
-                }
-            }
-            mask[mask_size - 1] &= last_mask;
-            Arc::from(mask.into_boxed_slice())
-        });
-        let base_mask = if let Some(mask) = selected_mask.as_ref() {
-            Arc::clone(mask)
-        } else {
-            let mut mask = vec![0xFF; mask_size];
-            mask[mask_size - 1] &= last_mask;
-            Arc::from(mask.into_boxed_slice())
-        };
-        ReadOptionsMasks {
-            num_columns,
-            selected_mask,
-            base_mask,
-        }
-    }
 }
 
 pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<Bytes>>>> {
@@ -715,6 +623,41 @@ impl Db {
         })
     }
 
+    pub fn scan<'a>(
+        &'a self,
+        bucket: u16,
+        range: std::ops::Range<&[u8]>,
+        options: &ScanOptions,
+    ) -> Result<DbIterator<'a>> {
+        let snapshot = self.memtable_manager.db_state().load();
+        let memtable_iters = self
+            .memtable_manager
+            .scan_memtable_iterators_with_snapshot(Arc::clone(&snapshot))?;
+        let lsm_iters = self.lsm_tree.scan_with_snapshot(
+            &self.file_manager,
+            Arc::clone(&snapshot),
+            self.num_columns,
+            options.read_ahead_bytes,
+        )?;
+        let encode_scan_key = |key: &[u8]| encode_key(&Key::new(bucket, key.to_vec()));
+        let start_key = encode_scan_key(range.start);
+        let end_bound = Some((encode_scan_key(range.end), false));
+        let mut iter = DbIterator::new(
+            memtable_iters,
+            lsm_iters,
+            DbIteratorOptions {
+                end_bound,
+                snapshot,
+                memtable_manager: &self.memtable_manager,
+                vlog_store: Arc::clone(&self.vlog_store),
+                ttl_provider: Arc::clone(&self.ttl_provider),
+                num_columns: self.num_columns,
+            },
+        );
+        iter.seek(start_key.as_ref())?;
+        Ok(iter)
+    }
+
     /// Set the current time for TTL evaluation (manual time provider only).
     pub fn set_time(&self, next: u32) {
         self.time_provider.set_time(next);
@@ -730,7 +673,7 @@ impl Drop for Db {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::VolumeDescriptor;
+    use crate::{ReadOptions, ScanOptions, VolumeDescriptor};
     use serial_test::serial;
 
     fn cleanup_test_root(path: &str) {
@@ -1151,6 +1094,112 @@ mod tests {
         assert_eq!(value.len(), 2);
         assert_eq!(value[0].as_ref().unwrap().as_ref(), b"c1");
         assert_eq!(value[1].as_ref().unwrap().as_ref(), b"c0");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_scan_range_merges_memtable_and_l0() {
+        let root = "/tmp/db_scan_range";
+        cleanup_test_root(root);
+        let config = config_with_small_memtable(root);
+        let db = Db::open(config).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"k1", 0, b"old".to_vec());
+        batch.put(b"z1", 0, vec![b'a'; 64]);
+        db.write_batch(batch).unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        db.put(b"k1", 0, b"new").unwrap();
+        db.put(b"k2", 0, b"v2").unwrap();
+
+        let mut iter = db
+            .scan(
+                0,
+                b"k1".as_slice()..b"k3".as_slice(),
+                &ScanOptions::default(),
+            )
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = iter.next() {
+            let (key, columns) = row.unwrap();
+            rows.push((key, columns[0].clone()));
+        }
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.as_ref(), b"k1");
+        assert_eq!(rows[0].1.as_ref().unwrap().as_ref(), b"new");
+        assert_eq!(rows[1].0.as_ref(), b"k2");
+        assert_eq!(rows[1].1.as_ref().unwrap().as_ref(), b"v2");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_scan_holds_snapshot_until_drop() {
+        let root = "/tmp/db_scan_snapshot";
+        cleanup_test_root(root);
+        let config = config_with_small_memtable(root);
+        let db = Db::open(config).unwrap();
+
+        db.put(b"k1", 0, b"old").unwrap();
+        let mut iter = db
+            .scan(
+                0,
+                b"".as_slice()..b"\xff".as_slice(),
+                &ScanOptions::default(),
+            )
+            .unwrap();
+        db.put(b"k1", 0, b"new").unwrap();
+
+        let (key, columns) = iter.next().unwrap().unwrap();
+        assert_eq!(key.as_ref(), b"k1");
+        assert_eq!(columns[0].as_ref().unwrap().as_ref(), b"old");
+        assert!(iter.next().is_none());
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_scan_with_read_ahead_option() {
+        let root = "/tmp/db_scan_read_ahead";
+        cleanup_test_root(root);
+        let config = config_with_small_memtable(root);
+        let db = Db::open(config).unwrap();
+
+        db.put(b"k1", 0, b"v1").unwrap();
+        db.put(b"k2", 0, b"v2").unwrap();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut iter = db
+                .scan(
+                    0,
+                    b"".as_slice()..b"\xff".as_slice(),
+                    &ScanOptions {
+                        read_ahead_bytes: 128,
+                    },
+                )
+                .unwrap();
+            let mut keys = Vec::new();
+            while let Some(row) = iter.next() {
+                let (key, _) = row.unwrap();
+                keys.push(key);
+            }
+            assert_eq!(keys.len(), 2);
+            assert_eq!(keys[0].as_ref(), b"k1");
+            assert_eq!(keys[1].as_ref(), b"k2");
+        });
 
         cleanup_test_root(root);
     }

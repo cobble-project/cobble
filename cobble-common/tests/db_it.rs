@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::{
     CompactionPolicyKind, Config, Db, MemtableType, MetricValue, ReadOptions, ReadProxy,
-    ReadProxyConfig, SingleNodeDb, TimeProviderKind, VolumeDescriptor, WriteBatch,
+    ReadProxyConfig, ScanOptions, SingleNodeDb, TimeProviderKind, VolumeDescriptor, WriteBatch,
 };
 use std::path::Path;
 
@@ -895,6 +895,126 @@ fn test_db_snapshot_retain_skips_auto_expire() {
     let _ = wait_for_manifest_in_db(root, db.id(), first_id);
     let _ = wait_for_manifest_in_db(root, db.id(), second_id);
     assert!(db.expire_snapshot(first_id).unwrap());
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_scan_put_reads_from_memtable_and_sst() {
+    let root = "/tmp/db_it_scan_memtable_sst";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 1024,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        value_separation_threshold: 64,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+
+    let huge_sst = vec![b's'; 512];
+    let huge_mem = vec![b'm'; 768];
+
+    db.put(b"aaa:outside", 0, b"ignore-left").unwrap();
+    db.put(b"mix:key", 0, b"old").unwrap();
+    db.put(b"mix:huge-sst", 0, huge_sst.clone()).unwrap();
+    for i in 0..200u32 {
+        let key = format!("fill:{:04}", i).into_bytes();
+        db.put(&key, 0, vec![b'f'; 96]).unwrap();
+    }
+    db.put(b"mix:key", 0, b"new").unwrap();
+    db.put(b"mix:huge-mem", 0, huge_mem.clone()).unwrap();
+    db.put(b"mix:tail", 0, b"tail").unwrap();
+    db.put(b"zzz:outside", 0, b"ignore-right").unwrap();
+
+    let mut iter = db
+        .scan(
+            0,
+            b"fill:0000".as_slice()..b"mix;".as_slice(),
+            &ScanOptions::default(),
+        )
+        .unwrap();
+    let mut seen: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    while let Some(row) = iter.next() {
+        let (key, columns) = row.unwrap();
+        if let Some(value) = columns[0].as_ref() {
+            seen.insert(key.to_vec(), value.to_vec());
+        }
+    }
+
+    assert_eq!(seen.len(), 204);
+    for i in 0..200u32 {
+        let key = format!("fill:{:04}", i).into_bytes();
+        assert_eq!(
+            seen.get(&key).unwrap().as_slice(),
+            vec![b'f'; 96].as_slice()
+        );
+    }
+    assert_eq!(seen.get(&b"mix:key".to_vec()).unwrap().as_slice(), b"new");
+    assert_eq!(
+        seen.get(&b"mix:huge-sst".to_vec()).unwrap().as_slice(),
+        huge_sst.as_slice()
+    );
+    assert_eq!(
+        seen.get(&b"mix:huge-mem".to_vec()).unwrap().as_slice(),
+        huge_mem.as_slice()
+    );
+    assert_eq!(seen.get(&b"mix:tail".to_vec()).unwrap().as_slice(), b"tail");
+    assert!(!seen.contains_key(&b"aaa:outside".to_vec()));
+    assert!(!seen.contains_key(&b"zzz:outside".to_vec()));
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_scan_put_range_keeps_latest_value() {
+    let root = "/tmp/db_it_scan_range_latest";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 1024,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+
+    for i in 0..160u32 {
+        let key = format!("r:{:04}", i).into_bytes();
+        db.put(&key, 0, format!("v:{:04}", i).into_bytes()).unwrap();
+    }
+    db.put(b"q:outside", 0, b"left").unwrap();
+    db.put(b"r:0050", 0, b"latest").unwrap();
+    db.put(b"s:outside", 0, b"right").unwrap();
+
+    let mut iter = db
+        .scan(
+            0,
+            b"r:0000".as_slice()..b"r:0100".as_slice(),
+            &ScanOptions::default(),
+        )
+        .unwrap();
+    let mut seen: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    while let Some(row) = iter.next() {
+        let (key, columns) = row.unwrap();
+        if let Some(value) = columns[0].as_ref() {
+            seen.insert(key.to_vec(), value.to_vec());
+        }
+    }
+
+    assert_eq!(seen.len(), 100);
+    assert_eq!(seen.get(&b"r:0050".to_vec()).unwrap().as_slice(), b"latest");
+    assert_eq!(seen.get(&b"r:0000".to_vec()).unwrap().as_slice(), b"v:0000");
+    assert_eq!(seen.get(&b"r:0099".to_vec()).unwrap().as_slice(), b"v:0099");
+    assert!(!seen.contains_key(&b"q:outside".to_vec()));
+    assert!(!seen.contains_key(&b"s:outside".to_vec()));
 
     cleanup_test_root(root);
 }

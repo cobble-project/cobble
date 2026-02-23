@@ -4,7 +4,8 @@ use crate::compaction::{
 };
 use crate::data_file::DataFile;
 use crate::error::Result;
-use crate::file::FileManager;
+use crate::file::{FileManager, ReadAheadBufferedReader};
+use crate::iterator::{KvIterator, SortedRun};
 use crate::metrics_manager::MetricsManager;
 use crate::sst::block_cache::BlockCache;
 use crate::sst::row_codec::decode_value_masked;
@@ -16,6 +17,8 @@ use std::sync::{Arc, Mutex};
 use crate::db_state::{DbState, DbStateHandle};
 use crate::ttl::TTLProvider;
 use crate::vlog::VlogEdit;
+
+pub(crate) type DynKvIterator = Box<dyn for<'a> KvIterator<'a>>;
 
 #[derive(Clone)]
 pub(crate) struct Level {
@@ -555,6 +558,58 @@ impl LSMTree {
         }
 
         Ok(values)
+    }
+
+    pub(crate) fn scan_with_snapshot(
+        &self,
+        file_manager: &Arc<FileManager>,
+        snapshot: Arc<DbState>,
+        num_columns: usize,
+        read_ahead_bytes: usize,
+    ) -> Result<Vec<DynKvIterator>> {
+        let mut iterators: Vec<DynKvIterator> = Vec::new();
+        let use_read_ahead = read_ahead_bytes > 0 && tokio::runtime::Handle::try_current().is_ok();
+        let sst_options = SSTIteratorOptions {
+            metrics: Some(Arc::clone(&self.sst_metrics)),
+            num_columns,
+            bloom_filter_enabled: true,
+            ..SSTIteratorOptions::default()
+        };
+        let mut runs: Vec<SortedRun> = Vec::new();
+        for level in &snapshot.lsm_version.levels {
+            if level.files.is_empty() {
+                continue;
+            }
+            if level.tiered {
+                for file in level.files.iter().rev() {
+                    runs.push(SortedRun::new(level.ordinal, vec![Arc::clone(file)]));
+                }
+            } else {
+                runs.push(SortedRun::new(level.ordinal, level.files.clone()));
+            }
+        }
+        for run in runs {
+            let file_manager = Arc::clone(file_manager);
+            let sst_options = sst_options.clone();
+            let block_cache = self.block_cache.clone();
+            let run_iter = run.iter(move |file| {
+                let reader = file_manager.open_data_file_reader(file.file_id)?;
+                let reader: Box<dyn crate::file::RandomAccessFile> = if use_read_ahead {
+                    Box::new(ReadAheadBufferedReader::new(reader, read_ahead_bytes))
+                } else {
+                    Box::new(reader)
+                };
+                let iter = SSTIterator::with_cache_and_file(
+                    reader,
+                    file,
+                    sst_options.clone(),
+                    block_cache.clone(),
+                )?;
+                Ok(Box::new(iter) as DynKvIterator)
+            });
+            iterators.push(Box::new(run_iter));
+        }
+        Ok(iterators)
     }
 
     /// Get values from one data file for the given encoded key.

@@ -2,6 +2,7 @@ use crate::SstCompressionAlgorithm;
 use crate::time::TimeProviderKind;
 use log::warn;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 
 const DEFAULT_READ_PROXY_RELOAD_TOLERANCE_SECONDS: u64 = 10;
 
@@ -177,6 +178,104 @@ impl Default for ReadProxyConfigEntry {
             pin_partition_in_memory_count: 1,
             block_cache_size: 512 * 1024 * 1024,
             reload_tolerance_seconds: DEFAULT_READ_PROXY_RELOAD_TOLERANCE_SECONDS,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ReadOptions {
+    pub column_indices: Option<Vec<usize>>,
+    max_index: Option<usize>,
+    cached_masks: Arc<Mutex<Option<ReadOptionsMasks>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ScanOptions {
+    pub read_ahead_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReadOptionsMasks {
+    pub(crate) num_columns: usize,
+    pub(crate) selected_mask: Option<Arc<[u8]>>,
+    pub(crate) base_mask: Arc<[u8]>,
+}
+
+impl Default for ReadOptions {
+    fn default() -> Self {
+        Self {
+            column_indices: None,
+            max_index: None,
+            cached_masks: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl ReadOptions {
+    pub fn for_column(column_index: usize) -> Self {
+        Self::new_with_indices(Some(vec![column_index]))
+    }
+
+    pub fn for_columns(column_indices: Vec<usize>) -> Self {
+        Self::new_with_indices(Some(column_indices))
+    }
+
+    fn new_with_indices(column_indices: Option<Vec<usize>>) -> Self {
+        let max_index = column_indices
+            .as_ref()
+            .and_then(|indices| indices.iter().max().cloned());
+        Self {
+            column_indices,
+            max_index,
+            cached_masks: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn columns(&self) -> Option<&[usize]> {
+        self.column_indices.as_deref()
+    }
+
+    pub(crate) fn max_index(&self) -> Option<usize> {
+        self.max_index
+    }
+
+    pub(crate) fn masks(&self, num_columns: usize) -> ReadOptionsMasks {
+        let mut guard = self.cached_masks.lock().unwrap();
+        if guard
+            .as_ref()
+            .map(|mask| mask.num_columns != num_columns)
+            .unwrap_or(true)
+        {
+            *guard = Some(self.build_masks(num_columns));
+        }
+        guard.as_ref().expect("cached mask initialized").clone()
+    }
+
+    fn build_masks(&self, num_columns: usize) -> ReadOptionsMasks {
+        let mask_size = num_columns.div_ceil(8).max(1);
+        let last_bits = (num_columns - 1) % 8 + 1;
+        let last_mask = (1u8 << last_bits) - 1;
+        let selected_mask = self.column_indices.as_ref().map(|columns| {
+            let mut mask = vec![0u8; mask_size];
+            for &column_idx in columns {
+                if column_idx < num_columns {
+                    mask[column_idx / 8] |= 1 << (column_idx % 8);
+                }
+            }
+            mask[mask_size - 1] &= last_mask;
+            Arc::from(mask.into_boxed_slice())
+        });
+        let base_mask = if let Some(mask) = selected_mask.as_ref() {
+            Arc::clone(mask)
+        } else {
+            let mut mask = vec![0xFF; mask_size];
+            mask[mask_size - 1] &= last_mask;
+            Arc::from(mask.into_boxed_slice())
+        };
+        ReadOptionsMasks {
+            num_columns,
+            selected_mask,
+            base_mask,
         }
     }
 }

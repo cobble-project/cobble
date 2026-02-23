@@ -14,7 +14,7 @@ use crate::iterator::{DeduplicatingIterator, KvIterator};
 use crate::lsm::LSMTree;
 use crate::memtable::vlog::{MemtableVlogRecorder, rewrite_ref_value_for_memtable};
 use crate::memtable::{HashMemtable, VecMemtable};
-use crate::memtable::{Memtable, MemtableImpl, MemtableReclaimer};
+use crate::memtable::{Memtable, MemtableImpl, MemtableKvIter, MemtableReclaimer};
 use crate::metrics_manager::MetricsManager;
 use crate::snapshot::SnapshotManager;
 use crate::sst::{SSTWriter, SSTWriterOptions};
@@ -22,6 +22,8 @@ use crate::r#type::{RefKey, RefValue};
 use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
 use log::{debug, trace, warn};
 use metrics::{Counter, counter};
+
+type DynKvIterator = Box<dyn for<'a> KvIterator<'a>>;
 
 #[derive(Clone)]
 pub(crate) struct MemtableFlushResult {
@@ -134,6 +136,135 @@ pub(crate) struct ActiveMemtable {
 struct ActiveMemtableCheckpoint {
     blob_cursor: usize,
     recorder_checkpoint: Option<u32>,
+}
+
+enum MemtableScanSource {
+    Active(Arc<Mutex<ActiveMemtable>>),
+    Immutable(Arc<MemtableImpl>),
+}
+
+struct MemtableScanIterator {
+    source: MemtableScanSource,
+    seek_target: Option<Bytes>,
+    next_offset: usize,
+    current_key: Option<Bytes>,
+    current_value: Option<Bytes>,
+}
+
+impl MemtableScanIterator {
+    fn for_active(active: Arc<Mutex<ActiveMemtable>>) -> Self {
+        Self {
+            source: MemtableScanSource::Active(active),
+            seek_target: None,
+            next_offset: 0,
+            current_key: None,
+            current_value: None,
+        }
+    }
+
+    fn for_immutable(memtable: Arc<MemtableImpl>) -> Self {
+        Self {
+            source: MemtableScanSource::Immutable(memtable),
+            seek_target: None,
+            next_offset: 0,
+            current_key: None,
+            current_value: None,
+        }
+    }
+
+    fn read_entry_from_iter(
+        iter: &mut MemtableKvIter<'_>,
+        seek_target: Option<&[u8]>,
+        offset: usize,
+    ) -> Result<Option<(Bytes, Bytes)>> {
+        if let Some(target) = seek_target {
+            iter.seek(target)?;
+        } else {
+            iter.seek_to_first()?;
+        }
+        for _ in 0..=offset {
+            if !iter.next()? {
+                return Ok(None);
+            }
+        }
+        iter.current()
+    }
+
+    fn read_entry_at_offset(&self, offset: usize) -> Result<Option<(Bytes, Bytes)>> {
+        let seek_target = self.seek_target.as_deref();
+        match &self.source {
+            MemtableScanSource::Active(active) => {
+                let active = active.lock().unwrap();
+                let Some(memtable) = active.memtable.as_ref() else {
+                    return Ok(None);
+                };
+                let mut iter = memtable.iter();
+                Self::read_entry_from_iter(&mut iter, seek_target, offset)
+            }
+            MemtableScanSource::Immutable(memtable) => {
+                let mut iter = memtable.iter();
+                Self::read_entry_from_iter(&mut iter, seek_target, offset)
+            }
+        }
+    }
+
+    fn prime_current(&mut self) -> Result<()> {
+        if let Some((key, value)) = self.read_entry_at_offset(0)? {
+            self.current_key = Some(key);
+            self.current_value = Some(value);
+            self.next_offset = 1;
+        } else {
+            self.current_key = None;
+            self.current_value = None;
+            self.next_offset = 0;
+        }
+        Ok(())
+    }
+}
+
+impl<'a> KvIterator<'a> for MemtableScanIterator {
+    fn seek(&mut self, target: &[u8]) -> Result<()> {
+        self.seek_target = Some(Bytes::copy_from_slice(target));
+        self.prime_current()
+    }
+
+    fn seek_to_first(&mut self) -> Result<()> {
+        self.seek_target = None;
+        self.prime_current()
+    }
+
+    fn next(&mut self) -> Result<bool> {
+        if let Some((key, value)) = self.read_entry_at_offset(self.next_offset)? {
+            self.current_key = Some(key);
+            self.current_value = Some(value);
+            self.next_offset += 1;
+            Ok(true)
+        } else {
+            self.current_key = None;
+            self.current_value = None;
+            Ok(false)
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.current_key.is_some() && self.current_value.is_some()
+    }
+
+    fn key(&self) -> Result<Option<Bytes>> {
+        Ok(self.current_key.clone())
+    }
+
+    fn key_slice(&self) -> Result<Option<&[u8]>> {
+        Ok(self.current_key.as_deref())
+    }
+
+    fn value(&self) -> Result<Option<Bytes>> {
+        Ok(self.current_value.clone())
+    }
+
+    fn value_slice(&self) -> Result<Option<&[u8]>> {
+        Ok(self.current_value.as_deref())
+    }
 }
 
 #[derive(Clone)]
@@ -690,6 +821,24 @@ impl MemtableManager {
             }
         }
         Ok(Some(min_seq))
+    }
+
+    pub(crate) fn scan_memtable_iterators_with_snapshot(
+        &self,
+        snapshot: Arc<DbState>,
+    ) -> Result<Vec<DynKvIterator>> {
+        let mut iterators: Vec<DynKvIterator> = Vec::new();
+        if let Some(active) = &snapshot.active {
+            iterators.push(Box::new(MemtableScanIterator::for_active(Arc::clone(
+                active,
+            ))));
+        }
+        for immutable in snapshot.immutables.iter().rev() {
+            iterators.push(Box::new(MemtableScanIterator::for_immutable(Arc::clone(
+                &immutable.memtable,
+            ))));
+        }
+        Ok(iterators)
     }
 
     pub(crate) fn read_vlog_pointer_with_snapshot(

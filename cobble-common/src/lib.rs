@@ -6,6 +6,7 @@ mod compaction;
 mod config;
 mod data_file;
 mod db;
+mod db_iter;
 mod db_state;
 mod error;
 mod file;
@@ -32,8 +33,12 @@ mod vlog;
 mod write_batch;
 
 pub use compaction::RemoteCompactionServer;
-pub use config::{CompactionPolicyKind, Config, MemtableType, VolumeDescriptor, VolumeUsageKind};
-pub use db::{Db, ReadOptions};
+pub use config::{
+    CompactionPolicyKind, Config, MemtableType, ReadOptions, ScanOptions, VolumeDescriptor,
+    VolumeUsageKind,
+};
+pub use db::Db;
+pub use db_iter::DbIterator;
 pub use metrics_manager::MetricsManager;
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
 pub use read_only_db::ReadOnlyDb;
