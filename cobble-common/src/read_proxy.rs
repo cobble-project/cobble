@@ -10,7 +10,7 @@ use crate::paths::{
     global_snapshot_current_path, global_snapshot_manifest_path_by_pointer, snapshot_manifest_name,
 };
 use crate::sst::block_cache::{BlockCache, new_block_cache};
-use crate::{Config, ReadOnlyDb, ReadOptions, VolumeDescriptor};
+use crate::{Config, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, VolumeDescriptor};
 use bytes::Bytes;
 use serde_json::Error as SerdeError;
 use std::ops::Range;
@@ -174,22 +174,23 @@ impl ReadProxy {
         if self.auto_refresh {
             self.refresh_if_changed(false)?;
         }
-        if bucket_id >= self.global_snapshot.total_buckets {
-            return Err(Error::IoError(format!(
-                "Bucket {} outside total buckets {}",
-                bucket_id, self.global_snapshot.total_buckets
-            )));
-        }
-        let snapshot_key = self
-            .bucket_map
-            .get(bucket_id as usize)
-            .and_then(|entry| entry.as_ref())
-            .cloned()
-            .ok_or_else(|| {
-                Error::IoError(format!("No bucket snapshot for bucket {}", bucket_id))
-            })?;
+        let snapshot_key = self.snapshot_key_for_bucket(bucket_id)?;
         let db = self.load_snapshot(&snapshot_key)?;
         db.get(key, options)
+    }
+
+    pub fn scan(
+        &mut self,
+        bucket_id: u16,
+        range: Range<&[u8]>,
+        options: &ScanOptions,
+    ) -> Result<DbIterator<'static>> {
+        if self.auto_refresh {
+            self.refresh_if_changed(false)?;
+        }
+        let snapshot_key = self.snapshot_key_for_bucket(bucket_id)?;
+        let db = self.load_snapshot(&snapshot_key)?;
+        db.scan(bucket_id, range, options)
     }
 
     fn load_snapshot(&mut self, key: &Arc<BucketSnapshotKey>) -> Result<Arc<ReadOnlyDb>> {
@@ -205,6 +206,20 @@ impl ReadProxy {
         )?);
         self.cache.insert(Arc::clone(key), Arc::clone(&db));
         Ok(db)
+    }
+
+    fn snapshot_key_for_bucket(&self, bucket_id: u16) -> Result<Arc<BucketSnapshotKey>> {
+        if bucket_id >= self.global_snapshot.total_buckets {
+            return Err(Error::IoError(format!(
+                "Bucket {} outside total buckets {}",
+                bucket_id, self.global_snapshot.total_buckets
+            )));
+        }
+        self.bucket_map
+            .get(bucket_id as usize)
+            .and_then(|entry| entry.as_ref())
+            .cloned()
+            .ok_or_else(|| Error::IoError(format!("No bucket snapshot for bucket {}", bucket_id)))
     }
 
     fn refresh_if_changed(&mut self, force: bool) -> Result<()> {

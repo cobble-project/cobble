@@ -15,7 +15,7 @@ use std::sync::Arc;
 pub(crate) struct DbIteratorOptions<'a> {
     pub(crate) end_bound: Option<(Bytes, bool)>,
     pub(crate) snapshot: Arc<DbState>,
-    pub(crate) memtable_manager: &'a MemtableManager,
+    pub(crate) memtable_manager: Option<&'a MemtableManager>,
     pub(crate) vlog_store: Arc<VlogStore>,
     pub(crate) ttl_provider: Arc<TTLProvider>,
     pub(crate) num_columns: usize,
@@ -25,7 +25,7 @@ pub struct DbIterator<'a> {
     inner: DeduplicatingIterator<MergingIterator<DynKvIterator>>,
     end_bound: Option<(Bytes, bool)>,
     snapshot: Arc<DbState>,
-    memtable_manager: &'a MemtableManager,
+    memtable_manager: Option<&'a MemtableManager>,
     vlog_store: Arc<VlogStore>,
     num_columns: usize,
 }
@@ -83,10 +83,18 @@ impl<'a> DbIterator<'a> {
                     .read_pointer(&self.snapshot.vlog_version, pointer)
                 {
                     Ok(value) => Ok(value),
-                    Err(vlog_err) => self
-                        .memtable_manager
-                        .read_vlog_pointer_with_snapshot(Arc::clone(&self.snapshot), pointer)?
-                        .ok_or(vlog_err),
+                    Err(vlog_err) => {
+                        if let Some(memtable_manager) = self.memtable_manager {
+                            memtable_manager
+                                .read_vlog_pointer_with_snapshot(
+                                    Arc::clone(&self.snapshot),
+                                    pointer,
+                                )?
+                                .ok_or(vlog_err)
+                        } else {
+                            Err(vlog_err)
+                        }
+                    }
                 }
             })?;
             if let Some(columns) = columns {

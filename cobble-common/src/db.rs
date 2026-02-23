@@ -648,7 +648,7 @@ impl Db {
             DbIteratorOptions {
                 end_bound,
                 snapshot,
-                memtable_manager: &self.memtable_manager,
+                memtable_manager: Some(&self.memtable_manager),
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 num_columns: self.num_columns,

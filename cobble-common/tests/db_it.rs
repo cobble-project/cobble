@@ -510,6 +510,8 @@ fn test_single_node_db_snapshot_updates_global_manifest() {
     let db = SingleNodeDb::open(config.clone(), 4).unwrap();
 
     db.put(b"k1", 0, b"v1".to_vec()).unwrap();
+    db.put(b"k2", 0, b"v2".to_vec()).unwrap();
+    db.put(b"x1", 0, b"vx".to_vec()).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let global_id = db
         .snapshot_with_callback(move |result| {
@@ -529,6 +531,22 @@ fn test_single_node_db_snapshot_updates_global_manifest() {
         .expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
+    let mut iter = proxy
+        .scan(
+            0,
+            b"k1".as_slice()..b"kz".as_slice(),
+            &ScanOptions::default(),
+        )
+        .unwrap();
+    let mut rows = Vec::new();
+    while let Some(row) = iter.next() {
+        rows.push(row.unwrap());
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0.as_ref(), b"k1");
+    assert_eq!(rows[0].1[0].as_ref().unwrap().as_ref(), b"v1");
+    assert_eq!(rows[1].0.as_ref(), b"k2");
+    assert_eq!(rows[1].1[0].as_ref().unwrap().as_ref(), b"v2");
     cleanup_test_root(root);
 }
 
@@ -681,6 +699,53 @@ fn test_db_snapshot_read_only_get_with_separated_value() {
         .expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), large);
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_read_only_scan_with_separated_value() {
+    let root = "/tmp/db_snapshot_readonly_scan_separated";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        value_separation_threshold: 8,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config.clone()).unwrap();
+    let huge = vec![b'h'; 128];
+    db.put(b"aa", 0, b"ignore-left").unwrap();
+    db.put(b"k1", 0, b"v1").unwrap();
+    db.put(b"k2", 0, huge.clone()).unwrap();
+    db.put(b"z1", 0, b"ignore-right").unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    db.close().unwrap();
+
+    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    let mut iter = ro
+        .scan(
+            0,
+            b"k1".as_slice()..b"kz".as_slice(),
+            &ScanOptions::default(),
+        )
+        .unwrap();
+    let mut rows = Vec::new();
+    while let Some(row) = iter.next() {
+        rows.push(row.unwrap());
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0.as_ref(), b"k1");
+    assert_eq!(rows[0].1[0].as_ref().unwrap().as_ref(), b"v1");
+    assert_eq!(rows[1].0.as_ref(), b"k2");
+    assert_eq!(rows[1].1[0].as_ref().unwrap().as_ref(), huge.as_slice());
 
     cleanup_test_root(root);
 }

@@ -1,4 +1,5 @@
 use crate::db::value_to_vec_of_columns_with_vlog;
+use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::DbStateHandle;
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager};
@@ -14,8 +15,9 @@ use crate::sst::row_codec::encode_key;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::r#type::{Key, Value};
 use crate::vlog::VlogStore;
-use crate::{Config, ReadOptions};
+use crate::{Config, ReadOptions, ScanOptions};
 use bytes::Bytes;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Read-only database that serves data from a snapshot manifest.
@@ -166,5 +168,37 @@ impl ReadOnlyDb {
             self.vlog_store
                 .read_pointer(&snapshot.vlog_version, pointer)
         })
+    }
+
+    pub fn scan(
+        &self,
+        bucket: u16,
+        range: Range<&[u8]>,
+        options: &ScanOptions,
+    ) -> Result<DbIterator<'static>> {
+        let snapshot = self.lsm_tree.db_state().load();
+        let lsm_iters = self.lsm_tree.scan_with_snapshot(
+            &self.file_manager,
+            Arc::clone(&snapshot),
+            self.num_columns,
+            options.read_ahead_bytes,
+        )?;
+        let encode_scan_key = |key: &[u8]| encode_key(&Key::new(bucket, key.to_vec()));
+        let start_key = encode_scan_key(range.start);
+        let end_bound = Some((encode_scan_key(range.end), false));
+        let mut iter: DbIterator<'static> = DbIterator::new(
+            Vec::new(),
+            lsm_iters,
+            DbIteratorOptions {
+                end_bound,
+                snapshot,
+                memtable_manager: None,
+                vlog_store: Arc::clone(&self.vlog_store),
+                ttl_provider: Arc::clone(&self.ttl_provider),
+                num_columns: self.num_columns,
+            },
+        );
+        iter.seek(start_key.as_ref())?;
+        Ok(iter)
     }
 }
