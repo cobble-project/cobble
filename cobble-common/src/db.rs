@@ -6,7 +6,7 @@ use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::metrics_manager::MetricsManager;
 use crate::snapshot::{
     SnapshotCallback, SnapshotManager, build_levels_from_manifest,
-    build_vlog_version_from_manifest, decode_manifest, snapshot_manifest_name,
+    build_vlog_version_from_manifest, load_manifest_for_snapshot, snapshot_manifest_name,
 };
 use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value_masked, encode_key};
@@ -390,11 +390,7 @@ impl Db {
         let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
         let file_manager = FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
-
-        let manifest_name = snapshot_manifest_name(snapshot_id);
-        let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
-        let bytes = reader.read_at(0, reader.size())?;
-        let manifest = decode_manifest(bytes.as_ref())?;
+        let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
         let max_file_seq = manifest
             .levels
@@ -413,6 +409,7 @@ impl Db {
             vlog_version,
             active: None,
             immutables: Vec::new().into(),
+            suggested_base_snapshot_id: Some(snapshot_id),
         });
         let initial_file_seq = max_file_seq.saturating_add(1);
         Self::open_with_state(

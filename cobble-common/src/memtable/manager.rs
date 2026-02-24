@@ -423,6 +423,7 @@ impl MemtableManager {
         let file_manager_clone = Arc::clone(&file_manager);
         let file_builder_factory_clone = Arc::clone(&file_builder_factory);
         let lsm_tree_clone = Arc::clone(&lsm_tree);
+        let db_state_clone = lsm_tree_clone.db_state();
         let ttl_provider_clone = Arc::clone(&ttl_provider);
         let vlog_store_clone = Arc::clone(&vlog_store);
         let handle = std::thread::Builder::new()
@@ -463,7 +464,11 @@ impl MemtableManager {
                                 state.flush_results.insert(res.seq, Ok(res));
                                 flush_done_clone.notify_all();
                                 drop(state);
-                                Self::finish_and_materialize_snapshot(&job.snapshot, &snapshot);
+                                Self::finish_and_materialize_snapshot(
+                                    &job.snapshot,
+                                    &snapshot,
+                                    &db_state_clone,
+                                );
                             }
                             Err(err) => {
                                 panic!("memtable flush failed seq={} err={}", job.seq, err);
@@ -471,12 +476,16 @@ impl MemtableManager {
                         }
                         drop(keep_memtable_alive);
                     } else {
-                        let snapshot = lsm_tree_clone.db_state().load();
+                        let snapshot = db_state_clone.load();
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
                         flush_done_clone.notify_all();
                         drop(state);
-                        Self::finish_and_materialize_snapshot(&job.snapshot, &snapshot);
+                        Self::finish_and_materialize_snapshot(
+                            &job.snapshot,
+                            &snapshot,
+                            &db_state_clone,
+                        );
                     }
                 }
             })
@@ -487,11 +496,14 @@ impl MemtableManager {
     fn finish_and_materialize_snapshot(
         snapshot_completion: &Option<SnapshotCompletion>,
         snapshot: &Arc<DbState>,
+        db_state: &Arc<DbStateHandle>,
     ) {
         if let Some(snapshot_job) = snapshot_completion {
-            snapshot_job
-                .manager
-                .finish_snapshot(snapshot_job.snapshot_id, snapshot);
+            snapshot_job.manager.finish_snapshot(
+                snapshot_job.snapshot_id,
+                snapshot,
+                db_state.as_ref(),
+            );
             let _ = snapshot_job
                 .manager
                 .schedule_materialize(snapshot_job.snapshot_id);
@@ -542,13 +554,14 @@ impl MemtableManager {
                 vlog_recorder: None,
             }));
             db_state.cas_mutate(snapshot.seq_id, |db_state, snapshot| {
-                Some(DbState::new(
-                    db_state,
-                    snapshot.lsm_version.clone(),
-                    snapshot.vlog_version.clone(),
-                    Some(Arc::clone(&active)),
-                    snapshot.immutables.clone(),
-                ))
+                Some(DbState {
+                    seq_id: db_state.allocate_seq_id(),
+                    lsm_version: snapshot.lsm_version.clone(),
+                    vlog_version: snapshot.vlog_version.clone(),
+                    active: Some(Arc::clone(&active)),
+                    immutables: snapshot.immutables.clone(),
+                    suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+                })
             });
         }
     }
@@ -700,13 +713,14 @@ impl MemtableManager {
             drop(active);
             self.db_state
                 .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
-                    Some(DbState::new(
-                        db_state,
-                        snapshot.lsm_version.clone(),
-                        snapshot.vlog_version.clone(),
-                        None,
-                        snapshot.immutables.clone(),
-                    ))
+                    Some(DbState {
+                        seq_id: db_state.allocate_seq_id(),
+                        lsm_version: snapshot.lsm_version.clone(),
+                        vlog_version: snapshot.vlog_version.clone(),
+                        active: None,
+                        immutables: snapshot.immutables.clone(),
+                        suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+                    })
                 });
             drop(old_memtable);
         }
@@ -920,13 +934,14 @@ impl MemtableManager {
                 to_flush = Some(new_immutable.clone());
                 immutables.push_back(new_immutable);
 
-                Some(DbState::new(
-                    db_state,
-                    snapshot_state.lsm_version.clone(),
-                    snapshot_state.vlog_version.clone(),
-                    None,
+                Some(DbState {
+                    seq_id: db_state.allocate_seq_id(),
+                    lsm_version: snapshot_state.lsm_version.clone(),
+                    vlog_version: snapshot_state.vlog_version.clone(),
+                    active: None,
                     immutables,
-                ))
+                    suggested_base_snapshot_id: snapshot_state.suggested_base_snapshot_id,
+                })
             });
         drop(guard);
         let job = if let Some(to_flush) = to_flush {

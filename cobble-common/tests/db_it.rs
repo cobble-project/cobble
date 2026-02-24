@@ -5,6 +5,7 @@ use cobble::{
     CompactionPolicyKind, Config, Db, MemtableType, MetricValue, ReadOptions, ReadProxy,
     ReadProxyConfig, ScanOptions, SingleNodeDb, TimeProviderKind, VolumeDescriptor, WriteBatch,
 };
+use serde_json::Value as JsonValue;
 use std::path::Path;
 
 fn cleanup_test_root(path: &str) {
@@ -752,6 +753,104 @@ fn test_db_snapshot_read_only_scan_with_separated_value() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_db_incremental_snapshot_restore() {
+    let root = "/tmp/db_snapshot_incremental_restore";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config.clone()).unwrap();
+    db.put(b"k1", 0, b"v1").unwrap();
+    let base_snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), base_snapshot_id);
+
+    db.put(b"k2", 0, b"v2").unwrap();
+    let incremental_snapshot_id = db.snapshot().unwrap();
+    let incremental_manifest = wait_for_manifest_in_db(root, db.id(), incremental_snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&incremental_manifest).unwrap();
+    assert_eq!(
+        manifest_json
+            .get("base_snapshot_id")
+            .and_then(|value| value.as_u64()),
+        Some(base_snapshot_id)
+    );
+    assert!(manifest_json.get("vlog_files").is_some());
+    db.close().unwrap();
+
+    let ro =
+        Db::open_read_only(config.clone(), incremental_snapshot_id, db.id().to_string()).unwrap();
+    let value1 = ro
+        .get(b"k1", &ReadOptions::default())
+        .unwrap()
+        .expect("k1 value present");
+    assert_eq!(value1[0].as_ref().unwrap().as_ref(), b"v1");
+    let value2 = ro
+        .get(b"k2", &ReadOptions::default())
+        .unwrap()
+        .expect("k2 value present");
+    assert_eq!(value2[0].as_ref().unwrap().as_ref(), b"v2");
+
+    let writable =
+        Db::open_from_snapshot(config, incremental_snapshot_id, db.id().to_string()).unwrap();
+    let value1 = writable
+        .get(b"k1", &ReadOptions::default())
+        .unwrap()
+        .expect("k1 value present");
+    assert_eq!(value1[0].as_ref().unwrap().as_ref(), b"v1");
+    let value2 = writable
+        .get(b"k2", &ReadOptions::default())
+        .unwrap()
+        .expect("k2 value present");
+    assert_eq!(value2[0].as_ref().unwrap().as_ref(), b"v2");
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_incremental_snapshot_keeps_base_manifest_live() {
+    let root = "/tmp/db_snapshot_incremental_dependency";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+    db.put(b"k1", 0, b"v1").unwrap();
+    let base_snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), base_snapshot_id);
+    db.put(b"k2", 0, b"v2").unwrap();
+    let incremental_snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), incremental_snapshot_id);
+
+    let base_manifest_path = format!(
+        "{}/{}",
+        root,
+        bucket_snapshot_manifest_path(db.id(), base_snapshot_id)
+    );
+    assert!(db.expire_snapshot(base_snapshot_id).unwrap());
+    assert!(Path::new(&base_manifest_path).exists());
+
+    assert!(db.expire_snapshot(incremental_snapshot_id).unwrap());
+    let _ = db.expire_snapshot(base_snapshot_id).unwrap();
+    wait_for_missing(&base_manifest_path);
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_open_from_snapshot_allows_writes() {
     let root = "/tmp/db_snapshot_write";
     cleanup_test_root(root);
@@ -920,6 +1019,8 @@ fn test_db_snapshot_auto_expire() {
     let _ = wait_for_manifest_in_db(root, db.id(), first_id);
     let _ = wait_for_manifest_in_db(root, db.id(), second_id);
     assert!(db.expire_snapshot(first_id).unwrap());
+    assert!(db.expire_snapshot(second_id).unwrap());
+    let _ = db.expire_snapshot(first_id).unwrap();
 
     cleanup_test_root(root);
 }
@@ -960,6 +1061,8 @@ fn test_db_snapshot_retain_skips_auto_expire() {
     let _ = wait_for_manifest_in_db(root, db.id(), first_id);
     let _ = wait_for_manifest_in_db(root, db.id(), second_id);
     assert!(db.expire_snapshot(first_id).unwrap());
+    assert!(db.expire_snapshot(second_id).unwrap());
+    let _ = db.expire_snapshot(first_id).unwrap();
 
     cleanup_test_root(root);
 }

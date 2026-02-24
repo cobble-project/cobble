@@ -202,6 +202,10 @@ impl LSMTree {
         let guard = self.db_state.lock();
         let snapshot = self.db_state.load();
         let mut new_levels = snapshot.lsm_version.levels.clone();
+        let inherit_suggested_base_snapshot_id = edit.level_edits.is_empty()
+            || (edit.level_edits.len() == 1
+                && edit.level_edits[0].level == 0
+                && edit.level_edits[0].removed_files.is_empty());
 
         for level_edit in &edit.level_edits {
             if let Some(level) = new_levels
@@ -269,15 +273,20 @@ impl LSMTree {
 
         self.db_state
             .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
-                let mut new_db_state = DbState::new(
-                    db_state,
-                    LSMTreeVersion {
+                let mut new_db_state = DbState {
+                    seq_id: db_state.allocate_seq_id(),
+                    lsm_version: LSMTreeVersion {
                         levels: new_levels.clone(),
                     },
-                    snapshot.vlog_version.clone(),
-                    snapshot.active.clone(),
-                    snapshot.immutables.clone(),
-                );
+                    vlog_version: snapshot.vlog_version.clone(),
+                    active: snapshot.active.clone(),
+                    immutables: snapshot.immutables.clone(),
+                    suggested_base_snapshot_id: if inherit_suggested_base_snapshot_id {
+                        snapshot.suggested_base_snapshot_id
+                    } else {
+                        None
+                    },
+                };
                 fix(&mut new_db_state);
                 Some(new_db_state)
             });
@@ -811,6 +820,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
+            suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
@@ -892,6 +902,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
+            suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         lsm_tree.apply_edit(VersionEdit {
@@ -965,6 +976,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
+            suggested_base_snapshot_id: None,
         });
         let lsm_tree = Arc::new(LSMTree::with_state(
             Arc::clone(&db_state),
@@ -1042,6 +1054,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
+            suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));
@@ -1099,6 +1112,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
+            suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));

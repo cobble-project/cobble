@@ -2,13 +2,12 @@ use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::DbStateHandle;
 use crate::error::{Error, Result};
-use crate::file::{File, FileManager};
+use crate::file::FileManager;
 use crate::lsm::{LSMTree, LSMTreeVersion};
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
 use crate::snapshot::{
-    build_levels_from_manifest, build_vlog_version_from_manifest, decode_manifest,
-    snapshot_manifest_name,
+    build_levels_from_manifest, build_vlog_version_from_manifest, load_manifest_for_snapshot,
 };
 use crate::sst::block_cache::{BlockCache, new_block_cache};
 use crate::sst::row_codec::encode_key;
@@ -75,10 +74,7 @@ impl ReadOnlyDb {
             },
             Arc::clone(&time_provider),
         ));
-        let manifest_name = snapshot_manifest_name(snapshot_id);
-        let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
-        let bytes = reader.read_at(0, reader.size())?;
-        let manifest = decode_manifest(bytes.as_ref())?;
+        let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let levels = build_levels_from_manifest(&file_manager, manifest, true)?;
         let sst_options = crate::compaction::build_sst_writer_options(&config, 0);
@@ -95,6 +91,7 @@ impl ReadOnlyDb {
             vlog_version,
             active: None,
             immutables: Vec::new().into(),
+            suggested_base_snapshot_id: Some(snapshot_id),
         });
         let mut lsm_tree = LSMTree::with_state_and_ttl(
             Arc::clone(&db_state),

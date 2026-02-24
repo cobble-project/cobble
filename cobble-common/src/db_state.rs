@@ -12,25 +12,8 @@ pub(crate) struct DbState {
     pub(crate) vlog_version: VlogVersion,
     pub(crate) active: Option<Arc<Mutex<ActiveMemtable>>>,
     pub(crate) immutables: VecDeque<ImmutableMemtable>,
-}
-
-impl DbState {
-    /// Create the next DbState with incremented seq_id
-    pub(crate) fn new(
-        handle: &DbStateHandle,
-        lsm_version: LSMTreeVersion,
-        vlog_version: VlogVersion,
-        active_memtable: Option<Arc<Mutex<ActiveMemtable>>>,
-        immutable_memtable: VecDeque<ImmutableMemtable>,
-    ) -> Self {
-        Self {
-            seq_id: handle.allocate_seq_id(),
-            lsm_version,
-            vlog_version,
-            active: active_memtable,
-            immutables: immutable_memtable,
-        }
-    }
+    // This is used to suggest a base snapshot ID for new snapshots
+    pub(crate) suggested_base_snapshot_id: Option<u64>,
 }
 
 pub(crate) struct DbStateHandle {
@@ -49,6 +32,7 @@ impl DbStateHandle {
                 vlog_version: VlogVersion::new(),
                 active: None,
                 immutables: VecDeque::new(),
+                suggested_base_snapshot_id: None,
             }),
             lock: Mutex::new(()),
             next_seq_id: AtomicU64::new(1),
@@ -89,6 +73,23 @@ impl DbStateHandle {
         };
         self.store(new_version);
         true
+    }
+
+    pub(crate) fn update_suggested_snapshot(&self, seq_id: u64, snapshot_id: u64) -> bool {
+        let _guard = self.lock();
+        self.cas_mutate(seq_id, |_db_state, snapshot| {
+            if snapshot.suggested_base_snapshot_id == Some(snapshot_id) {
+                return None;
+            }
+            Some(DbState {
+                seq_id,
+                lsm_version: snapshot.lsm_version.clone(),
+                vlog_version: snapshot.vlog_version.clone(),
+                active: snapshot.active.clone(),
+                immutables: snapshot.immutables.clone(),
+                suggested_base_snapshot_id: Some(snapshot_id),
+            })
+        })
     }
 
     pub(crate) fn store(&self, new_version: DbState) {

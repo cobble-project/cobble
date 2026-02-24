@@ -1,6 +1,6 @@
 //! Snapshot manager and manifest encoding for LSM state.
 use crate::data_file::{DataFile, DataFileType};
-use crate::db_state::DbState;
+use crate::db_state::{DbState, DbStateHandle};
 use crate::error::{Error, Result};
 use crate::file::{
     BufferedWriter, File, FileManager, SequentialWriteFile, TrackedFile, TrackedFileId,
@@ -8,8 +8,7 @@ use crate::file::{
 use crate::lsm::Level;
 use crate::vlog::VlogVersion;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -19,6 +18,7 @@ use std::thread::JoinHandle;
 pub(crate) struct DbSnapshot {
     pub id: u64,
     pub manifest_path: String,
+    pub base_snapshot_id: Option<u64>,
     pub levels: Vec<Level>,
     pub data_files: Vec<Arc<DataFile>>,
     pub tracked_files: Vec<Arc<TrackedFile>>,
@@ -30,23 +30,43 @@ pub(crate) struct DbSnapshot {
 
 pub(crate) type SnapshotCallback = Arc<dyn Fn(Result<u64>) + Send + Sync + 'static>;
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
     pub(crate) id: u64,
     pub(crate) seq_id: u64,
+    #[serde(default)]
     pub(crate) levels: Vec<ManifestLevel>,
     #[serde(default)]
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct ManifestIncrementalSnapshot {
+    pub(crate) id: u64,
+    pub(crate) seq_id: u64,
+    pub(crate) base_snapshot_id: u64,
+    #[serde(default)]
+    pub(crate) level_edits: Vec<ManifestLevelEdit>,
+    // always include vlog file info in incremental manifests since vlog files are more likely to have changes
+    #[serde(default)]
+    pub(crate) vlog_files: Vec<ManifestVlogFile>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ManifestPayload {
+    IncrementalSnapshot(ManifestIncrementalSnapshot),
+    Snapshot(ManifestSnapshot),
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestLevel {
     pub(crate) ordinal: u8,
     pub(crate) tiered: bool,
     pub(crate) files: Vec<ManifestFile>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestFile {
     pub(crate) file_id: u64,
     pub(crate) file_type: String,
@@ -58,7 +78,17 @@ pub(crate) struct ManifestFile {
     pub(crate) has_separated_values: bool,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct ManifestLevelEdit {
+    pub(crate) level: u8,
+    pub(crate) tiered: bool,
+    #[serde(default)]
+    pub(crate) removed_file_ids: Vec<u64>,
+    #[serde(default)]
+    pub(crate) new_files: Vec<ManifestFile>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestVlogFile {
     pub(crate) file_seq: u32,
     pub(crate) file_id: u64,
@@ -71,6 +101,7 @@ impl DbSnapshot {
         Self {
             id,
             manifest_path,
+            base_snapshot_id: None,
             levels: vec![],
             data_files: Vec::new(),
             tracked_files: Vec::new(),
@@ -108,8 +139,14 @@ impl Clone for SnapshotManager {
 struct SnapshotManagerState {
     next_id: u64,
     snapshots: BTreeMap<u64, DbSnapshot>,
-    completed: Vec<u64>,
+    completed: BTreeSet<u64>,
     retained: HashSet<u64>,
+    // Map<snapshot_id, set_of_snapshot_ids_that_it_references>.
+    // Includes self-reference while the snapshot retains itself.
+    incremental_references: HashMap<u64, HashSet<u64>>,
+    // Map<snapshot_id, number_of_references_pointing_to_it>.
+    // Counts self-reference and incoming references from incremental children.
+    incremental_ref_counts: HashMap<u64, usize>,
     in_flight: usize,
 }
 
@@ -120,8 +157,10 @@ impl SnapshotManager {
             state: Arc::new(Mutex::new(SnapshotManagerState {
                 next_id: 0,
                 snapshots: BTreeMap::new(),
-                completed: Vec::new(),
+                completed: BTreeSet::new(),
                 retained: HashSet::new(),
+                incremental_references: HashMap::new(),
+                incremental_ref_counts: HashMap::new(),
                 in_flight: 0,
             })),
             retention,
@@ -160,10 +199,22 @@ impl SnapshotManager {
         let manifest_path = self.file_manager.metadata_path(&snapshot_manifest_name(id));
         let snapshot = DbSnapshot::new(id, manifest_path, callback);
         state.snapshots.insert(id, snapshot.clone());
+        // initialize incremental references with self-reference
+        state
+            .incremental_references
+            .entry(id)
+            .or_default()
+            .insert(id);
+        state.incremental_ref_counts.insert(id, 1);
         snapshot
     }
 
-    pub(crate) fn finish_snapshot(&self, id: u64, db_state: &Arc<DbState>) -> bool {
+    pub(crate) fn finish_snapshot(
+        &self,
+        id: u64,
+        db_state: &Arc<DbState>,
+        db_state_handle: &DbStateHandle,
+    ) -> bool {
         let mut state = self.state.lock().unwrap();
         let Some(snapshot) = state.snapshots.get_mut(&id) else {
             return false;
@@ -182,7 +233,10 @@ impl SnapshotManager {
             .filter_map(|file| self.file_manager.data_file_ref(file.file_id).ok())
             .collect();
         snapshot.vlog_version = db_state.vlog_version.clone();
-        state.completed.push(id);
+        snapshot.base_snapshot_id = db_state.suggested_base_snapshot_id;
+        state.completed.insert(id);
+        drop(state);
+        db_state_handle.update_suggested_snapshot(db_state.seq_id, id);
         true
     }
 
@@ -198,7 +252,7 @@ impl SnapshotManager {
     pub(crate) fn process_retention(&self) -> Result<()> {
         let mut to_expire = Vec::new();
         {
-            let mut state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap();
             let Some(retention) = self.retention else {
                 return Ok(());
             };
@@ -206,7 +260,9 @@ impl SnapshotManager {
                 return Ok(());
             }
             let keep_from = state.completed.len().saturating_sub(retention);
-            to_expire.extend(state.completed.drain(..keep_from));
+            state.completed.iter().take(keep_from).for_each(|id| {
+                to_expire.push(*id);
+            });
         }
         for id in to_expire {
             if !self.retain_snapshot(id) {
@@ -218,22 +274,35 @@ impl SnapshotManager {
 
     /// Write the snapshot manifest for the given id.
     pub(crate) fn materialize(&self, id: u64) -> Result<()> {
-        let (snapshot, callback) = {
+        let (snapshot, callback, base_snapshot) = {
             let mut state = self.state.lock().unwrap();
             let snapshot = state.snapshots.get(&id).cloned();
             let callback = state
                 .snapshots
                 .get_mut(&id)
                 .and_then(|snapshot| snapshot.callback.take());
-            (snapshot, callback)
+            // base snapshot must be finished to be used as incremental base, otherwise treat as no base
+            let base_snapshot = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.base_snapshot_id)
+                .and_then(|base_id| state.snapshots.get(&base_id))
+                .filter(|snapshot| snapshot.finished)
+                .cloned();
+            (snapshot, callback, base_snapshot)
         };
+        let mut incremental_base_id = None;
         let result = match snapshot {
             Some(snapshot) => (|| {
                 let writer = self
                     .file_manager
                     .create_metadata_file(&snapshot_manifest_name(id))?;
                 let mut buffered = BufferedWriter::new(writer, 8192);
-                encode_manifest(&mut buffered, &snapshot, &self.file_manager)?;
+                incremental_base_id = encode_manifest(
+                    &mut buffered,
+                    &snapshot,
+                    base_snapshot.as_ref(),
+                    &self.file_manager,
+                )?;
                 buffered.close()?;
                 Ok(())
             })(),
@@ -243,6 +312,18 @@ impl SnapshotManager {
             let mut state = self.state.lock().unwrap();
             if let Some(snapshot) = state.snapshots.get_mut(&id) {
                 snapshot.finished = true;
+                snapshot.base_snapshot_id = incremental_base_id;
+            }
+            // if there is an incremental base, add reference from the new snapshot to the base;
+            if let Some(base_id) = incremental_base_id {
+                let inserted = state
+                    .incremental_references
+                    .entry(id)
+                    .or_default()
+                    .insert(base_id);
+                if inserted {
+                    *state.incremental_ref_counts.entry(base_id).or_insert(0) += 1;
+                }
             }
         }
         if let Some(callback) = callback {
@@ -257,22 +338,70 @@ impl SnapshotManager {
     }
 
     pub(crate) fn expire_snapshot(&self, id: u64) -> Result<bool> {
-        let snapshot = {
+        let (removed_snapshots, removed_requested_snapshot) = {
             let mut state = self.state.lock().unwrap();
-            state.completed.retain(|completed| *completed != id);
-            state.retained.remove(&id);
-            state.snapshots.remove(&id)
+            if !state.snapshots.contains_key(&id) {
+                return Ok(false);
+            }
+            let mut removed_requested_snapshot = false;
+            if let Some(refs) = state.incremental_references.get_mut(&id) {
+                removed_requested_snapshot = refs.remove(&id);
+            }
+            let mut pending = Vec::new();
+            if removed_requested_snapshot
+                && let Some(ref_count) = state.incremental_ref_counts.get_mut(&id)
+            {
+                *ref_count = ref_count.saturating_sub(1);
+                if *ref_count == 0 {
+                    pending.push(id);
+                }
+            }
+            let mut removed_snapshots = Vec::new();
+            // recursively remove snapshots that no longer have incoming references
+            while let Some(snapshot_id) = pending.pop() {
+                if state
+                    .incremental_ref_counts
+                    .get(&snapshot_id)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+                {
+                    continue;
+                }
+                state.incremental_ref_counts.remove(&snapshot_id);
+                let referenced = state
+                    .incremental_references
+                    .remove(&snapshot_id)
+                    .unwrap_or_default();
+                state.completed.remove(&snapshot_id);
+                state.retained.remove(&snapshot_id);
+                let Some(snapshot) = state.snapshots.remove(&snapshot_id) else {
+                    continue;
+                };
+                for referenced_id in referenced {
+                    if referenced_id == snapshot_id {
+                        continue;
+                    }
+                    if let Some(ref_count) = state.incremental_ref_counts.get_mut(&referenced_id) {
+                        *ref_count = ref_count.saturating_sub(1);
+                        if *ref_count == 0 {
+                            pending.push(referenced_id);
+                        }
+                    }
+                }
+                removed_snapshots.push(snapshot);
+            }
+            (removed_snapshots, removed_requested_snapshot)
         };
-        let Some(snapshot) = snapshot else {
-            return Ok(false);
-        };
-        self.file_manager
-            .remove_metadata_file(&snapshot_manifest_name(id))?;
-        snapshot
-            .tracked_files
-            .iter()
-            .for_each(|file| file.dereference());
-        Ok(true)
+        for snapshot in &removed_snapshots {
+            self.file_manager
+                .remove_metadata_file(&snapshot_manifest_name(snapshot.id))?;
+            snapshot
+                .tracked_files
+                .iter()
+                .for_each(|file| file.dereference());
+        }
+        Ok(removed_requested_snapshot)
     }
 
     /// Enqueue a manifest materialization job on the background worker.
@@ -331,53 +460,151 @@ impl SnapshotManager {
 pub(crate) fn encode_manifest<W: SequentialWriteFile>(
     writer: &mut BufferedWriter<W>,
     snapshot: &DbSnapshot,
+    base_snapshot: Option<&DbSnapshot>,
     file_manager: &FileManager,
-) -> Result<()> {
-    let manifest = ManifestSnapshot {
-        id: snapshot.id,
-        seq_id: snapshot.seq_id,
-        levels: snapshot
-            .levels
-            .iter()
-            .map(|level| ManifestLevel {
-                ordinal: level.ordinal,
-                tiered: level.tiered,
-                files: level
-                    .files
-                    .iter()
-                    .map(|file| ManifestFile {
-                        file_id: file.file_id,
-                        file_type: file.file_type.as_str().to_string(),
-                        seq: file.seq,
-                        size: file.size,
-                        start_key: to_hex(&file.start_key),
-                        end_key: to_hex(&file.end_key),
-                        path: file_manager
-                            .get_data_file_full_path(file.file_id)
-                            .expect("Unknown file ID"),
-                        has_separated_values: file.has_separated_values,
-                    })
-                    .collect(),
+) -> Result<Option<u64>> {
+    let full_manifest = || {
+        ManifestPayload::Snapshot(ManifestSnapshot {
+            id: snapshot.id,
+            seq_id: snapshot.seq_id,
+            levels: manifest_levels_from_snapshot(&snapshot.levels, file_manager),
+            vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
+        })
+    };
+    let mut incremental_base_id = None;
+    let manifest = if let Some(base) = base_snapshot {
+        if let Some(level_edits) = build_incremental_level_edits(base, snapshot, file_manager) {
+            incremental_base_id = Some(base.id);
+            ManifestPayload::IncrementalSnapshot(ManifestIncrementalSnapshot {
+                id: snapshot.id,
+                seq_id: snapshot.seq_id,
+                base_snapshot_id: base.id,
+                level_edits,
+                vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
             })
-            .collect(),
-        vlog_files: snapshot
-            .vlog_version
-            .files_with_entries()
-            .into_iter()
-            .map(|(file_seq, tracked_id, valid_entries)| ManifestVlogFile {
-                file_seq,
-                file_id: tracked_id.file_id(),
-                path: file_manager
-                    .get_data_file_full_path(tracked_id.file_id())
-                    .expect("Unknown file ID"),
-                valid_entries,
-            })
-            .collect(),
+        } else {
+            full_manifest()
+        }
+    } else {
+        full_manifest()
     };
     let json = serde_json::to_vec(&manifest)
         .map_err(|err| Error::IoError(format!("Failed to encode manifest: {}", err)))?;
     writer.write(&json)?;
-    Ok(())
+    Ok(incremental_base_id)
+}
+
+fn manifest_levels_from_snapshot(
+    levels: &[Level],
+    file_manager: &FileManager,
+) -> Vec<ManifestLevel> {
+    levels
+        .iter()
+        .map(|level| ManifestLevel {
+            ordinal: level.ordinal,
+            tiered: level.tiered,
+            files: level
+                .files
+                .iter()
+                .map(|file| manifest_file_from_data_file(file, file_manager))
+                .collect(),
+        })
+        .collect()
+}
+
+fn manifest_file_from_data_file(file: &DataFile, file_manager: &FileManager) -> ManifestFile {
+    ManifestFile {
+        file_id: file.file_id,
+        file_type: file.file_type.as_str().to_string(),
+        seq: file.seq,
+        size: file.size,
+        start_key: to_hex(&file.start_key),
+        end_key: to_hex(&file.end_key),
+        path: file_manager
+            .get_data_file_full_path(file.file_id)
+            .expect("Unknown file ID"),
+        has_separated_values: file.has_separated_values,
+    }
+}
+
+fn manifest_vlog_files_from_snapshot(
+    snapshot: &DbSnapshot,
+    file_manager: &FileManager,
+) -> Vec<ManifestVlogFile> {
+    snapshot
+        .vlog_version
+        .files_with_entries()
+        .into_iter()
+        .map(|(file_seq, tracked_id, valid_entries)| ManifestVlogFile {
+            file_seq,
+            file_id: tracked_id.file_id(),
+            path: file_manager
+                .get_data_file_full_path(tracked_id.file_id())
+                .expect("Unknown file ID"),
+            valid_entries,
+        })
+        .collect()
+}
+
+/// Attempt to build incremental level edits from the base snapshot to the current snapshot.
+/// Returns None if incremental edits cannot fully capture the changes (e.g. due to file removals
+/// or complex tiered level changes), in which case a full snapshot manifest should be written instead.
+fn build_incremental_level_edits(
+    base: &DbSnapshot,
+    snapshot: &DbSnapshot,
+    file_manager: &FileManager,
+) -> Option<Vec<ManifestLevelEdit>> {
+    let mut edits = Vec::new();
+    for level in &snapshot.levels {
+        let base_level = base
+            .levels
+            .iter()
+            .find(|base_level| base_level.ordinal == level.ordinal)?;
+        let base_file_ids: HashSet<u64> =
+            base_level.files.iter().map(|file| file.file_id).collect();
+        let removed: Vec<u64> = base_level
+            .files
+            .iter()
+            .filter(|file| {
+                !level
+                    .files
+                    .iter()
+                    .any(|current| current.file_id == file.file_id)
+            })
+            .map(|file| file.file_id)
+            .collect();
+        if !removed.is_empty() {
+            return None;
+        }
+        let new_files: Vec<ManifestFile> = level
+            .files
+            .iter()
+            .filter(|file| !base_file_ids.contains(&file.file_id))
+            .map(|file| manifest_file_from_data_file(file, file_manager))
+            .collect();
+        if !new_files.is_empty() {
+            if !level.tiered || level.ordinal != 0 || new_files.len() != 1 || !edits.is_empty() {
+                return None;
+            }
+            edits.push(ManifestLevelEdit {
+                level: level.ordinal,
+                tiered: level.tiered,
+                removed_file_ids: Vec::new(),
+                new_files,
+            });
+        }
+    }
+    for base_level in &base.levels {
+        if !snapshot
+            .levels
+            .iter()
+            .any(|level| level.ordinal == base_level.ordinal)
+            && !base_level.files.is_empty()
+        {
+            return None;
+        }
+    }
+    if edits.is_empty() { None } else { Some(edits) }
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -389,9 +616,78 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<ManifestSnapshot> {
+pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<ManifestPayload> {
     serde_json::from_slice(bytes)
         .map_err(|err| Error::IoError(format!("Failed to decode manifest: {}", err)))
+}
+
+/// Load the manifest for the given snapshot, applying incremental edits along the way if necessary.
+pub(crate) fn load_manifest_for_snapshot(
+    file_manager: &Arc<FileManager>,
+    snapshot_id: u64,
+) -> Result<ManifestSnapshot> {
+    let mut visited = HashSet::new();
+    load_manifest_for_snapshot_inner(file_manager, snapshot_id, &mut visited)
+}
+
+/// Recursive load entry of the manifest for the given snapshot.
+fn load_manifest_for_snapshot_inner(
+    file_manager: &Arc<FileManager>,
+    snapshot_id: u64,
+    visited: &mut HashSet<u64>,
+) -> Result<ManifestSnapshot> {
+    // Sanity check to prevent infinite recursion on cycles, which should never happen if the manager is correct.
+    if !visited.insert(snapshot_id) {
+        return Err(Error::IoError(format!(
+            "Snapshot manifest dependency cycle detected for {}",
+            snapshot_id
+        )));
+    }
+    let manifest_name = snapshot_manifest_name(snapshot_id);
+    let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
+    let bytes = reader.read_at(0, reader.size())?;
+    match decode_manifest(bytes.as_ref())? {
+        ManifestPayload::Snapshot(manifest) => Ok(manifest),
+        ManifestPayload::IncrementalSnapshot(manifest) => {
+            let mut resolved_base =
+                load_manifest_for_snapshot_inner(file_manager, manifest.base_snapshot_id, visited)?;
+            apply_manifest_level_edits(&mut resolved_base.levels, &manifest.level_edits)?;
+            resolved_base.vlog_files = manifest.vlog_files;
+            resolved_base.id = manifest.id;
+            resolved_base.seq_id = manifest.seq_id;
+            Ok(resolved_base)
+        }
+    }
+}
+
+fn apply_manifest_level_edits(
+    levels: &mut Vec<ManifestLevel>,
+    edits: &[ManifestLevelEdit],
+) -> Result<()> {
+    for edit in edits {
+        let level_pos = levels.iter().position(|level| level.ordinal == edit.level);
+        let level = if let Some(level_pos) = level_pos {
+            &mut levels[level_pos]
+        } else {
+            levels.push(ManifestLevel {
+                ordinal: edit.level,
+                tiered: edit.tiered,
+                files: Vec::new(),
+            });
+            levels.last_mut().expect("level inserted")
+        };
+        for removed_file_id in &edit.removed_file_ids {
+            level.files.retain(|file| file.file_id != *removed_file_id);
+        }
+        if !level.tiered && !edit.removed_file_ids.is_empty() {
+            return Err(Error::IoError(format!(
+                "Non-tiered incremental edits with removals are not supported for level {}",
+                level.ordinal
+            )));
+        }
+        level.files.extend(edit.new_files.clone());
+    }
+    Ok(())
 }
 
 pub(crate) fn build_levels_from_manifest(

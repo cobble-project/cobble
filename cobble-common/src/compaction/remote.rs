@@ -744,6 +744,7 @@ mod tests {
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            suggested_base_snapshot_id: None,
         });
         let lsm_tree = Arc::new(LSMTree::with_state(
             Arc::clone(&db_state),
