@@ -1268,8 +1268,8 @@ mod tests {
         iter.seek_to_first().unwrap();
         let mut entries = Vec::new();
         while iter.valid() {
-            let (key, value) = iter.current().unwrap().unwrap();
-            let decoded = decode_value(&value, num_columns).unwrap();
+            let (key, mut value) = iter.current().unwrap().unwrap();
+            let decoded = decode_value(&mut value, num_columns).unwrap();
             let raw = decoded
                 .columns()
                 .get(0)
@@ -1346,8 +1346,8 @@ mod tests {
         )
         .unwrap();
         iter.seek_to_first().unwrap();
-        let (_, value) = iter.current().unwrap().unwrap();
-        let decoded = decode_value(&value, 1).unwrap();
+        let (_, mut value) = iter.current().unwrap().unwrap();
+        let decoded = decode_value(&mut value, 1).unwrap();
         let column = decoded.columns()[0].as_ref().unwrap();
         assert_eq!(column.value_type, ValueType::PutSeparated);
         assert_eq!(column.data().len(), 8);

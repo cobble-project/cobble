@@ -666,8 +666,9 @@ impl LSMTree {
             && current_key.as_ref() == encoded_key
             && let Some(value_bytes) = iter.value()?
         {
+            let mut value_bytes = value_bytes;
             let value = decode_value_masked(
-                &value_bytes,
+                &mut value_bytes,
                 num_columns,
                 decode_mask,
                 terminal_mask.as_deref_mut(),
@@ -1070,7 +1071,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(value.len(), 1);
-        assert_eq!(value[0].columns()[0].as_ref().unwrap().data(), b"old");
+        assert_eq!(
+            value[0].columns()[0].as_ref().unwrap().data().as_ref(),
+            b"old"
+        );
         cleanup_test_root(root);
     }
 
@@ -1128,8 +1132,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(value.len(), 2);
-        assert_eq!(value[0].columns()[0].as_ref().unwrap().data(), b"new");
-        assert_eq!(value[1].columns()[0].as_ref().unwrap().data(), b"old");
+        assert_eq!(
+            value[0].columns()[0].as_ref().unwrap().data().as_ref(),
+            b"new"
+        );
+        assert_eq!(
+            value[1].columns()[0].as_ref().unwrap().data().as_ref(),
+            b"old"
+        );
         cleanup_test_root(root);
     }
 }

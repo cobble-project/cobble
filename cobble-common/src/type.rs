@@ -8,7 +8,7 @@ pub(crate) struct Key {
 
     /// Raw key bytes.
     /// The caller decides the encoding (prefixes, big-endian integers, varints, etc.).
-    data: Vec<u8>,
+    data: Bytes,
 }
 
 #[derive(Clone, Copy)]
@@ -55,7 +55,7 @@ pub(crate) struct Column {
     pub(crate) value_type: ValueType,
 
     /// Raw column bytes.
-    data: Vec<u8>,
+    data: Bytes,
 }
 
 #[derive(Clone, Copy)]
@@ -87,8 +87,11 @@ impl Key {
     ///
     /// \- `bucket`: logical namespace / group id
     /// \- `data`: raw key bytes
-    pub(crate) fn new(bucket: u16, data: Vec<u8>) -> Self {
-        Self { bucket, data }
+    pub(crate) fn new(bucket: u16, data: impl Into<Bytes>) -> Self {
+        Self {
+            bucket,
+            data: data.into(),
+        }
     }
 
     /// Returns the group identifier.
@@ -97,7 +100,7 @@ impl Key {
     }
 
     /// Returns the raw key bytes.
-    pub(crate) fn data(&self) -> &[u8] {
+    pub(crate) fn data(&self) -> &Bytes {
         &self.data
     }
 }
@@ -236,8 +239,11 @@ impl Column {
     ///
     /// \- `value_type`: write semantics (Put/Delete/Merge)
     /// \- `data`: raw column bytes
-    pub(crate) fn new(value_type: ValueType, data: Vec<u8>) -> Self {
-        Self { value_type, data }
+    pub(crate) fn new(value_type: ValueType, data: impl Into<Bytes>) -> Self {
+        Self {
+            value_type,
+            data: data.into(),
+        }
     }
 
     /// Returns the value type.
@@ -246,7 +252,7 @@ impl Column {
     }
 
     /// Returns the raw column bytes.
-    pub(crate) fn data(&self) -> &[u8] {
+    pub(crate) fn data(&self) -> &Bytes {
         &self.data
     }
 
@@ -272,7 +278,10 @@ impl Column {
                     return Self::merge_as_separated_array(self, newer)
                         .expect("separated merge invariant violated");
                 }
-                self.data.extend_from_slice(&newer.data);
+                let mut merged = BytesMut::with_capacity(self.data.len() + newer.data.len());
+                merged.extend_from_slice(self.data());
+                merged.extend_from_slice(newer.data());
+                self.data = merged.freeze();
                 self
             }
         }
@@ -313,7 +322,7 @@ impl<'a> RefColumn<'a> {
 
 impl From<Column> for Bytes {
     fn from(value: Column) -> Self {
-        Bytes::from(value.data)
+        value.data
     }
 }
 
@@ -481,7 +490,7 @@ mod tests {
 
         let merged = old.merge(new);
         assert!(matches!(merged.value_type(), ValueType::Put));
-        assert_eq!(merged.data(), b"new_data");
+        assert_eq!(merged.data().as_ref(), b"new_data");
     }
 
     #[test]
@@ -491,7 +500,7 @@ mod tests {
 
         let merged = old.merge(new);
         assert!(matches!(merged.value_type(), ValueType::Delete));
-        assert_eq!(merged.data(), b"");
+        assert_eq!(merged.data().as_ref(), b"");
     }
 
     #[test]
@@ -502,7 +511,7 @@ mod tests {
         let merged = old.merge(new);
         // Merge keeps the original value_type and concatenates data
         assert!(matches!(merged.value_type(), ValueType::Put));
-        assert_eq!(merged.data(), b"helloworld");
+        assert_eq!(merged.data().as_ref(), b"helloworld");
     }
 
     #[test]
@@ -513,7 +522,7 @@ mod tests {
 
         let merged = old.merge(merge1).merge(merge2);
         assert!(matches!(merged.value_type(), ValueType::Put));
-        assert_eq!(merged.data(), b"abc");
+        assert_eq!(merged.data().as_ref(), b"abc");
     }
 
     #[test]
@@ -531,8 +540,8 @@ mod tests {
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
-        assert_eq!(cols[0].as_ref().unwrap().data(), b"new1");
-        assert_eq!(cols[1].as_ref().unwrap().data(), b"old2_append");
+        assert_eq!(cols[0].as_ref().unwrap().data().as_ref(), b"new1");
+        assert_eq!(cols[1].as_ref().unwrap().data().as_ref(), b"old2_append");
     }
 
     #[test]
@@ -551,9 +560,9 @@ mod tests {
 
         assert_eq!(cols.len(), 2);
         // First column unchanged
-        assert_eq!(cols[0].as_ref().unwrap().data(), b"old1");
+        assert_eq!(cols[0].as_ref().unwrap().data().as_ref(), b"old1");
         // Second column replaced
-        assert_eq!(cols[1].as_ref().unwrap().data(), b"new2");
+        assert_eq!(cols[1].as_ref().unwrap().data().as_ref(), b"new2");
     }
 
     #[test]
@@ -571,8 +580,8 @@ mod tests {
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
-        assert_eq!(cols[0].as_ref().unwrap().data(), b"old1");
-        assert_eq!(cols[1].as_ref().unwrap().data(), b"new2");
+        assert_eq!(cols[0].as_ref().unwrap().data().as_ref(), b"old1");
+        assert_eq!(cols[1].as_ref().unwrap().data().as_ref(), b"new2");
     }
 
     #[test]
@@ -588,9 +597,9 @@ mod tests {
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 3);
-        assert_eq!(cols[0].as_ref().unwrap().data(), b"old1");
-        assert_eq!(cols[1].as_ref().unwrap().data(), b"new2");
-        assert_eq!(cols[2].as_ref().unwrap().data(), b"new3");
+        assert_eq!(cols[0].as_ref().unwrap().data().as_ref(), b"old1");
+        assert_eq!(cols[1].as_ref().unwrap().data().as_ref(), b"new2");
+        assert_eq!(cols[2].as_ref().unwrap().data().as_ref(), b"new3");
     }
 
     #[test]

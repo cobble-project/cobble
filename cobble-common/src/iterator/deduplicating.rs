@@ -185,7 +185,8 @@ impl<I> DeduplicatingIterator<I> {
             // The last value in the list is the oldest, the first is the newest
             let mut values_iter = values.into_iter().rev();
             let first = values_iter.next().expect("values is non-empty");
-            let mut merged_value = decode_value(first.as_ref(), self.num_columns)?;
+            let mut first = first;
+            let mut merged_value = decode_value(&mut first, self.num_columns)?;
 
             if let Some(callback) = self.on_merge.as_deref_mut() {
                 // The first column is invoked with callback(None, first_column) to indicate it's the oldest column being merged.
@@ -196,12 +197,14 @@ impl<I> DeduplicatingIterator<I> {
                 }
                 // Then for each newer value, we invoke the callback for each column pair (older, newer) before merging.
                 for newer_value in values_iter {
-                    let newer_value = decode_value(newer_value.as_ref(), self.num_columns)?;
+                    let mut newer_value = newer_value;
+                    let newer_value = decode_value(&mut newer_value, self.num_columns)?;
                     merged_value = merged_value.merge_with_callback(newer_value, callback);
                 }
             } else {
                 for newer_value in values_iter {
-                    let newer_value = decode_value(newer_value.as_ref(), self.num_columns)?;
+                    let mut newer_value = newer_value;
+                    let newer_value = decode_value(&mut newer_value, self.num_columns)?;
                     merged_value = merged_value.merge(newer_value);
                 }
             }
@@ -319,8 +322,8 @@ mod tests {
 
         let mut results = vec![];
         while dedup.valid() {
-            let (k, v) = dedup.current().unwrap().unwrap();
-            let decoded = decode_value(&v, num_columns).unwrap();
+            let (k, mut v) = dedup.current().unwrap().unwrap();
+            let decoded = decode_value(&mut v, num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();
         }
@@ -367,8 +370,8 @@ mod tests {
 
         let mut results = vec![];
         while dedup.valid() {
-            let (k, v) = dedup.current().unwrap().unwrap();
-            let decoded = decode_value(&v, num_columns).unwrap();
+            let (k, mut v) = dedup.current().unwrap().unwrap();
+            let decoded = decode_value(&mut v, num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();
         }
@@ -376,7 +379,10 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0.as_ref(), b"a");
         // The newer "new" value merged with older "old" - since newer is Put, it replaces
-        assert_eq!(results[0].1.columns()[0].as_ref().unwrap().data(), b"new");
+        assert_eq!(
+            results[0].1.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"new"
+        );
         assert_eq!(results[1].0.as_ref(), b"b");
     }
 
@@ -446,8 +452,8 @@ mod tests {
             DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()), None);
         dedup.seek_to_first().unwrap();
 
-        let (k, v) = dedup.current().unwrap().unwrap();
-        let decoded = decode_value(&v, num_columns).unwrap();
+        let (k, mut v) = dedup.current().unwrap().unwrap();
+        let decoded = decode_value(&mut v, num_columns).unwrap();
 
         assert_eq!(k.as_ref(), b"a");
         // The merge operation concatenates: "base" + "_suffix" should be how it works
@@ -456,7 +462,7 @@ mod tests {
         // The merge operation: older.merge(newer) = "base".merge("_suffix") where newer is Merge
         // So result should be "base_suffix"
         assert_eq!(
-            decoded.columns()[0].as_ref().unwrap().data(),
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
             b"base_suffix"
         );
     }
@@ -499,15 +505,18 @@ mod tests {
             DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()), None);
         dedup.seek_to_first().unwrap();
 
-        let (k, v) = dedup.current().unwrap().unwrap();
-        let decoded = decode_value(&v, num_columns).unwrap();
+        let (k, mut v) = dedup.current().unwrap().unwrap();
+        let decoded = decode_value(&mut v, num_columns).unwrap();
 
         assert_eq!(k.as_ref(), b"a");
         // Merge order: oldest to newest
         // 1. Start with oldest: Put "1"
         // 2. Merge with Merge "2": "1".merge("2") = "12" (concatenate)
         // 3. Merge with Merge "3": "12".merge("3") = "123" (concatenate)
-        assert_eq!(decoded.columns()[0].as_ref().unwrap().data(), b"123");
+        assert_eq!(
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"123"
+        );
     }
 
     #[test]
@@ -536,8 +545,8 @@ mod tests {
             DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()), None);
         dedup.seek_to_first().unwrap();
 
-        let (k, v) = dedup.current().unwrap().unwrap();
-        let decoded = decode_value(&v, num_columns).unwrap();
+        let (k, mut v) = dedup.current().unwrap().unwrap();
+        let decoded = decode_value(&mut v, num_columns).unwrap();
 
         assert_eq!(k.as_ref(), b"a");
         // Delete replaces the old value
@@ -623,15 +632,18 @@ mod tests {
             DeduplicatingIterator::new(iter, num_columns, Arc::new(TTLProvider::disabled()), None);
         dedup.seek_to_first().unwrap();
 
-        let (k, v) = dedup.current().unwrap().unwrap();
-        let decoded = decode_value(&v, num_columns).unwrap();
+        let (k, mut v) = dedup.current().unwrap().unwrap();
+        let decoded = decode_value(&mut v, num_columns).unwrap();
         let cols = decoded.columns();
 
         assert_eq!(k.as_ref(), b"a");
         // Column 0: Put replaces -> "col1_new"
-        assert_eq!(cols[0].as_ref().unwrap().data(), b"col1_new");
+        assert_eq!(cols[0].as_ref().unwrap().data().as_ref(), b"col1_new");
         // Column 1: Merge appends -> "col2_old_append"
-        assert_eq!(cols[1].as_ref().unwrap().data(), b"col2_old_append");
+        assert_eq!(
+            cols[1].as_ref().unwrap().data().as_ref(),
+            b"col2_old_append"
+        );
     }
 
     #[test]
@@ -698,17 +710,23 @@ mod tests {
 
         let mut results = vec![];
         while dedup.valid() {
-            let (k, v) = dedup.current().unwrap().unwrap();
-            let decoded = decode_value(&v, num_columns).unwrap();
+            let (k, mut v) = dedup.current().unwrap().unwrap();
+            let decoded = decode_value(&mut v, num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();
         }
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0.as_ref(), b"a");
-        assert_eq!(results[0].1.columns()[0].as_ref().unwrap().data(), b"old");
+        assert_eq!(
+            results[0].1.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"old"
+        );
         assert_eq!(results[1].0.as_ref(), b"c");
-        assert_eq!(results[1].1.columns()[0].as_ref().unwrap().data(), b"c");
+        assert_eq!(
+            results[1].1.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"c"
+        );
     }
 
     #[test]
@@ -768,8 +786,8 @@ mod tests {
 
         let mut results = vec![];
         while dedup.valid() {
-            let (k, v) = dedup.current().unwrap().unwrap();
-            let decoded = decode_value(&v, num_columns).unwrap();
+            let (k, mut v) = dedup.current().unwrap().unwrap();
+            let decoded = decode_value(&mut v, num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();
         }
@@ -780,16 +798,22 @@ mod tests {
         // Key "a" should be merged: "base" + "_suffix" = "base_suffix"
         assert_eq!(results[0].0.as_ref(), b"a");
         assert_eq!(
-            results[0].1.columns()[0].as_ref().unwrap().data(),
+            results[0].1.columns()[0].as_ref().unwrap().data().as_ref(),
             b"base_suffix"
         );
 
         // Key "b" should be unchanged
         assert_eq!(results[1].0.as_ref(), b"b");
-        assert_eq!(results[1].1.columns()[0].as_ref().unwrap().data(), b"b1");
+        assert_eq!(
+            results[1].1.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"b1"
+        );
 
         // Key "c" should be unchanged
         assert_eq!(results[2].0.as_ref(), b"c");
-        assert_eq!(results[2].1.columns()[0].as_ref().unwrap().data(), b"c1");
+        assert_eq!(
+            results[2].1.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"c1"
+        );
     }
 }

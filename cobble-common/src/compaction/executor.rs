@@ -776,26 +776,35 @@ mod tests {
 
         // Key "a" - newer value should win
         assert!(iter.valid());
-        let (key, value) = iter.current().unwrap().unwrap();
+        let (key, mut value) = iter.current().unwrap().unwrap();
         assert_eq!(&key[..], b"a");
-        let decoded = crate::sst::row_codec::decode_value(&value, num_columns).unwrap();
-        assert_eq!(decoded.columns()[0].as_ref().unwrap().data(), b"new_a");
+        let decoded = crate::sst::row_codec::decode_value(&mut value, num_columns).unwrap();
+        assert_eq!(
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"new_a"
+        );
 
         // Key "b" - newer value should win
         iter.next().unwrap();
         assert!(iter.valid());
-        let (key, value) = iter.current().unwrap().unwrap();
+        let (key, mut value) = iter.current().unwrap().unwrap();
         assert_eq!(&key[..], b"b");
-        let decoded = crate::sst::row_codec::decode_value(&value, num_columns).unwrap();
-        assert_eq!(decoded.columns()[0].as_ref().unwrap().data(), b"new_b");
+        let decoded = crate::sst::row_codec::decode_value(&mut value, num_columns).unwrap();
+        assert_eq!(
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"new_b"
+        );
 
         // Key "c" - only in older file
         iter.next().unwrap();
         assert!(iter.valid());
-        let (key, value) = iter.current().unwrap().unwrap();
+        let (key, mut value) = iter.current().unwrap().unwrap();
         assert_eq!(&key[..], b"c");
-        let decoded = crate::sst::row_codec::decode_value(&value, num_columns).unwrap();
-        assert_eq!(decoded.columns()[0].as_ref().unwrap().data(), b"old_c");
+        let decoded = crate::sst::row_codec::decode_value(&mut value, num_columns).unwrap();
+        assert_eq!(
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"old_c"
+        );
 
         cleanup_test_dir(test_dir);
     }
@@ -917,23 +926,23 @@ mod tests {
 
         iter.seek_to_first().unwrap();
         assert!(iter.valid());
-        let (key, value) = iter.current().unwrap().unwrap();
+        let (key, mut value) = iter.current().unwrap().unwrap();
         assert_eq!(&key[..], b"a");
-        let decoded = crate::sst::row_codec::decode_value(&value, num_columns).unwrap();
+        let decoded = crate::sst::row_codec::decode_value(&mut value, num_columns).unwrap();
         let column = decoded.columns()[0].as_ref().unwrap();
         assert_eq!(column.value_type, ValueType::MergeSeparatedArray);
         let merged_items = decode_merge_separated_array(column.data()).unwrap();
         assert_eq!(merged_items.len(), 2);
         assert_eq!(merged_items[0].value_type, ValueType::PutSeparated);
-        assert_eq!(merged_items[0].data(), old_put_separated);
+        assert_eq!(merged_items[0].data().as_ref(), old_put_separated);
         assert_eq!(merged_items[1].value_type, ValueType::MergeSeparated);
-        assert_eq!(merged_items[1].data(), new_merge_separated_a);
+        assert_eq!(merged_items[1].data().as_ref(), new_merge_separated_a);
 
         iter.next().unwrap();
         assert!(iter.valid());
-        let (key, value) = iter.current().unwrap().unwrap();
+        let (key, mut value) = iter.current().unwrap().unwrap();
         assert_eq!(&key[..], b"b");
-        let decoded = crate::sst::row_codec::decode_value(&value, num_columns).unwrap();
+        let decoded = crate::sst::row_codec::decode_value(&mut value, num_columns).unwrap();
         let column = decoded.columns()[0].as_ref().unwrap();
         assert_eq!(column.value_type, ValueType::MergeSeparatedArray);
         let merged_items = decode_merge_separated_array(column.data()).unwrap();
@@ -941,7 +950,7 @@ mod tests {
         assert_eq!(merged_items[0].value_type, ValueType::Put);
         assert_eq!(merged_items[0].data(), b"base_b");
         assert_eq!(merged_items[1].value_type, ValueType::MergeSeparated);
-        assert_eq!(merged_items[1].data(), new_merge_separated_b);
+        assert_eq!(merged_items[1].data().as_ref(), new_merge_separated_b);
 
         cleanup_test_dir(test_dir);
     }

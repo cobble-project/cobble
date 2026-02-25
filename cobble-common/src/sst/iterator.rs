@@ -760,8 +760,8 @@ impl SSTIterator {
 
     /// Get the current typed Key, decoding from the row codec format.
     pub fn current_key(&self) -> Result<Option<Key>> {
-        if let Some(bytes) = self.key()? {
-            let key = decode_key(&bytes)?;
+        if let Some(mut bytes) = self.key()? {
+            let key = decode_key(&mut bytes)?;
             return Ok(Some(key));
         }
         Ok(None)
@@ -770,8 +770,8 @@ impl SSTIterator {
     /// Get the current typed Value, decoding from the row codec format.
     /// Returns a Value containing optional columns.
     pub fn current_value(&self) -> Result<Option<Value>> {
-        if let Some(bytes) = self.value()? {
-            let value = decode_value(&bytes, self.options.num_columns)?;
+        if let Some(mut bytes) = self.value()? {
+            let value = decode_value(&mut bytes, self.options.num_columns)?;
             return Ok(Some(value));
         }
         Ok(None)
@@ -779,9 +779,9 @@ impl SSTIterator {
 
     /// Get the current typed Key and Value pair, decoding from the row codec format.
     pub fn current_kv(&self) -> Result<Option<(Key, Value)>> {
-        if let Some((key_bytes, value_bytes)) = self.current()? {
-            let key = decode_key(&key_bytes)?;
-            let value = decode_value(&value_bytes, self.options.num_columns)?;
+        if let Some((mut key_bytes, mut value_bytes)) = self.current()? {
+            let key = decode_key(&mut key_bytes)?;
+            let value = decode_value(&mut value_bytes, self.options.num_columns)?;
             return Ok(Some((key, value)));
         }
         Ok(None)
@@ -1264,11 +1264,14 @@ mod tests {
             let (key, value) = iter.current_kv().unwrap().unwrap();
             let cols = value.columns();
             assert_eq!(key.bucket(), 1);
-            assert_eq!(key.data(), b"user:1");
+            assert_eq!(key.data().as_ref(), b"user:1");
             assert!(cols[0].is_some());
-            assert_eq!(cols[0].as_ref().unwrap().data(), b"Alice");
+            assert_eq!(cols[0].as_ref().unwrap().data().as_ref(), b"Alice");
             assert!(cols[1].is_some());
-            assert_eq!(cols[1].as_ref().unwrap().data(), b"alice@example.com");
+            assert_eq!(
+                cols[1].as_ref().unwrap().data().as_ref(),
+                b"alice@example.com"
+            );
 
             // Second entry
             iter.next().unwrap();
@@ -1277,9 +1280,9 @@ mod tests {
             let value = iter.current_value().unwrap().unwrap();
             let cols = value.columns();
             assert_eq!(key.bucket(), 1);
-            assert_eq!(key.data(), b"user:2");
+            assert_eq!(key.data().as_ref(), b"user:2");
             assert!(cols[0].is_some());
-            assert_eq!(cols[0].as_ref().unwrap().data(), b"Bob");
+            assert_eq!(cols[0].as_ref().unwrap().data().as_ref(), b"Bob");
             assert!(cols[1].is_none());
 
             // Third entry
@@ -1288,7 +1291,7 @@ mod tests {
             let (key, value) = iter.current_kv().unwrap().unwrap();
             let cols = value.columns();
             assert_eq!(key.bucket(), 2);
-            assert_eq!(key.data(), b"order:100");
+            assert_eq!(key.data().as_ref(), b"order:100");
             assert!(cols[0].is_some());
             assert!(matches!(
                 cols[0].as_ref().unwrap().value_type(),
@@ -1320,7 +1323,7 @@ mod tests {
             iter.seek_key(&target).unwrap();
             assert!(iter.valid());
             let key = iter.current_key().unwrap().unwrap();
-            assert_eq!(key.data(), b"user:2");
+            assert_eq!(key.data().as_ref(), b"user:2");
         }
 
         let _ = std::fs::remove_dir_all("/tmp/sst_typed_kv_test");

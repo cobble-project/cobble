@@ -10,9 +10,9 @@ use crate::snapshot::{
     load_manifest_for_snapshot, snapshot_manifest_name,
 };
 use crate::sst::block_cache::new_block_cache;
-use crate::sst::row_codec::{decode_value_masked, encode_key};
+use crate::sst::row_codec::{decode_value_masked, encode_key_ref_into};
 use crate::r#type::decode_merge_separated_array;
-use crate::r#type::{Column, Key, RefColumn, RefKey, RefValue, Value, ValueType};
+use crate::r#type::{Column, RefColumn, RefKey, RefValue, Value, ValueType};
 use crate::vlog::{VlogPointer, VlogStore};
 use crate::write_batch::{WriteBatch, WriteOp};
 use crate::{Config, ReadOptions, ScanOptions, TimeProvider};
@@ -299,7 +299,7 @@ impl Db {
 
     /// Write a batch of operations to the database.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
-        let mut pending: std::collections::BTreeMap<Vec<u8>, Value> =
+        let mut pending: std::collections::BTreeMap<Bytes, Value> =
             std::collections::BTreeMap::new();
         for (key_and_seq, op) in batch.ops {
             let column_idx = key_and_seq.column as usize;
@@ -311,22 +311,22 @@ impl Db {
             }
             let (column, expired_at) = match op {
                 WriteOp::Put(_, value, ttl_secs) => (
-                    Column::new(ValueType::Put, value.to_vec()),
+                    Column::new(ValueType::Put, value),
                     self.ttl_provider.get_expiration_timestamp(ttl_secs),
                 ),
                 WriteOp::Delete(_) => (
-                    Column::new(ValueType::Delete, Vec::new()),
+                    Column::new(ValueType::Delete, Bytes::new()),
                     self.ttl_provider.get_expiration_timestamp(None),
                 ),
                 WriteOp::Merge(_, value, ttl_secs) => (
-                    Column::new(ValueType::Merge, value.to_vec()),
+                    Column::new(ValueType::Merge, value),
                     self.ttl_provider.get_expiration_timestamp(ttl_secs),
                 ),
             };
             let mut columns = vec![None; self.num_columns];
             columns[column_idx] = Some(column);
             let next_value = Value::new_with_expired_at(columns, expired_at);
-            match pending.entry(key_and_seq.key.to_vec()) {
+            match pending.entry(key_and_seq.key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(next_value);
                 }
@@ -338,7 +338,7 @@ impl Db {
             }
         }
         for (raw_key, value) in pending {
-            let key = RefKey::new(0, &raw_key);
+            let key = RefKey::new(0, raw_key.as_ref());
             let columns: Vec<Option<RefColumn<'_>>> = value
                 .columns()
                 .iter()
@@ -648,8 +648,9 @@ impl Db {
                 max_index, self.num_columns
             )));
         }
-        let lookup_key = Key::new(0, key.to_vec());
-        let encoded_key = encode_key(&lookup_key);
+        let mut encoded_key = BytesMut::with_capacity(2 + key.len());
+        encode_key_ref_into(&RefKey::new(0, key), &mut encoded_key);
+        let encoded_key = encoded_key.freeze();
         let selected_columns = options.columns();
         let masks = options.masks(self.num_columns);
         let selected_mask = masks.selected_mask.as_deref();
@@ -667,8 +668,9 @@ impl Db {
             Arc::clone(&snapshot),
             encoded_key.as_ref(),
             |raw| {
+                let mut raw_value = Bytes::copy_from_slice(raw);
                 let mut value = decode_value_masked(
-                    raw,
+                    &mut raw_value,
                     self.num_columns,
                     decode_mask,
                     terminal_mask.as_deref_mut(),
@@ -751,7 +753,11 @@ impl Db {
             self.num_columns,
             options.read_ahead_bytes,
         )?;
-        let encode_scan_key = |key: &[u8]| encode_key(&Key::new(bucket, key.to_vec()));
+        let encode_scan_key = |key: &[u8]| {
+            let mut encoded = BytesMut::with_capacity(2 + key.len());
+            encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded);
+            encoded.freeze()
+        };
         let start_key = encode_scan_key(range.start);
         let end_bound = Some((encode_scan_key(range.end), false));
         let mut iter = DbIterator::new(
@@ -934,8 +940,8 @@ mod tests {
         )
         .unwrap();
         iter.seek_to_first().unwrap();
-        let (_, raw_value) = iter.current().unwrap().unwrap();
-        let decoded = decode_value(&raw_value, 1).unwrap();
+        let (_, mut raw_value) = iter.current().unwrap().unwrap();
+        let decoded = decode_value(&mut raw_value, 1).unwrap();
         let column = decoded
             .columns()
             .first()

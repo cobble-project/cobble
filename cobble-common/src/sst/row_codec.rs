@@ -79,7 +79,7 @@ pub(crate) fn encode_key_ref_into(key: &RefKey<'_>, buf: &mut impl BufMut) {
 
 /// Decodes a Key from bytes.
 /// The full key data is provided (length is known from SST block format).
-pub(crate) fn decode_key(data: &[u8]) -> Result<Key> {
+pub(crate) fn decode_key(data: &mut Bytes) -> Result<Key> {
     if data.len() < 2 {
         return Err(Error::IoError(format!(
             "Key data too small: expected at least 2 bytes, got {}",
@@ -87,9 +87,8 @@ pub(crate) fn decode_key(data: &[u8]) -> Result<Key> {
         )));
     }
 
-    let mut buf = data;
-    let group = buf.get_u16_le();
-    let key_data = buf.to_vec();
+    let group = data.get_u16_le();
+    let key_data = data.split_to(data.len());
     Ok(Key::new(group, key_data))
 }
 
@@ -278,27 +277,26 @@ fn encode_value_columns_into<C: ColumnRef>(
 ///
 /// # Returns
 /// A Value containing optional columns, where `None` indicates an absent column.
-pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Value> {
+pub(crate) fn decode_value(data: &mut Bytes, num_columns: usize) -> Result<Value> {
     if data.len() < 4 {
         return Err(Error::IoError(format!(
             "Value data too small: expected at least 4 bytes for expired_at, got {}",
             data.len()
         )));
     }
-    let mut buf = data;
-    let expired_at = buf.get_u32_le();
+    let expired_at = data.get_u32_le();
     let bmp_size = bitmap_size(num_columns);
 
-    if buf.len() < bmp_size {
+    if data.len() < bmp_size {
         return Err(Error::IoError(format!(
             "Value data too small: expected at least {} bytes for bitmap, got {}",
             bmp_size,
-            buf.len()
+            data.len()
         )));
     }
 
-    let bitmap = &buf[..bmp_size];
-    let mut buf = &buf[bmp_size..];
+    let bitmap = data.split_to(bmp_size);
+    let bitmap = bitmap.as_ref();
 
     // First pass: determine which columns are present and find the last one
     let mut presence = Vec::with_capacity(num_columns);
@@ -323,39 +321,37 @@ pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Value> {
 
             if is_last {
                 // Last present column: data_len is not stored, use remaining bytes
-                if buf.remaining() < 1 {
+                if data.remaining() < 1 {
                     return Err(Error::IoError(format!(
                         "Column {} data corrupted: not enough bytes for value_type",
                         i
                     )));
                 }
-                let value_type = decode_value_type(buf.get_u8())?;
-                let col_data = buf.to_vec();
-                buf = &buf[buf.len()..];
+                let value_type = decode_value_type(data.get_u8())?;
+                let col_data = data.split_to(data.len());
                 columns.push(Some(Column::new(value_type, col_data)));
             } else {
                 // Non-last column: has data_len field
-                if buf.remaining() < 5 {
+                if data.remaining() < 5 {
                     return Err(Error::IoError(format!(
                         "Column {} data corrupted: not enough bytes",
                         i
                     )));
                 }
 
-                let value_type = decode_value_type(buf.get_u8())?;
-                let data_len = buf.get_u32_le() as usize;
+                let value_type = decode_value_type(data.get_u8())?;
+                let data_len = data.get_u32_le() as usize;
 
-                if buf.remaining() < data_len {
+                if data.remaining() < data_len {
                     return Err(Error::IoError(format!(
                         "Column {} data corrupted: expected {} bytes, got {}",
                         i,
                         data_len,
-                        buf.remaining()
+                        data.remaining()
                     )));
                 }
 
-                let col_data = buf[..data_len].to_vec();
-                buf = &buf[data_len..];
+                let col_data = data.split_to(data_len);
                 columns.push(Some(Column::new(value_type, col_data)));
             }
         } else {
@@ -375,7 +371,7 @@ pub(crate) fn decode_value(data: &[u8], num_columns: usize) -> Result<Value> {
 /// Columns not requested are skipped and returned as None, while their value types
 /// can still update `terminal_columns` if provided.
 pub(crate) fn decode_value_masked(
-    data: &[u8],
+    data: &mut Bytes,
     num_columns: usize,
     decode_mask: &[u8],
     mut terminal_mask: Option<&mut [u8]>,
@@ -386,8 +382,7 @@ pub(crate) fn decode_value_masked(
             data.len()
         )));
     }
-    let mut buf = data;
-    let expired_at = buf.get_u32_le();
+    let expired_at = data.get_u32_le();
 
     let mask_size = bitmap_size(num_columns).max(1);
     if decode_mask.len() < mask_size {
@@ -399,16 +394,16 @@ pub(crate) fn decode_value_masked(
     }
 
     let bmp_size = bitmap_size(num_columns);
-    if buf.len() < bmp_size {
+    if data.len() < bmp_size {
         return Err(Error::IoError(format!(
             "Value data too small: expected at least {} bytes for bitmap, got {}",
             bmp_size,
-            buf.len()
+            data.len()
         )));
     }
 
-    let bitmap = &buf[..bmp_size];
-    let mut buf = &buf[bmp_size..];
+    let bitmap = data.split_to(bmp_size);
+    let bitmap = bitmap.as_ref();
     let mut last_present_idx = None;
     if num_columns == 1 {
         last_present_idx = Some(0);
@@ -439,13 +434,13 @@ pub(crate) fn decode_value_masked(
         };
         if is_presence {
             let is_last = Some(i) == last_present_idx;
-            if buf.remaining() < 1 {
+            if data.remaining() < 1 {
                 return Err(Error::IoError(format!(
                     "Column {} data corrupted: not enough bytes for value_type",
                     i
                 )));
             }
-            let value_type = decode_value_type(buf.get_u8())?;
+            let value_type = decode_value_type(data.get_u8())?;
             if let Some(ref mut mask) = terminal_mask
                 && value_type.is_terminal()
                 && let Some(byte) = mask.get_mut(i / 8)
@@ -454,36 +449,35 @@ pub(crate) fn decode_value_masked(
             }
             if is_last {
                 if decode_mask[i / 8] & (1 << (i % 8)) != 0 {
-                    let col_data = buf.to_vec();
-                    buf = &buf[buf.len()..];
+                    let col_data = data.split_to(data.len());
                     columns.push(Some(Column::new(value_type, col_data)));
                 } else {
-                    buf = &buf[buf.len()..];
+                    data.advance(data.len());
                     columns.push(None);
                 }
             } else {
-                if buf.remaining() < 4 {
+                if data.remaining() < 4 {
                     return Err(Error::IoError(format!(
                         "Column {} data corrupted: not enough bytes for length",
                         i
                     )));
                 }
-                let data_len = buf.get_u32_le() as usize;
-                if buf.remaining() < data_len {
+                let data_len = data.get_u32_le() as usize;
+                if data.remaining() < data_len {
                     return Err(Error::IoError(format!(
                         "Column {} data corrupted: expected {} bytes, got {}",
                         i,
                         data_len,
-                        buf.remaining()
+                        data.remaining()
                     )));
                 }
                 if decode_mask[i / 8] & (1 << (i % 8)) != 0 {
-                    let col_data = buf[..data_len].to_vec();
+                    let col_data = data.split_to(data_len);
                     columns.push(Some(Column::new(value_type, col_data)));
                 } else {
+                    data.advance(data_len);
                     columns.push(None);
                 }
-                buf = &buf[data_len..];
             }
         } else {
             columns.push(None);
@@ -542,9 +536,10 @@ mod tests {
         assert_eq!(encoded.len(), 13);
         assert_eq!(key_encoded_size(&key), 13);
 
-        let decoded = decode_key(&encoded).unwrap();
+        let mut encoded_for_decode = encoded.clone();
+        let decoded = decode_key(&mut encoded_for_decode).unwrap();
         assert_eq!(decoded.bucket(), 42);
-        assert_eq!(decoded.data(), b"hello world");
+        assert_eq!(decoded.data().as_ref(), b"hello world");
     }
 
     #[test]
@@ -554,9 +549,10 @@ mod tests {
 
         assert_eq!(encoded.len(), 2);
 
-        let decoded = decode_key(&encoded).unwrap();
+        let mut encoded_for_decode = encoded.clone();
+        let decoded = decode_key(&mut encoded_for_decode).unwrap();
         assert_eq!(decoded.bucket(), 0);
-        assert_eq!(decoded.data(), b"");
+        assert_eq!(decoded.data().as_ref(), b"");
     }
 
     #[test]
@@ -564,14 +560,16 @@ mod tests {
         let key = Key::new(u16::MAX, b"test".to_vec());
         let encoded = encode_key(&key);
 
-        let decoded = decode_key(&encoded).unwrap();
+        let mut encoded_for_decode = encoded.clone();
+        let decoded = decode_key(&mut encoded_for_decode).unwrap();
         assert_eq!(decoded.bucket(), u16::MAX);
-        assert_eq!(decoded.data(), b"test");
+        assert_eq!(decoded.data().as_ref(), b"test");
     }
 
     #[test]
     fn test_key_decode_too_small() {
-        let result = decode_key(&[0]);
+        let mut encoded = Bytes::from_static(&[0]);
+        let result = decode_key(&mut encoded);
         assert!(result.is_err());
     }
 
@@ -636,19 +634,20 @@ mod tests {
         assert_eq!(encoded.len(), 21);
         assert_eq!(value_encoded_size(&value, 2), 21);
 
-        let decoded = decode_value(&encoded, 2).unwrap();
+        let mut encoded_for_decode = encoded.clone();
+        let decoded = decode_value(&mut encoded_for_decode, 2).unwrap();
         let cols = decoded.columns();
         assert_eq!(cols.len(), 2);
 
         assert!(cols[0].is_some());
         let c0 = cols[0].as_ref().unwrap();
         assert!(matches!(c0.value_type(), ValueType::Put));
-        assert_eq!(c0.data(), b"data1");
+        assert_eq!(c0.data().as_ref(), b"data1");
 
         assert!(cols[1].is_some());
         let c1 = cols[1].as_ref().unwrap();
         assert!(matches!(c1.value_type(), ValueType::Delete));
-        assert_eq!(c1.data(), b"data2");
+        assert_eq!(c1.data().as_ref(), b"data2");
     }
 
     #[test]
@@ -664,12 +663,13 @@ mod tests {
         // Total: 4 + 1 + 8 = 13
         assert_eq!(encoded.len(), 13);
 
-        let decoded = decode_value(&encoded, 3).unwrap();
+        let mut encoded_for_decode = encoded.clone();
+        let decoded = decode_value(&mut encoded_for_decode, 3).unwrap();
         let cols = decoded.columns();
         assert_eq!(cols.len(), 3);
 
         assert!(cols[0].is_some());
-        assert_eq!(cols[0].as_ref().unwrap().data(), b"present");
+        assert_eq!(cols[0].as_ref().unwrap().data().as_ref(), b"present");
 
         assert!(cols[1].is_none());
         assert!(cols[2].is_none());
@@ -685,7 +685,8 @@ mod tests {
         // Bitmap size: 1 byte for 4 columns, no column data
         assert_eq!(encoded.len(), 5);
 
-        let decoded = decode_value(&encoded, 4).unwrap();
+        let mut encoded_for_decode = encoded.clone();
+        let decoded = decode_value(&mut encoded_for_decode, 4).unwrap();
         let cols = decoded.columns();
         assert_eq!(cols.len(), 4);
         assert!(cols.iter().all(|c| c.is_none()));
@@ -710,7 +711,8 @@ mod tests {
         // Total: 4 + 2 + 12 + 2 = 20
         assert_eq!(encoded.len(), 20);
 
-        let decoded = decode_value(&encoded, 16).unwrap();
+        let mut encoded_for_decode = encoded.clone();
+        let decoded = decode_value(&mut encoded_for_decode, 16).unwrap();
         let cols = decoded.columns();
         assert_eq!(cols.len(), 16);
 
@@ -734,7 +736,8 @@ mod tests {
     #[test]
     fn test_value_decode_too_small() {
         // For 2 columns, need at least 1 byte bitmap
-        let result = decode_value(&[], 2);
+        let mut encoded = Bytes::new();
+        let result = decode_value(&mut encoded, 2);
         assert!(result.is_err());
     }
 
@@ -754,11 +757,12 @@ mod tests {
         assert_eq!(encoded.len(), 11);
         assert_eq!(value_encoded_size(&value, 1), 11);
 
-        let decoded = decode_value(&encoded, 1).unwrap();
+        let mut encoded_for_decode = encoded.clone();
+        let decoded = decode_value(&mut encoded_for_decode, 1).unwrap();
         let cols = decoded.columns();
         assert_eq!(cols.len(), 1);
         assert!(cols[0].is_some());
-        assert_eq!(cols[0].as_ref().unwrap().data(), b"single");
+        assert_eq!(cols[0].as_ref().unwrap().data().as_ref(), b"single");
     }
 
     #[test]
@@ -767,17 +771,22 @@ mod tests {
 
         let key = Key::new(1234, large_data.clone());
         let encoded_key = encode_key(&key);
-        let decoded_key = decode_key(&encoded_key).unwrap();
+        let mut encoded_key_for_decode = encoded_key.clone();
+        let decoded_key = decode_key(&mut encoded_key_for_decode).unwrap();
         assert_eq!(decoded_key.bucket(), 1234);
-        assert_eq!(decoded_key.data(), large_data.as_slice());
+        assert_eq!(decoded_key.data().as_ref(), large_data.as_slice());
 
         let col = Column::new(ValueType::Put, large_data.clone());
         let value = Value::new(vec![Some(col)]);
         let encoded = encode_value(&value, 1);
-        let decoded = decode_value(&encoded, 1).unwrap();
+        let mut encoded_for_decode = encoded.clone();
+        let decoded = decode_value(&mut encoded_for_decode, 1).unwrap();
         let cols = decoded.columns();
         assert!(cols[0].is_some());
-        assert_eq!(cols[0].as_ref().unwrap().data(), large_data.as_slice());
+        assert_eq!(
+            cols[0].as_ref().unwrap().data().as_ref(),
+            large_data.as_slice()
+        );
     }
 
     #[test]
@@ -786,8 +795,9 @@ mod tests {
 
         let key = Key::new(100, binary_data.clone());
         let encoded = encode_key(&key);
-        let decoded = decode_key(&encoded).unwrap();
-        assert_eq!(decoded.data(), binary_data.as_slice());
+        let mut encoded_for_decode = encoded.clone();
+        let decoded = decode_key(&mut encoded_for_decode).unwrap();
+        assert_eq!(decoded.data().as_ref(), binary_data.as_slice());
     }
 
     #[test]
@@ -867,46 +877,46 @@ mod tests {
 
             // First entry: user:1 with name="Alice", email="alice@example.com"
             assert!(iter.valid());
-            let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
-            let decoded_key = decode_key(&key_bytes).unwrap();
-            let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
+            let (mut key_bytes, mut value_bytes) = iter.current().unwrap().unwrap();
+            let decoded_key = decode_key(&mut key_bytes).unwrap();
+            let decoded_value = decode_value(&mut value_bytes, num_columns).unwrap();
             let decoded_cols = decoded_value.columns();
 
             assert_eq!(decoded_key.bucket(), 1);
-            assert_eq!(decoded_key.data(), b"user:1");
+            assert_eq!(decoded_key.data().as_ref(), b"user:1");
             assert_eq!(decoded_cols.len(), 2);
             assert!(decoded_cols[0].is_some());
-            assert_eq!(decoded_cols[0].as_ref().unwrap().data(), b"Alice");
+            assert_eq!(decoded_cols[0].as_ref().unwrap().data().as_ref(), b"Alice");
             assert!(decoded_cols[1].is_some());
             assert_eq!(
-                decoded_cols[1].as_ref().unwrap().data(),
+                decoded_cols[1].as_ref().unwrap().data().as_ref(),
                 b"alice@example.com"
             );
 
             // Second entry: user:2 with name="Bob", email=None
             iter.next().unwrap();
             assert!(iter.valid());
-            let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
-            let decoded_key = decode_key(&key_bytes).unwrap();
-            let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
+            let (mut key_bytes, mut value_bytes) = iter.current().unwrap().unwrap();
+            let decoded_key = decode_key(&mut key_bytes).unwrap();
+            let decoded_value = decode_value(&mut value_bytes, num_columns).unwrap();
             let decoded_cols = decoded_value.columns();
 
             assert_eq!(decoded_key.bucket(), 1);
-            assert_eq!(decoded_key.data(), b"user:2");
+            assert_eq!(decoded_key.data().as_ref(), b"user:2");
             assert!(decoded_cols[0].is_some());
-            assert_eq!(decoded_cols[0].as_ref().unwrap().data(), b"Bob");
+            assert_eq!(decoded_cols[0].as_ref().unwrap().data().as_ref(), b"Bob");
             assert!(decoded_cols[1].is_none());
 
             // Third entry: order:100 with all columns absent
             iter.next().unwrap();
             assert!(iter.valid());
-            let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
-            let decoded_key = decode_key(&key_bytes).unwrap();
-            let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
+            let (mut key_bytes, mut value_bytes) = iter.current().unwrap().unwrap();
+            let decoded_key = decode_key(&mut key_bytes).unwrap();
+            let decoded_value = decode_value(&mut value_bytes, num_columns).unwrap();
             let decoded_cols = decoded_value.columns();
 
             assert_eq!(decoded_key.bucket(), 2);
-            assert_eq!(decoded_key.data(), b"order:100");
+            assert_eq!(decoded_key.data().as_ref(), b"order:100");
             assert!(decoded_cols[0].is_none());
             assert!(decoded_cols[1].is_none());
 
@@ -983,10 +993,10 @@ mod tests {
             iter.seek(&encode_key(&seek_key)).unwrap();
             assert!(iter.valid());
 
-            let (key_bytes, _) = iter.current().unwrap().unwrap();
-            let decoded_key = decode_key(&key_bytes).unwrap();
+            let (mut key_bytes, _) = iter.current().unwrap().unwrap();
+            let decoded_key = decode_key(&mut key_bytes).unwrap();
             assert_eq!(decoded_key.bucket(), 1);
-            assert_eq!(decoded_key.data(), b"bbb");
+            assert_eq!(decoded_key.data().as_ref(), b"bbb");
         }
 
         let _ = std::fs::remove_dir_all("/tmp/sst_row_codec_seek_test");
@@ -1062,17 +1072,20 @@ mod tests {
 
             let mut count = 0;
             while iter.valid() {
-                let (key_bytes, value_bytes) = iter.current().unwrap().unwrap();
-                let decoded_key = decode_key(&key_bytes).unwrap();
-                let decoded_value = decode_value(&value_bytes, num_columns).unwrap();
+                let (mut key_bytes, mut value_bytes) = iter.current().unwrap().unwrap();
+                let decoded_key = decode_key(&mut key_bytes).unwrap();
+                let decoded_value = decode_value(&mut value_bytes, num_columns).unwrap();
                 let decoded_cols = decoded_value.columns();
 
                 assert_eq!(decoded_key.bucket(), count as u16);
-                assert_eq!(decoded_key.data(), format!("key{:04}", count).as_bytes());
+                assert_eq!(
+                    decoded_key.data().as_ref(),
+                    format!("key{:04}", count).as_bytes()
+                );
 
                 assert!(decoded_cols[0].is_some());
                 assert_eq!(
-                    decoded_cols[0].as_ref().unwrap().data(),
+                    decoded_cols[0].as_ref().unwrap().data().as_ref(),
                     format!("val{:04}", count).as_bytes()
                 );
 

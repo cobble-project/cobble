@@ -10,9 +10,9 @@ use crate::snapshot::{
     build_levels_from_manifest, build_vlog_version_from_manifest, load_manifest_for_snapshot,
 };
 use crate::sst::block_cache::{BlockCache, new_block_cache};
-use crate::sst::row_codec::encode_key;
+use crate::sst::row_codec::encode_key_ref_into;
 use crate::ttl::{TTLProvider, TtlConfig};
-use crate::r#type::{Key, Value};
+use crate::r#type::{RefKey, Value};
 use crate::vlog::VlogStore;
 use crate::{Config, ReadOptions, ScanOptions};
 use bytes::Bytes;
@@ -133,8 +133,9 @@ impl ReadOnlyDb {
                 max_index, self.num_columns
             )));
         }
-        let lookup_key = Key::new(0, key.to_vec());
-        let encoded_key = encode_key(&lookup_key);
+        let mut encoded_key = bytes::BytesMut::with_capacity(2 + key.len());
+        encode_key_ref_into(&RefKey::new(0, key), &mut encoded_key);
+        let encoded_key = encoded_key.freeze();
         let masks = options.masks(self.num_columns);
         let selected_mask = masks.selected_mask.as_deref();
         let lsm_values = self.lsm_tree.get(
@@ -180,7 +181,11 @@ impl ReadOnlyDb {
             self.num_columns,
             options.read_ahead_bytes,
         )?;
-        let encode_scan_key = |key: &[u8]| encode_key(&Key::new(bucket, key.to_vec()));
+        let encode_scan_key = |key: &[u8]| {
+            let mut encoded = bytes::BytesMut::with_capacity(2 + key.len());
+            encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded);
+            encoded.freeze()
+        };
         let start_key = encode_scan_key(range.start);
         let end_bound = Some((encode_scan_key(range.end), false));
         let mut iter: DbIterator<'static> = DbIterator::new(

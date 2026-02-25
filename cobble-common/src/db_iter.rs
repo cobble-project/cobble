@@ -67,7 +67,7 @@ impl<'a> DbIterator<'a> {
 
     fn next_row(&mut self) -> Result<Option<(Bytes, Vec<Option<Bytes>>)>> {
         while self.inner.valid() {
-            let Some((encoded_key, encoded_value)) = self.inner.current()? else {
+            let Some((mut encoded_key, mut encoded_value)) = self.inner.current()? else {
                 self.inner.next()?;
                 continue;
             };
@@ -75,8 +75,8 @@ impl<'a> DbIterator<'a> {
             if self.is_past_end(encoded_key.as_ref()) {
                 return Ok(None);
             }
-            let key = decode_key(encoded_key.as_ref())?;
-            let value = decode_value(encoded_value.as_ref(), self.num_columns)?;
+            let key = decode_key(&mut encoded_key)?;
+            let value = decode_value(&mut encoded_value, self.num_columns)?;
             let columns = value_to_vec_of_columns_with_vlog(value, |pointer| {
                 match self
                     .vlog_store
