@@ -5,8 +5,9 @@ use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::metrics_manager::MetricsManager;
 use crate::snapshot::{
-    SnapshotCallback, SnapshotManager, build_levels_from_manifest,
-    build_vlog_version_from_manifest, load_manifest_for_snapshot, snapshot_manifest_name,
+    LoadedManifest, ManifestPayload, SnapshotCallback, SnapshotManager, apply_manifest_level_edits,
+    build_levels_from_manifest, build_vlog_version_from_manifest, decode_manifest,
+    load_manifest_for_snapshot, snapshot_manifest_name,
 };
 use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value_masked, encode_key};
@@ -17,6 +18,7 @@ use crate::write_batch::{WriteBatch, WriteOp};
 use crate::{Config, ReadOptions, ScanOptions, TimeProvider};
 use bytes::{Bytes, BytesMut};
 use log::info;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -61,6 +63,43 @@ pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<
         return Ok(None);
     }
     Ok(Some(columns))
+}
+
+fn parse_snapshot_manifest_id(name: &str) -> Option<u64> {
+    let name = name.rsplit('/').next().unwrap_or(name);
+    name.strip_prefix("SNAPSHOT-")?.parse::<u64>().ok()
+}
+
+fn load_manifest_entry(
+    file_manager: &Arc<FileManager>,
+    snapshot_id: u64,
+    loaded_by_id: &HashMap<u64, LoadedManifest>,
+) -> Result<LoadedManifest> {
+    let manifest_name = snapshot_manifest_name(snapshot_id);
+    let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
+    let bytes = reader.read_at(0, reader.size())?;
+    let (base_snapshot_id, manifest) = match decode_manifest(bytes.as_ref())? {
+        ManifestPayload::Snapshot(manifest) => (None, manifest),
+        ManifestPayload::IncrementalSnapshot(incremental) => {
+            let base_snapshot_id = Some(incremental.base_snapshot_id);
+            let manifest = if let Some(base) = loaded_by_id.get(&incremental.base_snapshot_id) {
+                let mut resolved = base.manifest.clone();
+                apply_manifest_level_edits(&mut resolved.levels, &incremental.level_edits)?;
+                resolved.vlog_files = incremental.vlog_files;
+                resolved.id = incremental.id;
+                resolved.seq_id = incremental.seq_id;
+                resolved
+            } else {
+                load_manifest_for_snapshot(file_manager, snapshot_id)?
+            };
+            (base_snapshot_id, manifest)
+        }
+    };
+    Ok(LoadedManifest {
+        snapshot_id,
+        base_snapshot_id,
+        manifest,
+    })
 }
 
 /// Resolve a single column value, handling any value log pointers using the provided callback.
@@ -391,7 +430,7 @@ impl Db {
         let file_manager = FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
-        let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
+        let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let max_file_seq = manifest
             .levels
             .iter()
@@ -400,7 +439,7 @@ impl Db {
             .max()
             .unwrap_or(0);
         let max_seq = manifest.seq_id;
-        let levels = build_levels_from_manifest(&file_manager, manifest, false)?;
+        let levels = build_levels_from_manifest(&file_manager, manifest, true)?;
 
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
@@ -420,6 +459,71 @@ impl Db {
             initial_file_seq,
             metrics_manager,
         )
+    }
+
+    /// Resume a writable database from an existing folder by loading all snapshot manifests.
+    pub fn resume(config: Config, db_id: String) -> Result<Self> {
+        init_logging(&config);
+        metrics_registry::init_metrics();
+        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
+        let file_manager = FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager))?;
+        let file_manager = Arc::new(file_manager);
+        let mut snapshot_ids: Vec<u64> = file_manager
+            .list_snapshot_metadata_names()?
+            .into_iter()
+            .filter_map(|name| parse_snapshot_manifest_id(&name))
+            .collect();
+        snapshot_ids.sort_unstable();
+        snapshot_ids.dedup();
+        if snapshot_ids.is_empty() {
+            return Err(Error::IoError(format!(
+                "No snapshot manifests found for db {}",
+                db_id
+            )));
+        }
+
+        // loaded all manifests into memory
+        let mut loaded = Vec::with_capacity(snapshot_ids.len());
+        let mut loaded_by_id = HashMap::new();
+        for snapshot_id in snapshot_ids {
+            let entry = load_manifest_entry(&file_manager, snapshot_id, &loaded_by_id)?;
+            loaded_by_id.insert(snapshot_id, entry.clone());
+            loaded.push(entry);
+        }
+        // initialize the db using latest
+        let latest = loaded.last().ok_or_else(|| {
+            Error::IoError(format!("No snapshot manifests found for db {}", db_id))
+        })?;
+        let manifest = latest.manifest.clone();
+        let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
+        let max_file_seq = manifest
+            .levels
+            .iter()
+            .flat_map(|level| level.files.iter().map(|file| file.seq))
+            .chain(manifest.vlog_files.iter().map(|file| file.file_seq as u64))
+            .max()
+            .unwrap_or(0);
+        let levels = build_levels_from_manifest(&file_manager, manifest, false)?;
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(crate::db_state::DbState {
+            seq_id: latest.manifest.seq_id,
+            lsm_version: crate::lsm::LSMTreeVersion { levels },
+            vlog_version,
+            active: None,
+            immutables: Vec::new().into(),
+            suggested_base_snapshot_id: Some(latest.snapshot_id),
+        });
+        let db = Self::open_with_state(
+            config,
+            file_manager,
+            db_state,
+            db_id,
+            max_file_seq.saturating_add(1),
+            metrics_manager,
+        )?;
+        // take over all snapshots so they can be expired properly
+        db.take_over_snapshot_chain(&loaded)?;
+        Ok(db)
     }
 
     fn open_with_state(
@@ -521,6 +625,17 @@ impl Db {
             time_provider,
             ttl_provider,
         })
+    }
+
+    fn take_over_snapshot_chain(&self, chain: &[LoadedManifest]) -> Result<()> {
+        for entry in chain {
+            self.snapshot_manager.import_snapshot_from_manifest(
+                entry.snapshot_id,
+                entry.base_snapshot_id,
+                &entry.manifest,
+            )?;
+        }
+        Ok(())
     }
 
     /// Lookup a key across the memtable and LSM levels.

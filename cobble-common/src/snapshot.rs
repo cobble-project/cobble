@@ -19,9 +19,12 @@ pub(crate) struct DbSnapshot {
     pub id: u64,
     pub manifest_path: String,
     pub base_snapshot_id: Option<u64>,
+    // Levels without tracked file references.
     pub levels: Vec<Level>,
-    pub data_files: Vec<Arc<DataFile>>,
+    // Tracked references to all files included in the snapshot, used for reference counting and
+    // cleanup when expiring snapshots. This includes both LSM files and vlog files.
     pub tracked_files: Vec<Arc<TrackedFile>>,
+    // Vlog version at the time of snapshot creation, without tracked references.
     pub vlog_version: VlogVersion,
     pub seq_id: u64,
     pub finished: bool,
@@ -57,6 +60,13 @@ pub(crate) struct ManifestIncrementalSnapshot {
 pub(crate) enum ManifestPayload {
     IncrementalSnapshot(ManifestIncrementalSnapshot),
     Snapshot(ManifestSnapshot),
+}
+
+#[derive(Clone)]
+pub(crate) struct LoadedManifest {
+    pub(crate) snapshot_id: u64,
+    pub(crate) base_snapshot_id: Option<u64>,
+    pub(crate) manifest: ManifestSnapshot,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -103,7 +113,6 @@ impl DbSnapshot {
             manifest_path,
             base_snapshot_id: None,
             levels: vec![],
-            data_files: Vec::new(),
             tracked_files: Vec::new(),
             vlog_version: VlogVersion::new(),
             seq_id: 0,
@@ -219,20 +228,22 @@ impl SnapshotManager {
         let Some(snapshot) = state.snapshots.get_mut(&id) else {
             return false;
         };
-        snapshot.levels = db_state.lsm_version.levels.clone();
-        snapshot.data_files = db_state
+        snapshot.levels = clone_levels_untracked(&db_state.lsm_version.levels);
+        let mut tracked_file_ids: BTreeSet<u64> = db_state
             .lsm_version
             .levels
             .iter()
-            .flat_map(|level| level.files.iter().cloned())
+            .flat_map(|level| level.files.iter().map(|file| file.file_id))
             .collect();
+        for tracked in db_state.vlog_version.tracked_files() {
+            tracked_file_ids.insert(tracked.file_id());
+        }
         snapshot.seq_id = db_state.seq_id;
-        snapshot.tracked_files = snapshot
-            .data_files
-            .iter()
-            .filter_map(|file| self.file_manager.data_file_ref(file.file_id).ok())
+        snapshot.tracked_files = tracked_file_ids
+            .into_iter()
+            .filter_map(|file_id| self.file_manager.data_file_ref(file_id).ok())
             .collect();
-        snapshot.vlog_version = db_state.vlog_version.clone();
+        snapshot.vlog_version = clone_vlog_version_untracked(&db_state.vlog_version);
         snapshot.base_snapshot_id = db_state.suggested_base_snapshot_id;
         state.completed.insert(id);
         drop(state);
@@ -247,6 +258,65 @@ impl SnapshotManager {
         }
         state.retained.insert(id);
         true
+    }
+
+    /// Import a snapshot from an existing manifest. This is used when loading snapshots from disk
+    /// on startup, where the manifest files are already materialized, and we just need to populate
+    /// the in-memory state.
+    pub(crate) fn import_snapshot_from_manifest(
+        &self,
+        snapshot_id: u64,
+        base_snapshot_id: Option<u64>,
+        manifest: &ManifestSnapshot,
+    ) -> Result<()> {
+        let manifest_name = snapshot_manifest_name(snapshot_id);
+        let manifest_path = self.file_manager.metadata_path(&manifest_name);
+        self.file_manager
+            .register_metadata_file(&manifest_name, manifest_path.clone())?;
+
+        let tracked_files = manifest_data_file_refs(manifest)
+            .map(|(file_id, path)| {
+                if !self.file_manager.has_data_file(file_id) {
+                    self.file_manager.register_data_file(file_id, path)?;
+                }
+                self.file_manager.data_file_ref(file_id)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let levels = build_levels_from_manifest_untracked(manifest)?;
+        let snapshot = DbSnapshot {
+            id: snapshot_id,
+            manifest_path,
+            base_snapshot_id,
+            levels,
+            tracked_files,
+            vlog_version: build_vlog_version_from_manifest_untracked(manifest),
+            seq_id: manifest.seq_id,
+            finished: true,
+            callback: None,
+        };
+
+        let mut state = self.state.lock().unwrap();
+        state.next_id = state.next_id.max(snapshot_id.saturating_add(1));
+        if state.snapshots.contains_key(&snapshot_id) {
+            return Ok(());
+        }
+        state.completed.insert(snapshot_id);
+        state.snapshots.insert(snapshot_id, snapshot);
+        let (inserted_self_ref, inserted_base_ref) = {
+            let refs = state.incremental_references.entry(snapshot_id).or_default();
+            let inserted_self_ref = refs.insert(snapshot_id);
+            let inserted_base_ref = base_snapshot_id.is_some_and(|base_id| refs.insert(base_id));
+            (inserted_self_ref, inserted_base_ref)
+        };
+        if inserted_self_ref {
+            *state.incremental_ref_counts.entry(snapshot_id).or_insert(0) += 1;
+        }
+        if let Some(base_id) = base_snapshot_id
+            && inserted_base_ref
+        {
+            *state.incremental_ref_counts.entry(base_id).or_insert(0) += 1;
+        }
+        Ok(())
     }
 
     pub(crate) fn process_retention(&self) -> Result<()> {
@@ -621,46 +691,78 @@ pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<ManifestPayload> {
         .map_err(|err| Error::IoError(format!("Failed to decode manifest: {}", err)))
 }
 
-/// Load the manifest for the given snapshot, applying incremental edits along the way if necessary.
+/// Load the manifest dependency chain for the given snapshot and resolve each manifest once.
+pub(crate) fn load_manifest_chain(
+    file_manager: &Arc<FileManager>,
+    snapshot_id: u64,
+) -> Result<Vec<LoadedManifest>> {
+    let mut chain = Vec::new();
+    let mut visited = HashSet::new();
+    let mut raw_payloads = Vec::new();
+    let mut next_id = Some(snapshot_id);
+    while let Some(current_id) = next_id {
+        if !visited.insert(current_id) {
+            return Err(Error::IoError(format!(
+                "Snapshot manifest dependency cycle detected for {}",
+                current_id
+            )));
+        }
+        let manifest_name = snapshot_manifest_name(current_id);
+        let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
+        let bytes = reader.read_at(0, reader.size())?;
+        let payload = decode_manifest(bytes.as_ref())?;
+        next_id = match &payload {
+            ManifestPayload::Snapshot(_) => None,
+            ManifestPayload::IncrementalSnapshot(manifest) => Some(manifest.base_snapshot_id),
+        };
+        raw_payloads.push((current_id, payload));
+    }
+    raw_payloads.reverse();
+
+    let mut resolved_by_id: HashMap<u64, ManifestSnapshot> = HashMap::new();
+    for (current_id, payload) in raw_payloads {
+        let (base_snapshot_id, resolved_manifest) = match payload {
+            ManifestPayload::Snapshot(manifest) => (None, manifest),
+            ManifestPayload::IncrementalSnapshot(manifest) => {
+                let mut resolved_base = resolved_by_id
+                    .get(&manifest.base_snapshot_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::IoError(format!(
+                            "Missing base manifest {} for snapshot {}",
+                            manifest.base_snapshot_id, current_id
+                        ))
+                    })?;
+                apply_manifest_level_edits(&mut resolved_base.levels, &manifest.level_edits)?;
+                resolved_base.vlog_files = manifest.vlog_files;
+                resolved_base.id = manifest.id;
+                resolved_base.seq_id = manifest.seq_id;
+                (Some(manifest.base_snapshot_id), resolved_base)
+            }
+        };
+        resolved_by_id.insert(current_id, resolved_manifest.clone());
+        chain.push(LoadedManifest {
+            snapshot_id: current_id,
+            base_snapshot_id,
+            manifest: resolved_manifest,
+        });
+    }
+    Ok(chain)
+}
+
+/// Load the resolved manifest for the given snapshot id.
 pub(crate) fn load_manifest_for_snapshot(
     file_manager: &Arc<FileManager>,
     snapshot_id: u64,
 ) -> Result<ManifestSnapshot> {
-    let mut visited = HashSet::new();
-    load_manifest_for_snapshot_inner(file_manager, snapshot_id, &mut visited)
+    load_manifest_chain(file_manager, snapshot_id)?
+        .into_iter()
+        .last()
+        .map(|entry| entry.manifest)
+        .ok_or_else(|| Error::IoError(format!("Snapshot {} not found", snapshot_id)))
 }
 
-/// Recursive load entry of the manifest for the given snapshot.
-fn load_manifest_for_snapshot_inner(
-    file_manager: &Arc<FileManager>,
-    snapshot_id: u64,
-    visited: &mut HashSet<u64>,
-) -> Result<ManifestSnapshot> {
-    // Sanity check to prevent infinite recursion on cycles, which should never happen if the manager is correct.
-    if !visited.insert(snapshot_id) {
-        return Err(Error::IoError(format!(
-            "Snapshot manifest dependency cycle detected for {}",
-            snapshot_id
-        )));
-    }
-    let manifest_name = snapshot_manifest_name(snapshot_id);
-    let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
-    let bytes = reader.read_at(0, reader.size())?;
-    match decode_manifest(bytes.as_ref())? {
-        ManifestPayload::Snapshot(manifest) => Ok(manifest),
-        ManifestPayload::IncrementalSnapshot(manifest) => {
-            let mut resolved_base =
-                load_manifest_for_snapshot_inner(file_manager, manifest.base_snapshot_id, visited)?;
-            apply_manifest_level_edits(&mut resolved_base.levels, &manifest.level_edits)?;
-            resolved_base.vlog_files = manifest.vlog_files;
-            resolved_base.id = manifest.id;
-            resolved_base.seq_id = manifest.seq_id;
-            Ok(resolved_base)
-        }
-    }
-}
-
-fn apply_manifest_level_edits(
+pub(crate) fn apply_manifest_level_edits(
     levels: &mut Vec<ManifestLevel>,
     edits: &[ManifestLevelEdit],
 ) -> Result<()> {
@@ -688,6 +790,115 @@ fn apply_manifest_level_edits(
         level.files.extend(edit.new_files.clone());
     }
     Ok(())
+}
+
+/// Extract the file ID and path references for all data files in the manifest, deduplicating by file ID.
+fn manifest_data_file_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = (u64, String)> {
+    let mut refs: BTreeMap<u64, String> = BTreeMap::new();
+    for level in &manifest.levels {
+        for file in &level.files {
+            refs.entry(file.file_id)
+                .or_insert_with(|| file.path.clone());
+        }
+    }
+    for file in &manifest.vlog_files {
+        refs.entry(file.file_id)
+            .or_insert_with(|| file.path.clone());
+    }
+    refs.into_iter()
+}
+
+/// Clone levels and files from the LSM version without tracking.
+fn clone_levels_untracked(levels: &[Level]) -> Vec<Level> {
+    levels
+        .iter()
+        .map(|level| Level {
+            ordinal: level.ordinal,
+            tiered: level.tiered,
+            files: level
+                .files
+                .iter()
+                .map(|file| {
+                    let detached = DataFile {
+                        file_type: file.file_type,
+                        start_key: file.start_key.clone(),
+                        end_key: file.end_key.clone(),
+                        file_id: file.file_id,
+                        tracked_id: TrackedFileId::detached(file.file_id),
+                        seq: file.seq,
+                        size: file.size,
+                        has_separated_values: file.has_separated_values,
+                        meta_bytes: Default::default(),
+                    };
+                    if let Some(meta_bytes) = file.meta_bytes() {
+                        detached.set_meta_bytes(meta_bytes);
+                    }
+                    Arc::new(detached)
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Clone vlog version from the LSM version without tracking.
+fn clone_vlog_version_untracked(vlog_version: &VlogVersion) -> VlogVersion {
+    VlogVersion::from_files_with_entries(
+        vlog_version
+            .files_with_entries()
+            .into_iter()
+            .map(|(file_seq, tracked_id, valid_entries)| {
+                (
+                    file_seq,
+                    TrackedFileId::detached(tracked_id.file_id()),
+                    valid_entries,
+                )
+            })
+            .collect(),
+    )
+}
+
+fn build_levels_from_manifest_untracked(manifest: &ManifestSnapshot) -> Result<Vec<Level>> {
+    let mut levels = Vec::with_capacity(manifest.levels.len());
+    for level in &manifest.levels {
+        let mut files = Vec::with_capacity(level.files.len());
+        for file in &level.files {
+            let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
+            let start_key = from_hex(&file.start_key)?;
+            let end_key = from_hex(&file.end_key)?;
+            files.push(Arc::new(DataFile {
+                file_type,
+                start_key,
+                end_key,
+                file_id: file.file_id,
+                tracked_id: TrackedFileId::detached(file.file_id),
+                seq: file.seq,
+                size: file.size,
+                has_separated_values: file.has_separated_values,
+                meta_bytes: Default::default(),
+            }));
+        }
+        levels.push(Level {
+            ordinal: level.ordinal,
+            tiered: level.tiered,
+            files,
+        });
+    }
+    Ok(levels)
+}
+
+fn build_vlog_version_from_manifest_untracked(manifest: &ManifestSnapshot) -> VlogVersion {
+    let files = manifest
+        .vlog_files
+        .iter()
+        .map(|file| {
+            (
+                file.file_seq,
+                TrackedFileId::detached(file.file_id),
+                file.valid_entries,
+            )
+        })
+        .collect();
+    VlogVersion::from_files_with_entries(files)
 }
 
 pub(crate) fn build_levels_from_manifest(

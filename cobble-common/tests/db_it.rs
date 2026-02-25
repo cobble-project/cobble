@@ -897,6 +897,50 @@ fn test_db_open_from_snapshot_allows_writes() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_db_resume_takes_over_snapshot_lifecycle() {
+    let root = "/tmp/db_snapshot_takeover";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config.clone()).unwrap();
+    db.put(b"k1", 0, b"v1").unwrap();
+    let snapshot_id = db.snapshot().unwrap();
+    assert!(db.retain_snapshot(snapshot_id));
+    let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    db.close().unwrap();
+
+    let writable =
+        Db::open_from_snapshot(config.clone(), snapshot_id, db.id().to_string()).unwrap();
+    assert!(!writable.expire_snapshot(snapshot_id).unwrap());
+    writable.close().unwrap();
+
+    let writable = Db::resume(config, db.id().to_string()).unwrap();
+    assert!(
+        writable
+            .bucket_snapshot_input(snapshot_id, vec![0u16..1u16])
+            .is_ok()
+    );
+
+    let manifest_path = format!(
+        "{}/{}",
+        root,
+        bucket_snapshot_manifest_path(writable.id(), snapshot_id)
+    );
+    assert!(writable.expire_snapshot(snapshot_id).unwrap());
+    wait_for_missing(&manifest_path);
+    writable.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_metrics_list() {
     let root = "/tmp/db_metrics_list";
     cleanup_test_root(root);

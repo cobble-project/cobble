@@ -106,6 +106,13 @@ impl VlogVersion {
             .collect()
     }
 
+    pub(crate) fn tracked_files(&self) -> Vec<Arc<TrackedFileId>> {
+        self.files
+            .values()
+            .map(|tracked| Arc::clone(&tracked.tracked_id))
+            .collect()
+    }
+
     pub(crate) fn apply_edit(&self, edit: VlogEdit) -> Self {
         let mut files = self.files.clone();
         for file_seq in edit.removed_files {

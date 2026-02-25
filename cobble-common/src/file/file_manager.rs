@@ -1082,6 +1082,16 @@ impl FileManager {
             .map(|entry| entry.key().clone())
             .collect()
     }
+
+    /// Lists metadata file names under this DB's snapshot directory.
+    pub fn list_snapshot_metadata_names(&self) -> Result<Vec<String>> {
+        let snapshot_dir = if self.options.base_dir.is_empty() {
+            SNAPSHOT_DIR.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, SNAPSHOT_DIR)
+        };
+        self.meta_volume.state.fs.list(&snapshot_dir)
+    }
 }
 
 pub(crate) mod test_utils {
