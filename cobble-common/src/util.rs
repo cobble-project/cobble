@@ -1,4 +1,11 @@
 use crate::Config;
+use bytes::Bytes;
+
+/// Creates a `Bytes` instance that shares the same underlying data as the input slice.
+#[inline]
+pub(crate) fn unsafe_bytes(target: &[u8]) -> Bytes {
+    Bytes::from_owner(unsafe { std::slice::from_raw_parts(target.as_ptr(), target.len()) })
+}
 
 pub(crate) fn init_logging(config: &Config) {
     static INIT: std::sync::Once = std::sync::Once::new();

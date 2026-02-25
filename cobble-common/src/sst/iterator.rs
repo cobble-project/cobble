@@ -8,6 +8,7 @@ use crate::sst::compression::decode_block_bytes;
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, Value};
+use crate::util::unsafe_bytes;
 use bytes::Bytes;
 use metrics::{Counter, counter};
 use std::cell::{Cell, RefCell};
@@ -314,6 +315,7 @@ impl SSTIterator {
 
     /// Seek to the first key >= target
     pub fn seek(&mut self, target: &[u8]) -> Result<()> {
+        let target = unsafe_bytes(target);
         if self.index_partitions.is_empty() {
             self.current_data_block = None;
             self.clear_cached_entry();
@@ -327,20 +329,20 @@ impl SSTIterator {
             }
             self.current_index_partition_idx = 0;
             self.current_index_partition = Some(self.index_block.clone());
-            let block_idx = self.index_block.find_lower_or_equal_idx(target)?;
+            let block_idx = self.index_block.find_lower_or_equal_idx(&target)?;
             self.current_block_idx = block_idx;
             let partition = self.index_block.clone();
             self.load_data_block_from_partition(&partition, block_idx)?;
-            self.seek_in_current_block(target)?;
+            self.seek_in_current_block(&target)?;
             return Ok(());
         }
 
-        let partition_idx = self.index_block.find_lower_or_equal_idx(target)?;
+        let partition_idx = self.index_block.find_lower_or_equal_idx(&target)?;
         let partition = self.load_index_partition(partition_idx)?;
-        let block_idx = partition.find_lower_or_equal_idx(target)?;
+        let block_idx = partition.find_lower_or_equal_idx(&target)?;
         self.current_block_idx = block_idx;
         self.load_data_block_from_partition(&partition, block_idx)?;
-        self.seek_in_current_block(target)?;
+        self.seek_in_current_block(&target)?;
         Ok(())
     }
 
@@ -358,7 +360,8 @@ impl SSTIterator {
             if self.index_block.is_empty() {
                 return Ok(true);
             }
-            self.index_block.find_lower_or_equal_idx(key)?
+            let key = unsafe_bytes(key);
+            self.index_block.find_lower_or_equal_idx(&key)?
         } else {
             0
         };
@@ -628,7 +631,7 @@ impl SSTIterator {
         Ok(())
     }
 
-    fn seek_in_current_block(&mut self, target: &[u8]) -> Result<()> {
+    fn seek_in_current_block(&mut self, target: &Bytes) -> Result<()> {
         if let Some(block) = &self.current_data_block {
             self.current_entry_idx = block.find_equal_or_greater_idx(target)?;
         }

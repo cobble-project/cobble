@@ -303,13 +303,13 @@ impl Block {
         self.offsets.is_empty()
     }
 
-    pub(crate) fn find_equal_or_greater_idx(&self, target: &[u8]) -> Result<usize> {
+    pub(crate) fn find_equal_or_greater_idx(&self, target: &Bytes) -> Result<usize> {
         let mut left = 0;
         let mut right = self.offsets_len();
         while left < right {
             let mid = (left + right) / 2;
             let key = self.key(mid)?;
-            match key.as_ref().cmp(target) {
+            match key.cmp(target) {
                 std::cmp::Ordering::Less => left = mid + 1,
                 std::cmp::Ordering::Greater => right = mid,
                 std::cmp::Ordering::Equal => return Ok(mid),
@@ -318,13 +318,13 @@ impl Block {
         Ok(left)
     }
 
-    pub(crate) fn find_lower_or_equal_idx(&self, target: &[u8]) -> Result<usize> {
+    pub(crate) fn find_lower_or_equal_idx(&self, target: &Bytes) -> Result<usize> {
         let mut left = 0;
         let mut right = self.offsets_len() - 1;
         while left < right {
             let mid = (left + right).div_ceil(2);
             let key = self.key(mid)?;
-            match key.as_ref().cmp(target) {
+            match key.cmp(target) {
                 std::cmp::Ordering::Less => left = mid,
                 std::cmp::Ordering::Greater => right = mid - 1,
                 std::cmp::Ordering::Equal => return Ok(mid),
