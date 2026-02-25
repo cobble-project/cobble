@@ -121,6 +121,30 @@ impl FileSystem for PosixFileSystem {
             .map_err(|e| Error::IoError(format!("Failed to rename {} to {}: {}", from, to, e)))
     }
 
+    fn list(&self, path: &str) -> Result<Vec<String>> {
+        let resolved = self.resolve_path(path);
+        if !resolved.exists() {
+            return Ok(Vec::new());
+        }
+        let mut items = Vec::new();
+        for entry in std::fs::read_dir(&resolved)
+            .map_err(|e| Error::IoError(format!("Failed to list {}: {}", resolved.display(), e)))?
+        {
+            let entry = entry.map_err(|e| {
+                Error::IoError(format!(
+                    "Failed to read entry in {}: {}",
+                    resolved.display(),
+                    e
+                ))
+            })?;
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+            items.push(name);
+        }
+        Ok(items)
+    }
+
     fn open_read(&self, path: &str) -> Result<Box<dyn RandomAccessFile>> {
         let resolved = self.resolve_path(path);
         let file = StdFile::open(&resolved)
@@ -284,6 +308,38 @@ mod tests {
             assert_eq!(&read[..], data);
         }
         fs.delete("example").unwrap();
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    #[cfg(unix)]
+    fn test_posix_fs_list() {
+        cleanup_test_root();
+        let fs = PosixFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None).unwrap();
+        fs.create_dir("list/subdir").unwrap();
+        {
+            let mut writer = fs.open_write("list/a.txt").unwrap();
+            writer.write(b"a").unwrap();
+            writer.close().unwrap();
+        }
+        {
+            let mut writer = fs.open_write("list/b.txt").unwrap();
+            writer.write(b"b").unwrap();
+            writer.close().unwrap();
+        }
+
+        let mut listed = fs.list("list").unwrap();
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![
+                "a.txt".to_string(),
+                "b.txt".to_string(),
+                "subdir".to_string()
+            ]
+        );
+        assert!(fs.list("missing").unwrap().is_empty());
         cleanup_test_root();
     }
 }

@@ -23,6 +23,8 @@ pub trait FileSystem: Send + Sync {
 
     fn rename(&self, from: &str, to: &str) -> Result<()>;
 
+    fn list(&self, path: &str) -> Result<Vec<String>>;
+
     fn open_read(&self, path: &str) -> Result<Box<dyn RandomAccessFile>>;
 
     fn open_write(&self, path: &str) -> Result<Box<dyn SequentialWriteFile>>;

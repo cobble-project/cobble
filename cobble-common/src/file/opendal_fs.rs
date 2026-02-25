@@ -95,6 +95,25 @@ impl FileSystem for OpendalFileSystem {
             .map_err(|e| Error::IoError(format!("Failed to rename {} to {}: {}", from, to, e)))
     }
 
+    fn list(&self, path: &str) -> Result<Vec<String>> {
+        let path = if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/", path)
+        };
+        let entries = self
+            .runtime
+            .block_on(async { self.op.list(&path).await })
+            .map_err(|e| Error::IoError(format!("Failed to list {}: {}", path, e)))?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|entry| {
+                let name = entry.name().trim_end_matches('/');
+                (!name.is_empty()).then(|| name.to_string())
+            })
+            .collect())
+    }
+
     fn open_read(&self, path: &str) -> Result<Box<dyn RandomAccessFile>> {
         self.runtime.block_on(async {
             // Get file metadata to retrieve size
@@ -189,6 +208,36 @@ mod test {
             let read = reader.read_at(0, data.len()).unwrap();
             assert_eq!(&read[..], data);
         }
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_opendal_fs_list() {
+        cleanup_test_root();
+        let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None).unwrap();
+        fs.create_dir("list/subdir").unwrap();
+        {
+            let mut writer = fs.open_write("list/a.txt").unwrap();
+            writer.write(b"a").unwrap();
+            writer.close().unwrap();
+        }
+        {
+            let mut writer = fs.open_write("list/b.txt").unwrap();
+            writer.write(b"b").unwrap();
+            writer.close().unwrap();
+        }
+
+        let mut listed: Vec<String> = fs
+            .list("list")
+            .unwrap()
+            .into_iter()
+            .map(|name| name.trim_start_matches("list/").to_string())
+            .collect();
+        listed.sort();
+        assert!(listed.contains(&"a.txt".to_string()));
+        assert!(listed.contains(&"b.txt".to_string()));
+        assert!(listed.contains(&"subdir".to_string()));
         cleanup_test_root();
     }
 }
