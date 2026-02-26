@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use std::sync::{Arc, LazyLock};
@@ -22,6 +22,14 @@ pub trait MergeOperator: Send + Sync {
 #[derive(Default)]
 pub struct BytesMergeOperator;
 
+/// Built-in merge operator: sums little-endian `u32` values.
+#[derive(Default)]
+pub struct U32CounterMergeOperator;
+
+/// Built-in merge operator: sums little-endian `u64` values.
+#[derive(Default)]
+pub struct U64CounterMergeOperator;
+
 static DEFAULT_MERGE_OPERATOR: LazyLock<Arc<dyn MergeOperator>> =
     LazyLock::new(|| Arc::new(BytesMergeOperator));
 
@@ -31,6 +39,40 @@ pub(crate) fn default_merge_operator() -> Arc<dyn MergeOperator> {
 
 pub(crate) fn default_merge_operator_ref() -> &'static Arc<dyn MergeOperator> {
     &DEFAULT_MERGE_OPERATOR
+}
+
+fn decode_u32_counter(value: &Bytes, label: &str) -> Result<u32> {
+    if value.is_empty() {
+        return Ok(0);
+    }
+    if value.len() != std::mem::size_of::<u32>() {
+        return Err(Error::InputError(format!(
+            "U32CounterMergeOperator expects {} bytes for {}, got {}",
+            std::mem::size_of::<u32>(),
+            label,
+            value.len()
+        )));
+    }
+    let bytes: [u8; std::mem::size_of::<u32>()] =
+        value.as_ref().try_into().expect("length checked");
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn decode_u64_counter(value: &Bytes, label: &str) -> Result<u64> {
+    if value.is_empty() {
+        return Ok(0);
+    }
+    if value.len() != std::mem::size_of::<u64>() {
+        return Err(Error::InputError(format!(
+            "U64CounterMergeOperator expects {} bytes for {}, got {}",
+            std::mem::size_of::<u64>(),
+            label,
+            value.len()
+        )));
+    }
+    let bytes: [u8; std::mem::size_of::<u64>()] =
+        value.as_ref().try_into().expect("length checked");
+    Ok(u64::from_le_bytes(bytes))
 }
 
 impl MergeOperator for BytesMergeOperator {
@@ -62,6 +104,56 @@ impl MergeOperator for BytesMergeOperator {
             merged.extend_from_slice(operand.as_ref());
         }
         Ok(merged.freeze())
+    }
+}
+
+impl MergeOperator for U32CounterMergeOperator {
+    fn merge(&self, existing_value: Bytes, value: Bytes) -> Result<Bytes> {
+        let existing = decode_u32_counter(&existing_value, "existing_value")?;
+        let delta = decode_u32_counter(&value, "value")?;
+        let merged = existing.checked_add(delta).ok_or_else(|| {
+            Error::InputError(format!(
+                "U32CounterMergeOperator overflow: {} + {}",
+                existing, delta
+            ))
+        })?;
+        Ok(Bytes::copy_from_slice(&merged.to_le_bytes()))
+    }
+
+    fn merge_batch(&self, existing_value: Bytes, operands: Vec<Bytes>) -> Result<Bytes> {
+        let mut merged = decode_u32_counter(&existing_value, "existing_value")?;
+        for operand in operands {
+            let delta = decode_u32_counter(&operand, "operand")?;
+            merged = merged.checked_add(delta).ok_or_else(|| {
+                Error::InputError(format!("U32CounterMergeOperator overflow: {}", merged))
+            })?;
+        }
+        Ok(Bytes::copy_from_slice(&merged.to_le_bytes()))
+    }
+}
+
+impl MergeOperator for U64CounterMergeOperator {
+    fn merge(&self, existing_value: Bytes, value: Bytes) -> Result<Bytes> {
+        let existing = decode_u64_counter(&existing_value, "existing_value")?;
+        let delta = decode_u64_counter(&value, "value")?;
+        let merged = existing.checked_add(delta).ok_or_else(|| {
+            Error::InputError(format!(
+                "U64CounterMergeOperator overflow: {} + {}",
+                existing, delta
+            ))
+        })?;
+        Ok(Bytes::copy_from_slice(&merged.to_le_bytes()))
+    }
+
+    fn merge_batch(&self, existing_value: Bytes, operands: Vec<Bytes>) -> Result<Bytes> {
+        let mut merged = decode_u64_counter(&existing_value, "existing_value")?;
+        for operand in operands {
+            let delta = decode_u64_counter(&operand, "operand")?;
+            merged = merged.checked_add(delta).ok_or_else(|| {
+                Error::InputError(format!("U64CounterMergeOperator overflow: {}", merged))
+            })?;
+        }
+        Ok(Bytes::copy_from_slice(&merged.to_le_bytes()))
     }
 }
 
@@ -238,5 +330,34 @@ mod tests {
             .unwrap();
         assert_eq!(merged0.as_ref(), b"ab");
         assert_eq!(merged3.as_ref(), b"[a+b]");
+    }
+
+    #[test]
+    fn test_u32_counter_merge_operator() {
+        let op = U32CounterMergeOperator;
+        let merged = op
+            .merge(
+                Bytes::copy_from_slice(&3u32.to_le_bytes()),
+                Bytes::copy_from_slice(&4u32.to_le_bytes()),
+            )
+            .unwrap();
+        let value = u32::from_le_bytes(merged.as_ref().try_into().unwrap());
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn test_u64_counter_merge_operator() {
+        let op = U64CounterMergeOperator;
+        let merged = op
+            .merge_batch(
+                Bytes::copy_from_slice(&1u64.to_le_bytes()),
+                vec![
+                    Bytes::copy_from_slice(&2u64.to_le_bytes()),
+                    Bytes::copy_from_slice(&3u64.to_le_bytes()),
+                ],
+            )
+            .unwrap();
+        let value = u64::from_le_bytes(merged.as_ref().try_into().unwrap());
+        assert_eq!(value, 6);
     }
 }

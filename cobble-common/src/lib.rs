@@ -40,7 +40,9 @@ pub use config::{
 };
 pub use db::Db;
 pub use db_iter::DbIterator;
-pub use merge_operator::{BytesMergeOperator, MergeOperator};
+pub use merge_operator::{
+    BytesMergeOperator, MergeOperator, U32CounterMergeOperator, U64CounterMergeOperator,
+};
 pub use metrics_manager::MetricsManager;
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
 pub use read_only_db::ReadOnlyDb;

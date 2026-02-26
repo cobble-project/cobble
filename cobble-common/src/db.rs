@@ -828,7 +828,10 @@ impl Drop for Db {
 mod tests {
     use super::*;
     use crate::MergeOperator;
-    use crate::{ReadOptions, ScanOptions, VolumeDescriptor};
+    use crate::{
+        ReadOptions, ScanOptions, U32CounterMergeOperator, U64CounterMergeOperator,
+        VolumeDescriptor,
+    };
     use serial_test::serial;
     use std::sync::Arc;
 
@@ -845,6 +848,14 @@ mod tests {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", path)),
             ..Config::default()
         }
+    }
+
+    fn decode_u32_counter(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes.try_into().expect("u32 counter bytes"))
+    }
+
+    fn decode_u64_counter(bytes: &[u8]) -> u64 {
+        u64::from_le_bytes(bytes.try_into().expect("u64 counter bytes"))
     }
 
     struct PipeMergeOperator;
@@ -955,6 +966,67 @@ mod tests {
             .unwrap()
             .expect("value present");
         assert_eq!(value[0].as_ref().unwrap().as_ref(), b"a|b");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_counter_merge_operators_code_path() {
+        let root = "/tmp/db_counter_merge_operator";
+        cleanup_test_root(root);
+        let config = Config {
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 2,
+            sst_bloom_filter_enabled: true,
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            ..Config::default()
+        };
+        let db = Db::open(config).unwrap();
+        db.set_merge_operator(0, Arc::new(U32CounterMergeOperator))
+            .unwrap();
+        db.set_merge_operator(1, Arc::new(U64CounterMergeOperator))
+            .unwrap();
+
+        db.put(b"k1", 0, 10u32.to_le_bytes()).unwrap();
+        db.merge(b"k1", 0, 2u32.to_le_bytes()).unwrap();
+        db.merge(b"k1", 0, 3u32.to_le_bytes()).unwrap();
+        db.put(b"k1", 1, 100u64.to_le_bytes()).unwrap();
+        db.merge(b"k1", 1, 11u64.to_le_bytes()).unwrap();
+
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        assert_eq!(
+            decode_u32_counter(value[0].as_ref().unwrap().as_ref()),
+            15u32
+        );
+        assert_eq!(
+            decode_u64_counter(value[1].as_ref().unwrap().as_ref()),
+            111u64
+        );
+
+        let mut batch = WriteBatch::new();
+        batch.merge(b"k2", 0, 4u32.to_le_bytes());
+        batch.merge(b"k2", 0, 5u32.to_le_bytes());
+        batch.merge(b"k2", 1, 7u64.to_le_bytes());
+        batch.merge(b"k2", 1, 8u64.to_le_bytes());
+        db.write_batch(batch).unwrap();
+
+        let value = db
+            .get(b"k2", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        assert_eq!(
+            decode_u32_counter(value[0].as_ref().unwrap().as_ref()),
+            9u32
+        );
+        assert_eq!(
+            decode_u64_counter(value[1].as_ref().unwrap().as_ref()),
+            15u64
+        );
 
         cleanup_test_root(root);
     }

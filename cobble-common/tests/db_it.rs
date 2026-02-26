@@ -3,10 +3,12 @@ use std::collections::HashMap;
 use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::{
     CompactionPolicyKind, Config, Db, MemtableType, MetricValue, ReadOptions, ReadProxy,
-    ReadProxyConfig, ScanOptions, SingleNodeDb, TimeProviderKind, VolumeDescriptor, WriteBatch,
+    ReadProxyConfig, ScanOptions, SingleNodeDb, TimeProviderKind, U64CounterMergeOperator,
+    VolumeDescriptor, WriteBatch,
 };
 use serde_json::Value as JsonValue;
 use std::path::Path;
+use std::sync::Arc;
 
 fn cleanup_test_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
@@ -251,6 +253,88 @@ fn test_db_writebatch_get_large_dataset_with_separated_values() {
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), expected_value.as_slice());
     }
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_counter_merge_large_dataset_with_compaction_and_file_read() {
+    let root = "/tmp/db_it_counter_merge_compaction";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 8 * 1024,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        l0_file_limit: 2,
+        write_stall_limit: None,
+        l1_base_bytes: 64 * 1024,
+        level_size_multiplier: 2,
+        max_level: 4,
+        compaction_policy: CompactionPolicyKind::RoundRobin,
+        block_cache_size: 0,
+        base_file_size: 32 * 1024,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config).unwrap();
+    db.set_merge_operator(0, Arc::new(U64CounterMergeOperator))
+        .unwrap();
+
+    let key_count = 2_000u32;
+    let mut expected = HashMap::new();
+    for i in 0..key_count {
+        let key = format!("counter:{:05}", i).into_bytes();
+        let base = (i % 7 + 1) as u64;
+        db.put(&key, 0, base.to_le_bytes()).unwrap();
+        let mut sum = base;
+        for delta in 1..=4u64 {
+            db.merge(&key, 0, delta.to_le_bytes()).unwrap();
+            sum += delta;
+        }
+        expected.insert(key, sum);
+    }
+
+    let db_id = db.id().to_string();
+
+    let mut compaction_happened = false;
+    for _ in 0..200 {
+        let metrics = db.metrics();
+        compaction_happened = metrics.iter().any(|sample| {
+            sample.name == "compaction_write_bytes_total"
+                && sample
+                    .labels
+                    .iter()
+                    .any(|(key, value)| key == "db_id" && value == &db_id)
+                && matches!(sample.value, MetricValue::Counter(v) if v > 0)
+        });
+        if compaction_happened {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        compaction_happened,
+        "expected compaction_write_bytes_total > 0"
+    );
+
+    for i in 0..200u32 {
+        let key = format!("counter:{:05}", i).into_bytes();
+        db.merge(&key, 0, 10u64.to_le_bytes()).unwrap();
+        *expected.get_mut(&key).unwrap() += 10;
+    }
+
+    for (key, expected_sum) in expected {
+        let value = db
+            .get(&key, &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        let bytes = value[0].as_ref().unwrap();
+        let actual = u64::from_le_bytes(bytes.as_ref().try_into().unwrap());
+        assert_eq!(actual, expected_sum);
+    }
+    db.close().unwrap();
 
     cleanup_test_root(root);
 }
