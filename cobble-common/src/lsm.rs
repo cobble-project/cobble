@@ -990,6 +990,7 @@ mod tests {
                 Arc::downgrade(&lsm_tree),
                 db_config,
                 Arc::clone(&metrics_manager),
+                Arc::new(crate::merge_operator::MergeOperatorRegistry::new(1)),
             ));
         lsm_tree.configure_compaction(config, Some(Arc::clone(&worker)));
         let target = lsm_tree

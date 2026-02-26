@@ -232,7 +232,8 @@ pub(crate) fn rewrite_ref_value_for_memtable<'a>(
                 }
                 ValueType::PutSeparated
                 | ValueType::MergeSeparated
-                | ValueType::MergeSeparatedArray => {
+                | ValueType::MergeSeparatedArray
+                | ValueType::PutSeparatedArray => {
                     return Err(Error::InputError(format!(
                         "User writes must not use separated value types: {:?}",
                         column.value_type

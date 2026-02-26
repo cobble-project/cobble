@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 use crate::file::{DataVolume, FileId, FileManager, FileManagerOptions, TrackedFileId};
 use crate::iterator::SortedRun;
 use crate::lsm::{LSMTree, LevelEdit, VersionEdit};
+use crate::merge_operator::MergeOperatorRegistry;
 use crate::metrics_manager::MetricsManager;
 use crate::sst::SSTWriterOptions;
 use crate::time::ManualTimeProvider;
@@ -492,6 +493,7 @@ impl RemoteCompactionServer {
             DataFileType::from_str(&request.data_file_type).map_err(Error::IoError)?;
         let mut sst_options = request.sst_options.into_sst_options();
         sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
+        let num_columns = sst_options.num_columns;
         let file_builder_factory = super::make_sst_builder_factory(sst_options);
         let sorted_runs = request
             .runs
@@ -526,6 +528,7 @@ impl RemoteCompactionServer {
             Arc::clone(&file_builder_factory),
             data_file_type,
             ttl_provider,
+            MergeOperatorRegistry::new(num_columns).value_merge_operators(),
         )
         .with_readonly_outputs();
         let result = executor.execute_blocking(task, None);

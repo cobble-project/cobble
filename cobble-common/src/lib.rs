@@ -17,6 +17,7 @@ mod lru;
 mod lsm;
 mod maintainer;
 mod memtable;
+mod merge_operator;
 mod metrics_manager;
 mod metrics_registry;
 pub mod paths;
@@ -39,6 +40,7 @@ pub use config::{
 };
 pub use db::Db;
 pub use db_iter::DbIterator;
+pub use merge_operator::{BytesMergeOperator, MergeOperator};
 pub use metrics_manager::MetricsManager;
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
 pub use read_only_db::ReadOnlyDb;

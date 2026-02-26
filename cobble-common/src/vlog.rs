@@ -284,7 +284,7 @@ impl VlogMergeCollector {
                 let pointer = VlogPointer::from_bytes(column.data())?;
                 self.update_entry_delta(pointer.file_seq(), -1);
             }
-            ValueType::MergeSeparatedArray => {
+            ValueType::MergeSeparatedArray | ValueType::PutSeparatedArray => {
                 for item in decode_merge_separated_array(column.data())? {
                     if item.value_type == ValueType::PutSeparated
                         || item.value_type == ValueType::MergeSeparated

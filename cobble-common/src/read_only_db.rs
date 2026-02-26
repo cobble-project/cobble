@@ -4,6 +4,7 @@ use crate::db_state::DbStateHandle;
 use crate::error::{Error, Result};
 use crate::file::FileManager;
 use crate::lsm::{LSMTree, LSMTreeVersion};
+use crate::merge_operator::MergeOperatorRegistry;
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
 use crate::snapshot::{
@@ -24,6 +25,7 @@ pub struct ReadOnlyDb {
     file_manager: Arc<FileManager>,
     lsm_tree: Arc<LSMTree>,
     vlog_store: Arc<VlogStore>,
+    merge_registry: Arc<MergeOperatorRegistry>,
     num_columns: usize,
     ttl_provider: Arc<TTLProvider>,
     metrics_manager: Arc<MetricsManager>,
@@ -104,10 +106,12 @@ impl ReadOnlyDb {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
         let lsm_tree = Arc::new(lsm_tree);
+        let merge_registry = Arc::new(MergeOperatorRegistry::new(config.num_columns));
         Ok(Self {
             file_manager,
             lsm_tree,
             vlog_store,
+            merge_registry,
             num_columns: config.num_columns,
             ttl_provider,
             metrics_manager,
@@ -158,14 +162,19 @@ impl ReadOnlyDb {
         }
         let mut iter = values.into_iter();
         let mut merged = iter.next().expect("values not empty");
+        let merge_operators = self.merge_registry.value_merge_operators();
         for newer in iter {
-            merged = merged.merge(newer);
+            merged = merged.merge(newer, &merge_operators)?;
         }
         let snapshot = self.lsm_tree.db_state().load();
-        value_to_vec_of_columns_with_vlog(merged, |pointer| {
-            self.vlog_store
-                .read_pointer(&snapshot.vlog_version, pointer)
-        })
+        value_to_vec_of_columns_with_vlog(
+            merged,
+            |pointer| {
+                self.vlog_store
+                    .read_pointer(&snapshot.vlog_version, pointer)
+            },
+            &merge_operators,
+        )
     }
 
     pub fn scan(
@@ -198,6 +207,7 @@ impl ReadOnlyDb {
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 num_columns: self.num_columns,
+                merge_registry: Arc::clone(&self.merge_registry),
             },
         );
         iter.seek(start_key.as_ref())?;

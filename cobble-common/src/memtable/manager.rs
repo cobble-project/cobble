@@ -15,6 +15,7 @@ use crate::lsm::LSMTree;
 use crate::memtable::vlog::{MemtableVlogRecorder, rewrite_ref_value_for_memtable};
 use crate::memtable::{HashMemtable, VecMemtable};
 use crate::memtable::{Memtable, MemtableImpl, MemtableKvIter, MemtableReclaimer};
+use crate::merge_operator::MergeOperatorRegistry;
 use crate::metrics_manager::MetricsManager;
 use crate::snapshot::SnapshotManager;
 use crate::sst::{SSTWriter, SSTWriterOptions};
@@ -44,6 +45,7 @@ pub(crate) struct MemtableManagerOptions {
     pub(crate) auto_snapshot_manager: Option<SnapshotManager>,
     pub(crate) metrics_manager: Option<Arc<MetricsManager>>,
     pub(crate) vlog_store: Option<Arc<VlogStore>>,
+    pub(crate) merge_registry: Option<Arc<MergeOperatorRegistry>>,
 }
 
 #[derive(Clone)]
@@ -81,6 +83,7 @@ impl Default for MemtableManagerOptions {
             auto_snapshot_manager: None,
             metrics_manager: None,
             vlog_store: None,
+            merge_registry: None,
         }
     }
 }
@@ -95,6 +98,7 @@ pub(crate) struct MemtableManager {
     lsm_tree: Arc<LSMTree>,
     db_state: Arc<DbStateHandle>,
     vlog_store: Arc<VlogStore>,
+    merge_registry: Arc<MergeOperatorRegistry>,
     memtable_capacity: usize,
     total_budget: i64,
     memtable_type: MemtableType,
@@ -353,6 +357,9 @@ impl MemtableManager {
                 usize::MAX,
             ))
         });
+        let merge_registry = options
+            .merge_registry
+            .unwrap_or_else(|| Arc::new(MergeOperatorRegistry::new(options.num_columns)));
         {
             // init the first active buffer
             let mut state_guard = state.lock().unwrap();
@@ -376,6 +383,7 @@ impl MemtableManager {
             Arc::clone(&lsm_tree),
             lsm_tree.ttl_provider(),
             Arc::clone(&vlog_store),
+            Arc::clone(&merge_registry),
             metrics.clone(),
         )?;
         Ok(Self {
@@ -388,6 +396,7 @@ impl MemtableManager {
             lsm_tree,
             db_state,
             vlog_store,
+            merge_registry,
             memtable_capacity: options.memtable_capacity,
             total_budget,
             memtable_type: options.memtable_type,
@@ -415,6 +424,7 @@ impl MemtableManager {
         lsm_tree: Arc<LSMTree>,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
         vlog_store: Arc<VlogStore>,
+        merge_registry: Arc<MergeOperatorRegistry>,
         metrics: MemtableManagerMetrics,
     ) -> Result<(JoinHandle<()>, mpsc::Sender<FlushJob>)> {
         let (flush_tx, flush_rx) = mpsc::channel::<FlushJob>();
@@ -426,6 +436,7 @@ impl MemtableManager {
         let db_state_clone = lsm_tree_clone.db_state();
         let ttl_provider_clone = Arc::clone(&ttl_provider);
         let vlog_store_clone = Arc::clone(&vlog_store);
+        let merge_registry_clone = Arc::clone(&merge_registry);
         let handle = std::thread::Builder::new()
             .name("cobble-flush".to_string())
             .spawn(move || {
@@ -442,6 +453,7 @@ impl MemtableManager {
                             num_columns,
                             Arc::clone(&ttl_provider_clone),
                             Arc::clone(&vlog_store_clone),
+                            Arc::clone(&merge_registry_clone),
                         );
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
@@ -1049,6 +1061,7 @@ fn flush_memtable(
     num_columns: usize,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     vlog_store: Arc<VlogStore>,
+    merge_registry: Arc<MergeOperatorRegistry>,
 ) -> Result<MemtableFlushResult> {
     // Step 1: If there is a vlog recorder with entries, flush it to the vlog store and get the resulting edit.
     let mut vlog_edit = None;
@@ -1072,6 +1085,7 @@ fn flush_memtable(
         num_columns,
         ttl_provider,
         merge_callback,
+        merge_registry.value_merge_operators(),
     );
     dedup_iter.seek_to_first()?;
     while dedup_iter.valid() {

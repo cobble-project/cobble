@@ -584,6 +584,10 @@ mod tests {
             encode_value_type(&ValueType::MergeSeparatedArray),
             0b0000_1110
         );
+        assert_eq!(
+            encode_value_type(&ValueType::PutSeparatedArray),
+            0b0000_1111
+        );
 
         assert!(matches!(
             decode_value_type(0b0000_0001).unwrap(),
@@ -608,6 +612,10 @@ mod tests {
         assert!(matches!(
             decode_value_type(0b0000_1110).unwrap(),
             ValueType::MergeSeparatedArray
+        ));
+        assert!(matches!(
+            decode_value_type(0b0000_1111).unwrap(),
+            ValueType::PutSeparatedArray
         ));
     }
 

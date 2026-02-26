@@ -6,6 +6,7 @@ use crate::iterator::KvIterator;
 use crate::iterator::{DeduplicatingIterator, MergingIterator};
 use crate::lsm::DynKvIterator;
 use crate::memtable::MemtableManager;
+use crate::merge_operator::{MergeOperatorRegistry, ValueMergeOperator};
 use crate::sst::row_codec::{decode_key, decode_value};
 use crate::ttl::TTLProvider;
 use crate::vlog::VlogStore;
@@ -19,6 +20,7 @@ pub(crate) struct DbIteratorOptions<'a> {
     pub(crate) vlog_store: Arc<VlogStore>,
     pub(crate) ttl_provider: Arc<TTLProvider>,
     pub(crate) num_columns: usize,
+    pub(crate) merge_registry: Arc<MergeOperatorRegistry>,
 }
 
 pub struct DbIterator<'a> {
@@ -27,6 +29,7 @@ pub struct DbIterator<'a> {
     snapshot: Arc<DbState>,
     memtable_manager: Option<&'a MemtableManager>,
     vlog_store: Arc<VlogStore>,
+    merge_operators: Arc<ValueMergeOperator>,
     num_columns: usize,
 }
 
@@ -36,12 +39,14 @@ impl<'a> DbIterator<'a> {
         mut lsm_iters: Vec<DynKvIterator>,
         options: DbIteratorOptions<'a>,
     ) -> Self {
+        let merge_operators = options.merge_registry.value_merge_operators();
         memtable_iters.append(&mut lsm_iters);
         let inner = DeduplicatingIterator::new(
             MergingIterator::new(memtable_iters),
             options.num_columns,
             Arc::clone(&options.ttl_provider),
             None,
+            merge_operators.clone(),
         );
         Self {
             inner,
@@ -49,6 +54,7 @@ impl<'a> DbIterator<'a> {
             snapshot: options.snapshot,
             memtable_manager: options.memtable_manager,
             vlog_store: options.vlog_store,
+            merge_operators,
             num_columns: options.num_columns,
         }
     }
@@ -77,8 +83,9 @@ impl<'a> DbIterator<'a> {
             }
             let key = decode_key(&mut encoded_key)?;
             let value = decode_value(&mut encoded_value, self.num_columns)?;
-            let columns = value_to_vec_of_columns_with_vlog(value, |pointer| {
-                match self
+            let columns = value_to_vec_of_columns_with_vlog(
+                value,
+                |pointer| match self
                     .vlog_store
                     .read_pointer(&self.snapshot.vlog_version, pointer)
                 {
@@ -95,8 +102,9 @@ impl<'a> DbIterator<'a> {
                             Err(vlog_err)
                         }
                     }
-                }
-            })?;
+                },
+                &self.merge_operators,
+            )?;
             if let Some(columns) = columns {
                 return Ok(Some((Bytes::copy_from_slice(key.data()), columns)));
             }

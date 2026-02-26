@@ -3,6 +3,7 @@ use crate::error::{Error, Result};
 use crate::file::{FileManager, FileSystemRegistry};
 use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
+use crate::merge_operator::{MergeOperator, MergeOperatorRegistry, ValueMergeOperator};
 use crate::metrics_manager::MetricsManager;
 use crate::snapshot::{
     LoadedManifest, ManifestPayload, SnapshotCallback, SnapshotManager, apply_manifest_level_edits,
@@ -38,6 +39,7 @@ pub struct Db {
     memtable_manager: MemtableManager,
     vlog_store: Arc<VlogStore>,
     snapshot_manager: SnapshotManager,
+    merge_registry: Arc<MergeOperatorRegistry>,
     num_columns: usize,
     time_provider: Arc<dyn TimeProvider>,
     ttl_provider: Arc<TTLProvider>,
@@ -54,7 +56,8 @@ pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<
                 // TODO: Read from value log for separated values
                 | ValueType::PutSeparated
                 | ValueType::MergeSeparated
-                | ValueType::MergeSeparatedArray => Some(Bytes::from(col)),
+                | ValueType::MergeSeparatedArray
+                | ValueType::PutSeparatedArray => Some(Bytes::from(col)),
                 ValueType::Delete => None,
             })
         })
@@ -103,20 +106,34 @@ fn load_manifest_entry(
 }
 
 /// Resolve a single column value, handling any value log pointers using the provided callback.
-fn resolve_column_with_vlog<F>(column: Column, resolve_pointer: &mut F) -> Result<Option<Bytes>>
+fn resolve_column_with_vlog<F>(
+    column: Column,
+    resolve_pointer: &mut F,
+    merge_operator: &dyn MergeOperator,
+) -> Result<Option<Bytes>>
 where
     F: FnMut(VlogPointer) -> Result<Bytes>,
 {
     match column.value_type {
         ValueType::Delete => Ok(None),
-        ValueType::Put | ValueType::Merge => Ok(Some(Bytes::from(column))),
+        ValueType::Put => Ok(Some(Bytes::from(column))),
+        ValueType::Merge => {
+            let merged = merge_operator.merge(Bytes::new(), Bytes::from(column))?;
+            Ok(Some(merged))
+        }
         ValueType::PutSeparated | ValueType::MergeSeparated => {
             let pointer = VlogPointer::from_bytes(column.data())?;
-            Ok(Some(resolve_pointer(pointer)?))
+            let resolved = resolve_pointer(pointer)?;
+            if column.value_type == ValueType::MergeSeparated {
+                let merged = merge_operator.merge(Bytes::new(), resolved)?;
+                Ok(Some(merged))
+            } else {
+                Ok(Some(resolved))
+            }
         }
-        ValueType::MergeSeparatedArray => {
+        ValueType::MergeSeparatedArray | ValueType::PutSeparatedArray => {
             let items = decode_merge_separated_array(column.data())?;
-            let mut merged = BytesMut::new();
+            let mut merged = Bytes::new();
             for item in items {
                 let item_value = match item.value_type {
                     ValueType::Put | ValueType::Merge => Bytes::copy_from_slice(item.data()),
@@ -124,7 +141,9 @@ where
                         let pointer = VlogPointer::from_bytes(item.data())?;
                         resolve_pointer(pointer)?
                     }
-                    ValueType::Delete | ValueType::MergeSeparatedArray => {
+                    ValueType::Delete
+                    | ValueType::MergeSeparatedArray
+                    | ValueType::PutSeparatedArray => {
                         return Err(Error::IoError(format!(
                             "Invalid value type in MergeSeparatedArray: {:?}",
                             item.value_type
@@ -133,16 +152,17 @@ where
                 };
                 match item.value_type {
                     ValueType::Put | ValueType::PutSeparated => {
-                        merged.clear();
-                        merged.extend_from_slice(&item_value);
+                        merged = item_value;
                     }
                     ValueType::Merge | ValueType::MergeSeparated => {
-                        merged.extend_from_slice(&item_value);
+                        merged = merge_operator.merge(merged, item_value)?;
                     }
-                    ValueType::Delete | ValueType::MergeSeparatedArray => unreachable!(),
+                    ValueType::Delete
+                    | ValueType::MergeSeparatedArray
+                    | ValueType::PutSeparatedArray => unreachable!(),
                 }
             }
-            Ok(Some(merged.freeze()))
+            Ok(Some(merged))
         }
     }
 }
@@ -152,14 +172,17 @@ where
 pub(crate) fn value_to_vec_of_columns_with_vlog<F>(
     value: Value,
     mut resolve_pointer: F,
+    merge_operators: &ValueMergeOperator,
 ) -> Result<Option<Vec<Option<Bytes>>>>
 where
     F: FnMut(VlogPointer) -> Result<Bytes>,
 {
+    let resolve_pointer = &mut resolve_pointer;
     let mut columns = Vec::with_capacity(value.columns.len());
-    for column in value.columns {
+    for (column_idx, column) in value.columns.into_iter().enumerate() {
+        let merge_operator = merge_operators.operator(column_idx);
         let resolved = match column {
-            Some(column) => resolve_column_with_vlog(column, &mut resolve_pointer)?,
+            Some(column) => resolve_column_with_vlog(column, resolve_pointer, merge_operator)?,
             None => None,
         };
         columns.push(resolved);
@@ -205,6 +228,22 @@ impl Db {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Set a merge operator for a specific column index. The merge operator will be used for all
+    /// merge operations on that column.
+    pub fn set_merge_operator(
+        &self,
+        column: u16,
+        merge_operator: Arc<dyn MergeOperator>,
+    ) -> Result<()> {
+        self.merge_registry
+            .set_column_operator(column as usize, merge_operator)
+    }
+
+    /// Set merge operators for all columns at once.
+    pub fn set_merge_operators(&self, merge_operators: Vec<Arc<dyn MergeOperator>>) -> Result<()> {
+        self.merge_registry.set_all(merge_operators)
     }
 
     /// Return the metrics samples for this database.
@@ -301,6 +340,7 @@ impl Db {
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         let mut pending: std::collections::BTreeMap<Bytes, Value> =
             std::collections::BTreeMap::new();
+        let merge_operators = self.merge_registry.value_merge_operators();
         for (key_and_seq, op) in batch.ops {
             let column_idx = key_and_seq.column as usize;
             if column_idx >= self.num_columns {
@@ -332,7 +372,7 @@ impl Db {
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     let merged = std::mem::replace(entry.get_mut(), Value::new(Vec::new()))
-                        .merge(next_value);
+                        .merge(next_value, &merge_operators)?;
                     *entry.get_mut() = merged;
                 }
             }
@@ -540,6 +580,7 @@ impl Db {
             default_ttl_seconds: config.default_ttl_seconds,
         };
         let ttl_provider = Arc::new(TTLProvider::new(&ttl_config, Arc::clone(&time_provider)));
+        let merge_registry = Arc::new(MergeOperatorRegistry::new(config.num_columns));
 
         let mut lsm_tree = LSMTree::with_state_and_ttl(
             Arc::clone(&db_state),
@@ -560,25 +601,14 @@ impl Db {
         // Compaction setup
         let compaction_options = crate::compaction::build_compaction_config(&config);
         let compaction_worker: Arc<dyn crate::compaction::CompactionWorker> =
-            if let Some(address) = config.compaction_remote_addr.as_ref() {
-                Arc::new(crate::compaction::RemoteCompactionWorker::new(
-                    address.clone(),
-                    Arc::clone(&file_manager),
-                    Arc::downgrade(&lsm_tree),
-                    config.clone(),
-                    ttl_config.clone(),
-                    Duration::from_millis(config.compaction_remote_timeout_ms),
-                    Arc::clone(&metrics_manager),
-                )?)
-            } else {
-                Arc::new(crate::compaction::LocalCompactionWorker::new(
-                    crate::compaction::CompactionExecutor::new(compaction_options)?,
-                    Arc::clone(&file_manager),
-                    Arc::downgrade(&lsm_tree),
-                    config.clone(),
-                    Arc::clone(&metrics_manager),
-                ))
-            };
+            Arc::new(crate::compaction::LocalCompactionWorker::new(
+                crate::compaction::CompactionExecutor::new(compaction_options)?,
+                Arc::clone(&file_manager),
+                Arc::downgrade(&lsm_tree),
+                config.clone(),
+                Arc::clone(&metrics_manager),
+                Arc::clone(&merge_registry),
+            ));
         info!(
             "db compaction configured: l0_limit={} l1_base={} multiplier={} max_level={} target_file_size={}",
             compaction_options.l0_file_limit,
@@ -604,6 +634,7 @@ impl Db {
                 num_columns: config.num_columns,
                 write_stall_limit: config.resolved_write_stall_limit(),
                 initial_seq: initial_file_seq,
+                merge_registry: Some(Arc::clone(&merge_registry)),
                 auto_snapshot_manager: if config.snapshot_on_flush {
                     Some(snapshot_manager.clone())
                 } else {
@@ -621,6 +652,7 @@ impl Db {
             memtable_manager,
             vlog_store,
             snapshot_manager,
+            merge_registry,
             num_columns: config.num_columns,
             time_provider,
             ttl_provider,
@@ -720,11 +752,13 @@ impl Db {
         }
         let mut iter = values.into_iter();
         let mut merged = iter.next().expect("values not empty");
+        let merge_operators = self.merge_registry.value_merge_operators();
         for newer in iter {
-            merged = merged.merge(newer);
+            merged = merged.merge(newer, &merge_operators)?;
         }
-        value_to_vec_of_columns_with_vlog(merged, |pointer| {
-            match self
+        value_to_vec_of_columns_with_vlog(
+            merged,
+            |pointer| match self
                 .vlog_store
                 .read_pointer(&snapshot.vlog_version, pointer)
             {
@@ -733,8 +767,9 @@ impl Db {
                     .memtable_manager
                     .read_vlog_pointer_with_snapshot(Arc::clone(&snapshot), pointer)?
                     .ok_or(vlog_err),
-            }
-        })
+            },
+            &merge_operators,
+        )
     }
 
     pub fn scan<'a>(
@@ -770,6 +805,7 @@ impl Db {
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 num_columns: self.num_columns,
+                merge_registry: Arc::clone(&self.merge_registry),
             },
         );
         iter.seek(start_key.as_ref())?;
@@ -791,8 +827,10 @@ impl Drop for Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MergeOperator;
     use crate::{ReadOptions, ScanOptions, VolumeDescriptor};
     use serial_test::serial;
+    use std::sync::Arc;
 
     fn cleanup_test_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
@@ -806,6 +844,22 @@ mod tests {
             sst_bloom_filter_enabled: true,
             volumes: VolumeDescriptor::single_volume(format!("file://{}", path)),
             ..Config::default()
+        }
+    }
+
+    struct PipeMergeOperator;
+
+    impl MergeOperator for PipeMergeOperator {
+        fn merge(&self, existing_value: Bytes, value: Bytes) -> Result<Bytes> {
+            if existing_value.is_empty() {
+                Ok(value)
+            } else {
+                let mut merged = BytesMut::with_capacity(existing_value.len() + 1 + value.len());
+                merged.extend_from_slice(existing_value.as_ref());
+                merged.extend_from_slice(b"|");
+                merged.extend_from_slice(value.as_ref());
+                Ok(merged.freeze())
+            }
         }
     }
 
@@ -862,6 +916,51 @@ mod tests {
 
     #[test]
     #[serial(file)]
+    fn test_db_custom_merge_operator_per_column() {
+        let root = "/tmp/db_custom_merge_operator";
+        cleanup_test_root(root);
+        let config = Config {
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 2,
+            sst_bloom_filter_enabled: true,
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            ..Config::default()
+        };
+        let db = Db::open(config).unwrap();
+        db.set_merge_operator(0, Arc::new(PipeMergeOperator))
+            .unwrap();
+
+        db.put(b"k1", 0, b"base0").unwrap();
+        db.merge(b"k1", 0, b"a").unwrap();
+        db.merge(b"k1", 0, b"b").unwrap();
+        db.put(b"k1", 1, b"base1").unwrap();
+        db.merge(b"k1", 1, b"a").unwrap();
+        db.merge(b"k1", 1, b"b").unwrap();
+
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        assert_eq!(value[0].as_ref().unwrap().as_ref(), b"base0|a|b");
+        assert_eq!(value[1].as_ref().unwrap().as_ref(), b"base1ab");
+
+        let mut batch = WriteBatch::new();
+        batch.merge(b"k2", 0, b"a");
+        batch.merge(b"k2", 0, b"b");
+        db.write_batch(batch).unwrap();
+
+        let value = db
+            .get(b"k2", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        assert_eq!(value[0].as_ref().unwrap().as_ref(), b"a|b");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
     fn test_db_rejects_separated_value_type_input() {
         let root = "/tmp/db_reject_separated_input";
         cleanup_test_root(root);
@@ -871,6 +970,7 @@ mod tests {
             ValueType::PutSeparated,
             ValueType::MergeSeparated,
             ValueType::MergeSeparatedArray,
+            ValueType::PutSeparatedArray,
         ] {
             let err = db
                 .write_ref(b"k1", 0, value_type, b"value", None)

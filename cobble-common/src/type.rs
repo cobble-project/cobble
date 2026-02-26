@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::merge_operator::{MergeOperator, ValueMergeOperator};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub(crate) struct Key {
@@ -39,6 +40,9 @@ pub(crate) enum ValueType {
 
     /// Lazy merge chain for separated payloads during compaction.
     MergeSeparatedArray = 0b0000_1110,
+
+    /// Lazy merge chain for separated payloads during compaction, which is also a terminal value.
+    PutSeparatedArray = 0b0000_1111,
 }
 
 const VALUE_TYPE_TERMINAL_BIT: u8 = 0b0000_0001;
@@ -120,6 +124,7 @@ impl ValueType {
             x if x == ValueType::PutSeparated as u8 => Ok(ValueType::PutSeparated),
             x if x == ValueType::MergeSeparated as u8 => Ok(ValueType::MergeSeparated),
             x if x == ValueType::MergeSeparatedArray as u8 => Ok(ValueType::MergeSeparatedArray),
+            x if x == ValueType::PutSeparatedArray as u8 => Ok(ValueType::PutSeparatedArray),
             _ => Err(Error::IoError(format!("Invalid ValueType: {}", byte))),
         }
     }
@@ -175,7 +180,7 @@ pub(crate) fn encode_merge_separated_array(columns: &[RefColumn<'_>]) -> Result<
     let mut total_size = 0usize;
     for column in columns {
         match column.value_type {
-            ValueType::MergeSeparatedArray => {
+            ValueType::MergeSeparatedArray | ValueType::PutSeparatedArray => {
                 total_size = total_size.checked_add(column.data().len()).ok_or_else(|| {
                     Error::IoError("MergeSeparatedArray payload size overflow".to_string())
                 })?;
@@ -199,7 +204,9 @@ pub(crate) fn encode_merge_separated_array(columns: &[RefColumn<'_>]) -> Result<
     let mut buf = BytesMut::with_capacity(total_size);
     for column in columns {
         match column.value_type {
-            ValueType::MergeSeparatedArray => buf.put_slice(column.data()),
+            ValueType::MergeSeparatedArray | ValueType::PutSeparatedArray => {
+                buf.put_slice(column.data())
+            }
             value_type if value_type.is_merge_separated_array_item() => {
                 buf.put_u8(value_type.encode_tag());
                 buf.put_u32_le(column.data().len() as u32);
@@ -267,36 +274,54 @@ impl Column {
     /// - If `newer` is `Merge`, the data is concatenated to `self`'s data (reuses `self`'s buffer).
     ///
     /// This API takes ownership to minimize clones for performance.
-    pub(crate) fn merge(mut self, newer: Column) -> Column {
+    pub(crate) fn merge(
+        self,
+        mut newer: Column,
+        merge_operator: &dyn MergeOperator,
+    ) -> Result<Column> {
         match newer.value_type {
-            ValueType::Put | ValueType::PutSeparated | ValueType::Delete => newer,
+            ValueType::Put
+            | ValueType::PutSeparated
+            | ValueType::Delete
+            | ValueType::PutSeparatedArray => Ok(newer),
             ValueType::Merge | ValueType::MergeSeparated | ValueType::MergeSeparatedArray => {
-                if (self.value_type.uses_separated_storage()
-                    || newer.value_type.uses_separated_storage())
-                    && self.value_type != ValueType::Delete
+                if self.value_type.uses_separated_storage()
+                    || newer.value_type.uses_separated_storage()
                 {
-                    return Self::merge_as_separated_array(self, newer)
-                        .expect("separated merge invariant violated");
+                    return Self::merge_as_separated_array(self, newer);
                 }
-                let mut merged = BytesMut::with_capacity(self.data.len() + newer.data.len());
-                merged.extend_from_slice(self.data());
-                merged.extend_from_slice(newer.data());
-                self.data = merged.freeze();
-                self
+                // only merge/put/delete for self and merge for newer can reach here.
+                match self.value_type {
+                    ValueType::Delete => {
+                        // If the existing column is a tombstone, we treat it as an empty value for merging.
+                        newer.value_type = ValueType::Put;
+                        Ok(newer)
+                    }
+                    ValueType::Put | ValueType::Merge => Ok(Column::new(
+                        self.value_type,
+                        merge_operator.merge(Bytes::from(self), Bytes::from(newer))?,
+                    )),
+                    _ => unreachable!(),
+                }
             }
         }
     }
 
     fn merge_as_separated_array(self, newer: Column) -> Result<Column> {
+        let value_type = if self.value_type.is_terminal() {
+            ValueType::PutSeparatedArray
+        } else {
+            ValueType::MergeSeparatedArray
+        };
         let older = self.into_merge_separated_array_input()?;
         let refs = [older.as_ref_column(), newer.as_ref_column()];
         let encoded = encode_merge_separated_array(&refs)?;
-        Ok(Column::new(ValueType::MergeSeparatedArray, encoded))
+        Ok(Column::new(value_type, encoded))
     }
 
     fn into_merge_separated_array_input(self) -> Result<Column> {
         match self.value_type {
-            ValueType::MergeSeparatedArray => Ok(self),
+            ValueType::MergeSeparatedArray | ValueType::PutSeparatedArray => Ok(self),
             value_type if value_type.is_merge_separated_array_item() => Ok(self),
             value_type => Err(Error::IoError(format!(
                 "Cannot encode {:?} into MergeSeparatedArray",
@@ -390,11 +415,16 @@ impl Value {
     ///
     /// The resulting value has the maximum number of columns from both values.
     /// This API takes ownership to minimize clones for performance.
-    pub(crate) fn merge(self, newer: Value) -> Value {
-        self.merge_with_callback(newer, &mut |_, _| {})
+    pub(crate) fn merge(self, newer: Value, merge_operators: &ValueMergeOperator) -> Result<Value> {
+        self.merge_with_callback(newer, merge_operators, &mut |_, _| {})
     }
 
-    pub(crate) fn merge_with_callback<F>(self, newer: Value, on_merge: &mut F) -> Value
+    pub(crate) fn merge_with_callback<F>(
+        self,
+        newer: Value,
+        merge_operators: &ValueMergeOperator,
+        on_merge: &mut F,
+    ) -> Result<Value>
     where
         F: FnMut(Option<&Column>, Option<&Column>) + ?Sized,
     {
@@ -404,14 +434,18 @@ impl Value {
         let mut older_iter = self.columns.into_iter();
         let mut newer_iter = newer.columns.into_iter();
 
-        for _ in 0..max_cols {
+        for column_idx in 0..max_cols {
             let older_col = older_iter.next().flatten();
             let newer_col = newer_iter.next().flatten();
 
             let merged = match (older_col, newer_col) {
                 (Some(old), Some(new)) => {
                     on_merge(Some(&old), Some(&new));
-                    Some(old.merge(new))
+                    if old.data().is_empty() {
+                        Some(new)
+                    } else {
+                        Some(old.merge(new, merge_operators.operator(column_idx))?)
+                    }
                 }
                 (Some(old), None) => {
                     on_merge(Some(&old), None);
@@ -429,7 +463,10 @@ impl Value {
         // Prefer expiration from the newer value
         let merged_expired_at = newer.expired_at;
 
-        Value::new_with_expired_at(merged_columns, merged_expired_at)
+        Ok(Value::new_with_expired_at(
+            merged_columns,
+            merged_expired_at,
+        ))
     }
 }
 
@@ -482,13 +519,25 @@ impl<'a> RefValue<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::merge_operator::{MergeOperator, default_merge_operator_ref};
+    use std::sync::Arc;
+
+    struct PanicMergeOperator;
+
+    impl MergeOperator for PanicMergeOperator {
+        fn merge(&self, _existing_value: Bytes, _value: Bytes) -> Result<Bytes> {
+            panic!("merge operator should not be invoked for empty old value");
+        }
+    }
 
     #[test]
     fn test_column_merge_with_put_replaces() {
         let old = Column::new(ValueType::Put, b"old_data".to_vec());
         let new = Column::new(ValueType::Put, b"new_data".to_vec());
 
-        let merged = old.merge(new);
+        let merged = old
+            .merge(new, default_merge_operator_ref().as_ref())
+            .unwrap();
         assert!(matches!(merged.value_type(), ValueType::Put));
         assert_eq!(merged.data().as_ref(), b"new_data");
     }
@@ -498,7 +547,9 @@ mod tests {
         let old = Column::new(ValueType::Put, b"old_data".to_vec());
         let new = Column::new(ValueType::Delete, b"".to_vec());
 
-        let merged = old.merge(new);
+        let merged = old
+            .merge(new, default_merge_operator_ref().as_ref())
+            .unwrap();
         assert!(matches!(merged.value_type(), ValueType::Delete));
         assert_eq!(merged.data().as_ref(), b"");
     }
@@ -508,7 +559,9 @@ mod tests {
         let old = Column::new(ValueType::Put, b"hello".to_vec());
         let new = Column::new(ValueType::Merge, b"world".to_vec());
 
-        let merged = old.merge(new);
+        let merged = old
+            .merge(new, default_merge_operator_ref().as_ref())
+            .unwrap();
         // Merge keeps the original value_type and concatenates data
         assert!(matches!(merged.value_type(), ValueType::Put));
         assert_eq!(merged.data().as_ref(), b"helloworld");
@@ -520,7 +573,11 @@ mod tests {
         let merge1 = Column::new(ValueType::Merge, b"b".to_vec());
         let merge2 = Column::new(ValueType::Merge, b"c".to_vec());
 
-        let merged = old.merge(merge1).merge(merge2);
+        let merged = old
+            .merge(merge1, default_merge_operator_ref().as_ref())
+            .unwrap()
+            .merge(merge2, default_merge_operator_ref().as_ref())
+            .unwrap();
         assert!(matches!(merged.value_type(), ValueType::Put));
         assert_eq!(merged.data().as_ref(), b"abc");
     }
@@ -536,7 +593,7 @@ mod tests {
             Some(Column::new(ValueType::Merge, b"_append".to_vec())),
         ]);
 
-        let merged = old.merge(new);
+        let merged = old.merge(new, &ValueMergeOperator::empty()).unwrap();
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
@@ -555,7 +612,7 @@ mod tests {
             Some(Column::new(ValueType::Put, b"new2".to_vec())),
         ]);
 
-        let merged = old.merge(new);
+        let merged = old.merge(new, &ValueMergeOperator::empty()).unwrap();
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
@@ -576,7 +633,7 @@ mod tests {
             Some(Column::new(ValueType::Put, b"new2".to_vec())),
         ]);
 
-        let merged = old.merge(new);
+        let merged = old.merge(new, &ValueMergeOperator::empty()).unwrap();
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
@@ -593,7 +650,7 @@ mod tests {
             Some(Column::new(ValueType::Put, b"new3".to_vec())),
         ]);
 
-        let merged = old.merge(new);
+        let merged = old.merge(new, &ValueMergeOperator::empty()).unwrap();
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 3);
@@ -607,7 +664,7 @@ mod tests {
         let old = Value::new(vec![None, None]);
         let new = Value::new(vec![None, None]);
 
-        let merged = old.merge(new);
+        let merged = old.merge(new, &ValueMergeOperator::empty()).unwrap();
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
@@ -655,8 +712,10 @@ mod tests {
     fn test_column_merge_with_separated_creates_array() {
         let old = Column::new(ValueType::PutSeparated, b"p0".to_vec());
         let new = Column::new(ValueType::MergeSeparated, b"m1".to_vec());
-        let merged = old.merge(new);
-        assert_eq!(merged.value_type, ValueType::MergeSeparatedArray);
+        let merged = old
+            .merge(new, default_merge_operator_ref().as_ref())
+            .unwrap();
+        assert_eq!(merged.value_type, ValueType::PutSeparatedArray);
         let decoded = decode_merge_separated_array(merged.data()).unwrap();
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].value_type, ValueType::PutSeparated);
@@ -704,9 +763,15 @@ mod tests {
             None,
         ]);
         let mut seen = Vec::new();
-        let _ = old.merge_with_callback(new, &mut |old_col, new_col| {
-            seen.push((old_col.map(|c| c.value_type), new_col.map(|c| c.value_type)));
-        });
+        let _ = old
+            .merge_with_callback(
+                new,
+                &ValueMergeOperator::empty(),
+                &mut |old_col, new_col| {
+                    seen.push((old_col.map(|c| c.value_type), new_col.map(|c| c.value_type)));
+                },
+            )
+            .unwrap();
         assert_eq!(
             seen,
             vec![
@@ -714,5 +779,27 @@ mod tests {
                 (None, Some(ValueType::PutSeparated)),
             ]
         );
+    }
+
+    #[test]
+    fn test_value_merge_skips_operator_when_old_missing() {
+        let old = Value::new(vec![None]);
+        let new = Value::new(vec![Some(Column::new(ValueType::Merge, b"m".to_vec()))]);
+        let merge_ops = ValueMergeOperator::new(Arc::new(vec![Arc::new(PanicMergeOperator)]));
+        let merged = old.merge(new, &merge_ops).unwrap();
+        let col = merged.columns()[0].as_ref().unwrap();
+        assert_eq!(col.value_type, ValueType::Merge);
+        assert_eq!(col.data().as_ref(), b"m");
+    }
+
+    #[test]
+    fn test_value_merge_skips_operator_when_old_empty() {
+        let old = Value::new(vec![Some(Column::new(ValueType::Put, Bytes::new()))]);
+        let new = Value::new(vec![Some(Column::new(ValueType::Merge, b"m".to_vec()))]);
+        let merge_ops = ValueMergeOperator::new(Arc::new(vec![Arc::new(PanicMergeOperator)]));
+        let merged = old.merge(new, &merge_ops).unwrap();
+        let col = merged.columns()[0].as_ref().unwrap();
+        assert_eq!(col.value_type, ValueType::Merge);
+        assert_eq!(col.data().as_ref(), b"m");
     }
 }
