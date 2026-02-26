@@ -9,7 +9,10 @@ use crate::error::{Error, Result};
 use crate::file::{DataVolume, FileId, FileManager, FileManagerOptions, TrackedFileId};
 use crate::iterator::SortedRun;
 use crate::lsm::{LSMTree, LevelEdit, VersionEdit};
-use crate::merge_operator::MergeOperatorRegistry;
+use crate::merge_operator::{
+    BytesMergeOperator, MergeOperator, MergeOperatorRegistry, U32CounterMergeOperator,
+    U64CounterMergeOperator, ValueMergeOperator, default_merge_operator,
+};
 use crate::metrics_manager::MetricsManager;
 use crate::sst::SSTWriterOptions;
 use crate::time::ManualTimeProvider;
@@ -19,7 +22,7 @@ use crate::vlog::VlogEdit;
 use bytes::Bytes;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -183,6 +186,8 @@ struct RemoteCompactionRequest {
     ttl_config: RemoteTtlConfig,
     ttl_now_seconds: u32,
     runs: Vec<RemoteSortedRun>,
+    #[serde(default)]
+    merge_operator_ids: Vec<String>,
 }
 
 impl fmt::Display for RemoteCompactionRequest {
@@ -210,6 +215,21 @@ struct RemoteCompactionResponse {
     #[serde(default)]
     vlog_entry_deltas: Vec<(u32, i64)>,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+enum RemoteCompactionCommand {
+    Execute(RemoteCompactionRequest),
+    SupportedMergeOperators,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+enum RemoteCompactionReply {
+    Execute(RemoteCompactionResponse),
+    SupportedMergeOperators(Vec<String>),
+    Error(String),
 }
 
 impl RemoteCompactionResponse {
@@ -249,9 +269,12 @@ pub(crate) struct RemoteCompactionWorker {
     runtime: Mutex<Option<Runtime>>,
     remote_timeout: Duration,
     metrics_manager: Arc<MetricsManager>,
+    merge_registry: Arc<MergeOperatorRegistry>,
+    supported_merge_operator_ids: HashSet<String>,
 }
 
 impl RemoteCompactionWorker {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         address: String,
         file_manager: Arc<FileManager>,
@@ -260,6 +283,7 @@ impl RemoteCompactionWorker {
         ttl_config: TtlConfig,
         remote_timeout: Duration,
         metrics_manager: Arc<MetricsManager>,
+        merge_registry: Arc<MergeOperatorRegistry>,
     ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .thread_name("cobble-remote-compaction")
@@ -267,6 +291,10 @@ impl RemoteCompactionWorker {
             .enable_all()
             .build()
             .map_err(|e| Error::IoError(e.to_string()))?;
+        let supported_merge_operator_ids =
+            fetch_supported_merge_operator_ids(&address, remote_timeout)?
+                .into_iter()
+                .collect();
         Ok(Self {
             address,
             file_manager,
@@ -276,6 +304,8 @@ impl RemoteCompactionWorker {
             runtime: Mutex::new(Some(runtime)),
             remote_timeout,
             metrics_manager,
+            merge_registry,
+            supported_merge_operator_ids,
         })
     }
 
@@ -296,6 +326,21 @@ impl RemoteCompactionWorker {
             .map(|run| RemoteSortedRun::from_sorted_run(run, &self.file_manager))
             .collect::<Result<Vec<_>>>()?;
         let sst_options = super::build_sst_writer_options(&self.config, output_level);
+        let merge_operator_ids = self
+            .merge_registry
+            .value_merge_operators()
+            .operator_ids(sst_options.num_columns);
+        for merge_operator_id in &merge_operator_ids {
+            if !self
+                .supported_merge_operator_ids
+                .contains(merge_operator_id)
+            {
+                return Err(Error::ConfigError(format!(
+                    "remote compactor {} does not support merge operator '{}'",
+                    self.address, merge_operator_id
+                )));
+            }
+        }
         Ok(RemoteCompactionRequest {
             request_id: None,
             db_id: self.metrics_manager.db_id().to_string(),
@@ -308,6 +353,7 @@ impl RemoteCompactionWorker {
             },
             ttl_now_seconds: ttl_provider.now_seconds(),
             runs,
+            merge_operator_ids,
         })
     }
 }
@@ -346,7 +392,7 @@ impl CompactionWorker for RemoteCompactionWorker {
         let remote_timeout = self.remote_timeout;
         Some(handle.spawn_blocking(move || {
             let result = (|| -> Result<CompactionResult> {
-                let response = send_request_to(&address, request, remote_timeout)?;
+                let response = send_compaction_request_to(&address, request, remote_timeout)?;
                 let Some(lsm_tree) = lsm_tree.upgrade() else {
                     return Err(Error::IoError(
                         "lsm tree dropped during compaction".to_string(),
@@ -396,6 +442,7 @@ pub struct RemoteCompactionServer {
     data_volumes: Arc<Vec<DataVolume>>,
     request_id: Arc<AtomicU64>,
     metrics_manager: Arc<MetricsManager>,
+    merge_operator_map: Arc<Mutex<HashMap<String, Arc<dyn MergeOperator>>>>,
 }
 
 impl RemoteCompactionServer {
@@ -412,6 +459,14 @@ impl RemoteCompactionServer {
         let executor = CompactionExecutor::new_with_runtime(compaction_config, runtime.clone())?;
         let data_volumes = FileManager::data_volumes_from_config(&config)?;
         let metrics_manager = Arc::new(MetricsManager::new(Uuid::new_v4().to_string()));
+        let mut merge_operator_map: HashMap<String, Arc<dyn MergeOperator>> = HashMap::new();
+        for operator in [
+            Arc::new(BytesMergeOperator) as Arc<dyn MergeOperator>,
+            Arc::new(U32CounterMergeOperator) as Arc<dyn MergeOperator>,
+            Arc::new(U64CounterMergeOperator) as Arc<dyn MergeOperator>,
+        ] {
+            merge_operator_map.insert(operator.id(), operator);
+        }
         Ok(Self {
             config,
             runtime,
@@ -419,7 +474,27 @@ impl RemoteCompactionServer {
             data_volumes: Arc::new(data_volumes),
             request_id: Arc::new(AtomicU64::new(1)),
             metrics_manager,
+            merge_operator_map: Arc::new(Mutex::new(merge_operator_map)),
         })
+    }
+
+    pub fn register_merge_operator(&self, operator: Arc<dyn MergeOperator>) {
+        self.merge_operator_map
+            .lock()
+            .unwrap()
+            .insert(operator.id(), operator);
+    }
+
+    pub fn supported_merge_operator_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .merge_operator_map
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
     }
 
     pub fn serve(&self, address: &str) -> Result<()> {
@@ -450,31 +525,47 @@ impl RemoteCompactionServer {
         let data_volumes = Arc::clone(&self.data_volumes);
         let request_id_counter = Arc::clone(&self.request_id);
         let metrics_manager = Arc::clone(&self.metrics_manager);
+        let merge_operator_map = Arc::clone(&self.merge_operator_map);
         self.runtime.spawn_blocking(move || {
-            let request: Result<RemoteCompactionRequest> = read_message(&mut stream);
-            if let Err(err) = &request {
+            let command: Result<RemoteCompactionCommand> = read_message(&mut stream);
+            if let Err(err) = &command {
                 warn!("Read request error: {}", err);
-                let response = RemoteCompactionResponse::err(format!("Invalid request: {}", err));
+                let response = RemoteCompactionReply::Error(format!("Invalid request: {}", err));
                 let _ = write_message(&mut stream, &response);
                 return;
             }
-            let mut request = request.unwrap();
-            let request_id = request_id_counter.fetch_add(1, Ordering::SeqCst);
-            request.request_id = Some(request_id);
-            info!("Received request: {}", request);
-            let response = match Self::handle_request_with(
-                &config,
-                executor.as_ref(),
-                data_volumes.clone(),
-                Arc::clone(&metrics_manager),
-                request,
-            ) {
-                Ok((files, vlog_entry_deltas)) => {
-                    RemoteCompactionResponse::ok(files, vlog_entry_deltas)
+            let response = match command.unwrap() {
+                RemoteCompactionCommand::SupportedMergeOperators => {
+                    let mut ids = merge_operator_map
+                        .lock()
+                        .unwrap()
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    ids.sort();
+                    RemoteCompactionReply::SupportedMergeOperators(ids)
                 }
-                Err(err) => RemoteCompactionResponse::err(err.to_string()),
+                RemoteCompactionCommand::Execute(mut request) => {
+                    let request_id = request_id_counter.fetch_add(1, Ordering::SeqCst);
+                    request.request_id = Some(request_id);
+                    info!("Received request: {}", request);
+                    let response = match Self::handle_request_with(
+                        &config,
+                        executor.as_ref(),
+                        data_volumes.clone(),
+                        Arc::clone(&metrics_manager),
+                        Arc::clone(&merge_operator_map),
+                        request,
+                    ) {
+                        Ok((files, vlog_entry_deltas)) => {
+                            RemoteCompactionResponse::ok(files, vlog_entry_deltas)
+                        }
+                        Err(err) => RemoteCompactionResponse::err(err.to_string()),
+                    };
+                    info!("Request={} complete with response={}", request_id, response);
+                    RemoteCompactionReply::Execute(response)
+                }
             };
-            info!("Request={} complete with response={}", request_id, response);
             let _ = write_message(&mut stream, &response);
         });
         Ok(())
@@ -485,6 +576,7 @@ impl RemoteCompactionServer {
         executor: &CompactionExecutor,
         data_volumes: Arc<Vec<DataVolume>>,
         metrics_manager: Arc<MetricsManager>,
+        merge_operator_map: Arc<Mutex<HashMap<String, Arc<dyn MergeOperator>>>>,
         request: RemoteCompactionRequest,
     ) -> Result<RemoteCompactionOutput> {
         let file_manager =
@@ -519,6 +611,11 @@ impl RemoteCompactionServer {
         ));
         let compaction_metrics = metrics_manager.compaction_metrics();
         let sst_metrics = metrics_manager.sst_iterator_metrics();
+        let merge_operators = Self::resolve_merge_operators(
+            Arc::clone(&merge_operator_map),
+            &request.merge_operator_ids,
+            num_columns,
+        )?;
         let task = CompactionTask::new(
             compaction_metrics,
             sst_metrics,
@@ -528,7 +625,7 @@ impl RemoteCompactionServer {
             Arc::clone(&file_builder_factory),
             data_file_type,
             ttl_provider,
-            MergeOperatorRegistry::new(num_columns).value_merge_operators(),
+            merge_operators,
         )
         .with_readonly_outputs();
         let result = executor.execute_blocking(task, None);
@@ -546,6 +643,32 @@ impl RemoteCompactionServer {
             .map(|edit| edit.entry_deltas())
             .unwrap_or_default();
         Ok((output_files, vlog_entry_deltas))
+    }
+
+    fn resolve_merge_operators(
+        merge_operator_map: Arc<Mutex<HashMap<String, Arc<dyn MergeOperator>>>>,
+        request_ids: &[String],
+        num_columns: usize,
+    ) -> Result<Arc<ValueMergeOperator>> {
+        let ids: Vec<String> = if request_ids.is_empty() {
+            vec![default_merge_operator().id(); num_columns]
+        } else if request_ids.len() >= num_columns {
+            request_ids[..num_columns].to_vec()
+        } else {
+            // fill the provided ids with default ones if the count is less than num_columns
+            let mut ids = request_ids.to_vec();
+            ids.resize(num_columns, default_merge_operator().id());
+            ids
+        };
+        let map = merge_operator_map.lock().unwrap();
+        let mut operators = Vec::with_capacity(num_columns);
+        for id in ids {
+            let operator = map.get(&id).cloned().ok_or_else(|| {
+                Error::InputError(format!("unsupported merge operator id '{}'", id))
+            })?;
+            operators.push(operator);
+        }
+        Ok(Arc::new(ValueMergeOperator::new(Arc::new(operators))))
     }
 
     fn file_manager_for_with(
@@ -618,12 +741,11 @@ fn write_message<T: Serialize>(stream: &mut TcpStream, message: &T) -> Result<()
     Ok(())
 }
 
-/// Send a remote compaction request to the specified address and wait for the response.
-fn send_request_to(
+fn send_command_to(
     address: &str,
-    request: RemoteCompactionRequest,
+    command: RemoteCompactionCommand,
     timeout: Duration,
-) -> Result<RemoteCompactionResponse> {
+) -> Result<RemoteCompactionReply> {
     let mut stream = TcpStream::connect(address).map_err(|e| Error::IoError(e.to_string()))?;
     stream
         .set_read_timeout(Some(timeout))
@@ -631,10 +753,38 @@ fn send_request_to(
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|e| Error::IoError(e.to_string()))?;
-    // serialize the request and send it to the server
-    write_message(&mut stream, &request)?;
-    // read the response and deserialize it
+    write_message(&mut stream, &command)?;
     read_message(&mut stream)
+}
+
+fn fetch_supported_merge_operator_ids(address: &str, timeout: Duration) -> Result<Vec<String>> {
+    match send_command_to(
+        address,
+        RemoteCompactionCommand::SupportedMergeOperators,
+        timeout,
+    )? {
+        RemoteCompactionReply::SupportedMergeOperators(ids) => Ok(ids),
+        RemoteCompactionReply::Error(error) => Err(Error::IoError(error)),
+        RemoteCompactionReply::Execute(response) => Err(Error::IoError(format!(
+            "unexpected execute response while requesting capabilities: {}",
+            response
+        ))),
+    }
+}
+
+fn send_compaction_request_to(
+    address: &str,
+    request: RemoteCompactionRequest,
+    timeout: Duration,
+) -> Result<RemoteCompactionResponse> {
+    match send_command_to(address, RemoteCompactionCommand::Execute(request), timeout)? {
+        RemoteCompactionReply::Execute(response) => Ok(response),
+        RemoteCompactionReply::Error(error) => Err(Error::IoError(error)),
+        RemoteCompactionReply::SupportedMergeOperators(ids) => Err(Error::IoError(format!(
+            "unexpected capability response while executing compaction: {:?}",
+            ids
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -644,18 +794,18 @@ mod tests {
     use crate::compaction::build_sst_writer_options;
     use crate::db_state::{DbState, DbStateHandle};
     use crate::lsm::{LSMTree, LSMTreeVersion, Level};
-    use crate::sst::row_codec::encode_value;
+    use crate::sst::row_codec::{decode_value, encode_value};
     use crate::r#type::{Column, Value, ValueType};
     use serial_test::serial;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
 
     fn cleanup_test_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
     }
 
-    fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {
-        let value = Value::new(vec![Some(Column::new(ValueType::Put, data.to_vec()))]);
+    fn make_typed_value_bytes(value_type: ValueType, data: &[u8], num_columns: usize) -> Vec<u8> {
+        let value = Value::new(vec![Some(Column::new(value_type, data.to_vec()))]);
         encode_value(&value, num_columns).to_vec()
     }
 
@@ -712,14 +862,14 @@ mod tests {
         let entries_a = (0..40)
             .map(|idx| {
                 let key = format!("a{:03}", idx).into_bytes();
-                let value = make_value_bytes(&value_payload, num_columns);
+                let value = make_typed_value_bytes(ValueType::Put, &value_payload, num_columns);
                 (key, value)
             })
             .collect::<Vec<_>>();
         let entries_b = (0..40)
             .map(|idx| {
                 let key = format!("b{:03}", idx).into_bytes();
-                let value = make_value_bytes(&value_payload, num_columns);
+                let value = make_typed_value_bytes(ValueType::Put, &value_payload, num_columns);
                 (key, value)
             })
             .collect::<Vec<_>>();
@@ -761,11 +911,14 @@ mod tests {
         let server_thread = {
             let server = Arc::clone(&server);
             std::thread::spawn(move || {
-                if let Ok((stream, _)) = listener.accept() {
-                    server.handle_connection(stream).unwrap();
+                for _ in 0..2 {
+                    if let Ok((stream, _)) = listener.accept() {
+                        server.handle_connection(stream).unwrap();
+                    }
                 }
             })
         };
+        let merge_registry = Arc::new(MergeOperatorRegistry::new(config.num_columns));
 
         let worker = RemoteCompactionWorker::new(
             addr.to_string(),
@@ -778,6 +931,7 @@ mod tests {
             },
             remote_timeout,
             Arc::clone(&metrics_manager),
+            Arc::clone(&merge_registry),
         )
         .unwrap();
 
@@ -812,6 +966,161 @@ mod tests {
                 .all(|file| file.file_type == DataFileType::SSTable)
         );
 
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_remote_compaction_with_u64_counter_merge_operator() {
+        let root = "/tmp/remote_compaction_u64_counter";
+        cleanup_test_root(root);
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            base_file_size: 128,
+            sst_bloom_filter_enabled: true,
+            compaction_threads: 2,
+            num_columns: 1,
+            ..Config::default()
+        };
+        let db_id = "remote-compaction-u64-counter".to_string();
+        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
+        let file_manager = Arc::new(
+            FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
+        );
+        let mut sst_options = build_sst_writer_options(&config, 0);
+        sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
+        let num_columns = sst_options.num_columns;
+
+        let mut expected = HashMap::new();
+        let entries_old = (0..20u64)
+            .map(|idx| {
+                let key = format!("k{:03}", idx).into_bytes();
+                let base = idx + 1;
+                let delta = 10u64;
+                expected.insert(key.clone(), base + delta);
+                (
+                    key,
+                    make_typed_value_bytes(ValueType::Put, &base.to_le_bytes(), num_columns),
+                )
+            })
+            .collect::<Vec<_>>();
+        let entries_new = (0..20u64)
+            .map(|idx| {
+                let key = format!("k{:03}", idx).into_bytes();
+                let delta = 10u64;
+                (
+                    key,
+                    make_typed_value_bytes(ValueType::Merge, &delta.to_le_bytes(), num_columns),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let older_file = create_test_sst(&file_manager, entries_old, sst_options.clone()).unwrap();
+        let newer_file = create_test_sst(&file_manager, entries_new, sst_options.clone()).unwrap();
+
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(DbState {
+            seq_id: 0,
+            lsm_version: LSMTreeVersion {
+                levels: vec![
+                    Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: vec![Arc::clone(&newer_file), Arc::clone(&older_file)],
+                    },
+                    Level {
+                        ordinal: 1,
+                        tiered: false,
+                        files: Vec::new(),
+                    },
+                ],
+            },
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::clone(&db_state),
+            Arc::clone(&metrics_manager),
+        ));
+
+        let remote_timeout = Duration::from_millis(config.compaction_remote_timeout_ms);
+        let server = Arc::new(RemoteCompactionServer::new(config.clone()).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = {
+            let server = Arc::clone(&server);
+            std::thread::spawn(move || {
+                for _ in 0..2 {
+                    if let Ok((stream, _)) = listener.accept() {
+                        server.handle_connection(stream).unwrap();
+                    }
+                }
+            })
+        };
+
+        let merge_registry = Arc::new(MergeOperatorRegistry::new(config.num_columns));
+        merge_registry
+            .set_column_operator(0, Arc::new(U64CounterMergeOperator))
+            .unwrap();
+
+        let worker = RemoteCompactionWorker::new(
+            addr.to_string(),
+            Arc::clone(&file_manager),
+            Arc::downgrade(&lsm_tree),
+            config.clone(),
+            TtlConfig {
+                enabled: false,
+                default_ttl_seconds: None,
+            },
+            remote_timeout,
+            Arc::clone(&metrics_manager),
+            Arc::clone(&merge_registry),
+        )
+        .unwrap();
+
+        let runs = vec![
+            SortedRun::new(0, vec![newer_file]),
+            SortedRun::new(0, vec![older_file]),
+        ];
+        let handle = worker
+            .submit_runs(
+                runs,
+                1,
+                DataFileType::SSTable,
+                Arc::new(TTLProvider::disabled()),
+            )
+            .expect("compaction handle");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(handle).unwrap().unwrap();
+        let _ = server_thread.join();
+
+        let mut actual = HashMap::new();
+        for file in lsm_tree.level_files(1) {
+            let reader = file_manager.open_data_file_reader(file.file_id).unwrap();
+            let mut iter = crate::sst::SSTIterator::with_cache_and_file(
+                Box::new(reader),
+                file.as_ref(),
+                crate::sst::SSTIteratorOptions {
+                    num_columns,
+                    bloom_filter_enabled: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            iter.seek_to_first().unwrap();
+            while iter.valid() {
+                let (key, mut value) = iter.current().unwrap().unwrap();
+                let decoded = decode_value(&mut value, num_columns).unwrap();
+                let bytes = decoded.columns()[0].as_ref().unwrap().data();
+                let merged = u64::from_le_bytes(bytes.as_ref().try_into().unwrap());
+                actual.insert(key.to_vec(), merged);
+                iter.next().unwrap();
+            }
+        }
+        assert_eq!(actual, expected);
         cleanup_test_root(root);
     }
 }

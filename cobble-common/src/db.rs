@@ -601,14 +601,27 @@ impl Db {
         // Compaction setup
         let compaction_options = crate::compaction::build_compaction_config(&config);
         let compaction_worker: Arc<dyn crate::compaction::CompactionWorker> =
-            Arc::new(crate::compaction::LocalCompactionWorker::new(
-                crate::compaction::CompactionExecutor::new(compaction_options)?,
-                Arc::clone(&file_manager),
-                Arc::downgrade(&lsm_tree),
-                config.clone(),
-                Arc::clone(&metrics_manager),
-                Arc::clone(&merge_registry),
-            ));
+            if let Some(addr) = config.compaction_remote_addr.clone() {
+                Arc::new(crate::compaction::RemoteCompactionWorker::new(
+                    addr,
+                    Arc::clone(&file_manager),
+                    Arc::downgrade(&lsm_tree),
+                    config.clone(),
+                    ttl_config.clone(),
+                    Duration::from_millis(config.compaction_remote_timeout_ms),
+                    Arc::clone(&metrics_manager),
+                    Arc::clone(&merge_registry),
+                )?)
+            } else {
+                Arc::new(crate::compaction::LocalCompactionWorker::new(
+                    crate::compaction::CompactionExecutor::new(compaction_options)?,
+                    Arc::clone(&file_manager),
+                    Arc::downgrade(&lsm_tree),
+                    config.clone(),
+                    Arc::clone(&metrics_manager),
+                    Arc::clone(&merge_registry),
+                ))
+            };
         info!(
             "db compaction configured: l0_limit={} l1_base={} multiplier={} max_level={} target_file_size={}",
             compaction_options.l0_file_limit,

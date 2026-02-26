@@ -5,6 +5,11 @@ use std::sync::{Arc, LazyLock};
 
 /// User-defined merge semantics for a column.
 pub trait MergeOperator: Send + Sync {
+    /// Stable operator identifier used by remote compaction capability matching.
+    fn id(&self) -> String {
+        std::any::type_name::<Self>().to_string()
+    }
+
     /// Merge a single operand into the current value.
     fn merge(&self, existing_value: Bytes, value: Bytes) -> Result<Bytes>;
 
@@ -173,6 +178,12 @@ impl ValueMergeOperator {
             .get(column_idx)
             .unwrap_or_else(|| default_merge_operator_ref())
             .as_ref()
+    }
+
+    pub(crate) fn operator_ids(&self, num_columns: usize) -> Vec<String> {
+        (0..num_columns)
+            .map(|column_idx| self.operator(column_idx).id())
+            .collect()
     }
 
     pub(crate) fn empty() -> Arc<Self> {
