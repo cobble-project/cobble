@@ -10,10 +10,11 @@ use crate::file::{DataVolume, FileId, FileManager, FileManagerOptions, TrackedFi
 use crate::iterator::SortedRun;
 use crate::lsm::{LSMTree, LevelEdit, VersionEdit};
 use crate::merge_operator::{
-    BytesMergeOperator, MergeOperator, MergeOperatorRegistry, U32CounterMergeOperator,
-    U64CounterMergeOperator, ValueMergeOperator, default_merge_operator,
+    BytesMergeOperator, MergeOperator, U32CounterMergeOperator, U64CounterMergeOperator,
+    default_merge_operator,
 };
 use crate::metrics_manager::MetricsManager;
+use crate::schema::{Schema, SchemaManager};
 use crate::sst::SSTWriterOptions;
 use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
@@ -269,7 +270,7 @@ pub(crate) struct RemoteCompactionWorker {
     runtime: Mutex<Option<Runtime>>,
     remote_timeout: Duration,
     metrics_manager: Arc<MetricsManager>,
-    merge_registry: Arc<MergeOperatorRegistry>,
+    schema_manager: Arc<SchemaManager>,
     supported_merge_operator_ids: HashSet<String>,
 }
 
@@ -283,7 +284,7 @@ impl RemoteCompactionWorker {
         ttl_config: TtlConfig,
         remote_timeout: Duration,
         metrics_manager: Arc<MetricsManager>,
-        merge_registry: Arc<MergeOperatorRegistry>,
+        schema_manager: Arc<SchemaManager>,
     ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .thread_name("cobble-remote-compaction")
@@ -304,7 +305,7 @@ impl RemoteCompactionWorker {
             runtime: Mutex::new(Some(runtime)),
             remote_timeout,
             metrics_manager,
-            merge_registry,
+            schema_manager,
             supported_merge_operator_ids,
         })
     }
@@ -327,8 +328,8 @@ impl RemoteCompactionWorker {
             .collect::<Result<Vec<_>>>()?;
         let sst_options = super::build_sst_writer_options(&self.config, output_level);
         let merge_operator_ids = self
-            .merge_registry
-            .value_merge_operators()
+            .schema_manager
+            .latest_schema()
             .operator_ids(sst_options.num_columns);
         for merge_operator_id in &merge_operator_ids {
             if !self
@@ -649,7 +650,7 @@ impl RemoteCompactionServer {
         merge_operator_map: Arc<Mutex<HashMap<String, Arc<dyn MergeOperator>>>>,
         request_ids: &[String],
         num_columns: usize,
-    ) -> Result<Arc<ValueMergeOperator>> {
+    ) -> Result<Arc<Schema>> {
         let ids: Vec<String> = if request_ids.is_empty() {
             vec![default_merge_operator().id(); num_columns]
         } else if request_ids.len() >= num_columns {
@@ -668,7 +669,7 @@ impl RemoteCompactionServer {
             })?;
             operators.push(operator);
         }
-        Ok(Arc::new(ValueMergeOperator::new(Arc::new(operators))))
+        Ok(Arc::new(Schema::new(0, num_columns, operators)))
     }
 
     fn file_manager_for_with(
@@ -918,7 +919,7 @@ mod tests {
                 }
             })
         };
-        let merge_registry = Arc::new(MergeOperatorRegistry::new(config.num_columns));
+        let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
 
         let worker = RemoteCompactionWorker::new(
             addr.to_string(),
@@ -931,7 +932,7 @@ mod tests {
             },
             remote_timeout,
             Arc::clone(&metrics_manager),
-            Arc::clone(&merge_registry),
+            Arc::clone(&schema_manager),
         )
         .unwrap();
 
@@ -1060,10 +1061,12 @@ mod tests {
             })
         };
 
-        let merge_registry = Arc::new(MergeOperatorRegistry::new(config.num_columns));
-        merge_registry
+        let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
+        let mut schema_builder = schema_manager.builder();
+        schema_builder
             .set_column_operator(0, Arc::new(U64CounterMergeOperator))
             .unwrap();
+        let _ = schema_builder.commit();
 
         let worker = RemoteCompactionWorker::new(
             addr.to_string(),
@@ -1076,7 +1079,7 @@ mod tests {
             },
             remote_timeout,
             Arc::clone(&metrics_manager),
-            Arc::clone(&merge_registry),
+            Arc::clone(&schema_manager),
         )
         .unwrap();
 

@@ -26,8 +26,8 @@ pub(crate) use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::error::Result;
 use crate::iterator::SortedRun;
 use crate::lsm::VersionEdit;
-use crate::merge_operator::MergeOperatorRegistry;
 use crate::metrics_manager::MetricsManager;
+use crate::schema::SchemaManager;
 use crate::sst::SSTWriterOptions;
 use log::info;
 use std::sync::{Arc, Mutex, Weak};
@@ -50,7 +50,7 @@ pub(crate) struct LocalCompactionWorker {
     config: crate::Config,
     compaction_metrics: Arc<CompactionTaskMetrics>,
     metrics_manager: Arc<MetricsManager>,
-    merge_registry: Arc<MergeOperatorRegistry>,
+    schema_manager: Arc<SchemaManager>,
 }
 
 impl LocalCompactionWorker {
@@ -60,7 +60,7 @@ impl LocalCompactionWorker {
         lsm_tree: Weak<crate::lsm::LSMTree>,
         config: crate::Config,
         metrics_manager: Arc<MetricsManager>,
-        merge_registry: Arc<MergeOperatorRegistry>,
+        schema_manager: Arc<SchemaManager>,
     ) -> Self {
         let compaction_metrics = metrics_manager.compaction_metrics();
         Self {
@@ -70,7 +70,7 @@ impl LocalCompactionWorker {
             config,
             compaction_metrics,
             metrics_manager,
-            merge_registry,
+            schema_manager,
         }
     }
 
@@ -116,7 +116,7 @@ impl LocalCompactionWorker {
             file_builder_factory,
             data_file_type,
             ttl_provider,
-            self.merge_registry.value_merge_operators(),
+            self.schema_manager.latest_schema(),
         );
         Some(self.submit(task))
     }

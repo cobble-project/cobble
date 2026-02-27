@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
-use crate::merge_operator::{MergeOperator, ValueMergeOperator};
+use crate::merge_operator::MergeOperator;
+use crate::schema::Schema;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub(crate) struct Key {
@@ -415,14 +416,14 @@ impl Value {
     ///
     /// The resulting value has the maximum number of columns from both values.
     /// This API takes ownership to minimize clones for performance.
-    pub(crate) fn merge(self, newer: Value, merge_operators: &ValueMergeOperator) -> Result<Value> {
-        self.merge_with_callback(newer, merge_operators, &mut |_, _| {})
+    pub(crate) fn merge(self, newer: Value, schema: &Schema) -> Result<Value> {
+        self.merge_with_callback(newer, schema, &mut |_, _| {})
     }
 
     pub(crate) fn merge_with_callback<F>(
         self,
         newer: Value,
-        merge_operators: &ValueMergeOperator,
+        schema: &Schema,
         on_merge: &mut F,
     ) -> Result<Value>
     where
@@ -444,7 +445,7 @@ impl Value {
                     if old.data().is_empty() {
                         Some(new)
                     } else {
-                        Some(old.merge(new, merge_operators.operator(column_idx))?)
+                        Some(old.merge(new, schema.operator(column_idx))?)
                     }
                 }
                 (Some(old), None) => {
@@ -593,7 +594,7 @@ mod tests {
             Some(Column::new(ValueType::Merge, b"_append".to_vec())),
         ]);
 
-        let merged = old.merge(new, &ValueMergeOperator::empty()).unwrap();
+        let merged = old.merge(new, &Schema::empty()).unwrap();
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
@@ -612,7 +613,7 @@ mod tests {
             Some(Column::new(ValueType::Put, b"new2".to_vec())),
         ]);
 
-        let merged = old.merge(new, &ValueMergeOperator::empty()).unwrap();
+        let merged = old.merge(new, &Schema::empty()).unwrap();
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
@@ -633,7 +634,7 @@ mod tests {
             Some(Column::new(ValueType::Put, b"new2".to_vec())),
         ]);
 
-        let merged = old.merge(new, &ValueMergeOperator::empty()).unwrap();
+        let merged = old.merge(new, &Schema::empty()).unwrap();
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
@@ -650,7 +651,7 @@ mod tests {
             Some(Column::new(ValueType::Put, b"new3".to_vec())),
         ]);
 
-        let merged = old.merge(new, &ValueMergeOperator::empty()).unwrap();
+        let merged = old.merge(new, &Schema::empty()).unwrap();
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 3);
@@ -664,7 +665,7 @@ mod tests {
         let old = Value::new(vec![None, None]);
         let new = Value::new(vec![None, None]);
 
-        let merged = old.merge(new, &ValueMergeOperator::empty()).unwrap();
+        let merged = old.merge(new, &Schema::empty()).unwrap();
         let cols = merged.columns();
 
         assert_eq!(cols.len(), 2);
@@ -764,13 +765,9 @@ mod tests {
         ]);
         let mut seen = Vec::new();
         let _ = old
-            .merge_with_callback(
-                new,
-                &ValueMergeOperator::empty(),
-                &mut |old_col, new_col| {
-                    seen.push((old_col.map(|c| c.value_type), new_col.map(|c| c.value_type)));
-                },
-            )
+            .merge_with_callback(new, &Schema::empty(), &mut |old_col, new_col| {
+                seen.push((old_col.map(|c| c.value_type), new_col.map(|c| c.value_type)));
+            })
             .unwrap();
         assert_eq!(
             seen,
@@ -785,8 +782,8 @@ mod tests {
     fn test_value_merge_skips_operator_when_old_missing() {
         let old = Value::new(vec![None]);
         let new = Value::new(vec![Some(Column::new(ValueType::Merge, b"m".to_vec()))]);
-        let merge_ops = ValueMergeOperator::new(Arc::new(vec![Arc::new(PanicMergeOperator)]));
-        let merged = old.merge(new, &merge_ops).unwrap();
+        let schema = Schema::new(0, 1, vec![Arc::new(PanicMergeOperator)]);
+        let merged = old.merge(new, &schema).unwrap();
         let col = merged.columns()[0].as_ref().unwrap();
         assert_eq!(col.value_type, ValueType::Merge);
         assert_eq!(col.data().as_ref(), b"m");
@@ -796,8 +793,8 @@ mod tests {
     fn test_value_merge_skips_operator_when_old_empty() {
         let old = Value::new(vec![Some(Column::new(ValueType::Put, Bytes::new()))]);
         let new = Value::new(vec![Some(Column::new(ValueType::Merge, b"m".to_vec()))]);
-        let merge_ops = ValueMergeOperator::new(Arc::new(vec![Arc::new(PanicMergeOperator)]));
-        let merged = old.merge(new, &merge_ops).unwrap();
+        let schema = Schema::new(0, 1, vec![Arc::new(PanicMergeOperator)]);
+        let merged = old.merge(new, &schema).unwrap();
         let col = merged.columns()[0].as_ref().unwrap();
         assert_eq!(col.value_type, ValueType::Merge);
         assert_eq!(col.data().as_ref(), b"m");

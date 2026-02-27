@@ -3,8 +3,9 @@ use crate::error::{Error, Result};
 use crate::file::{FileManager, FileSystemRegistry};
 use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
-use crate::merge_operator::{MergeOperator, MergeOperatorRegistry, ValueMergeOperator};
+use crate::merge_operator::MergeOperator;
 use crate::metrics_manager::MetricsManager;
+use crate::schema::{Schema, SchemaBuilder, SchemaManager};
 use crate::snapshot::{
     LoadedManifest, ManifestPayload, SnapshotCallback, SnapshotManager, apply_manifest_level_edits,
     build_levels_from_manifest, build_vlog_version_from_manifest, decode_manifest,
@@ -39,7 +40,7 @@ pub struct Db {
     memtable_manager: MemtableManager,
     vlog_store: Arc<VlogStore>,
     snapshot_manager: SnapshotManager,
-    merge_registry: Arc<MergeOperatorRegistry>,
+    schema_manager: Arc<SchemaManager>,
     num_columns: usize,
     time_provider: Arc<dyn TimeProvider>,
     ttl_provider: Arc<TTLProvider>,
@@ -172,7 +173,7 @@ where
 pub(crate) fn value_to_vec_of_columns_with_vlog<F>(
     value: Value,
     mut resolve_pointer: F,
-    merge_operators: &ValueMergeOperator,
+    schema: &Schema,
 ) -> Result<Option<Vec<Option<Bytes>>>>
 where
     F: FnMut(VlogPointer) -> Result<Bytes>,
@@ -180,7 +181,7 @@ where
     let resolve_pointer = &mut resolve_pointer;
     let mut columns = Vec::with_capacity(value.columns.len());
     for (column_idx, column) in value.columns.into_iter().enumerate() {
-        let merge_operator = merge_operators.operator(column_idx);
+        let merge_operator = schema.operator(column_idx);
         let resolved = match column {
             Some(column) => resolve_column_with_vlog(column, resolve_pointer, merge_operator)?,
             None => None,
@@ -230,20 +231,9 @@ impl Db {
         &self.id
     }
 
-    /// Set a merge operator for a specific column index. The merge operator will be used for all
-    /// merge operations on that column.
-    pub fn set_merge_operator(
-        &self,
-        column: u16,
-        merge_operator: Arc<dyn MergeOperator>,
-    ) -> Result<()> {
-        self.merge_registry
-            .set_column_operator(column as usize, merge_operator)
-    }
-
-    /// Set merge operators for all columns at once.
-    pub fn set_merge_operators(&self, merge_operators: Vec<Arc<dyn MergeOperator>>) -> Result<()> {
-        self.merge_registry.set_all(merge_operators)
+    /// Start a schema update transaction.
+    pub fn update_schema(&self) -> SchemaBuilder {
+        self.schema_manager.builder()
     }
 
     /// Return the metrics samples for this database.
@@ -340,7 +330,7 @@ impl Db {
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         let mut pending: std::collections::BTreeMap<Bytes, Value> =
             std::collections::BTreeMap::new();
-        let merge_operators = self.merge_registry.value_merge_operators();
+        let schema = self.schema_manager.latest_schema();
         for (key_and_seq, op) in batch.ops {
             let column_idx = key_and_seq.column as usize;
             if column_idx >= self.num_columns {
@@ -372,7 +362,7 @@ impl Db {
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     let merged = std::mem::replace(entry.get_mut(), Value::new(Vec::new()))
-                        .merge(next_value, &merge_operators)?;
+                        .merge(next_value, &schema)?;
                     *entry.get_mut() = merged;
                 }
             }
@@ -580,7 +570,7 @@ impl Db {
             default_ttl_seconds: config.default_ttl_seconds,
         };
         let ttl_provider = Arc::new(TTLProvider::new(&ttl_config, Arc::clone(&time_provider)));
-        let merge_registry = Arc::new(MergeOperatorRegistry::new(config.num_columns));
+        let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
 
         let mut lsm_tree = LSMTree::with_state_and_ttl(
             Arc::clone(&db_state),
@@ -610,7 +600,7 @@ impl Db {
                     ttl_config.clone(),
                     Duration::from_millis(config.compaction_remote_timeout_ms),
                     Arc::clone(&metrics_manager),
-                    Arc::clone(&merge_registry),
+                    Arc::clone(&schema_manager),
                 )?)
             } else {
                 Arc::new(crate::compaction::LocalCompactionWorker::new(
@@ -619,7 +609,7 @@ impl Db {
                     Arc::downgrade(&lsm_tree),
                     config.clone(),
                     Arc::clone(&metrics_manager),
-                    Arc::clone(&merge_registry),
+                    Arc::clone(&schema_manager),
                 ))
             };
         info!(
@@ -647,7 +637,7 @@ impl Db {
                 num_columns: config.num_columns,
                 write_stall_limit: config.resolved_write_stall_limit(),
                 initial_seq: initial_file_seq,
-                merge_registry: Some(Arc::clone(&merge_registry)),
+                schema_manager: Some(Arc::clone(&schema_manager)),
                 auto_snapshot_manager: if config.snapshot_on_flush {
                     Some(snapshot_manager.clone())
                 } else {
@@ -665,7 +655,7 @@ impl Db {
             memtable_manager,
             vlog_store,
             snapshot_manager,
-            merge_registry,
+            schema_manager,
             num_columns: config.num_columns,
             time_provider,
             ttl_provider,
@@ -765,9 +755,9 @@ impl Db {
         }
         let mut iter = values.into_iter();
         let mut merged = iter.next().expect("values not empty");
-        let merge_operators = self.merge_registry.value_merge_operators();
+        let schema = self.schema_manager.latest_schema();
         for newer in iter {
-            merged = merged.merge(newer, &merge_operators)?;
+            merged = merged.merge(newer, &schema)?;
         }
         value_to_vec_of_columns_with_vlog(
             merged,
@@ -781,7 +771,7 @@ impl Db {
                     .read_vlog_pointer_with_snapshot(Arc::clone(&snapshot), pointer)?
                     .ok_or(vlog_err),
             },
-            &merge_operators,
+            &schema,
         )
     }
 
@@ -818,7 +808,7 @@ impl Db {
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 num_columns: self.num_columns,
-                merge_registry: Arc::clone(&self.merge_registry),
+                schema_manager: Arc::clone(&self.schema_manager),
             },
         );
         iter.seek(start_key.as_ref())?;
@@ -952,8 +942,11 @@ mod tests {
             ..Config::default()
         };
         let db = Db::open(config).unwrap();
-        db.set_merge_operator(0, Arc::new(PipeMergeOperator))
+        let mut schema = db.update_schema();
+        schema
+            .set_column_operator(0, Arc::new(PipeMergeOperator))
             .unwrap();
+        let _ = schema.commit();
 
         db.put(b"k1", 0, b"base0").unwrap();
         db.merge(b"k1", 0, b"a").unwrap();
@@ -997,10 +990,14 @@ mod tests {
             ..Config::default()
         };
         let db = Db::open(config).unwrap();
-        db.set_merge_operator(0, Arc::new(U32CounterMergeOperator))
+        let mut schema = db.update_schema();
+        schema
+            .set_column_operator(0, Arc::new(U32CounterMergeOperator))
             .unwrap();
-        db.set_merge_operator(1, Arc::new(U64CounterMergeOperator))
+        schema
+            .set_column_operator(1, Arc::new(U64CounterMergeOperator))
             .unwrap();
+        let _ = schema.commit();
 
         db.put(b"k1", 0, 10u32.to_le_bytes()).unwrap();
         db.merge(b"k1", 0, 2u32.to_le_bytes()).unwrap();

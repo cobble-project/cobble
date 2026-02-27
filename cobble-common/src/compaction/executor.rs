@@ -12,7 +12,7 @@ use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
 use crate::lsm::{LevelEdit, VersionEdit};
-use crate::merge_operator::ValueMergeOperator;
+use crate::schema::Schema;
 use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions};
 use crate::vlog::{VlogEdit, VlogMergeCollector};
 use log::trace;
@@ -40,7 +40,7 @@ pub struct CompactionTask {
     /// Whether to create output files in read-only mode.
     /// This is used for remote compaction workers where we want to write files.
     output_files_readonly: bool,
-    merge_operators: Arc<ValueMergeOperator>,
+    schema: Arc<Schema>,
 }
 
 #[derive(Clone)]
@@ -77,7 +77,7 @@ impl CompactionTask {
         file_builder_factory: Arc<FileBuilderFactory>,
         data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
-        merge_operators: Arc<ValueMergeOperator>,
+        schema: Arc<Schema>,
     ) -> Self {
         Self {
             metrics,
@@ -89,7 +89,7 @@ impl CompactionTask {
             data_file_type,
             ttl_provider,
             output_files_readonly: false,
-            merge_operators,
+            schema,
         }
     }
 
@@ -320,7 +320,7 @@ impl CompactionExecutor {
             options.num_columns,
             task.ttl_provider(),
             merge_callback,
-            task.merge_operators.clone(),
+            task.schema.clone(),
         );
         dedup_iter.seek_to_first()?;
 
@@ -611,7 +611,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            ValueMergeOperator::empty(),
+            Schema::empty(),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -745,7 +745,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            ValueMergeOperator::empty(),
+            Schema::empty(),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -911,7 +911,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            ValueMergeOperator::empty(),
+            Schema::empty(),
         );
         let executor = CompactionExecutor::new(options).unwrap();
         let result = executor.execute_blocking(task, None).unwrap();
@@ -1052,7 +1052,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            ValueMergeOperator::empty(),
+            Schema::empty(),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -1123,7 +1123,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            ValueMergeOperator::empty(),
+            Schema::empty(),
         );
 
         let executor = CompactionExecutor::with_defaults().unwrap();
@@ -1182,7 +1182,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            ValueMergeOperator::empty(),
+            Schema::empty(),
         );
         let executor = CompactionExecutor::with_defaults().unwrap();
         let result = executor.execute_blocking(task, None).unwrap();

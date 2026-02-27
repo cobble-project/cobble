@@ -279,8 +279,11 @@ fn test_db_counter_merge_large_dataset_with_compaction_and_file_read() {
         ..Config::default()
     };
     let db = Db::open(config).unwrap();
-    db.set_merge_operator(0, Arc::new(U64CounterMergeOperator))
+    let mut schema = db.update_schema();
+    schema
+        .set_column_operator(0, Arc::new(U64CounterMergeOperator))
         .unwrap();
+    let _ = schema.commit();
 
     let key_count = 2_000u32;
     let mut expected = HashMap::new();
