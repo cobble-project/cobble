@@ -379,7 +379,6 @@ impl MemtableManager {
             Arc::clone(&flush_done),
             Arc::clone(&file_manager),
             Arc::clone(&file_builder_factory),
-            options.num_columns,
             Arc::clone(&lsm_tree),
             lsm_tree.ttl_provider(),
             Arc::clone(&vlog_store),
@@ -420,7 +419,6 @@ impl MemtableManager {
         flush_done: Arc<Condvar>,
         file_manager: Arc<FileManager>,
         file_builder_factory: Arc<FileBuilderFactory>,
-        num_columns: usize,
         lsm_tree: Arc<LSMTree>,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
         vlog_store: Arc<VlogStore>,
@@ -450,7 +448,6 @@ impl MemtableManager {
                             job.vlog_recorder,
                             Arc::clone(&file_manager_clone),
                             Arc::clone(&file_builder_factory_clone),
-                            num_columns,
                             Arc::clone(&ttl_provider_clone),
                             Arc::clone(&vlog_store_clone),
                             Arc::clone(&schema_manager_clone),
@@ -1058,7 +1055,6 @@ fn flush_memtable(
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
     file_manager: Arc<FileManager>,
     file_builder_factory: Arc<FileBuilderFactory>,
-    num_columns: usize,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     vlog_store: Arc<VlogStore>,
     schema_manager: Arc<SchemaManager>,
@@ -1081,6 +1077,7 @@ fn flush_memtable(
     let merge_collector = vlog_edit.as_ref().map(|_| VlogMergeCollector::shared(true));
     let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
     let schema = schema_manager.latest_schema();
+    let num_columns = schema.num_columns();
     let mut dedup_iter = DeduplicatingIterator::new(
         PrimedIterator::new(memtable.iter()),
         num_columns,

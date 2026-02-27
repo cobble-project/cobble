@@ -329,11 +329,10 @@ impl RemoteCompactionWorker {
             .iter()
             .map(|run| RemoteSortedRun::from_sorted_run(run, &self.file_manager))
             .collect::<Result<Vec<_>>>()?;
-        let sst_options = super::build_sst_writer_options(&self.config, output_level);
-        let merge_operator_ids = self
-            .schema_manager
-            .latest_schema()
-            .operator_ids(sst_options.num_columns);
+        let schema = self.schema_manager.latest_schema();
+        let mut sst_options = super::build_sst_writer_options(&self.config, output_level);
+        sst_options.num_columns = schema.num_columns();
+        let merge_operator_ids = schema.operator_ids(schema.num_columns());
         for merge_operator_id in &merge_operator_ids {
             if !self
                 .supported_merge_operator_ids

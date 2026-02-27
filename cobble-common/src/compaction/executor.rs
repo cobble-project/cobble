@@ -262,9 +262,10 @@ impl CompactionExecutor {
         let mut read_bytes = 0u64;
         let use_read_ahead =
             options.read_ahead_enabled && tokio::runtime::Handle::try_current().is_ok();
+        let num_columns = task.schema.num_columns();
         let sst_options = SSTIteratorOptions {
             metrics: Some(Arc::clone(&task.sst_metrics)),
-            num_columns: options.num_columns,
+            num_columns,
             bloom_filter_enabled: options.bloom_filter_enabled,
             ..SSTIteratorOptions::default()
         };
@@ -317,7 +318,7 @@ impl CompactionExecutor {
         // Create deduplicating iterator
         let mut dedup_iter = DeduplicatingIterator::new(
             merging_iter,
-            options.num_columns,
+            num_columns,
             task.ttl_provider(),
             merge_callback,
             task.schema.clone(),
@@ -614,7 +615,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Schema::empty(),
+            Arc::new(Schema::new(0, num_columns, Vec::new())),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -748,7 +749,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Schema::empty(),
+            Arc::new(Schema::new(0, num_columns, Vec::new())),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -914,7 +915,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Schema::empty(),
+            Arc::new(Schema::new(0, num_columns, Vec::new())),
         );
         let executor = CompactionExecutor::new(options).unwrap();
         let result = executor.execute_blocking(task, None).unwrap();
@@ -1056,7 +1057,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Schema::empty(),
+            Arc::new(Schema::new(0, num_columns, Vec::new())),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -1127,7 +1128,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Schema::empty(),
+            Arc::new(Schema::new(0, options.num_columns, Vec::new())),
         );
 
         let executor = CompactionExecutor::with_defaults().unwrap();
@@ -1186,7 +1187,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Schema::empty(),
+            Arc::new(Schema::new(0, num_columns, Vec::new())),
         );
         let executor = CompactionExecutor::with_defaults().unwrap();
         let result = executor.execute_blocking(task, None).unwrap();
