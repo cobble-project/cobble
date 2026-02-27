@@ -92,6 +92,7 @@ fn load_manifest_entry(
                 resolved.vlog_files = incremental.vlog_files;
                 resolved.id = incremental.id;
                 resolved.seq_id = incremental.seq_id;
+                resolved.latest_schema_id = incremental.latest_schema_id;
                 resolved
             } else {
                 load_manifest_for_snapshot(file_manager, snapshot_id)?
@@ -224,7 +225,16 @@ impl Db {
         let file_manager = FileManager::from_config(&config, &id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let db_state = Arc::new(DbStateHandle::new());
-        Self::open_with_state(config, file_manager, db_state, id, 0, metrics_manager)
+        let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
+        Self::open_with_state(
+            config,
+            file_manager,
+            db_state,
+            id,
+            0,
+            metrics_manager,
+            schema_manager,
+        )
     }
 
     pub fn id(&self) -> &str {
@@ -460,6 +470,11 @@ impl Db {
         let file_manager = FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
+        let schema_manager = Arc::new(SchemaManager::from_manifest(
+            &file_manager,
+            &manifest,
+            config.num_columns,
+        )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let max_file_seq = manifest
             .levels
@@ -488,6 +503,7 @@ impl Db {
             db_id,
             initial_file_seq,
             metrics_manager,
+            schema_manager,
         )
     }
 
@@ -525,6 +541,11 @@ impl Db {
             Error::IoError(format!("No snapshot manifests found for db {}", db_id))
         })?;
         let manifest = latest.manifest.clone();
+        let schema_manager = Arc::new(SchemaManager::from_manifests(
+            &file_manager,
+            loaded.iter().map(|entry| &entry.manifest),
+            config.num_columns,
+        )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
         let max_file_seq = manifest
             .levels
@@ -550,6 +571,7 @@ impl Db {
             db_id,
             max_file_seq.saturating_add(1),
             metrics_manager,
+            schema_manager,
         )?;
         // take over all snapshots so they can be expired properly
         db.take_over_snapshot_chain(&loaded)?;
@@ -563,6 +585,7 @@ impl Db {
         id: String,
         initial_file_seq: u64,
         metrics_manager: Arc<MetricsManager>,
+        schema_manager: Arc<SchemaManager>,
     ) -> Result<Self> {
         let time_provider = config.time_provider.create();
         let ttl_config = TtlConfig {
@@ -570,8 +593,7 @@ impl Db {
             default_ttl_seconds: config.default_ttl_seconds,
         };
         let ttl_provider = Arc::new(TTLProvider::new(&ttl_config, Arc::clone(&time_provider)));
-        let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
-
+        let runtime_num_columns = schema_manager.latest_schema().num_columns();
         let mut lsm_tree = LSMTree::with_state_and_ttl(
             Arc::clone(&db_state),
             Arc::clone(&ttl_provider),
@@ -582,6 +604,7 @@ impl Db {
         }
         let lsm_tree = Arc::new(lsm_tree);
         let mut sst_options = crate::compaction::build_sst_writer_options(&config, 0);
+        sst_options.num_columns = runtime_num_columns;
         sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
         let vlog_store = Arc::new(VlogStore::new(
             Arc::clone(&file_manager),
@@ -589,7 +612,8 @@ impl Db {
             config.value_separation_threshold,
         ));
         // Compaction setup
-        let compaction_options = crate::compaction::build_compaction_config(&config);
+        let mut compaction_options = crate::compaction::build_compaction_config(&config);
+        compaction_options.num_columns = runtime_num_columns;
         let compaction_worker: Arc<dyn crate::compaction::CompactionWorker> =
             if let Some(addr) = config.compaction_remote_addr.clone() {
                 Arc::new(crate::compaction::RemoteCompactionWorker::new(
@@ -622,9 +646,13 @@ impl Db {
         );
         lsm_tree.configure_compaction(compaction_options, Some(Arc::clone(&compaction_worker)));
 
+        let snapshot_manager = SnapshotManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&schema_manager),
+            config.snapshot_retention,
+        );
+
         // Memtable manager setup
-        let snapshot_manager =
-            SnapshotManager::new(Arc::clone(&file_manager), config.snapshot_retention);
         let memtable_manager = MemtableManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
@@ -634,7 +662,7 @@ impl Db {
                 memtable_type: config.memtable_type,
                 sst_options,
                 file_builder_factory: None,
-                num_columns: config.num_columns,
+                num_columns: runtime_num_columns,
                 write_stall_limit: config.resolved_write_stall_limit(),
                 initial_seq: initial_file_seq,
                 schema_manager: Some(Arc::clone(&schema_manager)),
@@ -656,7 +684,7 @@ impl Db {
             vlog_store,
             snapshot_manager,
             schema_manager,
-            num_columns: config.num_columns,
+            num_columns: runtime_num_columns,
             time_provider,
             ttl_provider,
         })

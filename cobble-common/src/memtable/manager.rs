@@ -1080,12 +1080,13 @@ fn flush_memtable(
     // Try to handle merges during flush if vlog edits are present
     let merge_collector = vlog_edit.as_ref().map(|_| VlogMergeCollector::shared(true));
     let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
+    let schema = schema_manager.latest_schema();
     let mut dedup_iter = DeduplicatingIterator::new(
         PrimedIterator::new(memtable.iter()),
         num_columns,
         ttl_provider,
         merge_callback,
-        schema_manager.latest_schema(),
+        Arc::clone(&schema),
     );
     dedup_iter.seek_to_first()?;
     while dedup_iter.valid() {
@@ -1118,6 +1119,7 @@ fn flush_memtable(
         tracked_id: TrackedFileId::new(&file_manager, file_id),
         size: file_size,
         seq,
+        schema_id: schema.version(),
         has_separated_values,
         meta_bytes: Default::default(),
     };

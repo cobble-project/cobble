@@ -45,6 +45,18 @@ pub(crate) fn default_merge_operator_ref() -> &'static Arc<dyn MergeOperator> {
     &DEFAULT_MERGE_OPERATOR
 }
 
+pub(crate) fn merge_operator_by_id(id: &str) -> Arc<dyn MergeOperator> {
+    if id == BytesMergeOperator.id().as_str() {
+        Arc::new(BytesMergeOperator)
+    } else if id == U32CounterMergeOperator.id().as_str() {
+        Arc::new(U32CounterMergeOperator)
+    } else if id == U64CounterMergeOperator.id().as_str() {
+        Arc::new(U64CounterMergeOperator)
+    } else {
+        default_merge_operator()
+    }
+}
+
 fn decode_u32_counter(value: &Bytes, label: &str) -> Result<u32> {
     if value.is_empty() {
         return Ok(0);

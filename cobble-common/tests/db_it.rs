@@ -344,6 +344,75 @@ fn test_db_counter_merge_large_dataset_with_compaction_and_file_read() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_schema_persisted_and_restored_across_open_modes() {
+    let root = "/tmp/db_schema_persistence";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 8 * 1024,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = Db::open(config.clone()).unwrap();
+    let mut schema = db.update_schema();
+    schema
+        .set_column_operator(0, Arc::new(U64CounterMergeOperator))
+        .unwrap();
+    let _ = schema.commit();
+
+    db.put(b"counter", 0, 3u64.to_le_bytes()).unwrap();
+    db.merge(b"counter", 0, 4u64.to_le_bytes()).unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&manifest).unwrap();
+    let schema_id = manifest_json
+        .get("latest_schema_id")
+        .and_then(|value| value.as_u64())
+        .expect("manifest latest_schema_id");
+    let schema_path = format!("{}/{}/schema/schema-{}", root, db.id(), schema_id);
+    assert!(Path::new(&schema_path).exists(), "missing schema file");
+    db.close().unwrap();
+
+    let db_id = db.id().to_string();
+    let expected = 7u64;
+    let read_counter = |value: Option<Vec<Option<bytes::Bytes>>>| -> u64 {
+        let value = value.expect("value present");
+        let bytes = value[0].as_ref().expect("column value");
+        u64::from_le_bytes(bytes.as_ref().try_into().unwrap())
+    };
+
+    let read_only = Db::open_read_only(config.clone(), snapshot_id, db_id.clone()).unwrap();
+    assert_eq!(
+        read_counter(read_only.get(b"counter", &ReadOptions::default()).unwrap()),
+        expected
+    );
+
+    let from_snapshot = Db::open_from_snapshot(config.clone(), snapshot_id, db_id.clone()).unwrap();
+    assert_eq!(
+        read_counter(
+            from_snapshot
+                .get(b"counter", &ReadOptions::default())
+                .unwrap()
+        ),
+        expected
+    );
+    from_snapshot.close().unwrap();
+
+    let resumed = Db::resume(config, db_id).unwrap();
+    assert_eq!(
+        read_counter(resumed.get(b"counter", &ReadOptions::default()).unwrap()),
+        expected
+    );
+    resumed.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_get_filters_columns() {
     let root = "/tmp/db_it_get_filter_columns";
     cleanup_test_root(root);

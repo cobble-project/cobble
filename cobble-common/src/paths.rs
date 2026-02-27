@@ -1,4 +1,5 @@
 pub(crate) const SNAPSHOT_DIR: &str = "snapshot";
+pub(crate) const SCHEMA_DIR: &str = "schema";
 pub(crate) const GLOBAL_SNAPSHOT_POINTER_NAME: &str = "CURRENT";
 pub(crate) const GOVERNANCE_MANIFEST_POINTER_NAME: &str = "MANIFEST";
 pub(crate) const GOVERNANCE_MANIFEST_LOCK_NAME: &str = "MANIFEST.lock";
@@ -18,6 +19,14 @@ pub(crate) fn bucket_snapshot_dir(db_id: &str) -> String {
 
 pub(crate) fn snapshot_manifest_relative_path(id: u64) -> String {
     format!("{}/{}", SNAPSHOT_DIR, snapshot_manifest_name(id))
+}
+
+pub(crate) fn schema_file_name(id: u64) -> String {
+    format!("schema-{}", id)
+}
+
+pub(crate) fn schema_file_relative_path(id: u64) -> String {
+    format!("{}/{}", SCHEMA_DIR, schema_file_name(id))
 }
 
 pub(crate) fn global_snapshot_current_path() -> String {

@@ -395,10 +395,21 @@ mod tests {
     ) -> String {
         let snapshot_dir = bucket_snapshot_dir(db_id);
         let manifest_path = bucket_snapshot_manifest_path(db_id, snapshot_id);
+        let schema_dir = format!("{}/schema", db_id);
+        let schema_path = format!("{}/schema/schema-0", db_id);
         let _ = fs.create_dir(db_id);
         let _ = fs.create_dir(&snapshot_dir);
+        let _ = fs.create_dir(&schema_dir);
+        let mut schema_writer = fs.open_write(&schema_path).unwrap();
+        schema_writer
+            .write(br#"{"id":0,"num_columns":1,"merge_operator_ids":[]}"#)
+            .unwrap();
+        schema_writer.close().unwrap();
         let mut writer = fs.open_write(&manifest_path).unwrap();
-        let manifest = format!("{{\"id\":{},\"seq_id\":0,\"levels\":[]}}", snapshot_id);
+        let manifest = format!(
+            "{{\"id\":{},\"seq_id\":0,\"latest_schema_id\":0,\"levels\":[]}}",
+            snapshot_id
+        );
         writer.write(manifest.as_bytes()).unwrap();
         writer.close().unwrap();
         wait_for_manifest_in_db(root, db_id, snapshot_id)

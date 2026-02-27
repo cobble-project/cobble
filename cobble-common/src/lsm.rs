@@ -729,6 +729,7 @@ mod tests {
                 file_id: id,
                 tracked_id: TrackedFileId::detached(id),
                 seq: 0,
+                schema_id: 0,
                 size: 0, // Test file, size doesn't matter
                 has_separated_values: false,
                 meta_bytes: Default::default(),
@@ -747,6 +748,7 @@ mod tests {
                 file_id: id,
                 tracked_id: TrackedFileId::detached(id),
                 seq: 0,
+                schema_id: 0,
                 size,
                 has_separated_values: false,
                 meta_bytes: Default::default(),
@@ -786,6 +788,7 @@ mod tests {
             file_id,
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq,
+            schema_id: 0,
             size: file_size,
             has_separated_values: false,
             meta_bytes: Default::default(),

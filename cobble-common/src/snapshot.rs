@@ -6,6 +6,7 @@ use crate::file::{
     BufferedWriter, File, FileManager, SequentialWriteFile, TrackedFile, TrackedFileId,
 };
 use crate::lsm::Level;
+use crate::schema::SchemaManager;
 use crate::vlog::VlogVersion;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -27,6 +28,7 @@ pub(crate) struct DbSnapshot {
     // Vlog version at the time of snapshot creation, without tracked references.
     pub vlog_version: VlogVersion,
     pub seq_id: u64,
+    pub latest_schema_id: u64,
     pub finished: bool,
     pub callback: Option<SnapshotCallback>,
 }
@@ -37,6 +39,7 @@ pub(crate) type SnapshotCallback = Arc<dyn Fn(Result<u64>) + Send + Sync + 'stat
 pub(crate) struct ManifestSnapshot {
     pub(crate) id: u64,
     pub(crate) seq_id: u64,
+    pub(crate) latest_schema_id: u64,
     #[serde(default)]
     pub(crate) levels: Vec<ManifestLevel>,
     #[serde(default)]
@@ -48,6 +51,7 @@ pub(crate) struct ManifestIncrementalSnapshot {
     pub(crate) id: u64,
     pub(crate) seq_id: u64,
     pub(crate) base_snapshot_id: u64,
+    pub(crate) latest_schema_id: u64,
     #[serde(default)]
     pub(crate) level_edits: Vec<ManifestLevelEdit>,
     // always include vlog file info in incremental manifests since vlog files are more likely to have changes
@@ -81,6 +85,7 @@ pub(crate) struct ManifestFile {
     pub(crate) file_id: u64,
     pub(crate) file_type: String,
     pub(crate) seq: u64,
+    pub(crate) schema_id: u64,
     pub(crate) size: usize,
     pub(crate) start_key: String,
     pub(crate) end_key: String,
@@ -116,6 +121,7 @@ impl DbSnapshot {
             tracked_files: Vec::new(),
             vlog_version: VlogVersion::new(),
             seq_id: 0,
+            latest_schema_id: 0,
             finished: false,
             callback,
         }
@@ -124,6 +130,7 @@ impl DbSnapshot {
 
 pub(crate) struct SnapshotManager {
     file_manager: Arc<FileManager>,
+    schema_manager: Arc<SchemaManager>,
     state: Arc<Mutex<SnapshotManagerState>>,
     retention: Option<usize>,
     /// Background worker for manifest materialization.
@@ -136,6 +143,7 @@ impl Clone for SnapshotManager {
     fn clone(&self) -> Self {
         Self {
             file_manager: Arc::clone(&self.file_manager),
+            schema_manager: Arc::clone(&self.schema_manager),
             state: Arc::clone(&self.state),
             retention: self.retention,
             materialize_tx: Arc::clone(&self.materialize_tx),
@@ -160,9 +168,14 @@ struct SnapshotManagerState {
 }
 
 impl SnapshotManager {
-    pub(crate) fn new(file_manager: Arc<FileManager>, retention: Option<usize>) -> Self {
+    pub(crate) fn new(
+        file_manager: Arc<FileManager>,
+        schema_manager: Arc<SchemaManager>,
+        retention: Option<usize>,
+    ) -> Self {
         Self {
             file_manager,
+            schema_manager,
             state: Arc::new(Mutex::new(SnapshotManagerState {
                 next_id: 0,
                 snapshots: BTreeMap::new(),
@@ -239,6 +252,13 @@ impl SnapshotManager {
             tracked_file_ids.insert(tracked.file_id());
         }
         snapshot.seq_id = db_state.seq_id;
+        snapshot.latest_schema_id = db_state
+            .lsm_version
+            .levels
+            .iter()
+            .flat_map(|level| level.files.iter().map(|file| file.schema_id))
+            .max()
+            .unwrap_or(0);
         snapshot.tracked_files = tracked_file_ids
             .into_iter()
             .filter_map(|file_id| self.file_manager.data_file_ref(file_id).ok())
@@ -291,6 +311,7 @@ impl SnapshotManager {
             tracked_files,
             vlog_version: build_vlog_version_from_manifest_untracked(manifest),
             seq_id: manifest.seq_id,
+            latest_schema_id: manifest.latest_schema_id,
             finished: true,
             callback: None,
         };
@@ -363,6 +384,8 @@ impl SnapshotManager {
         let mut incremental_base_id = None;
         let result = match snapshot {
             Some(snapshot) => (|| {
+                self.schema_manager
+                    .persist_schemas_up_to(&self.file_manager, snapshot.latest_schema_id)?;
                 let writer = self
                     .file_manager
                     .create_metadata_file(&snapshot_manifest_name(id))?;
@@ -537,6 +560,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
         ManifestPayload::Snapshot(ManifestSnapshot {
             id: snapshot.id,
             seq_id: snapshot.seq_id,
+            latest_schema_id: snapshot.latest_schema_id,
             levels: manifest_levels_from_snapshot(&snapshot.levels, file_manager),
             vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
         })
@@ -549,6 +573,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 id: snapshot.id,
                 seq_id: snapshot.seq_id,
                 base_snapshot_id: base.id,
+                latest_schema_id: snapshot.latest_schema_id,
                 level_edits,
                 vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
             })
@@ -587,6 +612,7 @@ fn manifest_file_from_data_file(file: &DataFile, file_manager: &FileManager) -> 
         file_id: file.file_id,
         file_type: file.file_type.as_str().to_string(),
         seq: file.seq,
+        schema_id: file.schema_id,
         size: file.size,
         start_key: to_hex(&file.start_key),
         end_key: to_hex(&file.end_key),
@@ -737,6 +763,7 @@ pub(crate) fn load_manifest_chain(
                 resolved_base.vlog_files = manifest.vlog_files;
                 resolved_base.id = manifest.id;
                 resolved_base.seq_id = manifest.seq_id;
+                resolved_base.latest_schema_id = manifest.latest_schema_id;
                 (Some(manifest.base_snapshot_id), resolved_base)
             }
         };
@@ -826,6 +853,7 @@ fn clone_levels_untracked(levels: &[Level]) -> Vec<Level> {
                         file_id: file.file_id,
                         tracked_id: TrackedFileId::detached(file.file_id),
                         seq: file.seq,
+                        schema_id: file.schema_id,
                         size: file.size,
                         has_separated_values: file.has_separated_values,
                         meta_bytes: Default::default(),
@@ -872,6 +900,7 @@ fn build_levels_from_manifest_untracked(manifest: &ManifestSnapshot) -> Result<V
                 file_id: file.file_id,
                 tracked_id: TrackedFileId::detached(file.file_id),
                 seq: file.seq,
+                schema_id: file.schema_id,
                 size: file.size,
                 has_separated_values: file.has_separated_values,
                 meta_bytes: Default::default(),
@@ -927,6 +956,7 @@ pub(crate) fn build_levels_from_manifest(
                 file_id: file.file_id,
                 tracked_id,
                 seq: file.seq,
+                schema_id: file.schema_id,
                 size: file.size,
                 has_separated_values: file.has_separated_values,
                 meta_bytes: Default::default(),

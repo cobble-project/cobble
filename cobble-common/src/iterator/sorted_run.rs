@@ -257,6 +257,7 @@ mod tests {
             file_id: id,
             tracked_id: TrackedFileId::detached(id),
             seq: 0,
+            schema_id: 0,
             size: 0,
             has_separated_values: false,
             meta_bytes: Default::default(),

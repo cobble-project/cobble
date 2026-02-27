@@ -77,6 +77,11 @@ impl ReadOnlyDb {
             Arc::clone(&time_provider),
         ));
         let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
+        let schema_manager = Arc::new(SchemaManager::from_manifest(
+            &file_manager,
+            &manifest,
+            config.num_columns,
+        )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let levels = build_levels_from_manifest(&file_manager, manifest, true)?;
         let sst_options = crate::compaction::build_sst_writer_options(&config, 0);
@@ -106,13 +111,13 @@ impl ReadOnlyDb {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
         let lsm_tree = Arc::new(lsm_tree);
-        let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
+        let runtime_num_columns = schema_manager.latest_schema().num_columns();
         Ok(Self {
             file_manager,
             lsm_tree,
             vlog_store,
             schema_manager,
-            num_columns: config.num_columns,
+            num_columns: runtime_num_columns,
             ttl_provider,
             metrics_manager,
         })

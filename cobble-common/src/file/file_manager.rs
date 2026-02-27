@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 const DATA_DIR: &str = "data";
 const SNAPSHOT_DIR: &str = "snapshot";
+const SCHEMA_DIR: &str = "schema";
 const DEFAULT_BASE_FILE_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_READER_CACHE_CAPACITY: usize = 512;
 
@@ -500,6 +501,14 @@ impl FileManager {
         };
         if !fs.exists(&snapshot_dir)? {
             fs.create_dir(&snapshot_dir)?;
+        }
+        let schema_dir = if options.base_dir.is_empty() {
+            SCHEMA_DIR.to_string()
+        } else {
+            format!("{}/{}", options.base_dir, SCHEMA_DIR)
+        };
+        if !fs.exists(&schema_dir)? {
+            fs.create_dir(&schema_dir)?;
         }
         Ok(())
     }

@@ -44,6 +44,8 @@ pub struct DataFile {
     pub(crate) tracked_id: Arc<TrackedFileId>,
     /// Maximum sequence id for data contained in this file.
     pub seq: u64,
+    /// Schema id used when this data file was written.
+    pub schema_id: u64,
     /// Size of the file in bytes.
     pub size: usize,
     /// Whether this file contains separated value columns/pointers.

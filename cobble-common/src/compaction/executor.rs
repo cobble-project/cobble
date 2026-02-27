@@ -369,6 +369,7 @@ impl CompactionExecutor {
                         file_id,
                         tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                         seq: max_seq,
+                        schema_id: task.schema.version(),
                         size: file_size,
                         has_separated_values: merge_collector
                             .as_ref()
@@ -408,6 +409,7 @@ impl CompactionExecutor {
                 file_id,
                 tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                 seq: max_seq,
+                schema_id: task.schema.version(),
                 size: file_size,
                 has_separated_values: merge_collector
                     .as_ref()
@@ -529,6 +531,7 @@ mod tests {
             file_id,
             tracked_id: TrackedFileId::new(file_manager, file_id),
             seq: 0,
+            schema_id: 0,
             size: file_size,
             has_separated_values: true,
             meta_bytes: Default::default(),
@@ -1013,6 +1016,7 @@ mod tests {
             file_id,
             tracked_id: TrackedFileId::new(&file_manager, file_id),
             seq: 0,
+            schema_id: 0,
             size: file_size,
             has_separated_values: false,
             meta_bytes: Default::default(),
