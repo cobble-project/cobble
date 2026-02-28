@@ -12,7 +12,7 @@ use crate::snapshot::{
     load_manifest_for_snapshot, snapshot_manifest_name,
 };
 use crate::sst::block_cache::new_block_cache;
-use crate::sst::row_codec::{decode_value_masked, encode_key_ref_into};
+use crate::sst::row_codec::{decode_value, decode_value_masked, encode_key_ref_into};
 use crate::r#type::decode_merge_separated_array;
 use crate::r#type::{Column, RefColumn, RefKey, RefValue, Value, ValueType};
 use crate::vlog::{VlogPointer, VlogStore};
@@ -732,17 +732,36 @@ impl Db {
         let memtable_min_seq = self.memtable_manager.get_all_with_snapshot(
             Arc::clone(&snapshot),
             encoded_key.as_ref(),
-            |raw| {
+            |raw, source_schema| {
                 let mut raw_value = Bytes::copy_from_slice(raw);
-                let mut value = decode_value_masked(
-                    &mut raw_value,
-                    num_columns,
-                    decode_mask,
-                    terminal_mask.as_deref_mut(),
-                )?;
-                if let (Some(mask), Some(selected)) = (terminal_mask.as_mut(), selected_mask) {
-                    for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {
-                        *mask_byte &= selected[idx];
+                let mut value = if source_schema.version() == schema.version() {
+                    decode_value_masked(
+                        &mut raw_value,
+                        source_schema.num_columns(),
+                        decode_mask,
+                        None,
+                    )?
+                } else {
+                    let decoded = decode_value(&mut raw_value, source_schema.num_columns())?;
+                    self.schema_manager.evolve_value(
+                        decoded,
+                        source_schema.version(),
+                        schema.version(),
+                    )?
+                };
+                if let Some(mask) = terminal_mask.as_mut() {
+                    for (idx, column) in value.columns().iter().enumerate().take(num_columns) {
+                        if column
+                            .as_ref()
+                            .is_some_and(|column| column.value_type().is_terminal())
+                        {
+                            mask[idx / 8] |= 1 << (idx % 8);
+                        }
+                    }
+                    if let Some(selected) = selected_mask {
+                        for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {
+                            *mask_byte &= selected[idx];
+                        }
                     }
                 }
                 if let Some(columns) = selected_columns {
@@ -812,10 +831,10 @@ impl Db {
         options: &ScanOptions,
     ) -> Result<DbIterator<'a>> {
         let snapshot = self.memtable_manager.db_state().load();
+        let schema = self.schema_manager.latest_schema();
         let memtable_iters = self
             .memtable_manager
-            .scan_memtable_iterators_with_snapshot(Arc::clone(&snapshot))?;
-        let schema = self.schema_manager.latest_schema();
+            .scan_memtable_iterators_with_snapshot(Arc::clone(&snapshot), Arc::clone(&schema))?;
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
@@ -1102,6 +1121,52 @@ mod tests {
         assert_eq!(value.len(), 2);
         assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
         assert!(value[1].is_none());
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_memtable_read_evolves_older_schema_values() {
+        let root = "/tmp/db_schema_evolution_memtable_read";
+        cleanup_test_root(root);
+        let config = Config {
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 1,
+            sst_bloom_filter_enabled: true,
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            ..Config::default()
+        };
+        let db = Db::open(config).unwrap();
+
+        db.put(b"k1", 0, b"v1").unwrap();
+
+        let mut schema = db.update_schema();
+        schema.add_column(1, None, None).unwrap();
+        let _ = schema.commit();
+
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        assert_eq!(value.len(), 2);
+        assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
+        assert!(value[1].is_none());
+
+        let mut iter = db
+            .scan(
+                0,
+                b"k1".as_slice()..b"k2".as_slice(),
+                &ScanOptions::default(),
+            )
+            .unwrap();
+        let (scan_key, columns) = iter.next().unwrap().unwrap();
+        assert_eq!(scan_key.as_ref(), b"k1");
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].as_ref().unwrap().as_ref(), b"v1");
+        assert!(columns[1].is_none());
+        assert!(iter.next().is_none());
 
         cleanup_test_root(root);
     }

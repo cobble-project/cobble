@@ -10,13 +10,13 @@ use crate::error::Error::InvalidState;
 use crate::error::{Error, Result};
 use crate::file::{FileManager, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
-use crate::iterator::{DeduplicatingIterator, KvIterator};
+use crate::iterator::{DeduplicatingIterator, KvIterator, SchemaEvolvingIterator};
 use crate::lsm::LSMTree;
 use crate::memtable::vlog::{MemtableVlogRecorder, rewrite_ref_value_for_memtable};
 use crate::memtable::{HashMemtable, VecMemtable};
 use crate::memtable::{Memtable, MemtableImpl, MemtableKvIter, MemtableReclaimer};
 use crate::metrics_manager::MetricsManager;
-use crate::schema::SchemaManager;
+use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::SnapshotManager;
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use crate::r#type::{RefKey, RefValue};
@@ -120,6 +120,7 @@ struct MemtableManagerState {
 struct FlushJob {
     seq: u64,
     memtable: Option<Arc<MemtableImpl>>,
+    schema: Option<Arc<Schema>>,
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
     snapshot: Option<SnapshotCompletion>,
 }
@@ -131,6 +132,7 @@ pub(crate) struct SnapshotCompletion {
 
 pub(crate) struct ActiveMemtable {
     seq: u64,
+    schema: Arc<Schema>,
     memtable: Option<MemtableImpl>,
     vlog_recorder: Option<MemtableVlogRecorder>,
 }
@@ -273,6 +275,7 @@ impl<'a> KvIterator<'a> for MemtableScanIterator {
 #[derive(Clone)]
 pub(crate) struct ImmutableMemtable {
     pub(crate) seq: u64,
+    schema: Arc<Schema>,
     memtable: Arc<MemtableImpl>,
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
 }
@@ -339,10 +342,14 @@ impl MemtableManager {
             .as_ref()
             .map(|manager| manager.memtable_metrics())
             .unwrap_or_else(|| MemtableManagerMetrics::new("unknown"));
+        let schema_manager = options
+            .schema_manager
+            .unwrap_or_else(|| Arc::new(SchemaManager::new(options.num_columns)));
         let reclaimer = Self::make_reclaimer(
             Arc::clone(&state),
             Arc::clone(&buffer_ready),
             Arc::clone(&db_state),
+            Arc::clone(&schema_manager),
             options.memtable_capacity,
             options.memtable_type,
         );
@@ -356,15 +363,13 @@ impl MemtableManager {
                 usize::MAX,
             ))
         });
-        let schema_manager = options
-            .schema_manager
-            .unwrap_or_else(|| Arc::new(SchemaManager::new(options.num_columns)));
         {
             // init the first active buffer
             let mut state_guard = state.lock().unwrap();
             Self::make_active_buffer(
                 &mut state_guard,
                 &db_state,
+                &schema_manager,
                 options.memtable_capacity,
                 options.memtable_type,
                 &reclaimer,
@@ -381,7 +386,6 @@ impl MemtableManager {
             Arc::clone(&lsm_tree),
             lsm_tree.ttl_provider(),
             Arc::clone(&vlog_store),
-            Arc::clone(&schema_manager),
             metrics.clone(),
         )?;
         Ok(Self {
@@ -420,7 +424,6 @@ impl MemtableManager {
         lsm_tree: Arc<LSMTree>,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
         vlog_store: Arc<VlogStore>,
-        schema_manager: Arc<SchemaManager>,
         metrics: MemtableManagerMetrics,
     ) -> Result<(JoinHandle<()>, mpsc::Sender<FlushJob>)> {
         let (flush_tx, flush_rx) = mpsc::channel::<FlushJob>();
@@ -432,7 +435,6 @@ impl MemtableManager {
         let db_state_clone = lsm_tree_clone.db_state();
         let ttl_provider_clone = Arc::clone(&ttl_provider);
         let vlog_store_clone = Arc::clone(&vlog_store);
-        let schema_manager_clone = Arc::clone(&schema_manager);
         let handle = std::thread::Builder::new()
             .name("cobble-flush".to_string())
             .spawn(move || {
@@ -443,12 +445,12 @@ impl MemtableManager {
                         let result = flush_memtable(
                             job.seq,
                             memtable.as_ref(),
+                            job.schema.expect("flush job schema exists"),
                             job.vlog_recorder,
                             Arc::clone(&file_manager_clone),
                             Arc::clone(&file_builder_factory_clone),
                             Arc::clone(&ttl_provider_clone),
                             Arc::clone(&vlog_store_clone),
-                            Arc::clone(&schema_manager_clone),
                         );
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
@@ -520,9 +522,11 @@ impl MemtableManager {
 
     /// Makes an active memtable from a free buffer if none exists.
     /// Assumes the caller holds the lock on the state.
+    #[allow(clippy::too_many_arguments)]
     fn make_active_buffer(
         state: &mut MemtableManagerState,
         db_state: &Arc<DbStateHandle>,
+        schema_manager: &Arc<SchemaManager>,
         memtable_capacity: usize,
         memtable_type: MemtableType,
         reclaimer: &MemtableReclaimer,
@@ -542,6 +546,7 @@ impl MemtableManager {
             state.budget -= budget_need;
             let seq = state.next_seq;
             state.next_seq += 1;
+            let schema = schema_manager.latest_schema();
             let memtable = match memtable_type {
                 MemtableType::Hash => {
                     let buffer = vec![0u8; memtable_capacity];
@@ -557,6 +562,7 @@ impl MemtableManager {
             };
             let active = Arc::new(Mutex::new(ActiveMemtable {
                 seq,
+                schema,
                 memtable: Some(memtable),
                 vlog_recorder: None,
             }));
@@ -580,12 +586,14 @@ impl MemtableManager {
         state: Arc<Mutex<MemtableManagerState>>,
         buffer_ready: Arc<Condvar>,
         db_state: Arc<DbStateHandle>,
+        schema_manager: Arc<SchemaManager>,
         memtable_capacity: usize,
         memtable_type: MemtableType,
     ) -> MemtableReclaimer {
         let state = Arc::downgrade(&state);
         let buffer_ready = Arc::downgrade(&buffer_ready);
         let db_state = Arc::downgrade(&db_state);
+        let schema_manager = Arc::downgrade(&schema_manager);
         Arc::new(move |returned| {
             // upgrade weak references
             let Some(state) = state.upgrade() else {
@@ -597,6 +605,9 @@ impl MemtableManager {
             let Some(db_state) = db_state.upgrade() else {
                 return;
             };
+            let Some(schema_manager) = schema_manager.upgrade() else {
+                return;
+            };
             let mut guard = state.lock().unwrap();
             let returned_budget = returned.min(i64::MAX as u64) as i64;
             guard.budget = guard.budget.saturating_add(returned_budget);
@@ -605,6 +616,7 @@ impl MemtableManager {
                 Arc::clone(&state),
                 Arc::clone(&buffer_ready),
                 Arc::clone(&db_state),
+                Arc::clone(&schema_manager),
                 memtable_capacity,
                 memtable_type,
             );
@@ -613,6 +625,7 @@ impl MemtableManager {
                 Self::make_active_buffer(
                     &mut guard,
                     &db_state,
+                    &schema_manager,
                     memtable_capacity,
                     memtable_type,
                     &reclaimer,
@@ -627,7 +640,6 @@ impl MemtableManager {
 
     /// Puts a key-value pair into the active memtable using reference types to avoid extra copy.
     pub(crate) fn put(&self, key: &RefKey<'_>, value: &RefValue<'_>) -> Result<()> {
-        let num_columns = self.schema_manager.current_num_columns();
         loop {
             // Wait for an active memtable to be available.
             if self.db_state.load().active.is_none() {
@@ -644,6 +656,26 @@ impl MemtableManager {
                 .clone()
                 .expect("active memtable exists");
             let mut active = active.lock().unwrap();
+            let latest_schema = self.schema_manager.latest_schema();
+            if active.schema.version() != latest_schema.version() {
+                let is_empty = active
+                    .memtable
+                    .as_ref()
+                    .map(|memtable| memtable.is_empty())
+                    .unwrap_or(true);
+                if is_empty {
+                    active.schema = latest_schema;
+                } else {
+                    drop(active);
+                    let _ = self.flush_active()?;
+                    continue;
+                }
+            }
+            let num_columns = active.schema.num_columns();
+            if active.memtable.is_none() {
+                drop(active);
+                continue;
+            }
             // Steps:
             // 1) checkpoint active memtable state (blob arena + vlog recorder offsets)
             // 2) rewrite large columns to vlog pointers
@@ -739,6 +771,7 @@ impl MemtableManager {
             Self::make_active_buffer(
                 &mut state,
                 &self.db_state,
+                &self.schema_manager,
                 capacity,
                 MemtableType::Vec,
                 &self.reclaimer,
@@ -805,7 +838,7 @@ impl MemtableManager {
     /// Returns the minimum sequence number among the memtables searched.
     pub(crate) fn get_all<F>(&self, key: &[u8], f: F) -> Result<Option<u64>>
     where
-        F: FnMut(&[u8]) -> Result<()>,
+        F: FnMut(&[u8], &Schema) -> Result<()>,
     {
         let snapshot = self.db_state.load();
         self.get_all_with_snapshot(snapshot, key, f)
@@ -819,7 +852,7 @@ impl MemtableManager {
         mut f: F,
     ) -> Result<Option<u64>>
     where
-        F: FnMut(&[u8]) -> Result<()>,
+        F: FnMut(&[u8], &Schema) -> Result<()>,
     {
         let mut min_seq = u64::MAX;
         if let Some(active) = &snapshot.active {
@@ -827,7 +860,7 @@ impl MemtableManager {
             let memtable = active.memtable.as_ref().expect("active memtable exists");
             min_seq = active.seq;
             for value in memtable.get_all(key) {
-                f(value)?;
+                f(value, active.schema.as_ref())?;
             }
             drop(active);
         }
@@ -840,7 +873,7 @@ impl MemtableManager {
         );
         for immutable in snapshot.immutables.iter().rev() {
             for value in immutable.memtable.get_all(key) {
-                f(value)?;
+                f(value, immutable.schema.as_ref())?;
             }
         }
         Ok(Some(min_seq))
@@ -849,17 +882,40 @@ impl MemtableManager {
     pub(crate) fn scan_memtable_iterators_with_snapshot(
         &self,
         snapshot: Arc<DbState>,
+        target_schema: Arc<Schema>,
     ) -> Result<Vec<DynKvIterator>> {
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         if let Some(active) = &snapshot.active {
-            iterators.push(Box::new(MemtableScanIterator::for_active(Arc::clone(
-                active,
-            ))));
+            let source_schema = {
+                let active_guard = active.lock().unwrap();
+                Arc::clone(&active_guard.schema)
+            };
+            let iter = MemtableScanIterator::for_active(Arc::clone(active));
+            let iter: DynKvIterator = if source_schema.version() == target_schema.version() {
+                Box::new(iter)
+            } else {
+                Box::new(SchemaEvolvingIterator::new(
+                    iter,
+                    Arc::clone(&source_schema),
+                    Arc::clone(&target_schema),
+                    Arc::clone(&self.schema_manager),
+                ))
+            };
+            iterators.push(iter);
         }
         for immutable in snapshot.immutables.iter().rev() {
-            iterators.push(Box::new(MemtableScanIterator::for_immutable(Arc::clone(
-                &immutable.memtable,
-            ))));
+            let iter = MemtableScanIterator::for_immutable(Arc::clone(&immutable.memtable));
+            let iter: DynKvIterator = if immutable.schema.version() == target_schema.version() {
+                Box::new(iter)
+            } else {
+                Box::new(SchemaEvolvingIterator::new(
+                    iter,
+                    Arc::clone(&immutable.schema),
+                    Arc::clone(&target_schema),
+                    Arc::clone(&self.schema_manager),
+                ))
+            };
+            iterators.push(iter);
         }
         Ok(iterators)
     }
@@ -936,6 +992,7 @@ impl MemtableManager {
                 let mut immutables = snapshot_state.immutables.clone();
                 let new_immutable = ImmutableMemtable {
                     seq: inner_active.seq,
+                    schema: Arc::clone(&inner_active.schema),
                     memtable: Arc::new(active_memtable),
                     vlog_recorder: active_vlog_recorder,
                 };
@@ -957,6 +1014,7 @@ impl MemtableManager {
             Self::make_active_buffer(
                 &mut state,
                 &self.db_state,
+                &self.schema_manager,
                 self.memtable_capacity,
                 self.memtable_type,
                 &self.reclaimer,
@@ -967,6 +1025,7 @@ impl MemtableManager {
             FlushJob {
                 seq: to_flush.seq,
                 memtable: Some(to_flush.memtable),
+                schema: Some(to_flush.schema),
                 vlog_recorder: to_flush.vlog_recorder,
                 snapshot,
             }
@@ -975,6 +1034,7 @@ impl MemtableManager {
             FlushJob {
                 seq: 0,
                 memtable: None,
+                schema: None,
                 vlog_recorder: None,
                 snapshot,
             }
@@ -1052,12 +1112,12 @@ impl Drop for MemtableManager {
 fn flush_memtable(
     seq: u64,
     memtable: &impl Memtable,
+    schema: Arc<Schema>,
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
     file_manager: Arc<FileManager>,
     file_builder_factory: Arc<FileBuilderFactory>,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     vlog_store: Arc<VlogStore>,
-    schema_manager: Arc<SchemaManager>,
 ) -> Result<MemtableFlushResult> {
     // Step 1: If there is a vlog recorder with entries, flush it to the vlog store and get the resulting edit.
     let mut vlog_edit = None;
@@ -1076,7 +1136,6 @@ fn flush_memtable(
     // Try to handle merges during flush if vlog edits are present
     let merge_collector = vlog_edit.as_ref().map(|_| VlogMergeCollector::shared(true));
     let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
-    let schema = schema_manager.latest_schema();
     let num_columns = schema.num_columns();
     let mut dedup_iter = DeduplicatingIterator::new(
         PrimedIterator::new(memtable.iter()),
@@ -1364,6 +1423,65 @@ mod tests {
         let column = decoded.columns()[0].as_ref().unwrap();
         assert_eq!(column.value_type, ValueType::PutSeparated);
         assert_eq!(column.data().len(), 8);
+
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_memtable_schema_change_triggers_flush_and_preserves_flush_schema() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::new(DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
+        let schema_manager = Arc::new(SchemaManager::new(1));
+        let manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                initial_seq: 0,
+                memtable_capacity: 256,
+                buffer_count: 2,
+                file_builder_factory: None,
+                num_columns: 1,
+                write_stall_limit: 8,
+                schema_manager: Some(Arc::clone(&schema_manager)),
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let key1 = RefKey::new(0, b"k1");
+        let value1 = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"v1"))]);
+        manager.put(&key1, &value1).unwrap();
+
+        let mut builder = schema_manager.builder();
+        builder.add_column(1, None, None).unwrap();
+        let _ = builder.commit();
+
+        let key2 = RefKey::new(0, b"k2");
+        let value2 = RefValue::new(vec![
+            Some(RefColumn::new(ValueType::Put, b"v2")),
+            Some(RefColumn::new(ValueType::Put, b"v2c1")),
+        ]);
+        manager.put(&key2, &value2).unwrap();
+
+        let results = manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().data_file.schema_id, 0);
+
+        manager.flush_active().unwrap();
+        let results = manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().data_file.schema_id, 1);
 
         cleanup_test_root();
     }

@@ -630,8 +630,7 @@ impl LSMTree {
                 } else {
                     Box::new(SchemaEvolvingIterator::new(
                         iter,
-                        file.schema_id,
-                        source_schema.num_columns(),
+                        Arc::clone(&source_schema),
                         Arc::clone(&target_schema),
                         Arc::clone(&schema_manager),
                     ))

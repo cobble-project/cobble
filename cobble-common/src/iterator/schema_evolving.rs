@@ -10,8 +10,7 @@ use std::sync::Arc;
 /// An iterator wrapper that evolves values from a source schema to a target schema on-the-fly.
 pub(crate) struct SchemaEvolvingIterator<I> {
     inner: I,
-    source_schema_id: u64,
-    source_num_columns: usize,
+    source_schema: Arc<Schema>,
     target_schema: Arc<Schema>,
     schema_manager: Arc<SchemaManager>,
     evolved_value_cache: RefCell<Option<Bytes>>,
@@ -20,15 +19,13 @@ pub(crate) struct SchemaEvolvingIterator<I> {
 impl<I> SchemaEvolvingIterator<I> {
     pub(crate) fn new(
         inner: I,
-        source_schema_id: u64,
-        source_num_columns: usize,
+        source_schema: Arc<Schema>,
         target_schema: Arc<Schema>,
         schema_manager: Arc<SchemaManager>,
     ) -> Self {
         Self {
             inner,
-            source_schema_id,
-            source_num_columns,
+            source_schema,
             target_schema,
             schema_manager,
             evolved_value_cache: RefCell::new(None),
@@ -36,34 +33,36 @@ impl<I> SchemaEvolvingIterator<I> {
     }
 
     fn evolve_value_if_needed(&self, mut encoded: Bytes) -> Result<Bytes> {
+        let source_schema_id = self.source_schema.version();
         let target_schema_id = self.target_schema.version();
-        if self.source_schema_id == target_schema_id {
+        if source_schema_id == target_schema_id {
             return Ok(encoded);
         }
-        if self.source_schema_id > target_schema_id {
+        if source_schema_id > target_schema_id {
             return Err(Error::InvalidState(format!(
                 "Source schema {} is newer than target schema {}",
-                self.source_schema_id, target_schema_id
+                source_schema_id, target_schema_id
             )));
         }
-        let value = decode_value(&mut encoded, self.source_num_columns)?;
+        let value = decode_value(&mut encoded, self.source_schema.num_columns())?;
         let evolved = self.schema_manager.evolve_value(
             value,
-            self.source_schema_id,
+            source_schema_id,
             self.target_schema.version(),
         )?;
         Ok(encode_value(&evolved, self.target_schema.num_columns()))
     }
 
     fn should_evolve(&self) -> Result<bool> {
+        let source_schema_id = self.source_schema.version();
         let target_schema_id = self.target_schema.version();
-        if self.source_schema_id == target_schema_id {
+        if source_schema_id == target_schema_id {
             return Ok(false);
         }
-        if self.source_schema_id > target_schema_id {
+        if source_schema_id > target_schema_id {
             return Err(Error::InvalidState(format!(
                 "Source schema {} is newer than target schema {}",
-                self.source_schema_id, target_schema_id
+                source_schema_id, target_schema_id
             )));
         }
         Ok(true)
