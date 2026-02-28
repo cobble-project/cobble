@@ -619,6 +619,10 @@ impl RemoteCompactionServer {
             &request.merge_operator_ids,
             num_columns,
         )?;
+        let schema_manager = Arc::new(SchemaManager::from_schemas(
+            vec![merge_operators.as_ref().clone()],
+            num_columns,
+        ));
         let task = CompactionTask::new(
             compaction_metrics,
             sst_metrics,
@@ -628,7 +632,7 @@ impl RemoteCompactionServer {
             Arc::clone(&file_builder_factory),
             data_file_type,
             ttl_provider,
-            merge_operators,
+            schema_manager,
         )
         .with_readonly_outputs();
         let result = executor.execute_blocking(task, None);

@@ -7,6 +7,7 @@ mod deduplicating;
 mod factory;
 mod merging;
 pub(crate) mod mock_iterator;
+mod schema_evolving;
 mod sorted_run;
 
 // Public API exports for the iterator module.
@@ -17,6 +18,8 @@ pub(crate) use deduplicating::DeduplicatingIterator;
 pub(crate) use factory::{IteratorFactoryOptions, create_iterator, make_iterator_factory};
 #[allow(unused_imports)]
 pub(crate) use merging::MergingIterator;
+#[allow(unused_imports)]
+pub(crate) use schema_evolving::SchemaEvolvingIterator;
 #[allow(unused_imports)]
 pub(crate) use sorted_run::SortedRun;
 

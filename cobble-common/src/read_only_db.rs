@@ -26,7 +26,6 @@ pub struct ReadOnlyDb {
     lsm_tree: Arc<LSMTree>,
     vlog_store: Arc<VlogStore>,
     schema_manager: Arc<SchemaManager>,
-    num_columns: usize,
     ttl_provider: Arc<TTLProvider>,
     metrics_manager: Arc<MetricsManager>,
 }
@@ -111,13 +110,11 @@ impl ReadOnlyDb {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
         let lsm_tree = Arc::new(lsm_tree);
-        let runtime_num_columns = schema_manager.latest_schema().num_columns();
         Ok(Self {
             file_manager,
             lsm_tree,
             vlog_store,
             schema_manager,
-            num_columns: runtime_num_columns,
             ttl_provider,
             metrics_manager,
         })
@@ -134,23 +131,26 @@ impl ReadOnlyDb {
 
     /// Lookup a key across the snapshot LSM levels.
     pub fn get(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Vec<Option<Bytes>>>> {
+        let schema = self.schema_manager.latest_schema();
+        let num_columns = schema.num_columns();
         if let Some(max_index) = options.max_index()
-            && max_index >= self.num_columns
+            && max_index >= num_columns
         {
             return Err(Error::IoError(format!(
                 "max_index {} in ReadOptions exceeds num_columns {}",
-                max_index, self.num_columns
+                max_index, num_columns
             )));
         }
         let mut encoded_key = bytes::BytesMut::with_capacity(2 + key.len());
         encode_key_ref_into(&RefKey::new(0, key), &mut encoded_key);
         let encoded_key = encoded_key.freeze();
-        let masks = options.masks(self.num_columns);
+        let masks = options.masks(num_columns);
         let selected_mask = masks.selected_mask.as_deref();
         let lsm_values = self.lsm_tree.get(
             &self.file_manager,
             encoded_key.as_ref(),
-            self.num_columns,
+            schema.as_ref(),
+            self.schema_manager.as_ref(),
             options.columns(),
             selected_mask,
             None,
@@ -167,7 +167,6 @@ impl ReadOnlyDb {
         }
         let mut iter = values.into_iter();
         let mut merged = iter.next().expect("values not empty");
-        let schema = self.schema_manager.latest_schema();
         for newer in iter {
             merged = merged.merge(newer, &schema)?;
         }
@@ -189,10 +188,12 @@ impl ReadOnlyDb {
         options: &ScanOptions,
     ) -> Result<DbIterator<'static>> {
         let snapshot = self.lsm_tree.db_state().load();
+        let schema = self.schema_manager.latest_schema();
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
-            self.num_columns,
+            Arc::clone(&schema),
+            Arc::clone(&self.schema_manager),
             options.read_ahead_bytes,
         )?;
         let encode_scan_key = |key: &[u8]| {
@@ -211,7 +212,6 @@ impl ReadOnlyDb {
                 memtable_manager: None,
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
-                num_columns: self.num_columns,
                 schema_manager: Arc::clone(&self.schema_manager),
             },
         );

@@ -19,7 +19,6 @@ pub(crate) struct DbIteratorOptions<'a> {
     pub(crate) memtable_manager: Option<&'a MemtableManager>,
     pub(crate) vlog_store: Arc<VlogStore>,
     pub(crate) ttl_provider: Arc<TTLProvider>,
-    pub(crate) num_columns: usize,
     pub(crate) schema_manager: Arc<SchemaManager>,
 }
 
@@ -40,10 +39,11 @@ impl<'a> DbIterator<'a> {
         options: DbIteratorOptions<'a>,
     ) -> Self {
         let schema = options.schema_manager.latest_schema();
+        let num_columns = schema.num_columns();
         memtable_iters.append(&mut lsm_iters);
         let inner = DeduplicatingIterator::new(
             MergingIterator::new(memtable_iters),
-            options.num_columns,
+            num_columns,
             Arc::clone(&options.ttl_provider),
             None,
             schema.clone(),
@@ -55,7 +55,7 @@ impl<'a> DbIterator<'a> {
             memtable_manager: options.memtable_manager,
             vlog_store: options.vlog_store,
             schema,
-            num_columns: options.num_columns,
+            num_columns,
         }
     }
 

@@ -41,7 +41,6 @@ pub struct Db {
     vlog_store: Arc<VlogStore>,
     snapshot_manager: SnapshotManager,
     schema_manager: Arc<SchemaManager>,
-    num_columns: usize,
     time_provider: Arc<dyn TimeProvider>,
     ttl_provider: Arc<TTLProvider>,
 }
@@ -264,16 +263,17 @@ impl Db {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
+        let num_columns = self.schema_manager.current_num_columns();
         let column_idx = column as usize;
-        if column_idx >= self.num_columns {
+        if column_idx >= num_columns {
             return Err(Error::IoError(format!(
                 "Column index {} exceeds num_columns {}",
-                column_idx, self.num_columns
+                column_idx, num_columns
             )));
         }
         let column = RefColumn::new(value_type, value.as_ref());
         let expired_at = self.ttl_provider.get_expiration_timestamp(ttl_seconds);
-        let mut columns: Vec<Option<RefColumn<'_>>> = vec![None; self.num_columns];
+        let mut columns: Vec<Option<RefColumn<'_>>> = vec![None; num_columns];
         columns[column_idx] = Some(column);
         let record = RefValue::new_with_expired_at(columns, expired_at);
         let key = RefKey::new(0, key.as_ref());
@@ -341,12 +341,13 @@ impl Db {
         let mut pending: std::collections::BTreeMap<Bytes, Value> =
             std::collections::BTreeMap::new();
         let schema = self.schema_manager.latest_schema();
+        let num_columns = schema.num_columns();
         for (key_and_seq, op) in batch.ops {
             let column_idx = key_and_seq.column as usize;
-            if column_idx >= self.num_columns {
+            if column_idx >= num_columns {
                 return Err(Error::IoError(format!(
                     "Column index {} exceeds num_columns {}",
-                    column_idx, self.num_columns
+                    column_idx, num_columns
                 )));
             }
             let (column, expired_at) = match op {
@@ -363,7 +364,7 @@ impl Db {
                     self.ttl_provider.get_expiration_timestamp(ttl_secs),
                 ),
             };
-            let mut columns = vec![None; self.num_columns];
+            let mut columns = vec![None; num_columns];
             columns[column_idx] = Some(column);
             let next_value = Value::new_with_expired_at(columns, expired_at);
             match pending.entry(key_and_seq.key) {
@@ -593,7 +594,7 @@ impl Db {
             default_ttl_seconds: config.default_ttl_seconds,
         };
         let ttl_provider = Arc::new(TTLProvider::new(&ttl_config, Arc::clone(&time_provider)));
-        let runtime_num_columns = schema_manager.latest_schema().num_columns();
+        let runtime_num_columns = schema_manager.current_num_columns();
         let mut lsm_tree = LSMTree::with_state_and_ttl(
             Arc::clone(&db_state),
             Arc::clone(&ttl_provider),
@@ -684,7 +685,6 @@ impl Db {
             vlog_store,
             snapshot_manager,
             schema_manager,
-            num_columns: runtime_num_columns,
             time_provider,
             ttl_provider,
         })
@@ -703,24 +703,26 @@ impl Db {
 
     /// Lookup a key across the memtable and LSM levels.
     pub fn get(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Vec<Option<Bytes>>>> {
+        let schema = self.schema_manager.latest_schema();
+        let num_columns = schema.num_columns();
         if let Some(max_index) = options.max_index()
-            && max_index >= self.num_columns
+            && max_index >= num_columns
         {
             return Err(Error::IoError(format!(
                 "max_index {} in ReadOptions exceeds num_columns {}",
-                max_index, self.num_columns
+                max_index, num_columns
             )));
         }
         let mut encoded_key = BytesMut::with_capacity(2 + key.len());
         encode_key_ref_into(&RefKey::new(0, key), &mut encoded_key);
         let encoded_key = encoded_key.freeze();
         let selected_columns = options.columns();
-        let masks = options.masks(self.num_columns);
+        let masks = options.masks(num_columns);
         let selected_mask = masks.selected_mask.as_deref();
         let decode_mask = masks.base_mask.as_ref();
         let mask_size = decode_mask.len();
 
-        let mut terminal_mask = if self.num_columns == 1 {
+        let mut terminal_mask = if num_columns == 1 {
             None
         } else {
             Some(vec![0u8; mask_size])
@@ -734,7 +736,7 @@ impl Db {
                 let mut raw_value = Bytes::copy_from_slice(raw);
                 let mut value = decode_value_masked(
                     &mut raw_value,
-                    self.num_columns,
+                    num_columns,
                     decode_mask,
                     terminal_mask.as_deref_mut(),
                 )?;
@@ -751,12 +753,13 @@ impl Db {
             },
         )?;
         let mut should_stop =
-            self.num_columns > 1 && values.last().is_some_and(|value| value.is_terminal());
+            num_columns > 1 && values.last().is_some_and(|value| value.is_terminal());
         let lsm_values = self.lsm_tree.get_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
             encoded_key.as_ref(),
-            self.num_columns,
+            schema.as_ref(),
+            self.schema_manager.as_ref(),
             selected_columns,
             selected_mask,
             terminal_mask.as_deref_mut(),
@@ -766,7 +769,7 @@ impl Db {
             if should_stop {
                 break;
             }
-            if self.num_columns > 1 {
+            if num_columns > 1 {
                 should_stop = value.is_terminal();
             }
             values.push(value);
@@ -783,7 +786,6 @@ impl Db {
         }
         let mut iter = values.into_iter();
         let mut merged = iter.next().expect("values not empty");
-        let schema = self.schema_manager.latest_schema();
         for newer in iter {
             merged = merged.merge(newer, &schema)?;
         }
@@ -813,10 +815,12 @@ impl Db {
         let memtable_iters = self
             .memtable_manager
             .scan_memtable_iterators_with_snapshot(Arc::clone(&snapshot))?;
+        let schema = self.schema_manager.latest_schema();
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
-            self.num_columns,
+            Arc::clone(&schema),
+            Arc::clone(&self.schema_manager),
             options.read_ahead_bytes,
         )?;
         let encode_scan_key = |key: &[u8]| {
@@ -835,7 +839,6 @@ impl Db {
                 memtable_manager: Some(&self.memtable_manager),
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
-                num_columns: self.num_columns,
                 schema_manager: Arc::clone(&self.schema_manager),
             },
         );
@@ -1065,6 +1068,40 @@ mod tests {
             decode_u64_counter(value[1].as_ref().unwrap().as_ref()),
             15u64
         );
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_get_evolves_older_schema_values() {
+        let root = "/tmp/db_schema_evolution_get";
+        cleanup_test_root(root);
+        let config = Config {
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 1,
+            sst_bloom_filter_enabled: true,
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            ..Config::default()
+        };
+        let db = Db::open(config).unwrap();
+
+        db.put(b"k1", 0, b"v1").unwrap();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let mut schema = db.update_schema();
+        schema.add_column(1, None, None).unwrap();
+        let _ = schema.commit();
+
+        let value = db
+            .get(b"k1", &ReadOptions::default())
+            .unwrap()
+            .expect("value present");
+        assert_eq!(value.len(), 2);
+        assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
+        assert!(value[1].is_none());
 
         cleanup_test_root(root);
     }

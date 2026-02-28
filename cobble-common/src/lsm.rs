@@ -5,10 +5,11 @@ use crate::compaction::{
 use crate::data_file::DataFile;
 use crate::error::Result;
 use crate::file::{FileManager, ReadAheadBufferedReader};
-use crate::iterator::{KvIterator, SortedRun};
+use crate::iterator::{KvIterator, SchemaEvolvingIterator, SortedRun};
 use crate::metrics_manager::MetricsManager;
+use crate::schema::{Schema, SchemaManager};
 use crate::sst::block_cache::BlockCache;
-use crate::sst::row_codec::decode_value_masked;
+use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 use crate::r#type::Value;
 use log::debug;
@@ -467,7 +468,8 @@ impl LSMTree {
         &self,
         file_manager: &Arc<FileManager>,
         encoded_key: &[u8],
-        num_columns: usize,
+        target_schema: &Schema,
+        schema_manager: &SchemaManager,
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
         terminal_mask: Option<&mut [u8]>,
@@ -478,7 +480,8 @@ impl LSMTree {
             file_manager,
             snapshot,
             encoded_key,
-            num_columns,
+            target_schema,
+            schema_manager,
             selected_columns,
             selected_mask,
             terminal_mask,
@@ -492,12 +495,14 @@ impl LSMTree {
         file_manager: &Arc<FileManager>,
         snapshot: Arc<DbState>,
         encoded_key: &[u8],
-        num_columns: usize,
+        target_schema: &Schema,
+        schema_manager: &SchemaManager,
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
         mut terminal_mask: Option<&mut [u8]>,
         max_seq: Option<u64>,
     ) -> Result<Vec<Value>> {
+        let num_columns = target_schema.num_columns();
         let mut values = Vec::new();
         let mask_size = num_columns.div_ceil(8).max(1);
         let last_bits = (num_columns - 1) % 8 + 1;
@@ -527,7 +532,8 @@ impl LSMTree {
                         file,
                         file_manager,
                         encoded_key,
-                        num_columns,
+                        target_schema,
+                        schema_manager,
                         selected_columns,
                         selected_mask,
                         terminal_mask.as_deref_mut(),
@@ -550,7 +556,8 @@ impl LSMTree {
                         file,
                         file_manager,
                         encoded_key,
-                        num_columns,
+                        target_schema,
+                        schema_manager,
                         selected_columns,
                         selected_mask,
                         terminal_mask.as_deref_mut(),
@@ -573,17 +580,12 @@ impl LSMTree {
         &self,
         file_manager: &Arc<FileManager>,
         snapshot: Arc<DbState>,
-        num_columns: usize,
+        target_schema: Arc<Schema>,
+        schema_manager: Arc<SchemaManager>,
         read_ahead_bytes: usize,
     ) -> Result<Vec<DynKvIterator>> {
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let use_read_ahead = read_ahead_bytes > 0 && tokio::runtime::Handle::try_current().is_ok();
-        let sst_options = SSTIteratorOptions {
-            metrics: Some(Arc::clone(&self.sst_metrics)),
-            num_columns,
-            bloom_filter_enabled: true,
-            ..SSTIteratorOptions::default()
-        };
         let mut runs: Vec<SortedRun> = Vec::new();
         for level in &snapshot.lsm_version.levels {
             if level.files.is_empty() {
@@ -599,22 +601,42 @@ impl LSMTree {
         }
         for run in runs {
             let file_manager = Arc::clone(file_manager);
-            let sst_options = sst_options.clone();
             let block_cache = self.block_cache.clone();
+            let sst_metrics = Arc::clone(&self.sst_metrics);
+            let target_schema = Arc::clone(&target_schema);
+            let schema_manager = Arc::clone(&schema_manager);
             let run_iter = run.iter(move |file| {
+                let source_schema = schema_manager.schema(file.schema_id)?;
                 let reader = file_manager.open_data_file_reader(file.file_id)?;
                 let reader: Box<dyn crate::file::RandomAccessFile> = if use_read_ahead {
                     Box::new(ReadAheadBufferedReader::new(reader, read_ahead_bytes))
                 } else {
                     Box::new(reader)
                 };
+                let sst_options = SSTIteratorOptions {
+                    metrics: Some(Arc::clone(&sst_metrics)),
+                    num_columns: source_schema.num_columns(),
+                    bloom_filter_enabled: true,
+                    ..SSTIteratorOptions::default()
+                };
                 let iter = SSTIterator::with_cache_and_file(
                     reader,
                     file,
-                    sst_options.clone(),
+                    sst_options,
                     block_cache.clone(),
                 )?;
-                Ok(Box::new(iter) as DynKvIterator)
+                let iter: DynKvIterator = if file.schema_id == target_schema.version() {
+                    Box::new(iter)
+                } else {
+                    Box::new(SchemaEvolvingIterator::new(
+                        iter,
+                        file.schema_id,
+                        source_schema.num_columns(),
+                        Arc::clone(&target_schema),
+                        Arc::clone(&schema_manager),
+                    ))
+                };
+                Ok(iter)
             });
             iterators.push(Box::new(run_iter));
         }
@@ -630,7 +652,8 @@ impl LSMTree {
         file: &Arc<DataFile>,
         file_manager: &Arc<FileManager>,
         encoded_key: &[u8],
-        num_columns: usize,
+        target_schema: &Schema,
+        schema_manager: &SchemaManager,
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
         mut terminal_mask: Option<&mut [u8]>,
@@ -638,6 +661,10 @@ impl LSMTree {
         max_seq: Option<u64>,
         out_values: &mut Vec<Value>,
     ) -> Result<bool> {
+        let num_columns = target_schema.num_columns();
+        let target_schema_id = target_schema.version();
+        let source_schema = schema_manager.schema(file.schema_id)?;
+        let source_num_columns = source_schema.num_columns();
         let mask_size = decode_mask.len();
         if let Some(max_seq) = max_seq
             && file.seq >= max_seq
@@ -649,7 +676,7 @@ impl LSMTree {
             Box::new(reader),
             file.as_ref(),
             SSTIteratorOptions {
-                num_columns,
+                num_columns: source_num_columns,
                 metrics: Some(Arc::clone(&self.sst_metrics)),
                 bloom_filter_enabled: true,
                 ..SSTIteratorOptions::default()
@@ -666,16 +693,33 @@ impl LSMTree {
             && current_key.as_ref() == encoded_key
             && let Some(value_bytes) = iter.value()?
         {
-            let mut value_bytes = value_bytes;
-            let value = decode_value_masked(
-                &mut value_bytes,
-                num_columns,
-                decode_mask,
-                terminal_mask.as_deref_mut(),
-            )?;
-            if self.ttl_provider.expired(&value.expired_at) {
-                return Ok(false);
-            }
+            let value = if file.schema_id == target_schema_id {
+                let mut value_bytes = value_bytes;
+                let value = decode_value_masked(
+                    &mut value_bytes,
+                    num_columns,
+                    decode_mask,
+                    terminal_mask.as_deref_mut(),
+                )?;
+                if self.ttl_provider.expired(&value.expired_at) {
+                    return Ok(false);
+                }
+                value
+            } else {
+                let mut value_bytes = value_bytes;
+                let value = decode_value(&mut value_bytes, source_num_columns)?;
+                if self.ttl_provider.expired(&value.expired_at) {
+                    return Ok(false);
+                }
+                let value = schema_manager.evolve_value(value, file.schema_id, target_schema_id)?;
+                if let Some(mask) = terminal_mask.as_deref_mut() {
+                    let evolved_mask = value.terminal_mask();
+                    for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {
+                        *mask_byte |= evolved_mask.get(idx).copied().unwrap_or(0);
+                    }
+                }
+                value
+            };
             if let (Some(mask), Some(selected_mask)) = (terminal_mask.as_deref_mut(), selected_mask)
             {
                 for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {
@@ -1062,12 +1106,15 @@ mod tests {
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+        let schema_manager = Arc::new(crate::schema::SchemaManager::new(num_columns));
+        let schema = schema_manager.latest_schema();
         let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));
         let value = lsm_tree
             .get(
                 &file_manager,
                 encoded_key.as_ref(),
-                num_columns,
+                schema.as_ref(),
+                schema_manager.as_ref(),
                 None,
                 None,
                 None,
@@ -1123,12 +1170,15 @@ mod tests {
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+        let schema_manager = Arc::new(crate::schema::SchemaManager::new(num_columns));
+        let schema = schema_manager.latest_schema();
         let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));
         let value = lsm_tree
             .get(
                 &file_manager,
                 encoded_key.as_ref(),
-                num_columns,
+                schema.as_ref(),
+                schema_manager.as_ref(),
                 None,
                 None,
                 None,

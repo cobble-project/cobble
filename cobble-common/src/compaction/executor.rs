@@ -10,9 +10,11 @@ use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
 use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
-use crate::iterator::{DeduplicatingIterator, KvIterator, MergingIterator, SortedRun};
+use crate::iterator::{
+    DeduplicatingIterator, KvIterator, MergingIterator, SchemaEvolvingIterator, SortedRun,
+};
 use crate::lsm::{LevelEdit, VersionEdit};
-use crate::schema::Schema;
+use crate::schema::SchemaManager;
 use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions};
 use crate::vlog::{VlogEdit, VlogMergeCollector};
 use log::trace;
@@ -40,7 +42,7 @@ pub struct CompactionTask {
     /// Whether to create output files in read-only mode.
     /// This is used for remote compaction workers where we want to write files.
     output_files_readonly: bool,
-    schema: Arc<Schema>,
+    schema_manager: Arc<SchemaManager>,
 }
 
 #[derive(Clone)]
@@ -77,7 +79,7 @@ impl CompactionTask {
         file_builder_factory: Arc<FileBuilderFactory>,
         data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
-        schema: Arc<Schema>,
+        schema_manager: Arc<SchemaManager>,
     ) -> Self {
         Self {
             metrics,
@@ -89,7 +91,7 @@ impl CompactionTask {
             data_file_type,
             ttl_provider,
             output_files_readonly: false,
-            schema,
+            schema_manager,
         }
     }
 
@@ -262,20 +264,18 @@ impl CompactionExecutor {
         let mut read_bytes = 0u64;
         let use_read_ahead =
             options.read_ahead_enabled && tokio::runtime::Handle::try_current().is_ok();
-        let num_columns = task.schema.num_columns();
-        let sst_options = SSTIteratorOptions {
-            metrics: Some(Arc::clone(&task.sst_metrics)),
-            num_columns,
-            bloom_filter_enabled: options.bloom_filter_enabled,
-            ..SSTIteratorOptions::default()
-        };
+        let target_schema = task.schema_manager.latest_schema();
+        let num_columns = target_schema.num_columns();
         for run in &task.sorted_runs {
             for file in run.files() {
                 read_bytes = read_bytes.saturating_add(file.size as u64);
             }
             let file_manager = Arc::clone(&task.file_manager);
-            let sst_options = sst_options.clone();
+            let sst_metrics = Arc::clone(&task.sst_metrics);
+            let schema_manager = Arc::clone(&task.schema_manager);
+            let target_schema = Arc::clone(&target_schema);
             let run_iter = run.iter(move |file| {
+                let source_schema = schema_manager.schema(file.schema_id)?;
                 let reader = file_manager.open_data_file_reader(file.file_id)?;
                 let reader: Box<dyn crate::file::RandomAccessFile> = if use_read_ahead {
                     Box::new(ReadAheadBufferedReader::new(
@@ -285,13 +285,27 @@ impl CompactionExecutor {
                 } else {
                     Box::new(reader)
                 };
-                let iter = crate::sst::SSTIterator::with_cache_and_file(
-                    reader,
-                    file,
-                    sst_options.clone(),
-                    None,
-                )?;
-                Ok(Box::new(iter) as Box<dyn for<'a> KvIterator<'a>>)
+                let sst_options = SSTIteratorOptions {
+                    metrics: Some(Arc::clone(&sst_metrics)),
+                    num_columns: source_schema.num_columns(),
+                    bloom_filter_enabled: options.bloom_filter_enabled,
+                    ..SSTIteratorOptions::default()
+                };
+                let iter =
+                    crate::sst::SSTIterator::with_cache_and_file(reader, file, sst_options, None)?;
+                let iter: Box<dyn for<'a> KvIterator<'a>> =
+                    if file.schema_id == target_schema.version() {
+                        Box::new(iter)
+                    } else {
+                        Box::new(SchemaEvolvingIterator::new(
+                            iter,
+                            file.schema_id,
+                            source_schema.num_columns(),
+                            Arc::clone(&target_schema),
+                            Arc::clone(&schema_manager),
+                        ))
+                    };
+                Ok(iter)
             });
             all_iters.push(Box::new(run_iter));
         }
@@ -321,7 +335,7 @@ impl CompactionExecutor {
             num_columns,
             task.ttl_provider(),
             merge_callback,
-            task.schema.clone(),
+            Arc::clone(&target_schema),
         );
         dedup_iter.seek_to_first()?;
 
@@ -370,7 +384,7 @@ impl CompactionExecutor {
                         file_id,
                         tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                         seq: max_seq,
-                        schema_id: task.schema.version(),
+                        schema_id: target_schema.version(),
                         size: file_size,
                         has_separated_values: merge_collector
                             .as_ref()
@@ -410,7 +424,7 @@ impl CompactionExecutor {
                 file_id,
                 tracked_id: TrackedFileId::new(&task.file_manager, file_id),
                 seq: max_seq,
-                schema_id: task.schema.version(),
+                schema_id: target_schema.version(),
                 size: file_size,
                 has_separated_values: merge_collector
                     .as_ref()
@@ -487,6 +501,7 @@ mod tests {
     use super::*;
     use crate::file::{FileSystemRegistry, TrackedFileId};
     use crate::metrics_manager::MetricsManager;
+    use crate::schema::Schema;
     use crate::sst::row_codec::encode_value;
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::Value;
@@ -500,6 +515,13 @@ mod tests {
     fn make_typed_value_bytes(value_type: ValueType, data: &[u8], num_columns: usize) -> Vec<u8> {
         let value = Value::new(vec![Some(Column::new(value_type, data.to_vec()))]);
         encode_value(&value, num_columns).to_vec()
+    }
+
+    fn schema_manager_for(num_columns: usize) -> Arc<SchemaManager> {
+        Arc::new(SchemaManager::from_schemas(
+            vec![Schema::new(0, num_columns, Vec::new())],
+            num_columns,
+        ))
     }
 
     fn cleanup_test_dir(path: &str) {
@@ -615,7 +637,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Arc::new(Schema::new(0, num_columns, Vec::new())),
+            schema_manager_for(num_columns),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -749,7 +771,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Arc::new(Schema::new(0, num_columns, Vec::new())),
+            schema_manager_for(num_columns),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -915,7 +937,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Arc::new(Schema::new(0, num_columns, Vec::new())),
+            schema_manager_for(num_columns),
         );
         let executor = CompactionExecutor::new(options).unwrap();
         let result = executor.execute_blocking(task, None).unwrap();
@@ -963,6 +985,96 @@ mod tests {
         assert_eq!(merged_items[0].data(), b"base_b");
         assert_eq!(merged_items[1].value_type, ValueType::MergeSeparated);
         assert_eq!(merged_items[1].data().as_ref(), new_merge_separated_b);
+
+        cleanup_test_dir(test_dir);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_compaction_evolves_older_schema_values() {
+        let test_dir = "/tmp/compaction_schema_evolution_test";
+        cleanup_test_dir(test_dir);
+
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", test_dir))
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
+
+        let old_num_columns = 1;
+        let old_file = create_test_sst(
+            &file_manager,
+            vec![(b"k", &make_value_bytes(b"old", old_num_columns))],
+        )
+        .unwrap();
+
+        let schema_manager = Arc::new(SchemaManager::new(old_num_columns));
+        let mut schema_builder = schema_manager.builder();
+        schema_builder.add_column(1, None, None).unwrap();
+        let target_schema = schema_builder.commit();
+
+        let options = CompactionConfig {
+            num_columns: target_schema.num_columns(),
+            bloom_filter_enabled: true,
+            bloom_bits_per_key: 10,
+            ..Default::default()
+        };
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            metrics: None,
+            block_size: options.block_size,
+            buffer_size: options.buffer_size,
+            num_columns: options.num_columns,
+            bloom_filter_enabled: options.bloom_filter_enabled,
+            bloom_bits_per_key: options.bloom_bits_per_key,
+            partitioned_index: options.partitioned_index,
+            compression: crate::SstCompressionAlgorithm::None,
+        });
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
+        let task = CompactionTask::new(
+            compaction_metrics,
+            sst_metrics,
+            vec![SortedRun::new(0, vec![old_file])],
+            1,
+            Arc::clone(&file_manager),
+            factory,
+            DataFileType::SSTable,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
+            Arc::clone(&schema_manager),
+        );
+
+        let executor = CompactionExecutor::new(options).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+        assert_eq!(result.new_files().len(), 1);
+        assert_eq!(result.new_files()[0].schema_id, target_schema.version());
+
+        let reader = file_manager
+            .open_data_file_reader(result.new_files()[0].file_id)
+            .unwrap();
+        let mut iter = crate::sst::SSTIterator::with_cache_and_file(
+            Box::new(reader),
+            result.new_files()[0].as_ref(),
+            crate::sst::SSTIteratorOptions {
+                bloom_filter_enabled: true,
+                num_columns: target_schema.num_columns(),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        iter.seek_to_first().unwrap();
+        let (_, mut value) = iter.current().unwrap().unwrap();
+        let decoded =
+            crate::sst::row_codec::decode_value(&mut value, target_schema.num_columns()).unwrap();
+        assert_eq!(decoded.columns().len(), 2);
+        assert_eq!(
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"old"
+        );
+        assert!(decoded.columns()[1].is_none());
 
         cleanup_test_dir(test_dir);
     }
@@ -1057,7 +1169,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Arc::new(Schema::new(0, num_columns, Vec::new())),
+            schema_manager_for(num_columns),
         );
 
         let executor = CompactionExecutor::new(options).unwrap();
@@ -1128,7 +1240,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Arc::new(Schema::new(0, options.num_columns, Vec::new())),
+            schema_manager_for(options.num_columns),
         );
 
         let executor = CompactionExecutor::with_defaults().unwrap();
@@ -1187,7 +1299,7 @@ mod tests {
             factory,
             DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
-            Arc::new(Schema::new(0, num_columns, Vec::new())),
+            schema_manager_for(num_columns),
         );
         let executor = CompactionExecutor::with_defaults().unwrap();
         let result = executor.execute_blocking(task, None).unwrap();

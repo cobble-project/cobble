@@ -94,7 +94,6 @@ pub(crate) struct MemtableManager {
     flush_done: Arc<Condvar>,
     file_manager: Arc<FileManager>,
     file_builder_factory: Arc<FileBuilderFactory>,
-    num_columns: usize,
     lsm_tree: Arc<LSMTree>,
     db_state: Arc<DbStateHandle>,
     vlog_store: Arc<VlogStore>,
@@ -391,7 +390,6 @@ impl MemtableManager {
             flush_done,
             file_manager,
             file_builder_factory,
-            num_columns: options.num_columns,
             lsm_tree,
             db_state,
             vlog_store,
@@ -629,6 +627,7 @@ impl MemtableManager {
 
     /// Puts a key-value pair into the active memtable using reference types to avoid extra copy.
     pub(crate) fn put(&self, key: &RefKey<'_>, value: &RefValue<'_>) -> Result<()> {
+        let num_columns = self.schema_manager.current_num_columns();
         loop {
             // Wait for an active memtable to be available.
             if self.db_state.load().active.is_none() {
@@ -663,7 +662,7 @@ impl MemtableManager {
                     &self.vlog_store,
                     memtable,
                     vlog_recorder,
-                    self.num_columns,
+                    num_columns,
                 )
             };
             let rewrite_plan = match rewrite_result {
@@ -676,9 +675,9 @@ impl MemtableManager {
             let put_result = {
                 let memtable = active.memtable.as_mut().expect("active memtable exists");
                 if let Some(plan) = rewrite_plan.as_ref() {
-                    memtable.put_ref_rewritten(key, plan, self.num_columns)
+                    memtable.put_ref_rewritten(key, plan, num_columns)
                 } else {
-                    memtable.put_ref(key, value, self.num_columns)
+                    memtable.put_ref(key, value, num_columns)
                 }
             };
             match put_result {
@@ -695,10 +694,11 @@ impl MemtableManager {
         key: &RefKey<'_>,
         value: &RefValue<'_>,
     ) -> Result<bool> {
+        let num_columns = self.schema_manager.current_num_columns();
         let capacity = VecMemtable::estimate_capacity_for_ref(
             key,
             value,
-            self.num_columns,
+            num_columns,
             self.vlog_store.as_ref(),
         );
         {

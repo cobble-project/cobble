@@ -5,12 +5,107 @@ use crate::merge_operator::{
 };
 use crate::paths::schema_file_relative_path;
 use crate::snapshot::ManifestSnapshot;
+use crate::r#type::{Column, Value, ValueType};
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+pub(crate) trait SchemaEvolution: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn evolve(&self, value: Value) -> Result<Value>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BuiltinSchemaEvolution {
+    Noop,
+    ColumnAdd {
+        indexes: Arc<Vec<usize>>,
+        default_values: Arc<Vec<Option<Bytes>>>,
+    },
+    ColumnDelete {
+        indexes: Arc<Vec<usize>>,
+    },
+}
+
+impl SchemaEvolution for BuiltinSchemaEvolution {
+    fn id(&self) -> &'static str {
+        match self {
+            Self::Noop => "noop",
+            Self::ColumnAdd { .. } => "column_add",
+            Self::ColumnDelete { .. } => "column_delete",
+        }
+    }
+
+    fn evolve(&self, value: Value) -> Result<Value> {
+        let expired_at = value.expired_at();
+        let mut columns = value.columns;
+        match self {
+            Self::Noop => {}
+            Self::ColumnAdd {
+                indexes,
+                default_values,
+            } => {
+                if indexes.len() != default_values.len() {
+                    return Err(Error::InvalidState(format!(
+                        "Column add evolution indexes/defaults length mismatch: {} != {}",
+                        indexes.len(),
+                        default_values.len()
+                    )));
+                }
+                for (&index, default_value) in indexes.iter().zip(default_values.iter()) {
+                    if index > columns.len() {
+                        return Err(Error::InvalidState(format!(
+                            "Cannot add column at index {} when value has {} columns",
+                            index,
+                            columns.len()
+                        )));
+                    }
+                    columns.insert(
+                        index,
+                        default_value
+                            .as_ref()
+                            .map(|bytes| Column::new(ValueType::Put, bytes.clone())),
+                    );
+                }
+            }
+            Self::ColumnDelete { indexes } => {
+                for &index in indexes.iter() {
+                    if index >= columns.len() {
+                        return Err(Error::InvalidState(format!(
+                            "Cannot delete column at index {} when value has {} columns",
+                            index,
+                            columns.len()
+                        )));
+                    }
+                    columns.remove(index);
+                }
+            }
+        }
+        Ok(Value::new_with_expired_at(columns, expired_at))
+    }
+}
+
+impl BuiltinSchemaEvolution {
+    fn indexes(&self) -> Option<&[usize]> {
+        match self {
+            Self::Noop => None,
+            Self::ColumnAdd { indexes, .. } | Self::ColumnDelete { indexes } => {
+                Some(indexes.as_ref())
+            }
+        }
+    }
+
+    fn default_values(&self) -> Option<&[Option<Bytes>]> {
+        match self {
+            Self::ColumnAdd { default_values, .. } => Some(default_values.as_ref()),
+            Self::Noop | Self::ColumnDelete { .. } => None,
+        }
+    }
+}
 
 /// Runtime schema for merge semantics.
 #[derive(Clone)]
@@ -18,13 +113,28 @@ pub struct Schema {
     version: u64,
     num_columns: usize,
     operators: Arc<Vec<Arc<dyn MergeOperator>>>,
+    evolution: BuiltinSchemaEvolution,
 }
 
 impl Schema {
     pub(crate) fn new(
         version: u64,
         num_columns: usize,
+        operators: Vec<Arc<dyn MergeOperator>>,
+    ) -> Self {
+        Self::new_with_evolution(
+            version,
+            num_columns,
+            operators,
+            BuiltinSchemaEvolution::Noop,
+        )
+    }
+
+    fn new_with_evolution(
+        version: u64,
+        num_columns: usize,
         mut operators: Vec<Arc<dyn MergeOperator>>,
+        evolution: BuiltinSchemaEvolution,
     ) -> Self {
         if operators.len() < num_columns {
             operators.resize_with(num_columns, default_merge_operator);
@@ -35,6 +145,7 @@ impl Schema {
             version,
             num_columns,
             operators: Arc::new(operators),
+            evolution,
         }
     }
 
@@ -62,6 +173,10 @@ impl Schema {
     pub(crate) fn empty() -> Arc<Self> {
         Arc::new(Self::new(0, 0, Vec::new()))
     }
+
+    fn evolution(&self) -> BuiltinSchemaEvolution {
+        self.evolution.clone()
+    }
 }
 
 /// Manages versioned runtime schema snapshots.
@@ -69,6 +184,7 @@ impl Schema {
 pub(crate) struct SchemaManager {
     latest_schema: Arc<ArcSwap<Schema>>,
     schemas: Arc<RwLock<BTreeMap<u64, Arc<Schema>>>>,
+    evolutions: Arc<RwLock<BTreeMap<u64, BuiltinSchemaEvolution>>>,
     max_persisted_schema_id: Arc<RwLock<Option<u64>>>,
     next_version: Arc<AtomicU64>,
 }
@@ -98,9 +214,14 @@ impl SchemaManager {
             return Self {
                 latest_schema: Arc::new(ArcSwap::from(initial)),
                 schemas: Arc::new(RwLock::new(versions)),
+                evolutions: Arc::new(RwLock::new(BTreeMap::new())),
                 max_persisted_schema_id: Arc::new(RwLock::new(None)),
                 next_version: Arc::new(AtomicU64::new(1)),
             };
+        }
+        let mut evolutions = BTreeMap::new();
+        for schema in versions.values() {
+            evolutions.insert(schema.version(), schema.evolution());
         }
         let (max_version, latest) = versions
             .iter()
@@ -110,6 +231,7 @@ impl SchemaManager {
         Self {
             latest_schema: Arc::new(ArcSwap::from(latest)),
             schemas: Arc::new(RwLock::new(versions)),
+            evolutions: Arc::new(RwLock::new(evolutions)),
             max_persisted_schema_id: Arc::new(RwLock::new(Some(max_version))),
             next_version: Arc::new(AtomicU64::new(max_version.saturating_add(1))),
         }
@@ -132,8 +254,15 @@ impl SchemaManager {
         I: IntoIterator<Item = &'a ManifestSnapshot>,
     {
         let mut schema_ids = BTreeSet::new();
+        let mut max_latest_schema_id = 0u64;
         for manifest in manifests {
+            max_latest_schema_id = max_latest_schema_id.max(manifest.latest_schema_id);
             collect_schema_ids_from_manifest(manifest, &mut schema_ids);
+        }
+        if !schema_ids.is_empty() {
+            for schema_id in 0..=max_latest_schema_id {
+                schema_ids.insert(schema_id);
+            }
         }
         let schemas = schema_ids
             .into_iter()
@@ -149,6 +278,7 @@ impl SchemaManager {
         Self {
             latest_schema: Arc::new(ArcSwap::from(initial)),
             schemas: Arc::new(RwLock::new(versions)),
+            evolutions: Arc::new(RwLock::new(BTreeMap::new())),
             max_persisted_schema_id: Arc::new(RwLock::new(None)),
             next_version: Arc::new(AtomicU64::new(next_version)),
         }
@@ -156,6 +286,19 @@ impl SchemaManager {
 
     pub(crate) fn latest_schema(&self) -> Arc<Schema> {
         self.latest_schema.load_full()
+    }
+
+    pub(crate) fn current_num_columns(&self) -> usize {
+        self.latest_schema.load().num_columns()
+    }
+
+    pub(crate) fn schema(&self, schema_id: u64) -> Result<Arc<Schema>> {
+        self.schemas
+            .read()
+            .unwrap()
+            .get(&schema_id)
+            .cloned()
+            .ok_or_else(|| Error::InvalidState(format!("Missing schema version {}", schema_id)))
     }
 
     pub(crate) fn builder(self: &Arc<Self>) -> SchemaBuilder {
@@ -168,17 +311,62 @@ impl SchemaManager {
 
     fn commit_build(
         &self,
+        base_schema: &Schema,
         num_columns: usize,
         operators: Vec<Arc<dyn MergeOperator>>,
+        evolution: BuiltinSchemaEvolution,
     ) -> Arc<Schema> {
+        let latest = self.latest_schema();
+        assert_eq!(
+            latest.version(),
+            base_schema.version(),
+            "schema builder commit version conflict"
+        );
         let version = self.next_version.fetch_add(1, Ordering::SeqCst);
-        let schema = Arc::new(Schema::new(version, num_columns, operators));
+        let schema = Arc::new(Schema::new_with_evolution(
+            version,
+            num_columns,
+            operators,
+            evolution.clone(),
+        ));
         self.latest_schema.store(Arc::clone(&schema));
         self.schemas
             .write()
             .unwrap()
             .insert(schema.version(), Arc::clone(&schema));
+        self.evolutions
+            .write()
+            .unwrap()
+            .insert(schema.version(), evolution);
         schema
+    }
+
+    pub(crate) fn evolve_value(
+        &self,
+        mut value: Value,
+        from_schema_id: u64,
+        to_schema_id: u64,
+    ) -> Result<Value> {
+        if from_schema_id == to_schema_id {
+            return Ok(value);
+        }
+        if from_schema_id > to_schema_id {
+            return Err(Error::InvalidState(format!(
+                "cannot evolve schema from {} down to {}",
+                from_schema_id, to_schema_id
+            )));
+        }
+        let evolutions = self.evolutions.read().unwrap();
+        for schema_id in (from_schema_id + 1)..=to_schema_id {
+            let evolution = evolutions.get(&schema_id).ok_or_else(|| {
+                Error::InvalidState(format!(
+                    "Missing schema evolution for version {}",
+                    schema_id
+                ))
+            })?;
+            value = evolution.evolve(value)?;
+        }
+        Ok(value)
     }
 
     pub(crate) fn persist_schemas_up_to(
@@ -228,6 +416,12 @@ struct SchemaFile {
     num_columns: usize,
     #[serde(default)]
     merge_operator_ids: Vec<String>,
+    #[serde(default)]
+    evolution_id: Option<String>,
+    #[serde(default)]
+    evolution_indexes: Option<Vec<usize>>,
+    #[serde(default)]
+    evolution_default_values: Option<Vec<Option<Vec<u8>>>>,
 }
 
 pub(crate) fn persist_schema(file_manager: &FileManager, schema: &Schema) -> Result<()> {
@@ -235,9 +429,17 @@ pub(crate) fn persist_schema(file_manager: &FileManager, schema: &Schema) -> Res
         id: schema.version(),
         num_columns: schema.num_columns(),
         merge_operator_ids: schema.operator_ids(schema.num_columns()),
+        evolution_id: Some(schema.evolution().id().to_string()),
+        evolution_indexes: schema.evolution().indexes().map(|indexes| indexes.to_vec()),
+        evolution_default_values: schema.evolution().default_values().map(|defaults| {
+            defaults
+                .iter()
+                .map(|default_value| default_value.as_ref().map(|bytes| bytes.to_vec()))
+                .collect()
+        }),
     };
     let json = serde_json::to_vec(&schema_file)
-        .map_err(|err| Error::IoError(format!("Failed to encode schema file: {}", err)))?;
+        .map_err(|err| Error::FileFormatError(format!("Failed to encode schema file: {}", err)))?;
     let mut writer = BufferedWriter::new(
         file_manager.create_metadata_file(&schema_file_relative_path(schema.version()))?,
         4096,
@@ -250,15 +452,15 @@ pub(crate) fn persist_schema(file_manager: &FileManager, schema: &Schema) -> Res
 pub(crate) fn load_schema(
     file_manager: &Arc<FileManager>,
     schema_id: u64,
-    default_num_columns: usize,
+    _default_num_columns: usize,
 ) -> Result<Schema> {
     let reader =
         file_manager.open_metadata_file_reader_untracked(&schema_file_relative_path(schema_id))?;
     let bytes = reader.read_at(0, reader.size())?;
     let schema_file: SchemaFile = serde_json::from_slice(bytes.as_ref())
-        .map_err(|err| Error::IoError(format!("Failed to decode schema file: {}", err)))?;
+        .map_err(|err| Error::FileFormatError(format!("Failed to decode schema file: {}", err)))?;
     if schema_file.id != schema_id {
-        return Err(Error::IoError(format!(
+        return Err(Error::InvalidState(format!(
             "Schema file id mismatch: expected {}, got {}",
             schema_id, schema_file.id
         )));
@@ -268,33 +470,84 @@ pub(crate) fn load_schema(
         .iter()
         .map(|id| merge_operator_by_id(id))
         .collect();
-    let num_columns = schema_file.num_columns.max(default_num_columns);
+    let evolution = match schema_file.evolution_id.as_deref() {
+        Some("noop") | None => BuiltinSchemaEvolution::Noop,
+        Some("column_add") => {
+            let indexes = schema_file.evolution_indexes.ok_or_else(|| {
+                Error::FileFormatError(
+                    "Missing evolution_indexes for column_add schema evolution".to_string(),
+                )
+            })?;
+            let default_values = schema_file
+                .evolution_default_values
+                .unwrap_or_else(|| vec![None; indexes.len()])
+                .into_iter()
+                .map(|default_value| default_value.map(Bytes::from))
+                .collect::<Vec<_>>();
+            if default_values.len() != indexes.len() {
+                return Err(Error::FileFormatError(format!(
+                    "Invalid evolution_default_values length for column_add schema evolution: {} != {}",
+                    default_values.len(),
+                    indexes.len()
+                )));
+            }
+            BuiltinSchemaEvolution::ColumnAdd {
+                indexes: Arc::new(indexes),
+                default_values: Arc::new(default_values),
+            }
+        }
+        Some("column_delete") => BuiltinSchemaEvolution::ColumnDelete {
+            indexes: Arc::new(schema_file.evolution_indexes.ok_or_else(|| {
+                Error::FileFormatError(
+                    "Missing evolution_indexes for column_delete schema evolution".to_string(),
+                )
+            })?),
+        },
+        Some(id) => {
+            return Err(Error::InvalidState(format!(
+                "Unknown schema evolution id '{}'",
+                id
+            )));
+        }
+    };
+    let num_columns = schema_file.num_columns;
     if operators.len() < num_columns {
         operators.resize_with(num_columns, default_merge_operator);
     }
-    Ok(Schema::new(schema_file.id, num_columns, operators))
+    Ok(Schema::new_with_evolution(
+        schema_file.id,
+        num_columns,
+        operators,
+        evolution,
+    ))
 }
 
 pub struct SchemaBuilder {
     manager: Arc<SchemaManager>,
+    base_schema: Arc<Schema>,
     num_columns: usize,
     operators: Vec<Arc<dyn MergeOperator>>,
+    evolution: BuiltinSchemaEvolution,
 }
 
 impl SchemaBuilder {
     fn from_schema(manager: Arc<SchemaManager>, schema: Arc<Schema>) -> Self {
         Self {
             manager,
+            base_schema: Arc::clone(&schema),
             num_columns: schema.num_columns(),
             operators: schema.operators.as_ref().clone(),
+            evolution: BuiltinSchemaEvolution::Noop,
         }
     }
 
+    /// Set the merge operator for a column index.
     pub fn set_column_operator(
         &mut self,
         column_idx: usize,
         operator: Arc<dyn MergeOperator>,
     ) -> Result<()> {
+        let old_num_columns = self.num_columns;
         if self.operators.is_empty() && column_idx > 0 {
             self.operators = vec![default_merge_operator(); column_idx + 1];
         } else if column_idx >= self.operators.len() {
@@ -304,16 +557,117 @@ impl SchemaBuilder {
         if column_idx >= self.num_columns {
             self.num_columns = column_idx + 1;
         }
+        if self.num_columns > old_num_columns {
+            if matches!(self.evolution, BuiltinSchemaEvolution::ColumnDelete { .. }) {
+                return Err(Error::InvalidState(
+                    "Cannot mix add and delete schema evolution in one commit".to_string(),
+                ));
+            }
+            let mut added_indexes = Vec::with_capacity(self.num_columns - old_num_columns);
+            for idx in old_num_columns..self.num_columns {
+                added_indexes.push(idx);
+            }
+            match &mut self.evolution {
+                BuiltinSchemaEvolution::Noop => {
+                    self.evolution = BuiltinSchemaEvolution::ColumnAdd {
+                        indexes: Arc::new(added_indexes),
+                        default_values: Arc::new(vec![None; self.num_columns - old_num_columns]),
+                    };
+                }
+                BuiltinSchemaEvolution::ColumnAdd {
+                    indexes,
+                    default_values,
+                } => {
+                    Arc::make_mut(indexes).extend(added_indexes);
+                    Arc::make_mut(default_values)
+                        .extend((0..(self.num_columns - old_num_columns)).map(|_| None));
+                }
+                BuiltinSchemaEvolution::ColumnDelete { .. } => unreachable!(),
+            }
+        }
         self.operators[column_idx] = operator;
         Ok(())
     }
 
-    pub fn set_all(&mut self, operators: Vec<Arc<dyn MergeOperator>>) {
-        self.operators = operators;
+    /// Add a new column at the specified index, shifting existing columns at and after that index to the right.
+    /// Cannot be used in the same commit as `delete_column`.
+    pub fn add_column(
+        &mut self,
+        column_idx: usize,
+        operator: Option<Arc<dyn MergeOperator>>,
+        default_value: Option<Bytes>,
+    ) -> Result<()> {
+        if column_idx > self.num_columns {
+            return Err(Error::InvalidState(format!(
+                "Cannot add column at index {} when schema has {} columns",
+                column_idx, self.num_columns
+            )));
+        }
+        if matches!(self.evolution, BuiltinSchemaEvolution::ColumnDelete { .. }) {
+            return Err(Error::InvalidState(
+                "Cannot mix add and delete schema evolution in one commit".to_string(),
+            ));
+        }
+        self.num_columns += 1;
+        self.operators
+            .insert(column_idx, operator.unwrap_or_else(default_merge_operator));
+        match &mut self.evolution {
+            BuiltinSchemaEvolution::Noop => {
+                self.evolution = BuiltinSchemaEvolution::ColumnAdd {
+                    indexes: Arc::new(vec![column_idx]),
+                    default_values: Arc::new(vec![default_value]),
+                };
+            }
+            BuiltinSchemaEvolution::ColumnAdd {
+                indexes,
+                default_values,
+            } => {
+                Arc::make_mut(indexes).push(column_idx);
+                Arc::make_mut(default_values).push(default_value);
+            }
+            BuiltinSchemaEvolution::ColumnDelete { .. } => unreachable!(),
+        }
+        Ok(())
     }
 
+    /// Delete the column at the specified index, shifting existing columns after that index to the left.
+    /// Cannot be used in the same commit as `add_column`.
+    pub fn delete_column(&mut self, column_idx: usize) -> Result<()> {
+        if self.num_columns == 0 || column_idx >= self.num_columns {
+            return Err(Error::InvalidState(format!(
+                "Cannot delete column at index {} when schema has {} columns",
+                column_idx, self.num_columns
+            )));
+        }
+        if matches!(self.evolution, BuiltinSchemaEvolution::ColumnAdd { .. }) {
+            return Err(Error::InvalidState(
+                "Cannot mix add and delete schema evolution in one commit".to_string(),
+            ));
+        }
+        self.num_columns -= 1;
+        self.operators.remove(column_idx);
+        match &mut self.evolution {
+            BuiltinSchemaEvolution::Noop => {
+                self.evolution = BuiltinSchemaEvolution::ColumnDelete {
+                    indexes: Arc::new(vec![column_idx]),
+                };
+            }
+            BuiltinSchemaEvolution::ColumnDelete { indexes } => {
+                Arc::make_mut(indexes).push(column_idx);
+            }
+            BuiltinSchemaEvolution::ColumnAdd { .. } => unreachable!(),
+        }
+        Ok(())
+    }
+
+    /// Commit the schema changes and return the new schema.
     pub fn commit(self) -> Arc<Schema> {
-        self.manager.commit_build(self.num_columns, self.operators)
+        self.manager.commit_build(
+            self.base_schema.as_ref(),
+            self.num_columns,
+            self.operators,
+            self.evolution,
+        )
     }
 }
 
@@ -321,6 +675,7 @@ impl SchemaBuilder {
 mod tests {
     use super::*;
     use crate::merge_operator::MergeOperator;
+    use crate::r#type::{Column, ValueType};
     use bytes::Bytes;
 
     struct BracketMergeOperator;
@@ -385,5 +740,66 @@ mod tests {
             .unwrap();
         assert_eq!(merged0.as_ref(), b"ab");
         assert_eq!(merged3.as_ref(), b"[a+b]");
+    }
+
+    #[test]
+    fn test_schema_evolution_add_column() {
+        let manager = Arc::new(SchemaManager::new(1));
+        let mut builder = manager.builder();
+        builder.add_column(1, None, None).unwrap();
+        let schema = builder.commit();
+        assert_eq!(schema.version(), 1);
+        assert_eq!(schema.num_columns(), 2);
+
+        let value = Value::new(vec![Some(Column::new(
+            ValueType::Put,
+            Bytes::from_static(b"v"),
+        ))]);
+        let evolved = manager.evolve_value(value, 0, 1).unwrap();
+        assert_eq!(evolved.columns().len(), 2);
+        assert!(evolved.columns()[1].is_none());
+    }
+
+    #[test]
+    fn test_schema_evolution_add_column_with_default() {
+        let manager = Arc::new(SchemaManager::new(1));
+        let mut builder = manager.builder();
+        builder
+            .add_column(1, None, Some(Bytes::from_static(b"default")))
+            .unwrap();
+        let schema = builder.commit();
+        assert_eq!(schema.version(), 1);
+        assert_eq!(schema.num_columns(), 2);
+
+        let value = Value::new(vec![Some(Column::new(
+            ValueType::Put,
+            Bytes::from_static(b"v"),
+        ))]);
+        let evolved = manager.evolve_value(value, 0, 1).unwrap();
+        assert_eq!(evolved.columns().len(), 2);
+        let default_column = evolved.columns()[1].as_ref().unwrap();
+        assert_eq!(*default_column.value_type(), ValueType::Put);
+        assert_eq!(default_column.data().as_ref(), b"default");
+    }
+
+    #[test]
+    fn test_schema_evolution_delete_column() {
+        let manager = Arc::new(SchemaManager::new(2));
+        let mut builder = manager.builder();
+        builder.delete_column(1).unwrap();
+        let schema = builder.commit();
+        assert_eq!(schema.version(), 1);
+        assert_eq!(schema.num_columns(), 1);
+
+        let value = Value::new(vec![
+            Some(Column::new(ValueType::Put, Bytes::from_static(b"v0"))),
+            Some(Column::new(ValueType::Put, Bytes::from_static(b"v1"))),
+        ]);
+        let evolved = manager.evolve_value(value, 0, 1).unwrap();
+        assert_eq!(evolved.columns().len(), 1);
+        assert_eq!(
+            evolved.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"v0"
+        );
     }
 }

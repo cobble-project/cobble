@@ -102,8 +102,7 @@ impl LocalCompactionWorker {
             .map(|tree| tree.sst_metrics())
             .unwrap_or_else(|| self.metrics_manager.sst_iterator_metrics());
         let mut sst_options = build_sst_writer_options(&self.config, output_level);
-        let schema = self.schema_manager.latest_schema();
-        sst_options.num_columns = schema.num_columns();
+        sst_options.num_columns = self.schema_manager.current_num_columns();
         sst_options.metrics = Some(
             self.metrics_manager
                 .sst_writer_metrics(sst_options.compression),
@@ -118,7 +117,7 @@ impl LocalCompactionWorker {
             file_builder_factory,
             data_file_type,
             ttl_provider,
-            schema,
+            Arc::clone(&self.schema_manager),
         );
         Some(self.submit(task))
     }

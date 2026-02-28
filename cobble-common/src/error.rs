@@ -15,6 +15,8 @@ pub enum Error {
     InputError(String),
     #[error("Internal state error: {0}")]
     InvalidState(String),
+    #[error("File format error: {0}")]
+    FileFormatError(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
