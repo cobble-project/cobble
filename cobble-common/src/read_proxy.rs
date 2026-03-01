@@ -176,7 +176,7 @@ impl ReadProxy {
         }
         let snapshot_key = self.snapshot_key_for_bucket(bucket_id)?;
         let db = self.load_snapshot(&snapshot_key)?;
-        db.get(key, options)
+        db.get(bucket_id, key, options)
     }
 
     pub fn scan(

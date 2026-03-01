@@ -21,6 +21,7 @@ use crate::{Config, ReadOptions, ScanOptions, TimeProvider};
 use bytes::{Bytes, BytesMut};
 use log::info;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -35,6 +36,7 @@ use crate::util::init_logging;
 /// Public database interface.
 pub struct Db {
     id: String,
+    bucket_ranges: Vec<Range<u16>>,
     file_manager: Arc<FileManager>,
     lsm_tree: Arc<LSMTree>,
     memtable_manager: MemtableManager,
@@ -196,8 +198,25 @@ where
 
 impl Db {
     /// Open a database with the provided configuration.
-    #[allow(clippy::single_range_in_vec_init)]
-    pub fn open(config: Config) -> Result<Self> {
+    pub fn open(config: Config, bucket_ranges: Vec<Range<u16>>) -> Result<Self> {
+        if config.total_buckets == 0 {
+            return Err(Error::ConfigError(
+                "total_buckets must be greater than 0".to_string(),
+            ));
+        }
+        if bucket_ranges.is_empty() {
+            return Err(Error::ConfigError(
+                "bucket_ranges must not be empty".to_string(),
+            ));
+        }
+        for range in &bucket_ranges {
+            if range.start >= range.end || range.end > config.total_buckets {
+                return Err(Error::ConfigError(format!(
+                    "Invalid bucket range {}..{} for total_buckets {}",
+                    range.start, range.end, config.total_buckets
+                )));
+            }
+        }
         init_logging(&config);
         metrics_registry::init_metrics();
         let id = Uuid::new_v4().to_string();
@@ -219,7 +238,7 @@ impl Db {
             Arc::clone(&governance_fs),
             create_manifest_lock_provider(Arc::clone(&governance_fs), &config)?,
         );
-        governance.insert_and_publish(&id, vec![0u16..1u16], 1)?;
+        governance.insert_and_publish(&id, bucket_ranges.clone(), config.total_buckets)?;
 
         let file_manager = FileManager::from_config(&config, &id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
@@ -230,6 +249,7 @@ impl Db {
             file_manager,
             db_state,
             id,
+            bucket_ranges,
             0,
             metrics_manager,
             schema_manager,
@@ -253,6 +273,7 @@ impl Db {
     /// Internal helper to write a single column value with the given ValueType.
     fn write_ref<K, V>(
         &self,
+        bucket: u16,
         key: K,
         column: u16,
         value_type: ValueType,
@@ -276,22 +297,23 @@ impl Db {
         let mut columns: Vec<Option<RefColumn<'_>>> = vec![None; num_columns];
         columns[column_idx] = Some(column);
         let record = RefValue::new_with_expired_at(columns, expired_at);
-        let key = RefKey::new(0, key.as_ref());
+        let key = RefKey::new(bucket, key.as_ref());
         self.memtable_manager.put(&key, &record)
     }
 
-    /// Insert a single key/value pair into the given column.
-    pub fn put<K, V>(&self, key: K, column: u16, value: V) -> Result<()>
+    /// Insert a single key/value pair into the given bucket and column.
+    pub fn put<K, V>(&self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.put_with_ttl(key, column, value, None)
+        self.put_with_ttl(bucket, key, column, value, None)
     }
 
-    /// Insert a single key/value pair into the given column with a TTL.
+    /// Insert a single key/value pair into the given bucket and column with a TTL.
     pub fn put_with_ttl<K, V>(
         &self,
+        bucket: u16,
         key: K,
         column: u16,
         value: V,
@@ -301,29 +323,30 @@ impl Db {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.write_ref(key, column, ValueType::Put, value, ttl_seconds)
+        self.write_ref(bucket, key, column, ValueType::Put, value, ttl_seconds)
     }
 
-    /// Delete a single column value.
-    pub fn delete<K>(&self, key: K, column: u16) -> Result<()>
+    /// Delete a single column value in the given bucket.
+    pub fn delete<K>(&self, bucket: u16, key: K, column: u16) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
-        self.write_ref(key, column, ValueType::Delete, [], None)
+        self.write_ref(bucket, key, column, ValueType::Delete, [], None)
     }
 
-    /// Merge a value into the given column.
-    pub fn merge<K, V>(&self, key: K, column: u16, value: V) -> Result<()>
+    /// Merge a value into the given bucket and column.
+    pub fn merge<K, V>(&self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.merge_with_ttl(key, column, value, None)
+        self.merge_with_ttl(bucket, key, column, value, None)
     }
 
-    /// Merge a value into the given column with a TTL.
+    /// Merge a value into the given bucket and column with a TTL.
     pub fn merge_with_ttl<K, V>(
         &self,
+        bucket: u16,
         key: K,
         column: u16,
         value: V,
@@ -333,16 +356,17 @@ impl Db {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.write_ref(key, column, ValueType::Merge, value, ttl_seconds)
+        self.write_ref(bucket, key, column, ValueType::Merge, value, ttl_seconds)
     }
 
     /// Write a batch of operations to the database.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
-        let mut pending: std::collections::BTreeMap<Bytes, Value> =
+        let mut pending: std::collections::BTreeMap<(u16, Bytes), Value> =
             std::collections::BTreeMap::new();
         let schema = self.schema_manager.latest_schema();
         let num_columns = schema.num_columns();
         for (key_and_seq, op) in batch.ops {
+            let bucket = key_and_seq.bucket;
             let column_idx = key_and_seq.column as usize;
             if column_idx >= num_columns {
                 return Err(Error::IoError(format!(
@@ -367,7 +391,7 @@ impl Db {
             let mut columns = vec![None; num_columns];
             columns[column_idx] = Some(column);
             let next_value = Value::new_with_expired_at(columns, expired_at);
-            match pending.entry(key_and_seq.key) {
+            match pending.entry((bucket, key_and_seq.key)) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(next_value);
                 }
@@ -378,8 +402,8 @@ impl Db {
                 }
             }
         }
-        for (raw_key, value) in pending {
-            let key = RefKey::new(0, raw_key.as_ref());
+        for ((bucket, raw_key), value) in pending {
+            let key = RefKey::new(bucket, raw_key.as_ref());
             let columns: Vec<Option<RefColumn<'_>>> = value
                 .columns()
                 .iter()
@@ -440,7 +464,6 @@ impl Db {
     pub fn bucket_snapshot_input(
         &self,
         snapshot_id: u64,
-        ranges: Vec<std::ops::Range<u16>>,
     ) -> Result<crate::maintainer::BucketSnapshotInput> {
         let manifest_name = snapshot_manifest_name(snapshot_id);
         let manifest_path = self
@@ -450,7 +473,7 @@ impl Db {
                 Error::IoError(format!("Snapshot manifest not tracked: {}", manifest_name))
             })?;
         Ok(crate::maintainer::BucketSnapshotInput {
-            ranges,
+            ranges: self.bucket_ranges.clone(),
             db_id: self.id.clone(),
             snapshot_id,
             manifest_path,
@@ -485,6 +508,13 @@ impl Db {
             .max()
             .unwrap_or(0);
         let max_seq = manifest.seq_id;
+        if manifest.bucket_ranges.is_empty() {
+            return Err(Error::InvalidState(format!(
+                "Snapshot {} manifest missing bucket_ranges",
+                snapshot_id
+            )));
+        }
+        let bucket_ranges = manifest.bucket_ranges.clone();
         let levels = build_levels_from_manifest(&file_manager, manifest, true)?;
 
         let db_state = Arc::new(DbStateHandle::new());
@@ -502,6 +532,7 @@ impl Db {
             file_manager,
             db_state,
             db_id,
+            bucket_ranges,
             initial_file_seq,
             metrics_manager,
             schema_manager,
@@ -542,6 +573,13 @@ impl Db {
             Error::IoError(format!("No snapshot manifests found for db {}", db_id))
         })?;
         let manifest = latest.manifest.clone();
+        if manifest.bucket_ranges.is_empty() {
+            return Err(Error::InvalidState(format!(
+                "Snapshot {} manifest missing bucket_ranges",
+                latest.snapshot_id
+            )));
+        }
+        let bucket_ranges = manifest.bucket_ranges.clone();
         let schema_manager = Arc::new(SchemaManager::from_manifests(
             &file_manager,
             loaded.iter().map(|entry| &entry.manifest),
@@ -570,6 +608,7 @@ impl Db {
             file_manager,
             db_state,
             db_id,
+            bucket_ranges,
             max_file_seq.saturating_add(1),
             metrics_manager,
             schema_manager,
@@ -579,11 +618,13 @@ impl Db {
         Ok(db)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_with_state(
         config: Config,
         file_manager: Arc<FileManager>,
         db_state: Arc<DbStateHandle>,
         id: String,
+        bucket_ranges: Vec<Range<u16>>,
         initial_file_seq: u64,
         metrics_manager: Arc<MetricsManager>,
         schema_manager: Arc<SchemaManager>,
@@ -651,6 +692,7 @@ impl Db {
             Arc::clone(&file_manager),
             Arc::clone(&schema_manager),
             config.snapshot_retention,
+            bucket_ranges.clone(),
         );
 
         // Memtable manager setup
@@ -679,6 +721,7 @@ impl Db {
 
         Ok(Self {
             id,
+            bucket_ranges,
             file_manager: Arc::clone(&file_manager),
             lsm_tree,
             memtable_manager,
@@ -701,8 +744,13 @@ impl Db {
         Ok(())
     }
 
-    /// Lookup a key across the memtable and LSM levels.
-    pub fn get(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Vec<Option<Bytes>>>> {
+    /// Lookup a key in a bucket across the memtable and LSM levels.
+    pub fn get(
+        &self,
+        bucket: u16,
+        key: &[u8],
+        options: &ReadOptions,
+    ) -> Result<Option<Vec<Option<Bytes>>>> {
         let schema = self.schema_manager.latest_schema();
         let num_columns = schema.num_columns();
         if let Some(max_index) = options.max_index()
@@ -714,7 +762,7 @@ impl Db {
             )));
         }
         let mut encoded_key = BytesMut::with_capacity(2 + key.len());
-        encode_key_ref_into(&RefKey::new(0, key), &mut encoded_key);
+        encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded_key);
         let encoded_key = encoded_key.freeze();
         let selected_columns = options.columns();
         let masks = options.masks(num_columns);
@@ -827,7 +875,7 @@ impl Db {
     pub fn scan<'a>(
         &'a self,
         bucket: u16,
-        range: std::ops::Range<&[u8]>,
+        range: Range<&[u8]>,
         options: &ScanOptions,
     ) -> Result<DbIterator<'a>> {
         let snapshot = self.memtable_manager.db_state().load();
@@ -903,6 +951,11 @@ mod tests {
         }
     }
 
+    fn open_db(config: Config) -> Db {
+        let total_buckets = config.total_buckets;
+        Db::open(config, std::iter::once(0u16..total_buckets).collect()).unwrap()
+    }
+
     fn decode_u32_counter(bytes: &[u8]) -> u32 {
         u32::from_le_bytes(bytes.try_into().expect("u32 counter bytes"))
     }
@@ -933,10 +986,10 @@ mod tests {
         let root = "/tmp/db_write_batch_flush";
         cleanup_test_root(root);
         let config = config_with_small_memtable(root);
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, vec![b'a'; 64]);
-        batch.put(b"k2", 0, vec![b'b'; 64]);
+        batch.put(0, b"k1", 0, vec![b'a'; 64]);
+        batch.put(0, b"k2", 0, vec![b'b'; 64]);
         db.write_batch(batch).unwrap();
 
         let results = db.memtable_manager.wait_for_flushes();
@@ -957,11 +1010,11 @@ mod tests {
         let root = "/tmp/db_write_batch_put";
         cleanup_test_root(root);
         let config = config_with_small_memtable(root);
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, b"old".to_vec());
-        batch.put(b"k1", 0, b"new".to_vec());
-        batch.put(b"k2", 0, vec![b'x'; 64]);
+        batch.put(0, b"k1", 0, b"old".to_vec());
+        batch.put(0, b"k1", 0, b"new".to_vec());
+        batch.put(0, b"k2", 0, vec![b'x'; 64]);
         db.write_batch(batch).unwrap();
 
         let _ = db.memtable_manager.wait_for_flushes();
@@ -969,7 +1022,7 @@ mod tests {
         let _ = db.memtable_manager.wait_for_flushes();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -991,34 +1044,34 @@ mod tests {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             ..Config::default()
         };
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
         let mut schema = db.update_schema();
         schema
             .set_column_operator(0, Arc::new(PipeMergeOperator))
             .unwrap();
         let _ = schema.commit();
 
-        db.put(b"k1", 0, b"base0").unwrap();
-        db.merge(b"k1", 0, b"a").unwrap();
-        db.merge(b"k1", 0, b"b").unwrap();
-        db.put(b"k1", 1, b"base1").unwrap();
-        db.merge(b"k1", 1, b"a").unwrap();
-        db.merge(b"k1", 1, b"b").unwrap();
+        db.put(0, b"k1", 0, b"base0").unwrap();
+        db.merge(0, b"k1", 0, b"a").unwrap();
+        db.merge(0, b"k1", 0, b"b").unwrap();
+        db.put(0, b"k1", 1, b"base1").unwrap();
+        db.merge(0, b"k1", 1, b"a").unwrap();
+        db.merge(0, b"k1", 1, b"b").unwrap();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         assert_eq!(value[0].as_ref().unwrap().as_ref(), b"base0|a|b");
         assert_eq!(value[1].as_ref().unwrap().as_ref(), b"base1ab");
 
         let mut batch = WriteBatch::new();
-        batch.merge(b"k2", 0, b"a");
-        batch.merge(b"k2", 0, b"b");
+        batch.merge(0, b"k2", 0, b"a");
+        batch.merge(0, b"k2", 0, b"b");
         db.write_batch(batch).unwrap();
 
         let value = db
-            .get(b"k2", &ReadOptions::default())
+            .get(0, b"k2", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         assert_eq!(value[0].as_ref().unwrap().as_ref(), b"a|b");
@@ -1039,7 +1092,7 @@ mod tests {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             ..Config::default()
         };
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
         let mut schema = db.update_schema();
         schema
             .set_column_operator(0, Arc::new(U32CounterMergeOperator))
@@ -1049,14 +1102,14 @@ mod tests {
             .unwrap();
         let _ = schema.commit();
 
-        db.put(b"k1", 0, 10u32.to_le_bytes()).unwrap();
-        db.merge(b"k1", 0, 2u32.to_le_bytes()).unwrap();
-        db.merge(b"k1", 0, 3u32.to_le_bytes()).unwrap();
-        db.put(b"k1", 1, 100u64.to_le_bytes()).unwrap();
-        db.merge(b"k1", 1, 11u64.to_le_bytes()).unwrap();
+        db.put(0, b"k1", 0, 10u32.to_le_bytes()).unwrap();
+        db.merge(0, b"k1", 0, 2u32.to_le_bytes()).unwrap();
+        db.merge(0, b"k1", 0, 3u32.to_le_bytes()).unwrap();
+        db.put(0, b"k1", 1, 100u64.to_le_bytes()).unwrap();
+        db.merge(0, b"k1", 1, 11u64.to_le_bytes()).unwrap();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         assert_eq!(
@@ -1069,14 +1122,14 @@ mod tests {
         );
 
         let mut batch = WriteBatch::new();
-        batch.merge(b"k2", 0, 4u32.to_le_bytes());
-        batch.merge(b"k2", 0, 5u32.to_le_bytes());
-        batch.merge(b"k2", 1, 7u64.to_le_bytes());
-        batch.merge(b"k2", 1, 8u64.to_le_bytes());
+        batch.merge(0, b"k2", 0, 4u32.to_le_bytes());
+        batch.merge(0, b"k2", 0, 5u32.to_le_bytes());
+        batch.merge(0, b"k2", 1, 7u64.to_le_bytes());
+        batch.merge(0, b"k2", 1, 8u64.to_le_bytes());
         db.write_batch(batch).unwrap();
 
         let value = db
-            .get(b"k2", &ReadOptions::default())
+            .get(0, b"k2", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         assert_eq!(
@@ -1104,9 +1157,9 @@ mod tests {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             ..Config::default()
         };
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
-        db.put(b"k1", 0, b"v1").unwrap();
+        db.put(0, b"k1", 0, b"v1").unwrap();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
@@ -1115,7 +1168,7 @@ mod tests {
         let _ = schema.commit();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         assert_eq!(value.len(), 2);
@@ -1138,16 +1191,16 @@ mod tests {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             ..Config::default()
         };
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
-        db.put(b"k1", 0, b"v1").unwrap();
+        db.put(0, b"k1", 0, b"v1").unwrap();
 
         let mut schema = db.update_schema();
         schema.add_column(1, None, None).unwrap();
         let _ = schema.commit();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         assert_eq!(value.len(), 2);
@@ -1176,7 +1229,7 @@ mod tests {
     fn test_db_rejects_separated_value_type_input() {
         let root = "/tmp/db_reject_separated_input";
         cleanup_test_root(root);
-        let db = Db::open(config_with_small_memtable(root)).unwrap();
+        let db = open_db(config_with_small_memtable(root));
 
         for value_type in [
             ValueType::PutSeparated,
@@ -1185,7 +1238,7 @@ mod tests {
             ValueType::PutSeparatedArray,
         ] {
             let err = db
-                .write_ref(b"k1", 0, value_type, b"value", None)
+                .write_ref(0, b"k1", 0, value_type, b"value", None)
                 .unwrap_err();
             assert!(matches!(err, Error::InputError(_)));
         }
@@ -1202,12 +1255,12 @@ mod tests {
             value_separation_threshold: 8,
             ..config_with_small_memtable(root)
         };
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
         let large = b"value-larger-than-threshold";
-        db.put(b"k1", 0, large).unwrap();
+        db.put(0, b"k1", 0, large).unwrap();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         assert_eq!(value[0].as_ref().unwrap().as_ref(), large);
@@ -1227,9 +1280,9 @@ mod tests {
             value_separation_threshold: 8,
             ..config_with_small_memtable(root)
         };
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
         let large = b"value-larger-than-threshold";
-        db.put(b"k1", 0, large).unwrap();
+        db.put(0, b"k1", 0, large).unwrap();
 
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
@@ -1263,7 +1316,7 @@ mod tests {
         assert_eq!(column.data().len(), 8);
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         assert_eq!(value[0].as_ref().unwrap().as_ref(), large);
@@ -1280,13 +1333,13 @@ mod tests {
             value_separation_threshold: 4,
             ..config_with_small_memtable(root)
         };
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
-        db.put(b"k1", 0, b"base-separated").unwrap();
-        db.merge(b"k1", 0, b"-suffix-separated").unwrap();
+        db.put(0, b"k1", 0, b"base-separated").unwrap();
+        db.merge(0, b"k1", 0, b"-suffix-separated").unwrap();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         assert_eq!(
@@ -1303,26 +1356,26 @@ mod tests {
         let root = "/tmp/db_get_newer_l0";
         cleanup_test_root(root);
         let config = config_with_small_memtable(root);
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, b"old".to_vec());
-        batch.put(b"k2", 0, vec![b'a'; 64]);
+        batch.put(0, b"k1", 0, b"old".to_vec());
+        batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, b"new".to_vec());
-        batch.put(b"k3", 0, vec![b'b'; 64]);
+        batch.put(0, b"k1", 0, b"new".to_vec());
+        batch.put(0, b"k3", 0, vec![b'b'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -1337,26 +1390,26 @@ mod tests {
         let root = "/tmp/db_get_merge_l0";
         cleanup_test_root(root);
         let config = config_with_small_memtable(root);
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, b"base".to_vec());
-        batch.put(b"k2", 0, vec![b'a'; 64]);
+        batch.put(0, b"k1", 0, b"base".to_vec());
+        batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.merge(b"k1", 0, b"_x".to_vec());
-        batch.put(b"k3", 0, vec![b'b'; 64]);
+        batch.merge(0, b"k1", 0, b"_x".to_vec());
+        batch.put(0, b"k3", 0, vec![b'b'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -1371,22 +1424,22 @@ mod tests {
         let root = "/tmp/db_get_memtable_overlaps_l0";
         cleanup_test_root(root);
         let config = config_with_small_memtable(root);
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, b"old".to_vec());
-        batch.put(b"k2", 0, vec![b'a'; 64]);
+        batch.put(0, b"k1", 0, b"old".to_vec());
+        batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, b"new".to_vec());
+        batch.put(0, b"k1", 0, b"new".to_vec());
         db.write_batch(batch).unwrap();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -1401,22 +1454,22 @@ mod tests {
         let root = "/tmp/db_get_memtable_merge_l0";
         cleanup_test_root(root);
         let config = config_with_small_memtable(root);
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, b"base".to_vec());
-        batch.put(b"k2", 0, vec![b'a'; 64]);
+        batch.put(0, b"k1", 0, b"base".to_vec());
+        batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.merge(b"k1", 0, b"_x".to_vec());
+        batch.merge(0, b"k1", 0, b"_x".to_vec());
         db.write_batch(batch).unwrap();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -1434,23 +1487,23 @@ mod tests {
             num_columns: 2,
             ..config_with_small_memtable(root)
         };
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, b"c0-old".to_vec());
-        batch.put(b"k1", 1, b"c1-old".to_vec());
-        batch.put(b"k2", 0, vec![b'a'; 64]);
+        batch.put(0, b"k1", 0, b"c0-old".to_vec());
+        batch.put(0, b"k1", 1, b"c1-old".to_vec());
+        batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 1, b"c1-new".to_vec());
+        batch.put(0, b"k1", 1, b"c1-new".to_vec());
         db.write_batch(batch).unwrap();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let col0 = value[0].as_ref().unwrap();
@@ -1470,27 +1523,27 @@ mod tests {
             num_columns: 2,
             ..config_with_small_memtable(root)
         };
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, b"c0".to_vec());
-        batch.put(b"k1", 1, b"c1".to_vec());
-        batch.put(b"k2", 0, vec![b'a'; 64]);
+        batch.put(0, b"k1", 0, b"c0".to_vec());
+        batch.put(0, b"k1", 1, b"c1".to_vec());
+        batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.merge(b"k1", 1, b"_x".to_vec());
-        batch.put(b"k3", 0, vec![b'b'; 64]);
+        batch.merge(0, b"k1", 1, b"_x".to_vec());
+        batch.put(0, b"k3", 0, vec![b'b'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
         let value = db
-            .get(b"k1", &ReadOptions::default())
+            .get(0, b"k1", &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let col0 = value[0].as_ref().unwrap();
@@ -1510,15 +1563,15 @@ mod tests {
             num_columns: 2,
             ..config_with_small_memtable(root)
         };
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, b"c0".to_vec());
-        batch.put(b"k1", 1, b"c1".to_vec());
+        batch.put(0, b"k1", 0, b"c0".to_vec());
+        batch.put(0, b"k1", 1, b"c1".to_vec());
         db.write_batch(batch).unwrap();
 
         let value = db
-            .get(b"k1", &ReadOptions::for_columns(vec![1, 0]))
+            .get(0, b"k1", &ReadOptions::for_columns(vec![1, 0]))
             .unwrap()
             .expect("value present");
         assert_eq!(value.len(), 2);
@@ -1534,18 +1587,18 @@ mod tests {
         let root = "/tmp/db_scan_range";
         cleanup_test_root(root);
         let config = config_with_small_memtable(root);
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(b"k1", 0, b"old".to_vec());
-        batch.put(b"z1", 0, vec![b'a'; 64]);
+        batch.put(0, b"k1", 0, b"old".to_vec());
+        batch.put(0, b"z1", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
-        db.put(b"k1", 0, b"new").unwrap();
-        db.put(b"k2", 0, b"v2").unwrap();
+        db.put(0, b"k1", 0, b"new").unwrap();
+        db.put(0, b"k2", 0, b"v2").unwrap();
 
         let mut iter = db
             .scan(
@@ -1574,9 +1627,9 @@ mod tests {
         let root = "/tmp/db_scan_snapshot";
         cleanup_test_root(root);
         let config = config_with_small_memtable(root);
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
-        db.put(b"k1", 0, b"old").unwrap();
+        db.put(0, b"k1", 0, b"old").unwrap();
         let mut iter = db
             .scan(
                 0,
@@ -1584,7 +1637,7 @@ mod tests {
                 &ScanOptions::default(),
             )
             .unwrap();
-        db.put(b"k1", 0, b"new").unwrap();
+        db.put(0, b"k1", 0, b"new").unwrap();
 
         let (key, columns) = iter.next().unwrap().unwrap();
         assert_eq!(key.as_ref(), b"k1");
@@ -1600,10 +1653,10 @@ mod tests {
         let root = "/tmp/db_scan_read_ahead";
         cleanup_test_root(root);
         let config = config_with_small_memtable(root);
-        let db = Db::open(config).unwrap();
+        let db = open_db(config);
 
-        db.put(b"k1", 0, b"v1").unwrap();
-        db.put(b"k2", 0, b"v2").unwrap();
+        db.put(0, b"k1", 0, b"v1").unwrap();
+        db.put(0, b"k2", 0, b"v2").unwrap();
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 

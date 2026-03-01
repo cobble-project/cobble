@@ -39,6 +39,11 @@ fn wait_for_missing(path: &str) {
     assert!(!Path::new(path).exists(), "path still exists: {}", path);
 }
 
+fn open_db(config: Config) -> Db {
+    let total_buckets = config.total_buckets;
+    Db::open(config, std::iter::once(0u16..total_buckets).collect()).unwrap()
+}
+
 #[test]
 #[serial_test::serial(file)]
 fn test_db_put_get_large_dataset() {
@@ -63,7 +68,7 @@ fn test_db_put_get_large_dataset() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     let target_bytes = 256 * 1024 * 1024;
     let value_len = 64 * 1024;
@@ -74,7 +79,8 @@ fn test_db_put_get_large_dataset() {
     while total < target_bytes {
         let key = format!("user:{:08}", idx).into_bytes();
         let value = vec![b'v'; value_len];
-        db.put(&key, 0, value.clone()).expect("Put should succeed");
+        db.put(0, &key, 0, value.clone())
+            .expect("Put should succeed");
         expected.insert(key, value);
         total += value_len;
         idx += 1;
@@ -82,7 +88,7 @@ fn test_db_put_get_large_dataset() {
 
     for (key, expected_value) in expected.iter() {
         let value = db
-            .get(key, &ReadOptions::default())
+            .get(0, key, &ReadOptions::default())
             .unwrap()
             .expect("Value present");
         let col = value[0].as_ref().unwrap();
@@ -116,7 +122,7 @@ fn test_db_writebatch_get_large_dataset() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     let target_bytes = 256 * 1024 * 1024;
     let value_len = 64 * 1024;
@@ -128,7 +134,7 @@ fn test_db_writebatch_get_large_dataset() {
         let key = format!("user:{:08}", idx).into_bytes();
         let value = vec![b'v'; value_len];
         let mut batch = WriteBatch::new();
-        batch.put(&key, 0, value.clone());
+        batch.put(0, &key, 0, value.clone());
         db.write_batch(batch).unwrap();
         expected.insert(key, value);
         total += value_len;
@@ -137,7 +143,7 @@ fn test_db_writebatch_get_large_dataset() {
 
     for (key, expected_value) in expected.iter() {
         let value = db
-            .get(key, &ReadOptions::default())
+            .get(0, key, &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -172,7 +178,7 @@ fn test_db_put_get_large_dataset_with_separated_values() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     let target_bytes = 256 * 1024 * 1024;
     let value_len = 8 * 1024;
@@ -183,7 +189,8 @@ fn test_db_put_get_large_dataset_with_separated_values() {
     while total < target_bytes {
         let key = format!("user:{:08}", idx).into_bytes();
         let value = vec![b's'; value_len];
-        db.put(&key, 0, value.clone()).expect("Put should succeed");
+        db.put(0, &key, 0, value.clone())
+            .expect("Put should succeed");
         expected.insert(key, value);
         total += value_len;
         idx += 1;
@@ -191,7 +198,7 @@ fn test_db_put_get_large_dataset_with_separated_values() {
 
     for (key, expected_value) in expected.iter() {
         let value = db
-            .get(key, &ReadOptions::default())
+            .get(0, key, &ReadOptions::default())
             .unwrap()
             .expect("Value present");
         let col = value[0].as_ref().unwrap();
@@ -226,7 +233,7 @@ fn test_db_writebatch_get_large_dataset_with_separated_values() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     let target_bytes = 256 * 1024 * 1024;
     let value_len = 8 * 1024;
@@ -238,7 +245,7 @@ fn test_db_writebatch_get_large_dataset_with_separated_values() {
         let key = format!("user:{:08}", idx).into_bytes();
         let value = vec![b's'; value_len];
         let mut batch = WriteBatch::new();
-        batch.put(&key, 0, value.clone());
+        batch.put(0, &key, 0, value.clone());
         db.write_batch(batch).unwrap();
         expected.insert(key, value);
         total += value_len;
@@ -247,7 +254,7 @@ fn test_db_writebatch_get_large_dataset_with_separated_values() {
 
     for (key, expected_value) in expected.iter() {
         let value = db
-            .get(key, &ReadOptions::default())
+            .get(0, key, &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -278,7 +285,7 @@ fn test_db_counter_merge_large_dataset_with_compaction_and_file_read() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
     let mut schema = db.update_schema();
     schema
         .set_column_operator(0, Arc::new(U64CounterMergeOperator))
@@ -290,10 +297,10 @@ fn test_db_counter_merge_large_dataset_with_compaction_and_file_read() {
     for i in 0..key_count {
         let key = format!("counter:{:05}", i).into_bytes();
         let base = (i % 7 + 1) as u64;
-        db.put(&key, 0, base.to_le_bytes()).unwrap();
+        db.put(0, &key, 0, base.to_le_bytes()).unwrap();
         let mut sum = base;
         for delta in 1..=4u64 {
-            db.merge(&key, 0, delta.to_le_bytes()).unwrap();
+            db.merge(0, &key, 0, delta.to_le_bytes()).unwrap();
             sum += delta;
         }
         expected.insert(key, sum);
@@ -324,13 +331,13 @@ fn test_db_counter_merge_large_dataset_with_compaction_and_file_read() {
 
     for i in 0..200u32 {
         let key = format!("counter:{:05}", i).into_bytes();
-        db.merge(&key, 0, 10u64.to_le_bytes()).unwrap();
+        db.merge(0, &key, 0, 10u64.to_le_bytes()).unwrap();
         *expected.get_mut(&key).unwrap() += 10;
     }
 
     for (key, expected_sum) in expected {
         let value = db
-            .get(&key, &ReadOptions::default())
+            .get(0, &key, &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let bytes = value[0].as_ref().unwrap();
@@ -356,15 +363,15 @@ fn test_schema_persisted_and_restored_across_open_modes() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config.clone()).unwrap();
+    let db = open_db(config.clone());
     let mut schema = db.update_schema();
     schema
         .set_column_operator(0, Arc::new(U64CounterMergeOperator))
         .unwrap();
     let _ = schema.commit();
 
-    db.put(b"counter", 0, 3u64.to_le_bytes()).unwrap();
-    db.merge(b"counter", 0, 4u64.to_le_bytes()).unwrap();
+    db.put(0, b"counter", 0, 3u64.to_le_bytes()).unwrap();
+    db.merge(0, b"counter", 0, 4u64.to_le_bytes()).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
     let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
@@ -387,7 +394,11 @@ fn test_schema_persisted_and_restored_across_open_modes() {
 
     let read_only = Db::open_read_only(config.clone(), snapshot_id, db_id.clone()).unwrap();
     assert_eq!(
-        read_counter(read_only.get(b"counter", &ReadOptions::default()).unwrap()),
+        read_counter(
+            read_only
+                .get(0, b"counter", &ReadOptions::default())
+                .unwrap()
+        ),
         expected
     );
 
@@ -395,7 +406,7 @@ fn test_schema_persisted_and_restored_across_open_modes() {
     assert_eq!(
         read_counter(
             from_snapshot
-                .get(b"counter", &ReadOptions::default())
+                .get(0, b"counter", &ReadOptions::default())
                 .unwrap()
         ),
         expected
@@ -404,7 +415,7 @@ fn test_schema_persisted_and_restored_across_open_modes() {
 
     let resumed = Db::resume(config, db_id).unwrap();
     assert_eq!(
-        read_counter(resumed.get(b"counter", &ReadOptions::default()).unwrap()),
+        read_counter(resumed.get(0, b"counter", &ReadOptions::default()).unwrap()),
         expected
     );
     resumed.close().unwrap();
@@ -425,15 +436,15 @@ fn test_db_get_filters_columns() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     for i in 0..1000 {
         let key = format!("key{:04}", i).into_bytes();
-        db.put(&key, 0, format!("v1:{:04}", i).into_bytes())
+        db.put(0, &key, 0, format!("v1:{:04}", i).into_bytes())
             .expect("Put should succeed");
-        db.put(&key, 1, format!("v2:{:04}", i).into_bytes())
+        db.put(0, &key, 1, format!("v2:{:04}", i).into_bytes())
             .expect("Put should succeed");
-        db.put(&key, 2, format!("v3:{:04}", i).into_bytes())
+        db.put(0, &key, 2, format!("v3:{:04}", i).into_bytes())
             .expect("Put should succeed");
     }
 
@@ -441,7 +452,7 @@ fn test_db_get_filters_columns() {
     for i in 0..1000 {
         let key = format!("key{:04}", i).into_bytes();
         let value = db
-            .get(&key, &options)
+            .get(0, &key, &options)
             .unwrap()
             .expect("Value should present");
         assert_eq!(value.len(), 2);
@@ -472,21 +483,25 @@ fn test_db_delete_with_large_values() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
     let payload = vec![b'd'; 64];
 
-    db.put(b"key", 0, payload.clone()).unwrap();
+    db.put(0, b"key", 0, payload.clone()).unwrap();
     for i in 0..200 {
         let key = format!("fill{:02}", i);
-        db.put(key.as_bytes(), 0, payload.clone()).unwrap();
+        db.put(0, key.as_bytes(), 0, payload.clone()).unwrap();
     }
-    db.delete(b"key", 0).unwrap();
+    db.delete(0, b"key", 0).unwrap();
     for i in 200..400 {
         let key = format!("fill{:03}", i);
-        db.put(key.as_bytes(), 0, payload.clone()).unwrap();
+        db.put(0, key.as_bytes(), 0, payload.clone()).unwrap();
     }
 
-    assert!(db.get(b"key", &ReadOptions::default()).unwrap().is_none());
+    assert!(
+        db.get(0, b"key", &ReadOptions::default())
+            .unwrap()
+            .is_none()
+    );
     cleanup_test_root(root);
 }
 
@@ -504,23 +519,23 @@ fn test_db_merge_with_large_values() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
     let base = vec![b'a'; 64];
     let suffix = vec![b'b'; 32];
 
-    db.put(b"key", 0, base.clone()).unwrap();
+    db.put(0, b"key", 0, base.clone()).unwrap();
     for i in 0..200 {
         let key = format!("fill{:02}", i);
-        db.put(key.as_bytes(), 0, base.clone()).unwrap();
+        db.put(0, key.as_bytes(), 0, base.clone()).unwrap();
     }
-    db.merge(b"key", 0, suffix.clone()).unwrap();
+    db.merge(0, b"key", 0, suffix.clone()).unwrap();
     for i in 200..400 {
         let key = format!("fill{:03}", i);
-        db.put(key.as_bytes(), 0, base.clone()).unwrap();
+        db.put(0, key.as_bytes(), 0, base.clone()).unwrap();
     }
 
     let value = db
-        .get(b"key", &ReadOptions::default())
+        .get(0, b"key", &ReadOptions::default())
         .unwrap()
         .expect("value present");
     let mut expected = base;
@@ -557,20 +572,24 @@ fn test_db_ttl_put_get_with_manual_time() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     // Put with explicit TTL of 10 seconds
     let mut batch = WriteBatch::new();
-    batch.put_with_ttl(b"key", 0, b"value".to_vec(), Some(10));
+    batch.put_with_ttl(0, b"key", 0, b"value".to_vec(), Some(10));
     db.write_batch(batch).unwrap();
 
     // At t=1000, value should be visible
-    let v = db.get(b"key", &ReadOptions::default()).unwrap().unwrap();
+    let v = db.get(0, b"key", &ReadOptions::default()).unwrap().unwrap();
     assert_eq!(v[0].as_ref().unwrap().as_ref(), b"value");
 
     // Advance time past expiry
     db.set_time(1_011);
-    assert!(db.get(b"key", &ReadOptions::default()).unwrap().is_none());
+    assert!(
+        db.get(0, b"key", &ReadOptions::default())
+            .unwrap()
+            .is_none()
+    );
 
     cleanup_test_root(root);
 }
@@ -603,19 +622,27 @@ fn test_db_ttl_default_ttl_with_manual_time() {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     // Put without explicit TTL uses default (5s)
     let mut batch = WriteBatch::new();
-    batch.put(b"foo", 0, b"bar".to_vec());
+    batch.put(0, b"foo", 0, b"bar".to_vec());
     db.write_batch(batch).unwrap();
 
     // Before expiry
-    assert!(db.get(b"foo", &ReadOptions::default()).unwrap().is_some());
+    assert!(
+        db.get(0, b"foo", &ReadOptions::default())
+            .unwrap()
+            .is_some()
+    );
 
     // Move to expiry boundary
     db.set_time(5_005);
-    assert!(db.get(b"foo", &ReadOptions::default()).unwrap().is_none());
+    assert!(
+        db.get(0, b"foo", &ReadOptions::default())
+            .unwrap()
+            .is_none()
+    );
 
     cleanup_test_root(root);
 }
@@ -630,14 +657,15 @@ fn test_db_snapshot_creates_manifest() {
         memtable_capacity: 128,
         memtable_buffer_count: 2,
         num_columns: 1,
+        total_buckets: 8,
         block_cache_size: 0,
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     let mut batch = WriteBatch::new();
-    batch.put(b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1".to_vec());
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -660,15 +688,16 @@ fn test_single_node_db_snapshot_updates_global_manifest() {
         memtable_capacity: 128,
         memtable_buffer_count: 2,
         num_columns: 1,
+        total_buckets: 8,
         block_cache_size: 0,
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = SingleNodeDb::open(config.clone(), 4).unwrap();
+    let db = SingleNodeDb::open(config.clone()).unwrap();
 
-    db.put(b"k1", 0, b"v1".to_vec()).unwrap();
-    db.put(b"k2", 0, b"v2".to_vec()).unwrap();
-    db.put(b"x1", 0, b"vx".to_vec()).unwrap();
+    db.put(0, b"k1", 0, b"v1".to_vec()).unwrap();
+    db.put(0, b"k2", 0, b"v2".to_vec()).unwrap();
+    db.put(0, b"x1", 0, b"vx".to_vec()).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let global_id = db
         .snapshot_with_callback(move |result| {
@@ -722,12 +751,12 @@ fn test_db_snapshot_read_only_get_with_vec_memtable() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config.clone()).unwrap();
+    let db = open_db(config.clone());
     let mut expected = HashMap::new();
     for i in 0..128u32 {
         let key = format!("k{:04}", i).into_bytes();
         let value = format!("value-{:04}", i).into_bytes();
-        db.put(&key, 0, value.clone()).unwrap();
+        db.put(0, &key, 0, value.clone()).unwrap();
         expected.insert(key, value);
     }
 
@@ -738,7 +767,7 @@ fn test_db_snapshot_read_only_get_with_vec_memtable() {
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
     for (key, expected_value) in expected.iter() {
         let value = ro
-            .get(key, &ReadOptions::default())
+            .get(0, key, &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -763,12 +792,12 @@ fn test_db_snapshot_read_only_get_with_vec_memtable_separated_values() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config.clone()).unwrap();
+    let db = open_db(config.clone());
     let mut expected = HashMap::new();
     for i in 0..64u32 {
         let key = format!("k{:04}", i).into_bytes();
         let value = vec![b'a' + (i % 26) as u8; 96];
-        db.put(&key, 0, value.clone()).unwrap();
+        db.put(0, &key, 0, value.clone()).unwrap();
         expected.insert(key, value);
     }
 
@@ -779,7 +808,7 @@ fn test_db_snapshot_read_only_get_with_vec_memtable_separated_values() {
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
     for (key, expected_value) in expected.iter() {
         let value = ro
-            .get(key, &ReadOptions::default())
+            .get(0, key, &ReadOptions::default())
             .unwrap()
             .expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -802,10 +831,10 @@ fn test_db_snapshot_read_only_get() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config.clone()).unwrap();
+    let db = open_db(config.clone());
 
     let mut batch = WriteBatch::new();
-    batch.put(b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1".to_vec());
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -814,7 +843,7 @@ fn test_db_snapshot_read_only_get() {
 
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
     let value = ro
-        .get(b"k1", &ReadOptions::default())
+        .get(0, b"k1", &ReadOptions::default())
         .unwrap()
         .expect("value present");
     let col = value[0].as_ref().unwrap();
@@ -838,11 +867,11 @@ fn test_db_snapshot_read_only_get_with_separated_value() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config.clone()).unwrap();
+    let db = open_db(config.clone());
     let large = b"value-larger-than-threshold";
 
     let mut batch = WriteBatch::new();
-    batch.put(b"k1", 0, large.to_vec());
+    batch.put(0, b"k1", 0, large.to_vec());
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -851,7 +880,7 @@ fn test_db_snapshot_read_only_get_with_separated_value() {
 
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
     let value = ro
-        .get(b"k1", &ReadOptions::default())
+        .get(0, b"k1", &ReadOptions::default())
         .unwrap()
         .expect("value present");
     let col = value[0].as_ref().unwrap();
@@ -875,12 +904,12 @@ fn test_db_snapshot_read_only_scan_with_separated_value() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config.clone()).unwrap();
+    let db = open_db(config.clone());
     let huge = vec![b'h'; 128];
-    db.put(b"aa", 0, b"ignore-left").unwrap();
-    db.put(b"k1", 0, b"v1").unwrap();
-    db.put(b"k2", 0, huge.clone()).unwrap();
-    db.put(b"z1", 0, b"ignore-right").unwrap();
+    db.put(0, b"aa", 0, b"ignore-left").unwrap();
+    db.put(0, b"k1", 0, b"v1").unwrap();
+    db.put(0, b"k2", 0, huge.clone()).unwrap();
+    db.put(0, b"z1", 0, b"ignore-right").unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
@@ -921,12 +950,12 @@ fn test_db_incremental_snapshot_restore() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config.clone()).unwrap();
-    db.put(b"k1", 0, b"v1").unwrap();
+    let db = open_db(config.clone());
+    db.put(0, b"k1", 0, b"v1").unwrap();
     let base_snapshot_id = db.snapshot().unwrap();
     let _ = wait_for_manifest_in_db(root, db.id(), base_snapshot_id);
 
-    db.put(b"k2", 0, b"v2").unwrap();
+    db.put(0, b"k2", 0, b"v2").unwrap();
     let incremental_snapshot_id = db.snapshot().unwrap();
     let incremental_manifest = wait_for_manifest_in_db(root, db.id(), incremental_snapshot_id);
     let manifest_json: JsonValue = serde_json::from_str(&incremental_manifest).unwrap();
@@ -942,12 +971,12 @@ fn test_db_incremental_snapshot_restore() {
     let ro =
         Db::open_read_only(config.clone(), incremental_snapshot_id, db.id().to_string()).unwrap();
     let value1 = ro
-        .get(b"k1", &ReadOptions::default())
+        .get(0, b"k1", &ReadOptions::default())
         .unwrap()
         .expect("k1 value present");
     assert_eq!(value1[0].as_ref().unwrap().as_ref(), b"v1");
     let value2 = ro
-        .get(b"k2", &ReadOptions::default())
+        .get(0, b"k2", &ReadOptions::default())
         .unwrap()
         .expect("k2 value present");
     assert_eq!(value2[0].as_ref().unwrap().as_ref(), b"v2");
@@ -955,12 +984,12 @@ fn test_db_incremental_snapshot_restore() {
     let writable =
         Db::open_from_snapshot(config, incremental_snapshot_id, db.id().to_string()).unwrap();
     let value1 = writable
-        .get(b"k1", &ReadOptions::default())
+        .get(0, b"k1", &ReadOptions::default())
         .unwrap()
         .expect("k1 value present");
     assert_eq!(value1[0].as_ref().unwrap().as_ref(), b"v1");
     let value2 = writable
-        .get(b"k2", &ReadOptions::default())
+        .get(0, b"k2", &ReadOptions::default())
         .unwrap()
         .expect("k2 value present");
     assert_eq!(value2[0].as_ref().unwrap().as_ref(), b"v2");
@@ -982,11 +1011,11 @@ fn test_db_incremental_snapshot_keeps_base_manifest_live() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
-    db.put(b"k1", 0, b"v1").unwrap();
+    let db = open_db(config);
+    db.put(0, b"k1", 0, b"v1").unwrap();
     let base_snapshot_id = db.snapshot().unwrap();
     let _ = wait_for_manifest_in_db(root, db.id(), base_snapshot_id);
-    db.put(b"k2", 0, b"v2").unwrap();
+    db.put(0, b"k2", 0, b"v2").unwrap();
     let incremental_snapshot_id = db.snapshot().unwrap();
     let _ = wait_for_manifest_in_db(root, db.id(), incremental_snapshot_id);
 
@@ -1019,10 +1048,10 @@ fn test_db_open_from_snapshot_allows_writes() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config.clone()).unwrap();
+    let db = open_db(config.clone());
 
     let mut batch = WriteBatch::new();
-    batch.put(b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1".to_vec());
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -1031,18 +1060,18 @@ fn test_db_open_from_snapshot_allows_writes() {
 
     let writable = Db::open_from_snapshot(config, snapshot_id, db.id().to_string()).unwrap();
     let mut batch = WriteBatch::new();
-    batch.put(b"k2", 0, b"v2".to_vec());
+    batch.put(0, b"k2", 0, b"v2".to_vec());
     writable.write_batch(batch).unwrap();
 
     let value = writable
-        .get(b"k1", &ReadOptions::default())
+        .get(0, b"k1", &ReadOptions::default())
         .unwrap()
         .expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
 
     let value = writable
-        .get(b"k2", &ReadOptions::default())
+        .get(0, b"k2", &ReadOptions::default())
         .unwrap()
         .expect("value present");
     let col = value[0].as_ref().unwrap();
@@ -1061,12 +1090,13 @@ fn test_db_resume_takes_over_snapshot_lifecycle() {
         memtable_capacity: 128,
         memtable_buffer_count: 2,
         num_columns: 1,
+        total_buckets: 8,
         block_cache_size: 0,
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config.clone()).unwrap();
-    db.put(b"k1", 0, b"v1").unwrap();
+    let db = open_db(config.clone());
+    db.put(0, b"k1", 0, b"v1").unwrap();
     let snapshot_id = db.snapshot().unwrap();
     assert!(db.retain_snapshot(snapshot_id));
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
@@ -1077,12 +1107,13 @@ fn test_db_resume_takes_over_snapshot_lifecycle() {
     assert!(!writable.expire_snapshot(snapshot_id).unwrap());
     writable.close().unwrap();
 
-    let writable = Db::resume(config, db.id().to_string()).unwrap();
-    assert!(
-        writable
-            .bucket_snapshot_input(snapshot_id, vec![0u16..1u16])
-            .is_ok()
-    );
+    let resume_config = Config {
+        total_buckets: 1,
+        ..config
+    };
+    let writable = Db::resume(resume_config, db.id().to_string()).unwrap();
+    let bucket_snapshot = writable.bucket_snapshot_input(snapshot_id).unwrap();
+    assert_eq!(bucket_snapshot.ranges, vec![0u16..8u16]);
 
     let manifest_path = format!(
         "{}/{}",
@@ -1109,10 +1140,10 @@ fn test_db_metrics_list() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     let mut batch = WriteBatch::new();
-    batch.put(b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1".to_vec());
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -1164,10 +1195,10 @@ fn test_db_expire_snapshot_releases_manifest() {
         block_cache_size: 0,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     let mut batch = WriteBatch::new();
-    batch.put(b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1".to_vec());
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -1200,17 +1231,17 @@ fn test_db_snapshot_auto_expire() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     let mut batch = WriteBatch::new();
-    batch.put(b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1".to_vec());
     db.write_batch(batch).unwrap();
 
     let first_id = db.snapshot().unwrap();
     let _ = wait_for_manifest_in_db(root, db.id(), first_id);
 
     let mut batch = WriteBatch::new();
-    batch.put(b"k2", 0, b"v2".to_vec());
+    batch.put(0, b"k2", 0, b"v2".to_vec());
     db.write_batch(batch).unwrap();
 
     let second_id = db.snapshot().unwrap();
@@ -1241,10 +1272,10 @@ fn test_db_snapshot_retain_skips_auto_expire() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     let mut batch = WriteBatch::new();
-    batch.put(b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1".to_vec());
     db.write_batch(batch).unwrap();
 
     let first_id = db.snapshot().unwrap();
@@ -1252,7 +1283,7 @@ fn test_db_snapshot_retain_skips_auto_expire() {
     assert!(db.retain_snapshot(first_id));
 
     let mut batch = WriteBatch::new();
-    batch.put(b"k2", 0, b"v2".to_vec());
+    batch.put(0, b"k2", 0, b"v2".to_vec());
     db.write_batch(batch).unwrap();
 
     let second_id = db.snapshot().unwrap();
@@ -1282,22 +1313,22 @@ fn test_db_scan_put_reads_from_memtable_and_sst() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     let huge_sst = vec![b's'; 512];
     let huge_mem = vec![b'm'; 768];
 
-    db.put(b"aaa:outside", 0, b"ignore-left").unwrap();
-    db.put(b"mix:key", 0, b"old").unwrap();
-    db.put(b"mix:huge-sst", 0, huge_sst.clone()).unwrap();
+    db.put(0, b"aaa:outside", 0, b"ignore-left").unwrap();
+    db.put(0, b"mix:key", 0, b"old").unwrap();
+    db.put(0, b"mix:huge-sst", 0, huge_sst.clone()).unwrap();
     for i in 0..200u32 {
         let key = format!("fill:{:04}", i).into_bytes();
-        db.put(&key, 0, vec![b'f'; 96]).unwrap();
+        db.put(0, &key, 0, vec![b'f'; 96]).unwrap();
     }
-    db.put(b"mix:key", 0, b"new").unwrap();
-    db.put(b"mix:huge-mem", 0, huge_mem.clone()).unwrap();
-    db.put(b"mix:tail", 0, b"tail").unwrap();
-    db.put(b"zzz:outside", 0, b"ignore-right").unwrap();
+    db.put(0, b"mix:key", 0, b"new").unwrap();
+    db.put(0, b"mix:huge-mem", 0, huge_mem.clone()).unwrap();
+    db.put(0, b"mix:tail", 0, b"tail").unwrap();
+    db.put(0, b"zzz:outside", 0, b"ignore-right").unwrap();
 
     let mut iter = db
         .scan(
@@ -1352,15 +1383,16 @@ fn test_db_scan_put_range_keeps_latest_value() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = Db::open(config).unwrap();
+    let db = open_db(config);
 
     for i in 0..160u32 {
         let key = format!("r:{:04}", i).into_bytes();
-        db.put(&key, 0, format!("v:{:04}", i).into_bytes()).unwrap();
+        db.put(0, &key, 0, format!("v:{:04}", i).into_bytes())
+            .unwrap();
     }
-    db.put(b"q:outside", 0, b"left").unwrap();
-    db.put(b"r:0050", 0, b"latest").unwrap();
-    db.put(b"s:outside", 0, b"right").unwrap();
+    db.put(0, b"q:outside", 0, b"left").unwrap();
+    db.put(0, b"r:0050", 0, b"latest").unwrap();
+    db.put(0, b"s:outside", 0, b"right").unwrap();
 
     let mut iter = db
         .scan(

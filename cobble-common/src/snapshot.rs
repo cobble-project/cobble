@@ -10,6 +10,7 @@ use crate::schema::SchemaManager;
 use crate::vlog::VlogVersion;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -29,6 +30,7 @@ pub(crate) struct DbSnapshot {
     pub vlog_version: VlogVersion,
     pub seq_id: u64,
     pub latest_schema_id: u64,
+    pub bucket_ranges: Vec<Range<u16>>,
     pub finished: bool,
     pub callback: Option<SnapshotCallback>,
 }
@@ -41,6 +43,8 @@ pub(crate) struct ManifestSnapshot {
     pub(crate) seq_id: u64,
     pub(crate) latest_schema_id: u64,
     #[serde(default)]
+    pub(crate) bucket_ranges: Vec<Range<u16>>,
+    #[serde(default)]
     pub(crate) levels: Vec<ManifestLevel>,
     #[serde(default)]
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
@@ -52,6 +56,8 @@ pub(crate) struct ManifestIncrementalSnapshot {
     pub(crate) seq_id: u64,
     pub(crate) base_snapshot_id: u64,
     pub(crate) latest_schema_id: u64,
+    #[serde(default)]
+    pub(crate) bucket_ranges: Vec<Range<u16>>,
     #[serde(default)]
     pub(crate) level_edits: Vec<ManifestLevelEdit>,
     // always include vlog file info in incremental manifests since vlog files are more likely to have changes
@@ -122,6 +128,7 @@ impl DbSnapshot {
             vlog_version: VlogVersion::new(),
             seq_id: 0,
             latest_schema_id: 0,
+            bucket_ranges: Vec::new(),
             finished: false,
             callback,
         }
@@ -131,6 +138,7 @@ impl DbSnapshot {
 pub(crate) struct SnapshotManager {
     file_manager: Arc<FileManager>,
     schema_manager: Arc<SchemaManager>,
+    bucket_ranges: Vec<Range<u16>>,
     state: Arc<Mutex<SnapshotManagerState>>,
     retention: Option<usize>,
     /// Background worker for manifest materialization.
@@ -144,6 +152,7 @@ impl Clone for SnapshotManager {
         Self {
             file_manager: Arc::clone(&self.file_manager),
             schema_manager: Arc::clone(&self.schema_manager),
+            bucket_ranges: self.bucket_ranges.clone(),
             state: Arc::clone(&self.state),
             retention: self.retention,
             materialize_tx: Arc::clone(&self.materialize_tx),
@@ -172,10 +181,12 @@ impl SnapshotManager {
         file_manager: Arc<FileManager>,
         schema_manager: Arc<SchemaManager>,
         retention: Option<usize>,
+        bucket_ranges: Vec<Range<u16>>,
     ) -> Self {
         Self {
             file_manager,
             schema_manager,
+            bucket_ranges,
             state: Arc::new(Mutex::new(SnapshotManagerState {
                 next_id: 0,
                 snapshots: BTreeMap::new(),
@@ -219,7 +230,8 @@ impl SnapshotManager {
         let id = state.next_id;
         state.next_id += 1;
         let manifest_path = self.file_manager.metadata_path(&snapshot_manifest_name(id));
-        let snapshot = DbSnapshot::new(id, manifest_path, callback);
+        let mut snapshot = DbSnapshot::new(id, manifest_path, callback);
+        snapshot.bucket_ranges = self.bucket_ranges.clone();
         state.snapshots.insert(id, snapshot.clone());
         // initialize incremental references with self-reference
         state
@@ -312,6 +324,11 @@ impl SnapshotManager {
             vlog_version: build_vlog_version_from_manifest_untracked(manifest),
             seq_id: manifest.seq_id,
             latest_schema_id: manifest.latest_schema_id,
+            bucket_ranges: if manifest.bucket_ranges.is_empty() {
+                self.bucket_ranges.clone()
+            } else {
+                manifest.bucket_ranges.clone()
+            },
             finished: true,
             callback: None,
         };
@@ -561,6 +578,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             id: snapshot.id,
             seq_id: snapshot.seq_id,
             latest_schema_id: snapshot.latest_schema_id,
+            bucket_ranges: snapshot.bucket_ranges.clone(),
             levels: manifest_levels_from_snapshot(&snapshot.levels, file_manager),
             vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
         })
@@ -574,6 +592,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 seq_id: snapshot.seq_id,
                 base_snapshot_id: base.id,
                 latest_schema_id: snapshot.latest_schema_id,
+                bucket_ranges: snapshot.bucket_ranges.clone(),
                 level_edits,
                 vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
             })
@@ -764,6 +783,9 @@ pub(crate) fn load_manifest_chain(
                 resolved_base.id = manifest.id;
                 resolved_base.seq_id = manifest.seq_id;
                 resolved_base.latest_schema_id = manifest.latest_schema_id;
+                if !manifest.bucket_ranges.is_empty() {
+                    resolved_base.bucket_ranges = manifest.bucket_ranges;
+                }
                 (Some(manifest.base_snapshot_id), resolved_base)
             }
         };

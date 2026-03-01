@@ -294,6 +294,8 @@ pub struct Config {
     pub memtable_type: MemtableType,
     /// Number of columns in the value schema.
     pub num_columns: usize,
+    /// Total number of buckets in the cluster.
+    pub total_buckets: u16,
     /// Maximum number of L0 files before triggering compaction.
     pub l0_file_limit: usize,
     /// Maximum number of immutables + L0 files before write stall.
@@ -358,6 +360,7 @@ impl Default for Config {
             memtable_buffer_count: 2,
             memtable_type: MemtableType::Hash,
             num_columns: 1,
+            total_buckets: 1,
             l0_file_limit: 4,
             write_stall_limit: None,
             l1_base_bytes: 64 * 1024 * 1024,
@@ -488,6 +491,7 @@ mod tests {
             memtable_buffer_count: 3,
             memtable_type: MemtableType::Vec,
             num_columns: 2,
+            total_buckets: 1024,
             l0_file_limit: 5,
             write_stall_limit: Some(12),
             l1_base_bytes: 8 * 1024,
@@ -540,6 +544,7 @@ mod tests {
         assert!(decoded.volumes[0].supports(VolumeUsageKind::Meta));
         assert_eq!(decoded.memtable_capacity, 1024);
         assert_eq!(decoded.memtable_type, MemtableType::Vec);
+        assert_eq!(decoded.total_buckets, 1024);
         assert_eq!(decoded.write_stall_limit, Some(12));
         assert_eq!(
             decoded.compaction_policy,

@@ -129,8 +129,13 @@ impl ReadOnlyDb {
         metrics_registry::snapshot_metrics(Some(self.metrics_manager.db_id()))
     }
 
-    /// Lookup a key across the snapshot LSM levels.
-    pub fn get(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Vec<Option<Bytes>>>> {
+    /// Lookup a key in a bucket across the snapshot LSM levels.
+    pub fn get(
+        &self,
+        bucket: u16,
+        key: &[u8],
+        options: &ReadOptions,
+    ) -> Result<Option<Vec<Option<Bytes>>>> {
         let schema = self.schema_manager.latest_schema();
         let num_columns = schema.num_columns();
         if let Some(max_index) = options.max_index()
@@ -142,7 +147,7 @@ impl ReadOnlyDb {
             )));
         }
         let mut encoded_key = bytes::BytesMut::with_capacity(2 + key.len());
-        encode_key_ref_into(&RefKey::new(0, key), &mut encoded_key);
+        encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded_key);
         let encoded_key = encoded_key.freeze();
         let masks = options.masks(num_columns);
         let selected_mask = masks.selected_mask.as_deref();

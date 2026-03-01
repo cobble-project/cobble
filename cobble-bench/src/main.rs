@@ -224,7 +224,7 @@ fn run(args: Args) -> Result<(), String> {
 
     match args.mode {
         BenchMode::BulkLoad | BenchMode::BulkLoadSeparated => {
-            let db = SingleNodeDb::open(config.clone(), 1)
+            let db = SingleNodeDb::open(config.clone())
                 .map_err(|err| format!("Failed to open db: {err}"))?;
 
             println!(
@@ -247,7 +247,7 @@ fn run(args: Args) -> Result<(), String> {
 
             while let Some(key_bytes) = generator.next_key() {
                 fill_value_from_key(&mut value, key_bytes);
-                db.put(key_bytes, 0, &value)
+                db.put(0, key_bytes, 0, &value)
                     .map_err(|err| format!("Write failed at key {}: {err}", inserted + 1))?;
                 inserted += 1;
 

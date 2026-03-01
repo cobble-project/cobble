@@ -87,7 +87,8 @@ fn open_configured_db(root: &str) -> Db {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    Db::open(config).unwrap()
+    let total_buckets = config.total_buckets;
+    Db::open(config, std::iter::once(0u16..total_buckets).collect()).unwrap()
 }
 
 fn setup_large_schema_evolution_dataset(root: &str) -> Db {
@@ -95,7 +96,7 @@ fn setup_large_schema_evolution_dataset(root: &str) -> Db {
     let db = open_configured_db(root);
 
     for i in 0..BASE_KEYS {
-        db.put(key(i), 0, old_col0(i)).unwrap();
+        db.put(0, key(i), 0, old_col0(i)).unwrap();
     }
     let snapshot_id = db.snapshot().unwrap();
     wait_for_manifest_in_db(root, db.id(), snapshot_id);
@@ -108,16 +109,16 @@ fn setup_large_schema_evolution_dataset(root: &str) -> Db {
 
     for i in UPDATED_START..UPDATED_END {
         if i % 2 == 0 {
-            db.put(key(i), 0, new_col0(i)).unwrap();
+            db.put(0, key(i), 0, new_col0(i)).unwrap();
         }
-        db.put(key(i), 1, new_col1(i)).unwrap();
+        db.put(0, key(i), 1, new_col1(i)).unwrap();
     }
 
     wait_for_compaction_in_db(&db);
 
     for i in MEMTABLE_ONLY_START..MEMTABLE_ONLY_END {
-        db.put(key(i), 0, new_col0(i)).unwrap();
-        db.put(key(i), 1, new_col1(i)).unwrap();
+        db.put(0, key(i), 0, new_col0(i)).unwrap();
+        db.put(0, key(i), 1, new_col1(i)).unwrap();
     }
 
     db
@@ -131,7 +132,7 @@ fn test_schema_evolution_get_large_mixed_sst_memtable() {
 
     for i in 0..BASE_KEYS {
         let value = db
-            .get(&key(i), &ReadOptions::default())
+            .get(0, &key(i), &ReadOptions::default())
             .unwrap()
             .expect("value present");
         assert_eq!(value.len(), 2);
@@ -157,7 +158,7 @@ fn test_schema_evolution_get_large_mixed_sst_memtable() {
 
     for i in MEMTABLE_ONLY_START..MEMTABLE_ONLY_END {
         let value = db
-            .get(&key(i), &ReadOptions::default())
+            .get(0, &key(i), &ReadOptions::default())
             .unwrap()
             .expect("value present");
         assert_eq!(value.len(), 2);
@@ -250,7 +251,10 @@ fn test_schema_evolution_get_large_with_column_projection() {
         MEMTABLE_ONLY_START,
         MEMTABLE_ONLY_END - 1,
     ] {
-        let value = db.get(&key(i), &options).unwrap().expect("value present");
+        let value = db
+            .get(0, &key(i), &options)
+            .unwrap()
+            .expect("value present");
         assert_eq!(value.len(), 2);
         let expected_col0 = if (UPDATED_START..UPDATED_END).contains(&i) && i % 2 == 0 {
             new_col0(i)

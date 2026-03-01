@@ -3,7 +3,7 @@ use crate::maintainer::{MaintainerConfig, MaintainerNode};
 use crate::{Config, Db, ReadOptions, WriteBatch};
 use bytes::Bytes;
 use log::error;
-use std::ops::{Deref, Range};
+use std::ops::Deref;
 use std::sync::Arc;
 
 /// Single node database that proxies reads/writes and emits global snapshots.
@@ -11,35 +11,20 @@ pub struct SingleNodeDb {
     db: Arc<Db>,
     maintainer: Arc<MaintainerNode>,
     total_buckets: u16,
-    ranges: Vec<Range<u16>>,
 }
 
 impl SingleNodeDb {
-    #[allow(clippy::single_range_in_vec_init)]
-    pub fn open(config: Config, total_buckets: u16) -> Result<Self> {
+    pub fn open(config: Config) -> Result<Self> {
+        let total_buckets = config.total_buckets;
         if total_buckets == 0 {
             return Err(Error::ConfigError(
                 "total_buckets must be greater than 0".to_string(),
             ));
         }
-        let ranges = vec![0u16..total_buckets];
-        if total_buckets == 0 {
-            return Err(Error::ConfigError(
-                "total_buckets must be greater than 0".to_string(),
-            ));
-        }
-        if ranges.is_empty() {
-            return Err(Error::ConfigError("bucket ranges required".to_string()));
-        }
-        for range in &ranges {
-            if range.start >= range.end || range.end > total_buckets {
-                return Err(Error::ConfigError(format!(
-                    "Invalid range {:?} for total buckets {}",
-                    range, total_buckets
-                )));
-            }
-        }
-        let db = Arc::new(Db::open(config.clone())?);
+        let db = Arc::new(Db::open(
+            config.clone(),
+            std::iter::once(0u16..total_buckets).collect(),
+        )?);
         let maintainer = Arc::new(MaintainerNode::open(MaintainerConfig::from_config(
             &config,
         ))?);
@@ -47,7 +32,6 @@ impl SingleNodeDb {
             db,
             maintainer,
             total_buckets,
-            ranges,
         })
     }
 
@@ -66,7 +50,6 @@ impl SingleNodeDb {
         let global_snapshot_id = self.maintainer.allocate_snapshot_id();
         let db = Arc::clone(&self.db);
         let maintainer = Arc::clone(&self.maintainer);
-        let ranges = self.ranges.clone();
         let total_buckets = self.total_buckets;
         self.db.snapshot_with_callback(move |result| {
             let global_result = match result {
@@ -75,7 +58,6 @@ impl SingleNodeDb {
                     &db,
                     snapshot_id,
                     total_buckets,
-                    ranges.clone(),
                     global_snapshot_id,
                 ),
                 Err(err) => Err(err),
@@ -89,20 +71,26 @@ impl SingleNodeDb {
         self.db.as_ref()
     }
 
-    pub fn get(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Vec<Option<Bytes>>>> {
-        self.db.get(key, options)
+    pub fn get(
+        &self,
+        bucket: u16,
+        key: &[u8],
+        options: &ReadOptions,
+    ) -> Result<Option<Vec<Option<Bytes>>>> {
+        self.db.get(bucket, key, options)
     }
 
-    pub fn put<K, V>(&self, key: K, column: u16, value: V) -> Result<()>
+    pub fn put<K, V>(&self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.db.put(key, column, value)
+        self.db.put(bucket, key, column, value)
     }
 
     pub fn put_with_ttl<K, V>(
         &self,
+        bucket: u16,
         key: K,
         column: u16,
         value: V,
@@ -112,26 +100,28 @@ impl SingleNodeDb {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.db.put_with_ttl(key, column, value, ttl_seconds)
+        self.db
+            .put_with_ttl(bucket, key, column, value, ttl_seconds)
     }
 
-    pub fn delete<K>(&self, key: K, column: u16) -> Result<()>
+    pub fn delete<K>(&self, bucket: u16, key: K, column: u16) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
-        self.db.delete(key, column)
+        self.db.delete(bucket, key, column)
     }
 
-    pub fn merge<K, V>(&self, key: K, column: u16, value: V) -> Result<()>
+    pub fn merge<K, V>(&self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.db.merge(key, column, value)
+        self.db.merge(bucket, key, column, value)
     }
 
     pub fn merge_with_ttl<K, V>(
         &self,
+        bucket: u16,
         key: K,
         column: u16,
         value: V,
@@ -141,7 +131,8 @@ impl SingleNodeDb {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.db.merge_with_ttl(key, column, value, ttl_seconds)
+        self.db
+            .merge_with_ttl(bucket, key, column, value, ttl_seconds)
     }
 
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
@@ -170,11 +161,10 @@ fn materialize_global_snapshot(
     db: &Arc<Db>,
     snapshot_id: u64,
     total_buckets: u16,
-    ranges: Vec<Range<u16>>,
     global_snapshot_id: u64,
 ) -> Result<u64> {
     // materialize global snapshot from bucket snapshot
-    let bucket_snapshot = db.bucket_snapshot_input(snapshot_id, ranges)?;
+    let bucket_snapshot = db.bucket_snapshot_input(snapshot_id)?;
     let global_snapshot = maintainer.take_global_snapshot_with_id(
         total_buckets,
         vec![bucket_snapshot],
