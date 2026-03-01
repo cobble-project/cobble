@@ -1,5 +1,5 @@
+use crate::coordinator::{CoordinatorConfig, DbCoordinator};
 use crate::error::{Error, Result};
-use crate::maintainer::{MaintainerConfig, MaintainerNode};
 use crate::{Config, Db, ReadOptions, WriteBatch};
 use bytes::Bytes;
 use log::error;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// Single node database that proxies reads/writes and emits global snapshots.
 pub struct SingleNodeDb {
     db: Arc<Db>,
-    maintainer: Arc<MaintainerNode>,
+    coordinator: Arc<DbCoordinator>,
     total_buckets: u16,
 }
 
@@ -25,12 +25,12 @@ impl SingleNodeDb {
             config.clone(),
             std::iter::once(0u16..total_buckets).collect(),
         )?);
-        let maintainer = Arc::new(MaintainerNode::open(MaintainerConfig::from_config(
+        let coordinator = Arc::new(DbCoordinator::open(CoordinatorConfig::from_config(
             &config,
         ))?);
         Ok(Self {
             db,
-            maintainer,
+            coordinator,
             total_buckets,
         })
     }
@@ -47,14 +47,14 @@ impl SingleNodeDb {
     where
         F: Fn(Result<u64>) + Send + Sync + 'static,
     {
-        let global_snapshot_id = self.maintainer.allocate_snapshot_id();
+        let global_snapshot_id = self.coordinator.allocate_snapshot_id();
         let db = Arc::clone(&self.db);
-        let maintainer = Arc::clone(&self.maintainer);
+        let coordinator = Arc::clone(&self.coordinator);
         let total_buckets = self.total_buckets;
         self.db.snapshot_with_callback(move |result| {
             let global_result = match result {
                 Ok(snapshot_id) => materialize_global_snapshot(
-                    &maintainer,
+                    &coordinator,
                     &db,
                     snapshot_id,
                     total_buckets,
@@ -157,7 +157,7 @@ impl Deref for SingleNodeDb {
 }
 
 fn materialize_global_snapshot(
-    maintainer: &Arc<MaintainerNode>,
+    coordinator: &Arc<DbCoordinator>,
     db: &Arc<Db>,
     snapshot_id: u64,
     total_buckets: u16,
@@ -165,11 +165,11 @@ fn materialize_global_snapshot(
 ) -> Result<u64> {
     // materialize global snapshot from bucket snapshot
     let bucket_snapshot = db.bucket_snapshot_input(snapshot_id)?;
-    let global_snapshot = maintainer.take_global_snapshot_with_id(
+    let global_snapshot = coordinator.take_global_snapshot_with_id(
         total_buckets,
         vec![bucket_snapshot],
         global_snapshot_id,
     )?;
-    maintainer.materialize_global_snapshot(&global_snapshot)?;
+    coordinator.materialize_global_snapshot(&global_snapshot)?;
     Ok(global_snapshot.id)
 }

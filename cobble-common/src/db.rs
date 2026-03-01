@@ -464,7 +464,7 @@ impl Db {
     pub fn bucket_snapshot_input(
         &self,
         snapshot_id: u64,
-    ) -> Result<crate::maintainer::BucketSnapshotInput> {
+    ) -> Result<crate::coordinator::BucketSnapshotInput> {
         let manifest_name = snapshot_manifest_name(snapshot_id);
         let manifest_path = self
             .file_manager
@@ -472,7 +472,7 @@ impl Db {
             .ok_or_else(|| {
                 Error::IoError(format!("Snapshot manifest not tracked: {}", manifest_name))
             })?;
-        Ok(crate::maintainer::BucketSnapshotInput {
+        Ok(crate::coordinator::BucketSnapshotInput {
             ranges: self.bucket_ranges.clone(),
             db_id: self.id.clone(),
             snapshot_id,

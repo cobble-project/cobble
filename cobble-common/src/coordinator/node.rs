@@ -1,9 +1,9 @@
-//! Maintainer node for global snapshot manifests.
+//! Coordinator node for global snapshot manifests.
+use crate::coordinator::CoordinatorConfig;
+use crate::coordinator::file::MetadataWriter;
 use crate::error::Error::IoError;
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, FileSystem, FileSystemRegistry, SequentialWriteFile};
-use crate::maintainer::MaintainerConfig;
-use crate::maintainer::file::MetadataWriter;
 use crate::paths::{
     SNAPSHOT_DIR, global_snapshot_current_path, global_snapshot_manifest_path,
     snapshot_manifest_name,
@@ -39,19 +39,19 @@ pub struct GlobalSnapshotManifest {
     pub bucket_snapshots: Vec<BucketSnapshotRef>,
 }
 
-/// Maintainer node that materializes global snapshots on shared storage.
-pub struct MaintainerNode {
-    config: MaintainerConfig,
+/// Coordinator node that materializes global snapshots on shared storage.
+pub struct DbCoordinator {
+    config: CoordinatorConfig,
     fs: Arc<dyn FileSystem>,
     next_id: AtomicU64,
 }
 
-impl MaintainerNode {
-    pub fn open(config: MaintainerConfig) -> Result<Self> {
+impl DbCoordinator {
+    pub fn open(config: CoordinatorConfig) -> Result<Self> {
         let registry = FileSystemRegistry::new();
         let volumes = if config.volumes.is_empty() {
             return Err(IoError(
-                "No volumes configured for maintainer node".to_string(),
+                "No volumes configured for coordinator node".to_string(),
             ));
         } else {
             config.volumes.clone()
@@ -65,7 +65,7 @@ impl MaintainerNode {
         if !fs.exists(SNAPSHOT_DIR)? {
             fs.create_dir(SNAPSHOT_DIR)?;
         }
-        let config = MaintainerConfig {
+        let config = CoordinatorConfig {
             volumes: config.volumes,
         };
         // determine next snapshot id, load from current pointer
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     #[serial_test::serial(file)]
     fn test_global_snapshot_round_trip() {
-        let root = "/tmp/maintainer_global_snapshot";
+        let root = "/tmp/coordinator_global_snapshot";
         cleanup_root(root);
         let registry = FileSystemRegistry::new();
         let fs = registry
@@ -249,7 +249,7 @@ mod tests {
         let path_a = write_bucket_snapshot(Arc::clone(&fs), root, "db-a", 1);
         let path_b = write_bucket_snapshot(Arc::clone(&fs), root, "db-b", 2);
 
-        let node = MaintainerNode::open(MaintainerConfig {
+        let node = DbCoordinator::open(CoordinatorConfig {
             volumes: vec![crate::config::VolumeDescriptor::new(
                 format!("file://{}", root),
                 vec![

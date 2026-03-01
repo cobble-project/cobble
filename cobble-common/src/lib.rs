@@ -1,9 +1,10 @@
 #![crate_type = "lib"]
 #![allow(dead_code)]
 
-pub mod cache;
+mod cache;
 mod compaction;
 mod config;
+mod coordinator;
 mod data_file;
 mod db;
 mod db_iter;
@@ -15,7 +16,6 @@ mod governance;
 mod iterator;
 mod lru;
 mod lsm;
-mod maintainer;
 mod memtable;
 mod merge_operator;
 mod metrics_manager;
@@ -38,6 +38,10 @@ pub use compaction::RemoteCompactionServer;
 pub use config::{
     CompactionPolicyKind, Config, MemtableType, ReadOptions, ScanOptions, VolumeDescriptor,
     VolumeUsageKind,
+};
+pub use coordinator::{
+    BucketSnapshotInput, BucketSnapshotRef, CoordinatorConfig, DbCoordinator,
+    GlobalSnapshotManifest,
 };
 pub use db::Db;
 pub use db_iter::DbIterator;

@@ -1,8 +1,8 @@
 use crate::config::VolumeUsageKind;
+use crate::coordinator::GlobalSnapshotManifest;
 use crate::error::{Error, Result};
 use crate::file::{File, FileSystem, FileSystemRegistry};
 use crate::lru::LruCache;
-use crate::maintainer::GlobalSnapshotManifest;
 use crate::metrics_manager::MetricsManager;
 #[cfg(test)]
 use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
@@ -360,7 +360,7 @@ fn validate_range(range: &Range<u16>, total_buckets: u16) -> Result<()> {
 mod tests {
     use super::*;
     use crate::VolumeDescriptor;
-    use crate::maintainer::{BucketSnapshotInput, MaintainerConfig, MaintainerNode};
+    use crate::coordinator::{BucketSnapshotInput, CoordinatorConfig, DbCoordinator};
     use std::path::Path;
 
     fn cleanup_root(path: &str) {
@@ -446,11 +446,11 @@ mod tests {
         let path_a = create_bucket_manifest(Arc::clone(&fs), root, &db_a, snap_a);
         let path_b = create_bucket_manifest(Arc::clone(&fs), root, &db_b, snap_b);
 
-        let maintainer = MaintainerNode::open(MaintainerConfig {
+        let coordinator = DbCoordinator::open(CoordinatorConfig {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         })
         .unwrap();
-        let global = maintainer
+        let global = coordinator
             .take_global_snapshot(
                 4,
                 vec![
@@ -469,7 +469,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        maintainer.materialize_global_snapshot(&global).unwrap();
+        coordinator.materialize_global_snapshot(&global).unwrap();
         wait_for_pointer(root, global.id);
 
         let mut proxy = ReadProxy::open_current(ReadProxyConfig {
@@ -517,11 +517,11 @@ mod tests {
         let path_a = create_bucket_manifest(Arc::clone(&fs), root, &db_a, snap_a);
         let path_b = create_bucket_manifest(Arc::clone(&fs), root, &db_b, snap_b);
 
-        let maintainer = MaintainerNode::open(MaintainerConfig {
+        let coordinator = DbCoordinator::open(CoordinatorConfig {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
         })
         .unwrap();
-        let global_a = maintainer
+        let global_a = coordinator
             .take_global_snapshot(
                 4,
                 vec![BucketSnapshotInput {
@@ -532,7 +532,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        maintainer.materialize_global_snapshot(&global_a).unwrap();
+        coordinator.materialize_global_snapshot(&global_a).unwrap();
         wait_for_pointer(root, global_a.id);
 
         let mut proxy = ReadProxy::open_current(ReadProxyConfig {
@@ -547,7 +547,7 @@ mod tests {
             snapshot_id: snap_a,
         })));
 
-        let global_b = maintainer
+        let global_b = coordinator
             .take_global_snapshot(
                 4,
                 vec![BucketSnapshotInput {
@@ -558,7 +558,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        maintainer.materialize_global_snapshot(&global_b).unwrap();
+        coordinator.materialize_global_snapshot(&global_b).unwrap();
         wait_for_pointer(root, global_b.id);
 
         proxy.refresh().unwrap();
