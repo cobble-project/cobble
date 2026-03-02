@@ -254,15 +254,8 @@ impl SchemaManager {
         I: IntoIterator<Item = &'a ManifestSnapshot>,
     {
         let mut schema_ids = BTreeSet::new();
-        let mut max_latest_schema_id = 0u64;
         for manifest in manifests {
-            max_latest_schema_id = max_latest_schema_id.max(manifest.latest_schema_id);
             collect_schema_ids_from_manifest(manifest, &mut schema_ids);
-        }
-        if !schema_ids.is_empty() {
-            for schema_id in 0..=max_latest_schema_id {
-                schema_ids.insert(schema_id);
-            }
         }
         let schemas = schema_ids
             .into_iter()
@@ -399,13 +392,29 @@ impl SchemaManager {
         *self.max_persisted_schema_id.write().unwrap() = Some(max_schema_id);
         Ok(())
     }
+
+    pub(crate) fn max_persisted_schema_id(&self) -> Option<u64> {
+        *self.max_persisted_schema_id.read().unwrap()
+    }
+
+    pub(crate) fn update_max_persisted_schema_id_from_live(&self, live_schema_ids: &BTreeSet<u64>) {
+        *self.max_persisted_schema_id.write().unwrap() =
+            live_schema_ids.iter().next_back().copied();
+    }
 }
 
 fn collect_schema_ids_from_manifest(manifest: &ManifestSnapshot, schema_ids: &mut BTreeSet<u64>) {
-    schema_ids.insert(manifest.latest_schema_id);
+    let latest_schema_id = manifest.latest_schema_id;
+    schema_ids.insert(latest_schema_id);
     for level in &manifest.levels {
         for file in &level.files {
-            schema_ids.insert(file.schema_id);
+            if file.schema_id <= latest_schema_id {
+                for schema_id in file.schema_id..=latest_schema_id {
+                    schema_ids.insert(schema_id);
+                }
+            } else {
+                schema_ids.insert(file.schema_id);
+            }
         }
     }
 }

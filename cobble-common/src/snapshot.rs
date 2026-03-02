@@ -6,6 +6,7 @@ use crate::file::{
     BufferedWriter, File, FileManager, SequentialWriteFile, TrackedFile, TrackedFileId,
 };
 use crate::lsm::Level;
+use crate::paths::schema_file_relative_path;
 use crate::schema::SchemaManager;
 use crate::vlog::VlogVersion;
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,7 @@ pub(crate) struct DbSnapshot {
     pub vlog_version: VlogVersion,
     pub seq_id: u64,
     pub latest_schema_id: u64,
+    pub referenced_schema_ids: BTreeSet<u64>,
     pub bucket_ranges: Vec<Range<u16>>,
     pub finished: bool,
     pub callback: Option<SnapshotCallback>,
@@ -128,6 +130,7 @@ impl DbSnapshot {
             vlog_version: VlogVersion::new(),
             seq_id: 0,
             latest_schema_id: 0,
+            referenced_schema_ids: BTreeSet::new(),
             bucket_ranges: Vec::new(),
             finished: false,
             callback,
@@ -164,7 +167,7 @@ impl Clone for SnapshotManager {
 
 struct SnapshotManagerState {
     next_id: u64,
-    snapshots: BTreeMap<u64, DbSnapshot>,
+    snapshots: BTreeMap<u64, Arc<DbSnapshot>>,
     completed: BTreeSet<u64>,
     retained: HashSet<u64>,
     // Map<snapshot_id, set_of_snapshot_ids_that_it_references>.
@@ -173,6 +176,8 @@ struct SnapshotManagerState {
     // Map<snapshot_id, number_of_references_pointing_to_it>.
     // Counts self-reference and incoming references from incremental children.
     incremental_ref_counts: HashMap<u64, usize>,
+    // Reference counts for schema files used by live snapshots.
+    schema_ref_counts: HashMap<u64, usize>,
     in_flight: usize,
 }
 
@@ -194,6 +199,7 @@ impl SnapshotManager {
                 retained: HashSet::new(),
                 incremental_references: HashMap::new(),
                 incremental_ref_counts: HashMap::new(),
+                schema_ref_counts: HashMap::new(),
                 in_flight: 0,
             })),
             retention,
@@ -225,14 +231,15 @@ impl SnapshotManager {
         Ok(())
     }
 
-    pub(crate) fn create_snapshot(&self, callback: Option<SnapshotCallback>) -> DbSnapshot {
+    pub(crate) fn create_snapshot(&self, callback: Option<SnapshotCallback>) -> Arc<DbSnapshot> {
         let mut state = self.state.lock().unwrap();
         let id = state.next_id;
         state.next_id += 1;
         let manifest_path = self.file_manager.metadata_path(&snapshot_manifest_name(id));
         let mut snapshot = DbSnapshot::new(id, manifest_path, callback);
         snapshot.bucket_ranges = self.bucket_ranges.clone();
-        state.snapshots.insert(id, snapshot.clone());
+        let snapshot = Arc::new(snapshot);
+        state.snapshots.insert(id, Arc::clone(&snapshot));
         // initialize incremental references with self-reference
         state
             .incremental_references
@@ -250,9 +257,10 @@ impl SnapshotManager {
         db_state_handle: &DbStateHandle,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
-        let Some(snapshot) = state.snapshots.get_mut(&id) else {
+        let Some(snapshot) = state.snapshots.get(&id).cloned() else {
             return false;
         };
+        let mut snapshot = (*snapshot).clone();
         snapshot.levels = clone_levels_untracked(&db_state.lsm_version.levels);
         let mut tracked_file_ids: BTreeSet<u64> = db_state
             .lsm_version
@@ -271,12 +279,19 @@ impl SnapshotManager {
             .flat_map(|level| level.files.iter().map(|file| file.schema_id))
             .max()
             .unwrap_or(0);
+        snapshot.referenced_schema_ids =
+            collect_schema_ids_from_levels(&snapshot.levels, snapshot.latest_schema_id);
         snapshot.tracked_files = tracked_file_ids
             .into_iter()
             .filter_map(|file_id| self.file_manager.data_file_ref(file_id).ok())
             .collect();
         snapshot.vlog_version = clone_vlog_version_untracked(&db_state.vlog_version);
         snapshot.base_snapshot_id = db_state.suggested_base_snapshot_id;
+        increment_schema_ref_counts(
+            &mut state.schema_ref_counts,
+            &snapshot.referenced_schema_ids,
+        );
+        state.snapshots.insert(id, Arc::new(snapshot));
         state.completed.insert(id);
         drop(state);
         db_state_handle.update_suggested_snapshot(db_state.seq_id, id);
@@ -315,7 +330,9 @@ impl SnapshotManager {
             })
             .collect::<Result<Vec<_>>>()?;
         let levels = build_levels_from_manifest_untracked(manifest)?;
-        let snapshot = DbSnapshot {
+        let referenced_schema_ids =
+            collect_schema_ids_from_levels(&levels, manifest.latest_schema_id);
+        let snapshot = Arc::new(DbSnapshot {
             id: snapshot_id,
             manifest_path,
             base_snapshot_id,
@@ -324,6 +341,7 @@ impl SnapshotManager {
             vlog_version: build_vlog_version_from_manifest_untracked(manifest),
             seq_id: manifest.seq_id,
             latest_schema_id: manifest.latest_schema_id,
+            referenced_schema_ids,
             bucket_ranges: if manifest.bucket_ranges.is_empty() {
                 self.bucket_ranges.clone()
             } else {
@@ -331,13 +349,17 @@ impl SnapshotManager {
             },
             finished: true,
             callback: None,
-        };
+        });
 
         let mut state = self.state.lock().unwrap();
         state.next_id = state.next_id.max(snapshot_id.saturating_add(1));
         if state.snapshots.contains_key(&snapshot_id) {
             return Ok(());
         }
+        increment_schema_ref_counts(
+            &mut state.schema_ref_counts,
+            &snapshot.referenced_schema_ids,
+        );
         state.completed.insert(snapshot_id);
         state.snapshots.insert(snapshot_id, snapshot);
         let (inserted_self_ref, inserted_base_ref) = {
@@ -385,10 +407,14 @@ impl SnapshotManager {
         let (snapshot, callback, base_snapshot) = {
             let mut state = self.state.lock().unwrap();
             let snapshot = state.snapshots.get(&id).cloned();
-            let callback = state
-                .snapshots
-                .get_mut(&id)
-                .and_then(|snapshot| snapshot.callback.take());
+            let callback = if let Some(current) = state.snapshots.get(&id).cloned() {
+                let mut updated = (*current).clone();
+                let callback = updated.callback.take();
+                state.snapshots.insert(id, Arc::new(updated));
+                callback
+            } else {
+                None
+            };
             // base snapshot must be finished to be used as incremental base, otherwise treat as no base
             let base_snapshot = snapshot
                 .as_ref()
@@ -410,7 +436,7 @@ impl SnapshotManager {
                 incremental_base_id = encode_manifest(
                     &mut buffered,
                     &snapshot,
-                    base_snapshot.as_ref(),
+                    base_snapshot.as_deref(),
                     &self.file_manager,
                 )?;
                 buffered.close()?;
@@ -420,9 +446,11 @@ impl SnapshotManager {
         };
         if result.is_ok() {
             let mut state = self.state.lock().unwrap();
-            if let Some(snapshot) = state.snapshots.get_mut(&id) {
-                snapshot.finished = true;
-                snapshot.base_snapshot_id = incremental_base_id;
+            if let Some(snapshot) = state.snapshots.get(&id).cloned() {
+                let mut updated = (*snapshot).clone();
+                updated.finished = true;
+                updated.base_snapshot_id = incremental_base_id;
+                state.snapshots.insert(id, Arc::new(updated));
             }
             // if there is an incremental base, add reference from the new snapshot to the base;
             if let Some(base_id) = incremental_base_id {
@@ -448,11 +476,12 @@ impl SnapshotManager {
     }
 
     pub(crate) fn expire_snapshot(&self, id: u64) -> Result<bool> {
-        let (removed_snapshots, removed_requested_snapshot) = {
+        let (removed_snapshots, removed_requested_snapshot, removed_schema_ids, live_schema_ids) = {
             let mut state = self.state.lock().unwrap();
             if !state.snapshots.contains_key(&id) {
                 return Ok(false);
             }
+            let mut removed_schema_ids = BTreeSet::new();
             let mut removed_requested_snapshot = false;
             if let Some(refs) = state.incremental_references.get_mut(&id) {
                 removed_requested_snapshot = refs.remove(&id);
@@ -488,6 +517,11 @@ impl SnapshotManager {
                 let Some(snapshot) = state.snapshots.remove(&snapshot_id) else {
                     continue;
                 };
+                decrement_schema_ref_counts(
+                    &mut state.schema_ref_counts,
+                    &snapshot.referenced_schema_ids,
+                    &mut removed_schema_ids,
+                );
                 for referenced_id in referenced {
                     if referenced_id == snapshot_id {
                         continue;
@@ -501,7 +535,16 @@ impl SnapshotManager {
                 }
                 removed_snapshots.push(snapshot);
             }
-            (removed_snapshots, removed_requested_snapshot)
+            (
+                removed_snapshots,
+                removed_requested_snapshot,
+                removed_schema_ids.into_iter().collect::<Vec<_>>(),
+                state
+                    .schema_ref_counts
+                    .keys()
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+            )
         };
         for snapshot in &removed_snapshots {
             self.file_manager
@@ -511,6 +554,21 @@ impl SnapshotManager {
                 .iter()
                 .for_each(|file| file.dereference());
         }
+        let max_persisted_schema_id = self.schema_manager.max_persisted_schema_id();
+        let mut schema_ids_to_remove: BTreeSet<u64> = removed_schema_ids.into_iter().collect();
+        if let Some(max_schema_id) = max_persisted_schema_id {
+            for schema_id in 0..=max_schema_id {
+                if !live_schema_ids.contains(&schema_id) {
+                    schema_ids_to_remove.insert(schema_id);
+                }
+            }
+        }
+        for schema_id in schema_ids_to_remove {
+            self.file_manager
+                .remove_metadata_file(&schema_file_relative_path(schema_id))?;
+        }
+        self.schema_manager
+            .update_max_persisted_schema_id_from_live(&live_schema_ids);
         Ok(removed_requested_snapshot)
     }
 
@@ -855,6 +913,52 @@ fn manifest_data_file_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = 
             .or_insert_with(|| file.path.clone());
     }
     refs.into_iter()
+}
+
+/// Collect all schema IDs referenced by the levels.
+fn collect_schema_ids_from_levels(levels: &[Level], latest_schema_id: u64) -> BTreeSet<u64> {
+    let mut schema_ids = BTreeSet::new();
+    schema_ids.insert(latest_schema_id);
+    for level in levels {
+        for file in &level.files {
+            if file.schema_id <= latest_schema_id {
+                for schema_id in file.schema_id..=latest_schema_id {
+                    schema_ids.insert(schema_id);
+                }
+            } else {
+                schema_ids.insert(file.schema_id);
+            }
+        }
+    }
+    schema_ids
+}
+
+/// Increment schema reference counts for the given schema IDs.
+fn increment_schema_ref_counts(
+    schema_ref_counts: &mut HashMap<u64, usize>,
+    schema_ids: &BTreeSet<u64>,
+) {
+    for schema_id in schema_ids {
+        *schema_ref_counts.entry(*schema_id).or_insert(0) += 1;
+    }
+}
+
+/// Decrement schema reference counts for the given schema IDs, and collect any schema IDs that are no longer referenced.
+fn decrement_schema_ref_counts(
+    schema_ref_counts: &mut HashMap<u64, usize>,
+    schema_ids: &BTreeSet<u64>,
+    removed_schema_ids: &mut BTreeSet<u64>,
+) {
+    for schema_id in schema_ids {
+        let Some(count) = schema_ref_counts.get_mut(schema_id) else {
+            continue;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            schema_ref_counts.remove(schema_id);
+            removed_schema_ids.insert(*schema_id);
+        }
+    }
 }
 
 /// Clone levels and files from the LSM version without tracking.

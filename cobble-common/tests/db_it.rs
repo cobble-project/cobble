@@ -39,6 +39,10 @@ fn wait_for_missing(path: &str) {
     assert!(!Path::new(path).exists(), "path still exists: {}", path);
 }
 
+fn schema_file_path(root: &str, db_id: &str, schema_id: u64) -> String {
+    format!("{}/{}/schema/schema-{}", root, db_id, schema_id)
+}
+
 fn open_db(config: Config) -> Db {
     let total_buckets = config.total_buckets;
     Db::open(config, std::iter::once(0u16..total_buckets).collect()).unwrap()
@@ -1211,6 +1215,57 @@ fn test_db_expire_snapshot_releases_manifest() {
 
     assert!(db.expire_snapshot(snapshot_id).unwrap());
     wait_for_missing(&manifest_path);
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_expire_snapshot_releases_schema_files() {
+    let root = "/tmp/db_snapshot_expire_schema_gc";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config);
+    let mut schema = db.update_schema();
+    schema.add_column(1, None, None).unwrap();
+    let _ = schema.commit();
+
+    db.put(0, b"k1", 1, b"v1").unwrap();
+    let snapshot_id = db.snapshot().unwrap();
+    let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&manifest).unwrap();
+    let latest_schema_id = manifest_json
+        .get("latest_schema_id")
+        .and_then(|value| value.as_u64())
+        .expect("manifest latest_schema_id");
+    let latest_schema_path = schema_file_path(root, db.id(), latest_schema_id);
+    assert!(
+        Path::new(&latest_schema_path).exists(),
+        "missing latest schema file {}",
+        latest_schema_path
+    );
+    let schema0_path = schema_file_path(root, db.id(), 0);
+    let schema0_exists = Path::new(&schema0_path).exists();
+
+    let manifest_path = format!(
+        "{}/{}",
+        root,
+        bucket_snapshot_manifest_path(db.id(), snapshot_id)
+    );
+    assert!(db.expire_snapshot(snapshot_id).unwrap());
+    wait_for_missing(&manifest_path);
+    wait_for_missing(&latest_schema_path);
+    if schema0_exists {
+        wait_for_missing(&schema0_path);
+    }
 
     cleanup_test_root(root);
 }
