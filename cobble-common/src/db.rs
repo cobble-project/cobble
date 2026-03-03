@@ -95,9 +95,7 @@ fn load_manifest_entry(
                 resolved.seq_id = incremental.seq_id;
                 resolved.latest_schema_id = incremental.latest_schema_id;
                 resolved.active_memtable_data = incremental.active_memtable_data;
-                if !incremental.bucket_ranges.is_empty() {
-                    resolved.bucket_ranges = incremental.bucket_ranges;
-                }
+                resolved.bucket_ranges = incremental.bucket_ranges;
                 resolved
             } else {
                 load_manifest_for_snapshot(file_manager, snapshot_id)?

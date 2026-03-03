@@ -407,7 +407,7 @@ mod tests {
         schema_writer.close().unwrap();
         let mut writer = fs.open_write(&manifest_path).unwrap();
         let manifest = format!(
-            "{{\"id\":{},\"seq_id\":0,\"latest_schema_id\":0,\"levels\":[]}}",
+            "{{\"id\":{},\"seq_id\":0,\"latest_schema_id\":0,\"bucket_ranges\":[],\"levels\":[],\"vlog_files\":[],\"active_memtable_data\":[]}}",
             snapshot_id
         );
         writer.write(manifest.as_bytes()).unwrap();
