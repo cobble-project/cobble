@@ -347,6 +347,9 @@ pub struct Config {
     pub log_level: log::LevelFilter,
     /// Automatically take a snapshot on every successful flush.
     pub snapshot_on_flush: bool,
+    /// If active memtable usage ratio is below this value during snapshot, write an
+    /// incremental active-memtable snapshot data file instead of flushing to SST.
+    pub active_memtable_incremental_snapshot_ratio: f64,
     /// Auto-expire snapshots after this many newer snapshots are completed.
     /// None disables auto-expiration.
     pub snapshot_retention: Option<usize>,
@@ -390,6 +393,7 @@ impl Default for Config {
             log_console: false,
             log_level: log::LevelFilter::Info,
             snapshot_on_flush: false,
+            active_memtable_incremental_snapshot_ratio: 0.0,
             snapshot_retention: None,
         }
     }
@@ -521,6 +525,7 @@ mod tests {
             log_console: true,
             log_level: log::LevelFilter::Debug,
             snapshot_on_flush: true,
+            active_memtable_incremental_snapshot_ratio: 0.5,
             snapshot_retention: Some(3),
             compaction_read_ahead_enabled: false,
             compaction_remote_addr: Some("127.0.0.1:9999".to_string()),
@@ -554,6 +559,7 @@ mod tests {
         assert_eq!(decoded.time_provider, crate::time::TimeProviderKind::Manual);
         assert_eq!(decoded.log_level, log::LevelFilter::Debug);
         assert_eq!(decoded.snapshot_retention, Some(3));
+        assert_eq!(decoded.active_memtable_incremental_snapshot_ratio, 0.5);
         assert_eq!(decoded.value_separation_threshold, 4096);
         assert_eq!(decoded.read_proxy.block_cache_size, 2048);
         assert_eq!(decoded.read_proxy.reload_tolerance_seconds, 5);

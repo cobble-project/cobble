@@ -47,6 +47,12 @@ pub(crate) trait Memtable {
     ) -> Result<()>;
     fn blob_cursor_checkpoint(&self) -> usize;
     fn rollback_blob_cursor(&mut self, checkpoint: usize);
+    fn data_offset(&self) -> usize;
+    fn write_data_since(
+        &self,
+        offset: usize,
+        writer: &mut dyn crate::file::SequentialWriteFile,
+    ) -> Result<usize>;
 
     fn iter(&self) -> Self::KvIter<'_>;
 
@@ -239,6 +245,24 @@ impl Memtable for MemtableImpl {
         match self {
             Self::Hash(memtable) => memtable.rollback_blob_cursor(checkpoint),
             Self::Vec(memtable) => memtable.rollback_blob_cursor(checkpoint),
+        }
+    }
+
+    fn data_offset(&self) -> usize {
+        match self {
+            Self::Hash(memtable) => memtable.data_offset(),
+            Self::Vec(memtable) => memtable.data_offset(),
+        }
+    }
+
+    fn write_data_since(
+        &self,
+        offset: usize,
+        writer: &mut dyn crate::file::SequentialWriteFile,
+    ) -> Result<usize> {
+        match self {
+            Self::Hash(memtable) => memtable.write_data_since(offset, writer),
+            Self::Vec(memtable) => memtable.write_data_since(offset, writer),
         }
     }
 

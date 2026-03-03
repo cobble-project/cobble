@@ -716,6 +716,8 @@ impl Db {
                 },
                 metrics_manager: Some(Arc::clone(&metrics_manager)),
                 vlog_store: Some(Arc::clone(&vlog_store)),
+                active_memtable_incremental_snapshot_ratio: config
+                    .active_memtable_incremental_snapshot_ratio,
             },
         )?;
 

@@ -9,6 +9,14 @@ pub(crate) fn snapshot_manifest_name(id: u64) -> String {
     format!("SNAPSHOT-{}", id)
 }
 
+pub(crate) fn snapshot_active_data_name(id: u64) -> String {
+    format!("SNAPSHOT-ACTIVE-DATA-{}", id)
+}
+
+pub(crate) fn snapshot_active_data_relative_path(id: u64) -> String {
+    format!("{}/{}", SNAPSHOT_DIR, snapshot_active_data_name(id))
+}
+
 pub fn bucket_snapshot_manifest_path(db_id: &str, snapshot_id: u64) -> String {
     format!("{}/{}", db_id, snapshot_manifest_relative_path(snapshot_id))
 }

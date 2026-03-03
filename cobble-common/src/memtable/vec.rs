@@ -13,6 +13,8 @@ pub(crate) type MemtableKvIterator<'a> = OrderedMemtableKvIterator<'a>;
 
 pub(crate) struct VecMemtable {
     entries: Vec<(Bytes, Bytes)>,
+    entry_data_offsets: Vec<usize>,
+    data_end: usize,
     blobs: BytesMut,
     capacity: usize,
     used_bytes: usize,
@@ -29,6 +31,8 @@ impl VecMemtable {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: Vec::new(),
+            entry_data_offsets: Vec::new(),
+            data_end: 0,
             blobs: BytesMut::new(),
             capacity,
             used_bytes: 0,
@@ -84,6 +88,8 @@ impl Memtable for VecMemtable {
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let needed = Self::entry_size(key.len(), value.len());
         self.has_space(needed)?;
+        self.entry_data_offsets.push(self.data_end);
+        self.data_end += needed;
         self.entries
             .push((Bytes::copy_from_slice(key), Bytes::copy_from_slice(value)));
         self.used_bytes += needed;
@@ -106,6 +112,8 @@ impl Memtable for VecMemtable {
         let mut value_slice = encoded_value.as_mut_slice();
         encode_key_ref_into(key, &mut key_slice);
         encode_value_ref_into(value, num_columns, &mut value_slice);
+        self.entry_data_offsets.push(self.data_end);
+        self.data_end += needed;
         self.entries
             .push((Bytes::from(encoded_key), Bytes::from(encoded_value)));
         self.used_bytes += needed;
@@ -127,6 +135,8 @@ impl Memtable for VecMemtable {
         let mut key_slice = encoded_key.as_mut_slice();
         encode_key_ref_into(key, &mut key_slice);
         encode_rewritten_value(plan, num_columns, &mut encoded_value[..]);
+        self.entry_data_offsets.push(self.data_end);
+        self.data_end += needed;
         self.entries
             .push((Bytes::from(encoded_key), Bytes::from(encoded_value)));
         self.used_bytes += needed;
@@ -200,6 +210,51 @@ impl Memtable for VecMemtable {
             self.blobs.truncate(checkpoint);
             self.used_bytes = self.used_bytes.saturating_sub(reclaimed);
         }
+    }
+
+    fn data_offset(&self) -> usize {
+        self.data_end
+    }
+
+    fn write_data_since(
+        &self,
+        offset: usize,
+        writer: &mut dyn crate::file::SequentialWriteFile,
+    ) -> Result<usize> {
+        if offset > self.data_end {
+            return Err(Error::InvalidState(format!(
+                "invalid memtable data offset {} > {}",
+                offset, self.data_end
+            )));
+        }
+        if offset == self.data_end {
+            return Ok(0);
+        }
+        let start_idx = self
+            .entry_data_offsets
+            .iter()
+            .position(|entry_offset| *entry_offset >= offset)
+            .ok_or_else(|| Error::InvalidState("missing memtable data offset".to_string()))?;
+        if self.entry_data_offsets[start_idx] != offset {
+            return Err(Error::InvalidState(format!(
+                "unaligned memtable data offset {}",
+                offset
+            )));
+        }
+        let mut written = 0usize;
+        for (key, value) in self.entries.iter().skip(start_idx) {
+            let key_len = (key.len() as u32).to_le_bytes();
+            let value_len = (value.len() as u32).to_le_bytes();
+            writer.write(&key_len)?;
+            writer.write(&value_len)?;
+            writer.write(key)?;
+            writer.write(value)?;
+            written = written
+                .saturating_add(8)
+                .saturating_add(key.len())
+                .saturating_add(value.len());
+        }
+        Ok(written)
     }
 
     fn iter(&self) -> Self::KvIter<'_> {

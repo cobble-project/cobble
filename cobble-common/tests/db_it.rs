@@ -43,6 +43,22 @@ fn schema_file_path(root: &str, db_id: &str, schema_id: u64) -> String {
     format!("{}/{}/schema/schema-{}", root, db_id, schema_id)
 }
 
+fn active_snapshot_segments_from_manifest(
+    manifest_json: &JsonValue,
+) -> Option<Vec<(String, String, u64, u64, u64)>> {
+    let segments = manifest_json.get("active_memtable_data")?.as_array()?;
+    let mut out = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let path = segment.get("path")?.as_str()?.to_string();
+        let memtable_type = segment.get("memtable_type")?.as_str()?.to_string();
+        let memtable_seq = segment.get("memtable_seq")?.as_u64()?;
+        let start_offset = segment.get("start_offset")?.as_u64()?;
+        let end_offset = segment.get("end_offset")?.as_u64()?;
+        out.push((path, memtable_type, memtable_seq, start_offset, end_offset));
+    }
+    Some(out)
+}
+
 fn open_db(config: Config) -> Db {
     let total_buckets = config.total_buckets;
     Db::open(config, std::iter::once(0u16..total_buckets).collect()).unwrap()
@@ -1266,6 +1282,110 @@ fn test_db_expire_snapshot_releases_schema_files() {
     if schema0_exists {
         wait_for_missing(&schema0_path);
     }
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_uses_active_memtable_incremental_data_when_under_threshold() {
+    let root = "/tmp/db_snapshot_active_incremental";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 1024,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        active_memtable_incremental_snapshot_ratio: 0.9,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config);
+    db.put(0, b"k1", 0, b"v1").unwrap();
+
+    let first_snapshot = db.snapshot().unwrap();
+    let first_manifest = wait_for_manifest_in_db(root, db.id(), first_snapshot);
+    let first_manifest_json: JsonValue = serde_json::from_str(&first_manifest).unwrap();
+    let first_segments = active_snapshot_segments_from_manifest(&first_manifest_json)
+        .expect("missing active memtable snapshot data");
+    assert_eq!(first_segments.len(), 1);
+    let (first_path, first_type, first_seq, first_start, first_end) = &first_segments[0];
+    assert!(!first_type.is_empty());
+    assert_eq!(*first_start, 0);
+    assert!(first_end > first_start);
+    let first_file = format!("{}/{}/{}", root, db.id(), first_path);
+    let first_data = std::fs::read(&first_file).unwrap();
+    assert_eq!(first_data.len() as u64, *first_end - *first_start);
+
+    db.put(0, b"k2", 0, b"v2").unwrap();
+    let second_snapshot = db.snapshot().unwrap();
+    let second_manifest = wait_for_manifest_in_db(root, db.id(), second_snapshot);
+    let second_manifest_json: JsonValue = serde_json::from_str(&second_manifest).unwrap();
+    let second_segments = active_snapshot_segments_from_manifest(&second_manifest_json)
+        .expect("missing second active memtable snapshot data");
+    assert_eq!(second_segments.len(), 2);
+    let (_, second_first_type, second_first_seq, second_first_start, second_first_end) =
+        &second_segments[0];
+    assert_eq!(*second_first_type, *first_type);
+    assert_eq!(*second_first_seq, *first_seq);
+    assert_eq!(*second_first_start, *first_start);
+    assert_eq!(*second_first_end, *first_end);
+    let (second_path, second_type, second_seq, second_start, second_end) = &second_segments[1];
+    assert_eq!(*second_type, *first_type);
+    assert_eq!(*second_seq, *first_seq);
+    assert_eq!(*second_start, *first_end);
+    assert!(second_end > second_start);
+    let second_file = format!("{}/{}/{}", root, db.id(), second_path);
+    let second_data = std::fs::read(&second_file).unwrap();
+    assert_eq!(second_data.len() as u64, *second_end - *second_start);
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_falls_back_to_sst_when_active_memtable_above_threshold() {
+    let root = "/tmp/db_snapshot_active_incremental_fallback";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 1024,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        active_memtable_incremental_snapshot_ratio: 0.05,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config);
+    for idx in 0..16u8 {
+        let key = format!("k{}", idx);
+        db.put(0, key.as_bytes(), 0, b"v").unwrap();
+    }
+
+    let snapshot_id = db.snapshot().unwrap();
+    let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&manifest).unwrap();
+    assert_eq!(
+        active_snapshot_segments_from_manifest(&manifest_json).unwrap_or_default(),
+        Vec::new()
+    );
+    let level_files: usize = manifest_json
+        .get("levels")
+        .and_then(|v| v.as_array())
+        .map_or(0, |levels| {
+            levels
+                .iter()
+                .map(|level| {
+                    level
+                        .get("files")
+                        .and_then(|files| files.as_array())
+                        .map_or(0, |files| files.len())
+                })
+                .sum()
+        });
+    assert!(level_files > 0);
 
     cleanup_test_root(root);
 }

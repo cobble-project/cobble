@@ -1,4 +1,5 @@
 //! Snapshot manager and manifest encoding for LSM state.
+use crate::config::MemtableType;
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{DbState, DbStateHandle};
 use crate::error::{Error, Result};
@@ -32,12 +33,22 @@ pub(crate) struct DbSnapshot {
     pub seq_id: u64,
     pub latest_schema_id: u64,
     pub referenced_schema_ids: BTreeSet<u64>,
+    pub active_memtable_data: Vec<ActiveMemtableSnapshotData>,
     pub bucket_ranges: Vec<Range<u16>>,
     pub finished: bool,
     pub callback: Option<SnapshotCallback>,
 }
 
 pub(crate) type SnapshotCallback = Arc<dyn Fn(Result<u64>) + Send + Sync + 'static>;
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct ActiveMemtableSnapshotData {
+    pub(crate) path: String,
+    pub(crate) memtable_type: MemtableType,
+    pub(crate) memtable_seq: u64,
+    pub(crate) start_offset: u64,
+    pub(crate) end_offset: u64,
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
@@ -50,6 +61,8 @@ pub(crate) struct ManifestSnapshot {
     pub(crate) levels: Vec<ManifestLevel>,
     #[serde(default)]
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
+    #[serde(default)]
+    pub(crate) active_memtable_data: Vec<ActiveMemtableSnapshotData>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -65,6 +78,8 @@ pub(crate) struct ManifestIncrementalSnapshot {
     // always include vlog file info in incremental manifests since vlog files are more likely to have changes
     #[serde(default)]
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
+    #[serde(default)]
+    pub(crate) active_memtable_data: Vec<ActiveMemtableSnapshotData>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -131,6 +146,7 @@ impl DbSnapshot {
             seq_id: 0,
             latest_schema_id: 0,
             referenced_schema_ids: BTreeSet::new(),
+            active_memtable_data: Vec::new(),
             bucket_ranges: Vec::new(),
             finished: false,
             callback,
@@ -254,6 +270,7 @@ impl SnapshotManager {
         &self,
         id: u64,
         db_state: &Arc<DbState>,
+        active_memtable_data: Vec<ActiveMemtableSnapshotData>,
         db_state_handle: &DbStateHandle,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
@@ -287,6 +304,7 @@ impl SnapshotManager {
             .collect();
         snapshot.vlog_version = clone_vlog_version_untracked(&db_state.vlog_version);
         snapshot.base_snapshot_id = db_state.suggested_base_snapshot_id;
+        snapshot.active_memtable_data = active_memtable_data;
         increment_schema_ref_counts(
             &mut state.schema_ref_counts,
             &snapshot.referenced_schema_ids,
@@ -305,6 +323,47 @@ impl SnapshotManager {
         }
         state.retained.insert(id);
         true
+    }
+
+    pub(crate) fn active_memtable_snapshot_segments(
+        &self,
+        base_snapshot_id: Option<u64>,
+        memtable_type: MemtableType,
+        memtable_seq: u64,
+    ) -> Vec<ActiveMemtableSnapshotData> {
+        let state = self.state.lock().unwrap();
+        let mut current = base_snapshot_id;
+        let mut visited = HashSet::new();
+        let mut by_start = BTreeMap::<u64, ActiveMemtableSnapshotData>::new();
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                break;
+            }
+            let Some(snapshot) = state.snapshots.get(&id) else {
+                break;
+            };
+            for segment in snapshot.active_memtable_data.iter().filter(|segment| {
+                segment.memtable_type == memtable_type && segment.memtable_seq == memtable_seq
+            }) {
+                match by_start.get(&segment.start_offset) {
+                    Some(existing) if existing.end_offset >= segment.end_offset => {}
+                    _ => {
+                        by_start.insert(segment.start_offset, segment.clone());
+                    }
+                }
+            }
+            current = snapshot.base_snapshot_id;
+        }
+        let mut next_start = 0u64;
+        let mut out = Vec::new();
+        while let Some(segment) = by_start.get(&next_start).cloned() {
+            if segment.end_offset <= next_start {
+                break;
+            }
+            next_start = segment.end_offset;
+            out.push(segment);
+        }
+        out
     }
 
     /// Import a snapshot from an existing manifest. This is used when loading snapshots from disk
@@ -342,6 +401,7 @@ impl SnapshotManager {
             seq_id: manifest.seq_id,
             latest_schema_id: manifest.latest_schema_id,
             referenced_schema_ids,
+            active_memtable_data: manifest.active_memtable_data.clone(),
             bucket_ranges: if manifest.bucket_ranges.is_empty() {
                 self.bucket_ranges.clone()
             } else {
@@ -476,7 +536,13 @@ impl SnapshotManager {
     }
 
     pub(crate) fn expire_snapshot(&self, id: u64) -> Result<bool> {
-        let (removed_snapshots, removed_requested_snapshot, removed_schema_ids, live_schema_ids) = {
+        let (
+            removed_snapshots,
+            removed_requested_snapshot,
+            removed_schema_ids,
+            live_schema_ids,
+            live_active_data_paths,
+        ) = {
             let mut state = self.state.lock().unwrap();
             if !state.snapshots.contains_key(&id) {
                 return Ok(false);
@@ -544,11 +610,31 @@ impl SnapshotManager {
                     .keys()
                     .copied()
                     .collect::<BTreeSet<_>>(),
+                state
+                    .snapshots
+                    .values()
+                    .flat_map(|snapshot| {
+                        snapshot
+                            .active_memtable_data
+                            .iter()
+                            .map(|segment| segment.path.clone())
+                    })
+                    .collect::<HashSet<_>>(),
             )
         };
+        let mut removed_active_data_paths = HashSet::new();
         for snapshot in &removed_snapshots {
             self.file_manager
                 .remove_metadata_file(&snapshot_manifest_name(snapshot.id))?;
+            // cleanup the active memtable data segments that are no longer referenced by any live snapshots
+            for segment in &snapshot.active_memtable_data {
+                if live_active_data_paths.contains(&segment.path) {
+                    continue;
+                }
+                if removed_active_data_paths.insert(segment.path.clone()) {
+                    self.file_manager.remove_metadata_file(&segment.path)?;
+                }
+            }
             snapshot
                 .tracked_files
                 .iter()
@@ -639,6 +725,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             bucket_ranges: snapshot.bucket_ranges.clone(),
             levels: manifest_levels_from_snapshot(&snapshot.levels, file_manager),
             vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
+            active_memtable_data: snapshot.active_memtable_data.clone(),
         })
     };
     let mut incremental_base_id = None;
@@ -653,6 +740,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 bucket_ranges: snapshot.bucket_ranges.clone(),
                 level_edits,
                 vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
+                active_memtable_data: snapshot.active_memtable_data.clone(),
             })
         } else {
             full_manifest()
@@ -841,6 +929,7 @@ pub(crate) fn load_manifest_chain(
                 resolved_base.id = manifest.id;
                 resolved_base.seq_id = manifest.seq_id;
                 resolved_base.latest_schema_id = manifest.latest_schema_id;
+                resolved_base.active_memtable_data = manifest.active_memtable_data;
                 if !manifest.bucket_ranges.is_empty() {
                     resolved_base.bucket_ranges = manifest.bucket_ranges;
                 }

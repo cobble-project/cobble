@@ -8,7 +8,7 @@ use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{DbState, DbStateHandle};
 use crate::error::Error::InvalidState;
 use crate::error::{Error, Result};
-use crate::file::{FileManager, TrackedFileId};
+use crate::file::{File, FileManager, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator, SchemaEvolvingIterator};
 use crate::lsm::LSMTree;
@@ -16,8 +16,9 @@ use crate::memtable::vlog::{MemtableVlogRecorder, rewrite_ref_value_for_memtable
 use crate::memtable::{HashMemtable, VecMemtable};
 use crate::memtable::{Memtable, MemtableImpl, MemtableKvIter, MemtableReclaimer};
 use crate::metrics_manager::MetricsManager;
+use crate::paths::snapshot_active_data_relative_path;
 use crate::schema::{Schema, SchemaManager};
-use crate::snapshot::SnapshotManager;
+use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotManager};
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use crate::r#type::{RefKey, RefValue};
 use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
@@ -46,6 +47,7 @@ pub(crate) struct MemtableManagerOptions {
     pub(crate) metrics_manager: Option<Arc<MetricsManager>>,
     pub(crate) vlog_store: Option<Arc<VlogStore>>,
     pub(crate) schema_manager: Option<Arc<SchemaManager>>,
+    pub(crate) active_memtable_incremental_snapshot_ratio: f64,
 }
 
 #[derive(Clone)]
@@ -84,6 +86,7 @@ impl Default for MemtableManagerOptions {
             metrics_manager: None,
             vlog_store: None,
             schema_manager: None,
+            active_memtable_incremental_snapshot_ratio: 0.0,
         }
     }
 }
@@ -106,6 +109,7 @@ pub(crate) struct MemtableManager {
     flush_tx: Mutex<Option<mpsc::Sender<FlushJob>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     auto_snapshot_manager: Option<SnapshotManager>,
+    active_memtable_incremental_snapshot_ratio: f64,
     metrics: MemtableManagerMetrics,
 }
 
@@ -123,6 +127,11 @@ struct FlushJob {
     schema: Option<Arc<Schema>>,
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
     snapshot: Option<SnapshotCompletion>,
+    active_memtable_snapshot: Option<ActiveMemtableSnapshotJob>,
+}
+
+struct ActiveMemtableSnapshotJob {
+    active: Arc<Mutex<ActiveMemtable>>,
 }
 
 pub(crate) struct SnapshotCompletion {
@@ -406,6 +415,9 @@ impl MemtableManager {
             flush_tx: Mutex::new(Some(flush_tx)),
             worker: Mutex::new(Some(worker)),
             auto_snapshot_manager: options.auto_snapshot_manager,
+            active_memtable_incremental_snapshot_ratio: options
+                .active_memtable_incremental_snapshot_ratio
+                .clamp(0.0, 1.0),
             metrics,
         })
     }
@@ -476,6 +488,7 @@ impl MemtableManager {
                                 Self::finish_and_materialize_snapshot(
                                     &job.snapshot,
                                     &snapshot,
+                                    Vec::new(),
                                     &db_state_clone,
                                 );
                             }
@@ -484,6 +497,34 @@ impl MemtableManager {
                             }
                         }
                         drop(keep_memtable_alive);
+                    } else if let Some(active_snapshot_job) = job.active_memtable_snapshot {
+                        let snapshot = db_state_clone.load();
+                        let active_data = match job.snapshot.as_ref() {
+                            Some(snapshot_job) => Self::write_active_memtable_snapshot_data(
+                                snapshot_job.snapshot_id,
+                                snapshot.suggested_base_snapshot_id,
+                                &active_snapshot_job.active,
+                                &snapshot_job.manager,
+                                &file_manager_clone,
+                            )
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "active memtable snapshot failed id={} err={}",
+                                    snapshot_job.snapshot_id, err
+                                )
+                            }),
+                            None => Vec::new(),
+                        };
+                        let mut state = state_clone.lock().unwrap();
+                        state.in_flight = state.in_flight.saturating_sub(1);
+                        flush_done_clone.notify_all();
+                        drop(state);
+                        Self::finish_and_materialize_snapshot(
+                            &job.snapshot,
+                            &snapshot,
+                            active_data,
+                            &db_state_clone,
+                        );
                     } else {
                         let snapshot = db_state_clone.load();
                         let mut state = state_clone.lock().unwrap();
@@ -493,6 +534,7 @@ impl MemtableManager {
                         Self::finish_and_materialize_snapshot(
                             &job.snapshot,
                             &snapshot,
+                            Vec::new(),
                             &db_state_clone,
                         );
                     }
@@ -505,12 +547,14 @@ impl MemtableManager {
     fn finish_and_materialize_snapshot(
         snapshot_completion: &Option<SnapshotCompletion>,
         snapshot: &Arc<DbState>,
+        active_data: Vec<ActiveMemtableSnapshotData>,
         db_state: &Arc<DbStateHandle>,
     ) {
         if let Some(snapshot_job) = snapshot_completion {
             snapshot_job.manager.finish_snapshot(
                 snapshot_job.snapshot_id,
                 snapshot,
+                active_data,
                 db_state.as_ref(),
             );
             let _ = snapshot_job
@@ -518,6 +562,53 @@ impl MemtableManager {
                 .schedule_materialize(snapshot_job.snapshot_id);
             let _ = snapshot_job.manager.process_retention();
         }
+    }
+
+    fn write_active_memtable_snapshot_data(
+        snapshot_id: u64,
+        base_snapshot_id: Option<u64>,
+        active: &Arc<Mutex<ActiveMemtable>>,
+        snapshot_manager: &SnapshotManager,
+        file_manager: &Arc<FileManager>,
+    ) -> Result<Vec<ActiveMemtableSnapshotData>> {
+        let active = active.lock().unwrap();
+        let memtable_seq = active.seq;
+        let memtable = active
+            .memtable
+            .as_ref()
+            .ok_or_else(|| InvalidState("Active memtable missing".to_string()))?;
+        let memtable_type = match memtable {
+            MemtableImpl::Hash(_) => MemtableType::Hash,
+            MemtableImpl::Vec(_) => MemtableType::Vec,
+        };
+        let mut segments = snapshot_manager.active_memtable_snapshot_segments(
+            base_snapshot_id,
+            memtable_type,
+            memtable_seq,
+        );
+        let end_offset = memtable.data_offset();
+        let inherited_end_offset = segments.last().map_or(0, |segment| segment.end_offset);
+        let inherited_end_offset = usize::try_from(inherited_end_offset).unwrap_or(usize::MAX);
+        let start_offset = if inherited_end_offset <= end_offset {
+            inherited_end_offset
+        } else {
+            segments.clear();
+            0
+        };
+        if start_offset < end_offset {
+            let path = snapshot_active_data_relative_path(snapshot_id);
+            let mut writer = file_manager.create_metadata_file(&path)?;
+            let _ = memtable.write_data_since(start_offset, &mut writer)?;
+            writer.close()?;
+            segments.push(ActiveMemtableSnapshotData {
+                path,
+                memtable_type,
+                memtable_seq,
+                start_offset: start_offset as u64,
+                end_offset: end_offset as u64,
+            });
+        }
+        Ok(segments)
     }
 
     /// Makes an active memtable from a free buffer if none exists.
@@ -970,45 +1061,61 @@ impl MemtableManager {
         guard = self.wait_for_write_stall_under_guard(guard);
         let snapshot_state = self.db_state.load();
         let mut to_flush = None;
+        let mut active_memtable_snapshot = None;
         let mut flushed_seq = None;
-        self.db_state
-            .cas_mutate(snapshot_state.seq_id, |db_state, snapshot_state| {
-                let active = snapshot_state.active.clone()?;
-                let mut inner_active = active.lock().unwrap();
-                let memtable = match inner_active.memtable.as_ref() {
-                    Some(memtable) => memtable,
-                    None => {
+        if snapshot.is_some()
+            && let Some(active) = snapshot_state.active.as_ref()
+        {
+            let inner_active = active.lock().unwrap();
+            if let Some(memtable) = inner_active.memtable.as_ref()
+                && !memtable.is_empty()
+                && self.should_use_active_incremental_snapshot(memtable)
+            {
+                active_memtable_snapshot = Some(ActiveMemtableSnapshotJob {
+                    active: Arc::clone(active),
+                });
+            }
+        }
+        if active_memtable_snapshot.is_none() {
+            self.db_state
+                .cas_mutate(snapshot_state.seq_id, |db_state, snapshot_state| {
+                    let active = snapshot_state.active.clone()?;
+                    let mut inner_active = active.lock().unwrap();
+                    let memtable = match inner_active.memtable.as_ref() {
+                        Some(memtable) => memtable,
+                        None => {
+                            return None;
+                        }
+                    };
+                    if memtable.is_empty() {
                         return None;
                     }
-                };
-                if memtable.is_empty() {
-                    return None;
-                }
-                let active_memtable = inner_active
-                    .memtable
-                    .take()
-                    .expect("active memtable exists");
-                let active_vlog_recorder = inner_active.vlog_recorder.take().map(Arc::new);
-                let mut immutables = snapshot_state.immutables.clone();
-                let new_immutable = ImmutableMemtable {
-                    seq: inner_active.seq,
-                    schema: Arc::clone(&inner_active.schema),
-                    memtable: Arc::new(active_memtable),
-                    vlog_recorder: active_vlog_recorder,
-                };
-                flushed_seq = Some(new_immutable.seq);
-                to_flush = Some(new_immutable.clone());
-                immutables.push_back(new_immutable);
+                    let active_memtable = inner_active
+                        .memtable
+                        .take()
+                        .expect("active memtable exists");
+                    let active_vlog_recorder = inner_active.vlog_recorder.take().map(Arc::new);
+                    let mut immutables = snapshot_state.immutables.clone();
+                    let new_immutable = ImmutableMemtable {
+                        seq: inner_active.seq,
+                        schema: Arc::clone(&inner_active.schema),
+                        memtable: Arc::new(active_memtable),
+                        vlog_recorder: active_vlog_recorder,
+                    };
+                    flushed_seq = Some(new_immutable.seq);
+                    to_flush = Some(new_immutable.clone());
+                    immutables.push_back(new_immutable);
 
-                Some(DbState {
-                    seq_id: db_state.allocate_seq_id(),
-                    lsm_version: snapshot_state.lsm_version.clone(),
-                    vlog_version: snapshot_state.vlog_version.clone(),
-                    active: None,
-                    immutables,
-                    suggested_base_snapshot_id: snapshot_state.suggested_base_snapshot_id,
-                })
-            });
+                    Some(DbState {
+                        seq_id: db_state.allocate_seq_id(),
+                        lsm_version: snapshot_state.lsm_version.clone(),
+                        vlog_version: snapshot_state.vlog_version.clone(),
+                        active: None,
+                        immutables,
+                        suggested_base_snapshot_id: snapshot_state.suggested_base_snapshot_id,
+                    })
+                });
+        }
         drop(guard);
         let job = if let Some(to_flush) = to_flush {
             Self::make_active_buffer(
@@ -1028,6 +1135,17 @@ impl MemtableManager {
                 schema: Some(to_flush.schema),
                 vlog_recorder: to_flush.vlog_recorder,
                 snapshot,
+                active_memtable_snapshot: None,
+            }
+        } else if let Some(active_memtable_snapshot) = active_memtable_snapshot {
+            state.in_flight += 1;
+            FlushJob {
+                seq: 0,
+                memtable: None,
+                schema: None,
+                vlog_recorder: None,
+                snapshot,
+                active_memtable_snapshot: Some(active_memtable_snapshot),
             }
         } else if snapshot.is_some() {
             state.in_flight += 1;
@@ -1037,6 +1155,7 @@ impl MemtableManager {
                 schema: None,
                 vlog_recorder: None,
                 snapshot,
+                active_memtable_snapshot: None,
             }
         } else {
             drop(state);
@@ -1052,6 +1171,17 @@ impl MemtableManager {
             warn!("failed to spawn flush task, flush channel closed");
         }
         Ok(flushed_seq)
+    }
+
+    fn should_use_active_incremental_snapshot(&self, memtable: &MemtableImpl) -> bool {
+        if self.active_memtable_incremental_snapshot_ratio <= 0.0 || self.memtable_capacity == 0 {
+            return false;
+        }
+        let used = self
+            .memtable_capacity
+            .saturating_sub(memtable.remaining_capacity());
+        let usage_ratio = (used as f64) / (self.memtable_capacity as f64);
+        usage_ratio < self.active_memtable_incremental_snapshot_ratio
     }
 
     #[cfg(test)]

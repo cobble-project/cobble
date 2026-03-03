@@ -345,6 +345,26 @@ impl Memtable for HashMemtable {
         self.index_cursor = checkpoint;
     }
 
+    fn data_offset(&self) -> usize {
+        self.data_end
+    }
+
+    fn write_data_since(
+        &self,
+        offset: usize,
+        writer: &mut dyn crate::file::SequentialWriteFile,
+    ) -> Result<usize> {
+        if offset > self.data_end {
+            return Err(Error::InvalidState(format!(
+                "invalid memtable data offset {} > {}",
+                offset, self.data_end
+            )));
+        }
+        let bytes = &self.buffer[offset..self.data_end];
+        writer.write(bytes)?;
+        Ok(bytes.len())
+    }
+
     /// Returns an iterator over all key-value pairs ordered by key bytes ascending.
     /// For duplicate keys, values are yielded in reverse insertion order (latest first).
     fn iter(&self) -> MemtableKvIterator<'_> {
