@@ -1,4 +1,6 @@
 //! Snapshot manager and manifest encoding for LSM state.
+mod memtable;
+
 use crate::config::MemtableType;
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{DbState, DbStateHandle};
@@ -16,6 +18,8 @@ use std::ops::Range;
 use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
+
+pub(crate) use memtable::ActiveMemtableSnapshotData;
 
 /// Internal snapshot record tracked by the manager.
 #[derive(Clone)]
@@ -40,15 +44,6 @@ pub(crate) struct DbSnapshot {
 }
 
 pub(crate) type SnapshotCallback = Arc<dyn Fn(Result<u64>) + Send + Sync + 'static>;
-
-#[derive(Clone, Deserialize, Serialize)]
-pub(crate) struct ActiveMemtableSnapshotData {
-    pub(crate) path: String,
-    pub(crate) memtable_type: MemtableType,
-    pub(crate) memtable_seq: u64,
-    pub(crate) start_offset: u64,
-    pub(crate) end_offset: u64,
-}
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
@@ -332,38 +327,12 @@ impl SnapshotManager {
         memtable_seq: u64,
     ) -> Vec<ActiveMemtableSnapshotData> {
         let state = self.state.lock().unwrap();
-        let mut current = base_snapshot_id;
-        let mut visited = HashSet::new();
-        let mut by_start = BTreeMap::<u64, ActiveMemtableSnapshotData>::new();
-        while let Some(id) = current {
-            if !visited.insert(id) {
-                break;
-            }
-            let Some(snapshot) = state.snapshots.get(&id) else {
-                break;
-            };
-            for segment in snapshot.active_memtable_data.iter().filter(|segment| {
-                segment.memtable_type == memtable_type && segment.memtable_seq == memtable_seq
-            }) {
-                match by_start.get(&segment.start_offset) {
-                    Some(existing) if existing.end_offset >= segment.end_offset => {}
-                    _ => {
-                        by_start.insert(segment.start_offset, segment.clone());
-                    }
-                }
-            }
-            current = snapshot.base_snapshot_id;
-        }
-        let mut next_start = 0u64;
-        let mut out = Vec::new();
-        while let Some(segment) = by_start.get(&next_start).cloned() {
-            if segment.end_offset <= next_start {
-                break;
-            }
-            next_start = segment.end_offset;
-            out.push(segment);
-        }
-        out
+        memtable::collect_active_memtable_snapshot_segments(
+            &state.snapshots,
+            base_snapshot_id,
+            memtable_type,
+            memtable_seq,
+        )
     }
 
     /// Import a snapshot from an existing manifest. This is used when loading snapshots from disk

@@ -337,6 +337,33 @@ impl Memtable for HashMemtable {
         Ok(())
     }
 
+    fn write_vlog_data_since(
+        &self,
+        entries: &BTreeMap<u32, (usize, usize)>,
+        offset: u32,
+        writer: &mut dyn crate::file::SequentialWriteFile,
+    ) -> Result<usize> {
+        let mut written = 0usize;
+        for (_entry_offset, (payload_start, payload_len)) in entries.range(offset..) {
+            let end = payload_start
+                .checked_add(*payload_len)
+                .ok_or_else(|| Error::IoError("VLOG payload range overflow".to_string()))?;
+            if *payload_start < self.index_cursor || end > self.bucket_base {
+                return Err(Error::IoError(format!(
+                    "VLOG recorder payload out of range at {} (len {})",
+                    payload_start, payload_len
+                )));
+            }
+            let len_u32 = u32::try_from(*payload_len).map_err(|_| {
+                Error::IoError(format!("VLOG value too large: {} bytes", payload_len))
+            })?;
+            writer.write(&len_u32.to_le_bytes())?;
+            writer.write(&self.buffer[*payload_start..end])?;
+            written = written.saturating_add(4 + *payload_len);
+        }
+        Ok(written)
+    }
+
     fn blob_cursor_checkpoint(&self) -> usize {
         self.index_cursor
     }

@@ -200,6 +200,27 @@ impl Memtable for VecMemtable {
         writer.write_encoded_records(&self.blobs)
     }
 
+    fn write_vlog_data_since(
+        &self,
+        _entries: &BTreeMap<u32, (usize, usize)>,
+        offset: u32,
+        writer: &mut dyn crate::file::SequentialWriteFile,
+    ) -> Result<usize> {
+        let offset = usize::try_from(offset).map_err(|_| {
+            Error::InvalidState(format!("invalid vec memtable vlog offset {}", offset))
+        })?;
+        if offset > self.blobs.len() {
+            return Err(Error::InvalidState(format!(
+                "invalid vec memtable vlog offset {} > {}",
+                offset,
+                self.blobs.len()
+            )));
+        }
+        let data = &self.blobs[offset..];
+        writer.write(data)?;
+        Ok(data.len())
+    }
+
     fn blob_cursor_checkpoint(&self) -> usize {
         self.blobs.len()
     }

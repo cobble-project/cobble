@@ -45,7 +45,7 @@ fn schema_file_path(root: &str, db_id: &str, schema_id: u64) -> String {
 
 fn active_snapshot_segments_from_manifest(
     manifest_json: &JsonValue,
-) -> Option<Vec<(String, String, u64, u64, u64)>> {
+) -> Option<Vec<(String, String, u64, u64, u64, Option<u64>, u64, u64, u64)>> {
     let segments = manifest_json.get("active_memtable_data")?.as_array()?;
     let mut out = Vec::with_capacity(segments.len());
     for segment in segments {
@@ -54,7 +54,26 @@ fn active_snapshot_segments_from_manifest(
         let memtable_seq = segment.get("memtable_seq")?.as_u64()?;
         let start_offset = segment.get("start_offset")?.as_u64()?;
         let end_offset = segment.get("end_offset")?.as_u64()?;
-        out.push((path, memtable_type, memtable_seq, start_offset, end_offset));
+        out.push((
+            path,
+            memtable_type,
+            memtable_seq,
+            start_offset,
+            end_offset,
+            segment.get("vlog_file_seq").and_then(|v| v.as_u64()),
+            segment
+                .get("vlog_start_offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            segment
+                .get("vlog_end_offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            segment
+                .get("vlog_data_file_offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        ));
     }
     Some(out)
 }
@@ -1310,7 +1329,8 @@ fn test_db_snapshot_uses_active_memtable_incremental_data_when_under_threshold()
     let first_segments = active_snapshot_segments_from_manifest(&first_manifest_json)
         .expect("missing active memtable snapshot data");
     assert_eq!(first_segments.len(), 1);
-    let (first_path, first_type, first_seq, first_start, first_end) = &first_segments[0];
+    let (first_path, first_type, first_seq, first_start, first_end, _, _, _, _) =
+        &first_segments[0];
     assert!(!first_type.is_empty());
     assert_eq!(*first_start, 0);
     assert!(first_end > first_start);
@@ -1325,13 +1345,14 @@ fn test_db_snapshot_uses_active_memtable_incremental_data_when_under_threshold()
     let second_segments = active_snapshot_segments_from_manifest(&second_manifest_json)
         .expect("missing second active memtable snapshot data");
     assert_eq!(second_segments.len(), 2);
-    let (_, second_first_type, second_first_seq, second_first_start, second_first_end) =
+    let (_, second_first_type, second_first_seq, second_first_start, second_first_end, _, _, _, _) =
         &second_segments[0];
     assert_eq!(*second_first_type, *first_type);
     assert_eq!(*second_first_seq, *first_seq);
     assert_eq!(*second_first_start, *first_start);
     assert_eq!(*second_first_end, *first_end);
-    let (second_path, second_type, second_seq, second_start, second_end) = &second_segments[1];
+    let (second_path, second_type, second_seq, second_start, second_end, _, _, _, _) =
+        &second_segments[1];
     assert_eq!(*second_type, *first_type);
     assert_eq!(*second_seq, *first_seq);
     assert_eq!(*second_start, *first_end);
@@ -1339,6 +1360,137 @@ fn test_db_snapshot_uses_active_memtable_incremental_data_when_under_threshold()
     let second_file = format!("{}/{}/{}", root, db.id(), second_path);
     let second_data = std::fs::read(&second_file).unwrap();
     assert_eq!(second_data.len() as u64, *second_end - *second_start);
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
+    let root = "/tmp/db_snapshot_active_incremental_vlog";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 2048,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        value_separation_threshold: 8,
+        active_memtable_incremental_snapshot_ratio: 0.9,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config);
+    let v1 = vec![b'a'; 128];
+    db.put(0, b"k1", 0, v1.clone()).unwrap();
+
+    let first_snapshot = db.snapshot().unwrap();
+    let first_manifest = wait_for_manifest_in_db(root, db.id(), first_snapshot);
+    let first_manifest_json: JsonValue = serde_json::from_str(&first_manifest).unwrap();
+    assert_eq!(
+        first_manifest_json
+            .get("vlog_files")
+            .and_then(|v| v.as_array())
+            .map_or(0, |v| v.len()),
+        0
+    );
+    let first_segments = active_snapshot_segments_from_manifest(&first_manifest_json)
+        .expect("missing active_memtable_data");
+    assert_eq!(first_segments.len(), 1);
+    let (
+        first_path,
+        first_type,
+        first_seq,
+        first_data_start,
+        first_data_end,
+        first_vlog_file_seq,
+        first_vlog_start,
+        first_vlog_end,
+        first_vlog_file_offset,
+    ) = &first_segments[0];
+    assert!(!first_type.is_empty());
+    assert_eq!(*first_data_start, 0);
+    assert!(first_data_end > first_data_start);
+    assert!(first_vlog_end > first_vlog_start);
+    assert!(first_vlog_file_seq.is_some());
+    assert_eq!(*first_vlog_file_offset, first_data_end - first_data_start);
+    let first_file = format!("{}/{}/{}", root, db.id(), first_path);
+    let first_data = std::fs::read(first_file).unwrap();
+    let expected_first_size =
+        (first_data_end - first_data_start) + (first_vlog_end - first_vlog_start);
+    assert_eq!(first_data.len() as u64, expected_first_size);
+    let value1 = db
+        .get(0, b"k1", &ReadOptions::default())
+        .unwrap()
+        .expect("k1 value");
+    assert_eq!(value1[0].as_ref().unwrap().as_ref(), v1.as_slice());
+
+    let v2 = vec![b'b'; 128];
+    db.put(0, b"k2", 0, v2.clone()).unwrap();
+    let second_snapshot = db.snapshot().unwrap();
+    let second_manifest = wait_for_manifest_in_db(root, db.id(), second_snapshot);
+    let second_manifest_json: JsonValue = serde_json::from_str(&second_manifest).unwrap();
+    assert_eq!(
+        second_manifest_json
+            .get("vlog_files")
+            .and_then(|v| v.as_array())
+            .map_or(0, |v| v.len()),
+        0
+    );
+    let second_segments = active_snapshot_segments_from_manifest(&second_manifest_json)
+        .expect("missing second active_memtable_data");
+    assert_eq!(second_segments.len(), 2);
+    let (
+        _,
+        second_first_type,
+        second_first_seq,
+        second_first_data_start,
+        second_first_data_end,
+        second_first_vlog_file_seq,
+        second_first_vlog_start,
+        second_first_vlog_end,
+        second_first_vlog_file_offset,
+    ) = &second_segments[0];
+    assert_eq!(*second_first_type, *first_type);
+    assert_eq!(*second_first_seq, *first_seq);
+    assert_eq!(*second_first_data_start, *first_data_start);
+    assert_eq!(*second_first_data_end, *first_data_end);
+    assert_eq!(*second_first_vlog_file_seq, *first_vlog_file_seq);
+    assert_eq!(*second_first_vlog_start, *first_vlog_start);
+    assert_eq!(*second_first_vlog_end, *first_vlog_end);
+    assert_eq!(*second_first_vlog_file_offset, *first_vlog_file_offset);
+    let (
+        second_path,
+        second_type,
+        second_seq,
+        second_data_start,
+        second_data_end,
+        second_vlog_file_seq,
+        second_vlog_start,
+        second_vlog_end,
+        second_vlog_file_offset,
+    ) = &second_segments[1];
+    assert_eq!(*second_type, *first_type);
+    assert_eq!(*second_seq, *first_seq);
+    assert_eq!(*second_data_start, *first_data_end);
+    assert!(second_data_end > second_data_start);
+    assert_eq!(*second_vlog_file_seq, *first_vlog_file_seq);
+    assert_eq!(*second_vlog_start, *first_vlog_end);
+    assert!(second_vlog_end > second_vlog_start);
+    assert_eq!(
+        *second_vlog_file_offset,
+        second_data_end - second_data_start
+    );
+    let second_file = format!("{}/{}/{}", root, db.id(), second_path);
+    let second_data = std::fs::read(second_file).unwrap();
+    let expected_second_size =
+        (second_data_end - second_data_start) + (second_vlog_end - second_vlog_start);
+    assert_eq!(second_data.len() as u64, expected_second_size);
+    let value2 = db
+        .get(0, b"k2", &ReadOptions::default())
+        .unwrap()
+        .expect("k2 value");
+    assert_eq!(value2[0].as_ref().unwrap().as_ref(), v2.as_slice());
 
     cleanup_test_root(root);
 }

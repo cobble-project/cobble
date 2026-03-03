@@ -134,6 +134,10 @@ struct ActiveMemtableSnapshotJob {
     active: Arc<Mutex<ActiveMemtable>>,
 }
 
+struct ActiveMemtableSnapshotWriteResult {
+    active_data: Vec<ActiveMemtableSnapshotData>,
+}
+
 pub(crate) struct SnapshotCompletion {
     pub(crate) snapshot_id: u64,
     pub(crate) manager: SnapshotManager,
@@ -499,7 +503,7 @@ impl MemtableManager {
                         drop(keep_memtable_alive);
                     } else if let Some(active_snapshot_job) = job.active_memtable_snapshot {
                         let snapshot = db_state_clone.load();
-                        let active_data = match job.snapshot.as_ref() {
+                        let snapshot_result = match job.snapshot.as_ref() {
                             Some(snapshot_job) => Self::write_active_memtable_snapshot_data(
                                 snapshot_job.snapshot_id,
                                 snapshot.suggested_base_snapshot_id,
@@ -513,8 +517,11 @@ impl MemtableManager {
                                     snapshot_job.snapshot_id, err
                                 )
                             }),
-                            None => Vec::new(),
+                            None => ActiveMemtableSnapshotWriteResult {
+                                active_data: Vec::new(),
+                            },
                         };
+                        let ActiveMemtableSnapshotWriteResult { active_data } = snapshot_result;
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
                         flush_done_clone.notify_all();
@@ -570,10 +577,10 @@ impl MemtableManager {
         active: &Arc<Mutex<ActiveMemtable>>,
         snapshot_manager: &SnapshotManager,
         file_manager: &Arc<FileManager>,
-    ) -> Result<Vec<ActiveMemtableSnapshotData>> {
-        let active = active.lock().unwrap();
-        let memtable_seq = active.seq;
-        let memtable = active
+    ) -> Result<ActiveMemtableSnapshotWriteResult> {
+        let active_guard = active.lock().unwrap();
+        let memtable_seq = active_guard.seq;
+        let memtable = active_guard
             .memtable
             .as_ref()
             .ok_or_else(|| InvalidState("Active memtable missing".to_string()))?;
@@ -586,29 +593,64 @@ impl MemtableManager {
             memtable_type,
             memtable_seq,
         );
-        let end_offset = memtable.data_offset();
-        let inherited_end_offset = segments.last().map_or(0, |segment| segment.end_offset);
-        let inherited_end_offset = usize::try_from(inherited_end_offset).unwrap_or(usize::MAX);
-        let start_offset = if inherited_end_offset <= end_offset {
-            inherited_end_offset
+        let data_end_offset = memtable.data_offset();
+        let inherited_data_end = segments.last().map_or(0, |segment| segment.end_offset);
+        let inherited_data_end = usize::try_from(inherited_data_end).unwrap_or(usize::MAX);
+        let data_start_offset = if inherited_data_end <= data_end_offset {
+            inherited_data_end
         } else {
             segments.clear();
             0
         };
-        if start_offset < end_offset {
+        let mut vlog_file_seq = None;
+        let mut vlog_start_offset = 0u32;
+        let mut vlog_end_offset = 0u32;
+        if let Some(recorder) = active_guard.vlog_recorder.as_ref()
+            && recorder.has_entries()
+        {
+            vlog_file_seq = Some(recorder.file_seq());
+            vlog_end_offset = recorder.checkpoint();
+            vlog_start_offset = segments
+                .iter()
+                .rev()
+                .find_map(|segment| {
+                    (segment.vlog_file_seq == vlog_file_seq).then_some(segment.vlog_end_offset)
+                })
+                .unwrap_or(0);
+            if vlog_start_offset > vlog_end_offset {
+                vlog_start_offset = 0;
+            }
+        }
+        if data_start_offset < data_end_offset || vlog_start_offset < vlog_end_offset {
             let path = snapshot_active_data_relative_path(snapshot_id);
             let mut writer = file_manager.create_metadata_file(&path)?;
-            let _ = memtable.write_data_since(start_offset, &mut writer)?;
+            let mut data_bytes_written = 0usize;
+            if data_start_offset < data_end_offset {
+                data_bytes_written = memtable.write_data_since(data_start_offset, &mut writer)?;
+            }
+            if vlog_start_offset < vlog_end_offset {
+                let recorder = active_guard
+                    .vlog_recorder
+                    .as_ref()
+                    .expect("vlog recorder exists when offsets advance");
+                let _ = recorder.write_data_since(memtable, vlog_start_offset, &mut writer)?;
+            }
             writer.close()?;
             segments.push(ActiveMemtableSnapshotData {
                 path,
                 memtable_type,
                 memtable_seq,
-                start_offset: start_offset as u64,
-                end_offset: end_offset as u64,
+                start_offset: data_start_offset as u64,
+                end_offset: data_end_offset as u64,
+                vlog_file_seq,
+                vlog_start_offset,
+                vlog_end_offset,
+                vlog_data_file_offset: data_bytes_written as u64,
             });
         }
-        Ok(segments)
+        Ok(ActiveMemtableSnapshotWriteResult {
+            active_data: segments,
+        })
     }
 
     /// Makes an active memtable from a free buffer if none exists.

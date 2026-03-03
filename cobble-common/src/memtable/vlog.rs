@@ -164,6 +164,45 @@ impl MemtableVlogRecorder {
         memtable.flush_blobs_to_vlog_writer(&self.entries, writer)
     }
 
+    pub(crate) fn write_data_since(
+        &self,
+        memtable: &impl Memtable,
+        offset: u32,
+        writer: &mut dyn crate::file::SequentialWriteFile,
+    ) -> Result<usize> {
+        if offset > self.next_offset {
+            return Err(Error::InvalidState(format!(
+                "invalid recorder offset {} > {}",
+                offset, self.next_offset
+            )));
+        }
+        if offset == self.next_offset {
+            return Ok(0);
+        }
+        let mut expected = offset;
+        for (entry_offset, (_start, len)) in self.entries.range(offset..) {
+            if *entry_offset != expected {
+                return Err(Error::InvalidState(format!(
+                    "recorder offset gap at {} expected {}",
+                    entry_offset, expected
+                )));
+            }
+            let len_u32 = u32::try_from(*len)
+                .map_err(|_| Error::IoError(format!("VLOG value too large: {} bytes", len)))?;
+            expected = expected
+                .checked_add(4)
+                .and_then(|next| next.checked_add(len_u32))
+                .ok_or_else(|| Error::IoError("VLOG offset overflow".to_string()))?;
+        }
+        if expected != self.next_offset {
+            return Err(Error::InvalidState(format!(
+                "recorder serialization incomplete: {} != {}",
+                expected, self.next_offset
+            )));
+        }
+        memtable.write_vlog_data_since(&self.entries, offset, writer)
+    }
+
     pub(crate) fn read_pointer(
         &self,
         memtable: &impl Memtable,

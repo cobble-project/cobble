@@ -45,6 +45,12 @@ pub(crate) trait Memtable {
         entries: &BTreeMap<u32, (usize, usize)>,
         writer: &mut crate::vlog::VlogWriter<Box<dyn crate::file::SequentialWriteFile>>,
     ) -> Result<()>;
+    fn write_vlog_data_since(
+        &self,
+        entries: &BTreeMap<u32, (usize, usize)>,
+        offset: u32,
+        writer: &mut dyn crate::file::SequentialWriteFile,
+    ) -> Result<usize>;
     fn blob_cursor_checkpoint(&self) -> usize;
     fn rollback_blob_cursor(&mut self, checkpoint: usize);
     fn data_offset(&self) -> usize;
@@ -231,6 +237,18 @@ impl Memtable for MemtableImpl {
         match self {
             Self::Hash(memtable) => memtable.flush_blobs_to_vlog_writer(entries, writer),
             Self::Vec(memtable) => memtable.flush_blobs_to_vlog_writer(entries, writer),
+        }
+    }
+
+    fn write_vlog_data_since(
+        &self,
+        entries: &BTreeMap<u32, (usize, usize)>,
+        offset: u32,
+        writer: &mut dyn crate::file::SequentialWriteFile,
+    ) -> Result<usize> {
+        match self {
+            Self::Hash(memtable) => memtable.write_vlog_data_since(entries, offset, writer),
+            Self::Vec(memtable) => memtable.write_vlog_data_since(entries, offset, writer),
         }
     }
 
