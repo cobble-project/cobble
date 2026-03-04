@@ -8,8 +8,9 @@ use crate::metrics_manager::MetricsManager;
 use crate::schema::{Schema, SchemaBuilder, SchemaManager};
 use crate::snapshot::{
     ActiveMemtableSnapshotData, LoadedManifest, ManifestPayload, SnapshotCallback, SnapshotManager,
-    apply_manifest_level_edits, build_levels_from_manifest, build_vlog_version_from_manifest,
-    decode_manifest, load_manifest_for_snapshot, snapshot_manifest_name,
+    apply_manifest_tree_level_edits, build_tree_versions_from_manifest,
+    build_vlog_version_from_manifest, decode_manifest, load_manifest_for_snapshot,
+    snapshot_manifest_name,
 };
 use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value, decode_value_masked, encode_key_ref_into};
@@ -89,7 +90,10 @@ fn load_manifest_entry(
             let base_snapshot_id = Some(incremental.base_snapshot_id);
             let manifest = if let Some(base) = loaded_by_id.get(&incremental.base_snapshot_id) {
                 let mut resolved = base.manifest.clone();
-                apply_manifest_level_edits(&mut resolved.levels, &incremental.level_edits)?;
+                apply_manifest_tree_level_edits(
+                    &mut resolved.tree_levels,
+                    &incremental.tree_level_edits,
+                )?;
                 resolved.vlog_files = incremental.vlog_files;
                 resolved.id = incremental.id;
                 resolved.seq_id = incremental.seq_id;
@@ -505,8 +509,9 @@ impl Db {
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let max_file_seq = manifest
-            .levels
+            .tree_levels
             .iter()
+            .flat_map(|levels| levels.iter())
             .flat_map(|level| level.files.iter().map(|file| file.seq))
             .chain(manifest.vlog_files.iter().map(|file| file.file_seq as u64))
             .max()
@@ -520,12 +525,17 @@ impl Db {
         }
         let bucket_ranges = manifest.bucket_ranges.clone();
         let active_memtable_data = manifest.active_memtable_data.clone();
-        let levels = build_levels_from_manifest(&file_manager, manifest, true)?;
+        let tree_versions = build_tree_versions_from_manifest(&file_manager, manifest, true)?;
+        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+            config.total_buckets,
+            &bucket_ranges,
+            tree_versions.into_iter().map(Arc::new).collect(),
+        )?;
 
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
             seq_id: max_seq,
-            multi_lsm_version: MultiLSMTreeVersion::new(crate::lsm::LSMTreeVersion { levels }),
+            multi_lsm_version,
             vlog_version,
             active: None,
             immutables: Vec::new().into(),
@@ -596,17 +606,23 @@ impl Db {
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
         let max_file_seq = manifest
-            .levels
+            .tree_levels
             .iter()
+            .flat_map(|levels| levels.iter())
             .flat_map(|level| level.files.iter().map(|file| file.seq))
             .chain(manifest.vlog_files.iter().map(|file| file.file_seq as u64))
             .max()
             .unwrap_or(0);
-        let levels = build_levels_from_manifest(&file_manager, manifest, false)?;
+        let tree_versions = build_tree_versions_from_manifest(&file_manager, manifest, false)?;
+        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+            config.total_buckets,
+            &bucket_ranges,
+            tree_versions.into_iter().map(Arc::new).collect(),
+        )?;
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
             seq_id: latest.manifest.seq_id,
-            multi_lsm_version: MultiLSMTreeVersion::new(crate::lsm::LSMTreeVersion { levels }),
+            multi_lsm_version,
             vlog_version,
             active: None,
             immutables: Vec::new().into(),

@@ -711,7 +711,7 @@ fn test_db_snapshot_creates_manifest() {
     let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     assert!(manifest.contains("\"id\":"));
     assert!(manifest.contains("\"seq_id\":"));
-    assert!(manifest.contains("\"levels\""));
+    assert!(manifest.contains("\"tree_levels\""));
     assert!(manifest.contains("\"path\":\""));
 
     cleanup_test_root(root);
@@ -1164,6 +1164,75 @@ fn test_db_resume_takes_over_snapshot_lifecycle() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_db_multi_lsm_snapshot_restore_and_resume() {
+    let root = "/tmp/db_multi_lsm_snapshot_restore_resume";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 256,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        total_buckets: 4,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let ranges = vec![0u16..2u16, 2u16..4u16];
+    let db = Db::open(config.clone(), ranges.clone()).unwrap();
+    db.put(0, b"k-left", 0, b"v-left").unwrap();
+    db.put(3, b"k-right", 0, b"v-right").unwrap();
+    let snapshot_id = db.snapshot().unwrap();
+    let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&manifest).unwrap();
+    assert_eq!(
+        manifest_json
+            .get("bucket_ranges")
+            .and_then(|v| v.as_array())
+            .map_or(0, |v| v.len()),
+        2
+    );
+    assert_eq!(
+        manifest_json
+            .get("tree_levels")
+            .and_then(|v| v.as_array())
+            .map_or(0, |v| v.len()),
+        2
+    );
+    db.close().unwrap();
+
+    let restored =
+        Db::open_from_snapshot(config.clone(), snapshot_id, db.id().to_string()).unwrap();
+    let left = restored
+        .get(0, b"k-left", &ReadOptions::default())
+        .unwrap()
+        .expect("left value");
+    assert_eq!(left[0].as_ref().unwrap().as_ref(), b"v-left");
+    let right = restored
+        .get(3, b"k-right", &ReadOptions::default())
+        .unwrap()
+        .expect("right value");
+    assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
+    restored.close().unwrap();
+
+    let resumed = Db::resume(config, db.id().to_string()).unwrap();
+    let left = resumed
+        .get(0, b"k-left", &ReadOptions::default())
+        .unwrap()
+        .expect("left value after resume");
+    assert_eq!(left[0].as_ref().unwrap().as_ref(), b"v-left");
+    let right = resumed
+        .get(3, b"k-right", &ReadOptions::default())
+        .unwrap()
+        .expect("right value after resume");
+    assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
+    let bucket_snapshot = resumed.bucket_snapshot_input(snapshot_id).unwrap();
+    assert_eq!(bucket_snapshot.ranges, ranges);
+    resumed.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_metrics_list() {
     let root = "/tmp/db_metrics_list";
     cleanup_test_root(root);
@@ -1599,16 +1668,23 @@ fn test_db_snapshot_falls_back_to_sst_when_active_memtable_above_threshold() {
         Vec::new()
     );
     let level_files: usize = manifest_json
-        .get("levels")
+        .get("tree_levels")
         .and_then(|v| v.as_array())
-        .map_or(0, |levels| {
-            levels
+        .map_or(0, |trees| {
+            trees
                 .iter()
-                .map(|level| {
-                    level
-                        .get("files")
-                        .and_then(|files| files.as_array())
-                        .map_or(0, |files| files.len())
+                .map(|levels| {
+                    levels.as_array().map_or(0, |levels| {
+                        levels
+                            .iter()
+                            .map(|level| {
+                                level
+                                    .get("files")
+                                    .and_then(|files| files.as_array())
+                                    .map_or(0, |files| files.len())
+                            })
+                            .sum::<usize>()
+                    })
                 })
                 .sum()
         });

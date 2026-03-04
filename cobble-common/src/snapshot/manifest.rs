@@ -2,7 +2,7 @@ use super::{ActiveMemtableSnapshotData, DbSnapshot};
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, FileManager, SequentialWriteFile, TrackedFileId};
-use crate::lsm::Level;
+use crate::lsm::{LSMTreeVersion, Level};
 use crate::vlog::VlogVersion;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,7 +16,7 @@ pub(crate) struct ManifestSnapshot {
     pub(crate) seq_id: u64,
     pub(crate) latest_schema_id: u64,
     pub(crate) bucket_ranges: Vec<Range<u16>>,
-    pub(crate) levels: Vec<ManifestLevel>,
+    pub(crate) tree_levels: Vec<Vec<ManifestLevel>>,
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
     pub(crate) active_memtable_data: Vec<ActiveMemtableSnapshotData>,
 }
@@ -28,10 +28,16 @@ pub(crate) struct ManifestIncrementalSnapshot {
     pub(crate) base_snapshot_id: u64,
     pub(crate) latest_schema_id: u64,
     pub(crate) bucket_ranges: Vec<Range<u16>>,
-    pub(crate) level_edits: Vec<ManifestLevelEdit>,
+    pub(crate) tree_level_edits: Vec<ManifestTreeLevelEdit>,
     // always include vlog file info in incremental manifests since vlog files are more likely to have changes
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
     pub(crate) active_memtable_data: Vec<ActiveMemtableSnapshotData>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct ManifestTreeLevelEdit {
+    pub(crate) tree_idx: usize,
+    pub(crate) level_edits: Vec<ManifestLevelEdit>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -131,7 +137,10 @@ pub(crate) fn load_manifest_chain(
                             manifest.base_snapshot_id, current_id
                         ))
                     })?;
-                apply_manifest_level_edits(&mut resolved_base.levels, &manifest.level_edits)?;
+                apply_manifest_tree_level_edits(
+                    &mut resolved_base.tree_levels,
+                    &manifest.tree_level_edits,
+                )?;
                 resolved_base.vlog_files = manifest.vlog_files;
                 resolved_base.id = manifest.id;
                 resolved_base.seq_id = manifest.seq_id;
@@ -163,7 +172,27 @@ pub(crate) fn load_manifest_for_snapshot(
         .ok_or_else(|| Error::IoError(format!("Snapshot {} not found", snapshot_id)))
 }
 
-pub(crate) fn apply_manifest_level_edits(
+pub(crate) fn apply_manifest_tree_level_edits(
+    tree_levels: &mut [Vec<ManifestLevel>],
+    edits: &[ManifestTreeLevelEdit],
+) -> Result<()> {
+    for tree_edit in edits {
+        if tree_edit.tree_idx >= tree_levels.len() {
+            return Err(Error::IoError(format!(
+                "Invalid tree index {} for {} trees",
+                tree_edit.tree_idx,
+                tree_levels.len()
+            )));
+        }
+        let levels = tree_levels
+            .get_mut(tree_edit.tree_idx)
+            .expect("tree index validated");
+        manifest_levels_apply_edits(levels, &tree_edit.level_edits)?;
+    }
+    Ok(())
+}
+
+fn manifest_levels_apply_edits(
     levels: &mut Vec<ManifestLevel>,
     edits: &[ManifestLevelEdit],
 ) -> Result<()> {
@@ -241,14 +270,16 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             seq_id: snapshot.seq_id,
             latest_schema_id: snapshot.latest_schema_id,
             bucket_ranges: snapshot.bucket_ranges.clone(),
-            levels: manifest_levels_from_snapshot(&snapshot.levels, file_manager),
+            tree_levels: manifest_tree_levels_from_snapshot(&snapshot.lsm_versions, file_manager),
             vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
             active_memtable_data: snapshot.active_memtable_data.clone(),
         })
     };
     let mut incremental_base_id = None;
     let manifest = if let Some(base) = base_snapshot {
-        if let Some(level_edits) = build_incremental_level_edits(base, snapshot, file_manager) {
+        if let Some(tree_level_edits) =
+            build_incremental_tree_level_edits(base, snapshot, file_manager)
+        {
             incremental_base_id = Some(base.id);
             ManifestPayload::IncrementalSnapshot(ManifestIncrementalSnapshot {
                 id: snapshot.id,
@@ -256,7 +287,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 base_snapshot_id: base.id,
                 latest_schema_id: snapshot.latest_schema_id,
                 bucket_ranges: snapshot.bucket_ranges.clone(),
-                level_edits,
+                tree_level_edits,
                 vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
                 active_memtable_data: snapshot.active_memtable_data.clone(),
             })
@@ -272,20 +303,26 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
     Ok(incremental_base_id)
 }
 
-fn manifest_levels_from_snapshot(
-    levels: &[Level],
+fn manifest_tree_levels_from_snapshot(
+    lsm_versions: &[LSMTreeVersion],
     file_manager: &FileManager,
-) -> Vec<ManifestLevel> {
-    levels
+) -> Vec<Vec<ManifestLevel>> {
+    lsm_versions
         .iter()
-        .map(|level| ManifestLevel {
-            ordinal: level.ordinal,
-            tiered: level.tiered,
-            files: level
-                .files
+        .map(|version| {
+            version
+                .levels
                 .iter()
-                .map(|file| manifest_file_from_data_file(file, file_manager))
-                .collect(),
+                .map(|level| ManifestLevel {
+                    ordinal: level.ordinal,
+                    tiered: level.tiered,
+                    files: level
+                        .files
+                        .iter()
+                        .map(|file| manifest_file_from_data_file(file, file_manager))
+                        .collect(),
+                })
+                .collect()
         })
         .collect()
 }
@@ -329,14 +366,13 @@ fn manifest_vlog_files_from_snapshot(
 /// Returns None if incremental edits cannot fully capture the changes (e.g. due to file removals
 /// or complex tiered level changes), in which case a full snapshot manifest should be written instead.
 fn build_incremental_level_edits(
-    base: &DbSnapshot,
-    snapshot: &DbSnapshot,
+    base_levels: &[Level],
+    snapshot_levels: &[Level],
     file_manager: &FileManager,
 ) -> Option<Vec<ManifestLevelEdit>> {
     let mut edits = Vec::new();
-    for level in &snapshot.levels {
-        let base_level = base
-            .levels
+    for level in snapshot_levels {
+        let base_level = base_levels
             .iter()
             .find(|base_level| base_level.ordinal == level.ordinal)?;
         let base_file_ids: HashSet<u64> =
@@ -373,9 +409,8 @@ fn build_incremental_level_edits(
             });
         }
     }
-    for base_level in &base.levels {
-        if !snapshot
-            .levels
+    for base_level in base_levels {
+        if !snapshot_levels
             .iter()
             .any(|level| level.ordinal == base_level.ordinal)
             && !base_level.files.is_empty()
@@ -383,7 +418,34 @@ fn build_incremental_level_edits(
             return None;
         }
     }
-    if edits.is_empty() { None } else { Some(edits) }
+    Some(edits)
+}
+
+fn build_incremental_tree_level_edits(
+    base: &DbSnapshot,
+    snapshot: &DbSnapshot,
+    file_manager: &FileManager,
+) -> Option<Vec<ManifestTreeLevelEdit>> {
+    if base.lsm_versions.len() != snapshot.lsm_versions.len() {
+        return None;
+    }
+    let mut tree_edits = Vec::new();
+    for (tree_idx, tree_version) in snapshot.lsm_versions.iter().enumerate() {
+        let base_tree = base.lsm_versions.get(tree_idx)?;
+        let level_edits =
+            build_incremental_level_edits(&base_tree.levels, &tree_version.levels, file_manager)?;
+        if !level_edits.is_empty() {
+            tree_edits.push(ManifestTreeLevelEdit {
+                tree_idx,
+                level_edits,
+            });
+        }
+    }
+    if tree_edits.is_empty() {
+        None
+    } else {
+        Some(tree_edits)
+    }
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -400,10 +462,12 @@ pub(crate) fn manifest_data_file_refs(
     manifest: &ManifestSnapshot,
 ) -> impl Iterator<Item = (u64, String)> {
     let mut refs: BTreeMap<u64, String> = BTreeMap::new();
-    for level in &manifest.levels {
-        for file in &level.files {
-            refs.entry(file.file_id)
-                .or_insert_with(|| file.path.clone());
+    for tree_levels in &manifest.tree_levels {
+        for level in tree_levels {
+            for file in &level.files {
+                refs.entry(file.file_id)
+                    .or_insert_with(|| file.path.clone());
+            }
         }
     }
     for file in &manifest.vlog_files {
@@ -413,36 +477,40 @@ pub(crate) fn manifest_data_file_refs(
     refs.into_iter()
 }
 
-pub(crate) fn build_levels_from_manifest_untracked(
+pub(crate) fn build_tree_versions_from_manifest_untracked(
     manifest: &ManifestSnapshot,
-) -> Result<Vec<Level>> {
-    let mut levels = Vec::with_capacity(manifest.levels.len());
-    for level in &manifest.levels {
-        let mut files = Vec::with_capacity(level.files.len());
-        for file in &level.files {
-            let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
-            let start_key = from_hex(&file.start_key)?;
-            let end_key = from_hex(&file.end_key)?;
-            files.push(Arc::new(DataFile {
-                file_type,
-                start_key,
-                end_key,
-                file_id: file.file_id,
-                tracked_id: TrackedFileId::detached(file.file_id),
-                seq: file.seq,
-                schema_id: file.schema_id,
-                size: file.size,
-                has_separated_values: file.has_separated_values,
-                meta_bytes: Default::default(),
-            }));
+) -> Result<Vec<LSMTreeVersion>> {
+    let mut tree_versions = Vec::with_capacity(manifest.tree_levels.len());
+    for levels in &manifest.tree_levels {
+        let mut out_levels = Vec::with_capacity(levels.len());
+        for level in levels {
+            let mut files = Vec::with_capacity(level.files.len());
+            for file in &level.files {
+                let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
+                let start_key = from_hex(&file.start_key)?;
+                let end_key = from_hex(&file.end_key)?;
+                files.push(Arc::new(DataFile {
+                    file_type,
+                    start_key,
+                    end_key,
+                    file_id: file.file_id,
+                    tracked_id: TrackedFileId::detached(file.file_id),
+                    seq: file.seq,
+                    schema_id: file.schema_id,
+                    size: file.size,
+                    has_separated_values: file.has_separated_values,
+                    meta_bytes: Default::default(),
+                }));
+            }
+            out_levels.push(Level {
+                ordinal: level.ordinal,
+                tiered: level.tiered,
+                files,
+            });
         }
-        levels.push(Level {
-            ordinal: level.ordinal,
-            tiered: level.tiered,
-            files,
-        });
+        tree_versions.push(LSMTreeVersion { levels: out_levels });
     }
-    Ok(levels)
+    Ok(tree_versions)
 }
 
 pub(crate) fn build_vlog_version_from_manifest_untracked(
@@ -462,45 +530,49 @@ pub(crate) fn build_vlog_version_from_manifest_untracked(
     VlogVersion::from_files_with_entries(files)
 }
 
-pub(crate) fn build_levels_from_manifest(
+pub(crate) fn build_tree_versions_from_manifest(
     file_manager: &Arc<FileManager>,
     manifest: ManifestSnapshot,
     read_only: bool,
-) -> Result<Vec<Level>> {
-    let mut levels = Vec::with_capacity(manifest.levels.len());
-    for level in manifest.levels {
-        let mut files = Vec::with_capacity(level.files.len());
-        for file in level.files {
-            let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
-            let start_key = from_hex(&file.start_key)?;
-            let end_key = from_hex(&file.end_key)?;
-            let tracked_id = if read_only {
-                file_manager.register_data_file_readonly(file.file_id, file.path)?;
-                TrackedFileId::detached(file.file_id)
-            } else {
-                file_manager.register_data_file(file.file_id, file.path)?;
-                TrackedFileId::new(file_manager, file.file_id)
-            };
-            files.push(Arc::new(DataFile {
-                file_type,
-                start_key,
-                end_key,
-                file_id: file.file_id,
-                tracked_id,
-                seq: file.seq,
-                schema_id: file.schema_id,
-                size: file.size,
-                has_separated_values: file.has_separated_values,
-                meta_bytes: Default::default(),
-            }));
+) -> Result<Vec<LSMTreeVersion>> {
+    let mut tree_versions = Vec::with_capacity(manifest.tree_levels.len());
+    for levels in manifest.tree_levels {
+        let mut out_levels = Vec::with_capacity(levels.len());
+        for level in levels {
+            let mut files = Vec::with_capacity(level.files.len());
+            for file in level.files {
+                let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
+                let start_key = from_hex(&file.start_key)?;
+                let end_key = from_hex(&file.end_key)?;
+                let tracked_id = if read_only {
+                    file_manager.register_data_file_readonly(file.file_id, file.path)?;
+                    TrackedFileId::detached(file.file_id)
+                } else {
+                    file_manager.register_data_file(file.file_id, file.path)?;
+                    TrackedFileId::new(file_manager, file.file_id)
+                };
+                files.push(Arc::new(DataFile {
+                    file_type,
+                    start_key,
+                    end_key,
+                    file_id: file.file_id,
+                    tracked_id,
+                    seq: file.seq,
+                    schema_id: file.schema_id,
+                    size: file.size,
+                    has_separated_values: file.has_separated_values,
+                    meta_bytes: Default::default(),
+                }));
+            }
+            out_levels.push(Level {
+                ordinal: level.ordinal,
+                tiered: level.tiered,
+                files,
+            });
         }
-        levels.push(Level {
-            ordinal: level.ordinal,
-            tiered: level.tiered,
-            files,
-        });
+        tree_versions.push(LSMTreeVersion { levels: out_levels });
     }
-    Ok(levels)
+    Ok(tree_versions)
 }
 
 pub(crate) fn build_vlog_version_from_manifest(

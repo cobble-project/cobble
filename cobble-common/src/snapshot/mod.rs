@@ -5,7 +5,7 @@ mod memtable;
 
 use crate::error::Result;
 use crate::file::TrackedFile;
-use crate::lsm::Level;
+use crate::lsm::LSMTreeVersion;
 use crate::vlog::VlogVersion;
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 pub(crate) use manager::SnapshotManager;
 pub(crate) use manifest::{
-    LoadedManifest, ManifestPayload, ManifestSnapshot, apply_manifest_level_edits,
-    build_levels_from_manifest, build_vlog_version_from_manifest, decode_manifest,
+    LoadedManifest, ManifestPayload, ManifestSnapshot, apply_manifest_tree_level_edits,
+    build_tree_versions_from_manifest, build_vlog_version_from_manifest, decode_manifest,
     load_manifest_for_snapshot, snapshot_manifest_name,
 };
 pub(crate) use memtable::ActiveMemtableSnapshotData;
@@ -25,8 +25,8 @@ pub(crate) struct DbSnapshot {
     pub id: u64,
     pub manifest_path: String,
     pub base_snapshot_id: Option<u64>,
-    // Levels without tracked file references.
-    pub levels: Vec<Level>,
+    // Per-tree LSM versions without tracked file references.
+    pub lsm_versions: Vec<LSMTreeVersion>,
     // Tracked references to all files included in the snapshot, used for reference counting and
     // cleanup when expiring snapshots. This includes both LSM files and vlog files.
     pub tracked_files: Vec<Arc<TrackedFile>>,
@@ -49,7 +49,7 @@ impl DbSnapshot {
             id,
             manifest_path,
             base_snapshot_id: None,
-            levels: vec![],
+            lsm_versions: vec![],
             tracked_files: Vec::new(),
             vlog_version: VlogVersion::new(),
             seq_id: 0,

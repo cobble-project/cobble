@@ -3,12 +3,12 @@ use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
 use crate::error::{Error, Result};
 use crate::file::FileManager;
-use crate::lsm::{LSMTree, LSMTreeVersion};
+use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
 use crate::schema::SchemaManager;
 use crate::snapshot::{
-    build_levels_from_manifest, build_vlog_version_from_manifest, load_manifest_for_snapshot,
+    build_tree_versions_from_manifest, build_vlog_version_from_manifest, load_manifest_for_snapshot,
 };
 use crate::sst::block_cache::{BlockCache, new_block_cache};
 use crate::sst::row_codec::encode_key_ref_into;
@@ -76,13 +76,30 @@ impl ReadOnlyDb {
             Arc::clone(&time_provider),
         ));
         let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
+        if manifest.bucket_ranges.is_empty() {
+            return Err(Error::InvalidState(format!(
+                "Snapshot {} manifest missing bucket_ranges",
+                snapshot_id
+            )));
+        }
+        let bucket_ranges = manifest.bucket_ranges.clone();
         let schema_manager = Arc::new(SchemaManager::from_manifest(
             &file_manager,
             &manifest,
             config.num_columns,
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
-        let levels = build_levels_from_manifest(&file_manager, manifest, true)?;
+        let tree_versions = build_tree_versions_from_manifest(&file_manager, manifest, true)?;
+        let manifest_total_buckets = bucket_ranges
+            .iter()
+            .map(|range| range.end)
+            .max()
+            .unwrap_or(config.total_buckets);
+        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+            manifest_total_buckets,
+            &bucket_ranges,
+            tree_versions.into_iter().map(Arc::new).collect(),
+        )?;
         let sst_options = crate::compaction::build_sst_writer_options(&config, 0);
         let vlog_store = Arc::new(VlogStore::new(
             Arc::clone(&file_manager),
@@ -93,7 +110,7 @@ impl ReadOnlyDb {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
             seq_id: 0,
-            multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels }),
+            multi_lsm_version,
             vlog_version,
             active: None,
             immutables: Vec::new().into(),

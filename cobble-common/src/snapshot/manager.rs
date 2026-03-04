@@ -1,5 +1,5 @@
 use super::manifest::{
-    ManifestSnapshot, build_levels_from_manifest_untracked,
+    ManifestSnapshot, build_tree_versions_from_manifest_untracked,
     build_vlog_version_from_manifest_untracked, encode_manifest, manifest_data_file_refs,
     snapshot_manifest_name,
 };
@@ -9,7 +9,7 @@ use crate::data_file::DataFile;
 use crate::db_state::{DbState, DbStateHandle};
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, FileManager, TrackedFileId};
-use crate::lsm::Level;
+use crate::lsm::{LSMTreeVersion, Level};
 use crate::paths::schema_file_relative_path;
 use crate::schema::SchemaManager;
 use crate::vlog::VlogVersion;
@@ -142,14 +142,23 @@ impl SnapshotManager {
             return false;
         };
         let mut snapshot = (*snapshot).clone();
-        let primary_lsm_version = db_state.multi_lsm_version.version_of_index(0);
-        snapshot.levels = clone_levels_untracked(&primary_lsm_version.levels);
+        snapshot.lsm_versions = (0..db_state.multi_lsm_version.tree_count())
+            .map(|tree_idx| {
+                clone_lsm_tree_version_untracked(
+                    db_state
+                        .multi_lsm_version
+                        .version_of_index(tree_idx)
+                        .as_ref(),
+                )
+            })
+            .collect();
         let mut tracked_file_ids: BTreeSet<u64> = db_state
             .multi_lsm_version
-            .version_of_index(0)
-            .levels
+            .tree_versions_cloned()
             .iter()
-            .flat_map(|level| level.files.iter().map(|file| file.file_id))
+            .flat_map(|version| version.levels.iter())
+            .flat_map(|level| level.files.iter())
+            .map(|file| file.file_id)
             .collect();
         for tracked in db_state.vlog_version.tracked_files() {
             tracked_file_ids.insert(tracked.file_id());
@@ -157,14 +166,15 @@ impl SnapshotManager {
         snapshot.seq_id = db_state.seq_id;
         snapshot.latest_schema_id = db_state
             .multi_lsm_version
-            .version_of_index(0)
-            .levels
+            .tree_versions_cloned()
             .iter()
-            .flat_map(|level| level.files.iter().map(|file| file.schema_id))
+            .flat_map(|version| version.levels.iter())
+            .flat_map(|level| level.files.iter())
+            .map(|file| file.schema_id)
             .max()
             .unwrap_or(0);
         snapshot.referenced_schema_ids =
-            collect_schema_ids_from_levels(&snapshot.levels, snapshot.latest_schema_id);
+            collect_schema_ids_from_lsm_versions(&snapshot.lsm_versions, snapshot.latest_schema_id);
         snapshot.tracked_files = tracked_file_ids
             .into_iter()
             .filter_map(|file_id| self.file_manager.data_file_ref(file_id).ok())
@@ -229,14 +239,14 @@ impl SnapshotManager {
                 self.file_manager.data_file_ref(file_id)
             })
             .collect::<Result<Vec<_>>>()?;
-        let levels = build_levels_from_manifest_untracked(manifest)?;
+        let lsm_versions = build_tree_versions_from_manifest_untracked(manifest)?;
         let referenced_schema_ids =
-            collect_schema_ids_from_levels(&levels, manifest.latest_schema_id);
+            collect_schema_ids_from_lsm_versions(&lsm_versions, manifest.latest_schema_id);
         let snapshot = Arc::new(DbSnapshot {
             id: snapshot_id,
             manifest_path,
             base_snapshot_id,
-            levels,
+            lsm_versions,
             tracked_files,
             vlog_version: build_vlog_version_from_manifest_untracked(manifest),
             seq_id: manifest.seq_id,
@@ -548,17 +558,22 @@ impl SnapshotManager {
 }
 
 /// Collect all schema IDs referenced by the levels.
-fn collect_schema_ids_from_levels(levels: &[Level], latest_schema_id: u64) -> BTreeSet<u64> {
+fn collect_schema_ids_from_lsm_versions(
+    lsm_versions: &[LSMTreeVersion],
+    latest_schema_id: u64,
+) -> BTreeSet<u64> {
     let mut schema_ids = BTreeSet::new();
     schema_ids.insert(latest_schema_id);
-    for level in levels {
-        for file in &level.files {
-            if file.schema_id <= latest_schema_id {
-                for schema_id in file.schema_id..=latest_schema_id {
-                    schema_ids.insert(schema_id);
+    for version in lsm_versions {
+        for level in &version.levels {
+            for file in &level.files {
+                if file.schema_id <= latest_schema_id {
+                    for schema_id in file.schema_id..=latest_schema_id {
+                        schema_ids.insert(schema_id);
+                    }
+                } else {
+                    schema_ids.insert(file.schema_id);
                 }
-            } else {
-                schema_ids.insert(file.schema_id);
             }
         }
     }
@@ -593,37 +608,40 @@ fn decrement_schema_ref_counts(
     }
 }
 
-/// Clone levels and files from the LSM version without tracking.
-fn clone_levels_untracked(levels: &[Level]) -> Vec<Level> {
-    levels
-        .iter()
-        .map(|level| Level {
-            ordinal: level.ordinal,
-            tiered: level.tiered,
-            files: level
-                .files
-                .iter()
-                .map(|file| {
-                    let detached = DataFile {
-                        file_type: file.file_type,
-                        start_key: file.start_key.clone(),
-                        end_key: file.end_key.clone(),
-                        file_id: file.file_id,
-                        tracked_id: TrackedFileId::detached(file.file_id),
-                        seq: file.seq,
-                        schema_id: file.schema_id,
-                        size: file.size,
-                        has_separated_values: file.has_separated_values,
-                        meta_bytes: Default::default(),
-                    };
-                    if let Some(meta_bytes) = file.meta_bytes() {
-                        detached.set_meta_bytes(meta_bytes);
-                    }
-                    Arc::new(detached)
-                })
-                .collect(),
-        })
-        .collect()
+/// Clone an LSM tree version without tracking.
+fn clone_lsm_tree_version_untracked(version: &LSMTreeVersion) -> LSMTreeVersion {
+    LSMTreeVersion {
+        levels: version
+            .levels
+            .iter()
+            .map(|level| Level {
+                ordinal: level.ordinal,
+                tiered: level.tiered,
+                files: level
+                    .files
+                    .iter()
+                    .map(|file| {
+                        let detached = DataFile {
+                            file_type: file.file_type,
+                            start_key: file.start_key.clone(),
+                            end_key: file.end_key.clone(),
+                            file_id: file.file_id,
+                            tracked_id: TrackedFileId::detached(file.file_id),
+                            seq: file.seq,
+                            schema_id: file.schema_id,
+                            size: file.size,
+                            has_separated_values: file.has_separated_values,
+                            meta_bytes: Default::default(),
+                        };
+                        if let Some(meta_bytes) = file.meta_bytes() {
+                            detached.set_meta_bytes(meta_bytes);
+                        }
+                        Arc::new(detached)
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
 }
 
 /// Clone vlog version from the LSM version without tracking.

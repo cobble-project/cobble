@@ -27,6 +27,17 @@ impl MultiLSMTreeVersion {
         bucket_ranges: &[Range<u16>],
         lsm_version: Arc<LSMTreeVersion>,
     ) -> Result<Self> {
+        let tree_versions = (0..bucket_ranges.len())
+            .map(|_| Arc::clone(&lsm_version))
+            .collect();
+        Self::from_bucket_ranges_with_tree_versions(total_buckets, bucket_ranges, tree_versions)
+    }
+
+    pub(crate) fn from_bucket_ranges_with_tree_versions(
+        total_buckets: u16,
+        bucket_ranges: &[Range<u16>],
+        tree_versions: Vec<Arc<LSMTreeVersion>>,
+    ) -> Result<Self> {
         if total_buckets == 0 {
             return Err(Error::ConfigError(
                 "total_buckets must be greater than 0".to_string(),
@@ -36,6 +47,13 @@ impl MultiLSMTreeVersion {
             return Err(Error::ConfigError(
                 "bucket_ranges must not be empty".to_string(),
             ));
+        }
+        if tree_versions.len() != bucket_ranges.len() {
+            return Err(Error::InvalidState(format!(
+                "LSM tree version count {} does not match bucket range count {}",
+                tree_versions.len(),
+                bucket_ranges.len()
+            )));
         }
         let mut bucket_to_tree_idx = vec![u16::MAX; total_buckets as usize];
         for (tree_idx, range) in bucket_ranges.iter().enumerate() {
@@ -58,9 +76,7 @@ impl MultiLSMTreeVersion {
         }
         Ok(Self {
             bucket_to_tree_idx,
-            tree_versions: (0..bucket_ranges.len())
-                .map(|_| Arc::clone(&lsm_version))
-                .collect(),
+            tree_versions,
         })
     }
 
@@ -80,6 +96,14 @@ impl MultiLSMTreeVersion {
             .get(i)
             .expect("Invalid tree index")
             .clone()
+    }
+
+    pub(crate) fn tree_count(&self) -> usize {
+        self.tree_versions.len().max(1)
+    }
+
+    pub(crate) fn tree_versions_cloned(&self) -> Vec<Arc<LSMTreeVersion>> {
+        self.tree_versions.clone()
     }
 
     pub(crate) fn tree_index_for_bucket(&self, bucket: u16) -> Option<usize> {
@@ -210,10 +234,25 @@ impl DbStateHandle {
     ) -> Result<()> {
         let _guard = self.lock();
         let snapshot = self.load();
-        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges(
+        let existing_tree_count = snapshot.multi_lsm_version.tree_count();
+        let tree_versions = if existing_tree_count == bucket_ranges.len() {
+            snapshot.multi_lsm_version.tree_versions_cloned()
+        } else if existing_tree_count == 1 {
+            let primary = snapshot.multi_lsm_version.version_of_index(0);
+            (0..bucket_ranges.len())
+                .map(|_| Arc::clone(&primary))
+                .collect()
+        } else {
+            return Err(Error::InvalidState(format!(
+                "Cannot configure {} bucket ranges with {} existing LSM trees",
+                bucket_ranges.len(),
+                existing_tree_count
+            )));
+        };
+        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
             total_buckets,
             bucket_ranges,
-            snapshot.multi_lsm_version.version_of_index(0),
+            tree_versions,
         )?;
         self.store(DbState {
             seq_id: snapshot.seq_id,
