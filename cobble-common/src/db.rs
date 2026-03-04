@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::db_state::DbStateHandle;
+use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
 use crate::governance::{GovernanceManager, create_manifest_lock_provider};
 use crate::metrics_registry;
 use crate::read_only_db::ReadOnlyDb;
@@ -525,7 +525,7 @@ impl Db {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
             seq_id: max_seq,
-            lsm_version: crate::lsm::LSMTreeVersion { levels },
+            multi_lsm_version: MultiLSMTreeVersion::new(crate::lsm::LSMTreeVersion { levels }),
             vlog_version,
             active: None,
             immutables: Vec::new().into(),
@@ -606,7 +606,7 @@ impl Db {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
             seq_id: latest.manifest.seq_id,
-            lsm_version: crate::lsm::LSMTreeVersion { levels },
+            multi_lsm_version: MultiLSMTreeVersion::new(crate::lsm::LSMTreeVersion { levels }),
             vlog_version,
             active: None,
             immutables: Vec::new().into(),
@@ -655,6 +655,7 @@ impl Db {
         if config.block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
         }
+        db_state.configure_multi_lsm(config.total_buckets, &bucket_ranges)?;
         let lsm_tree = Arc::new(lsm_tree);
         let mut sst_options = crate::compaction::build_sst_writer_options(&config, 0);
         sst_options.num_columns = runtime_num_columns;
@@ -852,6 +853,7 @@ impl Db {
         let lsm_values = self.lsm_tree.get_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
+            bucket,
             encoded_key.as_ref(),
             schema.as_ref(),
             self.schema_manager.as_ref(),

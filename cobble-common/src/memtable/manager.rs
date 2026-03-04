@@ -709,7 +709,7 @@ impl MemtableManager {
             db_state.cas_mutate(snapshot.seq_id, |db_state, snapshot| {
                 Some(DbState {
                     seq_id: db_state.allocate_seq_id(),
-                    lsm_version: snapshot.lsm_version.clone(),
+                    multi_lsm_version: snapshot.multi_lsm_version.clone(),
                     vlog_version: snapshot.vlog_version.clone(),
                     active: Some(Arc::clone(&active)),
                     immutables: snapshot.immutables.clone(),
@@ -896,7 +896,7 @@ impl MemtableManager {
                 .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
                     Some(DbState {
                         seq_id: db_state.allocate_seq_id(),
-                        lsm_version: snapshot.lsm_version.clone(),
+                        multi_lsm_version: snapshot.multi_lsm_version.clone(),
                         vlog_version: snapshot.vlog_version.clone(),
                         active: None,
                         immutables: snapshot.immutables.clone(),
@@ -1157,7 +1157,7 @@ impl MemtableManager {
 
                     Some(DbState {
                         seq_id: db_state.allocate_seq_id(),
-                        lsm_version: snapshot_state.lsm_version.clone(),
+                        multi_lsm_version: snapshot_state.multi_lsm_version.clone(),
                         vlog_version: snapshot_state.vlog_version.clone(),
                         active: None,
                         immutables,
@@ -1311,7 +1311,8 @@ impl MemtableManager {
     fn should_write_stall_with_snapshot(snapshot: &DbState, write_stall_limit: usize) -> bool {
         let immutables = snapshot.immutables.len();
         let level0 = snapshot
-            .lsm_version
+            .multi_lsm_version
+            .version_of_index(0)
             .levels
             .iter()
             .find(|level| level.ordinal == 0)

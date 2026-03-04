@@ -1,6 +1,6 @@
 use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
-use crate::db_state::DbStateHandle;
+use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
 use crate::error::{Error, Result};
 use crate::file::FileManager;
 use crate::lsm::{LSMTree, LSMTreeVersion};
@@ -93,7 +93,7 @@ impl ReadOnlyDb {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
             seq_id: 0,
-            lsm_version: LSMTreeVersion { levels },
+            multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels }),
             vlog_version,
             active: None,
             immutables: Vec::new().into(),
@@ -153,6 +153,7 @@ impl ReadOnlyDb {
         let selected_mask = masks.selected_mask.as_deref();
         let lsm_values = self.lsm_tree.get(
             &self.file_manager,
+            bucket,
             encoded_key.as_ref(),
             schema.as_ref(),
             self.schema_manager.as_ref(),

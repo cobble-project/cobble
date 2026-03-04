@@ -799,7 +799,7 @@ mod tests {
     use super::*;
     use crate::VolumeDescriptor;
     use crate::compaction::build_sst_writer_options;
-    use crate::db_state::{DbState, DbStateHandle};
+    use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
     use crate::lsm::{LSMTree, LSMTreeVersion, Level};
     use crate::sst::row_codec::{decode_value, encode_value};
     use crate::r#type::{Column, Value, ValueType};
@@ -885,23 +885,24 @@ mod tests {
         let file_a = create_test_sst(&file_manager, entries_a, sst_options.clone()).unwrap();
         let file_b = create_test_sst(&file_manager, entries_b, sst_options.clone()).unwrap();
 
+        let lsm_version = LSMTreeVersion {
+            levels: vec![
+                Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: vec![Arc::clone(&file_a), Arc::clone(&file_b)],
+                },
+                Level {
+                    ordinal: 1,
+                    tiered: false,
+                    files: Vec::new(),
+                },
+            ],
+        };
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(DbState {
             seq_id: 0,
-            lsm_version: LSMTreeVersion {
-                levels: vec![
-                    Level {
-                        ordinal: 0,
-                        tiered: true,
-                        files: vec![Arc::clone(&file_a), Arc::clone(&file_b)],
-                    },
-                    Level {
-                        ordinal: 1,
-                        tiered: false,
-                        files: Vec::new(),
-                    },
-                ],
-            },
+            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
@@ -1026,23 +1027,24 @@ mod tests {
         let older_file = create_test_sst(&file_manager, entries_old, sst_options.clone()).unwrap();
         let newer_file = create_test_sst(&file_manager, entries_new, sst_options.clone()).unwrap();
 
+        let lsm_version = LSMTreeVersion {
+            levels: vec![
+                Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: vec![Arc::clone(&newer_file), Arc::clone(&older_file)],
+                },
+                Level {
+                    ordinal: 1,
+                    tiered: false,
+                    files: Vec::new(),
+                },
+            ],
+        };
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(DbState {
             seq_id: 0,
-            lsm_version: LSMTreeVersion {
-                levels: vec![
-                    Level {
-                        ordinal: 0,
-                        tiered: true,
-                        files: vec![Arc::clone(&newer_file), Arc::clone(&older_file)],
-                    },
-                    Level {
-                        ordinal: 1,
-                        tiered: false,
-                        files: Vec::new(),
-                    },
-                ],
-            },
+            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),

@@ -202,7 +202,11 @@ impl LSMTree {
     ) -> Arc<DbState> {
         let guard = self.db_state.lock();
         let snapshot = self.db_state.load();
-        let mut new_levels = snapshot.lsm_version.levels.clone();
+        let mut new_levels = snapshot
+            .multi_lsm_version
+            .version_of_index(0)
+            .levels
+            .clone();
         let inherit_suggested_base_snapshot_id = edit.level_edits.is_empty()
             || (edit.level_edits.len() == 1
                 && edit.level_edits[0].level == 0
@@ -271,14 +275,17 @@ impl LSMTree {
                 });
             }
         }
+        let new_lsm_version = LSMTreeVersion {
+            levels: new_levels.clone(),
+        };
 
         self.db_state
             .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
                 let mut new_db_state = DbState {
                     seq_id: db_state.allocate_seq_id(),
-                    lsm_version: LSMTreeVersion {
-                        levels: new_levels.clone(),
-                    },
+                    multi_lsm_version: snapshot
+                        .multi_lsm_version
+                        .with_lsm_version(Arc::new(new_lsm_version.clone())),
                     vlog_version: snapshot.vlog_version.clone(),
                     active: snapshot.active.clone(),
                     immutables: snapshot.immutables.clone(),
@@ -296,7 +303,13 @@ impl LSMTree {
         debug!(
             "{}. {}",
             VersionEditSummary(&edit),
-            VersionSummary(&self.db_state.load().lsm_version)
+            VersionSummary(
+                self.db_state
+                    .load()
+                    .multi_lsm_version
+                    .version_of_index(0)
+                    .as_ref()
+            )
         );
         self.maybe_trigger_compaction_locked(state);
         snapshot
@@ -332,7 +345,8 @@ impl LSMTree {
     pub(crate) fn level_files(&self, level: u8) -> Vec<Arc<DataFile>> {
         self.db_state
             .load()
-            .lsm_version
+            .multi_lsm_version
+            .version_of_index(0)
             .levels
             .iter()
             .find(|l| l.ordinal == level)
@@ -394,9 +408,10 @@ impl LSMTree {
             return;
         }
         let levels_snapshot = self.db_state.load();
+        let primary_version = levels_snapshot.multi_lsm_version.version_of_index(0);
         let plan = state
             .compaction_policy
-            .pick(&levels_snapshot.lsm_version.levels, state.compaction_config);
+            .pick(&primary_version.levels, state.compaction_config);
         let Some(plan) = plan else {
             return;
         };
@@ -404,9 +419,7 @@ impl LSMTree {
             return;
         };
         if plan.trivial_move {
-            if let Some(edit) =
-                self.build_trivial_move_edit(&levels_snapshot.lsm_version.levels, &plan)
-            {
+            if let Some(edit) = self.build_trivial_move_edit(&primary_version.levels, &plan) {
                 debug!(
                     "compaction trivial move L{}->L{} file_id={}",
                     plan.input_level, plan.output_level, plan.base_file_id
@@ -416,11 +429,7 @@ impl LSMTree {
             return;
         }
         debug!("trigger compaction plan {}", plan);
-        let runs = build_runs_for_plan(
-            &levels_snapshot.lsm_version.levels,
-            &plan,
-            &state.compaction_config,
-        );
+        let runs = build_runs_for_plan(&primary_version.levels, &plan, &state.compaction_config);
         if let Some(handle) = worker.submit_runs(
             runs,
             plan.output_level,
@@ -467,6 +476,7 @@ impl LSMTree {
     pub(crate) fn get(
         &self,
         file_manager: &Arc<FileManager>,
+        bucket: u16,
         encoded_key: &[u8],
         target_schema: &Schema,
         schema_manager: &SchemaManager,
@@ -479,6 +489,7 @@ impl LSMTree {
         self.get_with_snapshot(
             file_manager,
             snapshot,
+            bucket,
             encoded_key,
             target_schema,
             schema_manager,
@@ -494,6 +505,36 @@ impl LSMTree {
         &self,
         file_manager: &Arc<FileManager>,
         snapshot: Arc<DbState>,
+        bucket: u16,
+        encoded_key: &[u8],
+        target_schema: &Schema,
+        schema_manager: &SchemaManager,
+        selected_columns: Option<&[usize]>,
+        selected_mask: Option<&[u8]>,
+        terminal_mask: Option<&mut [u8]>,
+        max_seq: Option<u64>,
+    ) -> Result<Vec<Value>> {
+        let Some(version) = snapshot.multi_lsm_version.version_for_bucket(bucket) else {
+            return Ok(Vec::new());
+        };
+        self.get_with_levels(
+            file_manager,
+            version.as_ref().levels.as_slice(),
+            encoded_key,
+            target_schema,
+            schema_manager,
+            selected_columns,
+            selected_mask,
+            terminal_mask,
+            max_seq,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn get_with_levels(
+        &self,
+        file_manager: &Arc<FileManager>,
+        levels: &[Level],
         encoded_key: &[u8],
         target_schema: &Schema,
         schema_manager: &SchemaManager,
@@ -525,7 +566,7 @@ impl LSMTree {
             terminal_mask = None;
         }
 
-        for level in snapshot.lsm_version.levels.iter() {
+        for level in levels.iter() {
             if level.tiered {
                 for file in level.files.iter().rev() {
                     let should_continue = self.get_values_in_one_file(
@@ -587,7 +628,8 @@ impl LSMTree {
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let use_read_ahead = read_ahead_bytes > 0 && tokio::runtime::Handle::try_current().is_ok();
         let mut runs: Vec<SortedRun> = Vec::new();
-        for level in &snapshot.lsm_version.levels {
+        let primary_version = snapshot.multi_lsm_version.version_of_index(0);
+        for level in &primary_version.levels {
             if level.files.is_empty() {
                 continue;
             }
@@ -752,7 +794,7 @@ impl LSMTree {
 mod tests {
     use super::*;
     use crate::data_file::DataFileType;
-    use crate::db_state::{DbState, DbStateHandle};
+    use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
     use crate::file::{FileId, FileManager, FileSystemRegistry, TrackedFileId};
     use crate::sst::row_codec::{encode_key, encode_value};
     use crate::sst::{SSTWriter, SSTWriterOptions};
@@ -808,6 +850,15 @@ mod tests {
         seq: u64,
         entries: Vec<(&[u8], &[u8])>,
     ) -> Result<Arc<DataFile>> {
+        create_test_sst_in_bucket(file_manager, seq, 0, entries)
+    }
+
+    fn create_test_sst_in_bucket(
+        file_manager: &Arc<FileManager>,
+        seq: u64,
+        bucket: u16,
+        entries: Vec<(&[u8], &[u8])>,
+    ) -> Result<Arc<DataFile>> {
         let (file_id, writer_file) = file_manager.create_data_file()?;
         let mut writer = SSTWriter::new(
             writer_file,
@@ -820,7 +871,7 @@ mod tests {
             },
         );
         for (key, value) in entries {
-            let encoded_key = encode_key(&Key::new(0, key.to_vec()));
+            let encoded_key = encode_key(&Key::new(bucket, key.to_vec()));
             writer.add(encoded_key.as_ref(), value)?;
         }
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
@@ -848,22 +899,23 @@ mod tests {
     #[test]
     fn test_lsm_tree_apply_edit() {
         let db_state = Arc::new(DbStateHandle::new());
+        let lsm_version = LSMTreeVersion {
+            levels: vec![
+                Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: vec![create_data_file(b"a", b"b"), create_data_file(b"c", b"d")],
+                },
+                Level {
+                    ordinal: 1,
+                    tiered: false,
+                    files: vec![create_data_file(b"e", b"f"), create_data_file(b"g", b"h")],
+                },
+            ],
+        };
         db_state.store(DbState {
             seq_id: 0,
-            lsm_version: LSMTreeVersion {
-                levels: vec![
-                    Level {
-                        ordinal: 0,
-                        tiered: true,
-                        files: vec![create_data_file(b"a", b"b"), create_data_file(b"c", b"d")],
-                    },
-                    Level {
-                        ordinal: 1,
-                        tiered: false,
-                        files: vec![create_data_file(b"e", b"f"), create_data_file(b"g", b"h")],
-                    },
-                ],
-            },
+            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
@@ -873,12 +925,12 @@ mod tests {
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
 
         // Create a version edit to remove one file from level 0 and add two new files
-        let current_version = db_state.load().lsm_version.clone();
+        let current_version = db_state.load().multi_lsm_version.version_of_index(0);
         let edit = VersionEdit {
             level_edits: vec![
                 LevelEdit {
                     level: 0,
-                    removed_files: vec![current_version.levels[0].files[0].clone()],
+                    removed_files: vec![current_version.as_ref().levels[0].files[0].clone()],
                     new_files: vec![
                         create_data_file(b"a1", b"a2"),
                         create_data_file(b"b1", b"b2"),
@@ -895,17 +947,17 @@ mod tests {
         lsm_tree.apply_edit(edit);
 
         // Verify the new version
-        let version = db_state.load().lsm_version.clone();
-        assert_eq!(version.levels.len(), 2);
+        let version = db_state.load().multi_lsm_version.version_of_index(0);
+        assert_eq!(version.as_ref().levels.len(), 2);
 
-        let level0 = &version.levels[0];
+        let level0 = &version.as_ref().levels[0];
         assert_eq!(level0.ordinal, 0);
         assert_eq!(level0.files.len(), 3);
         assert_eq!(level0.files[0].start_key, b"a1");
         assert_eq!(level0.files[1].start_key, b"b1");
         assert_eq!(level0.files[2].start_key, b"c");
 
-        let level1 = &version.levels[1];
+        let level1 = &version.as_ref().levels[1];
         assert_eq!(level1.ordinal, 1);
         assert_eq!(level1.files.len(), 3);
         assert_eq!(level1.files[0].start_key, b"d1");
@@ -937,15 +989,16 @@ mod tests {
         assert!(fs.exists(&path).unwrap());
 
         let db_state = Arc::new(DbStateHandle::new());
+        let lsm_version = LSMTreeVersion {
+            levels: vec![Level {
+                ordinal: 0,
+                tiered: true,
+                files: vec![Arc::clone(&to_remove)],
+            }],
+        };
         db_state.store(DbState {
             seq_id: 0,
-            lsm_version: LSMTreeVersion {
-                levels: vec![Level {
-                    ordinal: 0,
-                    tiered: true,
-                    files: vec![Arc::clone(&to_remove)],
-                }],
-            },
+            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
@@ -996,30 +1049,31 @@ mod tests {
         };
         let db_config = crate::Config::default();
         let db_state = Arc::new(DbStateHandle::new());
+        let lsm_version = LSMTreeVersion {
+            levels: vec![
+                Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: Vec::new(),
+                },
+                Level {
+                    ordinal: 1,
+                    tiered: false,
+                    files: vec![
+                        create_data_file_with_size(b"a", b"b", 10),
+                        create_data_file_with_size(b"c", b"d", 10),
+                    ],
+                },
+                Level {
+                    ordinal: 2,
+                    tiered: false,
+                    files: vec![create_data_file_with_size(b"e", b"f", 1)],
+                },
+            ],
+        };
         db_state.store(DbState {
             seq_id: 0,
-            lsm_version: LSMTreeVersion {
-                levels: vec![
-                    Level {
-                        ordinal: 0,
-                        tiered: true,
-                        files: Vec::new(),
-                    },
-                    Level {
-                        ordinal: 1,
-                        tiered: false,
-                        files: vec![
-                            create_data_file_with_size(b"a", b"b", 10),
-                            create_data_file_with_size(b"c", b"d", 10),
-                        ],
-                    },
-                    Level {
-                        ordinal: 2,
-                        tiered: false,
-                        files: vec![create_data_file_with_size(b"e", b"f", 1)],
-                    },
-                ],
-            },
+            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
@@ -1042,7 +1096,8 @@ mod tests {
         let target = lsm_tree
             .db_state
             .load()
-            .lsm_version
+            .multi_lsm_version
+            .version_of_index(0)
             .levels
             .iter()
             .find(|level| level.ordinal == 1)
@@ -1061,6 +1116,121 @@ mod tests {
         assert_eq!(level1.len(), 0);
         assert_eq!(level2.len(), 1);
         assert!(level2.iter().any(|file| file.start_key == b"e"));
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_lsm_get_in_bucket_routes_to_bucket_tree_state() {
+        let root = "/tmp/lsm_get_in_bucket_routes";
+        cleanup_test_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs.clone(), Arc::clone(&metrics_manager)).unwrap());
+        let num_columns = 1;
+        let file_bucket0 = create_test_sst_in_bucket(
+            &file_manager,
+            1,
+            0,
+            vec![(b"k", &make_value_bytes(b"v0", num_columns))],
+        )
+        .unwrap();
+        let file_bucket1 = create_test_sst_in_bucket(
+            &file_manager,
+            2,
+            1,
+            vec![(b"k", &make_value_bytes(b"v1", num_columns))],
+        )
+        .unwrap();
+
+        let db_state = Arc::new(DbStateHandle::new());
+        let multi_lsm_version = MultiLSMTreeVersion::from_parts(
+            vec![0, 1],
+            vec![
+                Arc::new(LSMTreeVersion {
+                    levels: vec![Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: vec![Arc::clone(&file_bucket0)],
+                    }],
+                }),
+                Arc::new(LSMTreeVersion {
+                    levels: vec![Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: vec![Arc::clone(&file_bucket1)],
+                    }],
+                }),
+            ],
+        );
+        db_state.store(DbState {
+            seq_id: 0,
+            multi_lsm_version,
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: Vec::new().into(),
+            suggested_base_snapshot_id: None,
+        });
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+
+        let schema_manager = SchemaManager::new(1);
+        let schema = schema_manager.latest_schema();
+        let encoded_bucket0 = encode_key(&Key::new(0, b"k".to_vec()));
+        let encoded_bucket1 = encode_key(&Key::new(1, b"k".to_vec()));
+        let bucket0_values = lsm_tree
+            .get(
+                &file_manager,
+                0,
+                encoded_bucket0.as_ref(),
+                schema.as_ref(),
+                &schema_manager,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let bucket1_values = lsm_tree
+            .get(
+                &file_manager,
+                1,
+                encoded_bucket1.as_ref(),
+                schema.as_ref(),
+                &schema_manager,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(bucket0_values.len(), 1);
+        assert_eq!(bucket1_values.len(), 1);
+        assert_eq!(
+            bucket0_values[0].columns()[0].as_ref().unwrap().data(),
+            b"v0".as_slice()
+        );
+        assert_eq!(
+            bucket1_values[0].columns()[0].as_ref().unwrap().data(),
+            b"v1".as_slice()
+        );
+        let unknown_bucket_values = lsm_tree
+            .get(
+                &file_manager,
+                3,
+                encoded_bucket0.as_ref(),
+                schema.as_ref(),
+                &schema_manager,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(unknown_bucket_values.is_empty());
         cleanup_test_root(root);
     }
 
@@ -1090,15 +1260,16 @@ mod tests {
         )
         .unwrap();
         let db_state = Arc::new(DbStateHandle::new());
+        let lsm_version = LSMTreeVersion {
+            levels: vec![Level {
+                ordinal: 0,
+                tiered: true,
+                files: vec![older, newer],
+            }],
+        };
         db_state.store(DbState {
             seq_id: 0,
-            lsm_version: LSMTreeVersion {
-                levels: vec![Level {
-                    ordinal: 0,
-                    tiered: true,
-                    files: vec![older, newer],
-                }],
-            },
+            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
@@ -1111,6 +1282,7 @@ mod tests {
         let value = lsm_tree
             .get(
                 &file_manager,
+                0,
                 encoded_key.as_ref(),
                 schema.as_ref(),
                 schema_manager.as_ref(),
@@ -1154,15 +1326,16 @@ mod tests {
         )
         .unwrap();
         let db_state = Arc::new(DbStateHandle::new());
+        let lsm_version = LSMTreeVersion {
+            levels: vec![Level {
+                ordinal: 0,
+                tiered: true,
+                files: vec![older, newer],
+            }],
+        };
         db_state.store(DbState {
             seq_id: 0,
-            lsm_version: LSMTreeVersion {
-                levels: vec![Level {
-                    ordinal: 0,
-                    tiered: true,
-                    files: vec![older, newer],
-                }],
-            },
+            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: Vec::new().into(),
@@ -1175,6 +1348,7 @@ mod tests {
         let value = lsm_tree
             .get(
                 &file_manager,
+                0,
                 encoded_key.as_ref(),
                 schema.as_ref(),
                 schema_manager.as_ref(),

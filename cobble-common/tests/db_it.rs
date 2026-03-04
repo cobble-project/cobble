@@ -1146,10 +1146,7 @@ fn test_db_resume_takes_over_snapshot_lifecycle() {
     assert!(!writable.expire_snapshot(snapshot_id).unwrap());
     writable.close().unwrap();
 
-    let resume_config = Config {
-        total_buckets: 1,
-        ..config
-    };
+    let resume_config = config;
     let writable = Db::resume(resume_config, db.id().to_string()).unwrap();
     let bucket_snapshot = writable.bucket_snapshot_input(snapshot_id).unwrap();
     assert_eq!(bucket_snapshot.ranges, vec![0u16..8u16]);

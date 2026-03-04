@@ -142,9 +142,11 @@ impl SnapshotManager {
             return false;
         };
         let mut snapshot = (*snapshot).clone();
-        snapshot.levels = clone_levels_untracked(&db_state.lsm_version.levels);
+        let primary_lsm_version = db_state.multi_lsm_version.version_of_index(0);
+        snapshot.levels = clone_levels_untracked(&primary_lsm_version.levels);
         let mut tracked_file_ids: BTreeSet<u64> = db_state
-            .lsm_version
+            .multi_lsm_version
+            .version_of_index(0)
             .levels
             .iter()
             .flat_map(|level| level.files.iter().map(|file| file.file_id))
@@ -154,7 +156,8 @@ impl SnapshotManager {
         }
         snapshot.seq_id = db_state.seq_id;
         snapshot.latest_schema_id = db_state
-            .lsm_version
+            .multi_lsm_version
+            .version_of_index(0)
             .levels
             .iter()
             .flat_map(|level| level.files.iter().map(|file| file.schema_id))
