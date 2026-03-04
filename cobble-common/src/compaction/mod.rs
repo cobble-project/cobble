@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex, Weak};
 pub(crate) trait CompactionWorker: Send + Sync {
     fn submit_runs(
         &self,
+        lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         data_file_type: crate::data_file::DataFileType,
@@ -76,10 +77,10 @@ impl LocalCompactionWorker {
 
     fn submit(&self, task: CompactionTask) -> tokio::task::JoinHandle<Result<CompactionResult>> {
         let lsm_tree = self.lsm_tree.clone();
-        let on_complete = Arc::new(move |edit: VersionEdit, vlog_edit| {
+        let on_complete = Arc::new(move |lsm_tree_idx: usize, edit: VersionEdit, vlog_edit| {
             if let Some(lsm_tree) = lsm_tree.upgrade() {
-                lsm_tree.on_compaction_complete();
-                lsm_tree.apply_edit(0, edit, vlog_edit);
+                lsm_tree.on_compaction_complete(lsm_tree_idx);
+                lsm_tree.apply_edit(lsm_tree_idx, edit, vlog_edit);
             }
         });
         let executor = self.executor.lock().unwrap();
@@ -88,6 +89,7 @@ impl LocalCompactionWorker {
 
     fn submit_runs_inner(
         &self,
+        lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         data_file_type: crate::data_file::DataFileType,
@@ -111,6 +113,7 @@ impl LocalCompactionWorker {
         let task = CompactionTask::new(
             Arc::clone(&self.compaction_metrics),
             sst_metrics,
+            lsm_tree_idx,
             sorted_runs,
             output_level,
             Arc::clone(&self.file_manager),
@@ -132,12 +135,19 @@ impl LocalCompactionWorker {
 impl CompactionWorker for LocalCompactionWorker {
     fn submit_runs(
         &self,
+        lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         data_file_type: crate::data_file::DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>> {
-        self.submit_runs_inner(sorted_runs, output_level, data_file_type, ttl_provider)
+        self.submit_runs_inner(
+            lsm_tree_idx,
+            sorted_runs,
+            output_level,
+            data_file_type,
+            ttl_provider,
+        )
     }
 
     fn shutdown(&self) {

@@ -184,6 +184,7 @@ struct RemoteCompactionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_id: Option<u64>,
     db_id: String,
+    lsm_tree_idx: usize,
     output_level: u8,
     data_file_type: String,
     sst_options: RemoteSstOptions,
@@ -199,11 +200,12 @@ impl fmt::Display for RemoteCompactionRequest {
         let file_count: usize = self.runs.iter().map(|run| run.files.len()).sum();
         write!(
             f,
-            "id={} db_id={} output_level={} data_file_type={} runs={} files={}",
+            "id={} db_id={} tree_idx={} output_level={} data_file_type={} runs={} files={}",
             self.request_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "unassigned".to_string()),
             self.db_id,
+            self.lsm_tree_idx,
             self.output_level,
             self.data_file_type,
             self.runs.len(),
@@ -320,6 +322,7 @@ impl RemoteCompactionWorker {
 
     fn build_request(
         &self,
+        lsm_tree_idx: usize,
         sorted_runs: &[SortedRun],
         output_level: u8,
         data_file_type: DataFileType,
@@ -347,6 +350,7 @@ impl RemoteCompactionWorker {
         Ok(RemoteCompactionRequest {
             request_id: None,
             db_id: self.metrics_manager.db_id().to_string(),
+            lsm_tree_idx,
             output_level,
             data_file_type: data_file_type.to_string(),
             sst_options: RemoteSstOptions::from_sst_options(&sst_options),
@@ -364,6 +368,7 @@ impl RemoteCompactionWorker {
 impl CompactionWorker for RemoteCompactionWorker {
     fn submit_runs(
         &self,
+        lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         data_file_type: DataFileType,
@@ -376,19 +381,24 @@ impl CompactionWorker for RemoteCompactionWorker {
             warn!("remote compaction worker is shutdown, cannot submit new tasks");
             return None;
         };
-        let request =
-            match self.build_request(&sorted_runs, output_level, data_file_type, ttl_provider) {
-                Ok(request) => request,
-                Err(err) => {
-                    let lsm_tree = self.lsm_tree.clone();
-                    return Some(handle.spawn_blocking(move || {
-                        if let Some(lsm_tree) = lsm_tree.upgrade() {
-                            lsm_tree.on_compaction_complete();
-                        }
-                        Err(err)
-                    }));
-                }
-            };
+        let request = match self.build_request(
+            lsm_tree_idx,
+            &sorted_runs,
+            output_level,
+            data_file_type,
+            ttl_provider,
+        ) {
+            Ok(request) => request,
+            Err(err) => {
+                let lsm_tree = self.lsm_tree.clone();
+                return Some(handle.spawn_blocking(move || {
+                    if let Some(lsm_tree) = lsm_tree.upgrade() {
+                        lsm_tree.on_compaction_complete(lsm_tree_idx);
+                    }
+                    Err(err)
+                }));
+            }
+        };
         let lsm_tree = self.lsm_tree.clone();
         let file_manager = Arc::clone(&self.file_manager);
         let address = self.address.clone();
@@ -416,14 +426,19 @@ impl CompactionWorker for RemoteCompactionWorker {
                     let edit = VlogEdit::from_entry_deltas(response.vlog_entry_deltas);
                     (!edit.is_empty()).then_some(edit)
                 };
-                lsm_tree.on_compaction_complete();
-                lsm_tree.apply_edit(0, edit.clone(), vlog_edit.clone());
-                Ok(CompactionResult::new(output_files, edit, vlog_edit))
+                lsm_tree.on_compaction_complete(lsm_tree_idx);
+                lsm_tree.apply_edit(lsm_tree_idx, edit.clone(), vlog_edit.clone());
+                Ok(CompactionResult::new(
+                    lsm_tree_idx,
+                    output_files,
+                    edit,
+                    vlog_edit,
+                ))
             })();
             if result.is_err()
                 && let Some(lsm_tree) = lsm_tree.upgrade()
             {
-                lsm_tree.on_compaction_complete();
+                lsm_tree.on_compaction_complete(lsm_tree_idx);
             }
             result
         }))
@@ -626,6 +641,7 @@ impl RemoteCompactionServer {
         let task = CompactionTask::new(
             compaction_metrics,
             sst_metrics,
+            request.lsm_tree_idx,
             sorted_runs,
             request.output_level,
             Arc::clone(&file_manager),
@@ -950,6 +966,7 @@ mod tests {
         ];
         let handle = worker
             .submit_runs(
+                0,
                 runs,
                 1,
                 DataFileType::SSTable,
@@ -1098,6 +1115,7 @@ mod tests {
         ];
         let handle = worker
             .submit_runs(
+                0,
                 runs,
                 1,
                 DataFileType::SSTable,

@@ -22,10 +22,11 @@ use metrics::{Counter, counter};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-type CompactionCompleteCallback = Arc<dyn Fn(VersionEdit, Option<VlogEdit>) + Send + Sync>;
+type CompactionCompleteCallback = Arc<dyn Fn(usize, VersionEdit, Option<VlogEdit>) + Send + Sync>;
 
 /// A compaction task describes the input and output parameters for a compaction.
 pub struct CompactionTask {
+    lsm_tree_idx: usize,
     metrics: Arc<CompactionTaskMetrics>,
     sst_metrics: Arc<SSTIteratorMetrics>,
     /// The sorted runs to compact.
@@ -73,6 +74,7 @@ impl CompactionTask {
     pub fn new(
         metrics: Arc<CompactionTaskMetrics>,
         sst_metrics: Arc<SSTIteratorMetrics>,
+        lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         file_manager: Arc<FileManager>,
@@ -82,6 +84,7 @@ impl CompactionTask {
         schema_manager: Arc<SchemaManager>,
     ) -> Self {
         Self {
+            lsm_tree_idx,
             metrics,
             sst_metrics,
             sorted_runs,
@@ -116,6 +119,7 @@ impl CompactionTask {
 
 /// The result of a compaction operation.
 pub struct CompactionResult {
+    lsm_tree_idx: usize,
     /// New files created by the compaction.
     /// Files are sorted by their key ranges (first key of each file is sorted).
     new_files: Vec<Arc<DataFile>>,
@@ -126,11 +130,13 @@ pub struct CompactionResult {
 impl CompactionResult {
     /// Creates a new compaction result.
     pub fn new(
+        lsm_tree_idx: usize,
         new_files: Vec<Arc<DataFile>>,
         edit: VersionEdit,
         vlog_edit: Option<VlogEdit>,
     ) -> Self {
         Self {
+            lsm_tree_idx,
             new_files,
             edit,
             vlog_edit,
@@ -232,7 +238,11 @@ impl CompactionExecutor {
         runtime.spawn_blocking(move || {
             let result = Self::run_compaction(task, options)?;
             if let Some(callback) = on_complete {
-                callback(result.edit.clone(), result.vlog_edit.clone());
+                callback(
+                    result.lsm_tree_idx,
+                    result.edit.clone(),
+                    result.vlog_edit.clone(),
+                );
             }
             Ok(result)
         })
@@ -246,7 +256,11 @@ impl CompactionExecutor {
     ) -> Result<CompactionResult> {
         let result = Self::run_compaction(task, self.options)?;
         if let Some(callback) = on_complete {
-            callback(result.edit.clone(), result.vlog_edit.clone());
+            callback(
+                result.lsm_tree_idx,
+                result.edit.clone(),
+                result.vlog_edit.clone(),
+            );
         }
         Ok(result)
     }
@@ -491,7 +505,12 @@ impl CompactionExecutor {
                 task.file_manager.make_data_file_readonly(file.file_id)?;
             }
         }
-        Ok(CompactionResult::new(output_files, edit, vlog_edit))
+        Ok(CompactionResult::new(
+            task.lsm_tree_idx,
+            output_files,
+            edit,
+            vlog_edit,
+        ))
     }
 }
 
@@ -630,6 +649,7 @@ mod tests {
         let task = CompactionTask::new(
             compaction_metrics,
             sst_metrics,
+            0,
             vec![run1, run2],
             1,
             Arc::clone(&file_manager),
@@ -764,6 +784,7 @@ mod tests {
         let task = CompactionTask::new(
             compaction_metrics,
             sst_metrics,
+            0,
             vec![run1, run2],
             1,
             Arc::clone(&file_manager),
@@ -930,6 +951,7 @@ mod tests {
         let task = CompactionTask::new(
             compaction_metrics,
             sst_metrics,
+            0,
             vec![run1, run2],
             1,
             Arc::clone(&file_manager),
@@ -1036,6 +1058,7 @@ mod tests {
         let task = CompactionTask::new(
             compaction_metrics,
             sst_metrics,
+            0,
             vec![SortedRun::new(0, vec![old_file])],
             1,
             Arc::clone(&file_manager),
@@ -1162,6 +1185,7 @@ mod tests {
         let task = CompactionTask::new(
             compaction_metrics,
             sst_metrics,
+            0,
             vec![run],
             1,
             Arc::clone(&file_manager),
@@ -1233,6 +1257,7 @@ mod tests {
         let task = CompactionTask::new(
             compaction_metrics,
             sst_metrics,
+            0,
             vec![],
             1,
             Arc::clone(&file_manager),
@@ -1289,6 +1314,7 @@ mod tests {
         let task = CompactionTask::new(
             compaction_metrics,
             sst_metrics,
+            0,
             vec![
                 SortedRun::new(0, vec![newer]),
                 SortedRun::new(1, vec![older]),

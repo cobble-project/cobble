@@ -13,7 +13,7 @@ use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 use crate::r#type::Value;
 use log::debug;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::db_state::{DbState, DbStateHandle};
@@ -50,7 +50,7 @@ struct LSMTreeState {
     level_options: Vec<LevelOptions>,
     compaction_config: CompactionConfig,
     compaction_policy: Box<dyn CompactionPolicy>,
-    pending_compaction: bool,
+    pending_compaction: HashSet<usize>,
     compaction_worker: Option<Arc<dyn CompactionWorker>>,
 }
 
@@ -123,7 +123,7 @@ impl LSMTree {
                 ],
                 compaction_config: CompactionConfig::default(),
                 compaction_policy: Box::new(RoundRobinPolicy::new()),
-                pending_compaction: false,
+                pending_compaction: HashSet::new(),
                 compaction_worker: None,
             }),
             ttl_provider,
@@ -272,7 +272,9 @@ impl LSMTree {
                     .as_ref()
             )
         );
-        self.maybe_trigger_compaction_locked(state);
+        for tree_idx in updated_versions.keys().copied() {
+            self.maybe_trigger_compaction_locked(state, tree_idx);
+        }
         snapshot
     }
 
@@ -356,7 +358,7 @@ impl LSMTree {
             worker.shutdown();
         }
         state.compaction_worker = None;
-        state.pending_compaction = false;
+        state.pending_compaction.clear();
     }
 
     fn make_policy(kind: crate::config::CompactionPolicyKind) -> Box<dyn CompactionPolicy> {
@@ -366,54 +368,55 @@ impl LSMTree {
         }
     }
 
-    pub(crate) fn on_compaction_complete(&self) {
+    pub(crate) fn on_compaction_complete(&self, tree_idx: usize) {
         let mut state = self.state.lock().unwrap();
-        state.pending_compaction = false;
+        state.pending_compaction.remove(&tree_idx);
     }
 
-    pub(crate) fn on_compaction_started(&self) {
+    pub(crate) fn on_compaction_started(&self, tree_idx: usize) {
         let mut state = self.state.lock().unwrap();
-        state.pending_compaction = true;
+        state.pending_compaction.insert(tree_idx);
     }
 
     pub(crate) fn ttl_provider(&self) -> Arc<crate::ttl::TTLProvider> {
         Arc::clone(&self.ttl_provider)
     }
 
-    fn maybe_trigger_compaction_locked(&self, state: &mut LSMTreeState) {
-        if state.pending_compaction {
-            return;
-        }
+    fn maybe_trigger_compaction_locked(&self, state: &mut LSMTreeState, tree_idx: usize) {
         let levels_snapshot = self.db_state.load();
-        let primary_version = levels_snapshot.multi_lsm_version.version_of_index(0);
-        let plan = state
-            .compaction_policy
-            .pick(&primary_version.levels, state.compaction_config);
-        let Some(plan) = plan else {
-            return;
-        };
         let Some(worker) = state.compaction_worker.clone() else {
             return;
         };
+        if state.pending_compaction.contains(&tree_idx) {
+            return;
+        }
+        let tree_version = levels_snapshot.multi_lsm_version.version_of_index(tree_idx);
+        let plan = state
+            .compaction_policy
+            .pick(&tree_version.levels, state.compaction_config);
+        let Some(plan) = plan else {
+            return;
+        };
         if plan.trivial_move {
-            if let Some(edit) = self.build_trivial_move_edit(&primary_version.levels, &plan) {
+            if let Some(edit) = self.build_trivial_move_edit(&tree_version.levels, &plan) {
                 debug!(
-                    "compaction trivial move L{}->L{} file_id={}",
-                    plan.input_level, plan.output_level, plan.base_file_id
+                    "compaction trivial move tree={} L{}->L{} file_id={}",
+                    tree_idx, plan.input_level, plan.output_level, plan.base_file_id
                 );
-                self.apply_edit_locked(state, vec![(0, edit)], |_db_state| {});
+                self.apply_edit_locked(state, vec![(tree_idx, edit)], |_db_state| {});
             }
             return;
         }
-        debug!("trigger compaction plan {}", plan);
-        let runs = build_runs_for_plan(&primary_version.levels, &plan, &state.compaction_config);
+        debug!("trigger compaction plan tree={} {}", tree_idx, plan);
+        let runs = build_runs_for_plan(&tree_version.levels, &plan, &state.compaction_config);
         if let Some(handle) = worker.submit_runs(
+            tree_idx,
             runs,
             plan.output_level,
             crate::data_file::DataFileType::SSTable,
             self.ttl_provider(),
         ) {
-            state.pending_compaction = true;
+            state.pending_compaction.insert(tree_idx);
             std::mem::drop(handle);
         }
     }
@@ -777,6 +780,7 @@ mod tests {
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::{Column, Key, Value, ValueType};
     use crate::vlog::VlogVersion;
+    use std::sync::Mutex;
 
     static mut FILE_ID_COUNTER: FileId = 0;
 
@@ -871,6 +875,27 @@ mod tests {
     fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {
         let value = Value::new(vec![Some(Column::new(ValueType::Put, data.to_vec()))]);
         encode_value(&value, num_columns).to_vec()
+    }
+
+    #[derive(Default)]
+    struct RecordingCompactionWorker {
+        submitted_tree_idxs: Mutex<Vec<usize>>,
+    }
+
+    impl CompactionWorker for RecordingCompactionWorker {
+        fn submit_runs(
+            &self,
+            lsm_tree_idx: usize,
+            _sorted_runs: Vec<SortedRun>,
+            _output_level: u8,
+            _data_file_type: DataFileType,
+            _ttl_provider: Arc<TTLProvider>,
+        ) -> Option<tokio::task::JoinHandle<Result<crate::compaction::CompactionResult>>> {
+            self.submitted_tree_idxs.lock().unwrap().push(lsm_tree_idx);
+            None
+        }
+
+        fn shutdown(&self) {}
     }
 
     #[test]
@@ -1217,6 +1242,69 @@ mod tests {
             .unwrap();
         assert!(unknown_bucket_values.is_empty());
         cleanup_test_root(root);
+    }
+
+    #[test]
+    fn test_lsm_compaction_submits_only_changed_tree() {
+        let db_state = Arc::new(DbStateHandle::new());
+        let multi_lsm_version = MultiLSMTreeVersion::from_parts(
+            vec![0, 1],
+            vec![
+                Arc::new(LSMTreeVersion {
+                    levels: vec![
+                        Level {
+                            ordinal: 0,
+                            tiered: true,
+                            files: vec![create_data_file_with_size(b"a", b"b", 1)],
+                        },
+                        Level {
+                            ordinal: 1,
+                            tiered: false,
+                            files: Vec::new(),
+                        },
+                    ],
+                }),
+                Arc::new(LSMTreeVersion {
+                    levels: vec![
+                        Level {
+                            ordinal: 0,
+                            tiered: true,
+                            files: vec![create_data_file_with_size(b"c", b"d", 1)],
+                        },
+                        Level {
+                            ordinal: 1,
+                            tiered: false,
+                            files: Vec::new(),
+                        },
+                    ],
+                }),
+            ],
+        );
+        db_state.store(DbState {
+            seq_id: 0,
+            multi_lsm_version,
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: Vec::new().into(),
+            suggested_base_snapshot_id: None,
+        });
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+        let worker = Arc::new(RecordingCompactionWorker::default());
+        let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
+        let mut config = crate::compaction::CompactionConfig::default();
+        config.l0_file_limit = 0;
+        lsm_tree.configure_compaction(config, Some(worker_dyn));
+        lsm_tree.apply_edit(
+            0,
+            VersionEdit {
+                level_edits: Vec::new(),
+            },
+            None,
+        );
+        let mut submitted = worker.submitted_tree_idxs.lock().unwrap().clone();
+        submitted.sort_unstable();
+        assert_eq!(submitted, vec![0]);
     }
 
     #[test]
