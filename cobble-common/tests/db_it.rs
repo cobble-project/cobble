@@ -1380,7 +1380,7 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = open_db(config);
+    let db = open_db(config.clone());
     let v1 = vec![b'a'; 128];
     db.put(0, b"k1", 0, v1.clone()).unwrap();
 
@@ -1491,6 +1491,84 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
         .unwrap()
         .expect("k2 value");
     assert_eq!(value2[0].as_ref().unwrap().as_ref(), v2.as_slice());
+
+    let db_id = db.id().to_string();
+    db.close().unwrap();
+
+    let from_snapshot = Db::open_from_snapshot(config.clone(), second_snapshot, db_id.clone())
+        .expect("open from snapshot with active memtable replay");
+    let restored_v1 = from_snapshot
+        .get(0, b"k1", &ReadOptions::default())
+        .unwrap()
+        .expect("restored k1");
+    assert_eq!(restored_v1[0].as_ref().unwrap().as_ref(), v1.as_slice());
+    let restored_v2 = from_snapshot
+        .get(0, b"k2", &ReadOptions::default())
+        .unwrap()
+        .expect("restored k2");
+    assert_eq!(restored_v2[0].as_ref().unwrap().as_ref(), v2.as_slice());
+    from_snapshot.close().unwrap();
+
+    let resumed = Db::resume(config, db_id).expect("resume with active memtable replay");
+    let resumed_v1 = resumed
+        .get(0, b"k1", &ReadOptions::default())
+        .unwrap()
+        .expect("resumed k1");
+    assert_eq!(resumed_v1[0].as_ref().unwrap().as_ref(), v1.as_slice());
+    let resumed_v2 = resumed
+        .get(0, b"k2", &ReadOptions::default())
+        .unwrap()
+        .expect("resumed k2");
+    assert_eq!(resumed_v2[0].as_ref().unwrap().as_ref(), v2.as_slice());
+    resumed.close().unwrap();
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_resume_can_continue_writes_after_active_memtable_snapshot() {
+    let root = "/tmp/db_resume_after_active_memtable_snapshot";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 1024,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        active_memtable_incremental_snapshot_ratio: 0.9,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config.clone());
+    db.put(0, b"k1", 0, b"v1").unwrap();
+    db.put(0, b"k2", 0, b"v2").unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&manifest).unwrap();
+    let active_segments =
+        active_snapshot_segments_from_manifest(&manifest_json).expect("active memtable snapshot");
+    assert!(!active_segments.is_empty());
+    let db_id = db.id().to_string();
+    db.close().unwrap();
+
+    let resumed = Db::resume(config.clone(), db_id.clone()).expect("resume db");
+    resumed.put(0, b"k3", 0, b"v3").unwrap();
+    resumed.put(0, b"k4", 0, b"v4").unwrap();
+    for (key, expected) in [
+        (b"k1".as_slice(), b"v1".as_slice()),
+        (b"k2".as_slice(), b"v2".as_slice()),
+        (b"k3".as_slice(), b"v3".as_slice()),
+        (b"k4".as_slice(), b"v4".as_slice()),
+    ] {
+        let value = resumed
+            .get(0, key, &ReadOptions::default())
+            .unwrap()
+            .expect("value present after resume");
+        assert_eq!(value[0].as_ref().unwrap().as_ref(), expected);
+    }
+    resumed.close().unwrap();
 
     cleanup_test_root(root);
 }

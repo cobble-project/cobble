@@ -7,9 +7,9 @@ use crate::merge_operator::MergeOperator;
 use crate::metrics_manager::MetricsManager;
 use crate::schema::{Schema, SchemaBuilder, SchemaManager};
 use crate::snapshot::{
-    LoadedManifest, ManifestPayload, SnapshotCallback, SnapshotManager, apply_manifest_level_edits,
-    build_levels_from_manifest, build_vlog_version_from_manifest, decode_manifest,
-    load_manifest_for_snapshot, snapshot_manifest_name,
+    ActiveMemtableSnapshotData, LoadedManifest, ManifestPayload, SnapshotCallback, SnapshotManager,
+    apply_manifest_level_edits, build_levels_from_manifest, build_vlog_version_from_manifest,
+    decode_manifest, load_manifest_for_snapshot, snapshot_manifest_name,
 };
 use crate::sst::block_cache::new_block_cache;
 use crate::sst::row_codec::{decode_value, decode_value_masked, encode_key_ref_into};
@@ -246,7 +246,7 @@ impl Db {
         let file_manager = Arc::new(file_manager);
         let db_state = Arc::new(DbStateHandle::new());
         let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
-        Self::open_with_state(
+        let db = Self::open_with_state(
             config,
             file_manager,
             db_state,
@@ -255,7 +255,9 @@ impl Db {
             0,
             metrics_manager,
             schema_manager,
-        )
+        )?;
+        db.memtable_manager.open()?;
+        Ok(db)
     }
 
     pub fn id(&self) -> &str {
@@ -517,6 +519,7 @@ impl Db {
             )));
         }
         let bucket_ranges = manifest.bucket_ranges.clone();
+        let active_memtable_data = manifest.active_memtable_data.clone();
         let levels = build_levels_from_manifest(&file_manager, manifest, true)?;
 
         let db_state = Arc::new(DbStateHandle::new());
@@ -529,7 +532,7 @@ impl Db {
             suggested_base_snapshot_id: Some(snapshot_id),
         });
         let initial_file_seq = max_file_seq.saturating_add(1);
-        Self::open_with_state(
+        let db = Self::open_with_state(
             config,
             file_manager,
             db_state,
@@ -538,7 +541,10 @@ impl Db {
             initial_file_seq,
             metrics_manager,
             schema_manager,
-        )
+        )?;
+        db.restore_active_memtable_snapshot_to_l0(&active_memtable_data)?;
+        db.memtable_manager.open()?;
+        Ok(db)
     }
 
     /// Resume a writable database from an existing folder by loading all snapshot manifests.
@@ -582,6 +588,7 @@ impl Db {
             )));
         }
         let bucket_ranges = manifest.bucket_ranges.clone();
+        let active_memtable_data = manifest.active_memtable_data.clone();
         let schema_manager = Arc::new(SchemaManager::from_manifests(
             &file_manager,
             loaded.iter().map(|entry| &entry.manifest),
@@ -617,6 +624,8 @@ impl Db {
         )?;
         // take over all snapshots so they can be expired properly
         db.take_over_snapshot_chain(&loaded)?;
+        db.restore_active_memtable_snapshot_to_l0(&active_memtable_data)?;
+        db.memtable_manager.open()?;
         Ok(db)
     }
 
@@ -744,6 +753,21 @@ impl Db {
                 entry.base_snapshot_id,
                 &entry.manifest,
             )?;
+        }
+        Ok(())
+    }
+
+    fn restore_active_memtable_snapshot_to_l0(
+        &self,
+        segments: &[ActiveMemtableSnapshotData],
+    ) -> Result<()> {
+        let restored = self
+            .memtable_manager
+            .restore_active_memtable_snapshot_to_l0(segments)?;
+        if !segments.is_empty() && !restored {
+            return Err(Error::InvalidState(
+                "active memtable snapshot restore did not flush".to_string(),
+            ));
         }
         Ok(())
     }

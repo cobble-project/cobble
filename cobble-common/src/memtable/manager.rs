@@ -376,20 +376,6 @@ impl MemtableManager {
                 usize::MAX,
             ))
         });
-        {
-            // init the first active buffer
-            let mut state_guard = state.lock().unwrap();
-            Self::make_active_buffer(
-                &mut state_guard,
-                &db_state,
-                &schema_manager,
-                options.memtable_capacity,
-                options.memtable_type,
-                &reclaimer,
-                total_budget,
-                false,
-            );
-        }
         // Initialize the flush worker
         let (worker, flush_tx) = Self::init_flush_worker(
             Arc::clone(&state),
@@ -428,6 +414,27 @@ impl MemtableManager {
 
     pub(crate) fn db_state(&self) -> Arc<DbStateHandle> {
         Arc::clone(&self.db_state)
+    }
+
+    pub(crate) fn open(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        Self::make_active_buffer(
+            &mut state,
+            &self.db_state,
+            &self.schema_manager,
+            self.memtable_capacity,
+            self.memtable_type,
+            &self.reclaimer,
+            self.total_budget,
+            false,
+        );
+        if self.db_state.load().active.is_none() {
+            return Err(InvalidState(
+                "failed to allocate initial active memtable".to_string(),
+            ));
+        }
+        self.buffer_ready.notify_all();
+        Ok(())
     }
 
     /// Initializes the flush worker and returns the worker handle and flush sender.
@@ -1237,6 +1244,46 @@ impl MemtableManager {
             .collect()
     }
 
+    pub(crate) fn restore_active_memtable_snapshot_to_l0(
+        &self,
+        segments: &[ActiveMemtableSnapshotData],
+    ) -> Result<bool> {
+        if segments.is_empty() {
+            return Ok(false);
+        }
+        let (memtable, vlog_recorder) =
+            decode_active_snapshot_segments_into_vec_memtable(&self.file_manager, segments)?;
+        if memtable.is_empty() {
+            return Ok(false);
+        }
+        let seq = {
+            let mut state = self.state.lock().unwrap();
+            let seq = state.next_seq;
+            state.next_seq = state.next_seq.saturating_add(1);
+            seq
+        };
+        let result = flush_memtable(
+            seq,
+            &memtable,
+            self.schema_manager.latest_schema(),
+            vlog_recorder.map(Arc::new),
+            Arc::clone(&self.file_manager),
+            Arc::clone(&self.file_builder_factory),
+            self.lsm_tree.ttl_provider(),
+            Arc::clone(&self.vlog_store),
+        )?;
+        self.metrics.flushes_total.increment(1);
+        self.metrics
+            .flush_bytes_total
+            .increment(result.data_file.size as u64);
+        self.lsm_tree.add_level0_files(
+            result.seq,
+            vec![Arc::clone(&result.data_file)],
+            result.vlog_edit,
+        );
+        Ok(true)
+    }
+
     pub(crate) fn close(&self) -> Result<()> {
         {
             let mut tx = self.flush_tx.lock().unwrap();
@@ -1359,6 +1406,180 @@ fn flush_memtable(
     })
 }
 
+fn decode_active_snapshot_segments_into_vec_memtable(
+    file_manager: &Arc<FileManager>,
+    segments: &[ActiveMemtableSnapshotData],
+) -> Result<(VecMemtable, Option<MemtableVlogRecorder>)> {
+    if segments.is_empty() {
+        return Ok((VecMemtable::with_capacity(1), None));
+    }
+    let first = &segments[0];
+    let mut expected_data_start = 0u64;
+    let mut required_capacity = 0u64;
+    for segment in segments {
+        if segment.memtable_type != first.memtable_type
+            || segment.memtable_seq != first.memtable_seq
+        {
+            return Err(Error::InvalidState(
+                "active memtable snapshot segment metadata mismatch".to_string(),
+            ));
+        }
+        if segment.end_offset < segment.start_offset || segment.start_offset != expected_data_start
+        {
+            return Err(Error::InvalidState(
+                "active memtable snapshot data offsets are discontinuous".to_string(),
+            ));
+        }
+        if segment.vlog_end_offset < segment.vlog_start_offset {
+            return Err(Error::InvalidState(
+                "active memtable snapshot vlog offsets are invalid".to_string(),
+            ));
+        }
+        expected_data_start = segment.end_offset;
+        required_capacity = required_capacity
+            .checked_add(segment.end_offset - segment.start_offset)
+            .and_then(|v| {
+                v.checked_add((segment.vlog_end_offset - segment.vlog_start_offset) as u64)
+            })
+            .ok_or_else(|| {
+                Error::IoError("active memtable snapshot capacity overflow".to_string())
+            })?;
+    }
+    let capacity = usize::try_from(required_capacity.max(1))
+        .map_err(|_| Error::IoError("active memtable snapshot too large".to_string()))?;
+    let mut memtable = VecMemtable::with_capacity(capacity);
+    let mut recorder: Option<MemtableVlogRecorder> = None;
+
+    for segment in segments {
+        let reader = file_manager.open_metadata_file_reader_untracked(&segment.path)?;
+        let bytes = reader.read_at(0, reader.size())?;
+        let segment_bytes = bytes.as_ref();
+        let vlog_data_file_offset = usize::try_from(segment.vlog_data_file_offset)
+            .map_err(|_| Error::InvalidState("invalid vlog_data_file_offset".to_string()))?;
+        if vlog_data_file_offset > segment_bytes.len() {
+            return Err(Error::InvalidState(format!(
+                "vlog_data_file_offset out of range: {} > {}",
+                vlog_data_file_offset,
+                segment_bytes.len()
+            )));
+        }
+        let kv_bytes = &segment_bytes[..vlog_data_file_offset];
+        let vlog_bytes = &segment_bytes[vlog_data_file_offset..];
+        let expected_kv_len = usize::try_from(segment.end_offset - segment.start_offset)
+            .map_err(|_| Error::IoError("active memtable kv length overflow".to_string()))?;
+        if kv_bytes.len() != expected_kv_len {
+            return Err(Error::InvalidState(format!(
+                "active memtable kv bytes mismatch: {} != {}",
+                kv_bytes.len(),
+                expected_kv_len
+            )));
+        }
+        let expected_vlog_len =
+            usize::try_from((segment.vlog_end_offset - segment.vlog_start_offset) as u64)
+                .map_err(|_| Error::IoError("active memtable vlog length overflow".to_string()))?;
+        if vlog_bytes.len() != expected_vlog_len {
+            return Err(Error::InvalidState(format!(
+                "active memtable vlog bytes mismatch: {} != {}",
+                vlog_bytes.len(),
+                expected_vlog_len
+            )));
+        }
+        let mut kv_pos = 0usize;
+        while kv_pos < kv_bytes.len() {
+            if kv_pos + 8 > kv_bytes.len() {
+                return Err(Error::InvalidState(
+                    "truncated active memtable kv entry header".to_string(),
+                ));
+            }
+            let key_len = match segment.memtable_type {
+                MemtableType::Hash => {
+                    u32::from_be_bytes(kv_bytes[kv_pos..kv_pos + 4].try_into().unwrap()) as usize
+                }
+                MemtableType::Vec => {
+                    u32::from_le_bytes(kv_bytes[kv_pos..kv_pos + 4].try_into().unwrap()) as usize
+                }
+            };
+            let value_len = match segment.memtable_type {
+                MemtableType::Hash => {
+                    u32::from_be_bytes(kv_bytes[kv_pos + 4..kv_pos + 8].try_into().unwrap())
+                        as usize
+                }
+                MemtableType::Vec => {
+                    u32::from_le_bytes(kv_bytes[kv_pos + 4..kv_pos + 8].try_into().unwrap())
+                        as usize
+                }
+            };
+            let entry_end = kv_pos
+                .checked_add(8)
+                .and_then(|v| v.checked_add(key_len))
+                .and_then(|v| v.checked_add(value_len))
+                .ok_or_else(|| Error::IoError("active memtable kv entry overflow".to_string()))?;
+            if entry_end > kv_bytes.len() {
+                return Err(Error::InvalidState(
+                    "truncated active memtable kv entry body".to_string(),
+                ));
+            }
+            let key_start = kv_pos + 8;
+            let value_start = key_start + key_len;
+            memtable.put(
+                &kv_bytes[key_start..value_start],
+                &kv_bytes[value_start..entry_end],
+            )?;
+            kv_pos = entry_end;
+        }
+        if expected_vlog_len > 0 {
+            let file_seq = segment.vlog_file_seq.ok_or_else(|| {
+                Error::InvalidState("missing vlog_file_seq for vlog snapshot data".to_string())
+            })?;
+            let recorder_ref = recorder.get_or_insert_with(|| MemtableVlogRecorder::new(file_seq));
+            if recorder_ref.file_seq() != file_seq {
+                return Err(Error::InvalidState(
+                    "active memtable vlog file seq mismatch".to_string(),
+                ));
+            }
+            if recorder_ref.checkpoint() != segment.vlog_start_offset {
+                return Err(Error::InvalidState(format!(
+                    "active memtable vlog start offset mismatch: {} != {}",
+                    recorder_ref.checkpoint(),
+                    segment.vlog_start_offset
+                )));
+            }
+            let mut vlog_pos = 0usize;
+            while vlog_pos < vlog_bytes.len() {
+                if vlog_pos + 4 > vlog_bytes.len() {
+                    return Err(Error::InvalidState(
+                        "truncated active memtable vlog record header".to_string(),
+                    ));
+                }
+                let payload_len =
+                    u32::from_le_bytes(vlog_bytes[vlog_pos..vlog_pos + 4].try_into().unwrap())
+                        as usize;
+                vlog_pos += 4;
+                let payload_end = vlog_pos.checked_add(payload_len).ok_or_else(|| {
+                    Error::IoError("active memtable vlog entry overflow".to_string())
+                })?;
+                if payload_end > vlog_bytes.len() {
+                    return Err(Error::InvalidState(
+                        "truncated active memtable vlog record body".to_string(),
+                    ));
+                }
+                let payload = &vlog_bytes[vlog_pos..payload_end];
+                let _ = recorder_ref.append_value(&mut memtable, payload)?;
+                vlog_pos = payload_end;
+            }
+            if recorder_ref.checkpoint() != segment.vlog_end_offset {
+                return Err(Error::InvalidState(format!(
+                    "active memtable vlog end offset mismatch: {} != {}",
+                    recorder_ref.checkpoint(),
+                    segment.vlog_end_offset
+                )));
+            }
+        }
+    }
+
+    Ok((memtable, recorder))
+}
+
 struct PrimedIterator<I> {
     inner: I,
 }
@@ -1476,6 +1697,7 @@ mod tests {
             },
         )
         .unwrap();
+        manager.open().unwrap();
 
         let num_columns = 1;
         let key_a = RefKey::new(0, b"a");
@@ -1564,6 +1786,7 @@ mod tests {
             },
         )
         .unwrap();
+        manager.open().unwrap();
 
         let key = RefKey::new(0, b"k1");
         let value = RefValue::new(vec![Some(RefColumn::new(
@@ -1630,6 +1853,7 @@ mod tests {
             },
         )
         .unwrap();
+        manager.open().unwrap();
 
         let key1 = RefKey::new(0, b"k1");
         let value1 = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"v1"))]);
@@ -1691,6 +1915,7 @@ mod tests {
             },
         )
         .unwrap();
+        manager.open().unwrap();
 
         let key1 = RefKey::new(0, b"k1");
         let v1 = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"v1"))]);
@@ -1744,6 +1969,7 @@ mod tests {
             },
         )
         .unwrap();
+        manager.open().unwrap();
 
         let key1 = RefKey::new(0, b"k1");
         let key2 = RefKey::new(0, b"k2");
@@ -1788,6 +2014,7 @@ mod tests {
             },
         )
         .unwrap();
+        manager.open().unwrap();
 
         let key = RefKey::new(0, b"k1");
         let big_value = vec![b'x'; 1024];
