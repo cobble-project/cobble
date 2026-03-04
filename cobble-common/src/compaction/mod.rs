@@ -79,7 +79,7 @@ impl LocalCompactionWorker {
         let on_complete = Arc::new(move |edit: VersionEdit, vlog_edit| {
             if let Some(lsm_tree) = lsm_tree.upgrade() {
                 lsm_tree.on_compaction_complete();
-                lsm_tree.apply_edit_with_vlog(edit, vlog_edit);
+                lsm_tree.apply_edit(0, edit, vlog_edit);
             }
         });
         let executor = self.executor.lock().unwrap();

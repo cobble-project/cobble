@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 
 use crate::config::MemtableType;
 use crate::data_file::{DataFile, DataFileType};
-use crate::db_state::{DbState, DbStateHandle};
+use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
 use crate::error::Error::InvalidState;
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager, TrackedFileId};
@@ -29,7 +29,7 @@ type DynKvIterator = Box<dyn for<'a> KvIterator<'a>>;
 
 #[derive(Clone)]
 pub(crate) struct MemtableFlushResult {
-    pub(crate) data_file: Arc<DataFile>,
+    pub(crate) data_files_by_tree: Vec<(usize, Arc<DataFile>)>,
     pub(crate) seq: u64,
     vlog_edit: Option<VlogEdit>,
 }
@@ -465,6 +465,7 @@ impl MemtableManager {
                     if let Some(memtable) = job.memtable {
                         trace!("memtable flush start seq={}", job.seq);
                         let keep_memtable_alive = Arc::clone(&memtable);
+                        let multi_lsm_version = db_state_clone.load().multi_lsm_version.clone();
                         let result = flush_memtable(
                             job.seq,
                             memtable.as_ref(),
@@ -474,23 +475,28 @@ impl MemtableManager {
                             Arc::clone(&file_builder_factory_clone),
                             Arc::clone(&ttl_provider_clone),
                             Arc::clone(&vlog_store_clone),
+                            multi_lsm_version,
                         );
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
                         match result {
                             Ok(res) => {
                                 debug!(
-                                    "memtable flush complete seq={} file_id={} size={}",
-                                    res.seq, res.data_file.file_id, res.data_file.size
+                                    "memtable flush complete seq={} files={}",
+                                    res.seq,
+                                    res.data_files_by_tree.len()
                                 );
                                 metrics.flushes_total.increment(1);
-                                metrics
-                                    .flush_bytes_total
-                                    .increment(res.data_file.size as u64);
+                                let flushed_bytes: u64 = res
+                                    .data_files_by_tree
+                                    .iter()
+                                    .map(|(_, file)| file.size as u64)
+                                    .sum();
+                                metrics.flush_bytes_total.increment(flushed_bytes);
                                 let vlog_edit = res.vlog_edit.clone();
                                 let snapshot = lsm_tree_clone.add_level0_files(
                                     res.seq,
-                                    vec![Arc::clone(&res.data_file)],
+                                    res.data_files_by_tree.clone(),
                                     vlog_edit,
                                 );
                                 state.flush_results.insert(res.seq, Ok(res));
@@ -1262,6 +1268,7 @@ impl MemtableManager {
             state.next_seq = state.next_seq.saturating_add(1);
             seq
         };
+        let multi_lsm_version = self.db_state.load().multi_lsm_version.clone();
         let result = flush_memtable(
             seq,
             &memtable,
@@ -1271,14 +1278,18 @@ impl MemtableManager {
             Arc::clone(&self.file_builder_factory),
             self.lsm_tree.ttl_provider(),
             Arc::clone(&self.vlog_store),
+            multi_lsm_version,
         )?;
         self.metrics.flushes_total.increment(1);
-        self.metrics
-            .flush_bytes_total
-            .increment(result.data_file.size as u64);
+        let flushed_bytes: u64 = result
+            .data_files_by_tree
+            .iter()
+            .map(|(_, file)| file.size as u64)
+            .sum();
+        self.metrics.flush_bytes_total.increment(flushed_bytes);
         self.lsm_tree.add_level0_files(
             result.seq,
-            vec![Arc::clone(&result.data_file)],
+            result.data_files_by_tree.clone(),
             result.vlog_edit,
         );
         Ok(true)
@@ -1338,6 +1349,7 @@ fn flush_memtable(
     file_builder_factory: Arc<FileBuilderFactory>,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     vlog_store: Arc<VlogStore>,
+    multi_lsm_version: MultiLSMTreeVersion,
 ) -> Result<MemtableFlushResult> {
     // Step 1: If there is a vlog recorder with entries, flush it to the vlog store and get the resulting edit.
     let mut vlog_edit = None;
@@ -1350,9 +1362,8 @@ fn flush_memtable(
         writer.close()?;
         vlog_edit = Some(edit);
     }
-    // Step 2: Create a new data file and write all entries from the memtable into it using a deduplicating iterator.
-    let (file_id, writer) = file_manager.create_data_file()?;
-    let mut builder = (file_builder_factory)(Box::new(writer));
+    // Step 2: Create data files on-demand per tree and write entries by key bucket.
+    let mut builders: BTreeMap<usize, (u64, Box<dyn FileBuilder>)> = BTreeMap::new();
     // Try to handle merges during flush if vlog edits are present
     let merge_collector = vlog_edit.as_ref().map(|_| VlogMergeCollector::shared(true));
     let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
@@ -1370,6 +1381,24 @@ fn flush_memtable(
             collector.borrow_mut().check_error()?;
         }
         if let (Some(key), Some(value)) = (dedup_iter.key_slice()?, dedup_iter.value_slice()?) {
+            if key.len() < 2 {
+                return Err(Error::InvalidState(
+                    "encoded key missing bucket prefix".to_string(),
+                ));
+            }
+            let bucket = u16::from_le_bytes([key[0], key[1]]);
+            let tree_idx = multi_lsm_version
+                .tree_index_for_bucket(bucket)
+                .ok_or_else(|| {
+                    Error::InvalidState(format!("bucket {} not mapped to an LSM tree", bucket))
+                })?;
+            if let std::collections::btree_map::Entry::Vacant(entry) = builders.entry(tree_idx) {
+                let (file_id, writer) = file_manager.create_data_file()?;
+                entry.insert((file_id, (file_builder_factory)(Box::new(writer))));
+            }
+            let (_, builder) = builders
+                .get_mut(&tree_idx)
+                .expect("builder should exist for tree");
             builder.add(key, value)?;
         }
         dedup_iter.next()?;
@@ -1382,26 +1411,35 @@ fn flush_memtable(
             edit.add_entry_delta(file_seq, delta);
         }
     }
-    // Step 3: Finish the data file and construct the resulting `MemtableFlushResult`.
-    let (start_key, end_key, file_size, footer_bytes) = builder.finish()?;
+    // Step 3: Finish data files and construct the resulting `MemtableFlushResult`.
     let has_separated_values = merge_collector
         .as_ref()
         .is_some_and(|collector| collector.borrow().has_separated_values());
-    let data_file = DataFile {
-        file_type: DataFileType::SSTable,
-        start_key,
-        end_key,
-        file_id,
-        tracked_id: TrackedFileId::new(&file_manager, file_id),
-        size: file_size,
-        seq,
-        schema_id: schema.version(),
-        has_separated_values,
-        meta_bytes: Default::default(),
-    };
-    data_file.set_meta_bytes(footer_bytes);
+    let mut data_files_by_tree = Vec::with_capacity(builders.len());
+    for (tree_idx, (file_id, builder)) in builders {
+        let (start_key, end_key, file_size, footer_bytes) = builder.finish()?;
+        let data_file = DataFile {
+            file_type: DataFileType::SSTable,
+            start_key,
+            end_key,
+            file_id,
+            tracked_id: TrackedFileId::new(&file_manager, file_id),
+            size: file_size,
+            seq,
+            schema_id: schema.version(),
+            has_separated_values,
+            meta_bytes: Default::default(),
+        };
+        data_file.set_meta_bytes(footer_bytes);
+        data_files_by_tree.push((tree_idx, Arc::new(data_file)));
+    }
+    if data_files_by_tree.is_empty() {
+        return Err(Error::InvalidState(
+            "flush produced no sst entries".to_string(),
+        ));
+    }
     Ok(MemtableFlushResult {
-        data_file: Arc::new(data_file),
+        data_files_by_tree,
         seq,
         vlog_edit,
     })
@@ -1715,7 +1753,7 @@ mod tests {
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].as_ref().unwrap().seq, 0);
-        let data_file = results[0].as_ref().unwrap().data_file.clone();
+        let data_file = results[0].as_ref().unwrap().data_files_by_tree[0].1.clone();
         let level0_files = lsm_tree.level_files(0);
         assert_eq!(level0_files.len(), 1);
         assert_eq!(level0_files[0].file_id, data_file.file_id);
@@ -1802,7 +1840,7 @@ mod tests {
         let flush_result = results[0].as_ref().unwrap();
         assert!(flush_result.vlog_edit.is_some());
 
-        let data_file = Arc::clone(&flush_result.data_file);
+        let data_file = Arc::clone(&flush_result.data_files_by_tree[0].1);
         let reader = file_manager
             .open_data_file_reader(data_file.file_id)
             .unwrap();
@@ -1820,6 +1858,58 @@ mod tests {
         assert_eq!(column.value_type, ValueType::PutSeparated);
         assert_eq!(column.data().len(), 8);
 
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_memtable_flush_splits_l0_files_by_bucket_tree() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::new(DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
+        lsm_tree
+            .db_state()
+            .configure_multi_lsm(2, &[0u16..1u16, 1u16..2u16])
+            .unwrap();
+        let manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                initial_seq: 0,
+                memtable_capacity: 256,
+                buffer_count: 2,
+                file_builder_factory: None,
+                num_columns: 1,
+                write_stall_limit: 8,
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        manager.open().unwrap();
+
+        let key_bucket0 = RefKey::new(0, b"k0");
+        let key_bucket1 = RefKey::new(1, b"k1");
+        let v0 = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"v0"))]);
+        let v1 = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"v1"))]);
+        manager.put(&key_bucket0, &v0).unwrap();
+        manager.put(&key_bucket1, &v1).unwrap();
+
+        manager.flush_active().unwrap();
+        let results = manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        let flush_result = results[0].as_ref().unwrap();
+        assert_eq!(flush_result.data_files_by_tree.len(), 2);
+        assert_eq!(lsm_tree.level_files_in_tree(0, 0).len(), 1);
+        assert_eq!(lsm_tree.level_files_in_tree(1, 0).len(), 1);
         cleanup_test_root();
     }
 
@@ -1873,12 +1963,22 @@ mod tests {
 
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].as_ref().unwrap().data_file.schema_id, 0);
+        assert_eq!(
+            results[0].as_ref().unwrap().data_files_by_tree[0]
+                .1
+                .schema_id,
+            0
+        );
 
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].as_ref().unwrap().data_file.schema_id, 1);
+        assert_eq!(
+            results[0].as_ref().unwrap().data_files_by_tree[0]
+                .1
+                .schema_id,
+            1
+        );
 
         cleanup_test_root();
     }

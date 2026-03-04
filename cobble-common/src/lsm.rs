@@ -13,6 +13,7 @@ use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 use crate::r#type::Value;
 use log::debug;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::db_state::{DbState, DbStateHandle};
@@ -63,45 +64,6 @@ pub(crate) struct LevelEdit {
 #[derive(Clone)]
 pub(crate) struct VersionEdit {
     pub(crate) level_edits: Vec<LevelEdit>,
-}
-
-struct VersionEditSummary<'a>(&'a VersionEdit);
-
-impl std::fmt::Display for VersionEditSummary<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "apply version edit [")?;
-        for (idx, level_edit) in self.0.level_edits.iter().enumerate() {
-            if idx > 0 {
-                write!(f, "; ")?;
-            }
-            write!(
-                f,
-                "L{} -{} +{}",
-                level_edit.level,
-                level_edit.removed_files.len(),
-                level_edit.new_files.len()
-            )?;
-            if !level_edit.removed_files.is_empty() {
-                write!(f, " removed=")?;
-                for (file_idx, file) in level_edit.removed_files.iter().enumerate() {
-                    if file_idx > 0 {
-                        write!(f, ",")?;
-                    }
-                    write!(f, "{}", file.file_id)?;
-                }
-            }
-            if !level_edit.new_files.is_empty() {
-                write!(f, " new=")?;
-                for (file_idx, file) in level_edit.new_files.iter().enumerate() {
-                    if file_idx > 0 {
-                        write!(f, ",")?;
-                    }
-                    write!(f, "{}", file.file_id)?;
-                }
-            }
-        }
-        write!(f, "]")
-    }
 }
 
 struct VersionSummary<'a>(&'a LSMTreeVersion);
@@ -181,13 +143,14 @@ impl LSMTree {
         Arc::clone(&self.db_state)
     }
 
-    pub(crate) fn apply_edit(&self, edit: VersionEdit) {
-        self.apply_edit_with_vlog(edit, None);
-    }
-
-    pub(crate) fn apply_edit_with_vlog(&self, edit: VersionEdit, vlog_edit: Option<VlogEdit>) {
+    pub(crate) fn apply_edit(
+        &self,
+        tree_idx: usize,
+        edit: VersionEdit,
+        vlog_edit: Option<VlogEdit>,
+    ) {
         let mut state = self.state.lock().unwrap();
-        self.apply_edit_locked(&mut state, edit, move |db_state| {
+        self.apply_edit_locked(&mut state, vec![(tree_idx, edit)], move |db_state| {
             if let Some(vlog_edit) = vlog_edit {
                 db_state.vlog_version = db_state.vlog_version.apply_edit(vlog_edit);
             }
@@ -197,56 +160,54 @@ impl LSMTree {
     fn apply_edit_locked(
         &self,
         state: &mut LSMTreeState,
-        edit: VersionEdit,
+        edits: Vec<(usize, VersionEdit)>,
         fix: impl FnOnce(&mut DbState),
     ) -> Arc<DbState> {
+        if edits.is_empty() {
+            return self.db_state.load();
+        }
         let guard = self.db_state.lock();
         let snapshot = self.db_state.load();
-        let mut new_levels = snapshot
-            .multi_lsm_version
-            .version_of_index(0)
-            .levels
-            .clone();
-        let inherit_suggested_base_snapshot_id = edit.level_edits.is_empty()
-            || (edit.level_edits.len() == 1
-                && edit.level_edits[0].level == 0
-                && edit.level_edits[0].removed_files.is_empty());
-
-        for level_edit in &edit.level_edits {
-            if let Some(level) = new_levels
-                .iter_mut()
-                .find(|l| l.ordinal == level_edit.level)
-            {
-                let mut insert_pos = Option::<usize>::None;
-                // First, find the position of files to be removed, and remove the files.
-                for file in &level_edit.removed_files {
-                    if let Some(pos) = level.files.iter().position(|f| Arc::ptr_eq(f, file)) {
-                        level.files.remove(pos);
-                        if !level.tiered {
-                            if let Some(previous) = insert_pos {
-                                // Ensure that all removed files are contiguous.
-                                assert_eq!(pos, previous);
-                            } else {
+        let mut updated_versions: BTreeMap<usize, Arc<LSMTreeVersion>> = BTreeMap::new();
+        let mut inherit_suggested_base_snapshot_id = true;
+        for (tree_idx, edit) in &edits {
+            inherit_suggested_base_snapshot_id &= edit.level_edits.is_empty()
+                || (edit.level_edits.len() == 1
+                    && edit.level_edits[0].level == 0
+                    && edit.level_edits[0].removed_files.is_empty());
+            let mut new_levels = updated_versions
+                .get(tree_idx)
+                .cloned()
+                .unwrap_or_else(|| snapshot.multi_lsm_version.version_of_index(*tree_idx))
+                .levels
+                .clone();
+            for level_edit in &edit.level_edits {
+                if let Some(level) = new_levels
+                    .iter_mut()
+                    .find(|l| l.ordinal == level_edit.level)
+                {
+                    let mut insert_pos = Option::<usize>::None;
+                    for file in &level_edit.removed_files {
+                        if let Some(pos) = level.files.iter().position(|f| Arc::ptr_eq(f, file)) {
+                            level.files.remove(pos);
+                            if !level.tiered {
+                                if let Some(previous) = insert_pos {
+                                    assert_eq!(pos, previous);
+                                } else {
+                                    insert_pos = Some(pos);
+                                }
+                            } else if insert_pos.is_none() {
                                 insert_pos = Some(pos);
                             }
-                        } else if insert_pos.is_none() {
-                            insert_pos = Some(pos);
                         }
                     }
-                }
-                // Insert new files at the position of the first removed file
-                if let Some(pos) = insert_pos {
-                    for (i, new_file) in level_edit.new_files.iter().enumerate() {
-                        level.files.insert(pos + i, Arc::clone(new_file));
-                    }
-                } else {
-                    // If no files were removed.
-                    //  if tiering, at the end if no files were removed.
-                    //  else, determine by file key range.
-                    if level.tiered {
+                    if let Some(pos) = insert_pos {
+                        for (i, new_file) in level_edit.new_files.iter().enumerate() {
+                            level.files.insert(pos + i, Arc::clone(new_file));
+                        }
+                    } else if level.tiered {
                         level.files.extend(level_edit.new_files.clone());
                     } else {
-                        // Determine position by key range
                         let mut last_pos = 0;
                         for new_file in &level_edit.new_files {
                             let mut inserted = false;
@@ -265,27 +226,27 @@ impl LSMTree {
                             }
                         }
                     }
+                } else {
+                    new_levels.push(Level {
+                        ordinal: level_edit.level,
+                        tiered: Self::get_level_option(state, level_edit.level).tiered,
+                        files: level_edit.new_files.clone(),
+                    });
                 }
-            } else {
-                // If the level does not exist, create it
-                new_levels.push(Level {
-                    ordinal: level_edit.level,
-                    tiered: Self::get_level_option(state, level_edit.level).tiered,
-                    files: level_edit.new_files.clone(),
-                });
             }
+            updated_versions.insert(*tree_idx, Arc::new(LSMTreeVersion { levels: new_levels }));
         }
-        let new_lsm_version = LSMTreeVersion {
-            levels: new_levels.clone(),
-        };
 
         self.db_state
             .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
+                let mut multi_lsm_version = snapshot.multi_lsm_version.clone();
+                for (tree_idx, version) in &updated_versions {
+                    multi_lsm_version =
+                        multi_lsm_version.with_lsm_version_at(*tree_idx, Arc::clone(version));
+                }
                 let mut new_db_state = DbState {
                     seq_id: db_state.allocate_seq_id(),
-                    multi_lsm_version: snapshot
-                        .multi_lsm_version
-                        .with_lsm_version(Arc::new(new_lsm_version.clone())),
+                    multi_lsm_version,
                     vlog_version: snapshot.vlog_version.clone(),
                     active: snapshot.active.clone(),
                     immutables: snapshot.immutables.clone(),
@@ -301,8 +262,8 @@ impl LSMTree {
         let snapshot = self.db_state.load();
         drop(guard);
         debug!(
-            "{}. {}",
-            VersionEditSummary(&edit),
+            "apply {} version edits. {}",
+            edits.len(),
             VersionSummary(
                 self.db_state
                     .load()
@@ -318,21 +279,33 @@ impl LSMTree {
     pub(crate) fn add_level0_files(
         &self,
         to_remove_memtable_seq: u64,
-        new_files: Vec<Arc<DataFile>>,
+        files_by_tree: Vec<(usize, Arc<DataFile>)>,
         vlog_edit: Option<VlogEdit>,
     ) -> Arc<DbState> {
-        if new_files.is_empty() {
+        if files_by_tree.is_empty() {
             panic!("cannot add empty new files");
         }
-        let edit = VersionEdit {
-            level_edits: vec![LevelEdit {
-                level: 0,
-                removed_files: Vec::new(),
-                new_files,
-            }],
-        };
+        let mut grouped: BTreeMap<usize, Vec<Arc<DataFile>>> = BTreeMap::new();
+        for (tree_idx, file) in files_by_tree {
+            grouped.entry(tree_idx).or_default().push(file);
+        }
+        let edits: Vec<(usize, VersionEdit)> = grouped
+            .into_iter()
+            .map(|(tree_idx, files)| {
+                (
+                    tree_idx,
+                    VersionEdit {
+                        level_edits: vec![LevelEdit {
+                            level: 0,
+                            removed_files: Vec::new(),
+                            new_files: files,
+                        }],
+                    },
+                )
+            })
+            .collect();
         let mut state = self.state.lock().unwrap();
-        self.apply_edit_locked(&mut state, edit, move |db_state| {
+        self.apply_edit_locked(&mut state, edits, move |db_state| {
             db_state
                 .immutables
                 .retain(|imm| imm.seq != to_remove_memtable_seq);
@@ -343,10 +316,14 @@ impl LSMTree {
     }
 
     pub(crate) fn level_files(&self, level: u8) -> Vec<Arc<DataFile>> {
+        self.level_files_in_tree(0, level)
+    }
+
+    pub(crate) fn level_files_in_tree(&self, tree_idx: usize, level: u8) -> Vec<Arc<DataFile>> {
         self.db_state
             .load()
             .multi_lsm_version
-            .version_of_index(0)
+            .version_of_index(tree_idx)
             .levels
             .iter()
             .find(|l| l.ordinal == level)
@@ -424,7 +401,7 @@ impl LSMTree {
                     "compaction trivial move L{}->L{} file_id={}",
                     plan.input_level, plan.output_level, plan.base_file_id
                 );
-                self.apply_edit_locked(state, edit, |_db_state| {});
+                self.apply_edit_locked(state, vec![(0, edit)], |_db_state| {});
             }
             return;
         }
@@ -944,7 +921,7 @@ mod tests {
             ],
         };
 
-        lsm_tree.apply_edit(edit);
+        lsm_tree.apply_edit(0, edit, None);
 
         // Verify the new version
         let version = db_state.load().multi_lsm_version.version_of_index(0);
@@ -1005,13 +982,17 @@ mod tests {
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
-        lsm_tree.apply_edit(VersionEdit {
-            level_edits: vec![LevelEdit {
-                level: 0,
-                removed_files: vec![Arc::clone(&to_remove)],
-                new_files: Vec::new(),
-            }],
-        });
+        lsm_tree.apply_edit(
+            0,
+            VersionEdit {
+                level_edits: vec![LevelEdit {
+                    level: 0,
+                    removed_files: vec![Arc::clone(&to_remove)],
+                    new_files: Vec::new(),
+                }],
+            },
+            None,
+        );
         assert!(lsm_tree.level_files(0).is_empty());
         drop(to_remove);
 
@@ -1104,13 +1085,17 @@ mod tests {
             .and_then(|level| level.files.iter().find(|file| file.start_key == b"a"))
             .cloned()
             .expect("target file");
-        lsm_tree.apply_edit(VersionEdit {
-            level_edits: vec![LevelEdit {
-                level: 1,
-                removed_files: vec![target],
-                new_files: Vec::new(),
-            }],
-        });
+        lsm_tree.apply_edit(
+            0,
+            VersionEdit {
+                level_edits: vec![LevelEdit {
+                    level: 1,
+                    removed_files: vec![target],
+                    new_files: Vec::new(),
+                }],
+            },
+            None,
+        );
         let level1 = lsm_tree.level_files(1);
         let level2 = lsm_tree.level_files(2);
         assert_eq!(level1.len(), 0);

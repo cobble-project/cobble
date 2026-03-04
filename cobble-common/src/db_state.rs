@@ -82,22 +82,37 @@ impl MultiLSMTreeVersion {
             .clone()
     }
 
-    pub(crate) fn version_for_bucket(&self, bucket: u16) -> Option<Arc<LSMTreeVersion>> {
+    pub(crate) fn tree_index_for_bucket(&self, bucket: u16) -> Option<usize> {
         if self.bucket_to_tree_idx.is_empty() {
-            return Some(self.version_of_index(0));
+            return Some(0);
         }
         let tree_idx = *self.bucket_to_tree_idx.get(bucket as usize)?;
         if tree_idx == u16::MAX {
             return None;
         }
-        self.tree_versions.get(tree_idx as usize).cloned()
+        Some(tree_idx as usize)
     }
 
-    pub(crate) fn with_lsm_version(&self, lsm_version: Arc<LSMTreeVersion>) -> Self {
-        let tree_count = self.tree_versions.len().max(1);
+    pub(crate) fn version_for_bucket(&self, bucket: u16) -> Option<Arc<LSMTreeVersion>> {
+        self.tree_index_for_bucket(bucket)
+            .map(|tree_idx| self.version_of_index(tree_idx))
+    }
+
+    pub(crate) fn with_lsm_version_at(
+        &self,
+        tree_idx: usize,
+        lsm_version: Arc<LSMTreeVersion>,
+    ) -> Self {
+        let mut tree_versions = self.tree_versions.clone();
+        if tree_versions.is_empty() {
+            tree_versions.push(lsm_version);
+        } else {
+            let slot = tree_versions.get_mut(tree_idx).expect("Invalid tree index");
+            *slot = lsm_version;
+        }
         Self {
             bucket_to_tree_idx: self.bucket_to_tree_idx.clone(),
-            tree_versions: (0..tree_count).map(|_| Arc::clone(&lsm_version)).collect(),
+            tree_versions,
         }
     }
 }

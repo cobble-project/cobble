@@ -417,7 +417,7 @@ impl CompactionWorker for RemoteCompactionWorker {
                     (!edit.is_empty()).then_some(edit)
                 };
                 lsm_tree.on_compaction_complete();
-                lsm_tree.apply_edit_with_vlog(edit.clone(), vlog_edit.clone());
+                lsm_tree.apply_edit(0, edit.clone(), vlog_edit.clone());
                 Ok(CompactionResult::new(output_files, edit, vlog_edit))
             })();
             if result.is_err()
