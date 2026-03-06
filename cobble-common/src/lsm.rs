@@ -500,18 +500,37 @@ impl LSMTree {
         tree_idx: usize,
     ) -> Option<std::ops::Range<usize>> {
         let split_level = state.compaction_config.split_trigger_level?;
+        if split_level == 0 {
+            return None;
+        }
         let tree_range = snapshot.multi_lsm_version.bucket_range_of_tree(tree_idx)?;
         let bucket_count = bucket_range_len(&tree_range);
         if bucket_count <= 1 {
             return None;
         }
         let tree_version = snapshot.multi_lsm_version.version_of_index(tree_idx);
-        let level_size = tree_version
+        let split_level_view = tree_version
             .levels
             .iter()
-            .find(|level| level.ordinal == split_level)
-            .map(|level| level.files.iter().map(|file| file.size).sum::<usize>())
-            .unwrap_or(0);
+            .find(|level| level.ordinal == split_level)?;
+        let level_size = split_level_view
+            .files
+            .iter()
+            .map(|file| file.size)
+            .sum::<usize>();
+        let has_out_of_range_data = split_level_view
+            .files
+            .iter()
+            .any(|file| file.needs_bucket_filter());
+        // if there are out-of-range data files, we cannot accurately estimate the level size for
+        // the split-level, so we skip auto split to avoid potential mis-split.
+        if has_out_of_range_data {
+            debug!(
+                "skip auto split tree={} level={} because of out-of-range data files",
+                tree_idx, split_level
+            );
+            return None;
+        }
         let threshold = level_threshold(
             state.compaction_config.l1_base_bytes,
             state.compaction_config.level_size_multiplier,
@@ -1678,6 +1697,59 @@ mod tests {
                 bucket
             );
         }
+    }
+
+    #[test]
+    fn test_lsm_auto_split_skips_l0_trigger_level() {
+        let db_state = Arc::new(DbStateHandle::new());
+        let initial_version = Arc::new(LSMTreeVersion {
+            levels: vec![
+                Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: vec![
+                        create_data_file_with_bucket(0, 10),
+                        create_data_file_with_bucket(1, 10),
+                        create_data_file_with_bucket(2, 10),
+                        create_data_file_with_bucket(3, 10),
+                    ],
+                },
+                Level {
+                    ordinal: 1,
+                    tiered: false,
+                    files: Vec::new(),
+                },
+            ],
+        });
+        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+            4,
+            &[0u16..=3u16],
+            vec![initial_version],
+        )
+        .unwrap();
+        db_state.store(DbState {
+            seq_id: 0,
+            multi_lsm_version,
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: Vec::new().into(),
+            suggested_base_snapshot_id: None,
+        });
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+        let worker = Arc::new(RecordingCompactionWorker::default());
+        let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
+        let mut config = crate::compaction::CompactionConfig::default();
+        config.split_trigger_level = Some(0);
+        lsm_tree.configure_compaction(config, Some(worker_dyn));
+        lsm_tree.apply_edit(
+            0,
+            VersionEdit {
+                level_edits: Vec::new(),
+            },
+            None,
+        );
+        assert_eq!(db_state.load().multi_lsm_version.tree_count(), 1);
     }
 
     #[test]
