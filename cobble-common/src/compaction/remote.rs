@@ -94,6 +94,10 @@ struct RemoteDataFile {
     size: usize,
     #[serde(default)]
     has_separated_values: bool,
+    bucket_range_start: u16,
+    bucket_range_end: u16,
+    effective_bucket_range_start: u16,
+    effective_bucket_range_end: u16,
     meta_bytes: Option<Vec<u8>>,
 }
 
@@ -109,6 +113,10 @@ impl RemoteDataFile {
             schema_id: file.schema_id,
             size: file.size,
             has_separated_values: file.has_separated_values,
+            bucket_range_start: *file.bucket_range.start(),
+            bucket_range_end: *file.bucket_range.end(),
+            effective_bucket_range_start: *file.effective_bucket_range.start(),
+            effective_bucket_range_end: *file.effective_bucket_range.end(),
             meta_bytes: file.meta_bytes().map(|bytes| bytes.to_vec()),
         }
     }
@@ -147,6 +155,9 @@ impl RemoteDataFile {
             seq: self.seq,
             schema_id: self.schema_id,
             size: self.size,
+            bucket_range: self.bucket_range_start..=self.bucket_range_end,
+            effective_bucket_range: self.effective_bucket_range_start
+                ..=self.effective_bucket_range_end,
             has_separated_values: self.has_separated_values,
             meta_bytes: Default::default(),
         };
@@ -393,7 +404,7 @@ impl CompactionWorker for RemoteCompactionWorker {
                 let lsm_tree = self.lsm_tree.clone();
                 return Some(handle.spawn_blocking(move || {
                     if let Some(lsm_tree) = lsm_tree.upgrade() {
-                        lsm_tree.on_compaction_complete(lsm_tree_idx);
+                        let _ = lsm_tree.on_compaction_complete(lsm_tree_idx);
                     }
                     Err(err)
                 }));
@@ -426,8 +437,10 @@ impl CompactionWorker for RemoteCompactionWorker {
                     let edit = VlogEdit::from_entry_deltas(response.vlog_entry_deltas);
                     (!edit.is_empty()).then_some(edit)
                 };
-                lsm_tree.on_compaction_complete(lsm_tree_idx);
-                lsm_tree.apply_edit(lsm_tree_idx, edit.clone(), vlog_edit.clone());
+                let apply_tree_idx = lsm_tree.on_compaction_complete(lsm_tree_idx);
+                if let Some(apply_tree_idx) = apply_tree_idx {
+                    lsm_tree.apply_edit(apply_tree_idx, edit.clone(), vlog_edit.clone());
+                }
                 Ok(CompactionResult::new(
                     lsm_tree_idx,
                     output_files,
@@ -438,7 +451,7 @@ impl CompactionWorker for RemoteCompactionWorker {
             if result.is_err()
                 && let Some(lsm_tree) = lsm_tree.upgrade()
             {
-                lsm_tree.on_compaction_complete(lsm_tree_idx);
+                let _ = lsm_tree.on_compaction_complete(lsm_tree_idx);
             }
             result
         }))
@@ -845,6 +858,7 @@ mod tests {
         }
 
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
+        let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
         let data_file = DataFile {
             file_type: DataFileType::SSTable,
             start_key: first_key,
@@ -854,6 +868,8 @@ mod tests {
             seq: 0,
             schema_id: 0,
             size: file_size,
+            bucket_range: bucket_range.clone(),
+            effective_bucket_range: bucket_range,
             has_separated_values: false,
             meta_bytes: Default::default(),
         };

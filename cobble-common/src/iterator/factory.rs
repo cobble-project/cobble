@@ -3,7 +3,7 @@
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
 use crate::file::FileManager;
-use crate::iterator::KvIterator;
+use crate::iterator::{BucketFilterIterator, KvIterator};
 use crate::sst::block_cache::BlockCache;
 use crate::sst::{SSTIterator, SSTIteratorOptions};
 use std::sync::Arc;
@@ -43,7 +43,14 @@ pub fn create_iterator(
                 options.sst_options.clone(),
                 options.block_cache.clone(),
             )?;
-            Ok(Box::new(iter))
+            if file.needs_bucket_filter() {
+                Ok(Box::new(BucketFilterIterator::new(
+                    iter,
+                    file.effective_bucket_range.clone(),
+                )))
+            } else {
+                Ok(Box::new(iter))
+            }
         }
     }
 }

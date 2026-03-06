@@ -6,7 +6,7 @@ use crate::lsm::{LSMTreeVersion, Level};
 use crate::vlog::VlogVersion;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Range;
+use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -15,7 +15,8 @@ pub(crate) struct ManifestSnapshot {
     pub(crate) id: u64,
     pub(crate) seq_id: u64,
     pub(crate) latest_schema_id: u64,
-    pub(crate) bucket_ranges: Vec<Range<u16>>,
+    pub(crate) bucket_ranges: Vec<RangeInclusive<u16>>,
+    pub(crate) lsm_tree_bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) tree_levels: Vec<Vec<ManifestLevel>>,
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
     pub(crate) active_memtable_data: Vec<ActiveMemtableSnapshotData>,
@@ -27,7 +28,8 @@ pub(crate) struct ManifestIncrementalSnapshot {
     pub(crate) seq_id: u64,
     pub(crate) base_snapshot_id: u64,
     pub(crate) latest_schema_id: u64,
-    pub(crate) bucket_ranges: Vec<Range<u16>>,
+    pub(crate) bucket_ranges: Vec<RangeInclusive<u16>>,
+    pub(crate) lsm_tree_bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) tree_level_edits: Vec<ManifestTreeLevelEdit>,
     // always include vlog file info in incremental manifests since vlog files are more likely to have changes
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
@@ -72,6 +74,10 @@ pub(crate) struct ManifestFile {
     pub(crate) end_key: String,
     pub(crate) path: String,
     pub(crate) has_separated_values: bool,
+    pub(crate) bucket_range_start: u16,
+    pub(crate) bucket_range_end: u16,
+    pub(crate) effective_bucket_range_start: u16,
+    pub(crate) effective_bucket_range_end: u16,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -147,6 +153,7 @@ pub(crate) fn load_manifest_chain(
                 resolved_base.latest_schema_id = manifest.latest_schema_id;
                 resolved_base.active_memtable_data = manifest.active_memtable_data;
                 resolved_base.bucket_ranges = manifest.bucket_ranges;
+                resolved_base.lsm_tree_bucket_ranges = manifest.lsm_tree_bucket_ranges;
                 (Some(manifest.base_snapshot_id), resolved_base)
             }
         };
@@ -270,6 +277,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             seq_id: snapshot.seq_id,
             latest_schema_id: snapshot.latest_schema_id,
             bucket_ranges: snapshot.bucket_ranges.clone(),
+            lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
             tree_levels: manifest_tree_levels_from_snapshot(&snapshot.lsm_versions, file_manager),
             vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
             active_memtable_data: snapshot.active_memtable_data.clone(),
@@ -287,6 +295,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 base_snapshot_id: base.id,
                 latest_schema_id: snapshot.latest_schema_id,
                 bucket_ranges: snapshot.bucket_ranges.clone(),
+                lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
                 tree_level_edits,
                 vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
                 active_memtable_data: snapshot.active_memtable_data.clone(),
@@ -340,6 +349,10 @@ fn manifest_file_from_data_file(file: &DataFile, file_manager: &FileManager) -> 
             .get_data_file_full_path(file.file_id)
             .expect("Unknown file ID"),
         has_separated_values: file.has_separated_values,
+        bucket_range_start: *file.bucket_range.start(),
+        bucket_range_end: *file.bucket_range.end(),
+        effective_bucket_range_start: *file.effective_bucket_range.start(),
+        effective_bucket_range_end: *file.effective_bucket_range.end(),
     }
 }
 
@@ -498,6 +511,9 @@ pub(crate) fn build_tree_versions_from_manifest_untracked(
                     seq: file.seq,
                     schema_id: file.schema_id,
                     size: file.size,
+                    bucket_range: file.bucket_range_start..=file.bucket_range_end,
+                    effective_bucket_range: file.effective_bucket_range_start
+                        ..=file.effective_bucket_range_end,
                     has_separated_values: file.has_separated_values,
                     meta_bytes: Default::default(),
                 }));
@@ -560,6 +576,9 @@ pub(crate) fn build_tree_versions_from_manifest(
                     seq: file.seq,
                     schema_id: file.schema_id,
                     size: file.size,
+                    bucket_range: file.bucket_range_start..=file.bucket_range_end,
+                    effective_bucket_range: file.effective_bucket_range_start
+                        ..=file.effective_bucket_range_end,
                     has_separated_values: file.has_separated_values,
                     meta_bytes: Default::default(),
                 }));

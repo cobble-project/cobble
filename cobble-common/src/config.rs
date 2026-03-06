@@ -294,8 +294,8 @@ pub struct Config {
     pub memtable_type: MemtableType,
     /// Number of columns in the value schema.
     pub num_columns: usize,
-    /// Total number of buckets in the cluster.
-    pub total_buckets: u16,
+    /// Total number of buckets in the cluster. Should be 1~65536.
+    pub total_buckets: u32,
     /// Maximum number of L0 files before triggering compaction.
     pub l0_file_limit: usize,
     /// Maximum number of immutables + L0 files before write stall.
@@ -350,6 +350,9 @@ pub struct Config {
     /// If active memtable usage ratio is below this value during snapshot, write an
     /// incremental active-memtable snapshot data file instead of flushing to SST.
     pub active_memtable_incremental_snapshot_ratio: f64,
+    /// Optional level ordinal whose overflow triggers automatic LSM tree splitting.
+    /// When set, the tree is split by bucket boundaries instead of compacting into deeper levels.
+    pub lsm_split_trigger_level: Option<u8>,
     /// Auto-expire snapshots after this many newer snapshots are completed.
     /// None disables auto-expiration.
     pub snapshot_retention: Option<usize>,
@@ -394,6 +397,7 @@ impl Default for Config {
             log_level: log::LevelFilter::Info,
             snapshot_on_flush: false,
             active_memtable_incremental_snapshot_ratio: 0.0,
+            lsm_split_trigger_level: None,
             snapshot_retention: None,
         }
     }
@@ -526,6 +530,7 @@ mod tests {
             log_level: log::LevelFilter::Debug,
             snapshot_on_flush: true,
             active_memtable_incremental_snapshot_ratio: 0.5,
+            lsm_split_trigger_level: Some(2),
             snapshot_retention: Some(3),
             compaction_read_ahead_enabled: false,
             compaction_remote_addr: Some("127.0.0.1:9999".to_string()),
@@ -560,6 +565,7 @@ mod tests {
         assert_eq!(decoded.log_level, log::LevelFilter::Debug);
         assert_eq!(decoded.snapshot_retention, Some(3));
         assert_eq!(decoded.active_memtable_incremental_snapshot_ratio, 0.5);
+        assert_eq!(decoded.lsm_split_trigger_level, Some(2));
         assert_eq!(decoded.value_separation_threshold, 4096);
         assert_eq!(decoded.read_proxy.block_cache_size, 2048);
         assert_eq!(decoded.read_proxy.reload_tolerance_seconds, 5);

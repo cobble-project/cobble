@@ -110,6 +110,10 @@ impl Key {
     }
 }
 
+pub(crate) fn key_bucket(key: &[u8]) -> Option<u16> {
+    (key.len() >= 2).then(|| u16::from_le_bytes([key[0], key[1]]))
+}
+
 impl ValueType {
     #[inline]
     pub(crate) fn encode_tag(self) -> u8 {

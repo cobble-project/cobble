@@ -14,7 +14,7 @@ pub(crate) use executor::{
 };
 pub(crate) use policy::{
     CompactionConfig, CompactionPlan, CompactionPolicy, MinOverlapPolicy, RoundRobinPolicy,
-    build_runs_for_plan,
+    build_runs_for_plan, level_threshold,
 };
 pub use remote::RemoteCompactionServer;
 #[allow(unused_imports)]
@@ -78,9 +78,10 @@ impl LocalCompactionWorker {
     fn submit(&self, task: CompactionTask) -> tokio::task::JoinHandle<Result<CompactionResult>> {
         let lsm_tree = self.lsm_tree.clone();
         let on_complete = Arc::new(move |lsm_tree_idx: usize, edit: VersionEdit, vlog_edit| {
-            if let Some(lsm_tree) = lsm_tree.upgrade() {
-                lsm_tree.on_compaction_complete(lsm_tree_idx);
-                lsm_tree.apply_edit(lsm_tree_idx, edit, vlog_edit);
+            if let Some(lsm_tree) = lsm_tree.upgrade()
+                && let Some(apply_tree_idx) = lsm_tree.on_compaction_complete(lsm_tree_idx)
+            {
+                lsm_tree.apply_edit(apply_tree_idx, edit, vlog_edit);
             }
         });
         let executor = self.executor.lock().unwrap();
@@ -186,6 +187,7 @@ pub(crate) fn build_compaction_config(config: &crate::Config) -> CompactionConfi
         partitioned_index: config.sst_partitioned_index,
         read_ahead_enabled: config.compaction_read_ahead_enabled,
         max_threads: config.compaction_threads,
+        split_trigger_level: config.lsm_split_trigger_level,
         ..CompactionConfig::default()
     }
 }

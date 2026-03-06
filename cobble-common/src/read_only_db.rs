@@ -82,7 +82,11 @@ impl ReadOnlyDb {
                 snapshot_id
             )));
         }
-        let bucket_ranges = manifest.bucket_ranges.clone();
+        let lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
+            manifest.bucket_ranges.clone()
+        } else {
+            manifest.lsm_tree_bucket_ranges.clone()
+        };
         let schema_manager = Arc::new(SchemaManager::from_manifest(
             &file_manager,
             &manifest,
@@ -90,14 +94,9 @@ impl ReadOnlyDb {
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let tree_versions = build_tree_versions_from_manifest(&file_manager, manifest, true)?;
-        let manifest_total_buckets = bucket_ranges
-            .iter()
-            .map(|range| range.end)
-            .max()
-            .unwrap_or(config.total_buckets);
         let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
-            manifest_total_buckets,
-            &bucket_ranges,
+            config.total_buckets,
+            &lsm_tree_bucket_ranges,
             tree_versions.into_iter().map(Arc::new).collect(),
         )?;
         let sst_options = crate::compaction::build_sst_writer_options(&config, 0);

@@ -3,6 +3,7 @@
 //! This module provides generic iterator abstractions that are independent of
 //! the underlying data file format (SST, etc.), allowing for future extensibility.
 
+mod bucket_filter;
 mod deduplicating;
 mod factory;
 mod merging;
@@ -12,6 +13,8 @@ mod sorted_run;
 
 // Public API exports for the iterator module.
 // These are currently unused within this crate but are exported for external usage.
+#[allow(unused_imports)]
+pub(crate) use bucket_filter::BucketFilterIterator;
 #[allow(unused_imports)]
 pub(crate) use deduplicating::DeduplicatingIterator;
 #[allow(unused_imports)]

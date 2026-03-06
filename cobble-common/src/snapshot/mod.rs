@@ -8,7 +8,7 @@ use crate::file::TrackedFile;
 use crate::lsm::LSMTreeVersion;
 use crate::vlog::VlogVersion;
 use std::collections::BTreeSet;
-use std::ops::Range;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 pub(crate) use manager::SnapshotManager;
@@ -36,7 +36,8 @@ pub(crate) struct DbSnapshot {
     pub latest_schema_id: u64,
     pub referenced_schema_ids: BTreeSet<u64>,
     pub active_memtable_data: Vec<ActiveMemtableSnapshotData>,
-    pub bucket_ranges: Vec<Range<u16>>,
+    pub lsm_tree_bucket_ranges: Vec<RangeInclusive<u16>>,
+    pub bucket_ranges: Vec<RangeInclusive<u16>>,
     pub finished: bool,
     pub callback: Option<SnapshotCallback>,
 }
@@ -56,6 +57,7 @@ impl DbSnapshot {
             latest_schema_id: 0,
             referenced_schema_ids: BTreeSet::new(),
             active_memtable_data: Vec::new(),
+            lsm_tree_bucket_ranges: Vec::new(),
             bucket_ranges: Vec::new(),
             finished: false,
             callback,

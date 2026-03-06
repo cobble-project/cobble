@@ -1,6 +1,8 @@
 use crate::file::{FileId, TrackedFileId};
+use crate::r#type::key_bucket;
 use bytes::Bytes;
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
@@ -48,6 +50,10 @@ pub struct DataFile {
     pub schema_id: u64,
     /// Size of the file in bytes.
     pub size: usize,
+    /// Full bucket range covered by keys physically present in this file.
+    pub bucket_range: RangeInclusive<u16>,
+    /// Bucket range visible to the owning LSM tree.
+    pub effective_bucket_range: RangeInclusive<u16>,
     /// Whether this file contains separated value columns/pointers.
     pub has_separated_values: bool,
     /// Optional cached meta bytes to avoid re-reading from disk.
@@ -55,6 +61,43 @@ pub struct DataFile {
 }
 
 impl DataFile {
+    pub(crate) fn bucket_range_from_keys(start_key: &[u8], end_key: &[u8]) -> RangeInclusive<u16> {
+        let start = key_bucket(start_key).unwrap_or(0);
+        let end = key_bucket(end_key).unwrap_or(u16::MAX);
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        start..=end
+    }
+
+    pub(crate) fn with_effective_bucket_range(&self, range: RangeInclusive<u16>) -> Self {
+        let data_file = Self {
+            file_type: self.file_type,
+            start_key: self.start_key.clone(),
+            end_key: self.end_key.clone(),
+            file_id: self.file_id,
+            tracked_id: Arc::clone(&self.tracked_id),
+            seq: self.seq,
+            schema_id: self.schema_id,
+            size: self.size,
+            bucket_range: self.bucket_range.clone(),
+            effective_bucket_range: range,
+            has_separated_values: self.has_separated_values,
+            meta_bytes: Default::default(),
+        };
+        if let Some(meta_bytes) = self.meta_bytes() {
+            data_file.set_meta_bytes(meta_bytes);
+        }
+        data_file
+    }
+
+    pub(crate) fn needs_bucket_filter(&self) -> bool {
+        self.bucket_range.start() >= self.effective_bucket_range.start()
+            && self.bucket_range.end() <= self.effective_bucket_range.end()
+    }
+
     pub fn meta_bytes(&self) -> Option<Bytes> {
         self.meta_bytes.get().cloned()
     }
@@ -66,4 +109,13 @@ impl DataFile {
     pub fn has_separated_values(&self) -> bool {
         self.has_separated_values
     }
+}
+
+pub(crate) fn intersect_bucket_ranges(
+    left: &RangeInclusive<u16>,
+    right: &RangeInclusive<u16>,
+) -> Option<RangeInclusive<u16>> {
+    let start = (*left.start()).max(*right.start());
+    let end = (*left.end()).min(*right.end());
+    (start <= end).then_some(start..=end)
 }

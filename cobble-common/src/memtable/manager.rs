@@ -494,11 +494,18 @@ impl MemtableManager {
                                     .sum();
                                 metrics.flush_bytes_total.increment(flushed_bytes);
                                 let vlog_edit = res.vlog_edit.clone();
-                                let snapshot = lsm_tree_clone.add_level0_files(
-                                    res.seq,
-                                    res.data_files_by_tree.clone(),
-                                    vlog_edit,
-                                );
+                                let snapshot = lsm_tree_clone
+                                    .add_level0_files(
+                                        res.seq,
+                                        res.data_files_by_tree.clone(),
+                                        vlog_edit,
+                                    )
+                                    .unwrap_or_else(|err| {
+                                        panic!(
+                                            "memtable flush l0 check-in failed seq={} err={}",
+                                            res.seq, err
+                                        )
+                                    });
                                 state.flush_results.insert(res.seq, Ok(res));
                                 flush_done_clone.notify_all();
                                 drop(state);
@@ -1291,7 +1298,7 @@ impl MemtableManager {
             result.seq,
             result.data_files_by_tree.clone(),
             result.vlog_edit,
-        );
+        )?;
         Ok(true)
     }
 
@@ -1321,15 +1328,20 @@ impl MemtableManager {
 
     fn should_write_stall_with_snapshot(snapshot: &DbState, write_stall_limit: usize) -> bool {
         let immutables = snapshot.immutables.len();
-        let level0 = snapshot
-            .multi_lsm_version
-            .version_of_index(0)
-            .levels
-            .iter()
-            .find(|level| level.ordinal == 0)
-            .map(|level| level.files.len())
+        let max_level0 = (0..snapshot.multi_lsm_version.tree_count())
+            .map(|tree_idx| {
+                snapshot
+                    .multi_lsm_version
+                    .version_of_index(tree_idx)
+                    .levels
+                    .iter()
+                    .find(|level| level.ordinal == 0)
+                    .map(|level| level.files.len())
+                    .unwrap_or(0)
+            })
+            .max()
             .unwrap_or(0);
-        immutables + level0 > write_stall_limit
+        immutables + max_level0 > write_stall_limit
     }
 }
 
@@ -1363,7 +1375,7 @@ fn flush_memtable(
         vlog_edit = Some(edit);
     }
     // Step 2: Create data files on-demand per tree and write entries by key bucket.
-    let mut builders: BTreeMap<usize, (u64, Box<dyn FileBuilder>)> = BTreeMap::new();
+    let mut builders: BTreeMap<usize, (u64, Box<dyn FileBuilder>, u16, u16)> = BTreeMap::new();
     // Try to handle merges during flush if vlog edits are present
     let merge_collector = vlog_edit.as_ref().map(|_| VlogMergeCollector::shared(true));
     let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
@@ -1394,12 +1406,19 @@ fn flush_memtable(
                 })?;
             if let std::collections::btree_map::Entry::Vacant(entry) = builders.entry(tree_idx) {
                 let (file_id, writer) = file_manager.create_data_file()?;
-                entry.insert((file_id, (file_builder_factory)(Box::new(writer))));
+                entry.insert((
+                    file_id,
+                    (file_builder_factory)(Box::new(writer)),
+                    bucket,
+                    bucket,
+                ));
             }
-            let (_, builder) = builders
+            let (_, builder, min_bucket, max_bucket) = builders
                 .get_mut(&tree_idx)
                 .expect("builder should exist for tree");
             builder.add(key, value)?;
+            *min_bucket = (*min_bucket).min(bucket);
+            *max_bucket = (*max_bucket).max(bucket);
         }
         dedup_iter.next()?;
     }
@@ -1416,8 +1435,9 @@ fn flush_memtable(
         .as_ref()
         .is_some_and(|collector| collector.borrow().has_separated_values());
     let mut data_files_by_tree = Vec::with_capacity(builders.len());
-    for (tree_idx, (file_id, builder)) in builders {
+    for (tree_idx, (file_id, builder, min_bucket, max_bucket)) in builders {
         let (start_key, end_key, file_size, footer_bytes) = builder.finish()?;
+        let bucket_range = min_bucket..=max_bucket;
         let data_file = DataFile {
             file_type: DataFileType::SSTable,
             start_key,
@@ -1427,6 +1447,8 @@ fn flush_memtable(
             size: file_size,
             seq,
             schema_id: schema.version(),
+            bucket_range: bucket_range.clone(),
+            effective_bucket_range: bucket_range,
             has_separated_values,
             meta_bytes: Default::default(),
         };
@@ -1878,7 +1900,7 @@ mod tests {
         ));
         lsm_tree
             .db_state()
-            .configure_multi_lsm(2, &[0u16..1u16, 1u16..2u16])
+            .configure_multi_lsm(2, &[0u16..=0u16, 1u16..=1u16])
             .unwrap();
         let manager = MemtableManager::new(
             Arc::clone(&file_manager),

@@ -250,6 +250,7 @@ mod tests {
     use crate::iterator::mock_iterator::MockIterator;
 
     fn create_data_file(id: u64, start: &[u8], end: &[u8]) -> Arc<DataFile> {
+        let bucket_range = DataFile::bucket_range_from_keys(start, end);
         Arc::new(DataFile {
             file_type: DataFileType::SSTable,
             start_key: start.to_vec(),
@@ -259,6 +260,8 @@ mod tests {
             seq: 0,
             schema_id: 0,
             size: 0,
+            bucket_range: bucket_range.clone(),
+            effective_bucket_range: bucket_range,
             has_separated_values: false,
             meta_bytes: Default::default(),
         })

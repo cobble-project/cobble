@@ -1,5 +1,6 @@
 use crate::config::VolumeUsageKind;
 use crate::coordinator::GlobalSnapshotManifest;
+use crate::db_state::{bucket_range_fits_total, bucket_range_last, bucket_slots_for_total};
 use crate::error::{Error, Result};
 use crate::file::{File, FileSystem, FileSystemRegistry};
 use crate::lru::LruCache;
@@ -13,7 +14,7 @@ use crate::sst::block_cache::{BlockCache, new_block_cache};
 use crate::{Config, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, VolumeDescriptor};
 use bytes::Bytes;
 use serde_json::Error as SerdeError;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -21,6 +22,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct ReadProxyConfig {
     pub volumes: Vec<VolumeDescriptor>,
+    pub total_buckets: u32,
     pub pin_partition_in_memory_count: usize,
     pub block_cache_size: usize,
     pub reload_tolerance: Duration,
@@ -30,6 +32,7 @@ impl Default for ReadProxyConfig {
     fn default() -> Self {
         Self {
             volumes: VolumeDescriptor::single_volume("file:///tmp/".to_string()),
+            total_buckets: Config::default().total_buckets,
             pin_partition_in_memory_count: 1,
             block_cache_size: 512 * 1024 * 1024,
             reload_tolerance: Duration::from_secs(10),
@@ -41,6 +44,7 @@ impl ReadProxyConfig {
     pub fn from_config(config: &Config) -> Self {
         Self {
             volumes: config.volumes.clone(),
+            total_buckets: config.total_buckets,
             pin_partition_in_memory_count: config.read_proxy.pin_partition_in_memory_count,
             block_cache_size: config.read_proxy.block_cache_size,
             reload_tolerance: Duration::from_secs(config.read_proxy.reload_tolerance_seconds),
@@ -75,6 +79,7 @@ impl ReadProxy {
     pub fn open(read_config: ReadProxyConfig, global_snapshot_id: u64) -> Result<Self> {
         let config = Config {
             volumes: read_config.volumes.clone(),
+            total_buckets: read_config.total_buckets,
             ..Config::default()
         };
         let registry = FileSystemRegistry::new();
@@ -118,6 +123,7 @@ impl ReadProxy {
     pub fn open_current(read_config: ReadProxyConfig) -> Result<Self> {
         let config = Config {
             volumes: read_config.volumes.clone(),
+            total_buckets: read_config.total_buckets,
             ..Config::default()
         };
         let registry = FileSystemRegistry::new();
@@ -209,7 +215,7 @@ impl ReadProxy {
     }
 
     fn snapshot_key_for_bucket(&self, bucket_id: u16) -> Result<Arc<BucketSnapshotKey>> {
-        if bucket_id >= self.global_snapshot.total_buckets {
+        if bucket_id as usize >= bucket_slots_for_total(self.global_snapshot.total_buckets) {
             return Err(Error::IoError(format!(
                 "Bucket {} outside total buckets {}",
                 bucket_id, self.global_snapshot.total_buckets
@@ -323,7 +329,7 @@ fn read_manifest_pointer(
 fn build_bucket_map(
     manifest: &GlobalSnapshotManifest,
 ) -> Result<Vec<Option<Arc<BucketSnapshotKey>>>> {
-    let mut mapping = vec![None; manifest.total_buckets as usize];
+    let mut mapping = vec![None; bucket_slots_for_total(manifest.total_buckets)];
     for snapshot in &manifest.bucket_snapshots {
         let key = Arc::new(BucketSnapshotKey {
             db_id: snapshot.db_id.clone(),
@@ -331,7 +337,11 @@ fn build_bucket_map(
         });
         for range in &snapshot.ranges {
             validate_range(range, manifest.total_buckets)?;
-            for bucket_id in range.start..range.end {
+            let Some(last_bucket) = bucket_range_last(range) else {
+                continue;
+            };
+            let mut bucket_id = *range.start();
+            loop {
                 let idx = bucket_id as usize;
                 if mapping[idx].is_some() {
                     return Err(Error::IoError(format!(
@@ -340,14 +350,18 @@ fn build_bucket_map(
                     )));
                 }
                 mapping[idx] = Some(Arc::clone(&key));
+                if bucket_id == last_bucket {
+                    break;
+                }
+                bucket_id = bucket_id.saturating_add(1);
             }
         }
     }
     Ok(mapping)
 }
 
-fn validate_range(range: &Range<u16>, total_buckets: u16) -> Result<()> {
-    if range.start >= range.end || range.end > total_buckets {
+fn validate_range(range: &RangeInclusive<u16>, total_buckets: u32) -> Result<()> {
+    if !bucket_range_fits_total(range, total_buckets) {
         return Err(Error::IoError(format!(
             "Invalid range {:?} for total buckets {}",
             range, total_buckets
@@ -407,7 +421,7 @@ mod tests {
         schema_writer.close().unwrap();
         let mut writer = fs.open_write(&manifest_path).unwrap();
         let manifest = format!(
-            "{{\"id\":{},\"seq_id\":0,\"latest_schema_id\":0,\"bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"tree_levels\":[[]],\"vlog_files\":[],\"active_memtable_data\":[]}}",
+            "{{\"id\":{},\"seq_id\":0,\"latest_schema_id\":0,\"bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"lsm_tree_bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"tree_levels\":[[]],\"vlog_files\":[],\"active_memtable_data\":[]}}",
             snapshot_id
         );
         writer.write(manifest.as_bytes()).unwrap();
@@ -455,13 +469,13 @@ mod tests {
                 4,
                 vec![
                     BucketSnapshotInput {
-                        ranges: vec![0u16..2u16],
+                        ranges: vec![0u16..=1u16],
                         db_id: db_a.clone(),
                         snapshot_id: snap_a,
                         manifest_path: path_a,
                     },
                     BucketSnapshotInput {
-                        ranges: vec![2u16..4u16],
+                        ranges: vec![2u16..=3u16],
                         db_id: db_b.clone(),
                         snapshot_id: snap_b,
                         manifest_path: path_b,
@@ -474,6 +488,7 @@ mod tests {
 
         let mut proxy = ReadProxy::open_current(ReadProxyConfig {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            total_buckets: 4,
             ..ReadProxyConfig::default()
         })
         .unwrap();
@@ -502,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(file)]
+    // #[serial_test::serial(file)]
     fn test_read_proxy_refreshes_on_pointer_change() {
         let root = "/tmp/read_proxy_refresh";
         cleanup_root(root);
@@ -525,7 +540,7 @@ mod tests {
             .take_global_snapshot(
                 4,
                 vec![BucketSnapshotInput {
-                    ranges: vec![0u16..4u16],
+                    ranges: vec![0u16..=3u16],
                     db_id: db_a.clone(),
                     snapshot_id: snap_a,
                     manifest_path: path_a,
@@ -537,6 +552,7 @@ mod tests {
 
         let mut proxy = ReadProxy::open_current(ReadProxyConfig {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            total_buckets: 4,
             ..ReadProxyConfig::default()
         })
         .unwrap();
@@ -551,7 +567,7 @@ mod tests {
             .take_global_snapshot(
                 4,
                 vec![BucketSnapshotInput {
-                    ranges: vec![0u16..4u16],
+                    ranges: vec![0u16..=3u16],
                     db_id: db_b.clone(),
                     snapshot_id: snap_b,
                     manifest_path: path_b,

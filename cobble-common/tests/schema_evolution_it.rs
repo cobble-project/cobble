@@ -88,7 +88,8 @@ fn open_configured_db(root: &str) -> Db {
         ..Config::default()
     };
     let total_buckets = config.total_buckets;
-    Db::open(config, std::iter::once(0u16..total_buckets).collect()).unwrap()
+    let full_range = 0u16..=u16::try_from(total_buckets - 1).expect("total_buckets must fit u16");
+    Db::open(config, std::iter::once(full_range).collect()).unwrap()
 }
 
 fn setup_large_schema_evolution_dataset(root: &str) -> Db {

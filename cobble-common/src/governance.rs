@@ -1,10 +1,11 @@
 //! Governance manifest management for distributed bucket ownership.
 //! This module provides structures and functions to manage governance manifests.
 use crate::Config;
+use crate::db_state::{bucket_range_fits_total, bucket_range_last};
 use crate::error::{Error, Result};
 use crate::file::{File, FileSystem, SequentialWriteFile};
 use serde::{Deserialize, Serialize};
-use std::ops::Range;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -16,13 +17,13 @@ use crate::paths::{
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GovernanceEntry {
     pub(crate) db_id: String,
-    pub(crate) ranges: Vec<Range<u16>>,
+    pub(crate) ranges: Vec<RangeInclusive<u16>>,
 }
 
 /// Snapshot of bucket ownership for distributed governance.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GovernanceManifest {
-    pub(crate) total_buckets: u16,
+    pub(crate) total_buckets: u32,
     pub(crate) assignments: Vec<GovernanceEntry>,
 }
 
@@ -139,8 +140,8 @@ impl GovernanceManager {
     pub(crate) fn insert_and_publish(
         &self,
         id: &String,
-        ranges: Vec<Range<u16>>,
-        total_buckets: u16,
+        ranges: Vec<RangeInclusive<u16>>,
+        total_buckets: u32,
     ) -> Result<String> {
         let _guard = self.lock_provider.lock()?;
         let mut current_manifest = self.load_current()?.unwrap_or_else(|| GovernanceManifest {
@@ -155,7 +156,7 @@ impl GovernanceManager {
         }
         // Validate ranges
         for range in &ranges {
-            if range.start >= range.end || range.end > total_buckets {
+            if !bucket_range_fits_total(range, total_buckets) {
                 return Err(Error::IoError(format!(
                     "Invalid range {:?} for total buckets {}",
                     range, total_buckets
@@ -169,8 +170,19 @@ impl GovernanceManager {
             }
             for existing_range in &entry.ranges {
                 for new_range in &ranges {
-                    if new_range.start < existing_range.end && existing_range.start < new_range.end
-                    {
+                    let existing_last = bucket_range_last(existing_range).ok_or_else(|| {
+                        Error::IoError(format!(
+                            "Invalid range {:?} for total buckets {}",
+                            existing_range, total_buckets
+                        ))
+                    })?;
+                    let new_last = bucket_range_last(new_range).ok_or_else(|| {
+                        Error::IoError(format!(
+                            "Invalid range {:?} for total buckets {}",
+                            new_range, total_buckets
+                        ))
+                    })?;
+                    if !(new_last < *existing_range.start() || existing_last < *new_range.start()) {
                         return Err(Error::IoError(format!(
                             "Range {:?} overlaps with existing range {:?} for db_id {}",
                             new_range, existing_range, entry.db_id
@@ -250,7 +262,7 @@ mod tests {
         let manager = make_manager(root);
         let id = "db-a".to_string();
         manager
-            .insert_and_publish(&id, vec![0u16..5u16, 10u16..12u16], 12)
+            .insert_and_publish(&id, vec![0u16..=4u16, 10u16..=11u16], 12)
             .unwrap();
         cleanup_root(root);
     }
@@ -263,10 +275,10 @@ mod tests {
         let id_a = "db-a".to_string();
         let id_b = "db-b".to_string();
         manager
-            .insert_and_publish(&id_a, vec![0u16..5u16], 10)
+            .insert_and_publish(&id_a, vec![0u16..=4u16], 10)
             .unwrap();
         let err = manager
-            .insert_and_publish(&id_b, vec![4u16..6u16], 10)
+            .insert_and_publish(&id_b, vec![4u16..=5u16], 10)
             .unwrap_err();
         assert!(matches!(err, Error::IoError(_)));
         cleanup_root(root);
@@ -279,10 +291,10 @@ mod tests {
         let manager = make_manager(root);
         let id = "db-a".to_string();
         manager
-            .insert_and_publish(&id, vec![0u16..5u16], 10)
+            .insert_and_publish(&id, vec![0u16..=4u16], 10)
             .unwrap();
         let err = manager
-            .insert_and_publish(&id, vec![0u16..5u16], 12)
+            .insert_and_publish(&id, vec![0u16..=4u16], 12)
             .unwrap_err();
         assert!(matches!(err, Error::IoError(_)));
         cleanup_root(root);

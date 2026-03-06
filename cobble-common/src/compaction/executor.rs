@@ -11,7 +11,8 @@ use crate::error::Result;
 use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{
-    DeduplicatingIterator, KvIterator, MergingIterator, SchemaEvolvingIterator, SortedRun,
+    BucketFilterIterator, DeduplicatingIterator, KvIterator, MergingIterator,
+    SchemaEvolvingIterator, SortedRun,
 };
 use crate::lsm::{LevelEdit, VersionEdit};
 use crate::schema::SchemaManager;
@@ -307,12 +308,20 @@ impl CompactionExecutor {
                 };
                 let iter =
                     crate::sst::SSTIterator::with_cache_and_file(reader, file, sst_options, None)?;
+                let base_iter: Box<dyn for<'a> KvIterator<'a>> = if file.needs_bucket_filter() {
+                    Box::new(BucketFilterIterator::new(
+                        iter,
+                        file.effective_bucket_range.clone(),
+                    ))
+                } else {
+                    Box::new(iter)
+                };
                 let iter: Box<dyn for<'a> KvIterator<'a>> =
                     if file.schema_id == target_schema.version() {
-                        Box::new(iter)
+                        base_iter
                     } else {
                         Box::new(SchemaEvolvingIterator::new(
-                            iter,
+                            base_iter,
                             Arc::clone(&source_schema),
                             Arc::clone(&target_schema),
                             Arc::clone(&schema_manager),
@@ -385,6 +394,7 @@ impl CompactionExecutor {
                     let file_id = current_file_id.take().unwrap();
                     let builder = current_builder.take().unwrap();
                     let (first_key, last_key, file_size, footer_bytes) = builder.finish()?;
+                    let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
                     trace!(
                         "compaction output file level={} file_id={} size={}",
                         task.output_level, file_id, file_size
@@ -399,6 +409,8 @@ impl CompactionExecutor {
                         seq: max_seq,
                         schema_id: target_schema.version(),
                         size: file_size,
+                        bucket_range: bucket_range.clone(),
+                        effective_bucket_range: bucket_range,
                         has_separated_values: merge_collector
                             .as_ref()
                             .is_some_and(|collector| collector.borrow().has_separated_values()),
@@ -425,6 +437,7 @@ impl CompactionExecutor {
         {
             let file_id = current_file_id.take().unwrap();
             let (first_key, last_key, file_size, footer_bytes) = builder.finish()?;
+            let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
             trace!(
                 "compaction output file level={} file_id={} size={}",
                 task.output_level, file_id, file_size
@@ -439,6 +452,8 @@ impl CompactionExecutor {
                 seq: max_seq,
                 schema_id: target_schema.version(),
                 size: file_size,
+                bucket_range: bucket_range.clone(),
+                effective_bucket_range: bucket_range,
                 has_separated_values: merge_collector
                     .as_ref()
                     .is_some_and(|collector| collector.borrow().has_separated_values()),
@@ -564,6 +579,7 @@ mod tests {
         }
 
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
+        let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
 
         let data_file = DataFile {
             file_type: DataFileType::SSTable,
@@ -574,6 +590,8 @@ mod tests {
             seq: 0,
             schema_id: 0,
             size: file_size,
+            bucket_range: bucket_range.clone(),
+            effective_bucket_range: bucket_range,
             has_separated_values: true,
             meta_bytes: Default::default(),
         };
@@ -1143,6 +1161,7 @@ mod tests {
             writer.add(key, value).unwrap();
         }
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range().unwrap();
+        let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
 
         let file = DataFile {
             file_type: DataFileType::SSTable,
@@ -1153,6 +1172,8 @@ mod tests {
             seq: 0,
             schema_id: 0,
             size: file_size,
+            bucket_range: bucket_range.clone(),
+            effective_bucket_range: bucket_range,
             has_separated_values: false,
             meta_bytes: Default::default(),
         };

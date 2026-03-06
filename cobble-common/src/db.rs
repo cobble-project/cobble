@@ -22,12 +22,12 @@ use crate::{Config, ReadOptions, ScanOptions, TimeProvider};
 use bytes::{Bytes, BytesMut};
 use log::info;
 use std::collections::HashMap;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
+use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, bucket_range_fits_total};
 use crate::governance::{GovernanceManager, create_manifest_lock_provider};
 use crate::metrics_registry;
 use crate::read_only_db::ReadOnlyDb;
@@ -37,7 +37,7 @@ use crate::util::init_logging;
 /// Public database interface.
 pub struct Db {
     id: String,
-    bucket_ranges: Vec<Range<u16>>,
+    bucket_ranges: Vec<RangeInclusive<u16>>,
     file_manager: Arc<FileManager>,
     lsm_tree: Arc<LSMTree>,
     memtable_manager: MemtableManager,
@@ -100,6 +100,7 @@ fn load_manifest_entry(
                 resolved.latest_schema_id = incremental.latest_schema_id;
                 resolved.active_memtable_data = incremental.active_memtable_data;
                 resolved.bucket_ranges = incremental.bucket_ranges;
+                resolved.lsm_tree_bucket_ranges = incremental.lsm_tree_bucket_ranges;
                 resolved
             } else {
                 load_manifest_for_snapshot(file_manager, snapshot_id)?
@@ -204,10 +205,10 @@ where
 
 impl Db {
     /// Open a database with the provided configuration.
-    pub fn open(config: Config, bucket_ranges: Vec<Range<u16>>) -> Result<Self> {
-        if config.total_buckets == 0 {
+    pub fn open(config: Config, bucket_ranges: Vec<RangeInclusive<u16>>) -> Result<Self> {
+        if config.total_buckets == 0 || config.total_buckets > (u16::MAX as u32) + 1 {
             return Err(Error::ConfigError(
-                "total_buckets must be greater than 0".to_string(),
+                "total_buckets must be in range 1..=65536".to_string(),
             ));
         }
         if bucket_ranges.is_empty() {
@@ -216,10 +217,12 @@ impl Db {
             ));
         }
         for range in &bucket_ranges {
-            if range.start >= range.end || range.end > config.total_buckets {
+            if !bucket_range_fits_total(range, config.total_buckets) {
                 return Err(Error::ConfigError(format!(
-                    "Invalid bucket range {}..{} for total_buckets {}",
-                    range.start, range.end, config.total_buckets
+                    "Invalid bucket range {}..={} for total_buckets {}",
+                    range.start(),
+                    range.end(),
+                    config.total_buckets
                 )));
             }
         }
@@ -524,11 +527,16 @@ impl Db {
             )));
         }
         let bucket_ranges = manifest.bucket_ranges.clone();
+        let lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
+            manifest.bucket_ranges.clone()
+        } else {
+            manifest.lsm_tree_bucket_ranges.clone()
+        };
         let active_memtable_data = manifest.active_memtable_data.clone();
         let tree_versions = build_tree_versions_from_manifest(&file_manager, manifest, true)?;
         let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
             config.total_buckets,
-            &bucket_ranges,
+            &lsm_tree_bucket_ranges,
             tree_versions.into_iter().map(Arc::new).collect(),
         )?;
 
@@ -598,6 +606,11 @@ impl Db {
             )));
         }
         let bucket_ranges = manifest.bucket_ranges.clone();
+        let lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
+            manifest.bucket_ranges.clone()
+        } else {
+            manifest.lsm_tree_bucket_ranges.clone()
+        };
         let active_memtable_data = manifest.active_memtable_data.clone();
         let schema_manager = Arc::new(SchemaManager::from_manifests(
             &file_manager,
@@ -616,7 +629,7 @@ impl Db {
         let tree_versions = build_tree_versions_from_manifest(&file_manager, manifest, false)?;
         let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
             config.total_buckets,
-            &bucket_ranges,
+            &lsm_tree_bucket_ranges,
             tree_versions.into_iter().map(Arc::new).collect(),
         )?;
         let db_state = Arc::new(DbStateHandle::new());
@@ -651,7 +664,7 @@ impl Db {
         file_manager: Arc<FileManager>,
         db_state: Arc<DbStateHandle>,
         id: String,
-        bucket_ranges: Vec<Range<u16>>,
+        bucket_ranges: Vec<RangeInclusive<u16>>,
         initial_file_seq: u64,
         metrics_manager: Arc<MetricsManager>,
         schema_manager: Arc<SchemaManager>,
@@ -975,6 +988,7 @@ impl Drop for Db {
 mod tests {
     use super::*;
     use crate::MergeOperator;
+    use crate::db_state::full_bucket_range;
     use crate::{
         ReadOptions, ScanOptions, U32CounterMergeOperator, U64CounterMergeOperator,
         VolumeDescriptor,
@@ -999,7 +1013,11 @@ mod tests {
 
     fn open_db(config: Config) -> Db {
         let total_buckets = config.total_buckets;
-        Db::open(config, std::iter::once(0u16..total_buckets).collect()).unwrap()
+        Db::open(
+            config,
+            std::iter::once(full_bucket_range(total_buckets)).collect(),
+        )
+        .unwrap()
     }
 
     fn decode_u32_counter(bytes: &[u8]) -> u32 {

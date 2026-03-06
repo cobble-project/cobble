@@ -80,7 +80,8 @@ fn active_snapshot_segments_from_manifest(
 
 fn open_db(config: Config) -> Db {
     let total_buckets = config.total_buckets;
-    Db::open(config, std::iter::once(0u16..total_buckets).collect()).unwrap()
+    let full_range = 0u16..=u16::try_from(total_buckets - 1).expect("total_buckets must fit u16");
+    Db::open(config, std::iter::once(full_range).collect()).unwrap()
 }
 
 #[test]
@@ -712,6 +713,7 @@ fn test_db_snapshot_creates_manifest() {
     assert!(manifest.contains("\"id\":"));
     assert!(manifest.contains("\"seq_id\":"));
     assert!(manifest.contains("\"tree_levels\""));
+    assert!(manifest.contains("\"lsm_tree_bucket_ranges\""));
     assert!(manifest.contains("\"path\":\""));
 
     cleanup_test_root(root);
@@ -1149,7 +1151,7 @@ fn test_db_resume_takes_over_snapshot_lifecycle() {
     let resume_config = config;
     let writable = Db::resume(resume_config, db.id().to_string()).unwrap();
     let bucket_snapshot = writable.bucket_snapshot_input(snapshot_id).unwrap();
-    assert_eq!(bucket_snapshot.ranges, vec![0u16..8u16]);
+    assert_eq!(bucket_snapshot.ranges, vec![0u16..=7u16]);
 
     let manifest_path = format!(
         "{}/{}",
@@ -1177,7 +1179,7 @@ fn test_db_multi_lsm_snapshot_restore_and_resume() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let ranges = vec![0u16..2u16, 2u16..4u16];
+    let ranges = vec![0u16..=1u16, 2u16..=3u16];
     let db = Db::open(config.clone(), ranges.clone()).unwrap();
     db.put(0, b"k-left", 0, b"v-left").unwrap();
     db.put(3, b"k-right", 0, b"v-right").unwrap();
@@ -1194,6 +1196,13 @@ fn test_db_multi_lsm_snapshot_restore_and_resume() {
     assert_eq!(
         manifest_json
             .get("tree_levels")
+            .and_then(|v| v.as_array())
+            .map_or(0, |v| v.len()),
+        2
+    );
+    assert_eq!(
+        manifest_json
+            .get("lsm_tree_bucket_ranges")
             .and_then(|v| v.as_array())
             .map_or(0, |v| v.len()),
         2

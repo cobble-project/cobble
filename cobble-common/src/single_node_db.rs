@@ -1,4 +1,5 @@
 use crate::coordinator::{CoordinatorConfig, DbCoordinator};
+use crate::db_state::full_bucket_range;
 use crate::error::{Error, Result};
 use crate::{Config, Db, ReadOptions, WriteBatch};
 use bytes::Bytes;
@@ -10,20 +11,20 @@ use std::sync::Arc;
 pub struct SingleNodeDb {
     db: Arc<Db>,
     coordinator: Arc<DbCoordinator>,
-    total_buckets: u16,
+    total_buckets: u32,
 }
 
 impl SingleNodeDb {
     pub fn open(config: Config) -> Result<Self> {
         let total_buckets = config.total_buckets;
-        if total_buckets == 0 {
+        if total_buckets == 0 || total_buckets > (u16::MAX as u32) + 1 {
             return Err(Error::ConfigError(
-                "total_buckets must be greater than 0".to_string(),
+                "total_buckets must be in range 1..=65536".to_string(),
             ));
         }
         let db = Arc::new(Db::open(
             config.clone(),
-            std::iter::once(0u16..total_buckets).collect(),
+            std::iter::once(full_bucket_range(total_buckets)).collect(),
         )?);
         let coordinator = Arc::new(DbCoordinator::open(CoordinatorConfig::from_config(
             &config,
@@ -160,7 +161,7 @@ fn materialize_global_snapshot(
     coordinator: &Arc<DbCoordinator>,
     db: &Arc<Db>,
     snapshot_id: u64,
-    total_buckets: u16,
+    total_buckets: u32,
     global_snapshot_id: u64,
 ) -> Result<u64> {
     // materialize global snapshot from bucket snapshot

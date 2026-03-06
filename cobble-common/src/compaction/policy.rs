@@ -24,6 +24,7 @@ pub(crate) struct CompactionConfig {
     pub(crate) bloom_bits_per_key: u32,
     pub(crate) partitioned_index: bool,
     pub(crate) max_threads: usize,
+    pub(crate) split_trigger_level: Option<u8>,
 }
 
 impl Default for CompactionConfig {
@@ -44,6 +45,7 @@ impl Default for CompactionConfig {
             bloom_bits_per_key: 10,
             partitioned_index: false,
             max_threads: 4,
+            split_trigger_level: None,
         }
     }
 }
@@ -511,7 +513,7 @@ fn file_overlap(left: &DataFile, right: &DataFile) -> bool {
     true
 }
 
-fn level_threshold(base: usize, multiplier: usize, level: u8) -> usize {
+pub fn level_threshold(base: usize, multiplier: usize, level: u8) -> usize {
     if level <= 1 {
         base
     } else {
@@ -534,6 +536,7 @@ mod tests {
     use crate::file::TrackedFileId;
 
     fn make_file(id: FileId, start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
+        let bucket_range = DataFile::bucket_range_from_keys(start, end);
         Arc::new(DataFile {
             file_type: DataFileType::SSTable,
             start_key: start.to_vec(),
@@ -543,6 +546,8 @@ mod tests {
             seq: 0,
             schema_id: 0,
             size,
+            bucket_range: bucket_range.clone(),
+            effective_bucket_range: bucket_range,
             has_separated_values: false,
             meta_bytes: Default::default(),
         })

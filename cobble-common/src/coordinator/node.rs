@@ -9,14 +9,14 @@ use crate::paths::{
     snapshot_manifest_name,
 };
 use serde::{Deserialize, Serialize};
-use std::ops::Range;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bucket snapshot reference input.
 #[derive(Clone, Debug)]
 pub struct BucketSnapshotInput {
-    pub ranges: Vec<Range<u16>>,
+    pub ranges: Vec<RangeInclusive<u16>>,
     pub db_id: String,
     pub snapshot_id: u64,
     pub manifest_path: String,
@@ -25,7 +25,7 @@ pub struct BucketSnapshotInput {
 /// Bucket snapshot reference stored in a global manifest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BucketSnapshotRef {
-    pub ranges: Vec<Range<u16>>,
+    pub ranges: Vec<RangeInclusive<u16>>,
     pub db_id: String,
     pub snapshot_id: u64,
     pub manifest_path: String,
@@ -35,7 +35,7 @@ pub struct BucketSnapshotRef {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GlobalSnapshotManifest {
     pub id: u64,
-    pub total_buckets: u16,
+    pub total_buckets: u32,
     pub bucket_snapshots: Vec<BucketSnapshotRef>,
 }
 
@@ -80,7 +80,7 @@ impl DbCoordinator {
     /// Create a new global snapshot description from bucket-level snapshots.
     pub fn take_global_snapshot(
         &self,
-        total_buckets: u16,
+        total_buckets: u32,
         bucket_snapshots: Vec<BucketSnapshotInput>,
     ) -> Result<GlobalSnapshotManifest> {
         let id = self.allocate_snapshot_id();
@@ -89,7 +89,7 @@ impl DbCoordinator {
 
     pub fn take_global_snapshot_with_id(
         &self,
-        total_buckets: u16,
+        total_buckets: u32,
         bucket_snapshots: Vec<BucketSnapshotInput>,
         id: u64,
     ) -> Result<GlobalSnapshotManifest> {
@@ -101,7 +101,7 @@ impl DbCoordinator {
     }
 
     fn build_global_snapshot(
-        total_buckets: u16,
+        total_buckets: u32,
         bucket_snapshots: Vec<BucketSnapshotInput>,
         id: u64,
     ) -> Result<GlobalSnapshotManifest> {
@@ -265,13 +265,13 @@ mod tests {
                 4,
                 vec![
                     BucketSnapshotInput {
-                        ranges: vec![0u16..2u16],
+                        ranges: vec![0u16..=1u16],
                         db_id: "db-a".to_string(),
                         snapshot_id: 1,
                         manifest_path: path_a.clone(),
                     },
                     BucketSnapshotInput {
-                        ranges: vec![2u16..4u16],
+                        ranges: vec![2u16..=3u16],
                         db_id: "db-b".to_string(),
                         snapshot_id: 2,
                         manifest_path: path_b.clone(),

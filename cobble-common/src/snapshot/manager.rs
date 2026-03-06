@@ -14,14 +14,14 @@ use crate::paths::schema_file_relative_path;
 use crate::schema::SchemaManager;
 use crate::vlog::VlogVersion;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ops::Range;
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 pub(crate) struct SnapshotManager {
     file_manager: Arc<FileManager>,
     schema_manager: Arc<SchemaManager>,
-    bucket_ranges: Vec<Range<u16>>,
+    bucket_ranges: Vec<RangeInclusive<u16>>,
     state: Arc<Mutex<SnapshotManagerState>>,
     retention: Option<usize>,
     /// Background worker for manifest materialization.
@@ -66,7 +66,7 @@ impl SnapshotManager {
         file_manager: Arc<FileManager>,
         schema_manager: Arc<SchemaManager>,
         retention: Option<usize>,
-        bucket_ranges: Vec<Range<u16>>,
+        bucket_ranges: Vec<RangeInclusive<u16>>,
     ) -> Self {
         Self {
             file_manager,
@@ -142,6 +142,10 @@ impl SnapshotManager {
             return false;
         };
         let mut snapshot = (*snapshot).clone();
+        snapshot.lsm_tree_bucket_ranges = db_state.multi_lsm_version.bucket_ranges();
+        if snapshot.lsm_tree_bucket_ranges.is_empty() {
+            snapshot.lsm_tree_bucket_ranges = snapshot.bucket_ranges.clone();
+        }
         snapshot.lsm_versions = (0..db_state.multi_lsm_version.tree_count())
             .map(|tree_idx| {
                 clone_lsm_tree_version_untracked(
@@ -253,6 +257,7 @@ impl SnapshotManager {
             latest_schema_id: manifest.latest_schema_id,
             referenced_schema_ids,
             active_memtable_data: manifest.active_memtable_data.clone(),
+            lsm_tree_bucket_ranges: manifest.lsm_tree_bucket_ranges.clone(),
             bucket_ranges: manifest.bucket_ranges.clone(),
             finished: true,
             callback: None,
@@ -630,6 +635,8 @@ fn clone_lsm_tree_version_untracked(version: &LSMTreeVersion) -> LSMTreeVersion 
                             seq: file.seq,
                             schema_id: file.schema_id,
                             size: file.size,
+                            bucket_range: file.bucket_range.clone(),
+                            effective_bucket_range: file.effective_bucket_range.clone(),
                             has_separated_values: file.has_separated_values,
                             meta_bytes: Default::default(),
                         };
