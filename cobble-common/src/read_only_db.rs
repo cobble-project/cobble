@@ -1,6 +1,7 @@
 use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
+use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::FileManager;
 use crate::lsm::LSMTree;
@@ -121,6 +122,7 @@ impl ReadOnlyDb {
         let mut lsm_tree = LSMTree::with_state_and_ttl(
             Arc::clone(&db_state),
             Arc::clone(&ttl_provider),
+            Arc::new(DbLifecycle::new_open()),
             Arc::clone(&metrics_manager),
         );
         if let Some(block_cache) = block_cache {

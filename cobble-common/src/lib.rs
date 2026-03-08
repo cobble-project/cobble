@@ -9,6 +9,7 @@ mod data_file;
 mod db;
 mod db_iter;
 mod db_state;
+mod db_status;
 mod error;
 mod file;
 mod format;

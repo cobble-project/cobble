@@ -1,4 +1,5 @@
 use crate::db_iter::{DbIterator, DbIteratorOptions};
+use crate::db_status::{CloseTransition, DbLifecycle};
 use crate::error::{Error, Result};
 use crate::file::{FileManager, FileSystemRegistry};
 use crate::lsm::LSMTree;
@@ -39,6 +40,7 @@ mod rescale;
 /// Public database interface.
 pub struct Db {
     id: String,
+    db_lifecycle: Arc<DbLifecycle>,
     db_state: Arc<DbStateHandle>,
     config: Config,
     file_manager: Arc<FileManager>,
@@ -163,6 +165,28 @@ where
 }
 
 impl Db {
+    #[inline]
+    fn ensure_open(&self) -> Result<()> {
+        self.db_lifecycle.ensure_open()
+    }
+
+    fn should_mark_error_on_read(err: &Error) -> bool {
+        let message = match err {
+            Error::IoError(msg) | Error::FileSystemError(msg) => msg,
+            _ => return false,
+        }
+        .to_ascii_lowercase();
+        message.contains("not found")
+            || message.contains("no such file")
+            || message.contains("does not exist")
+    }
+
+    fn maybe_mark_error_on_read(&self, err: &Error) {
+        if Self::should_mark_error_on_read(err) {
+            self.db_lifecycle.mark_error(err.clone());
+        }
+    }
+
     /// Open a database with the provided configuration.
     pub fn open(config: Config, bucket_ranges: Vec<RangeInclusive<u16>>) -> Result<Self> {
         if config.total_buckets == 0 || config.total_buckets > (u16::MAX as u32) + 1 {
@@ -213,10 +237,12 @@ impl Db {
         let file_manager = Arc::new(file_manager);
         let db_state = Arc::new(DbStateHandle::new());
         let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
+        let db_lifecycle = Arc::new(DbLifecycle::new_initializing());
         let db = Self::open_with_state(
             config,
             file_manager,
             db_state,
+            Arc::clone(&db_lifecycle),
             id,
             bucket_ranges,
             0,
@@ -224,6 +250,7 @@ impl Db {
             schema_manager,
         )?;
         db.memtable_manager.open()?;
+        db.db_lifecycle.mark_open()?;
         Ok(db)
     }
 
@@ -255,6 +282,7 @@ impl Db {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
+        self.ensure_open()?;
         let num_columns = self.schema_manager.current_num_columns();
         let column_idx = column as usize;
         if column_idx >= num_columns {
@@ -332,6 +360,7 @@ impl Db {
 
     /// Write a batch of operations to the database.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.ensure_open()?;
         let mut pending: std::collections::BTreeMap<(u16, Bytes), Value> =
             std::collections::BTreeMap::new();
         let schema = self.schema_manager.latest_schema();
@@ -392,18 +421,24 @@ impl Db {
 
     /// Close the database and flush pending state.
     pub fn close(&self) -> Result<()> {
+        match self.db_lifecycle.begin_close()? {
+            CloseTransition::AlreadyClosingOrClosed => return Ok(()),
+            CloseTransition::Transitioned => {}
+        }
         self.memtable_manager.close()?;
         let _ = self
             .snapshot_manager
             .wait_for_materialization(Duration::from_secs(30));
         self.lsm_tree.shutdown_compaction();
         self.snapshot_manager.close()?;
+        self.db_lifecycle.mark_closed();
         Ok(())
     }
 
     /// Flush the active memtable and capture an LSM snapshot with a manifest.
     /// The manifest is materialized asynchronously after the flush completes.
     pub fn snapshot(&self) -> Result<u64> {
+        self.ensure_open()?;
         let db_snapshot = self.snapshot_manager.create_snapshot(None);
         self.memtable_manager
             .flush_snapshot(db_snapshot.id, self.snapshot_manager.clone())?;
@@ -414,6 +449,7 @@ impl Db {
     where
         F: Fn(Result<u64>) + Send + Sync + 'static,
     {
+        self.ensure_open()?;
         let callback: SnapshotCallback = Arc::new(callback);
         let snapshot = self.snapshot_manager.create_snapshot(Some(callback));
         self.memtable_manager
@@ -423,11 +459,15 @@ impl Db {
 
     /// Expire a snapshot and release its file references.
     pub fn expire_snapshot(&self, snapshot_id: u64) -> Result<bool> {
+        self.ensure_open()?;
         self.snapshot_manager.expire_snapshot(snapshot_id)
     }
 
     /// Retain a snapshot to avoid auto-expiration.
     pub fn retain_snapshot(&self, snapshot_id: u64) -> bool {
+        if self.ensure_open().is_err() {
+            return false;
+        }
         self.snapshot_manager.retain_snapshot(snapshot_id)
     }
 
@@ -436,6 +476,7 @@ impl Db {
         &self,
         snapshot_id: u64,
     ) -> Result<crate::coordinator::BucketSnapshotInput> {
+        self.ensure_open()?;
         let manifest_name = snapshot_manifest_name(snapshot_id);
         let manifest_path = self
             .file_manager
@@ -501,6 +542,7 @@ impl Db {
         )?;
 
         let db_state = Arc::new(DbStateHandle::new());
+        let db_lifecycle = Arc::new(DbLifecycle::new_initializing());
         db_state.store(crate::db_state::DbState {
             seq_id: restored_seq_id,
             bucket_ranges: bucket_ranges.clone(),
@@ -514,6 +556,7 @@ impl Db {
             config,
             file_manager,
             db_state,
+            Arc::clone(&db_lifecycle),
             db_id,
             bucket_ranges,
             max_vlog_file_seq.saturating_add(1).min(u32::MAX as u64) as u32,
@@ -522,6 +565,7 @@ impl Db {
         )?;
         db.restore_active_memtable_snapshot_to_l0(&active_memtable_data)?;
         db.memtable_manager.open()?;
+        db.db_lifecycle.mark_open()?;
         Ok(db)
     }
 
@@ -587,6 +631,7 @@ impl Db {
             tree_versions.into_iter().map(Arc::new).collect(),
         )?;
         let db_state = Arc::new(DbStateHandle::new());
+        let db_lifecycle = Arc::new(DbLifecycle::new_initializing());
         db_state.store(crate::db_state::DbState {
             seq_id: restored_seq_id,
             bucket_ranges: bucket_ranges.clone(),
@@ -600,6 +645,7 @@ impl Db {
             config,
             file_manager,
             db_state,
+            Arc::clone(&db_lifecycle),
             db_id,
             bucket_ranges,
             max_vlog_file_seq.saturating_add(1).min(u32::MAX as u64) as u32,
@@ -610,6 +656,7 @@ impl Db {
         db.take_over_snapshot_chain(&loaded)?;
         db.restore_active_memtable_snapshot_to_l0(&active_memtable_data)?;
         db.memtable_manager.open()?;
+        db.db_lifecycle.mark_open()?;
         Ok(db)
     }
 
@@ -618,6 +665,7 @@ impl Db {
         config: Config,
         file_manager: Arc<FileManager>,
         db_state: Arc<DbStateHandle>,
+        db_lifecycle: Arc<DbLifecycle>,
         id: String,
         bucket_ranges: Vec<RangeInclusive<u16>>,
         initial_vlog_file_seq: u32,
@@ -634,6 +682,7 @@ impl Db {
         let mut lsm_tree = LSMTree::with_state_and_ttl(
             Arc::clone(&db_state),
             Arc::clone(&ttl_provider),
+            Arc::clone(&db_lifecycle),
             Arc::clone(&metrics_manager),
         );
         if config.block_cache_size > 0 {
@@ -667,10 +716,14 @@ impl Db {
                 )?)
             } else {
                 Arc::new(crate::compaction::LocalCompactionWorker::new(
-                    crate::compaction::CompactionExecutor::new(compaction_options)?,
+                    crate::compaction::CompactionExecutor::new(
+                        compaction_options,
+                        Arc::clone(&db_lifecycle),
+                    )?,
                     Arc::clone(&file_manager),
                     Arc::downgrade(&lsm_tree),
                     config.clone(),
+                    Arc::clone(&db_lifecycle),
                     Arc::clone(&metrics_manager),
                     Arc::clone(&schema_manager),
                 ))
@@ -714,11 +767,13 @@ impl Db {
                 vlog_store: Some(Arc::clone(&vlog_store)),
                 active_memtable_incremental_snapshot_ratio: config
                     .active_memtable_incremental_snapshot_ratio,
+                db_lifecycle: Some(Arc::clone(&db_lifecycle)),
             },
         )?;
 
         Ok(Self {
             id,
+            db_lifecycle,
             db_state,
             config,
             file_manager: Arc::clone(&file_manager),
@@ -786,6 +841,7 @@ impl Db {
         key: &[u8],
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<Bytes>>>> {
+        self.ensure_open()?;
         let schema = self.schema_manager.latest_schema();
         let num_columns = schema.num_columns();
         if let Some(max_index) = options.max_index()
@@ -866,7 +922,14 @@ impl Db {
             selected_columns,
             selected_mask,
             terminal_mask.as_deref_mut(),
-        )?;
+        );
+        let lsm_values = match lsm_values {
+            Ok(values) => values,
+            Err(err) => {
+                self.maybe_mark_error_on_read(&err);
+                return Err(err);
+            }
+        };
         for value in lsm_values {
             if should_stop {
                 break;
@@ -891,7 +954,7 @@ impl Db {
         for newer in iter {
             merged = merged.merge(newer, &schema)?;
         }
-        value_to_vec_of_columns_with_vlog(
+        let result = value_to_vec_of_columns_with_vlog(
             merged,
             |pointer| match self
                 .vlog_store
@@ -904,7 +967,14 @@ impl Db {
                     .ok_or(vlog_err),
             },
             &schema,
-        )
+        );
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                self.maybe_mark_error_on_read(&err);
+                Err(err)
+            }
+        }
     }
 
     pub fn scan<'a>(
@@ -913,6 +983,7 @@ impl Db {
         range: Range<&[u8]>,
         options: &ScanOptions,
     ) -> Result<DbIterator<'a>> {
+        self.ensure_open()?;
         let snapshot = self.db_state.load();
         let schema = self.schema_manager.latest_schema();
         let memtable_iters = self
@@ -924,7 +995,14 @@ impl Db {
             Arc::clone(&schema),
             Arc::clone(&self.schema_manager),
             options.read_ahead_bytes,
-        )?;
+        );
+        let lsm_iters = match lsm_iters {
+            Ok(iters) => iters,
+            Err(err) => {
+                self.maybe_mark_error_on_read(&err);
+                return Err(err);
+            }
+        };
         let encode_scan_key = |key: &[u8]| {
             let mut encoded = BytesMut::with_capacity(2 + key.len());
             encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded);
@@ -944,7 +1022,10 @@ impl Db {
                 schema_manager: Arc::clone(&self.schema_manager),
             },
         );
-        iter.seek(start_key.as_ref())?;
+        if let Err(err) = iter.seek(start_key.as_ref()) {
+            self.maybe_mark_error_on_read(&err);
+            return Err(err);
+        }
         Ok(iter)
     }
 
@@ -994,6 +1075,28 @@ mod tests {
             std::iter::once(full_bucket_range(total_buckets)).collect(),
         )
         .unwrap()
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_rejects_mutation_and_read_after_close() {
+        let root = "/tmp/db_state_after_close";
+        cleanup_test_root(root);
+        let config = config_with_small_memtable(root);
+        let db = open_db(config);
+        db.put(0, b"k1", 0, b"v1").unwrap();
+        db.close().unwrap();
+        db.close().unwrap();
+
+        let put_err = db.put(0, b"k2", 0, b"v2").unwrap_err();
+        assert!(matches!(put_err, Error::InvalidState(_)));
+        let get_err = db.get(0, b"k1", &ReadOptions::default()).unwrap_err();
+        assert!(matches!(get_err, Error::InvalidState(_)));
+        let snapshot_err = db.snapshot().unwrap_err();
+        assert!(matches!(snapshot_err, Error::InvalidState(_)));
+        assert!(!db.retain_snapshot(0));
+
+        cleanup_test_root(root);
     }
 
     fn decode_u32_counter(bytes: &[u8]) -> u32 {

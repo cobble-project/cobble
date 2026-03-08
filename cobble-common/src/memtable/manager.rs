@@ -6,6 +6,7 @@ use std::thread::JoinHandle;
 use crate::config::MemtableType;
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
+use crate::db_status::DbLifecycle;
 use crate::error::Error::InvalidState;
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager, TrackedFileId};
@@ -47,6 +48,7 @@ pub(crate) struct MemtableManagerOptions {
     pub(crate) vlog_store: Option<Arc<VlogStore>>,
     pub(crate) schema_manager: Option<Arc<SchemaManager>>,
     pub(crate) active_memtable_incremental_snapshot_ratio: f64,
+    pub(crate) db_lifecycle: Option<Arc<DbLifecycle>>,
 }
 
 #[derive(Clone)]
@@ -85,6 +87,7 @@ impl Default for MemtableManagerOptions {
             vlog_store: None,
             schema_manager: None,
             active_memtable_incremental_snapshot_ratio: 0.0,
+            db_lifecycle: None,
         }
     }
 }
@@ -97,6 +100,7 @@ pub(crate) struct MemtableManager {
     file_builder_factory: Arc<FileBuilderFactory>,
     lsm_tree: Arc<LSMTree>,
     db_state: Arc<DbStateHandle>,
+    db_lifecycle: Arc<DbLifecycle>,
     vlog_store: Arc<VlogStore>,
     schema_manager: Arc<SchemaManager>,
     memtable_capacity: usize,
@@ -356,6 +360,9 @@ impl MemtableManager {
         let schema_manager = options
             .schema_manager
             .unwrap_or_else(|| Arc::new(SchemaManager::new(options.num_columns)));
+        let db_lifecycle = options
+            .db_lifecycle
+            .unwrap_or_else(|| Arc::new(DbLifecycle::new_open()));
         let reclaimer = Self::make_reclaimer(
             Arc::clone(&state),
             Arc::clone(&buffer_ready),
@@ -382,6 +389,7 @@ impl MemtableManager {
             Arc::clone(&file_builder_factory),
             Arc::clone(&lsm_tree),
             lsm_tree.ttl_provider(),
+            Arc::clone(&db_lifecycle),
             Arc::clone(&vlog_store),
             metrics.clone(),
         )?;
@@ -393,6 +401,7 @@ impl MemtableManager {
             file_builder_factory,
             lsm_tree,
             db_state,
+            db_lifecycle,
             vlog_store,
             schema_manager,
             memtable_capacity: options.memtable_capacity,
@@ -444,6 +453,7 @@ impl MemtableManager {
         file_builder_factory: Arc<FileBuilderFactory>,
         lsm_tree: Arc<LSMTree>,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
+        db_lifecycle: Arc<DbLifecycle>,
         vlog_store: Arc<VlogStore>,
         metrics: MemtableManagerMetrics,
     ) -> Result<(JoinHandle<()>, mpsc::Sender<FlushJob>)> {
@@ -460,6 +470,12 @@ impl MemtableManager {
             .name("cobble-flush".to_string())
             .spawn(move || {
                 while let Ok(job) = flush_rx.recv() {
+                    if db_lifecycle.ensure_open().is_err() {
+                        let mut state = state_clone.lock().unwrap();
+                        state.in_flight = state.in_flight.saturating_sub(1);
+                        flush_done_clone.notify_all();
+                        continue;
+                    }
                     if let Some(memtable) = job.memtable {
                         trace!(
                             "memtable flush start memtable_id={}",
@@ -485,9 +501,8 @@ impl MemtableManager {
                         state.in_flight = state.in_flight.saturating_sub(1);
                         match result {
                             Ok(res) => {
-                                let memtable_id = job
-                                    .memtable_id
-                                    .expect("flush job memtable_id exists");
+                                let memtable_id =
+                                    job.memtable_id.expect("flush job memtable_id exists");
                                 debug!(
                                     "memtable flush complete memtable_id={} files={}",
                                     memtable_id,
@@ -501,18 +516,21 @@ impl MemtableManager {
                                     .sum();
                                 metrics.flush_bytes_total.increment(flushed_bytes);
                                 let vlog_edit = res.vlog_edit.clone();
-                                let snapshot = lsm_tree_clone
-                                    .add_level0_files(
-                                        memtable_id,
-                                        res.data_files_by_tree.clone(),
-                                        vlog_edit,
-                                    )
-                                    .unwrap_or_else(|err| {
-                                        panic!(
-                                            "memtable flush l0 check-in failed memtable_id={} err={}",
-                                            memtable_id, err
-                                        )
-                                    });
+                                let snapshot = match lsm_tree_clone.add_level0_files(
+                                    memtable_id,
+                                    res.data_files_by_tree.clone(),
+                                    vlog_edit,
+                                ) {
+                                    Ok(snapshot) => snapshot,
+                                    Err(err) => {
+                                        db_lifecycle.mark_error(err.clone());
+                                        state.flush_results.push(Err(err));
+                                        flush_done_clone.notify_all();
+                                        drop(state);
+                                        drop(keep_memtable_alive);
+                                        continue;
+                                    }
+                                };
                                 state.flush_results.push(Ok(res));
                                 flush_done_clone.notify_all();
                                 drop(state);
@@ -524,14 +542,9 @@ impl MemtableManager {
                                 );
                             }
                             Err(err) => {
-                                panic!(
-                                    "memtable flush failed memtable_id={} err={}",
-                                    job.memtable_id
-                                        .as_ref()
-                                        .map(Uuid::to_string)
-                                        .unwrap_or_else(|| "none".to_string()),
-                                    err
-                                );
+                                db_lifecycle.mark_error(err.clone());
+                                state.flush_results.push(Err(err));
+                                flush_done_clone.notify_all();
                             }
                         }
                         drop(keep_memtable_alive);
@@ -544,16 +557,21 @@ impl MemtableManager {
                                 &active_snapshot_job.active,
                                 &snapshot_job.manager,
                                 &file_manager_clone,
-                            )
-                            .unwrap_or_else(|err| {
-                                panic!(
-                                    "active memtable snapshot failed id={} err={}",
-                                    snapshot_job.snapshot_id, err
-                                )
-                            }),
-                            None => ActiveMemtableSnapshotWriteResult {
+                            ),
+                            None => Ok(ActiveMemtableSnapshotWriteResult {
                                 active_data: Vec::new(),
-                            },
+                            }),
+                        };
+                        let snapshot_result = match snapshot_result {
+                            Ok(result) => result,
+                            Err(err) => {
+                                db_lifecycle.mark_error(err.clone());
+                                let mut state = state_clone.lock().unwrap();
+                                state.in_flight = state.in_flight.saturating_sub(1);
+                                flush_done_clone.notify_all();
+                                drop(state);
+                                continue;
+                            }
                         };
                         let ActiveMemtableSnapshotWriteResult { active_data } = snapshot_result;
                         let mut state = state_clone.lock().unwrap();
@@ -1123,6 +1141,7 @@ impl MemtableManager {
     }
 
     fn flush_active_internal(&self, snapshot: Option<SnapshotCompletion>) -> Result<Option<Uuid>> {
+        self.db_lifecycle.ensure_open()?;
         let mut state = self.state.lock().unwrap();
         while state.restore_in_progress {
             state = self.flush_done.wait(state).unwrap();

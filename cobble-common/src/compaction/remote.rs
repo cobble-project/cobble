@@ -5,6 +5,7 @@
 use super::{CompactionExecutor, CompactionResult, CompactionTask, CompactionWorker};
 use crate::Config;
 use crate::data_file::{DataFile, DataFileType};
+use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::{DataVolume, FileId, FileManager, FileManagerOptions, TrackedFileId};
 use crate::iterator::SortedRun;
@@ -488,7 +489,11 @@ impl RemoteCompactionServer {
                 .build()
                 .map_err(|e| Error::IoError(e.to_string()))?,
         );
-        let executor = CompactionExecutor::new_with_runtime(compaction_config, runtime.clone())?;
+        let executor = CompactionExecutor::new_with_runtime(
+            compaction_config,
+            runtime.clone(),
+            Arc::new(DbLifecycle::new_open()),
+        )?;
         let data_volumes = FileManager::data_volumes_from_config(&config)?;
         let metrics_manager = Arc::new(MetricsManager::new(Uuid::new_v4().to_string()));
         let mut merge_operator_map: HashMap<String, Arc<dyn MergeOperator>> = HashMap::new();

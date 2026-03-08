@@ -7,6 +7,7 @@
 
 use crate::compaction::CompactionConfig;
 use crate::data_file::{DataFile, DataFileType};
+use crate::db_status::DbLifecycle;
 use crate::error::Result;
 use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
@@ -165,11 +166,12 @@ impl CompactionResult {
 pub struct CompactionExecutor {
     runtime: Option<Arc<Runtime>>,
     options: CompactionConfig,
+    db_lifecycle: Arc<DbLifecycle>,
 }
 
 impl CompactionExecutor {
     /// Creates a new compaction executor with the given options and its own runtime.
-    pub fn new(options: CompactionConfig) -> Result<Self> {
+    pub fn new(options: CompactionConfig, db_lifecycle: Arc<DbLifecycle>) -> Result<Self> {
         Self::new_with_runtime(
             options,
             Arc::new(
@@ -180,14 +182,20 @@ impl CompactionExecutor {
                     .build()
                     .map_err(|e| crate::error::Error::IoError(e.to_string()))?,
             ),
+            db_lifecycle,
         )
     }
 
     /// Creates a new compaction executor with the given options and thread count.
-    pub fn new_with_runtime(options: CompactionConfig, runtime: Arc<Runtime>) -> Result<Self> {
+    pub fn new_with_runtime(
+        options: CompactionConfig,
+        runtime: Arc<Runtime>,
+        db_lifecycle: Arc<DbLifecycle>,
+    ) -> Result<Self> {
         Ok(Self {
             runtime: Some(runtime),
             options,
+            db_lifecycle,
         })
     }
 
@@ -205,16 +213,17 @@ impl CompactionExecutor {
 
     /// Creates a new compaction executor with the given options without its own runtime.
     /// Use this when running in an existing tokio runtime.
-    pub fn new_without_runtime(options: CompactionConfig) -> Self {
+    pub fn new_without_runtime(options: CompactionConfig, db_lifecycle: Arc<DbLifecycle>) -> Self {
         Self {
             runtime: None,
             options,
+            db_lifecycle,
         }
     }
 
     /// Creates a new compaction executor with default options.
-    pub fn with_defaults() -> Result<Self> {
-        Self::new(CompactionConfig::default())
+    pub fn with_defaults(db_lifecycle: Arc<DbLifecycle>) -> Result<Self> {
+        Self::new(CompactionConfig::default(), db_lifecycle)
     }
 
     /// Executes a compaction task asynchronously using the executor's internal runtime.
@@ -235,17 +244,26 @@ impl CompactionExecutor {
     ) -> tokio::task::JoinHandle<Result<CompactionResult>> {
         let runtime = self.runtime.as_ref().expect("Executor has no runtime.");
         let options = self.options;
+        let db_lifecycle = Arc::clone(&self.db_lifecycle);
 
         runtime.spawn_blocking(move || {
-            let result = Self::run_compaction(task, options)?;
-            if let Some(callback) = on_complete {
-                callback(
-                    result.lsm_tree_idx,
-                    result.edit.clone(),
-                    result.vlog_edit.clone(),
-                );
+            let result = Self::run_compaction(task, options);
+            match result {
+                Ok(result) => {
+                    if let Some(callback) = on_complete {
+                        callback(
+                            result.lsm_tree_idx,
+                            result.edit.clone(),
+                            result.vlog_edit.clone(),
+                        );
+                    }
+                    Ok(result)
+                }
+                Err(err) => {
+                    db_lifecycle.mark_error(err.clone());
+                    Err(err)
+                }
             }
-            Ok(result)
         })
     }
 
@@ -255,7 +273,15 @@ impl CompactionExecutor {
         task: CompactionTask,
         on_complete: Option<CompactionCompleteCallback>,
     ) -> Result<CompactionResult> {
-        let result = Self::run_compaction(task, self.options)?;
+        let db_lifecycle = Arc::clone(&self.db_lifecycle);
+        let result = Self::run_compaction(task, self.options);
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                db_lifecycle.mark_error(err.clone());
+                return Err(err);
+            }
+        };
         if let Some(callback) = on_complete {
             callback(
                 result.lsm_tree_idx,
@@ -677,7 +703,7 @@ mod tests {
             schema_manager_for(num_columns),
         );
 
-        let executor = CompactionExecutor::new(options).unwrap();
+        let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
 
         let result = executor.execute_blocking(task, None).unwrap();
         assert_eq!(result.edit().level_edits.len(), 2);
@@ -812,7 +838,7 @@ mod tests {
             schema_manager_for(num_columns),
         );
 
-        let executor = CompactionExecutor::new(options).unwrap();
+        let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
 
         let result = executor.execute_blocking(task, None).unwrap();
         assert_eq!(result.edit().level_edits.len(), 2);
@@ -978,7 +1004,7 @@ mod tests {
             Arc::new(crate::ttl::TTLProvider::disabled()),
             schema_manager_for(num_columns),
         );
-        let executor = CompactionExecutor::new(options).unwrap();
+        let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
         let result = executor.execute_blocking(task, None).unwrap();
 
         assert_eq!(result.new_files().len(), 1);
@@ -1086,7 +1112,7 @@ mod tests {
             Arc::clone(&schema_manager),
         );
 
-        let executor = CompactionExecutor::new(options).unwrap();
+        let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
         let result = executor.execute_blocking(task, None).unwrap();
         assert_eq!(result.new_files().len(), 1);
         assert_eq!(result.new_files()[0].schema_id, target_schema.version());
@@ -1216,7 +1242,7 @@ mod tests {
             schema_manager_for(num_columns),
         );
 
-        let executor = CompactionExecutor::new(options).unwrap();
+        let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
 
         let result = executor.execute_blocking(task, None).unwrap();
         assert_eq!(result.edit().level_edits.len(), 2);
@@ -1288,7 +1314,8 @@ mod tests {
             schema_manager_for(options.num_columns),
         );
 
-        let executor = CompactionExecutor::with_defaults().unwrap();
+        let executor =
+            CompactionExecutor::with_defaults(Arc::new(DbLifecycle::new_open())).unwrap();
         let result = executor.execute_blocking(task, None).unwrap();
         assert_eq!(result.edit().level_edits.len(), 1);
         assert!(result.edit().level_edits[0].new_files.is_empty());
@@ -1347,7 +1374,8 @@ mod tests {
             Arc::new(crate::ttl::TTLProvider::disabled()),
             schema_manager_for(num_columns),
         );
-        let executor = CompactionExecutor::with_defaults().unwrap();
+        let executor =
+            CompactionExecutor::with_defaults(Arc::new(DbLifecycle::new_open())).unwrap();
         let result = executor.execute_blocking(task, None).unwrap();
         let deltas: std::collections::HashMap<u32, i64> = result
             .vlog_edit()

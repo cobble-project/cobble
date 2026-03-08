@@ -23,6 +23,7 @@ pub(crate) use remote::RemoteCompactionWorker;
 #[allow(unused_imports)]
 pub(crate) use crate::format::{FileBuilder, FileBuilderFactory};
 
+use crate::db_status::DbLifecycle;
 use crate::error::Result;
 use crate::iterator::SortedRun;
 use crate::lsm::VersionEdit;
@@ -49,6 +50,7 @@ pub(crate) struct LocalCompactionWorker {
     file_manager: Arc<crate::file::FileManager>,
     lsm_tree: Weak<crate::lsm::LSMTree>,
     config: crate::Config,
+    db_lifecycle: Arc<DbLifecycle>,
     compaction_metrics: Arc<CompactionTaskMetrics>,
     metrics_manager: Arc<MetricsManager>,
     schema_manager: Arc<SchemaManager>,
@@ -60,6 +62,7 @@ impl LocalCompactionWorker {
         file_manager: Arc<crate::file::FileManager>,
         lsm_tree: Weak<crate::lsm::LSMTree>,
         config: crate::Config,
+        db_lifecycle: Arc<DbLifecycle>,
         metrics_manager: Arc<MetricsManager>,
         schema_manager: Arc<SchemaManager>,
     ) -> Self {
@@ -69,6 +72,7 @@ impl LocalCompactionWorker {
             file_manager,
             lsm_tree,
             config,
+            db_lifecycle,
             compaction_metrics,
             metrics_manager,
             schema_manager,
@@ -99,11 +103,11 @@ impl LocalCompactionWorker {
         if sorted_runs.is_empty() {
             return None;
         }
-        let sst_metrics = self
-            .lsm_tree
-            .upgrade()
-            .map(|tree| tree.sst_metrics())
-            .unwrap_or_else(|| self.metrics_manager.sst_iterator_metrics());
+        let tree = self.lsm_tree.upgrade()?;
+        if self.db_lifecycle.ensure_open().is_err() {
+            return None;
+        }
+        let sst_metrics = tree.sst_metrics();
         let mut sst_options = build_sst_writer_options(&self.config, output_level);
         sst_options.num_columns = self.schema_manager.current_num_columns();
         sst_options.metrics = Some(

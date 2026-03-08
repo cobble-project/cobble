@@ -3,6 +3,7 @@ use crate::compaction::{
     RoundRobinPolicy, build_runs_for_plan, level_threshold,
 };
 use crate::data_file::{DataFile, intersect_bucket_ranges};
+use crate::db_status::DbLifecycle;
 use crate::error::Result;
 use crate::file::{FileManager, ReadAheadBufferedReader};
 use crate::iterator::{
@@ -44,6 +45,7 @@ pub(crate) struct LSMTreeVersion {
 
 pub(crate) struct LSMTree {
     db_state: Arc<DbStateHandle>,
+    db_lifecycle: Arc<DbLifecycle>,
     block_cache: Option<BlockCache>,
     state: Mutex<LSMTreeState>,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
@@ -108,16 +110,23 @@ impl LSMTree {
         db_state: Arc<DbStateHandle>,
         metrics_manager: Arc<MetricsManager>,
     ) -> Self {
-        Self::with_state_and_ttl(db_state, Arc::new(TTLProvider::disabled()), metrics_manager)
+        Self::with_state_and_ttl(
+            db_state,
+            Arc::new(TTLProvider::disabled()),
+            Arc::new(DbLifecycle::new_open()),
+            metrics_manager,
+        )
     }
 
     pub(crate) fn with_state_and_ttl(
         db_state: Arc<DbStateHandle>,
         ttl_provider: Arc<TTLProvider>,
+        db_lifecycle: Arc<DbLifecycle>,
         metrics_manager: Arc<MetricsManager>,
     ) -> Self {
         Self {
             db_state,
+            db_lifecycle,
             block_cache: None,
             state: Mutex::new(LSMTreeState {
                 // at least 2 level option
@@ -617,6 +626,9 @@ impl LSMTree {
     pub(crate) fn on_compaction_complete(&self, tree_idx: usize) -> Option<usize> {
         let mut state = self.state.lock().unwrap();
         let expected_range = state.pending_compaction.remove(&tree_idx).flatten();
+        if self.db_lifecycle.ensure_open().is_err() {
+            return None;
+        }
         let snapshot = self.db_state.load();
         let Some(expected_range) = expected_range else {
             return Some(tree_idx);
@@ -655,6 +667,9 @@ impl LSMTree {
     }
 
     fn maybe_trigger_compaction_locked(&self, state: &mut LSMTreeState, tree_idx: usize) {
+        if self.db_lifecycle.ensure_open().is_err() {
+            return;
+        }
         let levels_snapshot = self.db_state.load();
         let Some(worker) = state.compaction_worker.clone() else {
             return;
@@ -1400,10 +1415,15 @@ mod tests {
         ));
         let worker: Arc<dyn crate::compaction::CompactionWorker> =
             Arc::new(crate::compaction::LocalCompactionWorker::new(
-                crate::compaction::CompactionExecutor::new(config).unwrap(),
+                crate::compaction::CompactionExecutor::new(
+                    config,
+                    Arc::clone(&lsm_tree.db_lifecycle),
+                )
+                .unwrap(),
                 Arc::clone(&file_manager),
                 Arc::downgrade(&lsm_tree),
                 db_config,
+                Arc::clone(&lsm_tree.db_lifecycle),
                 Arc::clone(&metrics_manager),
                 Arc::new(crate::schema::SchemaManager::new(1)),
             ));
@@ -1802,6 +1822,42 @@ mod tests {
 
         let remapped_idx = lsm_tree.on_compaction_complete(1);
         assert_eq!(remapped_idx, Some(2));
+    }
+
+    #[test]
+    fn test_lsm_compaction_completion_skips_when_db_not_open() {
+        let db_state = Arc::new(DbStateHandle::new());
+        let base_version = Arc::new(LSMTreeVersion {
+            levels: vec![Level {
+                ordinal: 0,
+                tiered: true,
+                files: vec![create_data_file_with_bucket(1, 8)],
+            }],
+        });
+        let initial_multi = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+            2,
+            &[0u16..=1u16],
+            vec![Arc::clone(&base_version)],
+        )
+        .unwrap();
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: initial_multi,
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: Vec::new().into(),
+            suggested_base_snapshot_id: None,
+        });
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
+        let lsm_tree = LSMTree::with_state_and_ttl(
+            Arc::clone(&db_state),
+            Arc::new(TTLProvider::disabled()),
+            Arc::new(DbLifecycle::new_initializing()),
+            metrics_manager,
+        );
+        lsm_tree.on_compaction_started(0);
+        assert_eq!(lsm_tree.on_compaction_complete(0), None);
     }
 
     #[test]
