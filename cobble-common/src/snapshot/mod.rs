@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 pub(crate) use manager::SnapshotManager;
 pub(crate) use manifest::{
-    LoadedManifest, ManifestPayload, ManifestSnapshot, apply_manifest_tree_level_edits,
-    build_tree_versions_from_manifest, build_vlog_version_from_manifest, decode_manifest,
+    LoadedManifest, ManifestSnapshot, build_tree_versions_from_manifest,
+    build_vlog_version_from_manifest, list_snapshot_manifest_ids, load_manifest_entry,
     load_manifest_for_snapshot, snapshot_manifest_name,
 };
 pub(crate) use memtable::ActiveMemtableSnapshotData;

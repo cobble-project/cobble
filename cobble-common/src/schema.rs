@@ -401,6 +401,40 @@ impl SchemaManager {
         *self.max_persisted_schema_id.write().unwrap() =
             live_schema_ids.iter().next_back().copied();
     }
+
+    pub(crate) fn register_schema_from_file(
+        &self,
+        file_manager: &Arc<FileManager>,
+        schema_id: u64,
+        default_num_columns: usize,
+    ) -> Result<()> {
+        if self.schemas.read().unwrap().contains_key(&schema_id) {
+            return Ok(());
+        }
+        let schema = Arc::new(load_schema(file_manager, schema_id, default_num_columns)?);
+        self.schemas
+            .write()
+            .unwrap()
+            .insert(schema.version(), Arc::clone(&schema));
+        self.evolutions
+            .write()
+            .unwrap()
+            .insert(schema.version(), schema.evolution());
+        let target_next = schema.version().saturating_add(1);
+        let mut current_next = self.next_version.load(Ordering::SeqCst);
+        while current_next < target_next {
+            match self.next_version.compare_exchange(
+                current_next,
+                target_next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(value) => current_next = value,
+            }
+        }
+        Ok(())
+    }
 }
 
 fn collect_schema_ids_from_manifest(manifest: &ManifestSnapshot, schema_ids: &mut BTreeSet<u64>) {

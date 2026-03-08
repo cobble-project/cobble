@@ -117,6 +117,7 @@ struct MemtableManagerState {
     budget: i64,
     allow_make_active_buffer_in_reclaimer: bool,
     in_flight: usize,
+    restore_in_progress: bool,
     next_seq: u64,
     flush_results: BTreeMap<u64, Result<MemtableFlushResult>>,
 }
@@ -337,6 +338,7 @@ impl MemtableManager {
             budget: total_budget,
             allow_make_active_buffer_in_reclaimer: true,
             in_flight: 0,
+            restore_in_progress: false,
             next_seq: options.initial_seq,
             flush_results: BTreeMap::new(),
         };
@@ -416,6 +418,32 @@ impl MemtableManager {
         Arc::clone(&self.db_state)
     }
 
+    pub(crate) fn ensure_active_seq_at_least(&self, seq: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.next_seq < seq {
+            state.next_seq = seq;
+        }
+        drop(state);
+        let snapshot = self.db_state.load();
+        if let Some(active) = snapshot.active.as_ref() {
+            let mut active = active.lock().unwrap();
+            if active.seq < seq {
+                active.seq = seq;
+            }
+        }
+    }
+
+    pub(crate) fn ensure_next_seq_at_least(&self, seq: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.next_seq < seq {
+            state.next_seq = seq;
+        }
+    }
+
+    pub(crate) fn next_seq(&self) -> u64 {
+        self.state.lock().unwrap().next_seq
+    }
+
     pub(crate) fn open(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         Self::make_active_buffer(
@@ -476,6 +504,7 @@ impl MemtableManager {
                             Arc::clone(&ttl_provider_clone),
                             Arc::clone(&vlog_store_clone),
                             multi_lsm_version,
+                            0,
                         );
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
@@ -722,6 +751,7 @@ impl MemtableManager {
             db_state.cas_mutate(snapshot.seq_id, |db_state, snapshot| {
                 Some(DbState {
                     seq_id: db_state.allocate_seq_id(),
+                    bucket_ranges: snapshot.bucket_ranges.clone(),
                     multi_lsm_version: snapshot.multi_lsm_version.clone(),
                     vlog_version: snapshot.vlog_version.clone(),
                     active: Some(Arc::clone(&active)),
@@ -909,6 +939,7 @@ impl MemtableManager {
                 .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
                     Some(DbState {
                         seq_id: db_state.allocate_seq_id(),
+                        bucket_ranges: snapshot.bucket_ranges.clone(),
                         multi_lsm_version: snapshot.multi_lsm_version.clone(),
                         vlog_version: snapshot.vlog_version.clone(),
                         active: None,
@@ -1119,6 +1150,9 @@ impl MemtableManager {
 
     fn flush_active_internal(&self, snapshot: Option<SnapshotCompletion>) -> Result<Option<u64>> {
         let mut state = self.state.lock().unwrap();
+        while state.restore_in_progress {
+            state = self.flush_done.wait(state).unwrap();
+        }
         let mut guard = self.db_state.lock();
         guard = self.wait_for_write_stall_under_guard(guard);
         let snapshot_state = self.db_state.load();
@@ -1170,6 +1204,7 @@ impl MemtableManager {
 
                     Some(DbState {
                         seq_id: db_state.allocate_seq_id(),
+                        bucket_ranges: snapshot_state.bucket_ranges.clone(),
                         multi_lsm_version: snapshot_state.multi_lsm_version.clone(),
                         vlog_version: snapshot_state.vlog_version.clone(),
                         active: None,
@@ -1259,47 +1294,64 @@ impl MemtableManager {
 
     pub(crate) fn restore_active_memtable_snapshot_to_l0(
         &self,
+        source_file_manager: &Arc<FileManager>,
         segments: &[ActiveMemtableSnapshotData],
+        vlog_file_seq_offset: u32,
     ) -> Result<bool> {
         if segments.is_empty() {
             return Ok(false);
         }
-        let (memtable, vlog_recorder) =
-            decode_active_snapshot_segments_into_vec_memtable(&self.file_manager, segments)?;
-        if memtable.is_empty() {
-            return Ok(false);
-        }
-        let seq = {
+        {
             let mut state = self.state.lock().unwrap();
-            let seq = state.next_seq;
-            state.next_seq = state.next_seq.saturating_add(1);
-            seq
-        };
-        let multi_lsm_version = self.db_state.load().multi_lsm_version.clone();
-        let result = flush_memtable(
-            seq,
-            &memtable,
-            self.schema_manager.latest_schema(),
-            vlog_recorder.map(Arc::new),
-            Arc::clone(&self.file_manager),
-            Arc::clone(&self.file_builder_factory),
-            self.lsm_tree.ttl_provider(),
-            Arc::clone(&self.vlog_store),
-            multi_lsm_version,
-        )?;
-        self.metrics.flushes_total.increment(1);
-        let flushed_bytes: u64 = result
-            .data_files_by_tree
-            .iter()
-            .map(|(_, file)| file.size as u64)
-            .sum();
-        self.metrics.flush_bytes_total.increment(flushed_bytes);
-        self.lsm_tree.add_level0_files(
-            result.seq,
-            result.data_files_by_tree.clone(),
-            result.vlog_edit,
-        )?;
-        Ok(true)
+            while state.restore_in_progress || state.in_flight > 0 {
+                state = self.flush_done.wait(state).unwrap();
+            }
+            state.restore_in_progress = true;
+        }
+        let result = (|| {
+            let (memtable, vlog_recorder) =
+                decode_active_snapshot_segments_into_vec_memtable(source_file_manager, segments)?;
+            if memtable.is_empty() {
+                return Ok(false);
+            }
+            let seq = {
+                let mut state = self.state.lock().unwrap();
+                let seq = state.next_seq;
+                state.next_seq = state.next_seq.saturating_add(1);
+                seq
+            };
+            let multi_lsm_version = self.db_state.load().multi_lsm_version.clone();
+            let result = flush_memtable(
+                seq,
+                &memtable,
+                self.schema_manager.latest_schema(),
+                vlog_recorder.map(Arc::new),
+                Arc::clone(&self.file_manager),
+                Arc::clone(&self.file_builder_factory),
+                self.lsm_tree.ttl_provider(),
+                Arc::clone(&self.vlog_store),
+                multi_lsm_version,
+                vlog_file_seq_offset,
+            )?;
+            self.metrics.flushes_total.increment(1);
+            let flushed_bytes: u64 = result
+                .data_files_by_tree
+                .iter()
+                .map(|(_, file)| file.size as u64)
+                .sum();
+            self.metrics.flush_bytes_total.increment(flushed_bytes);
+            self.lsm_tree.add_level0_files(
+                result.seq,
+                result.data_files_by_tree.clone(),
+                result.vlog_edit,
+            )?;
+            Ok(true)
+        })();
+        let mut state = self.state.lock().unwrap();
+        state.restore_in_progress = false;
+        self.flush_done.notify_all();
+        drop(state);
+        result
     }
 
     pub(crate) fn close(&self) -> Result<()> {
@@ -1362,15 +1414,26 @@ fn flush_memtable(
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     vlog_store: Arc<VlogStore>,
     multi_lsm_version: MultiLSMTreeVersion,
+    vlog_file_seq_offset: u32,
 ) -> Result<MemtableFlushResult> {
     // Step 1: If there is a vlog recorder with entries, flush it to the vlog store and get the resulting edit.
     let mut vlog_edit = None;
     if let Some(recorder) = vlog_recorder
         && recorder.has_entries()
     {
-        let (mut writer, mut edit) = vlog_store.create_writer_for_seq(recorder.file_seq())?;
+        let target_file_seq = recorder
+            .file_seq()
+            .checked_add(vlog_file_seq_offset)
+            .ok_or_else(|| {
+                Error::IoError(format!(
+                    "VLOG file seq overflow: {} + {}",
+                    recorder.file_seq(),
+                    vlog_file_seq_offset
+                ))
+            })?;
+        let (mut writer, mut edit) = vlog_store.create_writer_for_seq(target_file_seq)?;
         recorder.flush_to_writer(memtable, &mut writer)?;
-        edit.add_entry_delta(recorder.file_seq(), recorder.entry_count() as i64);
+        edit.add_entry_delta(target_file_seq, recorder.entry_count() as i64);
         writer.close()?;
         vlog_edit = Some(edit);
     }
@@ -1427,7 +1490,13 @@ fn flush_memtable(
     }
     if let (Some(edit), Some(collector)) = (&mut vlog_edit, merge_collector.as_ref()) {
         for (file_seq, delta) in collector.borrow().removed_entry_deltas() {
-            edit.add_entry_delta(file_seq, delta);
+            let shifted_file_seq = file_seq.checked_add(vlog_file_seq_offset).ok_or_else(|| {
+                InvalidState(format!(
+                    "VLOG file seq overflow: {} + {}",
+                    file_seq, vlog_file_seq_offset
+                ))
+            })?;
+            edit.add_entry_delta(shifted_file_seq, delta);
         }
     }
     // Step 3: Finish data files and construct the resulting `MemtableFlushResult`.
@@ -1449,6 +1518,7 @@ fn flush_memtable(
             schema_id: schema.version(),
             bucket_range: bucket_range.clone(),
             effective_bucket_range: bucket_range,
+            vlog_file_seq_offset,
             has_separated_values,
             meta_bytes: Default::default(),
         };

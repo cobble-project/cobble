@@ -230,6 +230,7 @@ impl MultiLSMTreeVersion {
 
 pub(crate) struct DbState {
     pub(crate) seq_id: u64,
+    pub(crate) bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) multi_lsm_version: MultiLSMTreeVersion,
     pub(crate) vlog_version: VlogVersion,
     pub(crate) active: Option<Arc<Mutex<ActiveMemtable>>>,
@@ -250,6 +251,7 @@ impl DbStateHandle {
         Self {
             current: ArcSwap::from_pointee(DbState {
                 seq_id: 0,
+                bucket_ranges: Vec::new(),
                 multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: vec![] }),
                 vlog_version: VlogVersion::new(),
                 active: None,
@@ -305,6 +307,7 @@ impl DbStateHandle {
             }
             Some(DbState {
                 seq_id,
+                bucket_ranges: snapshot.bucket_ranges.clone(),
                 multi_lsm_version: snapshot.multi_lsm_version.clone(),
                 vlog_version: snapshot.vlog_version.clone(),
                 active: snapshot.active.clone(),
@@ -343,6 +346,7 @@ impl DbStateHandle {
         )?;
         self.store(DbState {
             seq_id: snapshot.seq_id,
+            bucket_ranges: bucket_ranges.to_vec(),
             multi_lsm_version,
             vlog_version: snapshot.vlog_version.clone(),
             active: snapshot.active.clone(),

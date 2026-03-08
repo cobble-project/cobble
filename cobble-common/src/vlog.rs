@@ -3,7 +3,9 @@
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, RandomAccessFile, SequentialWriteFile};
 use crate::file::{FileManager, TrackedFileId};
-use crate::r#type::{Column, ValueType, decode_merge_separated_array};
+use crate::r#type::{
+    Column, RefColumn, Value, ValueType, decode_merge_separated_array, encode_merge_separated_array,
+};
 use bytes::{Buf, Bytes, BytesMut};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -58,9 +60,73 @@ impl VlogPointer {
             offset: u32::from_le_bytes(offset),
         })
     }
+
+    pub(crate) fn with_file_seq_offset(self, offset: u32) -> Result<Self> {
+        let file_seq = self.file_seq.checked_add(offset).ok_or_else(|| {
+            Error::IoError(format!(
+                "VLOG file seq overflow: {} + {}",
+                self.file_seq, offset
+            ))
+        })?;
+        Ok(Self {
+            file_seq,
+            offset: self.offset,
+        })
+    }
 }
 
 pub(crate) type VlogFileSeq = u32;
+
+fn apply_vlog_offset_to_column(column: Column, file_seq_offset: u32) -> Result<Column> {
+    if file_seq_offset == 0 {
+        return Ok(column);
+    }
+    match column.value_type {
+        ValueType::PutSeparated | ValueType::MergeSeparated => {
+            let pointer =
+                VlogPointer::from_bytes(column.data())?.with_file_seq_offset(file_seq_offset)?;
+            Ok(Column::new(column.value_type, pointer.to_bytes().to_vec()))
+        }
+        ValueType::MergeSeparatedArray | ValueType::PutSeparatedArray => {
+            let mut columns = Vec::new();
+            for item in decode_merge_separated_array(column.data())? {
+                let mut data = item.data().to_vec();
+                if item.value_type == ValueType::PutSeparated
+                    || item.value_type == ValueType::MergeSeparated
+                {
+                    let pointer = VlogPointer::from_bytes(item.data())?
+                        .with_file_seq_offset(file_seq_offset)?;
+                    data = pointer.to_bytes().to_vec();
+                }
+                columns.push(Column::new(item.value_type, data));
+            }
+            let refs: Vec<RefColumn<'_>> = columns
+                .iter()
+                .map(|item| RefColumn::new(*item.value_type(), item.data().as_ref()))
+                .collect();
+            Ok(Column::new(
+                column.value_type,
+                encode_merge_separated_array(&refs)?,
+            ))
+        }
+        _ => Ok(column),
+    }
+}
+
+pub(crate) fn apply_vlog_offset_to_value(value: Value, file_seq_offset: u32) -> Result<Value> {
+    if file_seq_offset == 0 {
+        return Ok(value);
+    }
+    let expired_at = value.expired_at();
+    let mut columns = Vec::with_capacity(value.columns.len());
+    for column in value.columns {
+        let column = column
+            .map(|column| apply_vlog_offset_to_column(column, file_seq_offset))
+            .transpose()?;
+        columns.push(column);
+    }
+    Ok(Value::new_with_expired_at(columns, expired_at))
+}
 
 #[derive(Clone)]
 struct VlogTrackedFile {
@@ -446,6 +512,32 @@ impl VlogStore {
 
     pub(crate) fn allocate_file_seq(&self) -> VlogFileSeq {
         self.next_file_seq.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub(crate) fn next_file_seq(&self) -> VlogFileSeq {
+        self.next_file_seq.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn reserve_file_seq_span(&self, span: u32) -> VlogFileSeq {
+        if span == 0 {
+            return self.next_file_seq();
+        }
+        self.next_file_seq.fetch_add(span, Ordering::SeqCst)
+    }
+
+    pub(crate) fn ensure_next_file_seq_at_least(&self, next_seq: VlogFileSeq) {
+        let mut current = self.next_file_seq.load(Ordering::SeqCst);
+        while current < next_seq {
+            match self.next_file_seq.compare_exchange(
+                current,
+                next_seq,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(value) => current = value,
+            }
+        }
     }
 
     pub(crate) fn should_separate(&self, value_len: usize) -> bool {

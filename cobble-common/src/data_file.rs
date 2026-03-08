@@ -54,6 +54,8 @@ pub struct DataFile {
     pub bucket_range: RangeInclusive<u16>,
     /// Bucket range visible to the owning LSM tree.
     pub effective_bucket_range: RangeInclusive<u16>,
+    /// Per-file offset applied to VLOG file seq pointers for this SST.
+    pub vlog_file_seq_offset: u32,
     /// Whether this file contains separated value columns/pointers.
     pub has_separated_values: bool,
     /// Optional cached meta bytes to avoid re-reading from disk.
@@ -84,6 +86,7 @@ impl DataFile {
             size: self.size,
             bucket_range: self.bucket_range.clone(),
             effective_bucket_range: range,
+            vlog_file_seq_offset: self.vlog_file_seq_offset,
             has_separated_values: self.has_separated_values,
             meta_bytes: Default::default(),
         };
@@ -94,8 +97,8 @@ impl DataFile {
     }
 
     pub(crate) fn needs_bucket_filter(&self) -> bool {
-        self.bucket_range.start() >= self.effective_bucket_range.start()
-            && self.bucket_range.end() <= self.effective_bucket_range.end()
+        self.effective_bucket_range.start() > self.bucket_range.start()
+            || self.effective_bucket_range.end() < self.bucket_range.end()
     }
 
     pub fn meta_bytes(&self) -> Option<Bytes> {

@@ -10,6 +10,7 @@ mod merging;
 pub(crate) mod mock_iterator;
 mod schema_evolving;
 mod sorted_run;
+mod vlog_seq_offset;
 
 // Public API exports for the iterator module.
 // These are currently unused within this crate but are exported for external usage.
@@ -25,6 +26,8 @@ pub(crate) use merging::MergingIterator;
 pub(crate) use schema_evolving::SchemaEvolvingIterator;
 #[allow(unused_imports)]
 pub(crate) use sorted_run::SortedRun;
+#[allow(unused_imports)]
+pub(crate) use vlog_seq_offset::VlogSeqOffsetIterator;
 
 use crate::error::Result;
 use bytes::Bytes;

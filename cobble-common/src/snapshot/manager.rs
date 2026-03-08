@@ -15,13 +15,13 @@ use crate::schema::SchemaManager;
 use crate::vlog::VlogVersion;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::RangeInclusive;
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::JoinHandle;
 
 pub(crate) struct SnapshotManager {
     file_manager: Arc<FileManager>,
     schema_manager: Arc<SchemaManager>,
-    bucket_ranges: Vec<RangeInclusive<u16>>,
+    bucket_ranges: Arc<RwLock<Vec<RangeInclusive<u16>>>>,
     state: Arc<Mutex<SnapshotManagerState>>,
     retention: Option<usize>,
     /// Background worker for manifest materialization.
@@ -35,7 +35,7 @@ impl Clone for SnapshotManager {
         Self {
             file_manager: Arc::clone(&self.file_manager),
             schema_manager: Arc::clone(&self.schema_manager),
-            bucket_ranges: self.bucket_ranges.clone(),
+            bucket_ranges: Arc::clone(&self.bucket_ranges),
             state: Arc::clone(&self.state),
             retention: self.retention,
             materialize_tx: Arc::clone(&self.materialize_tx),
@@ -71,7 +71,7 @@ impl SnapshotManager {
         Self {
             file_manager,
             schema_manager,
-            bucket_ranges,
+            bucket_ranges: Arc::new(RwLock::new(bucket_ranges)),
             state: Arc::new(Mutex::new(SnapshotManagerState {
                 next_id: 0,
                 snapshots: BTreeMap::new(),
@@ -117,7 +117,7 @@ impl SnapshotManager {
         state.next_id += 1;
         let manifest_path = self.file_manager.metadata_path(&snapshot_manifest_name(id));
         let mut snapshot = DbSnapshot::new(id, manifest_path, callback);
-        snapshot.bucket_ranges = self.bucket_ranges.clone();
+        snapshot.bucket_ranges = self.bucket_ranges.read().unwrap().clone();
         let snapshot = Arc::new(snapshot);
         state.snapshots.insert(id, Arc::clone(&snapshot));
         // initialize incremental references with self-reference
@@ -128,6 +128,10 @@ impl SnapshotManager {
             .insert(id);
         state.incremental_ref_counts.insert(id, 1);
         snapshot
+    }
+
+    pub(crate) fn set_bucket_ranges(&self, bucket_ranges: Vec<RangeInclusive<u16>>) {
+        *self.bucket_ranges.write().unwrap() = bucket_ranges;
     }
 
     pub(crate) fn finish_snapshot(
@@ -637,6 +641,7 @@ fn clone_lsm_tree_version_untracked(version: &LSMTreeVersion) -> LSMTreeVersion 
                             size: file.size,
                             bucket_range: file.bucket_range.clone(),
                             effective_bucket_range: file.effective_bucket_range.clone(),
+                            vlog_file_seq_offset: file.vlog_file_seq_offset,
                             has_separated_values: file.has_separated_values,
                             meta_bytes: Default::default(),
                         };

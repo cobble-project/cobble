@@ -7,9 +7,9 @@ use crate::merge_operator::MergeOperator;
 use crate::metrics_manager::MetricsManager;
 use crate::schema::{Schema, SchemaBuilder, SchemaManager};
 use crate::snapshot::{
-    ActiveMemtableSnapshotData, LoadedManifest, ManifestPayload, SnapshotCallback, SnapshotManager,
-    apply_manifest_tree_level_edits, build_tree_versions_from_manifest,
-    build_vlog_version_from_manifest, decode_manifest, load_manifest_for_snapshot,
+    ActiveMemtableSnapshotData, LoadedManifest, SnapshotCallback, SnapshotManager,
+    build_tree_versions_from_manifest, build_vlog_version_from_manifest,
+    list_snapshot_manifest_ids, load_manifest_entry, load_manifest_for_snapshot,
     snapshot_manifest_name,
 };
 use crate::sst::block_cache::new_block_cache;
@@ -33,11 +33,14 @@ use crate::metrics_registry;
 use crate::read_only_db::ReadOnlyDb;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::util::init_logging;
+#[path = "db_rescale.rs"]
+mod rescale;
 
 /// Public database interface.
 pub struct Db {
     id: String,
-    bucket_ranges: Vec<RangeInclusive<u16>>,
+    db_state: Arc<DbStateHandle>,
+    config: Config,
     file_manager: Arc<FileManager>,
     lsm_tree: Arc<LSMTree>,
     memtable_manager: MemtableManager,
@@ -69,50 +72,6 @@ pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<
         return Ok(None);
     }
     Ok(Some(columns))
-}
-
-fn parse_snapshot_manifest_id(name: &str) -> Option<u64> {
-    let name = name.rsplit('/').next().unwrap_or(name);
-    name.strip_prefix("SNAPSHOT-")?.parse::<u64>().ok()
-}
-
-fn load_manifest_entry(
-    file_manager: &Arc<FileManager>,
-    snapshot_id: u64,
-    loaded_by_id: &HashMap<u64, LoadedManifest>,
-) -> Result<LoadedManifest> {
-    let manifest_name = snapshot_manifest_name(snapshot_id);
-    let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
-    let bytes = reader.read_at(0, reader.size())?;
-    let (base_snapshot_id, manifest) = match decode_manifest(bytes.as_ref())? {
-        ManifestPayload::Snapshot(manifest) => (None, manifest),
-        ManifestPayload::IncrementalSnapshot(incremental) => {
-            let base_snapshot_id = Some(incremental.base_snapshot_id);
-            let manifest = if let Some(base) = loaded_by_id.get(&incremental.base_snapshot_id) {
-                let mut resolved = base.manifest.clone();
-                apply_manifest_tree_level_edits(
-                    &mut resolved.tree_levels,
-                    &incremental.tree_level_edits,
-                )?;
-                resolved.vlog_files = incremental.vlog_files;
-                resolved.id = incremental.id;
-                resolved.seq_id = incremental.seq_id;
-                resolved.latest_schema_id = incremental.latest_schema_id;
-                resolved.active_memtable_data = incremental.active_memtable_data;
-                resolved.bucket_ranges = incremental.bucket_ranges;
-                resolved.lsm_tree_bucket_ranges = incremental.lsm_tree_bucket_ranges;
-                resolved
-            } else {
-                load_manifest_for_snapshot(file_manager, snapshot_id)?
-            };
-            (base_snapshot_id, manifest)
-        }
-    };
-    Ok(LoadedManifest {
-        snapshot_id,
-        base_snapshot_id,
-        manifest,
-    })
 }
 
 /// Resolve a single column value, handling any value log pointers using the provided callback.
@@ -484,7 +443,7 @@ impl Db {
                 Error::IoError(format!("Snapshot manifest not tracked: {}", manifest_name))
             })?;
         Ok(crate::coordinator::BucketSnapshotInput {
-            ranges: self.bucket_ranges.clone(),
+            ranges: self.db_state.load().bucket_ranges.clone(),
             db_id: self.id.clone(),
             snapshot_id,
             manifest_path,
@@ -543,6 +502,7 @@ impl Db {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
             seq_id: max_seq,
+            bucket_ranges: bucket_ranges.clone(),
             multi_lsm_version,
             vlog_version,
             active: None,
@@ -572,13 +532,7 @@ impl Db {
         let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
         let file_manager = FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
-        let mut snapshot_ids: Vec<u64> = file_manager
-            .list_snapshot_metadata_names()?
-            .into_iter()
-            .filter_map(|name| parse_snapshot_manifest_id(&name))
-            .collect();
-        snapshot_ids.sort_unstable();
-        snapshot_ids.dedup();
+        let snapshot_ids = list_snapshot_manifest_ids(&file_manager)?;
         if snapshot_ids.is_empty() {
             return Err(Error::IoError(format!(
                 "No snapshot manifests found for db {}",
@@ -635,6 +589,7 @@ impl Db {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
             seq_id: latest.manifest.seq_id,
+            bucket_ranges: bucket_ranges.clone(),
             multi_lsm_version,
             vlog_version,
             active: None,
@@ -764,7 +719,8 @@ impl Db {
 
         Ok(Self {
             id,
-            bucket_ranges,
+            db_state,
+            config,
             file_manager: Arc::clone(&file_manager),
             lsm_tree,
             memtable_manager,
@@ -793,7 +749,28 @@ impl Db {
     ) -> Result<()> {
         let restored = self
             .memtable_manager
-            .restore_active_memtable_snapshot_to_l0(segments)?;
+            .restore_active_memtable_snapshot_to_l0(&self.file_manager, segments, 0)?;
+        if !segments.is_empty() && !restored {
+            return Err(Error::InvalidState(
+                "active memtable snapshot restore did not flush".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn restore_active_memtable_snapshot_to_l0_with_source(
+        &self,
+        source_file_manager: &Arc<FileManager>,
+        segments: &[ActiveMemtableSnapshotData],
+        vlog_file_seq_offset: u32,
+    ) -> Result<()> {
+        let restored = self
+            .memtable_manager
+            .restore_active_memtable_snapshot_to_l0(
+                source_file_manager,
+                segments,
+                vlog_file_seq_offset,
+            )?;
         if !segments.is_empty() && !restored {
             return Err(Error::InvalidState(
                 "active memtable snapshot restore did not flush".to_string(),
@@ -833,7 +810,7 @@ impl Db {
         } else {
             Some(vec![0u8; mask_size])
         };
-        let snapshot = self.memtable_manager.db_state().load();
+        let snapshot = self.db_state.load();
         let mut values: Vec<Value> = Vec::new();
         let memtable_min_seq = self.memtable_manager.get_all_with_snapshot(
             Arc::clone(&snapshot),
@@ -937,7 +914,7 @@ impl Db {
         range: Range<&[u8]>,
         options: &ScanOptions,
     ) -> Result<DbIterator<'a>> {
-        let snapshot = self.memtable_manager.db_state().load();
+        let snapshot = self.db_state.load();
         let schema = self.schema_manager.latest_schema();
         let memtable_iters = self
             .memtable_manager

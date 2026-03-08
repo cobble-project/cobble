@@ -82,6 +82,7 @@ impl ReadOnlyDb {
                 snapshot_id
             )));
         }
+        let bucket_ranges = manifest.bucket_ranges.clone();
         let lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
             manifest.bucket_ranges.clone()
         } else {
@@ -109,6 +110,7 @@ impl ReadOnlyDb {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
             seq_id: 0,
+            bucket_ranges: bucket_ranges.clone(),
             multi_lsm_version,
             vlog_version,
             active: None,

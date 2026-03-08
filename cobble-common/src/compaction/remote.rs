@@ -98,6 +98,8 @@ struct RemoteDataFile {
     bucket_range_end: u16,
     effective_bucket_range_start: u16,
     effective_bucket_range_end: u16,
+    #[serde(default)]
+    vlog_file_seq_offset: u32,
     meta_bytes: Option<Vec<u8>>,
 }
 
@@ -117,6 +119,7 @@ impl RemoteDataFile {
             bucket_range_end: *file.bucket_range.end(),
             effective_bucket_range_start: *file.effective_bucket_range.start(),
             effective_bucket_range_end: *file.effective_bucket_range.end(),
+            vlog_file_seq_offset: file.vlog_file_seq_offset,
             meta_bytes: file.meta_bytes().map(|bytes| bytes.to_vec()),
         }
     }
@@ -158,6 +161,7 @@ impl RemoteDataFile {
             bucket_range: self.bucket_range_start..=self.bucket_range_end,
             effective_bucket_range: self.effective_bucket_range_start
                 ..=self.effective_bucket_range_end,
+            vlog_file_seq_offset: self.vlog_file_seq_offset,
             has_separated_values: self.has_separated_values,
             meta_bytes: Default::default(),
         };
@@ -870,6 +874,7 @@ mod tests {
             size: file_size,
             bucket_range: bucket_range.clone(),
             effective_bucket_range: bucket_range,
+            vlog_file_seq_offset: 0,
             has_separated_values: false,
             meta_bytes: Default::default(),
         };
@@ -934,6 +939,7 @@ mod tests {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
@@ -1077,6 +1083,7 @@ mod tests {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,

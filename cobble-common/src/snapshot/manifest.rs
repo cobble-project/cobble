@@ -78,6 +78,7 @@ pub(crate) struct ManifestFile {
     pub(crate) bucket_range_end: u16,
     pub(crate) effective_bucket_range_start: u16,
     pub(crate) effective_bucket_range_end: u16,
+    pub(crate) vlog_file_seq_offset: u32,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -99,6 +100,61 @@ pub(crate) struct ManifestVlogFile {
 pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<ManifestPayload> {
     serde_json::from_slice(bytes)
         .map_err(|err| Error::IoError(format!("Failed to decode manifest: {}", err)))
+}
+
+pub(crate) fn parse_snapshot_manifest_id(name: &str) -> Option<u64> {
+    let name = name.rsplit('/').next().unwrap_or(name);
+    name.strip_prefix("SNAPSHOT-")?.parse::<u64>().ok()
+}
+
+pub(crate) fn list_snapshot_manifest_ids(file_manager: &Arc<FileManager>) -> Result<Vec<u64>> {
+    let mut snapshot_ids: Vec<u64> = file_manager
+        .list_snapshot_metadata_names()?
+        .into_iter()
+        .filter_map(|name| parse_snapshot_manifest_id(&name))
+        .collect();
+    snapshot_ids.sort_unstable();
+    snapshot_ids.dedup();
+    Ok(snapshot_ids)
+}
+
+pub(crate) fn load_manifest_entry(
+    file_manager: &Arc<FileManager>,
+    snapshot_id: u64,
+    loaded_by_id: &HashMap<u64, LoadedManifest>,
+) -> Result<LoadedManifest> {
+    let manifest_name = snapshot_manifest_name(snapshot_id);
+    let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
+    let bytes = reader.read_at(0, reader.size())?;
+    let (base_snapshot_id, manifest) = match decode_manifest(bytes.as_ref())? {
+        ManifestPayload::Snapshot(manifest) => (None, manifest),
+        ManifestPayload::IncrementalSnapshot(incremental) => {
+            let base_snapshot_id = Some(incremental.base_snapshot_id);
+            let manifest = if let Some(base) = loaded_by_id.get(&incremental.base_snapshot_id) {
+                let mut resolved = base.manifest.clone();
+                apply_manifest_tree_level_edits(
+                    &mut resolved.tree_levels,
+                    &incremental.tree_level_edits,
+                )?;
+                resolved.vlog_files = incremental.vlog_files;
+                resolved.id = incremental.id;
+                resolved.seq_id = incremental.seq_id;
+                resolved.latest_schema_id = incremental.latest_schema_id;
+                resolved.active_memtable_data = incremental.active_memtable_data;
+                resolved.bucket_ranges = incremental.bucket_ranges;
+                resolved.lsm_tree_bucket_ranges = incremental.lsm_tree_bucket_ranges;
+                resolved
+            } else {
+                load_manifest_for_snapshot(file_manager, snapshot_id)?
+            };
+            (base_snapshot_id, manifest)
+        }
+    };
+    Ok(LoadedManifest {
+        snapshot_id,
+        base_snapshot_id,
+        manifest,
+    })
 }
 
 /// Load the manifest dependency chain for the given snapshot and resolve each manifest once.
@@ -353,6 +409,7 @@ fn manifest_file_from_data_file(file: &DataFile, file_manager: &FileManager) -> 
         bucket_range_end: *file.bucket_range.end(),
         effective_bucket_range_start: *file.effective_bucket_range.start(),
         effective_bucket_range_end: *file.effective_bucket_range.end(),
+        vlog_file_seq_offset: file.vlog_file_seq_offset,
     }
 }
 
@@ -514,6 +571,7 @@ pub(crate) fn build_tree_versions_from_manifest_untracked(
                     bucket_range: file.bucket_range_start..=file.bucket_range_end,
                     effective_bucket_range: file.effective_bucket_range_start
                         ..=file.effective_bucket_range_end,
+                    vlog_file_seq_offset: file.vlog_file_seq_offset,
                     has_separated_values: file.has_separated_values,
                     meta_bytes: Default::default(),
                 }));
@@ -579,6 +637,7 @@ pub(crate) fn build_tree_versions_from_manifest(
                     bucket_range: file.bucket_range_start..=file.bucket_range_end,
                     effective_bucket_range: file.effective_bucket_range_start
                         ..=file.effective_bucket_range_end,
+                    vlog_file_seq_offset: file.vlog_file_seq_offset,
                     has_separated_values: file.has_separated_values,
                     meta_bytes: Default::default(),
                 }));

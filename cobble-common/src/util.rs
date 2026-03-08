@@ -1,5 +1,6 @@
 use crate::Config;
 use bytes::Bytes;
+use std::ops::RangeInclusive;
 
 /// Creates a `Bytes` instance that shares the same underlying data as the input slice.
 #[inline]
@@ -30,4 +31,38 @@ pub(crate) fn init_logging(config: &Config) {
         let config = builder.build(root).unwrap();
         let _ = log4rs::init_config(config);
     });
+}
+
+pub(crate) fn ranges_overlap(left: &RangeInclusive<u16>, right: &RangeInclusive<u16>) -> bool {
+    !(*left.end() < *right.start() || *right.end() < *left.start())
+}
+
+pub(crate) fn normalize_bucket_ranges(
+    mut ranges: Vec<RangeInclusive<u16>>,
+) -> Vec<RangeInclusive<u16>> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort_by_key(|range| *range.start());
+    let mut merged: Vec<RangeInclusive<u16>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && (*range.start() as u32) <= (*last.end() as u32).saturating_add(1)
+        {
+            let start = *last.start();
+            let end = (*last.end()).max(*range.end());
+            *last = start..=end;
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+pub(crate) fn range_is_covered_by_ranges(
+    range: &RangeInclusive<u16>,
+    coverage: &[RangeInclusive<u16>],
+) -> bool {
+    (*range.start()..=*range.end())
+        .all(|bucket| coverage.iter().any(|source| source.contains(&bucket)))
 }

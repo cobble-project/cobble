@@ -262,6 +262,7 @@ mod tests {
             size: 0,
             bucket_range: bucket_range.clone(),
             effective_bucket_range: bucket_range,
+            vlog_file_seq_offset: 0,
             has_separated_values: false,
             meta_bytes: Default::default(),
         })

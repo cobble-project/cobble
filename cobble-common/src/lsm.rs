@@ -5,7 +5,9 @@ use crate::compaction::{
 use crate::data_file::{DataFile, intersect_bucket_ranges};
 use crate::error::Result;
 use crate::file::{FileManager, ReadAheadBufferedReader};
-use crate::iterator::{BucketFilterIterator, KvIterator, SchemaEvolvingIterator, SortedRun};
+use crate::iterator::{
+    BucketFilterIterator, KvIterator, SchemaEvolvingIterator, SortedRun, VlogSeqOffsetIterator,
+};
 use crate::metrics_manager::MetricsManager;
 use crate::schema::{Schema, SchemaManager};
 use crate::sst::block_cache::BlockCache;
@@ -19,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::db_state::{DbState, DbStateHandle, bucket_range_len};
 use crate::ttl::TTLProvider;
-use crate::vlog::VlogEdit;
+use crate::vlog::{VlogEdit, apply_vlog_offset_to_value};
 
 pub(crate) type DynKvIterator = Box<dyn for<'a> KvIterator<'a>>;
 
@@ -247,6 +249,7 @@ impl LSMTree {
                 }
                 let mut new_db_state = DbState {
                     seq_id: db_state.allocate_seq_id(),
+                    bucket_ranges: snapshot.bucket_ranges.clone(),
                     multi_lsm_version,
                     vlog_version: snapshot.vlog_version.clone(),
                     active: snapshot.active.clone(),
@@ -426,10 +429,10 @@ impl LSMTree {
         ranges
     }
 
-    fn clone_version_for_range(
+    pub(crate) fn clone_version_for_range(
         version: &LSMTreeVersion,
         range: &RangeInclusive<u16>,
-    ) -> LSMTreeVersion {
+    ) -> Arc<LSMTreeVersion> {
         let levels = version
             .levels
             .iter()
@@ -455,7 +458,7 @@ impl LSMTree {
                     .collect(),
             })
             .collect();
-        LSMTreeVersion { levels }
+        Arc::new(LSMTreeVersion { levels })
     }
 
     fn estimate_split_parts(
@@ -560,10 +563,7 @@ impl LSMTree {
             }
             for split_range in &split_ranges {
                 new_ranges.push(split_range.clone());
-                new_versions.push(Arc::new(Self::clone_version_for_range(
-                    version.as_ref(),
-                    split_range,
-                )));
+                new_versions.push(Self::clone_version_for_range(version.as_ref(), split_range));
             }
         }
         let new_multi =
@@ -580,6 +580,7 @@ impl LSMTree {
             .cas_mutate(snapshot.seq_id, |db_state, current| {
                 Some(DbState {
                     seq_id: db_state.allocate_seq_id(),
+                    bucket_ranges: current.bucket_ranges.clone(),
                     multi_lsm_version: new_multi.clone(),
                     vlog_version: current.vlog_version.clone(),
                     active: current.active.clone(),
@@ -946,7 +947,15 @@ impl LSMTree {
                         Arc::clone(&schema_manager),
                     ))
                 };
-                Ok(iter)
+                if file.vlog_file_seq_offset == 0 {
+                    Ok(iter)
+                } else {
+                    Ok(Box::new(VlogSeqOffsetIterator::new(
+                        iter,
+                        target_schema.num_columns(),
+                        file.vlog_file_seq_offset,
+                    )))
+                }
             });
             iterators.push(Box::new(run_iter));
         }
@@ -1041,6 +1050,7 @@ impl LSMTree {
                     *mask_byte &= selected_mask[idx];
                 }
             }
+            let value = apply_vlog_offset_to_value(value, file.vlog_file_seq_offset)?;
             let value = if let Some(columns) = selected_columns {
                 value.select_columns(columns)
             } else {
@@ -1094,6 +1104,7 @@ mod tests {
                 size: 0, // Test file, size doesn't matter
                 bucket_range: bucket_range.clone(),
                 effective_bucket_range: bucket_range,
+                vlog_file_seq_offset: 0,
                 has_separated_values: false,
                 meta_bytes: Default::default(),
             })
@@ -1116,6 +1127,7 @@ mod tests {
                 size,
                 bucket_range: bucket_range.clone(),
                 effective_bucket_range: bucket_range,
+                vlog_file_seq_offset: 0,
                 has_separated_values: false,
                 meta_bytes: Default::default(),
             })
@@ -1174,6 +1186,7 @@ mod tests {
             size: file_size,
             bucket_range: bucket_range.clone(),
             effective_bucket_range: bucket_range,
+            vlog_file_seq_offset: 0,
             has_separated_values: false,
             meta_bytes: Default::default(),
         };
@@ -1226,6 +1239,7 @@ mod tests {
         };
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
@@ -1309,6 +1323,7 @@ mod tests {
         };
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
@@ -1388,6 +1403,7 @@ mod tests {
         };
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
@@ -1489,6 +1505,7 @@ mod tests {
         );
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
             active: None,
@@ -1593,6 +1610,7 @@ mod tests {
         );
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
             active: None,
@@ -1648,6 +1666,7 @@ mod tests {
         .unwrap();
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
             active: None,
@@ -1729,6 +1748,7 @@ mod tests {
         .unwrap();
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
             active: None,
@@ -1770,6 +1790,7 @@ mod tests {
         .unwrap();
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version: initial_multi,
             vlog_version: VlogVersion::new(),
             active: None,
@@ -1792,6 +1813,7 @@ mod tests {
         .unwrap();
         db_state.store(DbState {
             seq_id: 1,
+            bucket_ranges: Vec::new(),
             multi_lsm_version: shifted_multi,
             vlog_version: VlogVersion::new(),
             active: None,
@@ -1838,6 +1860,7 @@ mod tests {
         };
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
@@ -1904,6 +1927,7 @@ mod tests {
         };
         db_state.store(DbState {
             seq_id: 0,
+            bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,

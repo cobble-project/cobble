@@ -12,7 +12,7 @@ use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{
     BucketFilterIterator, DeduplicatingIterator, KvIterator, MergingIterator,
-    SchemaEvolvingIterator, SortedRun,
+    SchemaEvolvingIterator, SortedRun, VlogSeqOffsetIterator,
 };
 use crate::lsm::{LevelEdit, VersionEdit};
 use crate::schema::SchemaManager;
@@ -327,7 +327,15 @@ impl CompactionExecutor {
                             Arc::clone(&schema_manager),
                         ))
                     };
-                Ok(iter)
+                if file.vlog_file_seq_offset == 0 {
+                    Ok(iter)
+                } else {
+                    Ok(Box::new(VlogSeqOffsetIterator::new(
+                        iter,
+                        target_schema.num_columns(),
+                        file.vlog_file_seq_offset,
+                    )))
+                }
             });
             all_iters.push(Box::new(run_iter));
         }
@@ -411,6 +419,7 @@ impl CompactionExecutor {
                         size: file_size,
                         bucket_range: bucket_range.clone(),
                         effective_bucket_range: bucket_range,
+                        vlog_file_seq_offset: 0,
                         has_separated_values: merge_collector
                             .as_ref()
                             .is_some_and(|collector| collector.borrow().has_separated_values()),
@@ -454,6 +463,7 @@ impl CompactionExecutor {
                 size: file_size,
                 bucket_range: bucket_range.clone(),
                 effective_bucket_range: bucket_range,
+                vlog_file_seq_offset: 0,
                 has_separated_values: merge_collector
                     .as_ref()
                     .is_some_and(|collector| collector.borrow().has_separated_values()),
@@ -592,6 +602,7 @@ mod tests {
             size: file_size,
             bucket_range: bucket_range.clone(),
             effective_bucket_range: bucket_range,
+            vlog_file_seq_offset: 0,
             has_separated_values: true,
             meta_bytes: Default::default(),
         };
@@ -1174,6 +1185,7 @@ mod tests {
             size: file_size,
             bucket_range: bucket_range.clone(),
             effective_bucket_range: bucket_range,
+            vlog_file_seq_offset: 0,
             has_separated_values: false,
             meta_bytes: Default::default(),
         };
