@@ -11,12 +11,24 @@ use crate::snapshot::{
     build_tree_versions_from_manifest, build_vlog_version_from_manifest,
     list_snapshot_manifest_ids, load_manifest_entry,
 };
-use crate::util::{normalize_bucket_ranges, range_is_covered_by_ranges, ranges_overlap};
+use crate::util::{
+    normalize_bucket_ranges, range_is_covered_by_ranges, ranges_overlap, subtract_range_by_cuts,
+    subtract_ranges,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 impl Db {
+    /// Expands owned bucket ranges by importing LSM tree and VLOG state from a snapshot of another db, while
+    /// keeping source files read-only and remapping file IDs to avoid collisions in local tracking. The source
+    /// snapshot must have bucket ranges that are fully covered by the requested expand ranges, and the target db
+    /// must not have any existing owned ranges that overlap with the requested expand ranges. The source snapshot's
+    /// active memtable segments will be replayed into L0 of the target after metadata-level merging,
+    /// with a file-level VLOG seq offset to avoid conflicts with existing VLOG files.
+    /// This operation is irreversible and may take time to complete depending on the size of the
+    /// imported snapshot, but the target db will be available for reads and writes on non-overlapping
+    /// buckets during the process. Returns the snapshot ID of the source snapshot used for expansion.
     pub fn expand_bucket(
         &self,
         source_db_id: String,
@@ -314,6 +326,125 @@ impl Db {
         )?;
         Ok(source_snapshot_id)
     }
+
+    /// Shrinks owned bucket ranges by kicking out specified ranges and removing all data in those ranges,
+    /// while keeping the db available for reads and writes on remaining owned buckets during the process.
+    /// The requested shrink ranges must be fully covered by current owned ranges, and the resulting owned ranges after
+    /// shrink must not be empty. This operation creates a snapshot to capture the state before shrink,
+    /// which will be used as the base for future expand operations on the kicked-out ranges,
+    /// and returns the snapshot ID of that snapshot.
+    pub fn shrink_bucket(&self, ranges: Vec<RangeInclusive<u16>>) -> Result<u64> {
+        if ranges.is_empty() {
+            return Err(Error::ConfigError(
+                "shrink ranges must not be empty".to_string(),
+            ));
+        }
+        let shrink_ranges = normalize_bucket_ranges(ranges);
+        for range in &shrink_ranges {
+            if !bucket_range_fits_total(range, self.config.total_buckets) {
+                return Err(Error::ConfigError(format!(
+                    "Invalid shrink range {}..={} for total_buckets {}",
+                    range.start(),
+                    range.end(),
+                    self.config.total_buckets
+                )));
+            }
+        }
+
+        let precheck = self.db_state.load();
+        for range in &shrink_ranges {
+            if !range_is_covered_by_ranges(range, &precheck.bucket_ranges) {
+                return Err(Error::ConfigError(format!(
+                    "Shrink range {}..={} is outside current owned ranges",
+                    range.start(),
+                    range.end()
+                )));
+            }
+        }
+        if subtract_ranges(&precheck.bucket_ranges, &shrink_ranges).is_empty() {
+            return Err(Error::ConfigError(
+                "cannot shrink all owned bucket ranges".to_string(),
+            ));
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let snapshot_id = self.snapshot_with_callback(move |result| {
+            let _ = tx.send(result);
+        })?;
+        match rx.recv_timeout(std::time::Duration::from_secs(900)) {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(Error::IoError(format!(
+                    "Timed out waiting for snapshot {} before shrink",
+                    snapshot_id
+                )));
+            }
+        };
+
+        let guard = self.db_state.lock();
+        let current = self.db_state.load();
+        for range in &shrink_ranges {
+            if !range_is_covered_by_ranges(range, &current.bucket_ranges) {
+                return Err(Error::ConfigError(format!(
+                    "Shrink range {}..={} is outside current owned ranges",
+                    range.start(),
+                    range.end()
+                )));
+            }
+        }
+        let updated_ranges = subtract_ranges(&current.bucket_ranges, &shrink_ranges);
+        if updated_ranges.is_empty() {
+            return Err(Error::ConfigError(
+                "cannot shrink all owned bucket ranges".to_string(),
+            ));
+        }
+        let tree_ranges = current.multi_lsm_version.bucket_ranges();
+        let tree_versions = current.multi_lsm_version.tree_versions_cloned();
+        if tree_ranges.len() != tree_versions.len() {
+            return Err(Error::InvalidState(format!(
+                "LSM tree version count {} does not match range count {}",
+                tree_versions.len(),
+                tree_ranges.len()
+            )));
+        }
+        let mut updated_tree_ranges = Vec::new();
+        let mut updated_tree_versions = Vec::new();
+        for (tree_range, tree_version) in tree_ranges.into_iter().zip(tree_versions.into_iter()) {
+            for kept_range in subtract_range_by_cuts(&tree_range, &shrink_ranges) {
+                updated_tree_ranges.push(kept_range.clone());
+                if kept_range == tree_range {
+                    updated_tree_versions.push(tree_version.clone());
+                } else {
+                    updated_tree_versions.push(LSMTree::clone_version_for_range(
+                        tree_version.as_ref(),
+                        &kept_range,
+                    ));
+                }
+            }
+        }
+        if updated_tree_ranges.is_empty() {
+            return Err(Error::ConfigError(
+                "cannot shrink all LSM tree ranges".to_string(),
+            ));
+        }
+        let updated_multi_lsm = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+            current.multi_lsm_version.total_buckets(),
+            &updated_tree_ranges,
+            updated_tree_versions,
+        )?;
+        self.db_state.store(DbState {
+            seq_id: current.seq_id,
+            bucket_ranges: updated_ranges.clone(),
+            multi_lsm_version: updated_multi_lsm,
+            vlog_version: current.vlog_version.clone(),
+            active: current.active.clone(),
+            immutables: current.immutables.clone(),
+            suggested_base_snapshot_id: None,
+        });
+        drop(guard);
+        self.snapshot_manager.set_bucket_ranges(updated_ranges);
+        Ok(snapshot_id)
+    }
 }
 
 #[cfg(test)]
@@ -510,6 +641,77 @@ mod tests {
 
         drop(target);
         drop(source);
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_shrink_bucket_removes_data_from_kicked_range() {
+        let root = "/tmp/db_shrink_bucket";
+        cleanup_test_root(root);
+        let config = Config {
+            total_buckets: 8,
+            memtable_capacity: 128,
+            memtable_buffer_count: 2,
+            num_columns: 1,
+            sst_bloom_filter_enabled: true,
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            ..Config::default()
+        };
+        let db = Db::open(config.clone(), vec![0u16..=3u16]).unwrap();
+        db.put(1, b"k1", 0, b"v1").unwrap();
+        db.put(2, b"k2", 0, b"v2").unwrap();
+
+        let shrink_snapshot = db.shrink_bucket(vec![2u16..=3u16]).unwrap();
+        let bucket_input = db.bucket_snapshot_input(shrink_snapshot).unwrap();
+        assert_eq!(bucket_input.ranges, vec![0u16..=1u16]);
+
+        let kept = db.get(1, b"k1", &ReadOptions::default()).unwrap().unwrap();
+        assert_eq!(kept[0].as_deref(), Some(&b"v1"[..]));
+        let removed = db.get(2, b"k2", &ReadOptions::default()).unwrap();
+        assert!(removed.is_none());
+
+        let metrics = Arc::new(MetricsManager::new("shrink-manifest".to_string()));
+        let file_manager = Arc::new(FileManager::from_config(&config, db.id(), metrics).unwrap());
+        let manifest =
+            crate::snapshot::load_manifest_for_snapshot(&file_manager, shrink_snapshot).unwrap();
+        assert_eq!(manifest.bucket_ranges, vec![0u16..=3u16]);
+
+        drop(db);
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_shrink_bucket_rejects_outside_range() {
+        let root = "/tmp/db_shrink_bucket_outside";
+        cleanup_test_root(root);
+        let config = Config {
+            total_buckets: 8,
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            ..Config::default()
+        };
+        let db = Db::open(config, vec![0u16..=1u16]).unwrap();
+        let err = db.shrink_bucket(vec![2u16..=2u16]).unwrap_err();
+        assert!(matches!(err, Error::ConfigError(_)));
+        drop(db);
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_shrink_bucket_rejects_removing_all_ranges() {
+        let root = "/tmp/db_shrink_bucket_all";
+        cleanup_test_root(root);
+        let config = Config {
+            total_buckets: 8,
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            ..Config::default()
+        };
+        let db = Db::open(config, vec![0u16..=1u16]).unwrap();
+        let err = db.shrink_bucket(vec![0u16..=1u16]).unwrap_err();
+        assert!(matches!(err, Error::ConfigError(_)));
+        drop(db);
         cleanup_test_root(root);
     }
 }
