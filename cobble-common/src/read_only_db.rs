@@ -63,6 +63,7 @@ impl ReadOnlyDb {
         block_cache: Option<BlockCache>,
         metrics_manager: Arc<MetricsManager>,
     ) -> Result<Self> {
+        let config = config.normalize_volume_paths()?;
         metrics_registry::init_metrics();
         let file_manager =
             FileManager::from_config(&config, &snapshot_db_id, Arc::clone(&metrics_manager))?;

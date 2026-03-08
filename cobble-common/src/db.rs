@@ -185,6 +185,7 @@ impl Db {
                 )));
             }
         }
+        let config = config.normalize_volume_paths()?;
         init_logging(&config);
         metrics_registry::init_metrics();
         let id = Uuid::new_v4().to_string();
@@ -452,12 +453,14 @@ impl Db {
 
     /// Open a read-only view from a snapshot manifest.
     pub fn open_read_only(config: Config, snapshot_id: u64, db_id: String) -> Result<ReadOnlyDb> {
+        let config = config.normalize_volume_paths()?;
         init_logging(&config);
         ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id)
     }
 
     /// Open a writable database initialized from a snapshot manifest.
     pub fn open_from_snapshot(config: Config, snapshot_id: u64, db_id: String) -> Result<Self> {
+        let config = config.normalize_volume_paths()?;
         init_logging(&config);
         metrics_registry::init_metrics();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
@@ -524,6 +527,7 @@ impl Db {
 
     /// Resume a writable database from an existing folder by loading all snapshot manifests.
     pub fn resume(config: Config, db_id: String) -> Result<Self> {
+        config.normalize_volume_paths()?;
         init_logging(&config);
         metrics_registry::init_metrics();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));

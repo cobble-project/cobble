@@ -1,5 +1,7 @@
 use crate::SstCompressionAlgorithm;
+use crate::error::Result;
 use crate::time::TimeProviderKind;
+use crate::util::normalize_storage_path_to_url;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -404,6 +406,16 @@ impl Default for Config {
 }
 
 impl Config {
+    pub(crate) fn normalize_volume_paths(&self) -> Result<Self> {
+        let mut copied = self.clone();
+        for volume in &mut copied.volumes {
+            volume.base_dir = normalize_storage_path_to_url(&volume.base_dir)?;
+        }
+        Ok(copied)
+    }
+}
+
+impl Config {
     pub fn from_path(path: impl AsRef<std::path::Path>) -> crate::error::Result<Self> {
         let mut builder = ::config::Config::builder();
         let path = path.as_ref();
@@ -604,5 +616,14 @@ mod tests {
         assert!(volume.supports(VolumeUsageKind::Meta));
         assert!(volume.supports(VolumeUsageKind::PrimaryDataPriorityHigh));
         assert!(volume.supports(VolumeUsageKind::Cache));
+    }
+
+    #[test]
+    fn test_normalize_volume_paths_converts_local_absolute_path() {
+        let mut config = Config::default();
+        let local = std::env::temp_dir().join("cobble-config-normalize");
+        config.volumes = VolumeDescriptor::single_volume(local.to_string_lossy().to_string());
+        let config = config.normalize_volume_paths().unwrap();
+        assert!(config.volumes[0].base_dir.starts_with("file://"));
     }
 }

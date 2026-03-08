@@ -1,6 +1,9 @@
 use crate::Config;
+use crate::error::{Error, Result};
 use bytes::Bytes;
 use std::ops::RangeInclusive;
+use std::path::{Path, PathBuf};
+use url::Url;
 
 /// Creates a `Bytes` instance that shares the same underlying data as the input slice.
 #[inline]
@@ -65,6 +68,90 @@ pub(crate) fn range_is_covered_by_ranges(
 ) -> bool {
     (*range.start()..=*range.end())
         .all(|bucket| coverage.iter().any(|source| source.contains(&bucket)))
+}
+
+/// Normalizes a storage path input into a canonical URL string.
+///
+/// Rules:
+/// - If input is already a valid URL, return normalized URL text.
+/// - If input is a local filesystem path, convert it to a `file://` URL.
+/// - Relative local paths are converted to absolute paths before URL conversion.
+pub(crate) fn normalize_storage_path_to_url(input: impl AsRef<str>) -> Result<String> {
+    let trimmed = input.as_ref().trim();
+    if trimmed.is_empty() {
+        return Err(Error::ConfigError(
+            "storage path must not be empty".to_string(),
+        ));
+    }
+    if trimmed.contains("://") {
+        let url = Url::parse(trimmed).map_err(|err| {
+            Error::ConfigError(format!("Invalid storage URL {}: {}", trimmed, err))
+        })?;
+        if url.scheme().eq_ignore_ascii_case("file") {
+            let path = url
+                .to_file_path()
+                .map_err(|_| Error::ConfigError(format!("Invalid file URL path: {}", trimmed)))?;
+            let normalized = Url::from_file_path(&path).map_err(|_| {
+                Error::ConfigError(format!("Failed to normalize file URL path: {}", trimmed))
+            })?;
+            return Ok(normalized.to_string());
+        }
+        return Ok(url.to_string());
+    }
+
+    let candidate = Path::new(trimmed);
+    let absolute: PathBuf = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| {
+                Error::ConfigError(format!("Failed to resolve current directory: {}", err))
+            })?
+            .join(candidate)
+    };
+    let file_url = Url::from_file_path(&absolute).map_err(|_| {
+        Error::ConfigError(format!(
+            "Failed to convert local path to file URL: {}",
+            trimmed
+        ))
+    })?;
+    Ok(file_url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_storage_path_to_url;
+
+    #[test]
+    fn test_normalize_storage_path_to_url_keeps_remote_url() {
+        let input = "s3://bucket-name/prefix";
+        let normalized = normalize_storage_path_to_url(input).unwrap();
+        assert_eq!(normalized, input);
+    }
+
+    #[test]
+    fn test_normalize_storage_path_to_url_file_url_roundtrip() {
+        let input = "file:///tmp/cobble";
+        let normalized = normalize_storage_path_to_url(input).unwrap();
+        assert!(normalized.starts_with("file:///tmp/cobble"));
+    }
+
+    #[test]
+    fn test_normalize_storage_path_to_url_local_path_to_file_url() {
+        let path = std::env::temp_dir().join("cobble-local-path");
+        let path_str = path.to_string_lossy();
+        let normalized = normalize_storage_path_to_url(&path_str).unwrap();
+        assert!(normalized.starts_with("file://"));
+    }
+
+    #[test]
+    fn test_normalize_storage_path_to_url_relative_path_becomes_absolute_file_url() {
+        let normalized = normalize_storage_path_to_url("./cobble-relative-path").unwrap();
+        assert!(normalized.starts_with("file://"));
+        let parsed = url::Url::parse(&normalized).unwrap();
+        let local = parsed.to_file_path().unwrap();
+        assert!(local.is_absolute());
+    }
 }
 
 pub(crate) fn subtract_ranges(

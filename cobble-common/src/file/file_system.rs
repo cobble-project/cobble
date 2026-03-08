@@ -4,6 +4,7 @@ use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::file::opendal_fs::OpendalFileSystem;
 #[cfg(unix)]
 use crate::file::posix_fs::PosixFileSystem;
+use crate::util::normalize_storage_path_to_url;
 use dashmap::DashMap;
 use std::sync::Arc;
 use url::Url;
@@ -44,7 +45,8 @@ impl FileSystemRegistry {
     }
 
     pub fn get_or_register(&self, name: impl AsRef<str>) -> Result<Arc<dyn FileSystem>> {
-        let url = Url::parse(name.as_ref())?;
+        let normalized = normalize_storage_path_to_url(name.as_ref())?;
+        let url = Url::parse(&normalized)?;
         let name = url.to_string();
         if let Some(fs) = self.registered.get(&name) {
             return Ok(Arc::clone(&fs));
@@ -63,7 +65,8 @@ impl FileSystemRegistry {
     }
 
     pub fn get_or_register_volume(&self, volume: &VolumeDescriptor) -> Result<Arc<dyn FileSystem>> {
-        let url = Url::parse(volume.base_dir.as_str())?;
+        let normalized = normalize_storage_path_to_url(&volume.base_dir)?;
+        let url = Url::parse(&normalized)?;
         let name = url.to_string();
         if let Some(fs) = self.registered.get(&name) {
             return Ok(Arc::clone(&fs));
@@ -93,6 +96,7 @@ impl FileSystemRegistry {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::path::PathBuf;
     #[test]
     fn test_filesystem_registry() {
         let registry = FileSystemRegistry::new();
@@ -101,5 +105,18 @@ mod test {
         let fs2 = registry.get_or_register("file:///tmp/checkpoint");
         assert!(fs2.is_ok());
         assert!(Arc::ptr_eq(&fs1.unwrap(), &fs2.unwrap()));
+    }
+
+    #[test]
+    fn test_filesystem_registry_normalizes_absolute_local_path() {
+        let registry = FileSystemRegistry::new();
+        let path = std::env::temp_dir().join("cobble-filesystem-registry-normalize");
+        let path_str = path.to_string_lossy().to_string();
+        let url = url::Url::from_file_path(PathBuf::from(&path_str))
+            .expect("absolute local path should convert to file URL")
+            .to_string();
+        let from_path = registry.get_or_register(&path_str).unwrap();
+        let from_url = registry.get_or_register(&url).unwrap();
+        assert!(Arc::ptr_eq(&from_path, &from_url));
     }
 }

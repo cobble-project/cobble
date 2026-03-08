@@ -17,6 +17,7 @@ use crate::file::file_system::{FileSystem, FileSystemRegistry};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
 use crate::lru::LruCache;
 use crate::metrics_manager::MetricsManager;
+use crate::util::normalize_storage_path_to_url;
 use bytes::Bytes;
 use dashmap::DashMap;
 use metrics::{Gauge, gauge};
@@ -558,18 +559,19 @@ impl FileManager {
 
     /// Resolves a file path to the corresponding data volume and relative path.
     /// This is used when registering existing files to determine which volume they belong to.
-    fn resolve_volume_path<'a>(&self, path: &'a str) -> Result<(&DataVolume, &'a str)> {
+    fn resolve_volume_path(&self, path: &str) -> Result<(&DataVolume, String)> {
+        let normalized = normalize_storage_path_to_url(path)?;
         for volume in &self.data_volumes {
             let Some(base_dir) = volume.state.base_dir() else {
                 continue;
             };
-            if path.starts_with(base_dir) {
-                let relative = self.trim_volume_base_dir(path, base_dir);
-                return Ok((volume, relative));
+            if normalized.starts_with(base_dir) {
+                let relative = self.trim_volume_base_dir(&normalized, base_dir);
+                return Ok((volume, relative.to_string()));
             }
         }
         let volume = self.test_existence_for_path(path)?;
-        Ok((volume, path))
+        Ok((volume, path.to_string()))
     }
     /// Creates a new FileManager with the given data volumes and options.
     ///
@@ -651,11 +653,12 @@ impl FileManager {
             }
             if let Some(priority) = priority {
                 let fs = registry.get_or_register_volume(volume)?;
+                let normalized_base_dir = normalize_storage_path_to_url(&volume.base_dir)?;
                 data_volumes.push(DataVolume {
                     state: Arc::new(VolumeState::new(
                         fs,
                         volume.size_limit,
-                        Some(volume.base_dir.clone()),
+                        Some(normalized_base_dir),
                     )),
                     priority,
                 });
@@ -795,7 +798,7 @@ impl FileManager {
         {
             let tracked = self.data_files.entry(file_id).or_insert_with(|| {
                 Arc::new(TrackedFile::new(
-                    relative_path.to_string(),
+                    relative_path.clone(),
                     Arc::clone(&fs),
                     Some(Arc::clone(&volume.state)),
                 ))
@@ -1016,7 +1019,7 @@ impl FileManager {
         let (volume, relative_path) = self.resolve_volume_path(path)?;
         let fs = Arc::clone(&volume.state.fs);
         let tracked = Arc::new(TrackedFile::readonly(
-            relative_path.to_string(),
+            relative_path,
             Arc::clone(&fs),
             Some(Arc::clone(&volume.state)),
         ));

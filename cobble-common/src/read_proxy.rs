@@ -81,7 +81,8 @@ impl ReadProxy {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
             ..Config::default()
-        };
+        }
+        .normalize_volume_paths()?;
         let registry = FileSystemRegistry::new();
         let volumes = if config.volumes.is_empty() {
             return Err(Error::ConfigError("No volumes configured".to_string()));
@@ -125,7 +126,8 @@ impl ReadProxy {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
             ..Config::default()
-        };
+        }
+        .normalize_volume_paths()?;
         let registry = FileSystemRegistry::new();
         let volumes = if config.volumes.is_empty() {
             return Err(Error::ConfigError("No volumes configured".to_string()));
