@@ -18,6 +18,7 @@ use log::debug;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 use crate::db_state::{DbState, DbStateHandle, bucket_range_len};
 use crate::ttl::TTLProvider;
@@ -284,7 +285,7 @@ impl LSMTree {
 
     pub(crate) fn add_level0_files(
         &self,
-        to_remove_memtable_seq: u64,
+        to_remove_memtable_id: Uuid,
         files_by_tree: Vec<(usize, Arc<DataFile>)>,
         vlog_edit: Option<VlogEdit>,
     ) -> Result<Arc<DbState>> {
@@ -347,7 +348,7 @@ impl LSMTree {
         Ok(self.apply_edit_locked(&mut state, edits, move |db_state| {
             db_state
                 .immutables
-                .retain(|imm| imm.seq != to_remove_memtable_seq);
+                .retain(|imm| imm.id != to_remove_memtable_id);
             if let Some(edit) = vlog_edit {
                 db_state.vlog_version = db_state.vlog_version.apply_edit(edit);
             }
@@ -745,7 +746,6 @@ impl LSMTree {
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
         terminal_mask: Option<&mut [u8]>,
-        max_seq: Option<u64>,
     ) -> Result<Vec<Value>> {
         let snapshot = self.db_state.load();
         self.get_with_snapshot(
@@ -758,7 +758,6 @@ impl LSMTree {
             selected_columns,
             selected_mask,
             terminal_mask,
-            max_seq,
         )
     }
 
@@ -774,7 +773,6 @@ impl LSMTree {
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
         terminal_mask: Option<&mut [u8]>,
-        max_seq: Option<u64>,
     ) -> Result<Vec<Value>> {
         let Some(version) = snapshot.multi_lsm_version.version_for_bucket(bucket) else {
             return Ok(Vec::new());
@@ -788,7 +786,6 @@ impl LSMTree {
             selected_columns,
             selected_mask,
             terminal_mask,
-            max_seq,
         )
     }
 
@@ -803,7 +800,6 @@ impl LSMTree {
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
         mut terminal_mask: Option<&mut [u8]>,
-        max_seq: Option<u64>,
     ) -> Result<Vec<Value>> {
         let num_columns = target_schema.num_columns();
         let mut values = Vec::new();
@@ -841,7 +837,6 @@ impl LSMTree {
                         selected_mask,
                         terminal_mask.as_deref_mut(),
                         &mut decode_mask,
-                        max_seq,
                         &mut values,
                     )?;
                     if !should_continue {
@@ -865,7 +860,6 @@ impl LSMTree {
                         selected_mask,
                         terminal_mask.as_deref_mut(),
                         &mut decode_mask,
-                        max_seq,
                         &mut values,
                     )?;
                     if !should_continue {
@@ -977,7 +971,6 @@ impl LSMTree {
         selected_mask: Option<&[u8]>,
         mut terminal_mask: Option<&mut [u8]>,
         decode_mask: &mut [u8],
-        max_seq: Option<u64>,
         out_values: &mut Vec<Value>,
     ) -> Result<bool> {
         let num_columns = target_schema.num_columns();
@@ -987,11 +980,6 @@ impl LSMTree {
         let mask_size = decode_mask.len();
         if let Some(bucket) = key_bucket(encoded_key)
             && !file.effective_bucket_range.contains(&bucket)
-        {
-            return Ok(true);
-        }
-        if let Some(max_seq) = max_seq
-            && file.seq >= max_seq
         {
             return Ok(true);
         }
@@ -1099,7 +1087,6 @@ mod tests {
                 end_key: end.to_vec(),
                 file_id: id,
                 tracked_id: TrackedFileId::detached(id),
-                seq: 0,
                 schema_id: 0,
                 size: 0, // Test file, size doesn't matter
                 bucket_range: bucket_range.clone(),
@@ -1122,7 +1109,6 @@ mod tests {
                 end_key: end.to_vec(),
                 file_id: id,
                 tracked_id: TrackedFileId::detached(id),
-                seq: 0,
                 schema_id: 0,
                 size,
                 bucket_range: bucket_range.clone(),
@@ -1146,15 +1132,14 @@ mod tests {
 
     fn create_test_sst(
         file_manager: &Arc<FileManager>,
-        seq: u64,
+        _seq: u64,
         entries: Vec<(&[u8], &[u8])>,
     ) -> Result<Arc<DataFile>> {
-        create_test_sst_in_bucket(file_manager, seq, 0, entries)
+        create_test_sst_in_bucket(file_manager, 0, entries)
     }
 
     fn create_test_sst_in_bucket(
         file_manager: &Arc<FileManager>,
-        seq: u64,
         bucket: u16,
         entries: Vec<(&[u8], &[u8])>,
     ) -> Result<Arc<DataFile>> {
@@ -1181,7 +1166,6 @@ mod tests {
             end_key: last_key,
             file_id,
             tracked_id: TrackedFileId::new(file_manager, file_id),
-            seq,
             schema_id: 0,
             size: file_size,
             bucket_range: bucket_range.clone(),
@@ -1469,14 +1453,12 @@ mod tests {
         let num_columns = 1;
         let file_bucket0 = create_test_sst_in_bucket(
             &file_manager,
-            1,
             0,
             vec![(b"k", &make_value_bytes(b"v0", num_columns))],
         )
         .unwrap();
         let file_bucket1 = create_test_sst_in_bucket(
             &file_manager,
-            2,
             1,
             vec![(b"k", &make_value_bytes(b"v1", num_columns))],
         )
@@ -1528,7 +1510,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
             )
             .unwrap();
         let bucket1_values = lsm_tree
@@ -1538,7 +1519,6 @@ mod tests {
                 encoded_bucket1.as_ref(),
                 schema.as_ref(),
                 &schema_manager,
-                None,
                 None,
                 None,
                 None,
@@ -1561,7 +1541,6 @@ mod tests {
                 encoded_bucket0.as_ref(),
                 schema.as_ref(),
                 &schema_manager,
-                None,
                 None,
                 None,
                 None,
@@ -1827,8 +1806,8 @@ mod tests {
 
     #[test]
     #[serial_test::serial(file)]
-    fn test_lsm_get_respects_max_seq() {
-        let root = "/tmp/lsm_get_max_seq";
+    fn test_lsm_get_tiered_returns_newest_first() {
+        let root = "/tmp/lsm_get_tiered_order";
         cleanup_test_root(root);
         let registry = FileSystemRegistry::new();
         let fs = registry
@@ -1878,74 +1857,6 @@ mod tests {
                 encoded_key.as_ref(),
                 schema.as_ref(),
                 schema_manager.as_ref(),
-                None,
-                None,
-                None,
-                Some(2),
-            )
-            .unwrap();
-        assert_eq!(value.len(), 1);
-        assert_eq!(
-            value[0].columns()[0].as_ref().unwrap().data().as_ref(),
-            b"old"
-        );
-        cleanup_test_root(root);
-    }
-
-    #[test]
-    #[serial_test::serial(file)]
-    fn test_lsm_get_without_max_seq() {
-        let root = "/tmp/lsm_get_no_max_seq";
-        cleanup_test_root(root);
-        let registry = FileSystemRegistry::new();
-        let fs = registry
-            .get_or_register(format!("file://{}", root))
-            .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
-        let file_manager =
-            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
-        let num_columns = 1;
-        let older = create_test_sst(
-            &file_manager,
-            1,
-            vec![(b"k1", &make_value_bytes(b"old", num_columns))],
-        )
-        .unwrap();
-        let newer = create_test_sst(
-            &file_manager,
-            3,
-            vec![(b"k1", &make_value_bytes(b"new", num_columns))],
-        )
-        .unwrap();
-        let db_state = Arc::new(DbStateHandle::new());
-        let lsm_version = LSMTreeVersion {
-            levels: vec![Level {
-                ordinal: 0,
-                tiered: true,
-                files: vec![older, newer],
-            }],
-        };
-        db_state.store(DbState {
-            seq_id: 0,
-            bucket_ranges: Vec::new(),
-            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
-            vlog_version: VlogVersion::new(),
-            active: None,
-            immutables: Vec::new().into(),
-            suggested_base_snapshot_id: None,
-        });
-        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
-        let schema_manager = Arc::new(crate::schema::SchemaManager::new(num_columns));
-        let schema = schema_manager.latest_schema();
-        let encoded_key = encode_key(&crate::r#type::Key::new(0, b"k1".to_vec()));
-        let value = lsm_tree
-            .get(
-                &file_manager,
-                0,
-                encoded_key.as_ref(),
-                schema.as_ref(),
-                schema_manager.as_ref(),
-                None,
                 None,
                 None,
                 None,

@@ -44,8 +44,6 @@ pub struct DataFile {
     pub file_id: FileId,
     /// Handle for removing the file when LSM drops references.
     pub(crate) tracked_id: Arc<TrackedFileId>,
-    /// Maximum sequence id for data contained in this file.
-    pub seq: u64,
     /// Schema id used when this data file was written.
     pub schema_id: u64,
     /// Size of the file in bytes.
@@ -81,7 +79,6 @@ impl DataFile {
             end_key: self.end_key.clone(),
             file_id: self.file_id,
             tracked_id: Arc::clone(&self.tracked_id),
-            seq: self.seq,
             schema_id: self.schema_id,
             size: self.size,
             bucket_range: self.bucket_range.clone(),

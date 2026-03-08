@@ -341,14 +341,6 @@ impl CompactionExecutor {
         }
         task.metrics.read_bytes_total.increment(read_bytes);
 
-        let max_seq = task
-            .sorted_runs
-            .iter()
-            .flat_map(|run| run.files().iter())
-            .map(|file| file.seq)
-            .max()
-            .unwrap_or(0);
-
         // Create merging iterator
         let merging_iter = MergingIterator::new(all_iters);
         let input_has_separated_values = task
@@ -414,7 +406,6 @@ impl CompactionExecutor {
                         end_key: last_key,
                         file_id,
                         tracked_id: TrackedFileId::new(&task.file_manager, file_id),
-                        seq: max_seq,
                         schema_id: target_schema.version(),
                         size: file_size,
                         bucket_range: bucket_range.clone(),
@@ -458,7 +449,6 @@ impl CompactionExecutor {
                 end_key: last_key,
                 file_id,
                 tracked_id: TrackedFileId::new(&task.file_manager, file_id),
-                seq: max_seq,
                 schema_id: target_schema.version(),
                 size: file_size,
                 bucket_range: bucket_range.clone(),
@@ -597,7 +587,6 @@ mod tests {
             end_key: last_key,
             file_id,
             tracked_id: TrackedFileId::new(file_manager, file_id),
-            seq: 0,
             schema_id: 0,
             size: file_size,
             bucket_range: bucket_range.clone(),
@@ -1180,7 +1169,6 @@ mod tests {
             end_key: last_key,
             file_id,
             tracked_id: TrackedFileId::new(&file_manager, file_id),
-            seq: 0,
             schema_id: 0,
             size: file_size,
             bucket_range: bucket_range.clone(),

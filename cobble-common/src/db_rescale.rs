@@ -238,12 +238,6 @@ impl Db {
                 source_tree_ranges.len()
             )));
         }
-        let imported_max_seq = source_tree_versions
-            .iter()
-            .flat_map(|version| version.levels.iter())
-            .flat_map(|level| level.files.iter().map(|file| file.seq))
-            .max()
-            .unwrap_or(0);
         let mut imported_ranges = Vec::new();
         let mut imported_versions = Vec::new();
         for expand_range in &expand_ranges {
@@ -312,16 +306,12 @@ impl Db {
         drop(guard);
 
         // Step 8: Replay source active memtable snapshot segments into L0 with a file-level VLOG seq offset.
-        self.memtable_manager
-            .ensure_next_seq_at_least(imported_max_seq.saturating_add(1));
         self.snapshot_manager.set_bucket_ranges(updated_ranges);
         self.restore_active_memtable_snapshot_to_l0_with_source(
             &source_file_manager,
             &source_manifest.active_memtable_data,
             vlog_file_seq_offset,
         )?;
-        self.memtable_manager
-            .ensure_active_seq_at_least(self.memtable_manager.next_seq());
         Ok(source_snapshot_id)
     }
 }

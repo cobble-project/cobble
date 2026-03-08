@@ -67,7 +67,6 @@ pub(crate) struct ManifestLevel {
 pub(crate) struct ManifestFile {
     pub(crate) file_id: u64,
     pub(crate) file_type: String,
-    pub(crate) seq: u64,
     pub(crate) schema_id: u64,
     pub(crate) size: usize,
     pub(crate) start_key: String,
@@ -396,7 +395,6 @@ fn manifest_file_from_data_file(file: &DataFile, file_manager: &FileManager) -> 
     ManifestFile {
         file_id: file.file_id,
         file_type: file.file_type.as_str().to_string(),
-        seq: file.seq,
         schema_id: file.schema_id,
         size: file.size,
         start_key: to_hex(&file.start_key),
@@ -565,7 +563,6 @@ pub(crate) fn build_tree_versions_from_manifest_untracked(
                     end_key,
                     file_id: file.file_id,
                     tracked_id: TrackedFileId::detached(file.file_id),
-                    seq: file.seq,
                     schema_id: file.schema_id,
                     size: file.size,
                     bucket_range: file.bucket_range_start..=file.bucket_range_end,
@@ -631,7 +628,6 @@ pub(crate) fn build_tree_versions_from_manifest(
                     end_key,
                     file_id: file.file_id,
                     tracked_id,
-                    seq: file.seq,
                     schema_id: file.schema_id,
                     size: file.size,
                     bucket_range: file.bucket_range_start..=file.bucket_range_end,

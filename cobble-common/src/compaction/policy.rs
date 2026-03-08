@@ -543,7 +543,6 @@ mod tests {
             end_key: end.to_vec(),
             file_id: id,
             tracked_id: TrackedFileId::detached(id),
-            seq: 0,
             schema_id: 0,
             size,
             bucket_range: bucket_range.clone(),

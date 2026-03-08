@@ -10,8 +10,8 @@ pub(crate) struct ActiveMemtableSnapshotData {
     pub(crate) path: String,
     /// Active memtable implementation type this segment belongs to.
     pub(crate) memtable_type: MemtableType,
-    /// Active memtable sequence id this segment belongs to.
-    pub(crate) memtable_seq: u64,
+    /// Active memtable identity this segment belongs to.
+    pub(crate) memtable_id: String,
     /// Inclusive start offset of KV bytes in memtable data stream.
     pub(crate) start_offset: u64,
     /// Exclusive end offset of KV bytes in memtable data stream.
@@ -30,7 +30,7 @@ pub(super) fn collect_active_memtable_snapshot_segments(
     snapshots: &BTreeMap<u64, Arc<DbSnapshot>>,
     base_snapshot_id: Option<u64>,
     memtable_type: MemtableType,
-    memtable_seq: u64,
+    memtable_id: &str,
 ) -> Vec<ActiveMemtableSnapshotData> {
     let mut current = base_snapshot_id;
     let mut visited = HashSet::new();
@@ -46,7 +46,7 @@ pub(super) fn collect_active_memtable_snapshot_segments(
         };
         let mut matched_in_snapshot = false;
         for segment in snapshot.active_memtable_data.iter().rev() {
-            if segment.memtable_type != memtable_type || segment.memtable_seq != memtable_seq {
+            if segment.memtable_type != memtable_type || segment.memtable_id != memtable_id {
                 continue;
             }
             if segment.end_offset < segment.start_offset {

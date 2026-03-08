@@ -178,7 +178,6 @@ impl ReadOnlyDb {
             options.columns(),
             selected_mask,
             None,
-            None,
         )?;
 
         let values: Vec<Value> = lsm_values

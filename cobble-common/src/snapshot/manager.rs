@@ -214,14 +214,14 @@ impl SnapshotManager {
         &self,
         base_snapshot_id: Option<u64>,
         memtable_type: MemtableType,
-        memtable_seq: u64,
+        memtable_id: &str,
     ) -> Vec<ActiveMemtableSnapshotData> {
         let state = self.state.lock().unwrap();
         memtable::collect_active_memtable_snapshot_segments(
             &state.snapshots,
             base_snapshot_id,
             memtable_type,
-            memtable_seq,
+            memtable_id,
         )
     }
 
@@ -636,7 +636,6 @@ fn clone_lsm_tree_version_untracked(version: &LSMTreeVersion) -> LSMTreeVersion 
                             end_key: file.end_key.clone(),
                             file_id: file.file_id,
                             tracked_id: TrackedFileId::detached(file.file_id),
-                            seq: file.seq,
                             schema_id: file.schema_id,
                             size: file.size,
                             bucket_range: file.bucket_range.clone(),

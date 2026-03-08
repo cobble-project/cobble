@@ -45,19 +45,19 @@ fn schema_file_path(root: &str, db_id: &str, schema_id: u64) -> String {
 
 fn active_snapshot_segments_from_manifest(
     manifest_json: &JsonValue,
-) -> Option<Vec<(String, String, u64, u64, u64, Option<u64>, u64, u64, u64)>> {
+) -> Option<Vec<(String, String, String, u64, u64, Option<u64>, u64, u64, u64)>> {
     let segments = manifest_json.get("active_memtable_data")?.as_array()?;
     let mut out = Vec::with_capacity(segments.len());
     for segment in segments {
         let path = segment.get("path")?.as_str()?.to_string();
         let memtable_type = segment.get("memtable_type")?.as_str()?.to_string();
-        let memtable_seq = segment.get("memtable_seq")?.as_u64()?;
+        let memtable_id = segment.get("memtable_id")?.as_str()?.to_string();
         let start_offset = segment.get("start_offset")?.as_u64()?;
         let end_offset = segment.get("end_offset")?.as_u64()?;
         out.push((
             path,
             memtable_type,
-            memtable_seq,
+            memtable_id,
             start_offset,
             end_offset,
             segment.get("vlog_file_seq").and_then(|v| v.as_u64()),
@@ -711,7 +711,6 @@ fn test_db_snapshot_creates_manifest() {
     let snapshot_id = db.snapshot().unwrap();
     let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     assert!(manifest.contains("\"id\":"));
-    assert!(manifest.contains("\"seq_id\":"));
     assert!(manifest.contains("\"tree_levels\""));
     assert!(manifest.contains("\"lsm_tree_bucket_ranges\""));
     assert!(manifest.contains("\"path\":\""));
@@ -1404,7 +1403,7 @@ fn test_db_snapshot_uses_active_memtable_incremental_data_when_under_threshold()
     let first_segments = active_snapshot_segments_from_manifest(&first_manifest_json)
         .expect("missing active memtable snapshot data");
     assert_eq!(first_segments.len(), 1);
-    let (first_path, first_type, first_seq, first_start, first_end, _, _, _, _) =
+    let (first_path, first_type, first_memtable_id, first_start, first_end, _, _, _, _) =
         &first_segments[0];
     assert!(!first_type.is_empty());
     assert_eq!(*first_start, 0);
@@ -1420,16 +1419,25 @@ fn test_db_snapshot_uses_active_memtable_incremental_data_when_under_threshold()
     let second_segments = active_snapshot_segments_from_manifest(&second_manifest_json)
         .expect("missing second active memtable snapshot data");
     assert_eq!(second_segments.len(), 2);
-    let (_, second_first_type, second_first_seq, second_first_start, second_first_end, _, _, _, _) =
-        &second_segments[0];
+    let (
+        _,
+        second_first_type,
+        second_first_memtable_id,
+        second_first_start,
+        second_first_end,
+        _,
+        _,
+        _,
+        _,
+    ) = &second_segments[0];
     assert_eq!(*second_first_type, *first_type);
-    assert_eq!(*second_first_seq, *first_seq);
+    assert_eq!(second_first_memtable_id, first_memtable_id);
     assert_eq!(*second_first_start, *first_start);
     assert_eq!(*second_first_end, *first_end);
-    let (second_path, second_type, second_seq, second_start, second_end, _, _, _, _) =
+    let (second_path, second_type, second_memtable_id, second_start, second_end, _, _, _, _) =
         &second_segments[1];
     assert_eq!(*second_type, *first_type);
-    assert_eq!(*second_seq, *first_seq);
+    assert_eq!(second_memtable_id, first_memtable_id);
     assert_eq!(*second_start, *first_end);
     assert!(second_end > second_start);
     let second_file = format!("{}/{}/{}", root, db.id(), second_path);
@@ -1475,7 +1483,7 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
     let (
         first_path,
         first_type,
-        first_seq,
+        first_memtable_id,
         first_data_start,
         first_data_end,
         first_vlog_file_seq,
@@ -1518,7 +1526,7 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
     let (
         _,
         second_first_type,
-        second_first_seq,
+        second_first_memtable_id,
         second_first_data_start,
         second_first_data_end,
         second_first_vlog_file_seq,
@@ -1527,7 +1535,7 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
         second_first_vlog_file_offset,
     ) = &second_segments[0];
     assert_eq!(*second_first_type, *first_type);
-    assert_eq!(*second_first_seq, *first_seq);
+    assert_eq!(second_first_memtable_id, first_memtable_id);
     assert_eq!(*second_first_data_start, *first_data_start);
     assert_eq!(*second_first_data_end, *first_data_end);
     assert_eq!(*second_first_vlog_file_seq, *first_vlog_file_seq);
@@ -1537,7 +1545,7 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
     let (
         second_path,
         second_type,
-        second_seq,
+        second_memtable_id,
         second_data_start,
         second_data_end,
         second_vlog_file_seq,
@@ -1546,7 +1554,7 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
         second_vlog_file_offset,
     ) = &second_segments[1];
     assert_eq!(*second_type, *first_type);
-    assert_eq!(*second_seq, *first_seq);
+    assert_eq!(second_memtable_id, first_memtable_id);
     assert_eq!(*second_data_start, *first_data_end);
     assert!(second_data_end > second_data_start);
     assert_eq!(*second_vlog_file_seq, *first_vlog_file_seq);

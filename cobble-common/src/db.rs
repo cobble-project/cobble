@@ -470,15 +470,13 @@ impl Db {
             config.num_columns,
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
-        let max_file_seq = manifest
-            .tree_levels
+        let max_vlog_file_seq = manifest
+            .vlog_files
             .iter()
-            .flat_map(|levels| levels.iter())
-            .flat_map(|level| level.files.iter().map(|file| file.seq))
-            .chain(manifest.vlog_files.iter().map(|file| file.file_seq as u64))
+            .map(|file| file.file_seq as u64)
             .max()
             .unwrap_or(0);
-        let max_seq = manifest.seq_id;
+        let restored_seq_id = manifest.seq_id;
         if manifest.bucket_ranges.is_empty() {
             return Err(Error::InvalidState(format!(
                 "Snapshot {} manifest missing bucket_ranges",
@@ -501,7 +499,7 @@ impl Db {
 
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
-            seq_id: max_seq,
+            seq_id: restored_seq_id,
             bucket_ranges: bucket_ranges.clone(),
             multi_lsm_version,
             vlog_version,
@@ -509,14 +507,13 @@ impl Db {
             immutables: Vec::new().into(),
             suggested_base_snapshot_id: Some(snapshot_id),
         });
-        let initial_file_seq = max_file_seq.saturating_add(1);
         let db = Self::open_with_state(
             config,
             file_manager,
             db_state,
             db_id,
             bucket_ranges,
-            initial_file_seq,
+            max_vlog_file_seq.saturating_add(1).min(u32::MAX as u64) as u32,
             metrics_manager,
             schema_manager,
         )?;
@@ -572,14 +569,13 @@ impl Db {
             config.num_columns,
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
-        let max_file_seq = manifest
-            .tree_levels
+        let max_vlog_file_seq = manifest
+            .vlog_files
             .iter()
-            .flat_map(|levels| levels.iter())
-            .flat_map(|level| level.files.iter().map(|file| file.seq))
-            .chain(manifest.vlog_files.iter().map(|file| file.file_seq as u64))
+            .map(|file| file.file_seq as u64)
             .max()
             .unwrap_or(0);
+        let restored_seq_id = latest.manifest.seq_id;
         let tree_versions = build_tree_versions_from_manifest(&file_manager, manifest, false)?;
         let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
             config.total_buckets,
@@ -588,7 +584,7 @@ impl Db {
         )?;
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
-            seq_id: latest.manifest.seq_id,
+            seq_id: restored_seq_id,
             bucket_ranges: bucket_ranges.clone(),
             multi_lsm_version,
             vlog_version,
@@ -602,7 +598,7 @@ impl Db {
             db_state,
             db_id,
             bucket_ranges,
-            max_file_seq.saturating_add(1),
+            max_vlog_file_seq.saturating_add(1).min(u32::MAX as u64) as u32,
             metrics_manager,
             schema_manager,
         )?;
@@ -620,7 +616,7 @@ impl Db {
         db_state: Arc<DbStateHandle>,
         id: String,
         bucket_ranges: Vec<RangeInclusive<u16>>,
-        initial_file_seq: u64,
+        initial_vlog_file_seq: u32,
         metrics_manager: Arc<MetricsManager>,
         schema_manager: Arc<SchemaManager>,
     ) -> Result<Self> {
@@ -649,6 +645,7 @@ impl Db {
             sst_options.buffer_size,
             config.value_separation_threshold,
         ));
+        vlog_store.ensure_next_file_seq_at_least(initial_vlog_file_seq);
         // Compaction setup
         let mut compaction_options = crate::compaction::build_compaction_config(&config);
         compaction_options.num_columns = runtime_num_columns;
@@ -703,7 +700,6 @@ impl Db {
                 file_builder_factory: None,
                 num_columns: runtime_num_columns,
                 write_stall_limit: config.resolved_write_stall_limit(),
-                initial_seq: initial_file_seq,
                 schema_manager: Some(Arc::clone(&schema_manager)),
                 auto_snapshot_manager: if config.snapshot_on_flush {
                     Some(snapshot_manager.clone())
@@ -812,7 +808,7 @@ impl Db {
         };
         let snapshot = self.db_state.load();
         let mut values: Vec<Value> = Vec::new();
-        let memtable_min_seq = self.memtable_manager.get_all_with_snapshot(
+        self.memtable_manager.get_all_with_snapshot(
             Arc::clone(&snapshot),
             encoded_key.as_ref(),
             |raw, source_schema| {
@@ -866,7 +862,6 @@ impl Db {
             selected_columns,
             selected_mask,
             terminal_mask.as_deref_mut(),
-            memtable_min_seq,
         )?;
         for value in lsm_values {
             if should_stop {

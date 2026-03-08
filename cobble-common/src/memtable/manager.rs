@@ -24,18 +24,17 @@ use crate::r#type::{RefKey, RefValue};
 use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
 use log::{debug, trace, warn};
 use metrics::{Counter, counter};
+use uuid::Uuid;
 
 type DynKvIterator = Box<dyn for<'a> KvIterator<'a>>;
 
 #[derive(Clone)]
 pub(crate) struct MemtableFlushResult {
     pub(crate) data_files_by_tree: Vec<(usize, Arc<DataFile>)>,
-    pub(crate) seq: u64,
     vlog_edit: Option<VlogEdit>,
 }
 
 pub(crate) struct MemtableManagerOptions {
-    pub(crate) initial_seq: u64,
     pub(crate) memtable_capacity: usize,
     pub(crate) buffer_count: usize,
     pub(crate) sst_options: SSTWriterOptions,
@@ -71,7 +70,6 @@ impl MemtableManagerMetrics {
 impl Default for MemtableManagerOptions {
     fn default() -> Self {
         Self {
-            initial_seq: 0,
             memtable_capacity: 1024 * 1024,
             buffer_count: 2,
             sst_options: SSTWriterOptions {
@@ -118,12 +116,11 @@ struct MemtableManagerState {
     allow_make_active_buffer_in_reclaimer: bool,
     in_flight: usize,
     restore_in_progress: bool,
-    next_seq: u64,
-    flush_results: BTreeMap<u64, Result<MemtableFlushResult>>,
+    flush_results: Vec<Result<MemtableFlushResult>>,
 }
 
 struct FlushJob {
-    seq: u64,
+    memtable_id: Option<Uuid>,
     memtable: Option<Arc<MemtableImpl>>,
     schema: Option<Arc<Schema>>,
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
@@ -145,7 +142,7 @@ pub(crate) struct SnapshotCompletion {
 }
 
 pub(crate) struct ActiveMemtable {
-    seq: u64,
+    id: Uuid,
     schema: Arc<Schema>,
     memtable: Option<MemtableImpl>,
     vlog_recorder: Option<MemtableVlogRecorder>,
@@ -288,7 +285,7 @@ impl<'a> KvIterator<'a> for MemtableScanIterator {
 
 #[derive(Clone)]
 pub(crate) struct ImmutableMemtable {
-    pub(crate) seq: u64,
+    pub(crate) id: Uuid,
     schema: Arc<Schema>,
     memtable: Arc<MemtableImpl>,
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
@@ -339,8 +336,7 @@ impl MemtableManager {
             allow_make_active_buffer_in_reclaimer: true,
             in_flight: 0,
             restore_in_progress: false,
-            next_seq: options.initial_seq,
-            flush_results: BTreeMap::new(),
+            flush_results: Vec::new(),
         };
         let state = Arc::new(Mutex::new(state));
         let buffer_ready = Arc::new(Condvar::new());
@@ -418,32 +414,6 @@ impl MemtableManager {
         Arc::clone(&self.db_state)
     }
 
-    pub(crate) fn ensure_active_seq_at_least(&self, seq: u64) {
-        let mut state = self.state.lock().unwrap();
-        if state.next_seq < seq {
-            state.next_seq = seq;
-        }
-        drop(state);
-        let snapshot = self.db_state.load();
-        if let Some(active) = snapshot.active.as_ref() {
-            let mut active = active.lock().unwrap();
-            if active.seq < seq {
-                active.seq = seq;
-            }
-        }
-    }
-
-    pub(crate) fn ensure_next_seq_at_least(&self, seq: u64) {
-        let mut state = self.state.lock().unwrap();
-        if state.next_seq < seq {
-            state.next_seq = seq;
-        }
-    }
-
-    pub(crate) fn next_seq(&self) -> u64 {
-        self.state.lock().unwrap().next_seq
-    }
-
     pub(crate) fn open(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         Self::make_active_buffer(
@@ -491,11 +461,16 @@ impl MemtableManager {
             .spawn(move || {
                 while let Ok(job) = flush_rx.recv() {
                     if let Some(memtable) = job.memtable {
-                        trace!("memtable flush start seq={}", job.seq);
+                        trace!(
+                            "memtable flush start memtable_id={}",
+                            job.memtable_id
+                                .as_ref()
+                                .map(Uuid::to_string)
+                                .unwrap_or_else(|| "none".to_string())
+                        );
                         let keep_memtable_alive = Arc::clone(&memtable);
                         let multi_lsm_version = db_state_clone.load().multi_lsm_version.clone();
                         let result = flush_memtable(
-                            job.seq,
                             memtable.as_ref(),
                             job.schema.expect("flush job schema exists"),
                             job.vlog_recorder,
@@ -510,9 +485,12 @@ impl MemtableManager {
                         state.in_flight = state.in_flight.saturating_sub(1);
                         match result {
                             Ok(res) => {
+                                let memtable_id = job
+                                    .memtable_id
+                                    .expect("flush job memtable_id exists");
                                 debug!(
-                                    "memtable flush complete seq={} files={}",
-                                    res.seq,
+                                    "memtable flush complete memtable_id={} files={}",
+                                    memtable_id,
                                     res.data_files_by_tree.len()
                                 );
                                 metrics.flushes_total.increment(1);
@@ -525,17 +503,17 @@ impl MemtableManager {
                                 let vlog_edit = res.vlog_edit.clone();
                                 let snapshot = lsm_tree_clone
                                     .add_level0_files(
-                                        res.seq,
+                                        memtable_id,
                                         res.data_files_by_tree.clone(),
                                         vlog_edit,
                                     )
                                     .unwrap_or_else(|err| {
                                         panic!(
-                                            "memtable flush l0 check-in failed seq={} err={}",
-                                            res.seq, err
+                                            "memtable flush l0 check-in failed memtable_id={} err={}",
+                                            memtable_id, err
                                         )
                                     });
-                                state.flush_results.insert(res.seq, Ok(res));
+                                state.flush_results.push(Ok(res));
                                 flush_done_clone.notify_all();
                                 drop(state);
                                 Self::finish_and_materialize_snapshot(
@@ -546,7 +524,14 @@ impl MemtableManager {
                                 );
                             }
                             Err(err) => {
-                                panic!("memtable flush failed seq={} err={}", job.seq, err);
+                                panic!(
+                                    "memtable flush failed memtable_id={} err={}",
+                                    job.memtable_id
+                                        .as_ref()
+                                        .map(Uuid::to_string)
+                                        .unwrap_or_else(|| "none".to_string()),
+                                    err
+                                );
                             }
                         }
                         drop(keep_memtable_alive);
@@ -628,7 +613,7 @@ impl MemtableManager {
         file_manager: &Arc<FileManager>,
     ) -> Result<ActiveMemtableSnapshotWriteResult> {
         let active_guard = active.lock().unwrap();
-        let memtable_seq = active_guard.seq;
+        let memtable_id = active_guard.id.to_string();
         let memtable = active_guard
             .memtable
             .as_ref()
@@ -640,7 +625,7 @@ impl MemtableManager {
         let mut segments = snapshot_manager.active_memtable_snapshot_segments(
             base_snapshot_id,
             memtable_type,
-            memtable_seq,
+            &memtable_id,
         );
         let data_end_offset = memtable.data_offset();
         let inherited_data_end = segments.last().map_or(0, |segment| segment.end_offset);
@@ -688,7 +673,7 @@ impl MemtableManager {
             segments.push(ActiveMemtableSnapshotData {
                 path,
                 memtable_type,
-                memtable_seq,
+                memtable_id: memtable_id.clone(),
                 start_offset: data_start_offset as u64,
                 end_offset: data_end_offset as u64,
                 vlog_file_seq,
@@ -726,8 +711,7 @@ impl MemtableManager {
                 return;
             }
             state.budget -= budget_need;
-            let seq = state.next_seq;
-            state.next_seq += 1;
+            let memtable_id = Uuid::new_v4();
             let schema = schema_manager.latest_schema();
             let memtable = match memtable_type {
                 MemtableType::Hash => {
@@ -743,7 +727,7 @@ impl MemtableManager {
                 )),
             };
             let active = Arc::new(Mutex::new(ActiveMemtable {
-                seq,
+                id: memtable_id,
                 schema,
                 memtable: Some(memtable),
                 vlog_recorder: None,
@@ -1019,8 +1003,7 @@ impl MemtableManager {
     /// The provided closure `f` is called for each value. This allows
     /// processing values without returning byte copy.
     ///
-    /// Returns the minimum sequence number among the memtables searched.
-    pub(crate) fn get_all<F>(&self, key: &[u8], f: F) -> Result<Option<u64>>
+    pub(crate) fn get_all<F>(&self, key: &[u8], f: F) -> Result<()>
     where
         F: FnMut(&[u8], &Schema) -> Result<()>,
     {
@@ -1034,33 +1017,24 @@ impl MemtableManager {
         snapshot: Arc<DbState>,
         key: &[u8],
         mut f: F,
-    ) -> Result<Option<u64>>
+    ) -> Result<()>
     where
         F: FnMut(&[u8], &Schema) -> Result<()>,
     {
-        let mut min_seq = u64::MAX;
         if let Some(active) = &snapshot.active {
             let active = active.lock().unwrap();
             let memtable = active.memtable.as_ref().expect("active memtable exists");
-            min_seq = active.seq;
             for value in memtable.get_all(key) {
                 f(value, active.schema.as_ref())?;
             }
             drop(active);
         }
-        min_seq = min_seq.min(
-            snapshot
-                .immutables
-                .front()
-                .map(|m| m.seq)
-                .unwrap_or(min_seq),
-        );
         for immutable in snapshot.immutables.iter().rev() {
             for value in immutable.memtable.get_all(key) {
                 f(value, immutable.schema.as_ref())?;
             }
         }
-        Ok(Some(min_seq))
+        Ok(())
     }
 
     pub(crate) fn scan_memtable_iterators_with_snapshot(
@@ -1128,7 +1102,7 @@ impl MemtableManager {
         Ok(None)
     }
 
-    pub(crate) fn flush_active(&self) -> Result<Option<u64>> {
+    pub(crate) fn flush_active(&self) -> Result<Option<Uuid>> {
         let auto_snapshot = self
             .auto_snapshot_manager
             .as_ref()
@@ -1148,7 +1122,7 @@ impl MemtableManager {
         Ok(())
     }
 
-    fn flush_active_internal(&self, snapshot: Option<SnapshotCompletion>) -> Result<Option<u64>> {
+    fn flush_active_internal(&self, snapshot: Option<SnapshotCompletion>) -> Result<Option<Uuid>> {
         let mut state = self.state.lock().unwrap();
         while state.restore_in_progress {
             state = self.flush_done.wait(state).unwrap();
@@ -1158,7 +1132,7 @@ impl MemtableManager {
         let snapshot_state = self.db_state.load();
         let mut to_flush = None;
         let mut active_memtable_snapshot = None;
-        let mut flushed_seq = None;
+        let mut flushed_id = None;
         if snapshot.is_some()
             && let Some(active) = snapshot_state.active.as_ref()
         {
@@ -1193,12 +1167,11 @@ impl MemtableManager {
                     let active_vlog_recorder = inner_active.vlog_recorder.take().map(Arc::new);
                     let mut immutables = snapshot_state.immutables.clone();
                     let new_immutable = ImmutableMemtable {
-                        seq: inner_active.seq,
+                        id: inner_active.id,
                         schema: Arc::clone(&inner_active.schema),
                         memtable: Arc::new(active_memtable),
                         vlog_recorder: active_vlog_recorder,
                     };
-                    flushed_seq = Some(new_immutable.seq);
                     to_flush = Some(new_immutable.clone());
                     immutables.push_back(new_immutable);
 
@@ -1225,9 +1198,10 @@ impl MemtableManager {
                 self.total_budget,
                 false,
             );
+            flushed_id = Some(to_flush.id);
             state.in_flight += 1;
             FlushJob {
-                seq: to_flush.seq,
+                memtable_id: Some(to_flush.id),
                 memtable: Some(to_flush.memtable),
                 schema: Some(to_flush.schema),
                 vlog_recorder: to_flush.vlog_recorder,
@@ -1237,7 +1211,7 @@ impl MemtableManager {
         } else if let Some(active_memtable_snapshot) = active_memtable_snapshot {
             state.in_flight += 1;
             FlushJob {
-                seq: 0,
+                memtable_id: None,
                 memtable: None,
                 schema: None,
                 vlog_recorder: None,
@@ -1247,7 +1221,7 @@ impl MemtableManager {
         } else if snapshot.is_some() {
             state.in_flight += 1;
             FlushJob {
-                seq: 0,
+                memtable_id: None,
                 memtable: None,
                 schema: None,
                 vlog_recorder: None,
@@ -1256,7 +1230,7 @@ impl MemtableManager {
             }
         } else {
             drop(state);
-            return Ok(flushed_seq);
+            return Ok(flushed_id);
         };
         drop(state);
         let sender = self.flush_tx.lock().unwrap();
@@ -1267,7 +1241,7 @@ impl MemtableManager {
         } else {
             warn!("failed to spawn flush task, flush channel closed");
         }
-        Ok(flushed_seq)
+        Ok(flushed_id)
     }
 
     fn should_use_active_incremental_snapshot(&self, memtable: &MemtableImpl) -> bool {
@@ -1288,8 +1262,6 @@ impl MemtableManager {
             state = self.flush_done.wait(state).unwrap();
         }
         std::mem::take(&mut state.flush_results)
-            .into_values()
-            .collect()
     }
 
     pub(crate) fn restore_active_memtable_snapshot_to_l0(
@@ -1314,15 +1286,8 @@ impl MemtableManager {
             if memtable.is_empty() {
                 return Ok(false);
             }
-            let seq = {
-                let mut state = self.state.lock().unwrap();
-                let seq = state.next_seq;
-                state.next_seq = state.next_seq.saturating_add(1);
-                seq
-            };
             let multi_lsm_version = self.db_state.load().multi_lsm_version.clone();
             let result = flush_memtable(
-                seq,
                 &memtable,
                 self.schema_manager.latest_schema(),
                 vlog_recorder.map(Arc::new),
@@ -1341,7 +1306,7 @@ impl MemtableManager {
                 .sum();
             self.metrics.flush_bytes_total.increment(flushed_bytes);
             self.lsm_tree.add_level0_files(
-                result.seq,
+                Uuid::new_v4(),
                 result.data_files_by_tree.clone(),
                 result.vlog_edit,
             )?;
@@ -1405,7 +1370,6 @@ impl Drop for MemtableManager {
 
 #[allow(clippy::too_many_arguments)]
 fn flush_memtable(
-    seq: u64,
     memtable: &impl Memtable,
     schema: Arc<Schema>,
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
@@ -1514,7 +1478,6 @@ fn flush_memtable(
             file_id,
             tracked_id: TrackedFileId::new(&file_manager, file_id),
             size: file_size,
-            seq,
             schema_id: schema.version(),
             bucket_range: bucket_range.clone(),
             effective_bucket_range: bucket_range,
@@ -1532,7 +1495,6 @@ fn flush_memtable(
     }
     Ok(MemtableFlushResult {
         data_files_by_tree,
-        seq,
         vlog_edit,
     })
 }
@@ -1548,8 +1510,7 @@ fn decode_active_snapshot_segments_into_vec_memtable(
     let mut expected_data_start = 0u64;
     let mut required_capacity = 0u64;
     for segment in segments {
-        if segment.memtable_type != first.memtable_type
-            || segment.memtable_seq != first.memtable_seq
+        if segment.memtable_type != first.memtable_type || segment.memtable_id != first.memtable_id
         {
             return Err(Error::InvalidState(
                 "active memtable snapshot segment metadata mismatch".to_string(),
@@ -1814,7 +1775,6 @@ mod tests {
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
             MemtableManagerOptions {
-                initial_seq: 0,
                 memtable_capacity: 256,
                 buffer_count: 2,
                 sst_options: SSTWriterOptions {
@@ -1844,7 +1804,7 @@ mod tests {
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].as_ref().unwrap().seq, 0);
+        assert!(results[0].is_ok());
         let data_file = results[0].as_ref().unwrap().data_files_by_tree[0].1.clone();
         let level0_files = lsm_tree.level_files(0);
         assert_eq!(level0_files.len(), 1);
@@ -1906,7 +1866,6 @@ mod tests {
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
             MemtableManagerOptions {
-                initial_seq: 0,
                 memtable_capacity: 256,
                 buffer_count: 2,
                 file_builder_factory: None,
@@ -1976,7 +1935,6 @@ mod tests {
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
             MemtableManagerOptions {
-                initial_seq: 0,
                 memtable_capacity: 256,
                 buffer_count: 2,
                 file_builder_factory: None,
@@ -2025,7 +1983,6 @@ mod tests {
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
             MemtableManagerOptions {
-                initial_seq: 0,
                 memtable_capacity: 256,
                 buffer_count: 2,
                 file_builder_factory: None,
@@ -2094,7 +2051,6 @@ mod tests {
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
             MemtableManagerOptions {
-                initial_seq: 0,
                 memtable_capacity: 256,
                 buffer_count: 2,
                 sst_options: SSTWriterOptions {
@@ -2147,7 +2103,6 @@ mod tests {
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
             MemtableManagerOptions {
-                initial_seq: 0,
                 memtable_capacity: 192,
                 buffer_count: 2,
                 memtable_type: MemtableType::Vec,
@@ -2196,7 +2151,6 @@ mod tests {
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
             MemtableManagerOptions {
-                initial_seq: 0,
                 memtable_capacity: 128,
                 buffer_count: 1,
                 memtable_type: MemtableType::Hash,
