@@ -98,7 +98,7 @@ impl Default for LSMTree {
     fn default() -> Self {
         Self::with_state(
             Arc::new(DbStateHandle::new()),
-            Arc::new(MetricsManager::new("unknown".to_string())),
+            Arc::new(MetricsManager::new("unknown")),
         )
     }
 }
@@ -1230,7 +1230,7 @@ mod tests {
             immutables: Vec::new().into(),
             suggested_base_snapshot_id: None,
         });
-        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
 
         // Create a version edit to remove one file from level 0 and add two new files
@@ -1283,7 +1283,7 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", root))
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
         let file_manager =
             Arc::new(FileManager::with_defaults(fs.clone(), Arc::clone(&metrics_manager)).unwrap());
         let num_columns = 1;
@@ -1349,7 +1349,7 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", root))
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("lsm-compaction-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-compaction-test"));
         let file_manager =
             Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let config = crate::compaction::CompactionConfig {
@@ -1447,7 +1447,7 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", root))
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
         let file_manager =
             Arc::new(FileManager::with_defaults(fs.clone(), Arc::clone(&metrics_manager)).unwrap());
         let num_columns = 1;
@@ -1596,7 +1596,7 @@ mod tests {
             immutables: Vec::new().into(),
             suggested_base_snapshot_id: None,
         });
-        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let worker = Arc::new(RecordingCompactionWorker::default());
         let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
@@ -1652,7 +1652,7 @@ mod tests {
             immutables: Vec::new().into(),
             suggested_base_snapshot_id: None,
         });
-        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let worker = Arc::new(RecordingCompactionWorker::default());
         let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
@@ -1734,7 +1734,7 @@ mod tests {
             immutables: Vec::new().into(),
             suggested_base_snapshot_id: None,
         });
-        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let worker = Arc::new(RecordingCompactionWorker::default());
         let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
@@ -1776,7 +1776,7 @@ mod tests {
             immutables: Vec::new().into(),
             suggested_base_snapshot_id: None,
         });
-        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         lsm_tree.on_compaction_started(1);
 
@@ -1813,7 +1813,7 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", root))
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("lsm-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
         let file_manager =
             Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let num_columns = 1;

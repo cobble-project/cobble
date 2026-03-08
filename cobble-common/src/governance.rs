@@ -45,10 +45,10 @@ pub(crate) struct FileManifestLockProvider {
 }
 
 impl FileManifestLockProvider {
-    pub(crate) fn new(fs: Arc<dyn FileSystem>, lock_path: String) -> Self {
+    pub(crate) fn new(fs: Arc<dyn FileSystem>, lock_path: &str) -> Self {
         Self {
             fs,
-            lock_path,
+            lock_path: lock_path.to_string(),
             retries: 50,
             retry_delay: Duration::from_millis(50),
         }
@@ -56,13 +56,13 @@ impl FileManifestLockProvider {
 
     pub(crate) fn with_retry(
         fs: Arc<dyn FileSystem>,
-        lock_path: String,
+        lock_path: &str,
         retries: usize,
         retry_delay: Duration,
     ) -> Self {
         Self {
             fs,
-            lock_path,
+            lock_path: lock_path.to_string(),
             retries,
             retry_delay,
         }
@@ -110,8 +110,10 @@ pub(crate) fn create_manifest_lock_provider(
     fs: Arc<dyn FileSystem>,
     _config: &Config,
 ) -> Result<Arc<dyn ManifestLockProvider>> {
-    let lock_path = GOVERNANCE_MANIFEST_LOCK_NAME.to_string();
-    Ok(Arc::new(FileManifestLockProvider::new(fs, lock_path)))
+    Ok(Arc::new(FileManifestLockProvider::new(
+        fs,
+        GOVERNANCE_MANIFEST_LOCK_NAME,
+    )))
 }
 
 /// Manager for governance manifests with lock coordination.
@@ -128,18 +130,18 @@ impl GovernanceManager {
         Self { fs, lock_provider }
     }
 
-    pub(crate) fn with_file_lock(fs: Arc<dyn FileSystem>, root_dir: String) -> Result<Self> {
-        if !fs.exists(&root_dir)? {
-            fs.create_dir(&root_dir)?;
+    pub(crate) fn with_file_lock(fs: Arc<dyn FileSystem>, root_dir: &str) -> Result<Self> {
+        if !fs.exists(root_dir)? {
+            fs.create_dir(root_dir)?;
         }
-        let lock_path = governance_manifest_lock_path(&root_dir);
-        let lock_provider = Arc::new(FileManifestLockProvider::new(Arc::clone(&fs), lock_path));
+        let lock_path = governance_manifest_lock_path(root_dir);
+        let lock_provider = Arc::new(FileManifestLockProvider::new(Arc::clone(&fs), &lock_path));
         Ok(Self::new(fs, lock_provider))
     }
 
     pub(crate) fn insert_and_publish(
         &self,
-        id: &String,
+        id: &str,
         ranges: Vec<RangeInclusive<u16>>,
         total_buckets: u32,
     ) -> Result<String> {
@@ -194,9 +196,9 @@ impl GovernanceManager {
         // Remove any existing entry for the same db_id
         current_manifest
             .assignments
-            .retain(|entry| &entry.db_id != id);
+            .retain(|entry| entry.db_id != id);
         current_manifest.assignments.push(GovernanceEntry {
-            db_id: id.clone(),
+            db_id: id.to_string(),
             ranges,
         });
         self.publish(&current_manifest)
@@ -248,7 +250,7 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", root))
             .unwrap();
-        GovernanceManager::with_file_lock(fs, root.to_string()).unwrap()
+        GovernanceManager::with_file_lock(fs, root).unwrap()
     }
 
     fn cleanup_root(path: &str) {

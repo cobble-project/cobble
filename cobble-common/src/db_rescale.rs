@@ -622,7 +622,7 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap(),
             snapshot_id
         );
-        let source_metrics = Arc::new(MetricsManager::new("rescale-source-manifest".to_string()));
+        let source_metrics = Arc::new(MetricsManager::new("rescale-source-manifest"));
         let source_file_manager =
             Arc::new(FileManager::from_config(&config, source.id(), source_metrics).unwrap());
         let source_manifest =
@@ -671,7 +671,7 @@ mod tests {
         let removed = db.get(2, b"k2", &ReadOptions::default()).unwrap();
         assert!(removed.is_none());
 
-        let metrics = Arc::new(MetricsManager::new("shrink-manifest".to_string()));
+        let metrics = Arc::new(MetricsManager::new("shrink-manifest"));
         let file_manager = Arc::new(FileManager::from_config(&config, db.id(), metrics).unwrap());
         let manifest =
             crate::snapshot::load_manifest_for_snapshot(&file_manager, shrink_snapshot).unwrap();

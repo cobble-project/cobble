@@ -43,8 +43,8 @@ impl FileSystemRegistry {
         }
     }
 
-    pub fn get_or_register(&self, name: String) -> Result<Arc<dyn FileSystem>> {
-        let url = Url::parse(name.as_str())?;
+    pub fn get_or_register(&self, name: impl AsRef<str>) -> Result<Arc<dyn FileSystem>> {
+        let url = Url::parse(name.as_ref())?;
         let name = url.to_string();
         if let Some(fs) = self.registered.get(&name) {
             return Ok(Arc::clone(&fs));
@@ -96,9 +96,9 @@ mod test {
     #[test]
     fn test_filesystem_registry() {
         let registry = FileSystemRegistry::new();
-        let fs1 = registry.get_or_register("file:///tmp/checkpoint".to_string());
+        let fs1 = registry.get_or_register("file:///tmp/checkpoint");
         assert!(fs1.is_ok());
-        let fs2 = registry.get_or_register("file:///tmp/checkpoint".to_string());
+        let fs2 = registry.get_or_register("file:///tmp/checkpoint");
         assert!(fs2.is_ok());
         assert!(Arc::ptr_eq(&fs1.unwrap(), &fs2.unwrap()));
     }

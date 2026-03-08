@@ -102,7 +102,7 @@ impl ReadProxy {
             None
         };
         let db_id = Uuid::new_v4().to_string();
-        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
+        let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         Ok(Self {
             config,
             global_snapshot,
@@ -147,7 +147,7 @@ impl ReadProxy {
             None
         };
         let db_id = Uuid::new_v4().to_string();
-        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
+        let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         Ok(Self {
             config,
             global_snapshot,

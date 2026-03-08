@@ -116,7 +116,7 @@ impl SnapshotManager {
         let id = state.next_id;
         state.next_id += 1;
         let manifest_path = self.file_manager.metadata_path(&snapshot_manifest_name(id));
-        let mut snapshot = DbSnapshot::new(id, manifest_path, callback);
+        let mut snapshot = DbSnapshot::new(id, &manifest_path, callback);
         snapshot.bucket_ranges = self.bucket_ranges.read().unwrap().clone();
         let snapshot = Arc::new(snapshot);
         state.snapshots.insert(id, Arc::clone(&snapshot));
@@ -237,12 +237,12 @@ impl SnapshotManager {
         let manifest_name = snapshot_manifest_name(snapshot_id);
         let manifest_path = self.file_manager.metadata_path(&manifest_name);
         self.file_manager
-            .register_metadata_file(&manifest_name, manifest_path.clone())?;
+            .register_metadata_file(&manifest_name, &manifest_path)?;
 
         let tracked_files = manifest_data_file_refs(manifest)
             .map(|(file_id, path)| {
                 if !self.file_manager.has_data_file(file_id) {
-                    self.file_manager.register_data_file(file_id, path)?;
+                    self.file_manager.register_data_file(file_id, &path)?;
                 }
                 self.file_manager.data_file_ref(file_id)
             })

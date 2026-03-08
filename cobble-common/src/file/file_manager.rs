@@ -787,8 +787,8 @@ impl FileManager {
     ///
     /// This is useful when recovering files from disk or when files were
     /// created externally. The file is tracked but no reader is opened.
-    pub fn register_data_file(&self, file_id: FileId, path: String) -> Result<()> {
-        let (volume, relative_path) = self.resolve_volume_path(&path)?;
+    pub fn register_data_file(&self, file_id: FileId, path: &str) -> Result<()> {
+        let (volume, relative_path) = self.resolve_volume_path(path)?;
         let fs = Arc::clone(&volume.state.fs);
 
         // Track the file if not already tracked
@@ -963,9 +963,9 @@ impl FileManager {
     }
 
     /// Registers an existing metadata file with the FileManager.
-    pub fn register_metadata_file(&self, name: &str, path: String) -> Result<()> {
+    pub fn register_metadata_file(&self, name: &str, path: &str) -> Result<()> {
         // Verify the file exists
-        if !self.meta_volume.state.fs.exists(&path)? {
+        if !self.meta_volume.state.fs.exists(path)? {
             return Err(Error::IoError(format!(
                 "Metadata file {} does not exist at path: {}",
                 name, path
@@ -975,7 +975,7 @@ impl FileManager {
         // Track the file if not already tracked
         if !self.metadata_files.contains_key(name) {
             let tracked = Arc::new(TrackedFile::new(
-                path,
+                path.to_string(),
                 Arc::clone(&self.meta_volume.state.fs),
                 Some(Arc::clone(&self.meta_volume.state)),
             ));
@@ -1012,8 +1012,8 @@ impl FileManager {
     }
 
     /// Registers an existing data file without deleting it on drop.
-    pub fn register_data_file_readonly(&self, file_id: FileId, path: String) -> Result<()> {
-        let (volume, relative_path) = self.resolve_volume_path(&path)?;
+    pub fn register_data_file_readonly(&self, file_id: FileId, path: &str) -> Result<()> {
+        let (volume, relative_path) = self.resolve_volume_path(path)?;
         let fs = Arc::clone(&volume.state.fs);
         let tracked = Arc::new(TrackedFile::readonly(
             relative_path.to_string(),
@@ -1134,7 +1134,7 @@ pub(crate) mod tests {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("file-manager-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-test"));
         let fm = FileManager::with_defaults(Arc::clone(&fs), metrics_manager).unwrap();
         (fs, fm)
     }
@@ -1322,7 +1322,7 @@ pub(crate) mod tests {
         writer.close().unwrap();
 
         // Register it with path
-        fm.register_data_file(999, path.to_string()).unwrap();
+        fm.register_data_file(999, path).unwrap();
         assert!(fm.has_data_file(999));
         assert_eq!(fm.peek_next_file_id(), 1000);
 
@@ -1399,7 +1399,7 @@ pub(crate) mod tests {
         let mut options = FileManagerOptions::default();
         options.base_dir = "db".to_string();
         options.base_file_size = 64;
-        let metrics_manager = Arc::new(MetricsManager::new("file-manager-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-test"));
         let fm = FileManager::new(vec![high_volume, low_volume], options, metrics_manager).unwrap();
 
         let (file_id1, mut writer1) = fm.create_data_file().unwrap();

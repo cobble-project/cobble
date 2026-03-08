@@ -46,7 +46,7 @@ impl ReadOnlyDb {
         snapshot_db_id: String,
         block_cache: Option<BlockCache>,
     ) -> Result<Self> {
-        let metrics_manager = Arc::new(MetricsManager::new(snapshot_db_id.clone()));
+        let metrics_manager = Arc::new(MetricsManager::new(&snapshot_db_id));
         Self::open_with_db_id_and_cache_with_metrics(
             config,
             snapshot_id,

@@ -1764,7 +1764,7 @@ mod tests {
         let fs = registry
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
             Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let lsm_tree = Arc::new(LSMTree::with_state(
@@ -1854,7 +1854,7 @@ mod tests {
         let fs = registry
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
             Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let lsm_tree = Arc::new(LSMTree::with_state(
@@ -1920,7 +1920,7 @@ mod tests {
         let fs = registry
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
             Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let lsm_tree = Arc::new(LSMTree::with_state(
@@ -1971,7 +1971,7 @@ mod tests {
         let fs = registry
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
             Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let lsm_tree = Arc::new(LSMTree::with_state(
@@ -2040,7 +2040,7 @@ mod tests {
         let fs = registry
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
             Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let lsm_tree = Arc::new(crate::lsm::LSMTree::with_state(
@@ -2092,7 +2092,7 @@ mod tests {
         let fs = registry
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
             Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let lsm_tree = Arc::new(crate::lsm::LSMTree::with_state(
@@ -2140,7 +2140,7 @@ mod tests {
         let fs = registry
             .get_or_register("file:///tmp/memtable_manager_test".to_string())
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("memtable-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
             Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
         let lsm_tree = Arc::new(crate::lsm::LSMTree::with_state(

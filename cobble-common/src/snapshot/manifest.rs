@@ -616,10 +616,10 @@ pub(crate) fn build_tree_versions_from_manifest(
                 let start_key = from_hex(&file.start_key)?;
                 let end_key = from_hex(&file.end_key)?;
                 let tracked_id = if read_only {
-                    file_manager.register_data_file_readonly(file.file_id, file.path)?;
+                    file_manager.register_data_file_readonly(file.file_id, &file.path)?;
                     TrackedFileId::detached(file.file_id)
                 } else {
-                    file_manager.register_data_file(file.file_id, file.path)?;
+                    file_manager.register_data_file(file.file_id, &file.path)?;
                     TrackedFileId::new(file_manager, file.file_id)
                 };
                 files.push(Arc::new(DataFile {
@@ -657,10 +657,10 @@ pub(crate) fn build_vlog_version_from_manifest(
     let mut files = Vec::with_capacity(manifest.vlog_files.len());
     for vlog_file in &manifest.vlog_files {
         let tracked_id = if read_only {
-            file_manager.register_data_file_readonly(vlog_file.file_id, vlog_file.path.clone())?;
+            file_manager.register_data_file_readonly(vlog_file.file_id, &vlog_file.path)?;
             TrackedFileId::detached(vlog_file.file_id)
         } else {
-            file_manager.register_data_file(vlog_file.file_id, vlog_file.path.clone())?;
+            file_manager.register_data_file(vlog_file.file_id, &vlog_file.path)?;
             TrackedFileId::new(file_manager, vlog_file.file_id)
         };
         files.push((vlog_file.file_seq, tracked_id, vlog_file.valid_entries));

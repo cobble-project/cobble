@@ -45,10 +45,10 @@ pub(crate) struct DbSnapshot {
 pub(crate) type SnapshotCallback = Arc<dyn Fn(Result<u64>) + Send + Sync + 'static>;
 
 impl DbSnapshot {
-    pub(crate) fn new(id: u64, manifest_path: String, callback: Option<SnapshotCallback>) -> Self {
+    pub(crate) fn new(id: u64, manifest_path: &str, callback: Option<SnapshotCallback>) -> Self {
         Self {
             id,
-            manifest_path,
+            manifest_path: manifest_path.to_string(),
             base_snapshot_id: None,
             lsm_versions: vec![],
             tracked_files: Vec::new(),

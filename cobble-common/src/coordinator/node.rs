@@ -162,7 +162,7 @@ impl DbCoordinator {
 
     fn publish_manifest_pointer(&self, manifest_name: &str) -> Result<()> {
         let pointer_path = global_snapshot_current_path();
-        let mut writer = MetadataWriter::new(pointer_path, &self.fs)?;
+        let mut writer = MetadataWriter::new(&pointer_path, &self.fs)?;
         writer.write(manifest_name.as_bytes())?;
         writer.close()?;
         Ok(())

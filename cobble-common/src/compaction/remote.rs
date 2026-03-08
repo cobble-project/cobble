@@ -143,9 +143,9 @@ impl RemoteDataFile {
         let file_type = DataFileType::from_str(&self.file_type).map_err(Error::IoError)?;
         let path = self.full_path;
         if readonly {
-            file_manager.register_data_file_readonly(file_id, path)?;
+            file_manager.register_data_file_readonly(file_id, &path)?;
         } else {
-            file_manager.register_data_file(file_id, path)?;
+            file_manager.register_data_file(file_id, &path)?;
         }
         let data_file = DataFile {
             file_type,
@@ -891,7 +891,7 @@ mod tests {
             ..Config::default()
         };
         let db_id = "remote-compaction-roundtrip".to_string();
-        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
+        let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         let file_manager = Arc::new(
             FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
         );
@@ -1027,7 +1027,7 @@ mod tests {
             ..Config::default()
         };
         let db_id = "remote-compaction-u64-counter".to_string();
-        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
+        let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         let file_manager = Arc::new(
             FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
         );

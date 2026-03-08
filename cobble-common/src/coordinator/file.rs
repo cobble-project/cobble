@@ -13,12 +13,12 @@ pub(crate) struct MetadataWriter {
 }
 
 impl MetadataWriter {
-    pub(crate) fn new(path: String, fs: &Arc<dyn FileSystem>) -> Result<Self> {
+    pub(crate) fn new(path: &str, fs: &Arc<dyn FileSystem>) -> Result<Self> {
         let temp_path = format!("{}.tmp-{}", path, Uuid::new_v4());
         let writer = fs.open_write(&temp_path)?;
         Ok(Self {
             temp_path,
-            final_path: path,
+            final_path: path.to_string(),
             fs: fs.clone(),
             writer: Some(writer),
         })

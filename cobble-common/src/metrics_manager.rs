@@ -16,15 +16,16 @@ pub struct MetricsManager {
 }
 
 impl MetricsManager {
-    pub(crate) fn new(db_id: String) -> Self {
-        let sst_iterator_metrics = Arc::new(SSTIteratorMetrics::new(&db_id));
-        let compaction_metrics = Arc::new(CompactionTaskMetrics::new(&db_id));
-        let memtable_metrics = MemtableManagerMetrics::new(&db_id);
-        let file_manager_metrics = FileManagerMetrics::new(&db_id);
-        let sst_writer_metrics_none = SSTWriterMetrics::new(&db_id, SstCompressionAlgorithm::None);
-        let sst_writer_metrics_lz4 = SSTWriterMetrics::new(&db_id, SstCompressionAlgorithm::Lz4);
+    pub(crate) fn new(db_id: impl AsRef<str>) -> Self {
+        let db_id = db_id.as_ref();
+        let sst_iterator_metrics = Arc::new(SSTIteratorMetrics::new(db_id));
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new(db_id));
+        let memtable_metrics = MemtableManagerMetrics::new(db_id);
+        let file_manager_metrics = FileManagerMetrics::new(db_id);
+        let sst_writer_metrics_none = SSTWriterMetrics::new(db_id, SstCompressionAlgorithm::None);
+        let sst_writer_metrics_lz4 = SSTWriterMetrics::new(db_id, SstCompressionAlgorithm::Lz4);
         Self {
-            db_id,
+            db_id: db_id.to_string(),
             sst_iterator_metrics,
             compaction_metrics,
             memtable_metrics,

@@ -188,7 +188,7 @@ impl Db {
         init_logging(&config);
         metrics_registry::init_metrics();
         let id = Uuid::new_v4().to_string();
-        let metrics_manager = Arc::new(MetricsManager::new(id.clone()));
+        let metrics_manager = Arc::new(MetricsManager::new(&id));
 
         // register the governance db id
         let registry = FileSystemRegistry::new();
@@ -460,7 +460,7 @@ impl Db {
     pub fn open_from_snapshot(config: Config, snapshot_id: u64, db_id: String) -> Result<Self> {
         init_logging(&config);
         metrics_registry::init_metrics();
-        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
+        let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         let file_manager = FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
@@ -526,7 +526,7 @@ impl Db {
     pub fn resume(config: Config, db_id: String) -> Result<Self> {
         init_logging(&config);
         metrics_registry::init_metrics();
-        let metrics_manager = Arc::new(MetricsManager::new(db_id.clone()));
+        let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         let file_manager = FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let snapshot_ids = list_snapshot_manifest_ids(&file_manager)?;

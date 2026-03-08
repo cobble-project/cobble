@@ -610,7 +610,7 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
         let file_manager = Arc::new(
             FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
         );
@@ -747,7 +747,7 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
         let file_manager = Arc::new(
             FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
         );
@@ -891,7 +891,7 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
         let file_manager = Arc::new(
             FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
         );
@@ -1038,7 +1038,7 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
         let file_manager = Arc::new(
             FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
         );
@@ -1130,7 +1130,7 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
         let file_manager = Arc::new(
             FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
         );
@@ -1255,7 +1255,7 @@ mod tests {
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
 
-        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
         let file_manager = Arc::new(
             FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
         );
@@ -1309,7 +1309,7 @@ mod tests {
         let fs = registry
             .get_or_register(format!("file://{}", test_dir))
             .unwrap();
-        let metrics_manager = Arc::new(MetricsManager::new("compaction-test".to_string()));
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
         let file_manager = Arc::new(
             FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
         );
