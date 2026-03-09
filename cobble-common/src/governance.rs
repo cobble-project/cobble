@@ -1,9 +1,10 @@
 //! Governance manifest management for distributed bucket ownership.
 //! This module provides structures and functions to manage governance manifests.
 use crate::Config;
+use crate::config::VolumeDescriptor;
 use crate::db_state::{bucket_range_fits_total, bucket_range_last};
 use crate::error::{Error, Result};
-use crate::file::{File, FileSystem, SequentialWriteFile};
+use crate::file::{File, FileSystem, FileSystemRegistry, SequentialWriteFile};
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -13,6 +14,16 @@ use uuid::Uuid;
 use crate::paths::{
     GOVERNANCE_MANIFEST_LOCK_NAME, GOVERNANCE_MANIFEST_POINTER_NAME, governance_manifest_lock_path,
 };
+
+/// Pluggable governance coordinator used during writable DB open.
+pub trait DbGovernance: Send + Sync {
+    fn register_db(
+        &self,
+        db_id: &str,
+        ranges: &[RangeInclusive<u16>],
+        total_buckets: u32,
+    ) -> Result<()>;
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GovernanceEntry {
@@ -114,6 +125,51 @@ pub(crate) fn create_manifest_lock_provider(
         fs,
         GOVERNANCE_MANIFEST_LOCK_NAME,
     )))
+}
+
+pub struct FileSystemDbGovernance {
+    manager: GovernanceManager,
+}
+
+impl FileSystemDbGovernance {
+    pub fn from_config(config: &Config) -> Result<Self> {
+        Self::from_volumes(&config.volumes)
+    }
+
+    pub fn from_volumes(volumes: &[VolumeDescriptor]) -> Result<Self> {
+        let registry = FileSystemRegistry::new();
+        if volumes.is_empty() {
+            return Err(Error::ConfigError("No volumes configured".to_string()));
+        }
+        let meta_volume = volumes
+            .iter()
+            .find(|volume| volume.supports(crate::config::VolumeUsageKind::Meta))
+            .unwrap_or_else(|| volumes.first().expect("No meta volume exists"));
+        let fs = registry.get_or_register_volume(meta_volume)?;
+        let lock_provider = Arc::new(FileManifestLockProvider::new(
+            Arc::clone(&fs),
+            GOVERNANCE_MANIFEST_LOCK_NAME,
+        ));
+        let manager = GovernanceManager::new(fs, lock_provider);
+        Ok(Self { manager })
+    }
+}
+
+impl DbGovernance for FileSystemDbGovernance {
+    fn register_db(
+        &self,
+        db_id: &str,
+        ranges: &[RangeInclusive<u16>],
+        total_buckets: u32,
+    ) -> Result<()> {
+        self.manager
+            .insert_and_publish(db_id, ranges.to_vec(), total_buckets)?;
+        Ok(())
+    }
+}
+
+pub(crate) fn create_default_db_governance(config: &Config) -> Result<Arc<dyn DbGovernance>> {
+    Ok(Arc::new(FileSystemDbGovernance::from_config(config)?))
 }
 
 /// Manager for governance manifests with lock coordination.

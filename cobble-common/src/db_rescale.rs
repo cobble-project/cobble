@@ -665,7 +665,7 @@ mod tests {
         db.put(2, b"k2", 0, b"v2").unwrap();
 
         let shrink_snapshot = db.shrink_bucket(vec![2u16..=3u16]).unwrap();
-        let bucket_input = db.bucket_snapshot_input(shrink_snapshot).unwrap();
+        let bucket_input = db.shard_snapshot_input(shrink_snapshot).unwrap();
         assert_eq!(bucket_input.ranges, vec![0u16..=1u16]);
 
         let kept = db.get(1, b"k1", &ReadOptions::default()).unwrap().unwrap();

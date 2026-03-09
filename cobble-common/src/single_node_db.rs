@@ -165,7 +165,7 @@ fn materialize_global_snapshot(
     global_snapshot_id: u64,
 ) -> Result<u64> {
     // materialize global snapshot from bucket snapshot
-    let bucket_snapshot = db.bucket_snapshot_input(snapshot_id)?;
+    let bucket_snapshot = db.shard_snapshot_input(snapshot_id)?;
     let global_snapshot = coordinator.take_global_snapshot_with_id(
         total_buckets,
         vec![bucket_snapshot],

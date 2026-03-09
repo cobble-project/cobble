@@ -1149,7 +1149,7 @@ fn test_db_resume_takes_over_snapshot_lifecycle() {
 
     let resume_config = config;
     let writable = Db::resume(resume_config, db.id().to_string()).unwrap();
-    let bucket_snapshot = writable.bucket_snapshot_input(snapshot_id).unwrap();
+    let bucket_snapshot = writable.shard_snapshot_input(snapshot_id).unwrap();
     assert_eq!(bucket_snapshot.ranges, vec![0u16..=7u16]);
 
     let manifest_path = format!(
@@ -1233,7 +1233,7 @@ fn test_db_multi_lsm_snapshot_restore_and_resume() {
         .unwrap()
         .expect("right value after resume");
     assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
-    let bucket_snapshot = resumed.bucket_snapshot_input(snapshot_id).unwrap();
+    let bucket_snapshot = resumed.shard_snapshot_input(snapshot_id).unwrap();
     assert_eq!(bucket_snapshot.ranges, ranges);
     resumed.close().unwrap();
     cleanup_test_root(root);

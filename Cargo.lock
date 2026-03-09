@@ -215,6 +215,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cobble-cluster"
+version = "0.0.1"
+dependencies = [
+ "cobble",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "config"
 version = "0.15.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"

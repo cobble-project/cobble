@@ -1,7 +1,8 @@
+use crate::db_builder::DbBuilder;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_status::{CloseTransition, DbLifecycle};
 use crate::error::{Error, Result};
-use crate::file::{FileManager, FileSystemRegistry};
+use crate::file::FileManager;
 use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::merge_operator::MergeOperator;
@@ -29,7 +30,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, bucket_range_fits_total};
-use crate::governance::{GovernanceManager, create_manifest_lock_provider};
+use crate::governance::create_default_db_governance;
 use crate::metrics_registry;
 use crate::read_only_db::ReadOnlyDb;
 use crate::ttl::{TTLProvider, TtlConfig};
@@ -189,6 +190,11 @@ impl Db {
 
     /// Open a database with the provided configuration.
     pub fn open(config: Config, bucket_ranges: Vec<RangeInclusive<u16>>) -> Result<Self> {
+        DbBuilder::new(config).bucket_ranges(bucket_ranges).open()
+    }
+
+    pub(crate) fn open_with_builder(builder: DbBuilder) -> Result<Self> {
+        let (config, bucket_ranges, db_id, governance) = builder.into_parts();
         if config.total_buckets == 0 || config.total_buckets > (u16::MAX as u32) + 1 {
             return Err(Error::ConfigError(
                 "total_buckets must be in range 1..=65536".to_string(),
@@ -212,26 +218,15 @@ impl Db {
         let config = config.normalize_volume_paths()?;
         init_logging(&config);
         metrics_registry::init_metrics();
-        let id = Uuid::new_v4().to_string();
+        let id = db_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let metrics_manager = Arc::new(MetricsManager::new(&id));
 
-        // register the governance db id
-        let registry = FileSystemRegistry::new();
-        let volumes = if config.volumes.is_empty() {
-            return Err(Error::ConfigError("No volumes configured".to_string()));
+        if let Some(governance) = governance {
+            governance.register_db(&id, &bucket_ranges, config.total_buckets)?;
         } else {
-            config.volumes.clone()
-        };
-        let meta_volume = volumes
-            .iter()
-            .find(|volume| volume.supports(crate::config::VolumeUsageKind::Meta))
-            .unwrap_or_else(|| volumes.first().expect("No meta volume exists."));
-        let governance_fs = registry.get_or_register_volume(meta_volume)?;
-        let governance = GovernanceManager::new(
-            Arc::clone(&governance_fs),
-            create_manifest_lock_provider(Arc::clone(&governance_fs), &config)?,
-        );
-        governance.insert_and_publish(&id, bucket_ranges.clone(), config.total_buckets)?;
+            let local_governance = create_default_db_governance(&config)?;
+            local_governance.register_db(&id, &bucket_ranges, config.total_buckets)?;
+        }
 
         let file_manager = FileManager::from_config(&config, &id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
@@ -471,11 +466,11 @@ impl Db {
         self.snapshot_manager.retain_snapshot(snapshot_id)
     }
 
-    /// Build a BucketSnapshotInput for a given snapshot id.
-    pub fn bucket_snapshot_input(
+    /// Build a ShardSnapshotInput for a given snapshot id.
+    pub fn shard_snapshot_input(
         &self,
         snapshot_id: u64,
-    ) -> Result<crate::coordinator::BucketSnapshotInput> {
+    ) -> Result<crate::coordinator::ShardSnapshotInput> {
         self.ensure_open()?;
         let manifest_name = snapshot_manifest_name(snapshot_id);
         let manifest_path = self
@@ -484,7 +479,7 @@ impl Db {
             .ok_or_else(|| {
                 Error::IoError(format!("Snapshot manifest not tracked: {}", manifest_name))
             })?;
-        Ok(crate::coordinator::BucketSnapshotInput {
+        Ok(crate::coordinator::ShardSnapshotInput {
             ranges: self.db_state.load().bucket_ranges.clone(),
             db_id: self.id.clone(),
             snapshot_id,
@@ -1047,11 +1042,11 @@ mod tests {
     use crate::MergeOperator;
     use crate::db_state::full_bucket_range;
     use crate::{
-        ReadOptions, ScanOptions, U32CounterMergeOperator, U64CounterMergeOperator,
-        VolumeDescriptor,
+        DbBuilder, DbGovernance, ReadOptions, ScanOptions, U32CounterMergeOperator,
+        U64CounterMergeOperator, VolumeDescriptor,
     };
     use serial_test::serial;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn cleanup_test_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
@@ -1077,6 +1072,27 @@ mod tests {
         .unwrap()
     }
 
+    #[derive(Default)]
+    struct RecordingGovernance {
+        calls: Mutex<Vec<(String, Vec<RangeInclusive<u16>>, u32)>>,
+    }
+
+    impl DbGovernance for RecordingGovernance {
+        fn register_db(
+            &self,
+            db_id: &str,
+            ranges: &[RangeInclusive<u16>],
+            total_buckets: u32,
+        ) -> Result<()> {
+            self.calls.lock().expect("recording governance lock").push((
+                db_id.to_string(),
+                ranges.to_vec(),
+                total_buckets,
+            ));
+            Ok(())
+        }
+    }
+
     #[test]
     #[serial(file)]
     fn test_db_rejects_mutation_and_read_after_close() {
@@ -1096,6 +1112,32 @@ mod tests {
         assert!(matches!(snapshot_err, Error::InvalidState(_)));
         assert!(!db.retain_snapshot(0));
 
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_builder_uses_custom_governance() {
+        let root = "/tmp/db_builder_custom_governance";
+        cleanup_test_root(root);
+        let config = config_with_small_memtable(root);
+        let total_buckets = config.total_buckets;
+        let ranges = vec![full_bucket_range(total_buckets)];
+        let governance = Arc::new(RecordingGovernance::default());
+        let db = DbBuilder::new(config)
+            .db_id("db-builder-governed")
+            .bucket_ranges(ranges.clone())
+            .governance(Arc::clone(&governance) as Arc<dyn DbGovernance>)
+            .open()
+            .unwrap();
+        db.close().unwrap();
+
+        let calls = governance.calls.lock().expect("recording governance lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "db-builder-governed");
+        assert_eq!(calls[0].1, ranges);
+        assert_eq!(calls[0].2, total_buckets);
+        drop(calls);
         cleanup_test_root(root);
     }
 

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bucket snapshot reference input.
 #[derive(Clone, Debug)]
-pub struct BucketSnapshotInput {
+pub struct ShardSnapshotInput {
     pub ranges: Vec<RangeInclusive<u16>>,
     pub db_id: String,
     pub snapshot_id: u64,
@@ -24,7 +24,7 @@ pub struct BucketSnapshotInput {
 
 /// Bucket snapshot reference stored in a global manifest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct BucketSnapshotRef {
+pub struct ShardSnapshotRef {
     pub ranges: Vec<RangeInclusive<u16>>,
     pub db_id: String,
     pub snapshot_id: u64,
@@ -36,7 +36,7 @@ pub struct BucketSnapshotRef {
 pub struct GlobalSnapshotManifest {
     pub id: u64,
     pub total_buckets: u32,
-    pub bucket_snapshots: Vec<BucketSnapshotRef>,
+    pub shard_snapshots: Vec<ShardSnapshotRef>,
 }
 
 /// Coordinator node that materializes global snapshots on shared storage.
@@ -81,19 +81,19 @@ impl DbCoordinator {
     pub fn take_global_snapshot(
         &self,
         total_buckets: u32,
-        bucket_snapshots: Vec<BucketSnapshotInput>,
+        shard_snapshots: Vec<ShardSnapshotInput>,
     ) -> Result<GlobalSnapshotManifest> {
         let id = self.allocate_snapshot_id();
-        Self::build_global_snapshot(total_buckets, bucket_snapshots, id)
+        Self::build_global_snapshot(total_buckets, shard_snapshots, id)
     }
 
     pub fn take_global_snapshot_with_id(
         &self,
         total_buckets: u32,
-        bucket_snapshots: Vec<BucketSnapshotInput>,
+        shard_snapshots: Vec<ShardSnapshotInput>,
         id: u64,
     ) -> Result<GlobalSnapshotManifest> {
-        Self::build_global_snapshot(total_buckets, bucket_snapshots, id)
+        Self::build_global_snapshot(total_buckets, shard_snapshots, id)
     }
 
     pub fn allocate_snapshot_id(&self) -> u64 {
@@ -102,23 +102,23 @@ impl DbCoordinator {
 
     fn build_global_snapshot(
         total_buckets: u32,
-        bucket_snapshots: Vec<BucketSnapshotInput>,
+        shard_snapshots: Vec<ShardSnapshotInput>,
         id: u64,
     ) -> Result<GlobalSnapshotManifest> {
-        if bucket_snapshots.is_empty() {
+        if shard_snapshots.is_empty() {
             return Err(Error::IoError(
                 "bucket snapshots required to build global snapshot".to_string(),
             ));
         }
-        let mut bucket_refs = Vec::with_capacity(bucket_snapshots.len());
-        for bucket in bucket_snapshots {
+        let mut bucket_refs = Vec::with_capacity(shard_snapshots.len());
+        for bucket in shard_snapshots {
             if bucket.manifest_path.is_empty() {
                 return Err(Error::ConfigError(format!(
                     "Bucket snapshot manifest path missing for {}:{}",
                     bucket.db_id, bucket.snapshot_id
                 )));
             }
-            bucket_refs.push(BucketSnapshotRef {
+            bucket_refs.push(ShardSnapshotRef {
                 ranges: bucket.ranges,
                 db_id: bucket.db_id,
                 snapshot_id: bucket.snapshot_id,
@@ -128,7 +128,7 @@ impl DbCoordinator {
         Ok(GlobalSnapshotManifest {
             id,
             total_buckets,
-            bucket_snapshots: bucket_refs,
+            shard_snapshots: bucket_refs,
         })
     }
 
@@ -264,13 +264,13 @@ mod tests {
             .take_global_snapshot(
                 4,
                 vec![
-                    BucketSnapshotInput {
+                    ShardSnapshotInput {
                         ranges: vec![0u16..=1u16],
                         db_id: "db-a".to_string(),
                         snapshot_id: 1,
                         manifest_path: path_a.clone(),
                     },
-                    BucketSnapshotInput {
+                    ShardSnapshotInput {
                         ranges: vec![2u16..=3u16],
                         db_id: "db-b".to_string(),
                         snapshot_id: 2,
@@ -283,9 +283,9 @@ mod tests {
 
         let loaded = node.load_current_global_snapshot().unwrap().unwrap();
         assert_eq!(loaded.id, snapshot.id);
-        assert_eq!(loaded.bucket_snapshots, snapshot.bucket_snapshots);
-        assert_eq!(loaded.bucket_snapshots[0].manifest_path, path_a);
-        assert_eq!(loaded.bucket_snapshots[1].manifest_path, path_b);
+        assert_eq!(loaded.shard_snapshots, snapshot.shard_snapshots);
+        assert_eq!(loaded.shard_snapshots[0].manifest_path, path_a);
+        assert_eq!(loaded.shard_snapshots[1].manifest_path, path_b);
 
         cleanup_root(root);
     }

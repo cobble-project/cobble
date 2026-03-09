@@ -332,7 +332,7 @@ fn build_bucket_map(
     manifest: &GlobalSnapshotManifest,
 ) -> Result<Vec<Option<Arc<BucketSnapshotKey>>>> {
     let mut mapping = vec![None; bucket_slots_for_total(manifest.total_buckets)];
-    for snapshot in &manifest.bucket_snapshots {
+    for snapshot in &manifest.shard_snapshots {
         let key = Arc::new(BucketSnapshotKey {
             db_id: snapshot.db_id.clone(),
             snapshot_id: snapshot.snapshot_id,
@@ -376,7 +376,7 @@ fn validate_range(range: &RangeInclusive<u16>, total_buckets: u32) -> Result<()>
 mod tests {
     use super::*;
     use crate::VolumeDescriptor;
-    use crate::coordinator::{BucketSnapshotInput, CoordinatorConfig, DbCoordinator};
+    use crate::coordinator::{CoordinatorConfig, DbCoordinator, ShardSnapshotInput};
     use std::path::Path;
 
     fn cleanup_root(path: &str) {
@@ -470,13 +470,13 @@ mod tests {
             .take_global_snapshot(
                 4,
                 vec![
-                    BucketSnapshotInput {
+                    ShardSnapshotInput {
                         ranges: vec![0u16..=1u16],
                         db_id: db_a.clone(),
                         snapshot_id: snap_a,
                         manifest_path: path_a,
                     },
-                    BucketSnapshotInput {
+                    ShardSnapshotInput {
                         ranges: vec![2u16..=3u16],
                         db_id: db_b.clone(),
                         snapshot_id: snap_b,
@@ -541,7 +541,7 @@ mod tests {
         let global_a = coordinator
             .take_global_snapshot(
                 4,
-                vec![BucketSnapshotInput {
+                vec![ShardSnapshotInput {
                     ranges: vec![0u16..=3u16],
                     db_id: db_a.clone(),
                     snapshot_id: snap_a,
@@ -568,7 +568,7 @@ mod tests {
         let global_b = coordinator
             .take_global_snapshot(
                 4,
-                vec![BucketSnapshotInput {
+                vec![ShardSnapshotInput {
                     ranges: vec![0u16..=3u16],
                     db_id: db_b.clone(),
                     snapshot_id: snap_b,

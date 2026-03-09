@@ -7,6 +7,7 @@ mod config;
 mod coordinator;
 mod data_file;
 mod db;
+mod db_builder;
 mod db_iter;
 mod db_state;
 mod db_status;
@@ -41,11 +42,13 @@ pub use config::{
     VolumeUsageKind,
 };
 pub use coordinator::{
-    BucketSnapshotInput, BucketSnapshotRef, CoordinatorConfig, DbCoordinator,
-    GlobalSnapshotManifest,
+    CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef,
 };
 pub use db::Db;
+pub use db_builder::DbBuilder;
 pub use db_iter::DbIterator;
+pub use error::{Error, Result};
+pub use governance::{DbGovernance, FileSystemDbGovernance};
 pub use merge_operator::{
     BytesMergeOperator, MergeOperator, U32CounterMergeOperator, U64CounterMergeOperator,
 };
