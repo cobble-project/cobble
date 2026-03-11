@@ -50,7 +50,8 @@ pub use db_iter::DbIterator;
 pub use error::{Error, Result};
 pub use governance::{DbGovernance, FileSystemDbGovernance};
 pub use merge_operator::{
-    BytesMergeOperator, MergeOperator, U32CounterMergeOperator, U64CounterMergeOperator,
+    BytesMergeOperator, MergeOperator, MergeOperatorResolver, U32CounterMergeOperator,
+    U64CounterMergeOperator,
 };
 pub use metrics_manager::MetricsManager;
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
@@ -60,4 +61,5 @@ pub use schema::{Schema, SchemaBuilder};
 pub use single_node_db::SingleNodeDb;
 pub use sst::SstCompressionAlgorithm;
 pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProviderKind};
+pub use r#type::ValueType;
 pub use write_batch::WriteBatch;

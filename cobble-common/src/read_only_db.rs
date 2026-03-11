@@ -94,6 +94,7 @@ impl ReadOnlyDb {
             &file_manager,
             &manifest,
             config.num_columns,
+            None,
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let tree_versions = build_tree_versions_from_manifest(&file_manager, manifest, true)?;
@@ -194,7 +195,7 @@ impl ReadOnlyDb {
         let mut iter = values.into_iter();
         let mut merged = iter.next().expect("values not empty");
         for newer in iter {
-            merged = merged.merge(newer, &schema)?;
+            merged = merged.merge(newer, &schema, Some(self.ttl_provider.time_provider()))?;
         }
         let snapshot = self.lsm_tree.db_state().load();
         value_to_vec_of_columns_with_vlog(
@@ -204,6 +205,7 @@ impl ReadOnlyDb {
                     .read_pointer(&snapshot.vlog_version, pointer)
             },
             &schema,
+            Some(self.ttl_provider.time_provider()),
         )
     }
 

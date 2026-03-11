@@ -204,14 +204,22 @@ impl<I> DeduplicatingIterator<I> {
                 for newer_value in values_iter {
                     let mut newer_value = newer_value;
                     let newer_value = decode_value(&mut newer_value, self.num_columns)?;
-                    merged_value =
-                        merged_value.merge_with_callback(newer_value, &self.schema, callback)?;
+                    merged_value = merged_value.merge_with_callback(
+                        newer_value,
+                        &self.schema,
+                        Some(self.ttl_provider.time_provider()),
+                        callback,
+                    )?;
                 }
             } else {
                 for newer_value in values_iter {
                     let mut newer_value = newer_value;
                     let newer_value = decode_value(&mut newer_value, self.num_columns)?;
-                    merged_value = merged_value.merge(newer_value, &self.schema)?;
+                    merged_value = merged_value.merge(
+                        newer_value,
+                        &self.schema,
+                        Some(self.ttl_provider.time_provider()),
+                    )?;
                 }
             }
 

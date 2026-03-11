@@ -62,6 +62,10 @@ impl TTLProvider {
     pub(crate) fn now_seconds(&self) -> u32 {
         self.time_provider.now_seconds()
     }
+
+    pub(crate) fn time_provider(&self) -> &dyn crate::time::TimeProvider {
+        self.time_provider.as_ref()
+    }
 }
 
 #[cfg(test)]

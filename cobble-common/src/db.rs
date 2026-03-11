@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::file::FileManager;
 use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
-use crate::merge_operator::MergeOperator;
+use crate::merge_operator::{MergeOperator, MergeOperatorResolver};
 use crate::metrics_manager::MetricsManager;
 use crate::schema::{Schema, SchemaBuilder, SchemaManager};
 use crate::snapshot::{
@@ -82,6 +82,7 @@ fn resolve_column_with_vlog<F>(
     column: Column,
     resolve_pointer: &mut F,
     merge_operator: &dyn MergeOperator,
+    time_provider: Option<&dyn TimeProvider>,
 ) -> Result<Option<Bytes>>
 where
     F: FnMut(VlogPointer) -> Result<Bytes>,
@@ -90,14 +91,16 @@ where
         ValueType::Delete => Ok(None),
         ValueType::Put => Ok(Some(Bytes::from(column))),
         ValueType::Merge => {
-            let merged = merge_operator.merge(Bytes::new(), Bytes::from(column))?;
+            // Read-path merge must reuse the same logical clock as write/compaction paths.
+            let (merged, _) =
+                merge_operator.merge(Bytes::new(), Bytes::from(column), time_provider)?;
             Ok(Some(merged))
         }
         ValueType::PutSeparated | ValueType::MergeSeparated => {
             let pointer = VlogPointer::from_bytes(column.data())?;
             let resolved = resolve_pointer(pointer)?;
             if column.value_type == ValueType::MergeSeparated {
-                let merged = merge_operator.merge(Bytes::new(), resolved)?;
+                let (merged, _) = merge_operator.merge(Bytes::new(), resolved, time_provider)?;
                 Ok(Some(merged))
             } else {
                 Ok(Some(resolved))
@@ -127,7 +130,7 @@ where
                         merged = item_value;
                     }
                     ValueType::Merge | ValueType::MergeSeparated => {
-                        merged = merge_operator.merge(merged, item_value)?;
+                        merged = merge_operator.merge(merged, item_value, time_provider)?.0;
                     }
                     ValueType::Delete
                     | ValueType::MergeSeparatedArray
@@ -145,6 +148,7 @@ pub(crate) fn value_to_vec_of_columns_with_vlog<F>(
     value: Value,
     mut resolve_pointer: F,
     schema: &Schema,
+    time_provider: Option<&dyn TimeProvider>,
 ) -> Result<Option<Vec<Option<Bytes>>>>
 where
     F: FnMut(VlogPointer) -> Result<Bytes>,
@@ -154,7 +158,9 @@ where
     for (column_idx, column) in value.columns.into_iter().enumerate() {
         let merge_operator = schema.operator(column_idx);
         let resolved = match column {
-            Some(column) => resolve_column_with_vlog(column, resolve_pointer, merge_operator)?,
+            Some(column) => {
+                resolve_column_with_vlog(column, resolve_pointer, merge_operator, time_provider)?
+            }
             None => None,
         };
         columns.push(resolved);
@@ -256,6 +262,11 @@ impl Db {
     /// Start a schema update transaction.
     pub fn update_schema(&self) -> SchemaBuilder {
         self.schema_manager.builder()
+    }
+
+    /// Return the current schema snapshot.
+    pub fn current_schema(&self) -> Arc<Schema> {
+        self.schema_manager.latest_schema()
     }
 
     /// Return the metrics samples for this database.
@@ -391,8 +402,11 @@ impl Db {
                     entry.insert(next_value);
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    let merged = std::mem::replace(entry.get_mut(), Value::new(Vec::new()))
-                        .merge(next_value, &schema)?;
+                    let merged = std::mem::replace(entry.get_mut(), Value::new(Vec::new())).merge(
+                        next_value,
+                        &schema,
+                        Some(self.time_provider.as_ref()),
+                    )?;
                     *entry.get_mut() = merged;
                 }
             }
@@ -496,6 +510,15 @@ impl Db {
 
     /// Open a writable database initialized from a snapshot manifest.
     pub fn open_from_snapshot(config: Config, snapshot_id: u64, db_id: String) -> Result<Self> {
+        Self::open_from_snapshot_with_resolver(config, snapshot_id, db_id, None)
+    }
+
+    pub fn open_from_snapshot_with_resolver(
+        config: Config,
+        snapshot_id: u64,
+        db_id: String,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
         let config = config.normalize_volume_paths()?;
         init_logging(&config);
         metrics_registry::init_metrics();
@@ -507,6 +530,7 @@ impl Db {
             &file_manager,
             &manifest,
             config.num_columns,
+            resolver,
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let max_vlog_file_seq = manifest
@@ -566,6 +590,14 @@ impl Db {
 
     /// Resume a writable database from an existing folder by loading all snapshot manifests.
     pub fn resume(config: Config, db_id: String) -> Result<Self> {
+        Self::resume_with_resolver(config, db_id, None)
+    }
+
+    pub fn resume_with_resolver(
+        config: Config,
+        db_id: String,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
         config.normalize_volume_paths()?;
         init_logging(&config);
         metrics_registry::init_metrics();
@@ -610,6 +642,7 @@ impl Db {
             &file_manager,
             loaded.iter().map(|entry| &entry.manifest),
             config.num_columns,
+            resolver,
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
         let max_vlog_file_seq = manifest
@@ -947,7 +980,7 @@ impl Db {
         let mut iter = values.into_iter();
         let mut merged = iter.next().expect("values not empty");
         for newer in iter {
-            merged = merged.merge(newer, &schema)?;
+            merged = merged.merge(newer, &schema, Some(self.time_provider.as_ref()))?;
         }
         let result = value_to_vec_of_columns_with_vlog(
             merged,
@@ -962,6 +995,7 @@ impl Db {
                     .ok_or(vlog_err),
             },
             &schema,
+            Some(self.time_provider.as_ref()),
         );
         match result {
             Ok(value) => Ok(value),
@@ -1027,6 +1061,11 @@ impl Db {
     /// Set the current time for TTL evaluation (manual time provider only).
     pub fn set_time(&self, next: u32) {
         self.time_provider.set_time(next);
+    }
+
+    /// Returns the current logical time in seconds from the configured time provider.
+    pub fn now_seconds(&self) -> u32 {
+        self.time_provider.now_seconds()
     }
 }
 
@@ -1152,15 +1191,20 @@ mod tests {
     struct PipeMergeOperator;
 
     impl MergeOperator for PipeMergeOperator {
-        fn merge(&self, existing_value: Bytes, value: Bytes) -> Result<Bytes> {
+        fn merge(
+            &self,
+            existing_value: Bytes,
+            value: Bytes,
+            _time_provider: Option<&dyn TimeProvider>,
+        ) -> Result<(Bytes, Option<ValueType>)> {
             if existing_value.is_empty() {
-                Ok(value)
+                Ok((value, None))
             } else {
                 let mut merged = BytesMut::with_capacity(existing_value.len() + 1 + value.len());
                 merged.extend_from_slice(existing_value.as_ref());
                 merged.extend_from_slice(b"|");
                 merged.extend_from_slice(value.as_ref());
-                Ok(merged.freeze())
+                Ok((merged.freeze(), None))
             }
         }
     }

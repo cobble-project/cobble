@@ -1,7 +1,8 @@
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, FileManager};
 use crate::merge_operator::{
-    MergeOperator, default_merge_operator, default_merge_operator_ref, merge_operator_by_id,
+    MergeOperator, MergeOperatorResolver, default_merge_operator, default_merge_operator_ref,
+    merge_operator_by_id,
 };
 use crate::paths::schema_file_relative_path;
 use crate::snapshot::ManifestSnapshot;
@@ -9,6 +10,7 @@ use crate::r#type::{Column, Value, ValueType};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -114,6 +116,7 @@ pub struct Schema {
     num_columns: usize,
     operators: Arc<Vec<Arc<dyn MergeOperator>>>,
     evolution: BuiltinSchemaEvolution,
+    pub(crate) column_metadata: Arc<Vec<Option<JsonValue>>>,
 }
 
 impl Schema {
@@ -127,6 +130,7 @@ impl Schema {
             num_columns,
             operators,
             BuiltinSchemaEvolution::Noop,
+            Vec::new(),
         )
     }
 
@@ -135,17 +139,24 @@ impl Schema {
         num_columns: usize,
         mut operators: Vec<Arc<dyn MergeOperator>>,
         evolution: BuiltinSchemaEvolution,
+        mut column_metadata: Vec<Option<JsonValue>>,
     ) -> Self {
         if operators.len() < num_columns {
             operators.resize_with(num_columns, default_merge_operator);
         } else if operators.len() > num_columns {
             operators.truncate(num_columns);
         }
+        if column_metadata.len() < num_columns {
+            column_metadata.resize_with(num_columns, || None);
+        } else if column_metadata.len() > num_columns {
+            column_metadata.truncate(num_columns);
+        }
         Self {
             version,
             num_columns,
             operators: Arc::new(operators),
             evolution,
+            column_metadata: Arc::new(column_metadata),
         }
     }
 
@@ -176,6 +187,16 @@ impl Schema {
 
     fn evolution(&self) -> BuiltinSchemaEvolution {
         self.evolution.clone()
+    }
+
+    pub(crate) fn column_metadata(&self) -> &[Option<JsonValue>] {
+        self.column_metadata.as_ref()
+    }
+
+    pub fn column_metadata_at(&self, column_idx: usize) -> Option<&JsonValue> {
+        self.column_metadata
+            .get(column_idx)
+            .and_then(|metadata| metadata.as_ref())
     }
 }
 
@@ -241,14 +262,21 @@ impl SchemaManager {
         file_manager: &Arc<FileManager>,
         manifest: &ManifestSnapshot,
         default_num_columns: usize,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
-        Self::from_manifests(file_manager, std::iter::once(manifest), default_num_columns)
+        Self::from_manifests(
+            file_manager,
+            std::iter::once(manifest),
+            default_num_columns,
+            resolver,
+        )
     }
 
     pub(crate) fn from_manifests<'a, I>(
         file_manager: &Arc<FileManager>,
         manifests: I,
         default_num_columns: usize,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self>
     where
         I: IntoIterator<Item = &'a ManifestSnapshot>,
@@ -259,7 +287,14 @@ impl SchemaManager {
         }
         let schemas = schema_ids
             .into_iter()
-            .map(|schema_id| load_schema(file_manager, schema_id, default_num_columns))
+            .map(|schema_id| {
+                load_schema(
+                    file_manager,
+                    schema_id,
+                    default_num_columns,
+                    resolver.as_ref(),
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self::from_schemas(schemas, default_num_columns))
     }
@@ -308,6 +343,7 @@ impl SchemaManager {
         num_columns: usize,
         operators: Vec<Arc<dyn MergeOperator>>,
         evolution: BuiltinSchemaEvolution,
+        column_metadata: Vec<Option<JsonValue>>,
     ) -> Arc<Schema> {
         let latest = self.latest_schema();
         assert_eq!(
@@ -321,6 +357,7 @@ impl SchemaManager {
             num_columns,
             operators,
             evolution.clone(),
+            column_metadata,
         ));
         self.latest_schema.store(Arc::clone(&schema));
         self.schemas
@@ -411,7 +448,12 @@ impl SchemaManager {
         if self.schemas.read().unwrap().contains_key(&schema_id) {
             return Ok(());
         }
-        let schema = Arc::new(load_schema(file_manager, schema_id, default_num_columns)?);
+        let schema = Arc::new(load_schema(
+            file_manager,
+            schema_id,
+            default_num_columns,
+            None,
+        )?);
         self.schemas
             .write()
             .unwrap()
@@ -467,6 +509,8 @@ struct SchemaFile {
     evolution_indexes: Option<Vec<usize>>,
     #[serde(default)]
     evolution_default_values: Option<Vec<Option<Vec<u8>>>>,
+    #[serde(default)]
+    column_metadata: Vec<Option<JsonValue>>,
 }
 
 pub(crate) fn persist_schema(file_manager: &FileManager, schema: &Schema) -> Result<()> {
@@ -482,6 +526,7 @@ pub(crate) fn persist_schema(file_manager: &FileManager, schema: &Schema) -> Res
                 .map(|default_value| default_value.as_ref().map(|bytes| bytes.to_vec()))
                 .collect()
         }),
+        column_metadata: schema.column_metadata().to_vec(),
     };
     let json = serde_json::to_vec(&schema_file)
         .map_err(|err| Error::FileFormatError(format!("Failed to encode schema file: {}", err)))?;
@@ -498,6 +543,7 @@ pub(crate) fn load_schema(
     file_manager: &Arc<FileManager>,
     schema_id: u64,
     _default_num_columns: usize,
+    resolver: Option<&Arc<dyn MergeOperatorResolver>>,
 ) -> Result<Schema> {
     let reader =
         file_manager.open_metadata_file_reader_untracked(&schema_file_relative_path(schema_id))?;
@@ -513,8 +559,15 @@ pub(crate) fn load_schema(
     let mut operators: Vec<Arc<dyn MergeOperator>> = schema_file
         .merge_operator_ids
         .iter()
-        .map(|id| merge_operator_by_id(id))
-        .collect();
+        .enumerate()
+        .map(|(idx, id)| {
+            let metadata = schema_file
+                .column_metadata
+                .get(idx)
+                .and_then(|metadata| metadata.as_ref());
+            merge_operator_by_id(id, metadata, resolver)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let evolution = match schema_file.evolution_id.as_deref() {
         Some("noop") | None => BuiltinSchemaEvolution::Noop,
         Some("column_add") => {
@@ -564,6 +617,7 @@ pub(crate) fn load_schema(
         num_columns,
         operators,
         evolution,
+        schema_file.column_metadata,
     ))
 }
 
@@ -573,6 +627,7 @@ pub struct SchemaBuilder {
     num_columns: usize,
     operators: Vec<Arc<dyn MergeOperator>>,
     evolution: BuiltinSchemaEvolution,
+    column_metadata: Vec<Option<JsonValue>>,
 }
 
 impl SchemaBuilder {
@@ -583,6 +638,7 @@ impl SchemaBuilder {
             num_columns: schema.num_columns(),
             operators: schema.operators.as_ref().clone(),
             evolution: BuiltinSchemaEvolution::Noop,
+            column_metadata: schema.column_metadata().to_vec(),
         }
     }
 
@@ -629,8 +685,15 @@ impl SchemaBuilder {
                 }
                 BuiltinSchemaEvolution::ColumnDelete { .. } => unreachable!(),
             }
+            self.column_metadata.resize_with(self.num_columns, || None);
+        } else if self.column_metadata.len() < self.num_columns {
+            self.column_metadata.resize_with(self.num_columns, || None);
         }
+        let operator_metadata = operator.metadata();
         self.operators[column_idx] = operator;
+        if operator_metadata.is_some() {
+            self.column_metadata[column_idx] = operator_metadata;
+        }
         Ok(())
     }
 
@@ -656,6 +719,8 @@ impl SchemaBuilder {
         self.num_columns += 1;
         self.operators
             .insert(column_idx, operator.unwrap_or_else(default_merge_operator));
+        let metadata = self.operators[column_idx].metadata();
+        self.column_metadata.insert(column_idx, metadata);
         match &mut self.evolution {
             BuiltinSchemaEvolution::Noop => {
                 self.evolution = BuiltinSchemaEvolution::ColumnAdd {
@@ -691,6 +756,7 @@ impl SchemaBuilder {
         }
         self.num_columns -= 1;
         self.operators.remove(column_idx);
+        self.column_metadata.remove(column_idx);
         match &mut self.evolution {
             BuiltinSchemaEvolution::Noop => {
                 self.evolution = BuiltinSchemaEvolution::ColumnDelete {
@@ -712,7 +778,36 @@ impl SchemaBuilder {
             self.num_columns,
             self.operators,
             self.evolution,
+            self.column_metadata,
         )
+    }
+
+    pub fn set_column_metadata(&mut self, column_idx: usize, value: JsonValue) -> Result<()> {
+        if column_idx >= self.num_columns {
+            return Err(Error::InvalidState(format!(
+                "Cannot set metadata for column {} when schema has {} columns",
+                column_idx, self.num_columns
+            )));
+        }
+        if self.column_metadata.len() < self.num_columns {
+            self.column_metadata.resize_with(self.num_columns, || None);
+        }
+        self.column_metadata[column_idx] = Some(value);
+        Ok(())
+    }
+
+    pub fn clear_column_metadata(&mut self, column_idx: usize) -> Result<()> {
+        if column_idx >= self.num_columns {
+            return Err(Error::InvalidState(format!(
+                "Cannot clear metadata for column {} when schema has {} columns",
+                column_idx, self.num_columns
+            )));
+        }
+        if self.column_metadata.len() < self.num_columns {
+            self.column_metadata.resize_with(self.num_columns, || None);
+        }
+        self.column_metadata[column_idx] = None;
+        Ok(())
     }
 }
 
@@ -726,15 +821,23 @@ mod tests {
     struct BracketMergeOperator;
 
     impl MergeOperator for BracketMergeOperator {
-        fn merge(&self, existing_value: Bytes, value: Bytes) -> Result<Bytes> {
+        fn merge(
+            &self,
+            existing_value: Bytes,
+            value: Bytes,
+            _time_provider: Option<&dyn crate::TimeProvider>,
+        ) -> Result<(Bytes, Option<ValueType>)> {
             let existing = existing_value.as_ref();
-            Ok(format!(
-                "[{}+{}]",
-                String::from_utf8_lossy(existing),
-                String::from_utf8_lossy(value.as_ref())
-            )
-            .into_bytes()
-            .into())
+            Ok((
+                format!(
+                    "[{}+{}]",
+                    String::from_utf8_lossy(existing),
+                    String::from_utf8_lossy(value.as_ref())
+                )
+                .into_bytes()
+                .into(),
+                None,
+            ))
         }
     }
 
@@ -748,8 +851,8 @@ mod tests {
         let schema = builder.commit();
         assert_eq!(schema.version(), 1);
         let op = schema.operator(1);
-        let merged = op
-            .merge(Bytes::from_static(b"x"), Bytes::from_static(b"y"))
+        let (merged, _) = op
+            .merge(Bytes::from_static(b"x"), Bytes::from_static(b"y"), None)
             .unwrap();
         assert_eq!(merged.as_ref(), b"[x+y]");
     }
@@ -759,8 +862,8 @@ mod tests {
         let manager = SchemaManager::new(1);
         let schema = manager.latest_schema();
         let op = schema.operator(10);
-        let merged = op
-            .merge(Bytes::from_static(b"a"), Bytes::from_static(b"b"))
+        let (merged, _) = op
+            .merge(Bytes::from_static(b"a"), Bytes::from_static(b"b"), None)
             .unwrap();
         assert_eq!(merged.as_ref(), b"ab");
     }
@@ -775,13 +878,13 @@ mod tests {
             .unwrap();
         let schema = builder.commit();
         assert_eq!(schema.num_columns(), 4);
-        let merged0 = schema
+        let (merged0, _) = schema
             .operator(0)
-            .merge(Bytes::from_static(b"a"), Bytes::from_static(b"b"))
+            .merge(Bytes::from_static(b"a"), Bytes::from_static(b"b"), None)
             .unwrap();
-        let merged3 = schema
+        let (merged3, _) = schema
             .operator(3)
-            .merge(Bytes::from_static(b"a"), Bytes::from_static(b"b"))
+            .merge(Bytes::from_static(b"a"), Bytes::from_static(b"b"), None)
             .unwrap();
         assert_eq!(merged0.as_ref(), b"ab");
         assert_eq!(merged3.as_ref(), b"[a+b]");

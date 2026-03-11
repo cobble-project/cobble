@@ -28,6 +28,7 @@ pub struct DbIterator<'a> {
     snapshot: Arc<DbState>,
     memtable_manager: Option<&'a MemtableManager>,
     vlog_store: Arc<VlogStore>,
+    ttl_provider: Arc<TTLProvider>,
     schema: Arc<Schema>,
     num_columns: usize,
 }
@@ -54,6 +55,7 @@ impl<'a> DbIterator<'a> {
             snapshot: options.snapshot,
             memtable_manager: options.memtable_manager,
             vlog_store: options.vlog_store,
+            ttl_provider: options.ttl_provider,
             schema,
             num_columns,
         }
@@ -104,6 +106,7 @@ impl<'a> DbIterator<'a> {
                     }
                 },
                 &self.schema,
+                Some(self.ttl_provider.time_provider()),
             )?;
             if let Some(columns) = columns {
                 return Ok(Some((Bytes::copy_from_slice(key.data()), columns)));
