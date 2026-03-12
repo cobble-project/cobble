@@ -32,6 +32,91 @@ pub enum StructuredColumnValue {
     List(Vec<Bytes>),
 }
 
+/// Structured write batch wrapper.
+///
+/// Each operation is encoded and written into the inner `cobble::WriteBatch` immediately, so we
+/// avoid a second typed-op staging buffer and an extra conversion pass at flush time.
+pub struct StructuredWriteBatch<'a> {
+    db: &'a DataStructureDb,
+    inner: WriteBatch,
+}
+
+impl<'a> StructuredWriteBatch<'a> {
+    pub fn new(db: &'a DataStructureDb) -> Self {
+        Self {
+            db,
+            inner: WriteBatch::new(),
+        }
+    }
+
+    pub fn put<K, V>(&mut self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: Into<StructuredColumnValue>,
+    {
+        self.put_with_ttl(bucket, key, column, value, None)
+    }
+
+    pub fn put_with_ttl<K, V>(
+        &mut self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        value: V,
+        ttl_seconds: Option<u32>,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: Into<StructuredColumnValue>,
+    {
+        let encoded = self
+            .db
+            .encode_for_write(column, value.into(), ttl_seconds)?;
+        self.inner
+            .put_with_ttl(bucket, key, column, encoded, ttl_seconds);
+        Ok(())
+    }
+
+    pub fn delete<K>(&mut self, bucket: u16, key: K, column: u16)
+    where
+        K: AsRef<[u8]>,
+    {
+        self.inner.delete(bucket, key, column);
+    }
+
+    pub fn merge<K, V>(&mut self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: Into<StructuredColumnValue>,
+    {
+        self.merge_with_ttl(bucket, key, column, value, None)
+    }
+
+    pub fn merge_with_ttl<K, V>(
+        &mut self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        value: V,
+        ttl_seconds: Option<u32>,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: Into<StructuredColumnValue>,
+    {
+        let encoded = self
+            .db
+            .encode_for_write(column, value.into(), ttl_seconds)?;
+        self.inner
+            .merge_with_ttl(bucket, key, column, encoded, ttl_seconds);
+        Ok(())
+    }
+
+    fn into_inner(self) -> WriteBatch {
+        self.inner
+    }
+}
+
 impl From<Bytes> for StructuredColumnValue {
     fn from(value: Bytes) -> Self {
         Self::Bytes(value)
@@ -180,10 +265,18 @@ impl DataStructureDb {
         self.db.delete(bucket, key, column)
     }
 
-    pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
-        // TODO: structured write-batch encoding/validation path (list columns should be encoded
-        // by structured schema before dispatching to core Db).
-        self.db.write_batch(batch)
+    pub fn new_write_batch(&self) -> StructuredWriteBatch<'_> {
+        StructuredWriteBatch::new(self)
+    }
+
+    pub fn write_batch(&self, batch: StructuredWriteBatch<'_>) -> Result<()> {
+        if !std::ptr::eq(self, batch.db) {
+            return Err(Error::InputError(
+                "structured write batch belongs to a different DataStructureDb instance"
+                    .to_string(),
+            ));
+        }
+        self.db.write_batch(batch.into_inner())
     }
 
     pub fn get<K>(&self, bucket: u16, key: K) -> Result<Option<Vec<Option<StructuredColumnValue>>>>
@@ -468,6 +561,94 @@ mod tests {
         );
         assert!(iter.next().is_none());
 
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_structured_write_batch_round_trip() {
+        let root = format!("/tmp/ds_structured_write_batch_{}", Uuid::new_v4());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            num_columns: 2,
+            ..Config::default()
+        };
+        let structured_schema = StructuredSchema {
+            columns: BTreeMap::from([(
+                1,
+                StructuredColumnType::List(ListConfig {
+                    max_elements: Some(3),
+                    retain_mode: ListRetainMode::Last,
+                    preserve_element_ttl: false,
+                }),
+            )]),
+        };
+        let db = DataStructureDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        let mut batch = db.new_write_batch();
+        batch.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
+        batch
+            .merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
+            .unwrap();
+        batch
+            .merge(0, b"k1", 1, vec![Bytes::from_static(b"b")])
+            .unwrap();
+        batch
+            .merge(0, b"k1", 1, vec![Bytes::from_static(b"c")])
+            .unwrap();
+        batch.put(0, b"k2", 0, Bytes::from_static(b"v2")).unwrap();
+        db.write_batch(batch).unwrap();
+
+        let row = db.get(0, b"k1").unwrap().expect("row exists");
+        assert_eq!(
+            row[0],
+            Some(StructuredColumnValue::Bytes(Bytes::from_static(b"v0")))
+        );
+        assert_eq!(
+            row[1],
+            Some(StructuredColumnValue::List(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c")
+            ]))
+        );
+        let mut iter = db
+            .scan(0, b"k0".as_ref()..b"k9".as_ref(), &ScanOptions::default())
+            .unwrap();
+        let first = iter.next().expect("first row").unwrap();
+        assert_eq!(first.0.as_ref(), b"k1");
+        let second = iter.next().expect("second row").unwrap();
+        assert_eq!(second.0.as_ref(), b"k2");
+        assert!(iter.next().is_none());
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_structured_write_batch_rejects_type_mismatch() {
+        let root = format!("/tmp/ds_structured_write_batch_mismatch_{}", Uuid::new_v4());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            num_columns: 2,
+            ..Config::default()
+        };
+        let structured_schema = StructuredSchema {
+            columns: BTreeMap::from([(
+                1,
+                StructuredColumnType::List(ListConfig {
+                    max_elements: None,
+                    retain_mode: ListRetainMode::Last,
+                    preserve_element_ttl: false,
+                }),
+            )]),
+        };
+        let db = DataStructureDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        let mut batch = db.new_write_batch();
+        assert!(
+            batch
+                .put(0, b"k1", 1, Bytes::from_static(b"not-a-list"))
+                .is_err()
+        );
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
