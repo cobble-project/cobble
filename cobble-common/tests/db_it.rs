@@ -778,6 +778,35 @@ fn test_single_node_db_snapshot_updates_global_manifest() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_single_node_db_close_waits_snapshot_global_materialization() {
+    let root = "/tmp/single_node_db_close_waits_snapshot";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        total_buckets: 8,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = SingleNodeDb::open(config.clone()).unwrap();
+    db.put(0, b"k1", 0, b"v1".to_vec()).unwrap();
+    let _global_snapshot_id = db.snapshot().unwrap();
+    db.close().unwrap();
+
+    let mut proxy = ReadProxy::open_current(ReadProxyConfig::from_config(&config)).unwrap();
+    let value = proxy
+        .get(0, b"k1", &ReadOptions::default())
+        .unwrap()
+        .expect("value present");
+    assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_snapshot_read_only_get_with_vec_memtable() {
     let root = "/tmp/db_snapshot_readonly_vec_memtable";
     cleanup_test_root(root);

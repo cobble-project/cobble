@@ -5,13 +5,21 @@ use crate::{Config, Db, ReadOptions, WriteBatch};
 use bytes::Bytes;
 use log::error;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+
+#[derive(Default)]
+struct SingleNodeSnapshotState {
+    in_flight: usize,
+    closing: bool,
+}
 
 /// Single node database that proxies reads/writes and emits global snapshots.
 pub struct SingleNodeDb {
     db: Arc<Db>,
     coordinator: Arc<DbCoordinator>,
     total_buckets: u32,
+    snapshot_state: Arc<Mutex<SingleNodeSnapshotState>>,
+    snapshot_done: Arc<Condvar>,
 }
 
 impl SingleNodeDb {
@@ -33,7 +41,31 @@ impl SingleNodeDb {
             db,
             coordinator,
             total_buckets,
+            snapshot_state: Arc::new(Mutex::new(SingleNodeSnapshotState::default())),
+            snapshot_done: Arc::new(Condvar::new()),
         })
+    }
+
+    fn begin_snapshot_in_flight(&self) -> Result<()> {
+        let mut state = self.snapshot_state.lock().unwrap();
+        if state.closing {
+            return Err(Error::InvalidState(
+                "SingleNodeDb is closing; cannot create new snapshot".to_string(),
+            ));
+        }
+        state.in_flight += 1;
+        Ok(())
+    }
+
+    fn finish_snapshot_in_flight(
+        snapshot_state: &Arc<Mutex<SingleNodeSnapshotState>>,
+        snapshot_done: &Arc<Condvar>,
+    ) {
+        let mut state = snapshot_state.lock().unwrap();
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if state.in_flight == 0 {
+            snapshot_done.notify_all();
+        }
     }
 
     pub fn snapshot(&self) -> Result<u64> {
@@ -48,11 +80,15 @@ impl SingleNodeDb {
     where
         F: Fn(Result<u64>) + Send + Sync + 'static,
     {
+        self.begin_snapshot_in_flight()?;
+
         let global_snapshot_id = self.coordinator.allocate_snapshot_id();
         let db = Arc::clone(&self.db);
         let coordinator = Arc::clone(&self.coordinator);
         let total_buckets = self.total_buckets;
-        self.db.snapshot_with_callback(move |result| {
+        let snapshot_state = Arc::clone(&self.snapshot_state);
+        let snapshot_done = Arc::clone(&self.snapshot_done);
+        if let Err(err) = self.db.snapshot_with_callback(move |result| {
             let global_result = match result {
                 Ok(snapshot_id) => materialize_global_snapshot(
                     &coordinator,
@@ -63,8 +99,12 @@ impl SingleNodeDb {
                 ),
                 Err(err) => Err(err),
             };
+            Self::finish_snapshot_in_flight(&snapshot_state, &snapshot_done);
             callback(global_result);
-        })?;
+        }) {
+            Self::finish_snapshot_in_flight(&self.snapshot_state, &self.snapshot_done);
+            return Err(err);
+        }
         Ok(global_snapshot_id)
     }
 
@@ -145,6 +185,12 @@ impl SingleNodeDb {
     }
 
     pub fn close(&self) -> Result<()> {
+        let mut state = self.snapshot_state.lock().unwrap();
+        state.closing = true;
+        while state.in_flight > 0 {
+            state = self.snapshot_done.wait(state).unwrap();
+        }
+        drop(state);
         self.db.close()
     }
 }
