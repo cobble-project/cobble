@@ -1,0 +1,13 @@
+[package]
+name = "cobble-data-structure"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+bytes = "1.11.0"
+cobble = { path = "../cobble-common" }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+
+[dev-dependencies]
+uuid = { version = "1.18.0", features = ["v4"] }
