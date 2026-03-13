@@ -1,46 +1,172 @@
-use foyer::{Cache, CacheBuilder};
+use crate::error::{Error, Result};
+use foyer::{
+    BlockEngineConfig, Cache, CacheBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache,
+    HybridCacheBuilder, PsyncIoEngineConfig,
+};
+use log::warn;
 use std::hash::Hash;
+use std::io::ErrorKind;
+use std::path::Path;
+use std::sync::Arc;
 
 pub trait CacheHandle<K, V>: Send + Sync {
     fn get(&self, key: &K) -> Option<V>;
     fn insert(&self, key: K, value: V);
 }
 
+struct HybridCacheBackend<K, V>
+where
+    K: foyer::StorageKey + Clone,
+    V: foyer::StorageValue + Clone,
+{
+    inner: HybridCache<K, V>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    cache_root: std::path::PathBuf,
+}
+
+impl<K, V> Drop for HybridCacheBackend<K, V>
+where
+    K: foyer::StorageKey + Clone,
+    V: foyer::StorageValue + Clone,
+{
+    fn drop(&mut self) {
+        if let Err(err) = self.runtime.block_on(self.inner.close()) {
+            warn!("failed to close hybrid block cache: {}", err);
+        }
+        if let Err(err) = std::fs::remove_dir_all(&self.cache_root)
+            && err.kind() != ErrorKind::NotFound
+        {
+            warn!(
+                "failed to remove hybrid cache directory {}: {}",
+                self.cache_root.display(),
+                err
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+enum FoyerCacheBackend<K, V>
+where
+    K: foyer::StorageKey + Clone,
+    V: foyer::StorageValue + Clone,
+{
+    Memory(Cache<K, V>),
+    Hybrid(Arc<HybridCacheBackend<K, V>>),
+}
+
 #[derive(Clone)]
 pub struct FoyerCache<K, V>
 where
-    K: Eq + Hash + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: foyer::StorageKey + Clone,
+    V: foyer::StorageValue + Clone,
 {
-    inner: Cache<K, V>,
+    backend: FoyerCacheBackend<K, V>,
 }
 
 impl<K, V> FoyerCache<K, V>
 where
-    K: Eq + Hash + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: foyer::StorageKey + Clone,
+    V: foyer::StorageValue + Clone,
 {
     pub fn new(
         capacity: usize,
         weighter: impl Fn(&K, &V) -> usize + Send + Sync + 'static,
     ) -> Self {
         Self {
-            inner: CacheBuilder::new(capacity).with_weighter(weighter).build(),
+            backend: FoyerCacheBackend::Memory(
+                CacheBuilder::new(capacity).with_weighter(weighter).build(),
+            ),
         }
+    }
+
+    pub fn new_hybrid(
+        memory_capacity: usize,
+        disk_capacity: usize,
+        disk_path: impl AsRef<Path>,
+        weighter: impl Fn(&K, &V) -> usize + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_name("cobble-hybrid-cache")
+                .build()
+                .map_err(|err| {
+                    Error::ConfigError(format!("Failed to build hybrid cache runtime: {err}"))
+                })?,
+        );
+        let disk_path_buf = disk_path.as_ref().to_path_buf();
+        std::fs::create_dir_all(&disk_path_buf).map_err(|err| {
+            Error::ConfigError(format!(
+                "Failed to create hybrid cache directory {}: {}",
+                disk_path_buf.display(),
+                err
+            ))
+        })?;
+        let handle = runtime.handle().clone();
+        let hybrid = runtime
+            .block_on(async move {
+                let device = FsDeviceBuilder::new(disk_path_buf)
+                    .with_capacity(disk_capacity)
+                    .build()
+                    .map_err(|err| {
+                        Error::ConfigError(format!("Failed to build hybrid cache device: {}", err))
+                    })?;
+                let cache = HybridCacheBuilder::new()
+                    .with_name("cobble-block-cache")
+                    .memory(memory_capacity)
+                    .with_weighter(weighter)
+                    .storage()
+                    .with_io_engine_config(PsyncIoEngineConfig::new())
+                    .with_engine_config(BlockEngineConfig::new(device))
+                    .with_spawner(handle.into())
+                    .build()
+                    .await
+                    .map_err(|err| {
+                        Error::ConfigError(format!("Failed to build hybrid block cache: {err}"))
+                    })?;
+                Ok::<HybridCache<K, V>, Error>(cache)
+            })
+            .map_err(|err| {
+                Error::ConfigError(format!("Failed to initialize hybrid cache: {err}"))
+            })?;
+        Ok(Self {
+            backend: FoyerCacheBackend::Hybrid(Arc::new(HybridCacheBackend {
+                inner: hybrid,
+                runtime,
+                cache_root: disk_path.as_ref().to_path_buf(),
+            })),
+        })
     }
 }
 
 impl<K, V> CacheHandle<K, V> for FoyerCache<K, V>
 where
-    K: Eq + Hash + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: foyer::StorageKey + Clone,
+    V: foyer::StorageValue + Clone,
 {
     fn get(&self, key: &K) -> Option<V> {
-        self.inner.get(key).map(|entry| entry.value().clone())
+        match &self.backend {
+            FoyerCacheBackend::Memory(cache) => cache.get(key).map(|entry| entry.value().clone()),
+            FoyerCacheBackend::Hybrid(cache) => cache
+                .runtime
+                .block_on(cache.inner.get(key))
+                .ok()
+                .flatten()
+                .map(|entry| entry.value().clone()),
+        }
     }
 
     fn insert(&self, key: K, value: V) {
-        self.inner.insert(key, value);
+        match &self.backend {
+            FoyerCacheBackend::Memory(cache) => {
+                cache.insert(key, value);
+            }
+            FoyerCacheBackend::Hybrid(cache) => {
+                cache.inner.insert(key, value);
+            }
+        }
     }
 }
 

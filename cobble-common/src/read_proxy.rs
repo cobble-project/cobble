@@ -10,7 +10,7 @@ use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
 use crate::paths::{
     global_snapshot_current_path, global_snapshot_manifest_path_by_pointer, snapshot_manifest_name,
 };
-use crate::sst::block_cache::{BlockCache, new_block_cache};
+use crate::sst::block_cache::{BlockCache, new_block_cache_with_config};
 use crate::{Config, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, VolumeDescriptor};
 use bytes::Bytes;
 use serde_json::Error as SerdeError;
@@ -25,16 +25,21 @@ pub struct ReadProxyConfig {
     pub total_buckets: u32,
     pub pin_partition_in_memory_count: usize,
     pub block_cache_size: usize,
+    pub block_cache_hybrid_enabled: bool,
+    pub block_cache_hybrid_disk_size: Option<usize>,
     pub reload_tolerance: Duration,
 }
 
 impl Default for ReadProxyConfig {
     fn default() -> Self {
+        let default_config = Config::default();
         Self {
             volumes: VolumeDescriptor::single_volume("file:///tmp/".to_string()),
-            total_buckets: Config::default().total_buckets,
+            total_buckets: default_config.total_buckets,
             pin_partition_in_memory_count: 1,
             block_cache_size: 512 * 1024 * 1024,
+            block_cache_hybrid_enabled: default_config.block_cache_hybrid_enabled,
+            block_cache_hybrid_disk_size: default_config.block_cache_hybrid_disk_size,
             reload_tolerance: Duration::from_secs(10),
         }
     }
@@ -47,6 +52,8 @@ impl ReadProxyConfig {
             total_buckets: config.total_buckets,
             pin_partition_in_memory_count: config.read_proxy.pin_partition_in_memory_count,
             block_cache_size: config.read_proxy.block_cache_size,
+            block_cache_hybrid_enabled: config.block_cache_hybrid_enabled,
+            block_cache_hybrid_disk_size: config.block_cache_hybrid_disk_size,
             reload_tolerance: Duration::from_secs(config.read_proxy.reload_tolerance_seconds),
         }
     }
@@ -80,6 +87,8 @@ impl ReadProxy {
         let config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
+            block_cache_hybrid_enabled: read_config.block_cache_hybrid_enabled,
+            block_cache_hybrid_disk_size: read_config.block_cache_hybrid_disk_size,
             ..Config::default()
         }
         .normalize_volume_paths()?;
@@ -97,12 +106,17 @@ impl ReadProxy {
         let manifest_name = snapshot_manifest_name(global_snapshot_id);
         let global_snapshot = load_global_snapshot_by_name(&fs, &manifest_name)?;
         let bucket_map = build_bucket_map(&global_snapshot)?;
+        let db_id = Uuid::new_v4().to_string();
         let block_cache = if read_config.block_cache_size > 0 {
-            Some(new_block_cache(read_config.block_cache_size))
+            Some(new_block_cache_with_config(
+                &config,
+                &db_id,
+                read_config.block_cache_size,
+                None,
+            )?)
         } else {
             None
         };
-        let db_id = Uuid::new_v4().to_string();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         Ok(Self {
             config,
@@ -125,6 +139,8 @@ impl ReadProxy {
         let config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
+            block_cache_hybrid_enabled: read_config.block_cache_hybrid_enabled,
+            block_cache_hybrid_disk_size: read_config.block_cache_hybrid_disk_size,
             ..Config::default()
         }
         .normalize_volume_paths()?;
@@ -143,12 +159,17 @@ impl ReadProxy {
             .ok_or_else(|| Error::IoError("Global snapshot pointer missing".to_string()))?;
         let global_snapshot = load_global_snapshot_by_name(&fs, &pointer)?;
         let bucket_map = build_bucket_map(&global_snapshot)?;
+        let db_id = Uuid::new_v4().to_string();
         let block_cache = if read_config.block_cache_size > 0 {
-            Some(new_block_cache(read_config.block_cache_size))
+            Some(new_block_cache_with_config(
+                &config,
+                &db_id,
+                read_config.block_cache_size,
+                None,
+            )?)
         } else {
             None
         };
-        let db_id = Uuid::new_v4().to_string();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         Ok(Self {
             config,

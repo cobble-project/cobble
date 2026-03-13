@@ -3,8 +3,10 @@ use crate::error::Result;
 use crate::time::TimeProviderKind;
 use crate::util::normalize_storage_path_to_url;
 use log::warn;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use url::Url;
 
 const DEFAULT_READ_PROXY_RELOAD_TOLERANCE_SECONDS: u64 = 10;
 
@@ -166,6 +168,12 @@ impl VolumeDescriptor {
     }
 }
 
+fn supports_primary_data(volume: &VolumeDescriptor) -> bool {
+    volume.supports(VolumeUsageKind::PrimaryDataPriorityHigh)
+        || volume.supports(VolumeUsageKind::PrimaryDataPriorityMedium)
+        || volume.supports(VolumeUsageKind::PrimaryDataPriorityLow)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ReadProxyConfigEntry {
@@ -321,6 +329,11 @@ pub struct Config {
     pub compaction_remote_timeout_ms: u64,
     /// Size of the block cache in bytes. If zero, cache is disabled.
     pub block_cache_size: usize,
+    /// Enable foyer hybrid block cache (memory + local disk).
+    pub block_cache_hybrid_enabled: bool,
+    /// Optional disk capacity for hybrid block cache in bytes.
+    /// If unset, defaults to the in-memory block cache size.
+    pub block_cache_hybrid_disk_size: Option<usize>,
     /// Read proxy configuration overrides.
     pub read_proxy: ReadProxyConfigEntry,
     /// Target base SST file size in bytes.
@@ -380,6 +393,8 @@ impl Default for Config {
             compaction_threads: 4,
             compaction_remote_timeout_ms: 300_000,
             block_cache_size: 64 * 1024 * 1024,
+            block_cache_hybrid_enabled: false,
+            block_cache_hybrid_disk_size: None,
             read_proxy: ReadProxyConfigEntry::default(),
             base_file_size: 64 * 1024 * 1024,
             sst_bloom_filter_enabled: false,
@@ -405,6 +420,15 @@ impl Default for Config {
     }
 }
 
+/// Plan for selecting a volume for hybrid block cache and reserving disk space if needed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HybridCacheVolumePlan {
+    pub(crate) volume_idx: usize,
+    pub(crate) base_dir: String,
+    pub(crate) disk_capacity_bytes: usize,
+    pub(crate) shared_with_primary: bool,
+}
+
 impl Config {
     pub(crate) fn normalize_volume_paths(&self) -> Result<Self> {
         let mut copied = self.clone();
@@ -416,6 +440,127 @@ impl Config {
 }
 
 impl Config {
+    pub(crate) fn hybrid_block_cache_disk_size(&self, memory_capacity: usize) -> Option<usize> {
+        if !self.block_cache_hybrid_enabled || memory_capacity == 0 {
+            return None;
+        }
+        let disk = self.block_cache_hybrid_disk_size.unwrap_or(memory_capacity);
+        Some(disk)
+    }
+
+    /// Select a suitable volume for hybrid block cache based on the config and the required disk capacity.
+    pub(crate) fn resolve_hybrid_cache_volume_plan(
+        &self,
+        memory_capacity: usize,
+    ) -> Result<Option<HybridCacheVolumePlan>> {
+        let Some(disk_capacity_bytes) = self.hybrid_block_cache_disk_size(memory_capacity) else {
+            return Ok(None);
+        };
+        if disk_capacity_bytes == 0 {
+            return Err(crate::error::Error::ConfigError(
+                "block_cache_hybrid_disk_size must be greater than 0 when hybrid cache is enabled"
+                    .to_string(),
+            ));
+        }
+        let required = disk_capacity_bytes as u64;
+        let mut cache_only_candidates: Vec<HybridCacheVolumePlan> = Vec::new();
+        let mut shared_candidates: Vec<HybridCacheVolumePlan> = Vec::new();
+        let mut has_cache_volume = false;
+        let mut has_local_cache_volume = false;
+
+        for (idx, volume) in self.volumes.iter().enumerate() {
+            if !volume.supports(VolumeUsageKind::Cache) {
+                continue;
+            }
+            has_cache_volume = true;
+            let normalized_base_dir = normalize_storage_path_to_url(&volume.base_dir)?;
+            let url = Url::parse(&normalized_base_dir).map_err(|err| {
+                crate::error::Error::ConfigError(format!(
+                    "Invalid cache volume URL {}: {}",
+                    normalized_base_dir, err
+                ))
+            })?;
+            if !url.scheme().eq_ignore_ascii_case("file") {
+                continue;
+            }
+            has_local_cache_volume = true;
+            let fits = match volume.size_limit {
+                Some(limit) => limit >= required,
+                None => true,
+            };
+            if !fits {
+                continue;
+            }
+            let shared_with_primary = supports_primary_data(volume);
+            let plan = HybridCacheVolumePlan {
+                volume_idx: idx,
+                base_dir: normalized_base_dir,
+                disk_capacity_bytes,
+                shared_with_primary,
+            };
+            if !shared_with_primary {
+                cache_only_candidates.push(plan);
+            } else {
+                shared_candidates.push(plan);
+            }
+        }
+
+        let mut rng = rand::thread_rng();
+        if let Some(plan) = cache_only_candidates.choose(&mut rng) {
+            return Ok(Some(plan.clone()));
+        }
+        if let Some(plan) = shared_candidates.choose(&mut rng) {
+            return Ok(Some(plan.clone()));
+        }
+        if !has_cache_volume {
+            return Err(crate::error::Error::ConfigError(
+                "Hybrid block cache enabled but no volume is configured with cache usage"
+                    .to_string(),
+            ));
+        }
+        if !has_local_cache_volume {
+            return Err(crate::error::Error::ConfigError(
+                "Hybrid block cache requires a local file:// cache volume".to_string(),
+            ));
+        }
+        Err(crate::error::Error::ConfigError(format!(
+            "No cache volume has enough capacity for hybrid block cache disk size {} bytes",
+            disk_capacity_bytes
+        )))
+    }
+
+    /// If the selected hybrid cache volume is shared with primary data, adjust the config to
+    /// reserve the required disk space for the cache.
+    pub(crate) fn apply_hybrid_cache_primary_partition_with_plan(
+        &self,
+        plan: Option<&HybridCacheVolumePlan>,
+    ) -> Result<Self> {
+        let Some(plan) = plan else {
+            return Ok(self.clone());
+        };
+        if !plan.shared_with_primary {
+            return Ok(self.clone());
+        }
+        let mut adjusted = self.clone();
+        let disk_bytes = plan.disk_capacity_bytes as u64;
+        let volume = adjusted.volumes.get_mut(plan.volume_idx).ok_or_else(|| {
+            crate::error::Error::ConfigError(format!(
+                "Selected hybrid cache volume index {} out of range",
+                plan.volume_idx
+            ))
+        })?;
+        if let Some(limit) = volume.size_limit {
+            if limit <= disk_bytes {
+                return Err(crate::error::Error::ConfigError(format!(
+                    "Hybrid cache reservation {} bytes exceeds shared volume limit {} bytes for {}",
+                    disk_bytes, limit, volume.base_dir
+                )));
+            }
+            volume.size_limit = Some(limit - disk_bytes);
+        }
+        Ok(adjusted)
+    }
+
     pub fn from_path(path: impl AsRef<std::path::Path>) -> crate::error::Result<Self> {
         let mut builder = ::config::Config::builder();
         let path = path.as_ref();
@@ -519,6 +664,8 @@ mod tests {
             max_level: 4,
             compaction_policy: super::CompactionPolicyKind::MinOverlap,
             block_cache_size: 256,
+            block_cache_hybrid_enabled: true,
+            block_cache_hybrid_disk_size: Some(1024),
             read_proxy: ReadProxyConfigEntry {
                 pin_partition_in_memory_count: 2,
                 block_cache_size: 2048,
@@ -581,6 +728,8 @@ mod tests {
         assert_eq!(decoded.value_separation_threshold, 4096);
         assert_eq!(decoded.read_proxy.block_cache_size, 2048);
         assert_eq!(decoded.read_proxy.reload_tolerance_seconds, 5);
+        assert!(decoded.block_cache_hybrid_enabled);
+        assert_eq!(decoded.block_cache_hybrid_disk_size, Some(1024));
 
         let yaml = serde_yaml::to_string(&config).expect("Cannot serialize yaml");
         let mut yaml_file = Builder::new()
@@ -625,5 +774,68 @@ mod tests {
         config.volumes = VolumeDescriptor::single_volume(local.to_string_lossy().to_string());
         let config = config.normalize_volume_paths().unwrap();
         assert!(config.volumes[0].base_dir.starts_with("file://"));
+    }
+
+    #[test]
+    fn test_hybrid_cache_prefers_cache_only_volume() {
+        let mut config = Config::default();
+        config.block_cache_hybrid_enabled = true;
+        config.block_cache_hybrid_disk_size = Some(1024);
+        config.volumes = vec![
+            VolumeDescriptor::new(
+                "file:///tmp/primary-shared".to_string(),
+                vec![
+                    VolumeUsageKind::PrimaryDataPriorityHigh,
+                    VolumeUsageKind::Cache,
+                    VolumeUsageKind::Meta,
+                ],
+            ),
+            VolumeDescriptor::new(
+                "file:///tmp/cache-only".to_string(),
+                vec![VolumeUsageKind::Cache],
+            ),
+        ];
+        let plan = config
+            .resolve_hybrid_cache_volume_plan(2048)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.volume_idx, 1);
+        assert!(!plan.shared_with_primary);
+        assert_eq!(plan.disk_capacity_bytes, 1024);
+    }
+
+    #[test]
+    fn test_hybrid_cache_partitions_shared_volume_limit() {
+        let mut config = Config::default();
+        config.block_cache_hybrid_enabled = true;
+        config.block_cache_hybrid_disk_size = Some(1024);
+        let mut shared = VolumeDescriptor::new(
+            "file:///tmp/shared".to_string(),
+            vec![
+                VolumeUsageKind::PrimaryDataPriorityHigh,
+                VolumeUsageKind::Cache,
+                VolumeUsageKind::Meta,
+            ],
+        );
+        shared.size_limit = Some(8192);
+        config.volumes = vec![shared];
+        let plan = config.resolve_hybrid_cache_volume_plan(4096).unwrap();
+        let adjusted = config
+            .apply_hybrid_cache_primary_partition_with_plan(plan.as_ref())
+            .unwrap();
+        assert_eq!(adjusted.volumes[0].size_limit, Some(7168));
+    }
+
+    #[test]
+    fn test_hybrid_cache_rejects_non_local_cache_volume() {
+        let mut config = Config::default();
+        config.block_cache_hybrid_enabled = true;
+        config.block_cache_hybrid_disk_size = Some(1024);
+        config.volumes = vec![VolumeDescriptor::new(
+            "s3://bucket/cache".to_string(),
+            vec![VolumeUsageKind::Cache],
+        )];
+        let err = config.resolve_hybrid_cache_volume_plan(2048).unwrap_err();
+        assert!(matches!(err, crate::error::Error::ConfigError(_)));
     }
 }

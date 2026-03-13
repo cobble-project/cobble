@@ -14,7 +14,7 @@ use crate::snapshot::{
     list_snapshot_manifest_ids, load_manifest_entry, load_manifest_for_snapshot,
     snapshot_manifest_name,
 };
-use crate::sst::block_cache::new_block_cache;
+use crate::sst::block_cache::new_block_cache_with_config;
 use crate::sst::row_codec::{decode_value, decode_value_masked, encode_key_ref_into};
 use crate::r#type::decode_merge_separated_array;
 use crate::r#type::{Column, RefColumn, RefKey, RefValue, Value, ValueType};
@@ -226,6 +226,9 @@ impl Db {
         metrics_registry::init_metrics();
         let id = db_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let metrics_manager = Arc::new(MetricsManager::new(&id));
+        let hybrid_cache_plan = config.resolve_hybrid_cache_volume_plan(config.block_cache_size)?;
+        let file_manager_config =
+            config.apply_hybrid_cache_primary_partition_with_plan(hybrid_cache_plan.as_ref())?;
 
         if let Some(governance) = governance {
             governance.register_db(&id, &bucket_ranges, config.total_buckets)?;
@@ -234,7 +237,8 @@ impl Db {
             local_governance.register_db(&id, &bucket_ranges, config.total_buckets)?;
         }
 
-        let file_manager = FileManager::from_config(&config, &id, Arc::clone(&metrics_manager))?;
+        let file_manager =
+            FileManager::from_config(&file_manager_config, &id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let db_state = Arc::new(DbStateHandle::new());
         let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
@@ -247,6 +251,7 @@ impl Db {
             id,
             bucket_ranges,
             0,
+            hybrid_cache_plan,
             metrics_manager,
             schema_manager,
         )?;
@@ -523,7 +528,11 @@ impl Db {
         init_logging(&config);
         metrics_registry::init_metrics();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
-        let file_manager = FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager))?;
+        let hybrid_cache_plan = config.resolve_hybrid_cache_volume_plan(config.block_cache_size)?;
+        let file_manager_config =
+            config.apply_hybrid_cache_primary_partition_with_plan(hybrid_cache_plan.as_ref())?;
+        let file_manager =
+            FileManager::from_config(&file_manager_config, &db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
         let schema_manager = Arc::new(SchemaManager::from_manifest(
@@ -579,6 +588,7 @@ impl Db {
             db_id,
             bucket_ranges,
             max_vlog_file_seq.saturating_add(1).min(u32::MAX as u64) as u32,
+            hybrid_cache_plan,
             metrics_manager,
             schema_manager,
         )?;
@@ -598,11 +608,15 @@ impl Db {
         db_id: String,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
-        config.normalize_volume_paths()?;
+        let config = config.normalize_volume_paths()?;
         init_logging(&config);
         metrics_registry::init_metrics();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
-        let file_manager = FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager))?;
+        let hybrid_cache_plan = config.resolve_hybrid_cache_volume_plan(config.block_cache_size)?;
+        let file_manager_config =
+            config.apply_hybrid_cache_primary_partition_with_plan(hybrid_cache_plan.as_ref())?;
+        let file_manager =
+            FileManager::from_config(&file_manager_config, &db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let snapshot_ids = list_snapshot_manifest_ids(&file_manager)?;
         if snapshot_ids.is_empty() {
@@ -677,6 +691,7 @@ impl Db {
             db_id,
             bucket_ranges,
             max_vlog_file_seq.saturating_add(1).min(u32::MAX as u64) as u32,
+            hybrid_cache_plan,
             metrics_manager,
             schema_manager,
         )?;
@@ -697,6 +712,7 @@ impl Db {
         id: String,
         bucket_ranges: Vec<RangeInclusive<u16>>,
         initial_vlog_file_seq: u32,
+        hybrid_cache_plan: Option<crate::config::HybridCacheVolumePlan>,
         metrics_manager: Arc<MetricsManager>,
         schema_manager: Arc<SchemaManager>,
     ) -> Result<Self> {
@@ -714,7 +730,12 @@ impl Db {
             Arc::clone(&metrics_manager),
         );
         if config.block_cache_size > 0 {
-            lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
+            lsm_tree.set_block_cache(Some(new_block_cache_with_config(
+                &config,
+                &id,
+                config.block_cache_size,
+                hybrid_cache_plan.as_ref(),
+            )?));
         }
         db_state.configure_multi_lsm(config.total_buckets, &bucket_ranges)?;
         let lsm_tree = Arc::new(lsm_tree);

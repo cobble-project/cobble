@@ -11,7 +11,7 @@ use crate::schema::SchemaManager;
 use crate::snapshot::{
     build_tree_versions_from_manifest, build_vlog_version_from_manifest, load_manifest_for_snapshot,
 };
-use crate::sst::block_cache::{BlockCache, new_block_cache};
+use crate::sst::block_cache::{BlockCache, new_block_cache_with_config};
 use crate::sst::row_codec::encode_key_ref_into;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::r#type::{RefKey, Value};
@@ -129,7 +129,12 @@ impl ReadOnlyDb {
         if let Some(block_cache) = block_cache {
             lsm_tree.set_block_cache(Some(block_cache));
         } else if config.block_cache_size > 0 {
-            lsm_tree.set_block_cache(Some(new_block_cache(config.block_cache_size)));
+            lsm_tree.set_block_cache(Some(new_block_cache_with_config(
+                &config,
+                &snapshot_db_id,
+                config.block_cache_size,
+                None,
+            )?));
         }
         let lsm_tree = Arc::new(lsm_tree);
         Ok(Self {

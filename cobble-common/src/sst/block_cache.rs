@@ -1,7 +1,14 @@
+use crate::Config;
 use crate::cache::{CacheHandle, FoyerCache};
+use crate::config::HybridCacheVolumePlan;
+use crate::error::{Error, Result};
 use crate::sst::bloom::BloomFilter;
 use crate::sst::format::Block;
+use bytes::Bytes;
+use foyer::{Code, Error as FoyerError};
 use std::sync::Arc;
+use std::{io::Read, io::Write, path::PathBuf};
+use url::Url;
 
 #[derive(Clone)]
 pub enum CachedBlock {
@@ -29,6 +36,42 @@ pub enum BlockCacheKind {
     FilterIndex,
 }
 
+impl Code for BlockCacheKind {
+    fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
+        let tag = match self {
+            BlockCacheKind::Data => 0u8,
+            BlockCacheKind::IndexPartition => 1u8,
+            BlockCacheKind::IndexTop => 2u8,
+            BlockCacheKind::FilterPartition => 3u8,
+            BlockCacheKind::FilterIndex => 4u8,
+        };
+        writer.write_all(&[tag]).map_err(FoyerError::io_error)
+    }
+
+    fn decode(reader: &mut impl Read) -> foyer::Result<Self>
+    where
+        Self: Sized,
+    {
+        let mut tag = [0u8; 1];
+        reader.read_exact(&mut tag).map_err(FoyerError::io_error)?;
+        match tag[0] {
+            0 => Ok(BlockCacheKind::Data),
+            1 => Ok(BlockCacheKind::IndexPartition),
+            2 => Ok(BlockCacheKind::IndexTop),
+            3 => Ok(BlockCacheKind::FilterPartition),
+            4 => Ok(BlockCacheKind::FilterIndex),
+            kind => Err(FoyerError::io_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unknown block cache kind tag: {}", kind),
+            ))),
+        }
+    }
+
+    fn estimated_size(&self) -> usize {
+        1
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct BlockCacheKey {
     pub file_id: u64,
@@ -36,10 +79,150 @@ pub struct BlockCacheKey {
     pub kind: BlockCacheKind,
 }
 
+impl Code for BlockCacheKey {
+    fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
+        writer
+            .write_all(&self.file_id.to_le_bytes())
+            .map_err(FoyerError::io_error)?;
+        writer
+            .write_all(&self.block_id.to_le_bytes())
+            .map_err(FoyerError::io_error)?;
+        self.kind.encode(writer)
+    }
+
+    fn decode(reader: &mut impl Read) -> foyer::Result<Self>
+    where
+        Self: Sized,
+    {
+        let mut file_id = [0u8; 8];
+        let mut block_id = [0u8; 8];
+        reader
+            .read_exact(&mut file_id)
+            .map_err(FoyerError::io_error)?;
+        reader
+            .read_exact(&mut block_id)
+            .map_err(FoyerError::io_error)?;
+        let kind = BlockCacheKind::decode(reader)?;
+        Ok(Self {
+            file_id: u64::from_le_bytes(file_id),
+            block_id: u64::from_le_bytes(block_id),
+            kind,
+        })
+    }
+
+    fn estimated_size(&self) -> usize {
+        8 + 8 + self.kind.estimated_size()
+    }
+}
+
+impl Code for CachedBlock {
+    fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
+        let (tag, payload) = match self {
+            CachedBlock::Block(block) => (0u8, block.encode()),
+            CachedBlock::BloomFilter(filter) => (1u8, filter.encode()),
+        };
+        writer.write_all(&[tag]).map_err(FoyerError::io_error)?;
+        let len = payload.len() as u32;
+        writer
+            .write_all(&len.to_le_bytes())
+            .map_err(FoyerError::io_error)?;
+        writer.write_all(&payload).map_err(FoyerError::io_error)
+    }
+
+    fn decode(reader: &mut impl Read) -> foyer::Result<Self>
+    where
+        Self: Sized,
+    {
+        let mut tag = [0u8; 1];
+        let mut len = [0u8; 4];
+        reader.read_exact(&mut tag).map_err(FoyerError::io_error)?;
+        reader.read_exact(&mut len).map_err(FoyerError::io_error)?;
+        let len = u32::from_le_bytes(len) as usize;
+        let mut data = vec![0u8; len];
+        reader.read_exact(&mut data).map_err(FoyerError::io_error)?;
+        let payload = Bytes::from(data);
+        match tag[0] {
+            0 => {
+                let block = Block::decode(payload).map_err(|err| {
+                    FoyerError::io_error(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        err.to_string(),
+                    ))
+                })?;
+                Ok(CachedBlock::Block(Arc::new(block)))
+            }
+            1 => {
+                let filter = BloomFilter::decode(payload).map_err(|err| {
+                    FoyerError::io_error(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        err.to_string(),
+                    ))
+                })?;
+                Ok(CachedBlock::BloomFilter(Arc::new(filter)))
+            }
+            kind => Err(FoyerError::io_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unknown cached block tag: {}", kind),
+            ))),
+        }
+    }
+
+    fn estimated_size(&self) -> usize {
+        1 + 4 + self.size_in_bytes()
+    }
+}
+
 pub fn new_block_cache(capacity: usize) -> BlockCache {
     Arc::new(FoyerCache::new(capacity, |_, v: &CachedBlock| {
         v.size_in_bytes()
     }))
+}
+
+pub(crate) fn new_block_cache_with_config(
+    config: &Config,
+    db_id: &str,
+    memory_capacity: usize,
+    selected_plan: Option<&HybridCacheVolumePlan>,
+) -> Result<BlockCache> {
+    if memory_capacity == 0 {
+        return Err(Error::ConfigError(
+            "block cache size must be greater than 0".to_string(),
+        ));
+    }
+    let plan = if let Some(plan) = selected_plan {
+        Some(plan.clone())
+    } else {
+        config.resolve_hybrid_cache_volume_plan(memory_capacity)?
+    };
+    let Some(plan) = plan else {
+        return Ok(new_block_cache(memory_capacity));
+    };
+    let cache_dir = build_hybrid_cache_dir(&plan.base_dir, db_id)?;
+    let hybrid = FoyerCache::new_hybrid(
+        memory_capacity,
+        plan.disk_capacity_bytes,
+        cache_dir,
+        |_, value: &CachedBlock| value.size_in_bytes(),
+    )?;
+    Ok(Arc::new(hybrid))
+}
+
+fn build_hybrid_cache_dir(base_dir: &str, db_id: &str) -> Result<PathBuf> {
+    let url = Url::parse(base_dir).map_err(|err| {
+        Error::ConfigError(format!("Invalid cache volume URL {}: {}", base_dir, err))
+    })?;
+    if !url.scheme().eq_ignore_ascii_case("file") {
+        return Err(Error::ConfigError(format!(
+            "Hybrid cache requires a local file:// volume, got {}",
+            base_dir
+        )));
+    }
+    let mut path = url.to_file_path().map_err(|_| {
+        Error::ConfigError(format!("Invalid file URL for cache volume: {}", base_dir))
+    })?;
+    path.push(db_id);
+    path.push("cache");
+    Ok(path)
 }
 
 #[cfg(test)]
