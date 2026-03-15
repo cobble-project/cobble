@@ -76,24 +76,43 @@ impl VolumePriority {
     }
 }
 
-struct VolumeState {
+struct VolumeUsage {
+    used_bytes: AtomicU64,
+}
+
+impl Clone for VolumeUsage {
+    fn clone(&self) -> Self {
+        Self {
+            used_bytes: AtomicU64::new(self.used_bytes.load(Ordering::SeqCst)),
+        }
+    }
+}
+
+pub(crate) struct DataVolume {
     fs: Arc<dyn FileSystem>,
     base_dir: Option<String>,
     size_limit: Option<u64>,
     used_bytes: AtomicU64,
+    priority: VolumePriority,
+    supports_primary_data: bool,
+    snapshot_persistable: bool,
 }
 
-impl VolumeState {
-    fn new(fs: Arc<dyn FileSystem>, size_limit: Option<u64>, base_dir: Option<String>) -> Self {
-        let base_dir = base_dir.map(|dir| dir.trim_end_matches('/').to_string());
+impl Clone for DataVolume {
+    fn clone(&self) -> Self {
         Self {
-            fs,
-            base_dir,
-            size_limit,
-            used_bytes: AtomicU64::new(0),
+            fs: Arc::clone(&self.fs),
+            base_dir: self.base_dir.clone(),
+            size_limit: self.size_limit,
+            used_bytes: AtomicU64::new(self.used_bytes.load(Ordering::SeqCst)),
+            priority: self.priority,
+            supports_primary_data: self.supports_primary_data,
+            snapshot_persistable: self.snapshot_persistable,
         }
     }
+}
 
+impl DataVolume {
     fn base_dir(&self) -> Option<&str> {
         self.base_dir.as_deref()
     }
@@ -127,14 +146,10 @@ impl VolumeState {
         let used = self.used_bytes.load(Ordering::SeqCst);
         used >= threshold
     }
-}
 
-#[derive(Clone)]
-pub(crate) struct DataVolume {
-    state: Arc<VolumeState>,
-    priority: VolumePriority,
-    supports_primary_data: bool,
-    snapshot_persistable: bool,
+    fn fs(&self) -> &Arc<dyn FileSystem> {
+        &self.fs
+    }
 }
 
 /// A unique identifier for data files managed by the FileManager.
@@ -171,7 +186,7 @@ pub struct TrackedFile {
     /// The underlying file system (needed for deletion on drop).
     fs: Arc<dyn FileSystem>,
     /// Optional volume usage tracker.
-    volume: Option<Arc<VolumeState>>,
+    volume: Option<Arc<DataVolume>>,
     /// Bytes tracked for this file.
     size_bytes: AtomicU64,
     /// Whether to delete the file when this TrackedFile is dropped.
@@ -185,7 +200,7 @@ impl TrackedFile {
         &self.fs
     }
     /// Creates a new TrackedFile.
-    fn new(path: String, fs: Arc<dyn FileSystem>, volume: Option<Arc<VolumeState>>) -> Self {
+    fn new(path: String, fs: Arc<dyn FileSystem>, volume: Option<Arc<DataVolume>>) -> Self {
         Self {
             path,
             fs,
@@ -197,7 +212,7 @@ impl TrackedFile {
     }
 
     /// Creates a new TrackedFile that never deletes on drop.
-    fn readonly(path: String, fs: Arc<dyn FileSystem>, volume: Option<Arc<VolumeState>>) -> Self {
+    fn readonly(path: String, fs: Arc<dyn FileSystem>, volume: Option<Arc<DataVolume>>) -> Self {
         Self {
             path,
             fs,
@@ -380,7 +395,7 @@ pub struct AtomicMetadataWriter {
     fs: Arc<dyn FileSystem>,
     metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
     metadata_files_gauge: Gauge,
-    volume: Option<Arc<VolumeState>>,
+    volume: Option<Arc<DataVolume>>,
 }
 
 impl AtomicMetadataWriter {
@@ -393,7 +408,7 @@ impl AtomicMetadataWriter {
         fs: Arc<dyn FileSystem>,
         metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
         metadata_files_gauge: Gauge,
-        volume: Option<Arc<VolumeState>>,
+        volume: Option<Arc<DataVolume>>,
     ) -> Self {
         Self {
             temp_path,
@@ -469,9 +484,9 @@ impl FileManagerMetrics {
 pub struct FileManager {
     metrics: FileManagerMetrics,
     /// The metadata volume for metadata files.
-    meta_volume: DataVolume,
+    meta_volume: Arc<DataVolume>,
     /// Ordered data volumes by priority (high to low).
-    data_volumes: Vec<DataVolume>,
+    data_volumes: Vec<Arc<DataVolume>>,
     /// Configuration options.
     options: FileManagerOptions,
     /// Counter for generating unique file IDs.
@@ -521,10 +536,10 @@ impl FileManager {
         Ok(())
     }
 
-    fn select_data_volume(&self) -> Result<&DataVolume> {
+    fn select_data_volume(&self) -> Result<&Arc<DataVolume>> {
         let base_file_size = self.options.base_file_size as u64;
-        let mut selected: Option<&DataVolume> = None;
-        let mut candidates: Vec<&DataVolume> = Vec::with_capacity(self.data_volumes.len());
+        let mut selected: Option<&Arc<DataVolume>> = None;
+        let mut candidates: Vec<&Arc<DataVolume>> = Vec::with_capacity(self.data_volumes.len());
         for volume in &self.data_volumes {
             if !volume.supports_primary_data {
                 continue;
@@ -532,7 +547,7 @@ impl FileManager {
             if !candidates.is_empty() && volume.priority.rank() < candidates[0].priority.rank() {
                 break;
             }
-            if volume.state.is_full(base_file_size) {
+            if volume.is_full(base_file_size) {
                 continue;
             }
             candidates.push(volume);
@@ -547,9 +562,9 @@ impl FileManager {
         selected.ok_or_else(|| Error::IoError("All primary data volumes are full".to_string()))
     }
 
-    fn test_existence_for_path(&self, path: &str) -> Result<&DataVolume> {
+    fn test_existence_for_path(&self, path: &str) -> Result<&Arc<DataVolume>> {
         for volume in &self.data_volumes {
-            if volume.state.fs.exists(path)? {
+            if volume.fs().exists(path)? {
                 return Ok(volume);
             }
         }
@@ -569,22 +584,22 @@ impl FileManager {
 
     /// Resolves a file path to the corresponding data volume and relative path.
     /// This is used when registering existing files to determine which volume they belong to.
-    fn resolve_volume_path(&self, path: &str) -> Result<(&DataVolume, String)> {
+    fn resolve_volume_path(&self, path: &str) -> Result<(Arc<DataVolume>, String)> {
         let normalized = normalize_storage_path_to_url(path)?;
         for volume in &self.data_volumes {
-            let Some(base_dir) = volume.state.base_dir() else {
+            let Some(base_dir) = volume.base_dir() else {
                 continue;
             };
             if normalized.starts_with(base_dir) {
                 let relative = self.trim_volume_base_dir(&normalized, base_dir);
-                return Ok((volume, relative.to_string()));
+                return Ok((Arc::clone(volume), relative.to_string()));
             }
         }
         let volume = self.test_existence_for_path(path)?;
-        Ok((volume, path.to_string()))
+        Ok((Arc::clone(volume), path.to_string()))
     }
-    fn choose_meta_volume(volumes: &[DataVolume]) -> Result<DataVolume> {
-        let candidates: Vec<&DataVolume> = volumes
+    fn choose_meta_volume(volumes: &[Arc<DataVolume>]) -> Result<Arc<DataVolume>> {
+        let candidates: Vec<&Arc<DataVolume>> = volumes
             .iter()
             .filter(|volume| volume.snapshot_persistable)
             .collect();
@@ -598,7 +613,7 @@ impl FileManager {
             .copied()
             .find(|volume| !volume.supports_primary_data);
         if let Some(volume) = snapshot_only {
-            return Ok(volume.clone());
+            return Ok(Arc::clone(volume));
         }
         let max_rank = candidates
             .iter()
@@ -611,7 +626,7 @@ impl FileManager {
         candidates
             .into_iter()
             .find(|volume| volume.supports_primary_data && volume.priority.rank() == max_rank)
-            .cloned()
+            .map(Arc::clone)
             .ok_or_else(|| {
                 Error::ConfigError("No volume configured for snapshot persistence".to_string())
             })
@@ -638,10 +653,13 @@ impl FileManager {
                 "No volume configured for primary data storage".to_string(),
             ));
         }
+        let data_volumes = Self::sort_data_volumes(data_volumes)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>();
         let meta_volume = Self::choose_meta_volume(&data_volumes)?;
-        let data_volumes = Self::sort_data_volumes(data_volumes);
         for volume in &data_volumes {
-            Self::ensure_volume_dirs(&volume.state.fs, &options)?;
+            Self::ensure_volume_dirs(volume.fs(), &options)?;
         }
         Ok(Self {
             metrics: metrics_manager.file_manager_metrics(),
@@ -661,7 +679,10 @@ impl FileManager {
         metrics_manager: Arc<MetricsManager>,
     ) -> Result<Self> {
         let volume = DataVolume {
-            state: Arc::new(VolumeState::new(fs, None, None)),
+            fs,
+            base_dir: None,
+            size_limit: None,
+            used_bytes: AtomicU64::new(0),
             priority: VolumePriority::High,
             supports_primary_data: true,
             snapshot_persistable: true,
@@ -715,11 +736,10 @@ impl FileManager {
                 let fs = registry.get_or_register_volume(volume)?;
                 let normalized_base_dir = normalize_storage_path_to_url(&volume.base_dir)?;
                 data_volumes.push(DataVolume {
-                    state: Arc::new(VolumeState::new(
-                        fs,
-                        volume.size_limit,
-                        Some(normalized_base_dir),
-                    )),
+                    fs,
+                    base_dir: Some(normalized_base_dir),
+                    size_limit: volume.size_limit,
+                    used_bytes: AtomicU64::new(0),
                     priority: priority.unwrap_or(VolumePriority::Low),
                     supports_primary_data,
                     snapshot_persistable: supports_snapshot,
@@ -840,16 +860,16 @@ impl FileManager {
     fn create_data_file_writer_on_volume(
         &self,
         file_id: FileId,
-        volume: &DataVolume,
+        volume: &Arc<DataVolume>,
     ) -> Result<TrackedWriter> {
         let tracked = Arc::new(TrackedFile::new(
             self.data_file_path(file_id),
-            Arc::clone(&volume.state.fs),
-            Some(Arc::clone(&volume.state)),
+            Arc::clone(volume.fs()),
+            Some(Arc::clone(volume)),
         ));
         self.data_files.insert(file_id, Arc::clone(&tracked));
         self.report_data_files_gauge();
-        let writer = volume.state.fs.open_write(tracked.path())?;
+        let writer = volume.fs().open_write(tracked.path())?;
         Ok(TrackedWriter::new(writer, tracked))
     }
 
@@ -859,7 +879,7 @@ impl FileManager {
     /// created externally. The file is tracked but no reader is opened.
     pub fn register_data_file(&self, file_id: FileId, path: &str) -> Result<()> {
         let (volume, relative_path) = self.resolve_volume_path(path)?;
-        let fs = Arc::clone(&volume.state.fs);
+        let fs = Arc::clone(volume.fs());
 
         // Track the file if not already tracked
         {
@@ -867,7 +887,7 @@ impl FileManager {
                 Arc::new(TrackedFile::new(
                     relative_path.clone(),
                     Arc::clone(&fs),
-                    Some(Arc::clone(&volume.state)),
+                    Some(Arc::clone(&volume)),
                 ))
             });
             let size = fs
@@ -965,18 +985,16 @@ impl FileManager {
         let Some(tracked_volume) = &tracked.volume else {
             return false;
         };
-        self.data_volumes
-            .iter()
-            .any(|volume| volume.snapshot_persistable && Arc::ptr_eq(&volume.state, tracked_volume))
+        tracked_volume.snapshot_persistable
     }
 
-    fn select_snapshot_persistable_volume(&self) -> Result<&DataVolume> {
+    fn select_snapshot_persistable_volume(&self) -> Result<&Arc<DataVolume>> {
         let base_file_size = self.options.base_file_size as u64;
         let snapshot_only_non_full = self
             .data_volumes
             .iter()
             .filter(|volume| volume.snapshot_persistable && !volume.supports_primary_data)
-            .find(|volume| !volume.state.is_full(base_file_size));
+            .find(|volume| !volume.is_full(base_file_size));
         if let Some(volume) = snapshot_only_non_full {
             return Ok(volume);
         }
@@ -991,7 +1009,7 @@ impl FileManager {
             .data_volumes
             .iter()
             .filter(|volume| volume.snapshot_persistable && volume.supports_primary_data)
-            .find(|volume| !volume.state.is_full(base_file_size));
+            .find(|volume| !volume.is_full(base_file_size));
         if let Some(volume) = shared_non_full {
             return Ok(volume);
         }
@@ -1120,12 +1138,12 @@ impl FileManager {
     pub fn create_metadata_file(&self, name: &str) -> Result<AtomicMetadataWriter> {
         let final_path = self.metadata_file_path(name);
         let temp_path = format!("{}.tmp-{}", final_path, Uuid::new_v4());
-        let writer = self.meta_volume.state.fs.open_write(&temp_path)?;
+        let writer = self.meta_volume.fs().open_write(&temp_path)?;
 
         let tracked = Arc::new(TrackedFile::new(
             temp_path.clone(),
-            Arc::clone(&self.meta_volume.state.fs),
-            Some(Arc::clone(&self.meta_volume.state)),
+            Arc::clone(self.meta_volume.fs()),
+            Some(Arc::clone(&self.meta_volume)),
         ));
         let tracked_writer = TrackedWriter::new(writer, tracked);
         Ok(AtomicMetadataWriter::new(
@@ -1133,17 +1151,17 @@ impl FileManager {
             name.to_string(),
             final_path,
             tracked_writer,
-            Arc::clone(&self.meta_volume.state.fs),
+            Arc::clone(self.meta_volume.fs()),
             Arc::clone(&self.metadata_files),
             self.metrics.metadata_files_tracked.clone(),
-            Some(Arc::clone(&self.meta_volume.state)),
+            Some(Arc::clone(&self.meta_volume)),
         ))
     }
 
     /// Registers an existing metadata file with the FileManager.
     pub fn register_metadata_file(&self, name: &str, path: &str) -> Result<()> {
         // Verify the file exists
-        if !self.meta_volume.state.fs.exists(path)? {
+        if !self.meta_volume.fs().exists(path)? {
             return Err(Error::IoError(format!(
                 "Metadata file {} does not exist at path: {}",
                 name, path
@@ -1154,8 +1172,8 @@ impl FileManager {
         if !self.metadata_files.contains_key(name) {
             let tracked = Arc::new(TrackedFile::new(
                 path.to_string(),
-                Arc::clone(&self.meta_volume.state.fs),
-                Some(Arc::clone(&self.meta_volume.state)),
+                Arc::clone(self.meta_volume.fs()),
+                Some(Arc::clone(&self.meta_volume)),
             ));
             self.metadata_files.insert(name.to_string(), tracked);
             self.report_metadata_files_gauge();
@@ -1176,7 +1194,7 @@ impl FileManager {
             ))
         })?;
 
-        let reader = self.meta_volume.state.fs.open_read(tracked.path())?;
+        let reader = self.meta_volume.fs().open_read(tracked.path())?;
         Ok(TrackedReader::new(reader, Arc::clone(&tracked)))
     }
 
@@ -1186,17 +1204,17 @@ impl FileManager {
         name: &str,
     ) -> Result<Box<dyn RandomAccessFile>> {
         let path = self.metadata_file_path(name);
-        self.meta_volume.state.fs.open_read(&path)
+        self.meta_volume.fs().open_read(&path)
     }
 
     /// Registers an existing data file without deleting it on drop.
     pub fn register_data_file_readonly(&self, file_id: FileId, path: &str) -> Result<()> {
         let (volume, relative_path) = self.resolve_volume_path(path)?;
-        let fs = Arc::clone(&volume.state.fs);
+        let fs = Arc::clone(volume.fs());
         let tracked = Arc::new(TrackedFile::readonly(
             relative_path,
             Arc::clone(&fs),
-            Some(Arc::clone(&volume.state)),
+            Some(Arc::clone(&volume)),
         ));
         let size = fs
             .open_read(tracked.path())
@@ -1233,14 +1251,14 @@ impl FileManager {
             if Arc::strong_count(&tracked) > 1 {
                 tracked.mark_for_deletion();
             } else {
-                self.meta_volume.state.fs.delete(tracked.path())?;
+                self.meta_volume.fs().delete(tracked.path())?;
             }
             self.report_metadata_files_gauge();
             return Ok(());
         }
         let path = self.metadata_file_path(name);
-        if self.meta_volume.state.fs.exists(&path)? {
-            self.meta_volume.state.fs.delete(&path)?;
+        if self.meta_volume.fs().exists(&path)? {
+            self.meta_volume.fs().delete(&path)?;
         }
         Ok(())
     }
@@ -1277,7 +1295,7 @@ impl FileManager {
         } else {
             format!("{}/{}", self.options.base_dir, SNAPSHOT_DIR)
         };
-        self.meta_volume.state.fs.list(&snapshot_dir)
+        self.meta_volume.fs().list(&snapshot_dir)
     }
 }
 
@@ -1559,21 +1577,19 @@ pub(crate) mod tests {
             .get_or_register(format!("file://{}/low", root))
             .unwrap();
         let high_volume = DataVolume {
-            state: Arc::new(VolumeState::new(
-                Arc::clone(&high_fs),
-                Some(128),
-                Some(format!("{}/high", root)),
-            )),
+            fs: Arc::clone(&high_fs),
+            base_dir: Some(format!("{}/high", root)),
+            size_limit: Some(128),
+            used_bytes: AtomicU64::new(0),
             priority: VolumePriority::High,
             supports_primary_data: true,
             snapshot_persistable: true,
         };
         let low_volume = DataVolume {
-            state: Arc::new(VolumeState::new(
-                Arc::clone(&low_fs),
-                None,
-                Some(format!("{}/low", root)),
-            )),
+            fs: Arc::clone(&low_fs),
+            base_dir: Some(format!("{}/low", root)),
+            size_limit: None,
+            used_bytes: AtomicU64::new(0),
             priority: VolumePriority::Low,
             supports_primary_data: true,
             snapshot_persistable: false,

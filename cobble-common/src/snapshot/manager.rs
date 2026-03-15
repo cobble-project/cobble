@@ -427,10 +427,8 @@ impl SnapshotManager {
                 let resources = Arc::new(MaterializeTempResourceRegistry::new(Arc::clone(
                     &self.file_manager,
                 )));
-                let prepared_result = self.prepare_snapshot_for_materialization(
-                    snapshot.as_ref(),
-                    &resources,
-                );
+                let prepared_result =
+                    self.prepare_snapshot_for_materialization(snapshot.as_ref(), &resources);
                 match prepared_result {
                     Ok(prepared) => {
                         let materialize_result = (|| {
