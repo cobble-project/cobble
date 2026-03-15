@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::file::TrackedFile;
 use crate::lsm::LSMTreeVersion;
 use crate::vlog::VlogVersion;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
@@ -27,9 +27,8 @@ pub(crate) struct DbSnapshot {
     pub base_snapshot_id: Option<u64>,
     // Per-tree LSM versions without tracked file references.
     pub lsm_versions: Vec<LSMTreeVersion>,
-    // Tracked references to all files included in the snapshot, used for reference counting and
-    // cleanup when expiring snapshots. This includes both LSM files and vlog files.
-    pub tracked_files: Vec<Arc<TrackedFile>>,
+    // Source data file id -> tracked snapshot file.
+    pub tracked_data_files: BTreeMap<u64, Arc<TrackedFile>>,
     // Vlog version at the time of snapshot creation, without tracked references.
     pub vlog_version: VlogVersion,
     pub seq_id: u64,
@@ -51,7 +50,7 @@ impl DbSnapshot {
             manifest_path: manifest_path.to_string(),
             base_snapshot_id: None,
             lsm_versions: vec![],
-            tracked_files: Vec::new(),
+            tracked_data_files: BTreeMap::new(),
             vlog_version: VlogVersion::new(),
             seq_id: 0,
             latest_schema_id: 0,

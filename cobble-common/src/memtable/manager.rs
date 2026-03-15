@@ -1502,6 +1502,7 @@ fn flush_memtable(
             effective_bucket_range: bucket_range,
             vlog_file_seq_offset,
             has_separated_values,
+            snapshot_data_file: Default::default(),
             meta_bytes: Default::default(),
         };
         data_file.set_meta_bytes(footer_bytes);

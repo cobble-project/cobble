@@ -4,7 +4,7 @@ use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::{
     CompactionPolicyKind, Config, Db, MemtableType, MetricValue, ReadOptions, ReadProxy,
     ReadProxyConfig, ScanOptions, SingleNodeDb, TimeProviderKind, U64CounterMergeOperator,
-    VolumeDescriptor, WriteBatch,
+    VolumeDescriptor, VolumeUsageKind, WriteBatch,
 };
 use serde_json::Value as JsonValue;
 use std::path::Path;
@@ -76,6 +76,65 @@ fn active_snapshot_segments_from_manifest(
         ));
     }
     Some(out)
+}
+
+fn snapshot_tree_file_paths(manifest_json: &JsonValue) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(tree_levels) = manifest_json
+        .get("tree_levels")
+        .and_then(|value| value.as_array())
+    {
+        for levels in tree_levels {
+            for level in levels.as_array().into_iter().flatten() {
+                for file in level
+                    .get("files")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(path) = file.get("path").and_then(|value| value.as_str()) {
+                        paths.push(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tree_edits) = manifest_json
+        .get("tree_level_edits")
+        .and_then(|value| value.as_array())
+    {
+        for tree_edit in tree_edits {
+            for level_edit in tree_edit
+                .get("level_edits")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+            {
+                for file in level_edit
+                    .get("new_files")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(path) = file.get("path").and_then(|value| value.as_str()) {
+                        paths.push(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn snapshot_vlog_file_paths(manifest_json: &JsonValue) -> Vec<String> {
+    manifest_json
+        .get("vlog_files")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("path").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect()
 }
 
 fn open_db(config: Config) -> Db {
@@ -1063,6 +1122,166 @@ fn test_db_incremental_snapshot_restore() {
         .expect("k2 value present");
     assert_eq!(value2[0].as_ref().unwrap().as_ref(), b"v2");
 
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_volume_uploads_files_and_keeps_incremental_manifest() {
+    let root = "/tmp/db_snapshot_volume_upload";
+    let primary_root = format!("{}/primary", root);
+    let snapshot_root = format!("{}/snapshot", root);
+    cleanup_test_root(root);
+    let snapshot_volume_prefix = format!("file://{}", snapshot_root);
+    let config = Config {
+        volumes: vec![
+            VolumeDescriptor::new(
+                format!("file://{}", primary_root),
+                vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{}", snapshot_root),
+                vec![VolumeUsageKind::Snapshot, VolumeUsageKind::Meta],
+            ),
+        ],
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        value_separation_threshold: 16,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config);
+    db.put(0, b"k1", 0, vec![b'a'; 128]).unwrap();
+    let first_snapshot_id = db.snapshot().unwrap();
+    let first_manifest = wait_for_manifest_in_db(&snapshot_root, db.id(), first_snapshot_id);
+    let first_manifest_json: JsonValue = serde_json::from_str(&first_manifest).unwrap();
+    let first_tree_paths = snapshot_tree_file_paths(&first_manifest_json);
+    assert!(!first_tree_paths.is_empty());
+    assert!(
+        first_tree_paths
+            .iter()
+            .all(|path| path.starts_with(&snapshot_volume_prefix))
+    );
+    let first_vlog_paths = snapshot_vlog_file_paths(&first_manifest_json);
+    assert!(!first_vlog_paths.is_empty());
+    assert!(
+        first_vlog_paths
+            .iter()
+            .all(|path| path.starts_with(&snapshot_volume_prefix))
+    );
+
+    db.put(0, b"k2", 0, vec![b'b'; 128]).unwrap();
+    let second_snapshot_id = db.snapshot().unwrap();
+    let second_manifest = wait_for_manifest_in_db(&snapshot_root, db.id(), second_snapshot_id);
+    let second_manifest_json: JsonValue = serde_json::from_str(&second_manifest).unwrap();
+    assert_eq!(
+        second_manifest_json
+            .get("base_snapshot_id")
+            .and_then(|value| value.as_u64()),
+        Some(first_snapshot_id)
+    );
+    let second_tree_paths = snapshot_tree_file_paths(&second_manifest_json);
+    assert!(!second_tree_paths.is_empty());
+    assert!(
+        second_tree_paths
+            .iter()
+            .all(|path| path.starts_with(&snapshot_volume_prefix))
+    );
+    let second_vlog_paths = snapshot_vlog_file_paths(&second_manifest_json);
+    assert!(!second_vlog_paths.is_empty());
+    assert!(
+        second_vlog_paths
+            .iter()
+            .all(|path| path.starts_with(&snapshot_volume_prefix))
+    );
+    assert!(Path::new(&format!("{}/{}/data", primary_root, db.id())).exists());
+    db.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_multi_volume_selection_reuse_and_expire_regression() {
+    let root = "/tmp/db_snapshot_multi_volume_regression";
+    let primary_root = format!("{}/primary", root);
+    let snapshot_a_root = format!("{}/snapshot-a", root);
+    let snapshot_b_root = format!("{}/snapshot-b", root);
+    cleanup_test_root(root);
+    let snapshot_a_prefix = format!("file://{}", snapshot_a_root);
+    let config = Config {
+        volumes: vec![
+            VolumeDescriptor::new(
+                format!("file://{}", primary_root),
+                vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{}", snapshot_a_root),
+                vec![VolumeUsageKind::Snapshot],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{}", snapshot_b_root),
+                vec![VolumeUsageKind::Snapshot],
+            ),
+        ],
+        memtable_capacity: 128,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        value_separation_threshold: 16,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config);
+
+    db.put(0, b"k1", 0, vec![b'a'; 128]).unwrap();
+    let first_snapshot_id = db.snapshot().unwrap();
+    let first_manifest = wait_for_manifest_in_db(&snapshot_a_root, db.id(), first_snapshot_id);
+    let first_manifest_json: JsonValue = serde_json::from_str(&first_manifest).unwrap();
+    assert!(
+        snapshot_tree_file_paths(&first_manifest_json)
+            .iter()
+            .all(|path| path.starts_with(&snapshot_a_prefix))
+    );
+    assert!(
+        snapshot_vlog_file_paths(&first_manifest_json)
+            .iter()
+            .all(|path| path.starts_with(&snapshot_a_prefix))
+    );
+
+    db.put(0, b"k2", 0, vec![b'b'; 128]).unwrap();
+    let second_snapshot_id = db.snapshot().unwrap();
+    let second_manifest = wait_for_manifest_in_db(&snapshot_a_root, db.id(), second_snapshot_id);
+    let second_manifest_json: JsonValue = serde_json::from_str(&second_manifest).unwrap();
+    assert_eq!(
+        second_manifest_json
+            .get("base_snapshot_id")
+            .and_then(|value| value.as_u64()),
+        Some(first_snapshot_id)
+    );
+    assert!(
+        snapshot_tree_file_paths(&second_manifest_json)
+            .iter()
+            .all(|path| path.starts_with(&snapshot_a_prefix))
+    );
+    assert!(
+        snapshot_vlog_file_paths(&second_manifest_json)
+            .iter()
+            .all(|path| path.starts_with(&snapshot_a_prefix))
+    );
+
+    let first_manifest_path = format!(
+        "{}/{}",
+        snapshot_a_root,
+        bucket_snapshot_manifest_path(db.id(), first_snapshot_id)
+    );
+    assert!(db.expire_snapshot(first_snapshot_id).unwrap());
+    assert!(Path::new(&first_manifest_path).exists());
+    assert!(db.expire_snapshot(second_snapshot_id).unwrap());
+    let _ = db.expire_snapshot(first_snapshot_id).unwrap();
+    wait_for_missing(&first_manifest_path);
+    db.close().unwrap();
     cleanup_test_root(root);
 }
 

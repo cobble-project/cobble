@@ -4,7 +4,7 @@ use bytes::Bytes;
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataFileType {
@@ -56,6 +56,8 @@ pub struct DataFile {
     pub vlog_file_seq_offset: u32,
     /// Whether this file contains separated value columns/pointers.
     pub has_separated_values: bool,
+    /// Optional snapshot-side tracked file id used to reuse uploaded files.
+    pub snapshot_data_file: Mutex<Option<Arc<TrackedFileId>>>,
     /// Optional cached meta bytes to avoid re-reading from disk.
     pub meta_bytes: OnceLock<Bytes>,
 }
@@ -85,6 +87,12 @@ impl DataFile {
             effective_bucket_range: range,
             vlog_file_seq_offset: self.vlog_file_seq_offset,
             has_separated_values: self.has_separated_values,
+            snapshot_data_file: Mutex::new(
+                self.snapshot_data_file
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            ),
             meta_bytes: Default::default(),
         };
         if let Some(meta_bytes) = self.meta_bytes() {
@@ -108,6 +116,22 @@ impl DataFile {
 
     pub fn has_separated_values(&self) -> bool {
         self.has_separated_values
+    }
+
+    pub fn snapshot_data_file_id(&self) -> Option<FileId> {
+        self.snapshot_data_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|tracked_id| tracked_id.file_id())
+    }
+
+    pub fn set_snapshot_data_file(&self, tracked_id: Arc<TrackedFileId>) {
+        let mut guard = self
+            .snapshot_data_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(tracked_id);
     }
 }
 

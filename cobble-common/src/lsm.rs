@@ -1108,6 +1108,7 @@ mod tests {
                 effective_bucket_range: bucket_range,
                 vlog_file_seq_offset: 0,
                 has_separated_values: false,
+                snapshot_data_file: Default::default(),
                 meta_bytes: Default::default(),
             })
         }
@@ -1130,6 +1131,7 @@ mod tests {
                 effective_bucket_range: bucket_range,
                 vlog_file_seq_offset: 0,
                 has_separated_values: false,
+                snapshot_data_file: Default::default(),
                 meta_bytes: Default::default(),
             })
         }
@@ -1187,6 +1189,7 @@ mod tests {
             effective_bucket_range: bucket_range,
             vlog_file_seq_offset: 0,
             has_separated_values: false,
+            snapshot_data_file: Default::default(),
             meta_bytes: Default::default(),
         };
         data_file.set_meta_bytes(footer_bytes);

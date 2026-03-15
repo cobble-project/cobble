@@ -31,6 +31,7 @@ const SNAPSHOT_DIR: &str = "snapshot";
 const SCHEMA_DIR: &str = "schema";
 const DEFAULT_BASE_FILE_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_READER_CACHE_CAPACITY: usize = 512;
+const SNAPSHOT_COPY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 struct CachedRandomAccessFile {
     inner: Arc<dyn RandomAccessFile>,
@@ -132,10 +133,16 @@ impl VolumeState {
 pub(crate) struct DataVolume {
     state: Arc<VolumeState>,
     priority: VolumePriority,
+    supports_primary_data: bool,
+    snapshot_persistable: bool,
 }
 
 /// A unique identifier for data files managed by the FileManager.
 pub type FileId = u64;
+
+pub(crate) trait SnapshotCopyResourceRegistry: Send + Sync {
+    fn register_temp_copied_file(&self, file_id: FileId);
+}
 
 /// Configuration options for the FileManager.
 pub struct FileManagerOptions {
@@ -519,6 +526,9 @@ impl FileManager {
         let mut selected: Option<&DataVolume> = None;
         let mut candidates: Vec<&DataVolume> = Vec::with_capacity(self.data_volumes.len());
         for volume in &self.data_volumes {
+            if !volume.supports_primary_data {
+                continue;
+            }
             if !candidates.is_empty() && volume.priority.rank() < candidates[0].priority.rank() {
                 break;
             }
@@ -573,6 +583,40 @@ impl FileManager {
         let volume = self.test_existence_for_path(path)?;
         Ok((volume, path.to_string()))
     }
+    fn choose_meta_volume(volumes: &[DataVolume]) -> Result<DataVolume> {
+        let candidates: Vec<&DataVolume> = volumes
+            .iter()
+            .filter(|volume| volume.snapshot_persistable)
+            .collect();
+        if candidates.is_empty() {
+            return Err(Error::ConfigError(
+                "No volume configured for snapshot persistence".to_string(),
+            ));
+        }
+        let snapshot_only = candidates
+            .iter()
+            .copied()
+            .find(|volume| !volume.supports_primary_data);
+        if let Some(volume) = snapshot_only {
+            return Ok(volume.clone());
+        }
+        let max_rank = candidates
+            .iter()
+            .filter(|volume| volume.supports_primary_data)
+            .map(|volume| volume.priority.rank())
+            .max()
+            .ok_or_else(|| {
+                Error::ConfigError("No volume configured for snapshot persistence".to_string())
+            })?;
+        candidates
+            .into_iter()
+            .find(|volume| volume.supports_primary_data && volume.priority.rank() == max_rank)
+            .cloned()
+            .ok_or_else(|| {
+                Error::ConfigError("No volume configured for snapshot persistence".to_string())
+            })
+    }
+
     /// Creates a new FileManager with the given data volumes and options.
     ///
     /// This will create the data and snapshot directories if they don't exist.
@@ -586,14 +630,19 @@ impl FileManager {
                 "No data volumes configured for FileManager".to_string(),
             ));
         }
+        if !data_volumes
+            .iter()
+            .any(|volume| volume.supports_primary_data)
+        {
+            return Err(Error::ConfigError(
+                "No volume configured for primary data storage".to_string(),
+            ));
+        }
+        let meta_volume = Self::choose_meta_volume(&data_volumes)?;
         let data_volumes = Self::sort_data_volumes(data_volumes);
         for volume in &data_volumes {
             Self::ensure_volume_dirs(&volume.state.fs, &options)?;
         }
-        let meta_volume = DataVolume {
-            state: Arc::clone(&data_volumes[0].state),
-            priority: data_volumes[0].priority,
-        };
         Ok(Self {
             metrics: metrics_manager.file_manager_metrics(),
             meta_volume,
@@ -614,6 +663,8 @@ impl FileManager {
         let volume = DataVolume {
             state: Arc::new(VolumeState::new(fs, None, None)),
             priority: VolumePriority::High,
+            supports_primary_data: true,
+            snapshot_persistable: true,
         };
         Self::new(vec![volume], FileManagerOptions::default(), metrics_manager)
     }
@@ -639,6 +690,9 @@ impl FileManager {
         } else {
             config.volumes.clone()
         };
+        let has_explicit_snapshot_volume = volumes
+            .iter()
+            .any(|volume| volume.supports(VolumeUsageKind::Snapshot));
         let mut data_volumes = Vec::new();
         for volume in &volumes {
             let mut priority = None;
@@ -651,7 +705,13 @@ impl FileManager {
             if priority.is_none() && volume.supports(VolumeUsageKind::PrimaryDataPriorityLow) {
                 priority = Some(VolumePriority::Low);
             }
-            if let Some(priority) = priority {
+            let supports_primary_data = priority.is_some();
+            let supports_snapshot = if has_explicit_snapshot_volume {
+                volume.supports(VolumeUsageKind::Snapshot)
+            } else {
+                supports_primary_data || volume.supports(VolumeUsageKind::Snapshot)
+            };
+            if supports_primary_data || supports_snapshot {
                 let fs = registry.get_or_register_volume(volume)?;
                 let normalized_base_dir = normalize_storage_path_to_url(&volume.base_dir)?;
                 data_volumes.push(DataVolume {
@@ -660,13 +720,23 @@ impl FileManager {
                         volume.size_limit,
                         Some(normalized_base_dir),
                     )),
-                    priority,
+                    priority: priority.unwrap_or(VolumePriority::Low),
+                    supports_primary_data,
+                    snapshot_persistable: supports_snapshot,
                 });
             }
         }
         if data_volumes.is_empty() {
             return Err(Error::ConfigError(
                 "No volume configured for primary data storage".to_string(),
+            ));
+        }
+        if !data_volumes
+            .iter()
+            .any(|volume| volume.snapshot_persistable)
+        {
+            return Err(Error::ConfigError(
+                "No volume configured for snapshot persistence".to_string(),
             ));
         }
         Ok(data_volumes)
@@ -730,20 +800,9 @@ impl FileManager {
     /// later using `open_data_file_reader`.
     pub fn create_data_file(&self) -> Result<(FileId, TrackedWriter)> {
         let file_id = self.allocate_file_id();
-        let path = self.data_file_path(file_id);
-
-        // Track the file
         let volume = self.select_data_volume()?;
-        let tracked = Arc::new(TrackedFile::new(
-            path,
-            Arc::clone(&volume.state.fs),
-            Some(Arc::clone(&volume.state)),
-        ));
-        self.data_files.insert(file_id, Arc::clone(&tracked));
-        self.report_data_files_gauge();
-        let writer = volume.state.fs.open_write(tracked.path())?;
-
-        Ok((file_id, TrackedWriter::new(writer, tracked)))
+        let writer = self.create_data_file_writer_on_volume(file_id, volume)?;
+        Ok((file_id, writer))
     }
 
     /// Creates a new data file with a specific file ID.
@@ -758,16 +817,8 @@ impl FileManager {
             )));
         }
 
-        // Track the file
         let volume = self.select_data_volume()?;
-        let tracked = Arc::new(TrackedFile::new(
-            self.data_file_path(file_id),
-            Arc::clone(&volume.state.fs),
-            Some(Arc::clone(&volume.state)),
-        ));
-        self.data_files.insert(file_id, Arc::clone(&tracked));
-        self.report_data_files_gauge();
-        let writer = volume.state.fs.open_write(tracked.path())?;
+        let writer = self.create_data_file_writer_on_volume(file_id, volume)?;
 
         // Update next_file_id if necessary
         let mut current = self.next_file_id.load(Ordering::SeqCst);
@@ -783,6 +834,22 @@ impl FileManager {
             }
         }
 
+        Ok(writer)
+    }
+
+    fn create_data_file_writer_on_volume(
+        &self,
+        file_id: FileId,
+        volume: &DataVolume,
+    ) -> Result<TrackedWriter> {
+        let tracked = Arc::new(TrackedFile::new(
+            self.data_file_path(file_id),
+            Arc::clone(&volume.state.fs),
+            Some(Arc::clone(&volume.state)),
+        ));
+        self.data_files.insert(file_id, Arc::clone(&tracked));
+        self.report_data_files_gauge();
+        let writer = volume.state.fs.open_write(tracked.path())?;
         Ok(TrackedWriter::new(writer, tracked))
     }
 
@@ -885,6 +952,112 @@ impl FileManager {
         Ok(Arc::clone(&tracked))
     }
 
+    pub(crate) fn has_snapshot_volume(&self) -> bool {
+        self.data_volumes
+            .iter()
+            .any(|volume| volume.snapshot_persistable)
+    }
+
+    pub(crate) fn is_data_file_persistable_for_snapshot(&self, file_id: FileId) -> bool {
+        let Some(tracked) = self.data_files.get(&file_id) else {
+            return false;
+        };
+        let Some(tracked_volume) = &tracked.volume else {
+            return false;
+        };
+        self.data_volumes
+            .iter()
+            .any(|volume| volume.snapshot_persistable && Arc::ptr_eq(&volume.state, tracked_volume))
+    }
+
+    fn select_snapshot_persistable_volume(&self) -> Result<&DataVolume> {
+        let base_file_size = self.options.base_file_size as u64;
+        let snapshot_only_non_full = self
+            .data_volumes
+            .iter()
+            .filter(|volume| volume.snapshot_persistable && !volume.supports_primary_data)
+            .find(|volume| !volume.state.is_full(base_file_size));
+        if let Some(volume) = snapshot_only_non_full {
+            return Ok(volume);
+        }
+        let snapshot_only_any = self
+            .data_volumes
+            .iter()
+            .find(|volume| volume.snapshot_persistable && !volume.supports_primary_data);
+        if let Some(volume) = snapshot_only_any {
+            return Ok(volume);
+        }
+        let shared_non_full = self
+            .data_volumes
+            .iter()
+            .filter(|volume| volume.snapshot_persistable && volume.supports_primary_data)
+            .find(|volume| !volume.state.is_full(base_file_size));
+        if let Some(volume) = shared_non_full {
+            return Ok(volume);
+        }
+        self.data_volumes
+            .iter()
+            .find(|volume| volume.snapshot_persistable && volume.supports_primary_data)
+            .ok_or_else(|| {
+                Error::ConfigError("Snapshot persistence volume is not configured".to_string())
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn copy_data_file_to_snapshot_volume(
+        &self,
+        source_file_id: FileId,
+    ) -> Result<FileId> {
+        self.copy_data_file_to_snapshot_volume_with_result(source_file_id, None)
+            .map(|(file_id, _)| file_id)
+    }
+
+    /// Copies a data file to a snapshot-persistable volume if it's not already on one.
+    ///
+    /// Returns the file ID of the snapshot-persistable copy (which may be the same as the source)
+    /// and a boolean indicating whether a copy was actually made.
+    pub(crate) fn copy_data_file_to_snapshot_volume_with_result(
+        &self,
+        source_file_id: FileId,
+        resource_registry: Option<Arc<dyn SnapshotCopyResourceRegistry + Send + Sync>>,
+    ) -> Result<(FileId, bool)> {
+        if self.is_data_file_persistable_for_snapshot(source_file_id) {
+            return Ok((source_file_id, false));
+        }
+        let snapshot_volume = self.select_snapshot_persistable_volume()?;
+        let source_tracked = self.data_files.get(&source_file_id).ok_or_else(|| {
+            Error::IoError(format!(
+                "Data file {} is not tracked by FileManager",
+                source_file_id
+            ))
+        })?;
+        let source_reader = source_tracked.fs().open_read(source_tracked.path())?;
+        let source_size = source_reader.size();
+        let target_file_id = self.allocate_file_id();
+        let mut writer = self.create_data_file_writer_on_volume(target_file_id, snapshot_volume)?;
+
+        let copy_result = (|| -> Result<()> {
+            let mut offset = 0usize;
+            while offset < source_size {
+                let chunk = SNAPSHOT_COPY_CHUNK_BYTES.min(source_size - offset);
+                let bytes = source_reader.read_at(offset, chunk)?;
+                writer.write(bytes.as_ref())?;
+                offset += bytes.len();
+            }
+            writer.close()?;
+            Ok(())
+        })();
+
+        if let Err(err) = copy_result {
+            let _ = self.remove_data_file(target_file_id);
+            return Err(err);
+        }
+        if let Some(registry) = resource_registry {
+            registry.register_temp_copied_file(target_file_id);
+        }
+        Ok((target_file_id, true))
+    }
+
     /// Returns the path for a data file.
     pub fn get_data_file_path(&self, file_id: FileId) -> Option<String> {
         self.data_files.get(&file_id).map(|f| f.path().to_string())
@@ -917,7 +1090,9 @@ impl FileManager {
 
     /// Removes a data file from tracking.
     pub(crate) fn remove_data_file(&self, file_id: FileId) -> Result<()> {
-        self.data_files.remove(&file_id);
+        let Some(_) = self.data_files.remove(&file_id) else {
+            return Ok(());
+        };
         if let Ok(mut cache) = self.reader_cache.lock() {
             cache.remove(&file_id);
         }
@@ -1390,6 +1565,8 @@ pub(crate) mod tests {
                 Some(format!("{}/high", root)),
             )),
             priority: VolumePriority::High,
+            supports_primary_data: true,
+            snapshot_persistable: true,
         };
         let low_volume = DataVolume {
             state: Arc::new(VolumeState::new(
@@ -1398,6 +1575,8 @@ pub(crate) mod tests {
                 Some(format!("{}/low", root)),
             )),
             priority: VolumePriority::Low,
+            supports_primary_data: true,
+            snapshot_persistable: false,
         };
         let mut options = FileManagerOptions::default();
         options.base_dir = "db".to_string();
@@ -1424,6 +1603,165 @@ pub(crate) mod tests {
         let meta_path = fm.get_metadata_file_path(manifest).unwrap();
         assert!(high_fs.exists(&meta_path).unwrap());
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_file_manager_snapshot_volume_for_metadata_and_copy() {
+        let root = "/tmp/file_manager_snapshot_volume";
+        let _ = std::fs::remove_dir_all(root);
+        let primary_url = format!("file://{}/primary", root);
+        let snapshot_url = format!("file://{}/snapshot", root);
+        let registry = FileSystemRegistry::new();
+        let primary_fs = registry.get_or_register(primary_url.clone()).unwrap();
+        let snapshot_fs = registry.get_or_register(snapshot_url.clone()).unwrap();
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    primary_url,
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    snapshot_url,
+                    vec![VolumeUsageKind::Snapshot, VolumeUsageKind::Meta],
+                ),
+            ],
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-snapshot"));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+
+        let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
+        source_writer.write(b"source-bytes").unwrap();
+        source_writer.close().unwrap();
+        let source_path = fm.get_data_file_path(source_file_id).unwrap();
+        assert!(primary_fs.exists(&source_path).unwrap());
+        assert!(!fm.is_data_file_persistable_for_snapshot(source_file_id));
+
+        let mut metadata_writer = fm.create_metadata_file("snapshot/MANIFEST").unwrap();
+        metadata_writer.write(b"manifest").unwrap();
+        metadata_writer.close().unwrap();
+        let metadata_path = fm.get_metadata_file_path("snapshot/MANIFEST").unwrap();
+        assert!(snapshot_fs.exists(&metadata_path).unwrap());
+        assert!(!primary_fs.exists(&metadata_path).unwrap());
+
+        let copied_file_id = fm
+            .copy_data_file_to_snapshot_volume(source_file_id)
+            .unwrap();
+        assert_ne!(copied_file_id, source_file_id);
+        assert!(fm.is_data_file_persistable_for_snapshot(copied_file_id));
+        let copied_path = fm.get_data_file_path(copied_file_id).unwrap();
+        assert!(snapshot_fs.exists(&copied_path).unwrap());
+        let copied_reader = fm.open_data_file_reader(copied_file_id).unwrap();
+        assert_eq!(&copied_reader.read_at(0, 12).unwrap()[..], b"source-bytes");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_file_manager_meta_volume_uses_first_snapshot_only_volume() {
+        let root = "/tmp/file_manager_snapshot_meta_first";
+        let _ = std::fs::remove_dir_all(root);
+        let primary_url = format!("file://{}/primary", root);
+        let snapshot_a_url = format!("file://{}/snapshot-a", root);
+        let snapshot_b_url = format!("file://{}/snapshot-b", root);
+        let registry = FileSystemRegistry::new();
+        let snapshot_a_fs = registry.get_or_register(snapshot_a_url.clone()).unwrap();
+        let snapshot_b_fs = registry.get_or_register(snapshot_b_url.clone()).unwrap();
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    primary_url,
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(snapshot_a_url, vec![VolumeUsageKind::Snapshot]),
+                crate::VolumeDescriptor::new(snapshot_b_url, vec![VolumeUsageKind::Snapshot]),
+            ],
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-snapshot-meta-first"));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+        let mut metadata_writer = fm.create_metadata_file("snapshot/MANIFEST").unwrap();
+        metadata_writer.write(b"manifest").unwrap();
+        metadata_writer.close().unwrap();
+        let metadata_path = fm.get_metadata_file_path("snapshot/MANIFEST").unwrap();
+        assert!(snapshot_a_fs.exists(&metadata_path).unwrap());
+        assert!(!snapshot_b_fs.exists(&metadata_path).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_file_manager_snapshot_copy_creates_snapshot_file() {
+        let root = "/tmp/file_manager_snapshot_copy_reuse";
+        let _ = std::fs::remove_dir_all(root);
+        let primary_url = format!("file://{}/primary", root);
+        let snapshot_url = format!("file://{}/snapshot", root);
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    primary_url,
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(snapshot_url, vec![VolumeUsageKind::Snapshot]),
+            ],
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-snapshot-copy-reuse"));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+
+        let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
+        source_writer.write(b"source-bytes").unwrap();
+        source_writer.close().unwrap();
+
+        let copied_file_id = fm
+            .copy_data_file_to_snapshot_volume(source_file_id)
+            .unwrap();
+        let copied_file_id_again = fm
+            .copy_data_file_to_snapshot_volume(source_file_id)
+            .unwrap();
+        assert_ne!(copied_file_id_again, copied_file_id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_file_manager_meta_volume_prefers_highest_priority_shared_snapshot() {
+        let root = "/tmp/file_manager_snapshot_meta_shared_priority";
+        let _ = std::fs::remove_dir_all(root);
+        let high_url = format!("file://{}/high", root);
+        let low_url = format!("file://{}/low", root);
+        let registry = FileSystemRegistry::new();
+        let high_fs = registry.get_or_register(high_url.clone()).unwrap();
+        let low_fs = registry.get_or_register(low_url.clone()).unwrap();
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    low_url,
+                    vec![
+                        VolumeUsageKind::Snapshot,
+                        VolumeUsageKind::PrimaryDataPriorityLow,
+                    ],
+                ),
+                crate::VolumeDescriptor::new(
+                    high_url,
+                    vec![
+                        VolumeUsageKind::Snapshot,
+                        VolumeUsageKind::PrimaryDataPriorityHigh,
+                    ],
+                ),
+            ],
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-snapshot-meta-shared"));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+        let mut metadata_writer = fm.create_metadata_file("snapshot/MANIFEST").unwrap();
+        metadata_writer.write(b"manifest").unwrap();
+        metadata_writer.close().unwrap();
+        let metadata_path = fm.get_metadata_file_path("snapshot/MANIFEST").unwrap();
+        assert!(high_fs.exists(&metadata_path).unwrap());
+        assert!(!low_fs.exists(&metadata_path).unwrap());
         let _ = std::fs::remove_dir_all(root);
     }
 }

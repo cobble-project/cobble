@@ -161,6 +161,7 @@ impl RemoteDataFile {
                 ..=self.effective_bucket_range_end,
             vlog_file_seq_offset: self.vlog_file_seq_offset,
             has_separated_values: self.has_separated_values,
+            snapshot_data_file: Default::default(),
             meta_bytes: Default::default(),
         };
         if let Some(bytes) = self.meta_bytes.map(Bytes::from) {
@@ -877,6 +878,7 @@ mod tests {
             effective_bucket_range: bucket_range,
             vlog_file_seq_offset: 0,
             has_separated_values: false,
+            snapshot_data_file: Default::default(),
             meta_bytes: Default::default(),
         };
         data_file.set_meta_bytes(footer_bytes);

@@ -41,6 +41,7 @@ where
                 "primary_data_priority_low" => {
                     add_kind(&mut mask, VolumeUsageKind::PrimaryDataPriorityLow);
                 }
+                "snapshot" => add_kind(&mut mask, VolumeUsageKind::Snapshot),
                 "cache" => add_kind(&mut mask, VolumeUsageKind::Cache),
                 _ => {
                     return Err(serde::de::Error::custom(format!(
@@ -106,6 +107,8 @@ pub enum VolumeUsageKind {
     PrimaryDataPriorityMedium = 2,
     // Primary data storage with low priority (SST files, write-ahead log).
     PrimaryDataPriorityLow = 3,
+    // Snapshot materialization storage (snapshot manifests, schema, and uploaded snapshot data).
+    Snapshot = 4,
     // Block cache storage. e.g. foryer cache files.
     Cache = 5,
 }
@@ -757,13 +760,14 @@ mod tests {
     fn test_volume_descriptor_kinds_list() {
         let json = r#"{
             "base_dir": "file:///tmp/cobble",
-            "kinds": ["meta", "primary_data_priority_high", "cache"]
+            "kinds": ["meta", "primary_data_priority_high", "snapshot", "cache"]
         }"#;
 
         let volume: VolumeDescriptor =
             serde_json::from_str(json).expect("Cannot deserialize volume descriptor");
         assert!(volume.supports(VolumeUsageKind::Meta));
         assert!(volume.supports(VolumeUsageKind::PrimaryDataPriorityHigh));
+        assert!(volume.supports(VolumeUsageKind::Snapshot));
         assert!(volume.supports(VolumeUsageKind::Cache));
     }
 

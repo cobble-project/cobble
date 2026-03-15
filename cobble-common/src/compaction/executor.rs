@@ -440,6 +440,7 @@ impl CompactionExecutor {
                         has_separated_values: merge_collector
                             .as_ref()
                             .is_some_and(|collector| collector.borrow().has_separated_values()),
+                        snapshot_data_file: Default::default(),
                         meta_bytes: Default::default(),
                     };
                     data_file.set_meta_bytes(footer_bytes);
@@ -483,6 +484,7 @@ impl CompactionExecutor {
                 has_separated_values: merge_collector
                     .as_ref()
                     .is_some_and(|collector| collector.borrow().has_separated_values()),
+                snapshot_data_file: Default::default(),
                 meta_bytes: Default::default(),
             };
             data_file.set_meta_bytes(footer_bytes);
@@ -619,6 +621,7 @@ mod tests {
             effective_bucket_range: bucket_range,
             vlog_file_seq_offset: 0,
             has_separated_values: true,
+            snapshot_data_file: Default::default(),
             meta_bytes: Default::default(),
         };
         data_file.set_meta_bytes(footer_bytes);
@@ -1201,6 +1204,7 @@ mod tests {
             effective_bucket_range: bucket_range,
             vlog_file_seq_offset: 0,
             has_separated_values: false,
+            snapshot_data_file: Default::default(),
             meta_bytes: Default::default(),
         };
         file.set_meta_bytes(footer_bytes);

@@ -392,6 +392,7 @@ fn manifest_tree_levels_from_snapshot(
 }
 
 fn manifest_file_from_data_file(file: &DataFile, file_manager: &FileManager) -> ManifestFile {
+    let path_file_id = file.snapshot_data_file_id().unwrap_or(file.file_id);
     ManifestFile {
         file_id: file.file_id,
         file_type: file.file_type.as_str().to_string(),
@@ -400,7 +401,7 @@ fn manifest_file_from_data_file(file: &DataFile, file_manager: &FileManager) -> 
         start_key: to_hex(&file.start_key),
         end_key: to_hex(&file.end_key),
         path: file_manager
-            .get_data_file_full_path(file.file_id)
+            .get_data_file_full_path(path_file_id)
             .expect("Unknown file ID"),
         has_separated_values: file.has_separated_values,
         bucket_range_start: *file.bucket_range.start(),
@@ -570,6 +571,7 @@ pub(crate) fn build_tree_versions_from_manifest_untracked(
                         ..=file.effective_bucket_range_end,
                     vlog_file_seq_offset: file.vlog_file_seq_offset,
                     has_separated_values: file.has_separated_values,
+                    snapshot_data_file: Default::default(),
                     meta_bytes: Default::default(),
                 }));
             }
@@ -635,6 +637,7 @@ pub(crate) fn build_tree_versions_from_manifest(
                         ..=file.effective_bucket_range_end,
                     vlog_file_seq_offset: file.vlog_file_seq_offset,
                     has_separated_values: file.has_separated_values,
+                    snapshot_data_file: Default::default(),
                     meta_bytes: Default::default(),
                 }));
             }
