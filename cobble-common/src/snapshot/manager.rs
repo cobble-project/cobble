@@ -323,6 +323,7 @@ impl SnapshotManager {
                 if !self.file_manager.has_data_file(file_id) {
                     self.file_manager.register_data_file(file_id, &path)?;
                 }
+                self.file_manager.make_data_file_owned(file_id)?;
                 self.file_manager
                     .data_file_ref(file_id)
                     .map(|tracked| (file_id, tracked))
@@ -515,6 +516,10 @@ impl SnapshotManager {
             if let Some(mapped_file_id) = source_data_files
                 .get(&source_file_id)
                 .and_then(|data_file| data_file.snapshot_data_file_id())
+                .filter(|mapped_file_id| {
+                    self.file_manager
+                        .is_data_file_on_snapshot_volume(*mapped_file_id)
+                })
             {
                 file_id_map.insert(source_file_id, mapped_file_id);
                 continue;
@@ -837,14 +842,14 @@ fn remap_snapshot_tree_file_ids(
                                 meta_bytes: Default::default(),
                             };
                             if mapped_file_id != file.file_id {
-                                if file_manager.has_data_file(mapped_file_id) {
+                                if file_manager.is_data_file_on_snapshot_volume(mapped_file_id) {
                                     detached.set_snapshot_data_file(TrackedFileId::new(
                                         file_manager,
                                         mapped_file_id,
                                     ));
                                 }
                             } else if let Some(snapshot_file_id) = file.snapshot_data_file_id()
-                                && file_manager.has_data_file(snapshot_file_id)
+                                && file_manager.is_data_file_on_snapshot_volume(snapshot_file_id)
                             {
                                 detached.set_snapshot_data_file(TrackedFileId::new(
                                     file_manager,
@@ -969,7 +974,7 @@ fn clone_lsm_tree_version_untracked(
                             meta_bytes: Default::default(),
                         };
                         if let Some(snapshot_file_id) = file.snapshot_data_file_id()
-                            && file_manager.has_data_file(snapshot_file_id)
+                            && file_manager.is_data_file_on_snapshot_volume(snapshot_file_id)
                         {
                             detached.set_snapshot_data_file(TrackedFileId::new(
                                 file_manager,

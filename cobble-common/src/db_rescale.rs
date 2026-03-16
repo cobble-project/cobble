@@ -243,7 +243,7 @@ impl Db {
 
         // Step 6: Build imported tree/vlog versions as read-only source files.
         let source_tree_versions =
-            build_tree_versions_from_manifest(&self.file_manager, source_manifest.clone(), true)?;
+            build_tree_versions_from_manifest(&self.file_manager, &source_manifest, true)?;
         if source_tree_versions.len() != source_tree_ranges.len() {
             return Err(Error::InvalidState(format!(
                 "Source tree version count {} does not match range count {}",

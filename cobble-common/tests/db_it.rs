@@ -1203,6 +1203,113 @@ fn test_db_snapshot_volume_uploads_files_and_keeps_incremental_manifest() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_db_restore_from_readonly_snapshot_volume_migrates_files_and_disables_first_incremental() {
+    let root = "/tmp/db_restore_readonly_snapshot_volume";
+    let old_root = format!("{}/old", root);
+    let new_primary_root = format!("{}/new-primary", root);
+    let new_snapshot_root = format!("{}/new-snapshot", root);
+    cleanup_test_root(root);
+
+    let source_config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", old_root)),
+        memtable_capacity: 64,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let source_db = open_db(source_config);
+    for idx in 0..64u16 {
+        let key = format!("k{:04}", idx);
+        source_db.put(0, key.as_bytes(), 0, b"value").unwrap();
+    }
+    let snapshot_id = source_db.snapshot().unwrap();
+    let source_manifest = wait_for_manifest_in_db(&old_root, source_db.id(), snapshot_id);
+    let source_manifest_json: JsonValue = serde_json::from_str(&source_manifest).unwrap();
+    assert!(
+        !snapshot_tree_file_paths(&source_manifest_json).is_empty(),
+        "expected source snapshot to contain tree files"
+    );
+    let db_id = source_db.id().to_string();
+    source_db.close().unwrap();
+
+    let manifest_rel_path = bucket_snapshot_manifest_path(&db_id, snapshot_id);
+    let old_manifest_path = format!("{}/{}", old_root, manifest_rel_path);
+    let new_manifest_path = format!("{}/{}", new_snapshot_root, manifest_rel_path);
+    if let Some(parent) = Path::new(&new_manifest_path).parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::copy(&old_manifest_path, &new_manifest_path).unwrap();
+    let old_schema_dir = format!("{}/{}/schema", old_root, db_id);
+    let new_schema_dir = format!("{}/{}/schema", new_snapshot_root, db_id);
+    std::fs::create_dir_all(&new_schema_dir).unwrap();
+    for entry in std::fs::read_dir(&old_schema_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(
+                entry.path(),
+                format!("{}/{}", new_schema_dir, entry.file_name().to_string_lossy()),
+            )
+            .unwrap();
+        }
+    }
+
+    let restore_config = Config {
+        volumes: vec![
+            VolumeDescriptor::new(
+                format!("file://{}", new_primary_root),
+                vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{}", new_snapshot_root),
+                vec![VolumeUsageKind::Snapshot, VolumeUsageKind::Meta],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{}", old_root),
+                vec![VolumeUsageKind::Readonly],
+            ),
+        ],
+        memtable_capacity: 64,
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: 0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let restored = Db::open_from_snapshot(restore_config, snapshot_id, db_id.clone()).unwrap();
+    let restored_value = restored
+        .get(0, b"k0001", &ReadOptions::default())
+        .unwrap()
+        .expect("restored value");
+    assert_eq!(restored_value[0].as_ref().unwrap().as_ref(), b"value");
+    let new_primary_data_dir = format!("{}/{}/data", new_primary_root, db_id);
+    assert!(Path::new(&new_primary_data_dir).exists());
+    assert!(
+        std::fs::read_dir(&new_primary_data_dir)
+            .unwrap()
+            .next()
+            .is_some(),
+        "expected restored files to be migrated into new primary volume"
+    );
+
+    let first_snapshot_after_restore = restored.snapshot().unwrap();
+    let restore_manifest = wait_for_manifest_in_db(
+        &new_snapshot_root,
+        restored.id(),
+        first_snapshot_after_restore,
+    );
+    let restore_manifest_json: JsonValue = serde_json::from_str(&restore_manifest).unwrap();
+    assert!(
+        restore_manifest_json.get("base_snapshot_id").is_none(),
+        "first snapshot after restore should not use incremental base"
+    );
+    restored.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_snapshot_multi_volume_selection_reuse_and_expire_regression() {
     let root = "/tmp/db_snapshot_multi_volume_regression";
     let primary_root = format!("{}/primary", root);

@@ -43,6 +43,7 @@ where
                 }
                 "snapshot" => add_kind(&mut mask, VolumeUsageKind::Snapshot),
                 "cache" => add_kind(&mut mask, VolumeUsageKind::Cache),
+                "readonly" => add_kind(&mut mask, VolumeUsageKind::Readonly),
                 _ => {
                     return Err(serde::de::Error::custom(format!(
                         "Unknown volume usage kind: {}",
@@ -111,6 +112,8 @@ pub enum VolumeUsageKind {
     Snapshot = 4,
     // Block cache storage. e.g. foryer cache files.
     Cache = 5,
+    // Read-only source volume used only for loading historical snapshot data.
+    Readonly = 6,
 }
 
 impl VolumeUsageKind {
@@ -769,6 +772,19 @@ mod tests {
         assert!(volume.supports(VolumeUsageKind::PrimaryDataPriorityHigh));
         assert!(volume.supports(VolumeUsageKind::Snapshot));
         assert!(volume.supports(VolumeUsageKind::Cache));
+    }
+
+    #[test]
+    fn test_volume_descriptor_kinds_readonly() {
+        let json = r#"{
+            "base_dir": "file:///tmp/cobble-readonly",
+            "kinds": ["readonly"]
+        }"#;
+        let volume: VolumeDescriptor =
+            serde_json::from_str(json).expect("Cannot deserialize readonly volume descriptor");
+        assert!(volume.supports(VolumeUsageKind::Readonly));
+        assert!(!volume.supports(VolumeUsageKind::Snapshot));
+        assert!(!volume.supports(VolumeUsageKind::PrimaryDataPriorityHigh));
     }
 
     #[test]

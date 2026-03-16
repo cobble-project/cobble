@@ -605,26 +605,31 @@ pub(crate) fn build_vlog_version_from_manifest_untracked(
 
 pub(crate) fn build_tree_versions_from_manifest(
     file_manager: &Arc<FileManager>,
-    manifest: ManifestSnapshot,
+    manifest: &ManifestSnapshot,
     read_only: bool,
 ) -> Result<Vec<LSMTreeVersion>> {
     let mut tree_versions = Vec::with_capacity(manifest.tree_levels.len());
-    for levels in manifest.tree_levels {
+    for levels in &manifest.tree_levels {
         let mut out_levels = Vec::with_capacity(levels.len());
         for level in levels {
             let mut files = Vec::with_capacity(level.files.len());
-            for file in level.files {
+            for file in &level.files {
                 let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
                 let start_key = from_hex(&file.start_key)?;
                 let end_key = from_hex(&file.end_key)?;
-                let tracked_id = if read_only {
+                let (tracked_id, snapshot_data_file_id) = if read_only {
                     file_manager.register_data_file_readonly(file.file_id, &file.path)?;
-                    TrackedFileId::detached(file.file_id)
+                    (TrackedFileId::detached(file.file_id), None)
                 } else {
-                    file_manager.register_data_file(file.file_id, &file.path)?;
-                    TrackedFileId::new(file_manager, file.file_id)
+                    if !file_manager.has_data_file(file.file_id) {
+                        return Err(Error::IoError(format!(
+                            "Restored file {} is not tracked by FileManager",
+                            file.file_id
+                        )));
+                    }
+                    (TrackedFileId::new(file_manager, file.file_id), None)
                 };
-                files.push(Arc::new(DataFile {
+                let data_file = DataFile {
                     file_type,
                     start_key,
                     end_key,
@@ -639,7 +644,14 @@ pub(crate) fn build_tree_versions_from_manifest(
                     has_separated_values: file.has_separated_values,
                     snapshot_data_file: Default::default(),
                     meta_bytes: Default::default(),
-                }));
+                };
+                if !read_only && let Some(snapshot_data_file_id) = snapshot_data_file_id {
+                    data_file.set_snapshot_data_file(TrackedFileId::new(
+                        file_manager,
+                        snapshot_data_file_id,
+                    ));
+                }
+                files.push(Arc::new(data_file));
             }
             out_levels.push(Level {
                 ordinal: level.ordinal,
@@ -663,7 +675,12 @@ pub(crate) fn build_vlog_version_from_manifest(
             file_manager.register_data_file_readonly(vlog_file.file_id, &vlog_file.path)?;
             TrackedFileId::detached(vlog_file.file_id)
         } else {
-            file_manager.register_data_file(vlog_file.file_id, &vlog_file.path)?;
+            if !file_manager.has_data_file(vlog_file.file_id) {
+                return Err(Error::IoError(format!(
+                    "Restored VLOG file {} is not tracked by FileManager",
+                    vlog_file.file_id
+                )));
+            }
             TrackedFileId::new(file_manager, vlog_file.file_id)
         };
         files.push((vlog_file.file_seq, tracked_id, vlog_file.valid_entries));

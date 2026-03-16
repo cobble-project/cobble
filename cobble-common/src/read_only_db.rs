@@ -97,7 +97,7 @@ impl ReadOnlyDb {
             None,
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
-        let tree_versions = build_tree_versions_from_manifest(&file_manager, manifest, true)?;
+        let tree_versions = build_tree_versions_from_manifest(&file_manager, &manifest, true)?;
         let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
             config.total_buckets,
             &lsm_tree_bucket_ranges,

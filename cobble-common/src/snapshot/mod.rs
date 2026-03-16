@@ -15,7 +15,7 @@ pub(crate) use manager::SnapshotManager;
 pub(crate) use manifest::{
     LoadedManifest, ManifestSnapshot, build_tree_versions_from_manifest,
     build_vlog_version_from_manifest, list_snapshot_manifest_ids, load_manifest_entry,
-    load_manifest_for_snapshot, snapshot_manifest_name,
+    load_manifest_for_snapshot, manifest_data_file_refs, snapshot_manifest_name,
 };
 pub(crate) use memtable::ActiveMemtableSnapshotData;
 
