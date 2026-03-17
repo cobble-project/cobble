@@ -94,6 +94,7 @@ pub(crate) struct DataVolume {
     pub(crate) base_dir: Option<String>,
     pub(crate) size_limit: Option<u64>,
     pub(crate) used_bytes: AtomicU64,
+    pub(crate) projected_offload_bytes: AtomicU64,
     pub(crate) priority: VolumePriority,
     pub(crate) supports_primary_data: bool,
     pub(crate) supports_meta: bool,
@@ -108,6 +109,9 @@ impl Clone for DataVolume {
             base_dir: self.base_dir.clone(),
             size_limit: self.size_limit,
             used_bytes: AtomicU64::new(self.used_bytes.load(Ordering::SeqCst)),
+            projected_offload_bytes: AtomicU64::new(
+                self.projected_offload_bytes.load(Ordering::SeqCst),
+            ),
             priority: self.priority,
             supports_primary_data: self.supports_primary_data,
             supports_meta: self.supports_meta,
@@ -124,6 +128,31 @@ impl DataVolume {
 
     pub(crate) fn add_usage(&self, bytes: u64) {
         self.used_bytes.fetch_add(bytes, Ordering::SeqCst);
+    }
+
+    pub(crate) fn add_projected_offload_bytes(&self, bytes: u64) {
+        self.projected_offload_bytes
+            .fetch_add(bytes, Ordering::SeqCst);
+    }
+
+    pub(crate) fn subtract_projected_offload_bytes(&self, bytes: u64) {
+        let mut current = self.projected_offload_bytes.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.projected_offload_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(updated) => current = updated,
+            }
+        }
+    }
+
+    pub(crate) fn projected_offload_bytes(&self) -> u64 {
+        self.projected_offload_bytes.load(Ordering::SeqCst)
     }
 
     pub(crate) fn subtract_usage(&self, bytes: u64) {
@@ -755,6 +784,7 @@ impl FileManager {
             base_dir: None,
             size_limit: None,
             used_bytes: AtomicU64::new(0),
+            projected_offload_bytes: AtomicU64::new(0),
             priority: VolumePriority::High,
             supports_primary_data: true,
             supports_meta: true,
@@ -833,6 +863,7 @@ impl FileManager {
                     base_dir: Some(normalized_base_dir),
                     size_limit: volume.size_limit,
                     used_bytes: AtomicU64::new(0),
+                    projected_offload_bytes: AtomicU64::new(0),
                     priority: priority.unwrap_or(VolumePriority::Low),
                     supports_primary_data,
                     supports_meta,
@@ -1816,6 +1847,7 @@ pub(crate) mod tests {
             base_dir: Some(format!("{}/high", root)),
             size_limit: Some(128),
             used_bytes: AtomicU64::new(0),
+            projected_offload_bytes: AtomicU64::new(0),
             priority: VolumePriority::High,
             supports_primary_data: true,
             supports_meta: false,
@@ -1827,6 +1859,7 @@ pub(crate) mod tests {
             base_dir: Some(format!("{}/low", root)),
             size_limit: None,
             used_bytes: AtomicU64::new(0),
+            projected_offload_bytes: AtomicU64::new(0),
             priority: VolumePriority::Low,
             supports_primary_data: true,
             supports_meta: false,

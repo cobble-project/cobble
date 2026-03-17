@@ -1,7 +1,7 @@
 use super::file_manager::FileId;
 use crate::Error;
 use crate::file::{DataVolume, FileManager, TrackedFile, TrackedWriter};
-use dashmap::Entry;
+use dashmap::{DashMap, Entry};
 use log::warn;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -26,15 +26,22 @@ pub(crate) trait PrimaryOffloadPolicy: Send + Sync {
 
 type OffloadJobFn = dyn Fn(FileId) + Send + Sync + 'static;
 
-#[derive(Default)]
-struct OffloadQueueState {
-    queued_or_running: HashSet<FileId>,
+#[derive(Clone)]
+struct OffloadJobPlan {
+    source_volume: Arc<DataVolume>,
+    estimated_bytes: u64,
+}
+
+struct OffloadQueuedJob {
+    file_id: FileId,
+    handler: Arc<OffloadJobFn>,
 }
 
 pub(crate) struct OffloadRuntime {
-    tx: Arc<Mutex<Option<mpsc::Sender<FileId>>>>,
+    tx: Arc<Mutex<Option<mpsc::Sender<OffloadQueuedJob>>>>,
     worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
-    state: Arc<Mutex<OffloadQueueState>>,
+    planned_jobs: Arc<DashMap<FileId, OffloadJobPlan>>,
+    idle: Arc<Mutex<()>>,
     done: Arc<Condvar>,
     runtime: Arc<Runtime>,
     primary_volume_by_rank: HashMap<u8, Vec<Arc<DataVolume>>>,
@@ -79,7 +86,8 @@ impl OffloadRuntime {
         Self {
             tx: Arc::new(Mutex::new(None)),
             worker: Arc::new(Mutex::new(None)),
-            state: Arc::new(Mutex::new(OffloadQueueState::default())),
+            planned_jobs: Arc::new(DashMap::new()),
+            idle: Arc::new(Mutex::new(())),
             done: Arc::new(Condvar::new()),
             runtime: Arc::new(runtime),
             primary_volume_by_rank,
@@ -124,33 +132,44 @@ impl OffloadRuntime {
     }
 
     fn complete_job(&self, file_id: FileId) {
-        let mut state = self.state.lock().unwrap();
-        state.queued_or_running.remove(&file_id);
-        if state.queued_or_running.is_empty() {
+        if let Some((_, plan)) = self.planned_jobs.remove(&file_id) {
+            plan.source_volume
+                .subtract_projected_offload_bytes(plan.estimated_bytes);
+        }
+        if self.planned_jobs.is_empty() {
             self.done.notify_all();
         }
     }
 
-    fn start_worker(self: &Arc<Self>, handler: Arc<OffloadJobFn>) -> Result<(), String> {
+    fn is_queued_or_running(&self, file_id: FileId) -> bool {
+        self.planned_jobs.contains_key(&file_id)
+    }
+
+    fn projected_source_offload_bytes(&self, source_volume: &Arc<DataVolume>) -> u64 {
+        source_volume.projected_offload_bytes()
+    }
+
+    fn start_worker(self: &Arc<Self>) -> Result<(), String> {
         let mut tx_guard = self.tx.lock().unwrap();
         if tx_guard.is_some() {
             return Ok(());
         }
-        let (tx, rx) = mpsc::channel::<FileId>();
+        let (tx, rx) = mpsc::channel::<OffloadQueuedJob>();
         let runtime = Arc::downgrade(self);
         let copy_runtime = Arc::clone(&self.runtime);
         let worker = std::thread::Builder::new()
             .name("cobble-offload".to_string())
             .spawn(move || {
-                while let Ok(file_id) = rx.recv() {
-                    let handler = Arc::clone(&handler);
+                while let Ok(job) = rx.recv() {
                     copy_runtime.block_on(async move {
+                        let file_id = job.file_id;
+                        let handler = Arc::clone(&job.handler);
                         let _ = tokio::task::spawn_blocking(move || handler(file_id)).await;
                     });
                     let Some(runtime) = runtime.upgrade() else {
                         break;
                     };
-                    runtime.complete_job(file_id);
+                    runtime.complete_job(job.file_id);
                 }
             })
             .map_err(|err| format!("Failed to start offload worker: {}", err))?;
@@ -160,16 +179,21 @@ impl OffloadRuntime {
         Ok(())
     }
 
-    pub(crate) fn schedule(
+    fn schedule(
         self: &Arc<Self>,
         file_id: FileId,
+        plan: OffloadJobPlan,
         handler: Arc<OffloadJobFn>,
     ) -> Result<bool, String> {
-        self.start_worker(handler)?;
-        {
-            let mut state = self.state.lock().unwrap();
-            if !state.queued_or_running.insert(file_id) {
+        self.start_worker()?;
+        match self.planned_jobs.entry(file_id) {
+            Entry::Occupied(_) => {
                 return Ok(false);
+            }
+            Entry::Vacant(vacant) => {
+                plan.source_volume
+                    .add_projected_offload_bytes(plan.estimated_bytes);
+                vacant.insert(plan);
             }
         }
         let tx_guard = self.tx.lock().unwrap();
@@ -177,7 +201,7 @@ impl OffloadRuntime {
             self.complete_job(file_id);
             return Err("Offload worker unavailable".to_string());
         };
-        if tx.send(file_id).is_err() {
+        if tx.send(OffloadQueuedJob { file_id, handler }).is_err() {
             self.complete_job(file_id);
             return Err("Offload worker unavailable".to_string());
         }
@@ -185,15 +209,16 @@ impl OffloadRuntime {
     }
 
     pub(crate) fn wait_idle(&self, timeout: Duration) -> bool {
-        let guard = self.state.lock().unwrap();
-        if guard.queued_or_running.is_empty() {
+        if self.planned_jobs.is_empty() {
             return true;
         }
+        let guard = self.idle.lock().unwrap();
         let (guard, _) = self
             .done
-            .wait_timeout_while(guard, timeout, |state| !state.queued_or_running.is_empty())
+            .wait_timeout_while(guard, timeout, |_| !self.planned_jobs.is_empty())
             .unwrap();
-        guard.queued_or_running.is_empty()
+        drop(guard);
+        self.planned_jobs.is_empty()
     }
 
     pub(crate) fn stop(&self) {
@@ -269,20 +294,60 @@ impl FileManager {
             if !self.should_trigger_offload_on_volume(source_volume) {
                 continue;
             }
-            let Some(target_volume) = self.offload_runtime.select_lower_priority_primary_volume(
-                source_volume.priority.rank(),
-                self.options.primary_volume_write_stop_watermark,
-            ) else {
+            let Some(size_limit) = source_volume.size_limit else {
                 continue;
             };
-            if Arc::ptr_eq(source_volume, &target_volume) {
+            let source_rank = source_volume.priority.rank();
+            let trigger_used_bytes = (size_limit as f64
+                * self.options.primary_volume_offload_trigger_watermark)
+                .ceil() as u64;
+            let already_planned = self
+                .offload_runtime
+                .projected_source_offload_bytes(source_volume);
+            let mut projected_used = source_volume
+                .used_bytes
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(already_planned);
+            let mut attempted = HashSet::new();
+            while projected_used > trigger_used_bytes {
+                let Some(target_volume) =
+                    self.offload_runtime.select_lower_priority_primary_volume(
+                        source_rank,
+                        self.options.primary_volume_write_stop_watermark,
+                    )
+                else {
+                    break;
+                };
+                if Arc::ptr_eq(source_volume, &target_volume) {
+                    break;
+                }
+                let Some(file_id) = self.select_offload_candidate_with_exclusions(
+                    source_volume,
+                    &target_volume,
+                    &attempted,
+                ) else {
+                    break;
+                };
+                attempted.insert(file_id);
+                let estimated_bytes = self
+                    .data_files
+                    .get(&file_id)
+                    .map(|entry| {
+                        entry
+                            .value()
+                            .size_bytes
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    })
+                    .unwrap_or(0);
+                if estimated_bytes == 0 {
+                    break;
+                }
+                if self.schedule_offload_move(file_id, &target_volume)? {
+                    scheduled += 1;
+                    projected_used = projected_used.saturating_sub(estimated_bytes);
+                    continue;
+                }
                 continue;
-            }
-            let Some(file_id) = self.select_offload_candidate(source_volume, &target_volume) else {
-                continue;
-            };
-            if self.schedule_offload_move(file_id, &target_volume)? {
-                scheduled += 1;
             }
         }
         Ok(scheduled)
@@ -301,6 +366,24 @@ impl FileManager {
         target_volume: &Arc<DataVolume>,
     ) -> crate::Result<bool> {
         let target_volume = Arc::clone(target_volume);
+        let source_volume = self
+            .data_files
+            .get(&file_id)
+            .and_then(|entry| entry.value().volume.as_ref().map(Arc::clone))
+            .ok_or_else(|| Error::IoError(format!("Data file {} is not tracked", file_id)))?;
+        let estimated_bytes = self
+            .data_files
+            .get(&file_id)
+            .map(|entry| {
+                entry
+                    .value()
+                    .size_bytes
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .unwrap_or(0);
+        if estimated_bytes == 0 {
+            return Ok(false);
+        }
         let manager = Arc::downgrade(self);
         let handler = Arc::new(move |scheduled_file_id| {
             if let Some(manager) = manager.upgrade() {
@@ -323,7 +406,14 @@ impl FileManager {
         });
         let scheduled = self
             .offload_runtime
-            .schedule(file_id, handler)
+            .schedule(
+                file_id,
+                OffloadJobPlan {
+                    source_volume,
+                    estimated_bytes,
+                },
+                handler,
+            )
             .map_err(Error::IoError)?;
         if scheduled {
             self.record_offload_scheduled();
@@ -336,6 +426,16 @@ impl FileManager {
         source_volume: &Arc<DataVolume>,
         target_volume: &Arc<DataVolume>,
     ) -> Option<FileId> {
+        let excluded = HashSet::new();
+        self.select_offload_candidate_with_exclusions(source_volume, target_volume, &excluded)
+    }
+
+    fn select_offload_candidate_with_exclusions(
+        &self,
+        source_volume: &Arc<DataVolume>,
+        target_volume: &Arc<DataVolume>,
+        excluded_file_ids: &HashSet<FileId>,
+    ) -> Option<FileId> {
         if !source_volume.supports_primary_data || !target_volume.supports_primary_data {
             return None;
         }
@@ -343,6 +443,9 @@ impl FileManager {
             .data_files
             .iter()
             .filter_map(|entry| {
+                if excluded_file_ids.contains(entry.key()) {
+                    return None;
+                }
                 let tracked = entry.value();
                 let volume = tracked.volume.as_ref()?;
                 if !volume.supports_primary_data || !Arc::ptr_eq(volume, source_volume) {
@@ -352,6 +455,9 @@ impl FileManager {
                     .explicit_refs
                     .load(std::sync::atomic::Ordering::SeqCst);
                 if explicit_refs != 0 && !tracked.is_marked_for_deletion() {
+                    return None;
+                }
+                if self.offload_runtime.is_queued_or_running(*entry.key()) {
                     return None;
                 }
                 let size_bytes = tracked.size_bytes.load(std::sync::atomic::Ordering::SeqCst);
@@ -754,6 +860,88 @@ mod tests {
         let new_path = fm.get_data_file_path(file_id).unwrap();
         assert_ne!(new_path, old_path);
         assert!(low_fs.exists(&new_path).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_trigger_offload_loops_until_projected_watermark_recovers() {
+        let root = "/tmp/file_manager_offload_loop_trigger";
+        let _ = std::fs::remove_dir_all(root);
+        let high_url = format!("file://{}/high", root);
+        let low_url = format!("file://{}/low", root);
+        let registry = FileSystemRegistry::new();
+        let low_fs = registry.get_or_register(low_url.clone()).unwrap();
+        let mut high =
+            crate::VolumeDescriptor::new(high_url, vec![VolumeUsageKind::PrimaryDataPriorityHigh]);
+        high.size_limit = Some(1200);
+        let low =
+            crate::VolumeDescriptor::new(low_url, vec![VolumeUsageKind::PrimaryDataPriorityLow]);
+        let config = Config {
+            volumes: vec![high, low],
+            base_file_size: 64,
+            primary_volume_write_stop_watermark: 0.95,
+            primary_volume_offload_trigger_watermark: 0.4,
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-offload-loop-trigger"));
+        let fm = Arc::new(FileManager::from_config(&config, "db", metrics_manager).unwrap());
+        let mut file_ids = Vec::new();
+        for _ in 0..3 {
+            let (file_id, mut writer) = fm.create_data_file().unwrap();
+            writer.write(&vec![b'x'; 300]).unwrap();
+            writer.close().unwrap();
+            file_ids.push(file_id);
+        }
+
+        let scheduled = fm.trigger_offload_if_needed().unwrap();
+        assert_eq!(scheduled, 2);
+        assert!(fm.wait_for_offload_idle(Duration::from_secs(20)));
+
+        let moved_to_low = file_ids
+            .iter()
+            .filter(|file_id| {
+                let path = fm.get_data_file_path(**file_id).unwrap();
+                low_fs.exists(&path).unwrap_or(false)
+            })
+            .count();
+        assert!(moved_to_low >= 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_trigger_offload_uses_planned_bytes_to_avoid_overscheduling() {
+        let root = "/tmp/file_manager_offload_planned_backpressure";
+        let _ = std::fs::remove_dir_all(root);
+        let mut high = crate::VolumeDescriptor::new(
+            format!("file://{}/high", root),
+            vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+        );
+        high.size_limit = Some(1024);
+        let low = crate::VolumeDescriptor::new(
+            format!("file://{}/low", root),
+            vec![VolumeUsageKind::PrimaryDataPriorityLow],
+        );
+        let config = Config {
+            volumes: vec![high, low],
+            base_file_size: 64,
+            primary_volume_write_stop_watermark: 0.95,
+            primary_volume_offload_trigger_watermark: 0.8,
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-offload-backpressure"));
+        let fm = Arc::new(FileManager::from_config(&config, "db", metrics_manager).unwrap());
+        for _ in 0..3 {
+            let (_id, mut writer) = fm.create_data_file().unwrap();
+            writer.write(&vec![b'x'; 300]).unwrap();
+            writer.close().unwrap();
+        }
+        let first = fm.trigger_offload_if_needed().unwrap();
+        let second = fm.trigger_offload_if_needed().unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(second, 0);
+        assert!(fm.wait_for_offload_idle(Duration::from_secs(20)));
         let _ = std::fs::remove_dir_all(root);
     }
 
