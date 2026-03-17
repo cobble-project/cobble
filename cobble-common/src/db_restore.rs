@@ -144,6 +144,7 @@ fn apply_restore_snapshot_links(
             && snapshot_data_file_id != file.file_id
         {
             file.set_snapshot_data_file(TrackedFileId::new(file_manager, snapshot_data_file_id));
+            file_manager.register_snapshot_replica_hint(file.file_id, snapshot_data_file_id);
         }
     }
 }

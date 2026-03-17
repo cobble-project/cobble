@@ -535,6 +535,8 @@ pub struct FileManager {
     pub(crate) next_file_id: AtomicU64,
     /// Map of file ID to tracked file information for data files.
     pub(crate) data_files: DashMap<FileId, Arc<TrackedFile>>,
+    /// Lazy hint mapping from primary data file id to equivalent snapshot replica file id.
+    snapshot_replica_hints: DashMap<FileId, FileId>,
     /// Map of filename to tracked file information for metadata files.
     pub(crate) metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
     /// LRU cache for open random access readers.
@@ -715,6 +717,7 @@ impl FileManager {
             options,
             next_file_id: AtomicU64::new(1), // Start from 1, 0 is reserved
             data_files: DashMap::new(),
+            snapshot_replica_hints: DashMap::new(),
             metadata_files: Arc::new(DashMap::new()),
             reader_cache: Mutex::new(LruCache::new(DEFAULT_READER_CACHE_CAPACITY)),
             offload_runtime,
@@ -1080,6 +1083,24 @@ impl FileManager {
         Ok(())
     }
 
+    pub(crate) fn register_snapshot_replica_hint(
+        &self,
+        source_file_id: FileId,
+        replica_file_id: FileId,
+    ) {
+        if source_file_id == replica_file_id {
+            return;
+        }
+        self.snapshot_replica_hints
+            .insert(source_file_id, replica_file_id);
+    }
+
+    pub(crate) fn snapshot_replica_hint_file_id(&self, source_file_id: FileId) -> Option<FileId> {
+        self.snapshot_replica_hints
+            .get(&source_file_id)
+            .map(|entry| *entry.value())
+    }
+
     /// Opens a data file for reading.
     ///
     /// Returns a TrackedReader that holds a reference to the TrackedFile.
@@ -1272,6 +1293,7 @@ impl FileManager {
 
     /// Removes a data file from tracking.
     pub(crate) fn remove_data_file(&self, file_id: FileId) -> Result<()> {
+        self.snapshot_replica_hints.remove(&file_id);
         let Some(_) = self.data_files.remove(&file_id) else {
             return Ok(());
         };

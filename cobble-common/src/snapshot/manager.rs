@@ -605,6 +605,10 @@ impl SnapshotManager {
     ) {
         for (source_data_file, snapshot_data_file) in &prepared.source_snapshot_links {
             source_data_file.set_snapshot_data_file(Arc::clone(snapshot_data_file));
+            self.file_manager.register_snapshot_replica_hint(
+                source_data_file.file_id,
+                snapshot_data_file.file_id(),
+            );
         }
         let mut state = self.state.lock().unwrap();
         if let Some(snapshot) = state.snapshots.get(&id).cloned() {

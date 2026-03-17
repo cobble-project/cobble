@@ -280,7 +280,7 @@ impl FileManager {
             let Some(file_id) = self.select_offload_candidate(source_volume, &target_volume) else {
                 continue;
             };
-            if self.schedule_offload_move(file_id)? {
+            if self.schedule_offload_move(file_id, &target_volume)? {
                 scheduled += 1;
             }
         }
@@ -294,15 +294,15 @@ impl FileManager {
         self.create_data_file()
     }
 
-    pub(crate) fn schedule_offload_move(self: &Arc<Self>, file_id: FileId) -> crate::Result<bool> {
+    pub(crate) fn schedule_offload_move(
+        self: &Arc<Self>,
+        file_id: FileId,
+        target_volume: &Arc<DataVolume>,
+    ) -> crate::Result<bool> {
+        let target_volume = Arc::clone(target_volume);
         let manager = Arc::downgrade(self);
         let handler = Arc::new(move |scheduled_file_id| {
             if let Some(manager) = manager.upgrade() {
-                let Some(target_volume) =
-                    manager.select_lower_priority_target_for_file(scheduled_file_id)
-                else {
-                    return;
-                };
                 let _ = manager
                     .offload_file_to_lower_priority_primary(scheduled_file_id, &target_volume);
             }
@@ -327,6 +327,12 @@ impl FileManager {
                 let tracked = entry.value();
                 let volume = tracked.volume.as_ref()?;
                 if !volume.supports_primary_data || !Arc::ptr_eq(volume, source_volume) {
+                    return None;
+                }
+                let explicit_refs = tracked
+                    .explicit_refs
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if explicit_refs != 0 && !tracked.is_marked_for_deletion() {
                     return None;
                 }
                 let size_bytes = tracked.size_bytes.load(std::sync::atomic::Ordering::SeqCst);
@@ -362,18 +368,6 @@ impl FileManager {
         self.offload_runtime.primary_volume_by_rank(rank)
     }
 
-    fn select_lower_priority_target_for_file(&self, file_id: FileId) -> Option<Arc<DataVolume>> {
-        let source_tracked = self.data_files.get(&file_id)?;
-        let source_volume = source_tracked.volume.as_ref()?;
-        if !source_volume.supports_primary_data {
-            return None;
-        }
-        self.offload_runtime.select_lower_priority_primary_volume(
-            source_volume.priority.rank(),
-            self.options.primary_volume_write_stop_watermark,
-        )
-    }
-
     pub(crate) fn offload_file_to_lower_priority_primary(
         &self,
         file_id: FileId,
@@ -392,6 +386,29 @@ impl FileManager {
         }
         if Arc::ptr_eq(source_volume, target_volume) {
             return Ok(false);
+        }
+        if let Some(snapshot_replica_file_id) = self.snapshot_replica_hint_file_id(file_id)
+            && let Some(snapshot_tracked) = self
+                .data_files
+                .get(&snapshot_replica_file_id)
+                .map(|entry| Arc::clone(entry.value()))
+            && let Some(snapshot_volume) = &snapshot_tracked.volume
+            && snapshot_volume.supports_primary_data
+            && Arc::ptr_eq(snapshot_volume, target_volume)
+        {
+            match self.data_files.entry(file_id) {
+                Entry::Occupied(mut occupied) => {
+                    if !Arc::ptr_eq(occupied.get(), &source_tracked) {
+                        return Ok(false);
+                    }
+                    occupied.insert(snapshot_tracked);
+                }
+                Entry::Vacant(_) => return Ok(false),
+            }
+            if let Ok(mut cache) = self.reader_cache.lock() {
+                cache.remove(&file_id);
+            }
+            return Ok(true);
         }
         let source_reader = source_tracked.fs().open_read(source_tracked.path())?;
         let (mut writer, new_tracked) =
@@ -525,6 +542,45 @@ mod tests {
 
     #[test]
     #[serial_test::serial(file)]
+    fn test_select_offload_candidate_skips_snapshot_replica_files() {
+        let root = "/tmp/file_manager_offload_skip_snapshot_replica";
+        let _ = std::fs::remove_dir_all(root);
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    format!("file://{}/high", root),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    format!("file://{}/low", root),
+                    vec![VolumeUsageKind::PrimaryDataPriorityLow],
+                ),
+            ],
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new(
+            "file-manager-offload-skip-snapshot-replica",
+        ));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+        let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
+        source_writer.write(&vec![b's'; 64]).unwrap();
+        source_writer.close().unwrap();
+        let (snapshot_replica_id, mut snapshot_writer) = fm.create_data_file().unwrap();
+        snapshot_writer.write(&vec![b'r'; 1024]).unwrap();
+        snapshot_writer.close().unwrap();
+        fm.make_data_file_readonly(snapshot_replica_id).unwrap();
+        let snapshot_ref = fm.data_file_ref(snapshot_replica_id).unwrap();
+        fm.register_snapshot_replica_hint(source_file_id, snapshot_replica_id);
+        let source_volume = fm.primary_volume_by_rank(3).unwrap();
+        let target_volume = fm.primary_volume_by_rank(1).unwrap();
+        let selected = fm.select_offload_candidate(&source_volume, &target_volume);
+        assert_eq!(selected, Some(source_file_id));
+        drop(snapshot_ref);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
     fn test_offload_move_is_async_and_keeps_reads_available() {
         let root = "/tmp/file_manager_offload_async";
         let _ = std::fs::remove_dir_all(root);
@@ -556,9 +612,10 @@ mod tests {
         let old_path = fm.get_data_file_path(file_id).unwrap();
         assert!(high_fs.exists(&old_path).unwrap());
         let old_reader = fm.open_data_file_reader(file_id).unwrap();
+        let target_volume = fm.primary_volume_by_rank(1).unwrap();
 
-        assert!(fm.schedule_offload_move(file_id).unwrap());
-        assert!(!fm.schedule_offload_move(file_id).unwrap());
+        assert!(fm.schedule_offload_move(file_id, &target_volume).unwrap());
+        assert!(!fm.schedule_offload_move(file_id, &target_volume).unwrap());
         assert!(fm.wait_for_offload_idle(Duration::from_secs(20)));
 
         assert_eq!(
@@ -575,6 +632,62 @@ mod tests {
         );
         drop(old_reader);
         test_utils::wait_for_file_deletion(&high_fs, &old_path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_offload_promotes_existing_snapshot_replica_on_target_volume() {
+        let root = "/tmp/file_manager_offload_promote_snapshot_replica";
+        let _ = std::fs::remove_dir_all(root);
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    format!("file://{}/high", root),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    format!("file://{}/low", root),
+                    vec![
+                        VolumeUsageKind::PrimaryDataPriorityLow,
+                        VolumeUsageKind::Snapshot,
+                    ],
+                ),
+            ],
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new(
+            "file-manager-offload-promote-snapshot-replica",
+        ));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+
+        let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
+        source_writer.write(&vec![b'x'; 512]).unwrap();
+        source_writer.close().unwrap();
+        let source_path = fm.get_data_file_path(source_file_id).unwrap();
+
+        let (snapshot_replica_file_id, copied) = fm
+            .copy_data_file_to_snapshot_volume_with_result(source_file_id, None)
+            .unwrap();
+        assert!(copied);
+        fm.register_snapshot_replica_hint(source_file_id, snapshot_replica_file_id);
+        let snapshot_replica_path = fm.get_data_file_path(snapshot_replica_file_id).unwrap();
+
+        let target_volume = fm.primary_volume_by_rank(1).unwrap();
+        let promoted = fm
+            .offload_file_to_lower_priority_primary(source_file_id, &target_volume)
+            .unwrap();
+        assert!(promoted);
+        assert_eq!(
+            fm.get_data_file_path(source_file_id).unwrap(),
+            snapshot_replica_path
+        );
+        assert_ne!(source_path, snapshot_replica_path);
+        assert_eq!(
+            fm.snapshot_replica_hint_file_id(source_file_id),
+            Some(snapshot_replica_file_id)
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
