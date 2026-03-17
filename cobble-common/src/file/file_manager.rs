@@ -15,6 +15,7 @@ use crate::config::VolumeUsageKind;
 use crate::error::{Error, Result};
 use crate::file::file_system::{FileSystem, FileSystemRegistry};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
+use crate::file::offload::OffloadRuntime;
 use crate::lru::LruCache;
 use crate::metrics_manager::MetricsManager;
 use crate::util::normalize_storage_path_to_url;
@@ -60,14 +61,14 @@ impl RandomAccessFile for CachedRandomAccessFile {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VolumePriority {
+pub(crate) enum VolumePriority {
     High,
     Medium,
     Low,
 }
 
 impl VolumePriority {
-    fn rank(self) -> u8 {
+    pub(crate) fn rank(self) -> u8 {
         match self {
             VolumePriority::High => 3,
             VolumePriority::Medium => 2,
@@ -89,15 +90,15 @@ impl Clone for VolumeUsage {
 }
 
 pub(crate) struct DataVolume {
-    fs: Arc<dyn FileSystem>,
-    base_dir: Option<String>,
-    size_limit: Option<u64>,
-    used_bytes: AtomicU64,
-    priority: VolumePriority,
-    supports_primary_data: bool,
-    supports_meta: bool,
-    snapshot_persistable: bool,
-    readonly_source: bool,
+    pub(crate) fs: Arc<dyn FileSystem>,
+    pub(crate) base_dir: Option<String>,
+    pub(crate) size_limit: Option<u64>,
+    pub(crate) used_bytes: AtomicU64,
+    pub(crate) priority: VolumePriority,
+    pub(crate) supports_primary_data: bool,
+    pub(crate) supports_meta: bool,
+    pub(crate) snapshot_persistable: bool,
+    pub(crate) readonly_source: bool,
 }
 
 impl Clone for DataVolume {
@@ -117,15 +118,15 @@ impl Clone for DataVolume {
 }
 
 impl DataVolume {
-    fn base_dir(&self) -> Option<&str> {
+    pub(crate) fn base_dir(&self) -> Option<&str> {
         self.base_dir.as_deref()
     }
 
-    fn add_usage(&self, bytes: u64) {
+    pub(crate) fn add_usage(&self, bytes: u64) {
         self.used_bytes.fetch_add(bytes, Ordering::SeqCst);
     }
 
-    fn subtract_usage(&self, bytes: u64) {
+    pub(crate) fn subtract_usage(&self, bytes: u64) {
         let mut current = self.used_bytes.load(Ordering::SeqCst);
         loop {
             // Use saturating_sub to avoid underflow, but ensure it doesn't go negative.
@@ -142,7 +143,7 @@ impl DataVolume {
         }
     }
 
-    fn is_full(&self, base_file_size: u64) -> bool {
+    pub(crate) fn is_full(&self, base_file_size: u64) -> bool {
         let Some(limit) = self.size_limit else {
             return false;
         };
@@ -151,7 +152,7 @@ impl DataVolume {
         used >= threshold
     }
 
-    fn fs(&self) -> &Arc<dyn FileSystem> {
+    pub(crate) fn fs(&self) -> &Arc<dyn FileSystem> {
         &self.fs
     }
 }
@@ -194,25 +195,29 @@ impl Default for FileManagerOptions {
 /// Information about a tracked file.
 pub struct TrackedFile {
     /// The path to the file relative to the file system root.
-    path: String,
+    pub(crate) path: String,
     /// The underlying file system (needed for deletion on drop).
-    fs: Arc<dyn FileSystem>,
+    pub(crate) fs: Arc<dyn FileSystem>,
     /// Optional volume usage tracker.
-    volume: Option<Arc<DataVolume>>,
+    pub(crate) volume: Option<Arc<DataVolume>>,
     /// Bytes tracked for this file.
-    size_bytes: AtomicU64,
+    pub(crate) size_bytes: AtomicU64,
     /// Whether to delete the file when this TrackedFile is dropped.
-    delete_on_drop: AtomicBool,
+    pub(crate) delete_on_drop: AtomicBool,
     /// Count of explicit references to this file (e.g., from snapshots).
-    explicit_refs: AtomicU32,
+    pub(crate) explicit_refs: AtomicU32,
 }
 
 impl TrackedFile {
-    fn fs(&self) -> &Arc<dyn FileSystem> {
+    pub(crate) fn fs(&self) -> &Arc<dyn FileSystem> {
         &self.fs
     }
     /// Creates a new TrackedFile.
-    fn new(path: String, fs: Arc<dyn FileSystem>, volume: Option<Arc<DataVolume>>) -> Self {
+    pub(crate) fn new(
+        path: String,
+        fs: Arc<dyn FileSystem>,
+        volume: Option<Arc<DataVolume>>,
+    ) -> Self {
         Self {
             path,
             fs,
@@ -224,7 +229,11 @@ impl TrackedFile {
     }
 
     /// Creates a new TrackedFile that never deletes on drop.
-    fn readonly(path: String, fs: Arc<dyn FileSystem>, volume: Option<Arc<DataVolume>>) -> Self {
+    pub(crate) fn readonly(
+        path: String,
+        fs: Arc<dyn FileSystem>,
+        volume: Option<Arc<DataVolume>>,
+    ) -> Self {
         Self {
             path,
             fs,
@@ -236,21 +245,21 @@ impl TrackedFile {
     }
 
     /// Marks the file for deletion when this TrackedFile is dropped.
-    pub fn mark_for_deletion(&self) {
+    pub(crate) fn mark_for_deletion(&self) {
         self.delete_on_drop.store(true, Ordering::SeqCst);
     }
 
-    pub fn mark_for_retention(&self) {
+    pub(crate) fn mark_for_retention(&self) {
         self.delete_on_drop.store(false, Ordering::SeqCst);
     }
 
     /// Returns true if the file is marked for deletion on drop.
-    pub fn is_marked_for_deletion(&self) -> bool {
+    pub(crate) fn is_marked_for_deletion(&self) -> bool {
         self.delete_on_drop.load(Ordering::SeqCst)
     }
 
     /// Returns the path to the file.
-    pub fn path(&self) -> &str {
+    pub(crate) fn path(&self) -> &str {
         &self.path
     }
 
@@ -494,21 +503,22 @@ impl FileManagerMetrics {
 /// The FileManager is responsible for managing both metadata files and data files.
 /// It provides file ID assignment, reader caching, and file lifecycle management.
 pub struct FileManager {
-    metrics: FileManagerMetrics,
+    pub(crate) metrics: FileManagerMetrics,
     /// The metadata volume for metadata files.
-    meta_volume: Arc<DataVolume>,
+    pub(crate) meta_volume: Arc<DataVolume>,
     /// Ordered data volumes by priority (high to low).
-    data_volumes: Vec<Arc<DataVolume>>,
+    pub(crate) data_volumes: Vec<Arc<DataVolume>>,
     /// Configuration options.
-    options: FileManagerOptions,
+    pub(crate) options: FileManagerOptions,
     /// Counter for generating unique file IDs.
-    next_file_id: AtomicU64,
+    pub(crate) next_file_id: AtomicU64,
     /// Map of file ID to tracked file information for data files.
-    data_files: DashMap<FileId, Arc<TrackedFile>>,
+    pub(crate) data_files: DashMap<FileId, Arc<TrackedFile>>,
     /// Map of filename to tracked file information for metadata files.
-    metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
+    pub(crate) metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
     /// LRU cache for open random access readers.
-    reader_cache: Mutex<LruCache<FileId, Arc<dyn RandomAccessFile>>>,
+    pub(crate) reader_cache: Mutex<LruCache<FileId, Arc<dyn RandomAccessFile>>>,
+    pub(crate) offload_runtime: Arc<OffloadRuntime>,
 }
 
 impl FileManager {
@@ -654,6 +664,7 @@ impl FileManager {
             }
             Self::ensure_volume_dirs(volume.fs(), &options)?;
         }
+        let offload_runtime = Arc::new(OffloadRuntime::new(&data_volumes));
         Ok(Self {
             metrics: metrics_manager.file_manager_metrics(),
             meta_volume,
@@ -663,6 +674,7 @@ impl FileManager {
             data_files: DashMap::new(),
             metadata_files: Arc::new(DashMap::new()),
             reader_cache: Mutex::new(LruCache::new(DEFAULT_READER_CACHE_CAPACITY)),
+            offload_runtime,
         })
     }
 
@@ -936,7 +948,7 @@ impl FileManager {
         Ok(())
     }
 
-    fn copy_reader_to_tracked_writer(
+    pub(crate) fn copy_reader_to_tracked_writer(
         &self,
         source: &dyn RandomAccessFile,
         writer: &mut TrackedWriter,
@@ -1402,6 +1414,12 @@ impl FileManager {
             format!("{}/{}", self.options.base_dir, SNAPSHOT_DIR)
         };
         self.meta_volume.fs().list(&snapshot_dir)
+    }
+}
+
+impl Drop for FileManager {
+    fn drop(&mut self) {
+        self.stop_offload_worker();
     }
 }
 

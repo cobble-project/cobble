@@ -1,6 +1,7 @@
 mod file_manager;
 mod file_system;
 mod files;
+mod offload;
 mod opendal_file;
 mod opendal_fs;
 #[cfg(unix)]
@@ -27,4 +28,8 @@ pub use self::file_system::{FileSystem, FileSystemRegistry};
 pub use self::files::{
     BufferedReader, BufferedWriter, File, RandomAccessFile, ReadAheadBufferedReader,
     SequentialWriteFile,
+};
+#[allow(unused_imports)]
+pub(crate) use self::offload::{
+    LargestFileOffloadPolicy, OffloadRuntime, PrimaryOffloadPolicy, VolumePressure,
 };
