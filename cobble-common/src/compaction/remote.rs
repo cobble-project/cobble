@@ -435,6 +435,9 @@ impl CompactionWorker for RemoteCompactionWorker {
                     .zip(output_ids)
                     .map(|(file, file_id)| file.into_data_file(&file_manager, file_id, false))
                     .collect::<Result<Vec<_>>>()?;
+                if let Err(err) = file_manager.trigger_offload_if_needed() {
+                    warn!("remote compaction check-in offload trigger failed: {}", err);
+                }
                 let edit = build_version_edit(&sorted_runs, output_level, output_files.clone());
                 let vlog_edit = {
                     let edit = VlogEdit::from_entry_deltas(response.vlog_entry_deltas);
@@ -857,7 +860,7 @@ mod tests {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         options: SSTWriterOptions,
     ) -> Result<Arc<DataFile>> {
-        let (file_id, writer_file) = file_manager.create_data_file()?;
+        let (file_id, writer_file) = file_manager.create_data_file_with_offload()?;
         let mut writer = crate::sst::SSTWriter::new(writer_file, options);
 
         for (key, value) in entries {

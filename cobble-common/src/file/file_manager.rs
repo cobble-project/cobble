@@ -152,6 +152,21 @@ impl DataVolume {
         used >= threshold
     }
 
+    pub(crate) fn is_write_stopped(&self, write_stop_watermark: f64) -> bool {
+        self.usage_ratio()
+            .map(|ratio| ratio >= write_stop_watermark)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn usage_ratio(&self) -> Option<f64> {
+        let limit = self.size_limit?;
+        if limit == 0 {
+            return Some(1.0);
+        }
+        let used = self.used_bytes.load(Ordering::SeqCst);
+        Some((used as f64 / limit as f64).min(1.0))
+    }
+
     pub(crate) fn fs(&self) -> &Arc<dyn FileSystem> {
         &self.fs
     }
@@ -180,6 +195,10 @@ pub struct FileManagerOptions {
     pub data_file_extension: String,
     /// Base SST file size used for volume threshold calculations.
     pub base_file_size: usize,
+    /// Usage ratio watermark for stopping new writes on a primary volume.
+    pub primary_volume_write_stop_watermark: f64,
+    /// Usage ratio watermark for triggering background offload from a primary volume.
+    pub primary_volume_offload_trigger_watermark: f64,
 }
 
 impl Default for FileManagerOptions {
@@ -188,6 +207,8 @@ impl Default for FileManagerOptions {
             base_dir: "".to_string(),
             data_file_extension: "sst".to_string(),
             base_file_size: DEFAULT_BASE_FILE_SIZE,
+            primary_volume_write_stop_watermark: 0.95,
+            primary_volume_offload_trigger_watermark: 0.85,
         }
     }
 }
@@ -522,6 +543,10 @@ pub struct FileManager {
 }
 
 impl FileManager {
+    fn is_volume_write_stopped(&self, volume: &Arc<DataVolume>) -> bool {
+        volume.is_write_stopped(self.options.primary_volume_write_stop_watermark)
+    }
+
     fn sort_data_volumes(mut volumes: Vec<Arc<DataVolume>>) -> Vec<Arc<DataVolume>> {
         volumes.sort_by_key(|volume| std::cmp::Reverse(volume.priority.rank()));
         volumes
@@ -568,6 +593,9 @@ impl FileManager {
             }
             if !candidates.is_empty() && volume.priority.rank() < candidates[0].priority.rank() {
                 break;
+            }
+            if self.is_volume_write_stopped(volume) {
+                continue;
             }
             if volume.is_full(base_file_size) {
                 continue;
@@ -642,6 +670,21 @@ impl FileManager {
         options: FileManagerOptions,
         metrics_manager: Arc<MetricsManager>,
     ) -> Result<Self> {
+        if !(0.0..=1.0).contains(&options.primary_volume_write_stop_watermark)
+            || !(0.0..=1.0).contains(&options.primary_volume_offload_trigger_watermark)
+        {
+            return Err(Error::ConfigError(
+                "primary volume watermarks must be in [0.0, 1.0]".to_string(),
+            ));
+        }
+        if options.primary_volume_offload_trigger_watermark
+            > options.primary_volume_write_stop_watermark
+        {
+            return Err(Error::ConfigError(
+                "primary_volume_offload_trigger_watermark must be <= primary_volume_write_stop_watermark"
+                    .to_string(),
+            ));
+        }
         if data_volumes.is_empty() {
             return Err(Error::ConfigError(
                 "No data volumes configured for FileManager".to_string(),
@@ -706,6 +749,9 @@ impl FileManager {
         let options = FileManagerOptions {
             base_dir: db_id.to_string(),
             base_file_size: config.base_file_size,
+            primary_volume_write_stop_watermark: config.primary_volume_write_stop_watermark,
+            primary_volume_offload_trigger_watermark: config
+                .primary_volume_offload_trigger_watermark,
             ..FileManagerOptions::default()
         };
         Self::new(data_volumes, options, metrics_manager)

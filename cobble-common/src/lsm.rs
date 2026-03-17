@@ -1160,7 +1160,7 @@ mod tests {
         bucket: u16,
         entries: Vec<(&[u8], &[u8])>,
     ) -> Result<Arc<DataFile>> {
-        let (file_id, writer_file) = file_manager.create_data_file()?;
+        let (file_id, writer_file) = file_manager.create_data_file_with_offload()?;
         let mut writer = SSTWriter::new(
             writer_file,
             SSTWriterOptions {

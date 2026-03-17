@@ -555,7 +555,7 @@ impl VlogStore {
         &self,
         file_seq: VlogFileSeq,
     ) -> Result<(VlogWriter<Box<dyn SequentialWriteFile>>, VlogEdit)> {
-        let (file_id, writer) = self.file_manager.create_data_file()?;
+        let (file_id, writer) = self.file_manager.create_data_file_with_offload()?;
         let tracked_id = TrackedFileId::new(&self.file_manager, file_id);
         let writer: Box<dyn SequentialWriteFile> = Box::new(writer);
         let edit = VlogEdit {

@@ -374,6 +374,12 @@ pub struct Config {
     /// Optional level ordinal whose overflow triggers automatic LSM tree splitting.
     /// When set, the tree is split by bucket boundaries instead of compacting into deeper levels.
     pub lsm_split_trigger_level: Option<u8>,
+    /// Usage ratio watermark for stopping new writes on a primary volume.
+    /// Range: [0.0, 1.0].
+    pub primary_volume_write_stop_watermark: f64,
+    /// Usage ratio watermark for triggering background offload from a primary volume.
+    /// Range: [0.0, 1.0], and should be <= write-stop watermark.
+    pub primary_volume_offload_trigger_watermark: f64,
     /// Auto-expire snapshots after this many newer snapshots are completed.
     /// None disables auto-expiration.
     pub snapshot_retention: Option<usize>,
@@ -421,6 +427,8 @@ impl Default for Config {
             snapshot_on_flush: false,
             active_memtable_incremental_snapshot_ratio: 0.0,
             lsm_split_trigger_level: None,
+            primary_volume_write_stop_watermark: 0.95,
+            primary_volume_offload_trigger_watermark: 0.85,
             snapshot_retention: None,
         }
     }
@@ -696,6 +704,8 @@ mod tests {
             snapshot_on_flush: true,
             active_memtable_incremental_snapshot_ratio: 0.5,
             lsm_split_trigger_level: Some(2),
+            primary_volume_write_stop_watermark: 0.93,
+            primary_volume_offload_trigger_watermark: 0.82,
             snapshot_retention: Some(3),
             compaction_read_ahead_enabled: false,
             compaction_remote_addr: Some("127.0.0.1:9999".to_string()),
@@ -731,6 +741,8 @@ mod tests {
         assert_eq!(decoded.snapshot_retention, Some(3));
         assert_eq!(decoded.active_memtable_incremental_snapshot_ratio, 0.5);
         assert_eq!(decoded.lsm_split_trigger_level, Some(2));
+        assert_eq!(decoded.primary_volume_write_stop_watermark, 0.93);
+        assert_eq!(decoded.primary_volume_offload_trigger_watermark, 0.82);
         assert_eq!(decoded.value_separation_threshold, 4096);
         assert_eq!(decoded.read_proxy.block_cache_size, 2048);
         assert_eq!(decoded.read_proxy.reload_tolerance_seconds, 5);

@@ -406,7 +406,11 @@ impl CompactionExecutor {
 
             // Check if we need to start a new file
             if current_builder.is_none() {
-                let (file_id, writer) = task.file_manager.create_data_file()?;
+                let (file_id, writer) = if task.output_files_readonly {
+                    task.file_manager.create_data_file()?
+                } else {
+                    task.file_manager.create_data_file_with_offload()?
+                };
                 current_file_id = Some(file_id);
                 current_builder = Some((task.file_builder_factory)(Box::new(writer)));
             }
@@ -593,7 +597,7 @@ mod tests {
         file_manager: &Arc<FileManager>,
         entries: Vec<(&[u8], &[u8])>,
     ) -> Result<Arc<DataFile>> {
-        let (file_id, writer_file) = file_manager.create_data_file()?;
+        let (file_id, writer_file) = file_manager.create_data_file_with_offload()?;
         let mut writer = SSTWriter::new(
             writer_file,
             SSTWriterOptions {

@@ -37,6 +37,7 @@ pub(crate) struct OffloadRuntime {
     done: Arc<Condvar>,
     runtime: Arc<Runtime>,
     primary_volume_by_rank: HashMap<u8, Vec<Arc<DataVolume>>>,
+    policy: Arc<dyn PrimaryOffloadPolicy>,
 }
 
 impl Default for OffloadRuntime {
@@ -47,6 +48,13 @@ impl Default for OffloadRuntime {
 
 impl OffloadRuntime {
     pub(crate) fn new(data_volumes: &[Arc<DataVolume>]) -> Self {
+        Self::new_with_policy(data_volumes, Arc::new(LargestFileOffloadPolicy))
+    }
+
+    fn new_with_policy(
+        data_volumes: &[Arc<DataVolume>],
+        policy: Arc<dyn PrimaryOffloadPolicy>,
+    ) -> Self {
         let worker_threads = std::thread::available_parallelism()
             .map(|parallelism| parallelism.get())
             .unwrap_or(1)
@@ -74,6 +82,7 @@ impl OffloadRuntime {
             done: Arc::new(Condvar::new()),
             runtime: Arc::new(runtime),
             primary_volume_by_rank,
+            policy,
         }
     }
 
@@ -87,7 +96,7 @@ impl OffloadRuntime {
     pub(crate) fn select_lower_priority_primary_volume(
         &self,
         source_priority_rank: u8,
-        base_file_size: u64,
+        write_stop_watermark: f64,
     ) -> Option<Arc<DataVolume>> {
         if source_priority_rank <= 1 {
             return None;
@@ -95,18 +104,22 @@ impl OffloadRuntime {
         for rank in (1..source_priority_rank).rev() {
             if let Some(volumes) = self.primary_volume_by_rank.get(&rank) {
                 for volume in volumes {
-                    if !volume.is_full(base_file_size) {
+                    if !volume.is_write_stopped(write_stop_watermark) {
                         return Some(Arc::clone(volume));
                     }
                 }
             }
         }
-        (1..source_priority_rank).rev().find_map(|rank| {
-            self.primary_volume_by_rank
-                .get(&rank)
-                .and_then(|volumes| volumes.first())
-                .map(Arc::clone)
-        })
+        None
+    }
+
+    pub(crate) fn select_candidate(
+        &self,
+        candidates: &[(FileId, Arc<TrackedFile>)],
+        source: &VolumePressure,
+        target: &VolumePressure,
+    ) -> Option<FileId> {
+        self.policy.select_candidate(candidates, source, target)
     }
 
     fn complete_job(&self, file_id: FileId) {
@@ -239,6 +252,48 @@ impl FileManager {
         self.offload_runtime.wait_idle(timeout)
     }
 
+    fn should_trigger_offload_on_volume(&self, volume: &Arc<DataVolume>) -> bool {
+        volume
+            .usage_ratio()
+            .map(|ratio| ratio >= self.options.primary_volume_offload_trigger_watermark)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn trigger_offload_if_needed(self: &Arc<Self>) -> crate::Result<usize> {
+        let mut scheduled = 0usize;
+        for source_volume in &self.data_volumes {
+            if !source_volume.supports_primary_data {
+                continue;
+            }
+            if !self.should_trigger_offload_on_volume(source_volume) {
+                continue;
+            }
+            let Some(target_volume) = self.offload_runtime.select_lower_priority_primary_volume(
+                source_volume.priority.rank(),
+                self.options.primary_volume_write_stop_watermark,
+            ) else {
+                continue;
+            };
+            if Arc::ptr_eq(source_volume, &target_volume) {
+                continue;
+            }
+            let Some(file_id) = self.select_offload_candidate(source_volume, &target_volume) else {
+                continue;
+            };
+            if self.schedule_offload_move(file_id)? {
+                scheduled += 1;
+            }
+        }
+        Ok(scheduled)
+    }
+
+    pub(crate) fn create_data_file_with_offload(
+        self: &Arc<Self>,
+    ) -> crate::Result<(FileId, TrackedWriter)> {
+        let _ = self.trigger_offload_if_needed()?;
+        self.create_data_file()
+    }
+
     pub(crate) fn schedule_offload_move(self: &Arc<Self>, file_id: FileId) -> crate::Result<bool> {
         let manager = Arc::downgrade(self);
         let handler = Arc::new(move |scheduled_file_id| {
@@ -261,7 +316,6 @@ impl FileManager {
         &self,
         source_volume: &Arc<DataVolume>,
         target_volume: &Arc<DataVolume>,
-        policy: &dyn PrimaryOffloadPolicy,
     ) -> Option<FileId> {
         if !source_volume.supports_primary_data || !target_volume.supports_primary_data {
             return None;
@@ -299,7 +353,8 @@ impl FileManager {
                 .load(std::sync::atomic::Ordering::SeqCst),
             size_limit: target_volume.size_limit,
         };
-        policy.select_candidate(&candidates, &source_pressure, &target_pressure)
+        self.offload_runtime
+            .select_candidate(&candidates, &source_pressure, &target_pressure)
     }
 
     #[cfg(test)]
@@ -315,7 +370,7 @@ impl FileManager {
         }
         self.offload_runtime.select_lower_priority_primary_volume(
             source_volume.priority.rank(),
-            self.options.base_file_size as u64,
+            self.options.primary_volume_write_stop_watermark,
         )
     }
 
@@ -460,10 +515,9 @@ mod tests {
         let (large_id, mut large_writer) = fm.create_data_file().unwrap();
         large_writer.write(&vec![b'b'; 128]).unwrap();
         large_writer.close().unwrap();
-        let policy = LargestFileOffloadPolicy;
         let source_volume = fm.primary_volume_by_rank(3).unwrap();
         let target_volume = fm.primary_volume_by_rank(1).unwrap();
-        let selected = fm.select_offload_candidate(&source_volume, &target_volume, &policy);
+        let selected = fm.select_offload_candidate(&source_volume, &target_volume);
         assert_eq!(selected, Some(large_id));
         assert_ne!(small_id, large_id);
         let _ = std::fs::remove_dir_all(root);
@@ -521,6 +575,82 @@ mod tests {
         );
         drop(old_reader);
         test_utils::wait_for_file_deletion(&high_fs, &old_path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_create_data_file_with_offload_triggers_background_offload() {
+        let root = "/tmp/file_manager_offload_trigger_watermark";
+        let _ = std::fs::remove_dir_all(root);
+        let high_url = format!("file://{}/high", root);
+        let low_url = format!("file://{}/low", root);
+        let registry = FileSystemRegistry::new();
+        let high_fs = registry.get_or_register(high_url.clone()).unwrap();
+        let low_fs = registry.get_or_register(low_url.clone()).unwrap();
+        let mut high =
+            crate::VolumeDescriptor::new(high_url, vec![VolumeUsageKind::PrimaryDataPriorityHigh]);
+        high.size_limit = Some(1024);
+        let low =
+            crate::VolumeDescriptor::new(low_url, vec![VolumeUsageKind::PrimaryDataPriorityLow]);
+        let config = Config {
+            volumes: vec![high, low],
+            base_file_size: 64,
+            primary_volume_write_stop_watermark: 0.95,
+            primary_volume_offload_trigger_watermark: 0.5,
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-offload-watermark"));
+        let fm = Arc::new(FileManager::from_config(&config, "db", metrics_manager).unwrap());
+
+        let (file_id, mut writer) = fm.create_data_file().unwrap();
+        writer.write(&vec![b'x'; 600]).unwrap();
+        writer.close().unwrap();
+        let old_path = fm.get_data_file_path(file_id).unwrap();
+        assert!(high_fs.exists(&old_path).unwrap());
+
+        let (_new_id, mut new_writer) = fm.create_data_file_with_offload().unwrap();
+        new_writer.write(b"small").unwrap();
+        new_writer.close().unwrap();
+
+        assert!(fm.wait_for_offload_idle(Duration::from_secs(20)));
+        let new_path = fm.get_data_file_path(file_id).unwrap();
+        assert_ne!(new_path, old_path);
+        assert!(low_fs.exists(&new_path).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_write_stop_watermark_blocks_new_writes() {
+        let root = "/tmp/file_manager_write_stop_watermark";
+        let _ = std::fs::remove_dir_all(root);
+        let high_url = format!("file://{}/high", root);
+        let mut high =
+            crate::VolumeDescriptor::new(high_url, vec![VolumeUsageKind::PrimaryDataPriorityHigh]);
+        high.size_limit = Some(1024);
+        let config = Config {
+            volumes: vec![high],
+            base_file_size: 64,
+            primary_volume_write_stop_watermark: 0.5,
+            primary_volume_offload_trigger_watermark: 0.4,
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-write-stop-watermark"));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+
+        let (_id, mut writer) = fm.create_data_file().unwrap();
+        writer.write(&vec![b'x'; 600]).unwrap();
+        writer.close().unwrap();
+
+        let err = match fm.create_data_file() {
+            Ok(_) => panic!("writes should stop after crossing write-stop watermark"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("All primary data volumes are full")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

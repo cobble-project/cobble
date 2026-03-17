@@ -1451,7 +1451,7 @@ fn flush_memtable(
                     Error::InvalidState(format!("bucket {} not mapped to an LSM tree", bucket))
                 })?;
             if let std::collections::btree_map::Entry::Vacant(entry) = builders.entry(tree_idx) {
-                let (file_id, writer) = file_manager.create_data_file()?;
+                let (file_id, writer) = file_manager.create_data_file_with_offload()?;
                 entry.insert((
                     file_id,
                     (file_builder_factory)(Box::new(writer)),
