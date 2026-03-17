@@ -21,7 +21,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::util::normalize_storage_path_to_url;
 use bytes::Bytes;
 use dashmap::DashMap;
-use metrics::{Gauge, gauge};
+use metrics::{Counter, Gauge, counter, gauge};
 use rand::random;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -507,6 +507,12 @@ impl SequentialWriteFile for AtomicMetadataWriter {
 pub(crate) struct FileManagerMetrics {
     data_files_tracked: Gauge,
     metadata_files_tracked: Gauge,
+    offload_jobs_scheduled_total: Counter,
+    offload_jobs_completed_total: Counter,
+    offload_jobs_failed_total: Counter,
+    offload_jobs_noop_total: Counter,
+    offload_bytes_moved_total: Counter,
+    offload_promotions_total: Counter,
 }
 
 impl FileManagerMetrics {
@@ -514,7 +520,22 @@ impl FileManagerMetrics {
         let db_id = db_id.to_string();
         Self {
             data_files_tracked: gauge!("data_files_tracked", "db_id" => db_id.clone()),
-            metadata_files_tracked: gauge!("metadata_files_tracked", "db_id" => db_id),
+            metadata_files_tracked: gauge!("metadata_files_tracked", "db_id" => db_id.clone()),
+            offload_jobs_scheduled_total: counter!(
+                "offload_jobs_scheduled_total",
+                "db_id" => db_id.clone()
+            ),
+            offload_jobs_completed_total: counter!(
+                "offload_jobs_completed_total",
+                "db_id" => db_id.clone()
+            ),
+            offload_jobs_failed_total: counter!(
+                "offload_jobs_failed_total",
+                "db_id" => db_id.clone()
+            ),
+            offload_jobs_noop_total: counter!("offload_jobs_noop_total", "db_id" => db_id.clone()),
+            offload_bytes_moved_total: counter!("offload_bytes_moved_total", "db_id" => db_id.clone()),
+            offload_promotions_total: counter!("offload_promotions_total", "db_id" => db_id),
         }
     }
 }
@@ -1459,6 +1480,28 @@ impl FileManager {
         self.metrics
             .metadata_files_tracked
             .set(self.metadata_files.len() as f64);
+    }
+
+    pub(crate) fn record_offload_scheduled(&self) {
+        self.metrics.offload_jobs_scheduled_total.increment(1);
+    }
+
+    pub(crate) fn record_offload_completed_copy(&self, bytes: u64) {
+        self.metrics.offload_jobs_completed_total.increment(1);
+        self.metrics.offload_bytes_moved_total.increment(bytes);
+    }
+
+    pub(crate) fn record_offload_completed_promotion(&self) {
+        self.metrics.offload_jobs_completed_total.increment(1);
+        self.metrics.offload_promotions_total.increment(1);
+    }
+
+    pub(crate) fn record_offload_noop(&self) {
+        self.metrics.offload_jobs_noop_total.increment(1);
+    }
+
+    pub(crate) fn record_offload_failed(&self) {
+        self.metrics.offload_jobs_failed_total.increment(1);
     }
 
     /// Returns the number of tracked metadata files.

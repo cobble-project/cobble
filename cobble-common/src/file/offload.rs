@@ -2,6 +2,7 @@ use super::file_manager::FileId;
 use crate::Error;
 use crate::file::{DataVolume, FileManager, TrackedFile, TrackedWriter};
 use dashmap::Entry;
+use log::warn;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
@@ -303,13 +304,31 @@ impl FileManager {
         let manager = Arc::downgrade(self);
         let handler = Arc::new(move |scheduled_file_id| {
             if let Some(manager) = manager.upgrade() {
-                let _ = manager
-                    .offload_file_to_lower_priority_primary(scheduled_file_id, &target_volume);
+                match manager
+                    .offload_file_to_lower_priority_primary(scheduled_file_id, &target_volume)
+                {
+                    Ok(true) => {}
+                    Ok(false) => manager.record_offload_noop(),
+                    Err(err) => {
+                        manager.record_offload_failed();
+                        warn!(
+                            "offload move failed for file_id={} target_rank={}: {}",
+                            scheduled_file_id,
+                            target_volume.priority.rank(),
+                            err
+                        );
+                    }
+                }
             }
         });
-        self.offload_runtime
+        let scheduled = self
+            .offload_runtime
             .schedule(file_id, handler)
-            .map_err(Error::IoError)
+            .map_err(Error::IoError)?;
+        if scheduled {
+            self.record_offload_scheduled();
+        }
+        Ok(scheduled)
     }
 
     pub(crate) fn select_offload_candidate(
@@ -408,8 +427,12 @@ impl FileManager {
             if let Ok(mut cache) = self.reader_cache.lock() {
                 cache.remove(&file_id);
             }
+            self.record_offload_completed_promotion();
             return Ok(true);
         }
+        let copied_bytes = source_tracked
+            .size_bytes
+            .load(std::sync::atomic::Ordering::SeqCst);
         let source_reader = source_tracked.fs().open_read(source_tracked.path())?;
         let (mut writer, new_tracked) =
             self.create_untracked_data_file_writer_on_volume(target_volume)?;
@@ -426,6 +449,7 @@ impl FileManager {
         if let Ok(mut cache) = self.reader_cache.lock() {
             cache.remove(&file_id);
         }
+        self.record_offload_completed_copy(copied_bytes);
         Ok(true)
     }
 }
