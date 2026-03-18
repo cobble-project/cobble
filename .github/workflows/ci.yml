@@ -14,10 +14,12 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
       
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -44,17 +46,19 @@ jobs:
             ${{ runner.os }}-cargo-build-target-
       
       - name: Run tests
+        timeout-minutes: 10
         run: cargo test --verbose
 
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
       
       - name: Cache cargo registry
