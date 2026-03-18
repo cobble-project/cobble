@@ -1,7 +1,10 @@
 use super::{ActiveMemtableSnapshotData, DbSnapshot};
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::{Error, Result};
-use crate::file::{BufferedWriter, File, FileManager, SequentialWriteFile, TrackedFileId};
+use crate::file::{
+    BufferedWriter, File, FileManager, SequentialWriteFile, TrackedFileId, VLOG_FILE_PRIORITY,
+    lsm_file_priority_for_level,
+};
 use crate::lsm::{LSMTreeVersion, Level};
 use crate::vlog::VlogVersion;
 use serde::{Deserialize, Serialize};
@@ -619,6 +622,10 @@ pub(crate) fn build_tree_versions_from_manifest(
                 let end_key = from_hex(&file.end_key)?;
                 let (tracked_id, snapshot_data_file_id) = if read_only {
                     file_manager.register_data_file_readonly(file.file_id, &file.path)?;
+                    file_manager.set_data_file_priority(
+                        file.file_id,
+                        lsm_file_priority_for_level(level.ordinal),
+                    )?;
                     (TrackedFileId::detached(file.file_id), None)
                 } else {
                     if !file_manager.has_data_file(file.file_id) {
@@ -627,6 +634,10 @@ pub(crate) fn build_tree_versions_from_manifest(
                             file.file_id
                         )));
                     }
+                    file_manager.set_data_file_priority(
+                        file.file_id,
+                        lsm_file_priority_for_level(level.ordinal),
+                    )?;
                     (TrackedFileId::new(file_manager, file.file_id), None)
                 };
                 let data_file = DataFile {
@@ -673,6 +684,7 @@ pub(crate) fn build_vlog_version_from_manifest(
     for vlog_file in &manifest.vlog_files {
         let tracked_id = if read_only {
             file_manager.register_data_file_readonly(vlog_file.file_id, &vlog_file.path)?;
+            file_manager.set_data_file_priority(vlog_file.file_id, VLOG_FILE_PRIORITY)?;
             TrackedFileId::detached(vlog_file.file_id)
         } else {
             if !file_manager.has_data_file(vlog_file.file_id) {
@@ -681,6 +693,7 @@ pub(crate) fn build_vlog_version_from_manifest(
                     vlog_file.file_id
                 )));
             }
+            file_manager.set_data_file_priority(vlog_file.file_id, VLOG_FILE_PRIORITY)?;
             TrackedFileId::new(file_manager, vlog_file.file_id)
         };
         files.push((vlog_file.file_seq, tracked_id, vlog_file.valid_entries));

@@ -85,6 +85,15 @@ pub enum CompactionPolicyKind {
     MinOverlap,
 }
 
+/// Primary-volume offload policy selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimaryVolumeOffloadPolicyKind {
+    LargestFile,
+    #[default]
+    Priority,
+}
+
 /// Memtable implementation selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -380,6 +389,8 @@ pub struct Config {
     /// Usage ratio watermark for triggering background offload from a primary volume.
     /// Range: [0.0, 1.0], and should be <= write-stop watermark.
     pub primary_volume_offload_trigger_watermark: f64,
+    /// Offload policy for selecting candidate files on pressured primary volumes.
+    pub primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind,
     /// Auto-expire snapshots after this many newer snapshots are completed.
     /// None disables auto-expiration.
     pub snapshot_retention: Option<usize>,
@@ -429,6 +440,7 @@ impl Default for Config {
             lsm_split_trigger_level: None,
             primary_volume_write_stop_watermark: 0.95,
             primary_volume_offload_trigger_watermark: 0.85,
+            primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::Priority,
             snapshot_retention: None,
         }
     }
@@ -650,7 +662,10 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, MemtableType, ReadProxyConfigEntry, VolumeDescriptor, VolumeUsageKind};
+    use super::{
+        Config, MemtableType, PrimaryVolumeOffloadPolicyKind, ReadProxyConfigEntry,
+        VolumeDescriptor, VolumeUsageKind,
+    };
     use crate::SstCompressionAlgorithm;
     use std::io::Write;
     use std::path::PathBuf;
@@ -706,6 +721,7 @@ mod tests {
             lsm_split_trigger_level: Some(2),
             primary_volume_write_stop_watermark: 0.93,
             primary_volume_offload_trigger_watermark: 0.82,
+            primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::LargestFile,
             snapshot_retention: Some(3),
             compaction_read_ahead_enabled: false,
             compaction_remote_addr: Some("127.0.0.1:9999".to_string()),
@@ -743,6 +759,10 @@ mod tests {
         assert_eq!(decoded.lsm_split_trigger_level, Some(2));
         assert_eq!(decoded.primary_volume_write_stop_watermark, 0.93);
         assert_eq!(decoded.primary_volume_offload_trigger_watermark, 0.82);
+        assert_eq!(
+            decoded.primary_volume_offload_policy,
+            PrimaryVolumeOffloadPolicyKind::LargestFile
+        );
         assert_eq!(decoded.value_separation_threshold, 4096);
         assert_eq!(decoded.read_proxy.block_cache_size, 2048);
         assert_eq!(decoded.read_proxy.reload_tolerance_seconds, 5);

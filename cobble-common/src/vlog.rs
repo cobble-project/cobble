@@ -2,7 +2,7 @@
 //! The value log is designed to be simple and efficient for appending and reading values by pointer.
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, RandomAccessFile, SequentialWriteFile};
-use crate::file::{FileManager, TrackedFileId};
+use crate::file::{FileManager, TrackedFileId, VLOG_FILE_PRIORITY};
 use crate::r#type::{
     Column, RefColumn, Value, ValueType, decode_merge_separated_array, encode_merge_separated_array,
 };
@@ -556,6 +556,8 @@ impl VlogStore {
         file_seq: VlogFileSeq,
     ) -> Result<(VlogWriter<Box<dyn SequentialWriteFile>>, VlogEdit)> {
         let (file_id, writer) = self.file_manager.create_data_file_with_offload()?;
+        self.file_manager
+            .set_data_file_priority(file_id, VLOG_FILE_PRIORITY)?;
         let tracked_id = TrackedFileId::new(&self.file_manager, file_id);
         let writer: Box<dyn SequentialWriteFile> = Box::new(writer);
         let edit = VlogEdit {

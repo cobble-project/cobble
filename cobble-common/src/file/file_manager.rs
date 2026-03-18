@@ -11,7 +11,7 @@
 //! - Creating files for writing and assigning file IDs
 
 use crate::Config;
-use crate::config::VolumeUsageKind;
+use crate::config::{PrimaryVolumeOffloadPolicyKind, VolumeUsageKind};
 use crate::error::{Error, Result};
 use crate::file::file_system::{FileSystem, FileSystemRegistry};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
@@ -23,7 +23,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use metrics::{Counter, Gauge, counter, gauge};
 use rand::random;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use uuid::Uuid;
 
@@ -33,6 +33,15 @@ const SCHEMA_DIR: &str = "schema";
 const DEFAULT_BASE_FILE_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_READER_CACHE_CAPACITY: usize = 512;
 const SNAPSHOT_COPY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const VLOG_FILE_PRIORITY: u8 = 10;
+const DEFAULT_TRACKED_FILE_PRIORITY: u8 = u8::MAX;
+
+#[inline(always)]
+pub(crate) fn lsm_file_priority_for_level(level: u8) -> u8 {
+    u8::MAX
+        .saturating_sub(level * 5 + 5)
+        .max(VLOG_FILE_PRIORITY + 1)
+}
 
 struct CachedRandomAccessFile {
     inner: Arc<dyn RandomAccessFile>,
@@ -228,6 +237,8 @@ pub struct FileManagerOptions {
     pub primary_volume_write_stop_watermark: f64,
     /// Usage ratio watermark for triggering background offload from a primary volume.
     pub primary_volume_offload_trigger_watermark: f64,
+    /// Offload policy for selecting candidate files.
+    pub primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind,
 }
 
 impl Default for FileManagerOptions {
@@ -238,6 +249,7 @@ impl Default for FileManagerOptions {
             base_file_size: DEFAULT_BASE_FILE_SIZE,
             primary_volume_write_stop_watermark: 0.95,
             primary_volume_offload_trigger_watermark: 0.85,
+            primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::Priority,
         }
     }
 }
@@ -256,6 +268,8 @@ pub struct TrackedFile {
     pub(crate) delete_on_drop: AtomicBool,
     /// Count of explicit references to this file (e.g., from snapshots).
     pub(crate) explicit_refs: AtomicU32,
+    /// File priority used by primary-volume offload policy.
+    pub(crate) priority: AtomicU8,
 }
 
 impl TrackedFile {
@@ -275,6 +289,7 @@ impl TrackedFile {
             size_bytes: AtomicU64::new(0),
             delete_on_drop: AtomicBool::new(true),
             explicit_refs: AtomicU32::new(0),
+            priority: AtomicU8::new(DEFAULT_TRACKED_FILE_PRIORITY),
         }
     }
 
@@ -291,6 +306,7 @@ impl TrackedFile {
             size_bytes: AtomicU64::new(0),
             delete_on_drop: AtomicBool::new(false),
             explicit_refs: AtomicU32::new(0),
+            priority: AtomicU8::new(DEFAULT_TRACKED_FILE_PRIORITY),
         }
     }
 
@@ -340,6 +356,14 @@ impl TrackedFile {
             volume.add_usage(delta);
         }
     }
+
+    pub(crate) fn set_priority(&self, priority: u8) {
+        self.priority.store(priority, Ordering::SeqCst);
+    }
+
+    pub(crate) fn priority(&self) -> u8 {
+        self.priority.load(Ordering::SeqCst)
+    }
 }
 
 /// Handle that keeps a data file id tracked by the FileManager.
@@ -365,6 +389,13 @@ impl TrackedFileId {
             file_id,
             file_manager: Weak::new(),
         })
+    }
+
+    pub(crate) fn set_priority(&self, priority: u8) -> Result<()> {
+        let Some(file_manager) = self.file_manager.upgrade() else {
+            return Ok(());
+        };
+        file_manager.set_data_file_priority(self.file_id, priority)
     }
 }
 
@@ -759,7 +790,10 @@ impl FileManager {
             }
             Self::ensure_volume_dirs(volume.fs(), &options)?;
         }
-        let offload_runtime = Arc::new(OffloadRuntime::new(&data_volumes));
+        let offload_runtime = Arc::new(OffloadRuntime::new_with_policy_kind(
+            &data_volumes,
+            options.primary_volume_offload_policy,
+        ));
         Ok(Self {
             metrics: metrics_manager.file_manager_metrics(),
             meta_volume,
@@ -806,6 +840,7 @@ impl FileManager {
             primary_volume_write_stop_watermark: config.primary_volume_write_stop_watermark,
             primary_volume_offload_trigger_watermark: config
                 .primary_volume_offload_trigger_watermark,
+            primary_volume_offload_policy: config.primary_volume_offload_policy,
             ..FileManagerOptions::default()
         };
         Self::new(data_volumes, options, metrics_manager)
@@ -1135,6 +1170,15 @@ impl FileManager {
         Ok(())
     }
 
+    pub(crate) fn set_data_file_priority(&self, file_id: FileId, priority: u8) -> Result<()> {
+        let tracked = self
+            .data_files
+            .get(&file_id)
+            .ok_or_else(|| Error::IoError(format!("Data file {} is not tracked", file_id)))?;
+        tracked.set_priority(priority);
+        Ok(())
+    }
+
     pub(crate) fn register_snapshot_replica_hint(
         &self,
         source_file_id: FileId,
@@ -1307,6 +1351,7 @@ impl FileManager {
             let _ = self.remove_data_file(target_file_id);
             return Err(err);
         }
+        writer.tracked.set_priority(source_tracked.priority());
         if let Some(registry) = resource_registry {
             registry.register_temp_copied_file(target_file_id);
         }

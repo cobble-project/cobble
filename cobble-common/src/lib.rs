@@ -38,8 +38,8 @@ mod write_batch;
 
 pub use compaction::RemoteCompactionServer;
 pub use config::{
-    CompactionPolicyKind, Config, MemtableType, ReadOptions, ScanOptions, VolumeDescriptor,
-    VolumeUsageKind,
+    CompactionPolicyKind, Config, MemtableType, PrimaryVolumeOffloadPolicyKind, ReadOptions,
+    ScanOptions, VolumeDescriptor, VolumeUsageKind,
 };
 pub use coordinator::{
     CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef,

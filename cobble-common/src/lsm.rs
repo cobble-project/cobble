@@ -5,7 +5,7 @@ use crate::compaction::{
 use crate::data_file::{DataFile, intersect_bucket_ranges};
 use crate::db_status::DbLifecycle;
 use crate::error::Result;
-use crate::file::{FileManager, ReadAheadBufferedReader};
+use crate::file::{FileManager, ReadAheadBufferedReader, lsm_file_priority_for_level};
 use crate::iterator::{
     BucketFilterIterator, KvIterator, SchemaEvolvingIterator, SortedRun, VlogSeqOffsetIterator,
 };
@@ -15,7 +15,7 @@ use crate::sst::block_cache::BlockCache;
 use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 use crate::r#type::{Value, key_bucket};
-use log::debug;
+use log::{debug, warn};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
@@ -195,6 +195,15 @@ impl LSMTree {
                 .levels
                 .clone();
             for level_edit in &edit.level_edits {
+                let file_priority = lsm_file_priority_for_level(level_edit.level);
+                for new_file in &level_edit.new_files {
+                    if let Err(err) = new_file.tracked_id.set_priority(file_priority) {
+                        warn!(
+                            "failed to set offload priority for file {} at level {}: {}",
+                            new_file.file_id, level_edit.level, err
+                        );
+                    }
+                }
                 if let Some(level) = new_levels
                     .iter_mut()
                     .find(|l| l.ordinal == level_edit.level)

@@ -16,6 +16,10 @@ pub(crate) use self::file_manager::RestoreCopyResourceRegistry;
 #[allow(unused_imports)]
 pub(crate) use self::file_manager::SnapshotCopyResourceRegistry;
 #[allow(unused_imports)]
+pub(crate) use self::file_manager::VLOG_FILE_PRIORITY;
+#[allow(unused_imports)]
+pub(crate) use self::file_manager::lsm_file_priority_for_level;
+#[allow(unused_imports)]
 pub(crate) use self::file_manager::test_utils;
 #[allow(unused_imports)]
 pub use self::file_manager::{

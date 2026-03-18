@@ -1,5 +1,6 @@
 use super::file_manager::FileId;
 use crate::Error;
+use crate::config::PrimaryVolumeOffloadPolicyKind;
 use crate::file::{DataVolume, FileManager, TrackedFile, TrackedWriter};
 use dashmap::{DashMap, Entry};
 use log::warn;
@@ -56,7 +57,18 @@ impl Default for OffloadRuntime {
 
 impl OffloadRuntime {
     pub(crate) fn new(data_volumes: &[Arc<DataVolume>]) -> Self {
-        Self::new_with_policy(data_volumes, Arc::new(LargestFileOffloadPolicy))
+        Self::new_with_policy_kind(data_volumes, PrimaryVolumeOffloadPolicyKind::Priority)
+    }
+
+    pub(crate) fn new_with_policy_kind(
+        data_volumes: &[Arc<DataVolume>],
+        policy_kind: PrimaryVolumeOffloadPolicyKind,
+    ) -> Self {
+        let policy: Arc<dyn PrimaryOffloadPolicy> = match policy_kind {
+            PrimaryVolumeOffloadPolicyKind::LargestFile => Arc::new(LargestFileOffloadPolicy),
+            PrimaryVolumeOffloadPolicyKind::Priority => Arc::new(PriorityOffloadPolicy),
+        };
+        Self::new_with_policy(data_volumes, policy)
     }
 
     fn new_with_policy(
@@ -250,6 +262,35 @@ impl PrimaryOffloadPolicy for LargestFileOffloadPolicy {
                     std::cmp::Ordering::Equal => right.0.cmp(&left.0),
                     ord => ord,
                 }
+            })
+            .map(|candidate| candidate.0)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PriorityOffloadPolicy;
+
+impl PrimaryOffloadPolicy for PriorityOffloadPolicy {
+    fn select_candidate(
+        &self,
+        candidates: &[(FileId, Arc<TrackedFile>)],
+        _source: &VolumePressure,
+        _target: &VolumePressure,
+    ) -> Option<FileId> {
+        candidates
+            .iter()
+            .min_by(|left, right| {
+                let left_priority = left.1.priority();
+                let right_priority = right.1.priority();
+                left_priority
+                    .cmp(&right_priority)
+                    .then_with(|| {
+                        let left_size = left.1.size_bytes.load(std::sync::atomic::Ordering::SeqCst);
+                        let right_size =
+                            right.1.size_bytes.load(std::sync::atomic::Ordering::SeqCst);
+                        right_size.cmp(&left_size)
+                    })
+                    .then_with(|| left.0.cmp(&right.0))
             })
             .map(|candidate| candidate.0)
     }
@@ -521,6 +562,7 @@ impl FileManager {
             && snapshot_volume.supports_primary_data
             && Arc::ptr_eq(snapshot_volume, target_volume)
         {
+            snapshot_tracked.set_priority(source_tracked.priority());
             match self.data_files.entry(file_id) {
                 Entry::Occupied(mut occupied) => {
                     if !Arc::ptr_eq(occupied.get(), &source_tracked) {
@@ -543,6 +585,7 @@ impl FileManager {
         let (mut writer, new_tracked) =
             self.create_untracked_data_file_writer_on_volume(target_volume)?;
         self.copy_reader_to_tracked_writer(source_reader.as_ref(), &mut writer)?;
+        new_tracked.set_priority(source_tracked.priority());
         match self.data_files.entry(file_id) {
             Entry::Occupied(mut occupied) => {
                 if !Arc::ptr_eq(occupied.get(), &source_tracked) {
@@ -637,6 +680,33 @@ mod tests {
     }
 
     #[test]
+    fn priority_policy_prefers_lower_priority_over_larger_size() {
+        let policy = PriorityOffloadPolicy;
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/offload-policy-priority".to_string())
+            .unwrap();
+        let candidates = vec![
+            (
+                11,
+                Arc::new(TrackedFile::new("a".to_string(), Arc::clone(&fs), None)),
+            ),
+            (
+                22,
+                Arc::new(TrackedFile::new("b".to_string(), Arc::clone(&fs), None)),
+            ),
+        ];
+        candidates[0].1.update_size_bytes(1024);
+        candidates[1].1.update_size_bytes(32);
+        candidates[0].1.set_priority(200);
+        candidates[1].1.set_priority(3);
+        assert_eq!(
+            policy.select_candidate(&candidates, &pressure(3), &pressure(2)),
+            Some(22)
+        );
+    }
+
+    #[test]
     #[serial_test::serial(file)]
     fn test_select_offload_candidate_uses_policy() {
         let root = "/tmp/file_manager_offload_policy";
@@ -667,6 +737,77 @@ mod tests {
         let selected = fm.select_offload_candidate(&source_volume, &target_volume);
         assert_eq!(selected, Some(large_id));
         assert_ne!(small_id, large_id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_select_offload_candidate_prefers_lower_priority_file() {
+        let root = "/tmp/file_manager_offload_priority_policy";
+        let _ = std::fs::remove_dir_all(root);
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    format!("file://{}/high", root),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    format!("file://{}/low", root),
+                    vec![VolumeUsageKind::PrimaryDataPriorityLow],
+                ),
+            ],
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-offload-priority"));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+        let (large_high_pri_id, mut large_writer) = fm.create_data_file().unwrap();
+        large_writer.write(&vec![b'a'; 512]).unwrap();
+        large_writer.close().unwrap();
+        let (small_low_pri_id, mut small_writer) = fm.create_data_file().unwrap();
+        small_writer.write(&vec![b'b'; 32]).unwrap();
+        small_writer.close().unwrap();
+        fm.set_data_file_priority(large_high_pri_id, 200).unwrap();
+        fm.set_data_file_priority(small_low_pri_id, 3).unwrap();
+        let source_volume = fm.primary_volume_by_rank(3).unwrap();
+        let target_volume = fm.primary_volume_by_rank(1).unwrap();
+        let selected = fm.select_offload_candidate(&source_volume, &target_volume);
+        assert_eq!(selected, Some(small_low_pri_id));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_select_offload_candidate_uses_configured_largest_file_policy() {
+        let root = "/tmp/file_manager_offload_policy_option_largest";
+        let _ = std::fs::remove_dir_all(root);
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    format!("file://{}/high", root),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    format!("file://{}/low", root),
+                    vec![VolumeUsageKind::PrimaryDataPriorityLow],
+                ),
+            ],
+            primary_volume_offload_policy: crate::PrimaryVolumeOffloadPolicyKind::LargestFile,
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-offload-policy-option"));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+        let (large_high_pri_id, mut large_writer) = fm.create_data_file().unwrap();
+        large_writer.write(&vec![b'a'; 512]).unwrap();
+        large_writer.close().unwrap();
+        let (small_low_pri_id, mut small_writer) = fm.create_data_file().unwrap();
+        small_writer.write(&vec![b'b'; 32]).unwrap();
+        small_writer.close().unwrap();
+        fm.set_data_file_priority(large_high_pri_id, 200).unwrap();
+        fm.set_data_file_priority(small_low_pri_id, 3).unwrap();
+        let source_volume = fm.primary_volume_by_rank(3).unwrap();
+        let target_volume = fm.primary_volume_by_rank(1).unwrap();
+        let selected = fm.select_offload_candidate(&source_volume, &target_volume);
+        assert_eq!(selected, Some(large_high_pri_id));
         let _ = std::fs::remove_dir_all(root);
     }
 
