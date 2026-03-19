@@ -27,7 +27,7 @@ pub trait RandomAccessFile: File + Send + Sync + 'static {
     }
 }
 
-pub trait SequentialWriteFile: File {
+pub trait SequentialWriteFile: File + Send {
     fn write(&mut self, data: &[u8]) -> Result<usize, Error>;
 }
 

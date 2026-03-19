@@ -9,12 +9,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataFileType {
     SSTable,
+    Parquet,
 }
 
 impl DataFileType {
     pub fn as_str(self) -> &'static str {
         match self {
             DataFileType::SSTable => "sst",
+            DataFileType::Parquet => "parquet",
         }
     }
 }
@@ -31,6 +33,7 @@ impl FromStr for DataFileType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "sst" => Ok(DataFileType::SSTable),
+            "parquet" => Ok(DataFileType::Parquet),
             _ => Err(format!("Unknown data file type: {}", s)),
         }
     }

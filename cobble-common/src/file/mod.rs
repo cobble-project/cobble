@@ -20,6 +20,7 @@ pub use self::file_manager::{
 };
 pub use self::file_system::{FileSystem, FileSystemRegistry};
 pub use self::files::{
-    BufferedWriter, File, RandomAccessFile, ReadAheadBufferedReader, SequentialWriteFile,
+    BufferedReader, BufferedWriter, File, RandomAccessFile, ReadAheadBufferedReader,
+    SequentialWriteFile,
 };
 pub(crate) use self::offload::{PrimaryOffloadFileRef, compare_primary_offload_file_refs};

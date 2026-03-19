@@ -22,6 +22,7 @@ mod memtable;
 mod merge_operator;
 mod metrics_manager;
 mod metrics_registry;
+mod parquet;
 pub mod paths;
 mod read_only_db;
 mod read_proxy;
