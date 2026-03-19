@@ -196,6 +196,22 @@ impl DataVolume {
             .unwrap_or(false)
     }
 
+    pub(crate) fn is_write_stopped_with_expected(
+        &self,
+        write_stop_watermark: f64,
+        expected_write_bytes: u64,
+    ) -> bool {
+        let Some(limit) = self.size_limit else {
+            return false;
+        };
+        if limit == 0 {
+            return true;
+        }
+        let used = self.used_bytes.load(Ordering::SeqCst);
+        let projected = used.saturating_add(expected_write_bytes);
+        (projected as f64 / limit as f64) >= write_stop_watermark
+    }
+
     pub(crate) fn usage_ratio(&self) -> Option<f64> {
         let limit = self.size_limit?;
         if limit == 0 {
@@ -626,8 +642,11 @@ pub struct FileManager {
 }
 
 impl FileManager {
-    fn is_volume_write_stopped(&self, volume: &Arc<DataVolume>) -> bool {
-        volume.is_write_stopped(self.options.primary_volume_write_stop_watermark)
+    fn is_volume_write_stopped(&self, volume: &Arc<DataVolume>, expected_write_bytes: u64) -> bool {
+        volume.is_write_stopped_with_expected(
+            self.options.primary_volume_write_stop_watermark,
+            expected_write_bytes,
+        )
     }
 
     fn sort_data_volumes(mut volumes: Vec<Arc<DataVolume>>) -> Vec<Arc<DataVolume>> {
@@ -666,8 +685,9 @@ impl FileManager {
         Ok(())
     }
 
-    fn select_data_volume(&self) -> Result<&Arc<DataVolume>> {
+    fn select_data_volume(&self, expected_write_bytes: Option<u64>) -> Result<&Arc<DataVolume>> {
         let base_file_size = self.options.base_file_size as u64;
+        let expected_write_bytes = expected_write_bytes.unwrap_or(base_file_size);
         let mut selected: Option<&Arc<DataVolume>> = None;
         let mut candidates: Vec<&Arc<DataVolume>> = Vec::with_capacity(self.data_volumes.len());
         for volume in &self.data_volumes {
@@ -677,10 +697,10 @@ impl FileManager {
             if !candidates.is_empty() && volume.priority.rank() < candidates[0].priority.rank() {
                 break;
             }
-            if self.is_volume_write_stopped(volume) {
+            if self.is_volume_write_stopped(volume, expected_write_bytes) {
                 continue;
             }
-            if volume.is_full(base_file_size) {
+            if volume.is_full(base_file_size.max(expected_write_bytes)) {
                 continue;
             }
             candidates.push(volume);
@@ -981,7 +1001,7 @@ impl FileManager {
     /// later using `open_data_file_reader`.
     pub fn create_data_file(&self) -> Result<(FileId, TrackedWriter)> {
         let file_id = self.allocate_file_id();
-        let volume = self.select_data_volume()?;
+        let volume = self.select_data_volume(None)?;
         let writer = self.create_data_file_writer_on_volume(file_id, volume)?;
         Ok((file_id, writer))
     }
@@ -990,7 +1010,11 @@ impl FileManager {
     ///
     /// This is useful when recovering files or when the ID is known in advance.
     /// Returns an error if the file ID is already in use.
-    pub fn create_data_file_with_id(&self, file_id: FileId) -> Result<TrackedWriter> {
+    pub fn create_data_file_with_id(
+        &self,
+        file_id: FileId,
+        expected_write_bytes: Option<u64>,
+    ) -> Result<TrackedWriter> {
         if self.data_files.contains_key(&file_id) {
             return Err(Error::IoError(format!(
                 "File ID {} is already in use",
@@ -998,7 +1022,7 @@ impl FileManager {
             )));
         }
 
-        let volume = self.select_data_volume()?;
+        let volume = self.select_data_volume(expected_write_bytes)?;
         let writer = self.create_data_file_writer_on_volume(file_id, volume)?;
 
         // Update next_file_id if necessary
@@ -1107,6 +1131,7 @@ impl FileManager {
         &self,
         file_id: FileId,
         path: &str,
+        estimated_size_bytes: Option<u64>,
         resource_registry: Option<Arc<dyn RestoreCopyResourceRegistry + Send + Sync>>,
     ) -> Result<RestoredDataFileRegistration> {
         let (source_volume, source_relative_path) = self.resolve_volume_path(path)?;
@@ -1133,7 +1158,9 @@ impl FileManager {
         };
 
         let source_reader = source_volume.fs().open_read(&source_relative_path)?;
-        let mut writer = self.create_data_file_with_id(file_id)?;
+        let expected_write_bytes =
+            estimated_size_bytes.or_else(|| Some(source_reader.size() as u64));
+        let mut writer = self.create_data_file_with_id(file_id, expected_write_bytes)?;
         if let Err(err) = self.copy_reader_to_tracked_writer(source_reader.as_ref(), &mut writer) {
             let _ = self.remove_data_file(file_id);
             if let Some(snapshot_file_id) = snapshot_link_file_id {
@@ -1803,7 +1830,7 @@ pub(crate) mod tests {
         let (_fs, fm) = create_test_file_manager();
 
         // Create file with specific ID
-        let mut writer = fm.create_data_file_with_id(50).unwrap();
+        let mut writer = fm.create_data_file_with_id(50, None).unwrap();
         writer.write(b"data50").unwrap();
         writer.close().unwrap();
 
@@ -1811,7 +1838,7 @@ pub(crate) mod tests {
         assert_eq!(fm.peek_next_file_id(), 51);
 
         // Should fail if ID already exists
-        let result = fm.create_data_file_with_id(50);
+        let result = fm.create_data_file_with_id(50, None);
         assert!(result.is_err());
 
         cleanup_test_root();
@@ -2250,7 +2277,7 @@ pub(crate) mod tests {
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let source_full_path = format!("file://{}/{}", readonly_root, source_path);
         let restored = fm
-            .register_data_file_for_restore(42, &source_full_path, None)
+            .register_data_file_for_restore(42, &source_full_path, None, None)
             .unwrap();
         assert!(fm.is_data_file_on_primary_volume(42));
         let restored_reader = fm.open_data_file_reader(42).unwrap();
@@ -2297,7 +2324,7 @@ pub(crate) mod tests {
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let source_full_path = format!("file://{}/{}", snapshot_root, source_path);
         let restored = fm
-            .register_data_file_for_restore(66, &source_full_path, None)
+            .register_data_file_for_restore(66, &source_full_path, None, None)
             .unwrap();
         assert!(fm.is_data_file_on_primary_volume(66));
         let snapshot_link_file_id = restored
@@ -2332,7 +2359,7 @@ pub(crate) mod tests {
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let source_full_path = format!("file://{}/db/data/source.sst", shared_root);
         let restored = fm
-            .register_data_file_for_restore(88, &source_full_path, None)
+            .register_data_file_for_restore(88, &source_full_path, None, None)
             .unwrap();
         assert_eq!(restored.snapshot_link_file_id, Some(88));
         fm.remove_data_file(88).unwrap();
@@ -2380,7 +2407,7 @@ pub(crate) mod tests {
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let source_full_path = format!("file://{}/{}", readonly_root, source_path);
         let restored = fm
-            .register_data_file_for_restore(77, &source_full_path, None)
+            .register_data_file_for_restore(77, &source_full_path, None, None)
             .unwrap();
         assert!(fm.is_data_file_on_primary_volume(77));
         assert_eq!(restored.snapshot_link_file_id, None);
@@ -2415,7 +2442,7 @@ pub(crate) mod tests {
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let source_full_path = format!("file://{}/db/data/source.sst", primary_root);
         let restored = fm
-            .register_data_file_for_restore(120, &source_full_path, None)
+            .register_data_file_for_restore(120, &source_full_path, None, None)
             .unwrap();
         assert_eq!(restored.snapshot_link_file_id, None);
         fm.remove_data_file(120).unwrap();

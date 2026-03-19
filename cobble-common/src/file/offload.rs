@@ -4,6 +4,7 @@ use crate::config::PrimaryVolumeOffloadPolicyKind;
 use crate::file::{DataVolume, FileManager, TrackedFile, TrackedWriter};
 use dashmap::{DashMap, Entry};
 use log::warn;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
@@ -16,13 +17,44 @@ pub(crate) struct VolumePressure {
     pub(crate) size_limit: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PrimaryOffloadFileRef {
+    pub(crate) file_id: FileId,
+    pub(crate) size_bytes: u64,
+    pub(crate) priority: u8,
+}
+
 pub(crate) trait PrimaryOffloadPolicy: Send + Sync {
+    fn compare_file_refs(
+        &self,
+        left: &PrimaryOffloadFileRef,
+        right: &PrimaryOffloadFileRef,
+    ) -> Ordering;
+
+    fn sort_file_refs(&self, refs: &mut [PrimaryOffloadFileRef]) {
+        refs.sort_by(|left, right| self.compare_file_refs(left, right));
+    }
+
     fn select_candidate(
         &self,
         candidates: &[(FileId, Arc<TrackedFile>)],
-        source: &VolumePressure,
-        target: &VolumePressure,
-    ) -> Option<FileId>;
+        _source: &VolumePressure,
+        _target: &VolumePressure,
+    ) -> Option<FileId> {
+        let mut refs: Vec<PrimaryOffloadFileRef> = candidates
+            .iter()
+            .map(|candidate| PrimaryOffloadFileRef {
+                file_id: candidate.0,
+                size_bytes: candidate
+                    .1
+                    .size_bytes
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                priority: candidate.1.priority(),
+            })
+            .collect();
+        self.sort_file_refs(&mut refs);
+        refs.first().map(|item| item.file_id)
+    }
 }
 
 type OffloadJobFn = dyn Fn(FileId) + Send + Sync + 'static;
@@ -64,10 +96,7 @@ impl OffloadRuntime {
         data_volumes: &[Arc<DataVolume>],
         policy_kind: PrimaryVolumeOffloadPolicyKind,
     ) -> Self {
-        let policy: Arc<dyn PrimaryOffloadPolicy> = match policy_kind {
-            PrimaryVolumeOffloadPolicyKind::LargestFile => Arc::new(LargestFileOffloadPolicy),
-            PrimaryVolumeOffloadPolicyKind::Priority => Arc::new(PriorityOffloadPolicy),
-        };
+        let policy = policy_from_kind_arc(policy_kind);
         Self::new_with_policy(data_volumes, policy)
     }
 
@@ -243,27 +272,51 @@ impl OffloadRuntime {
     }
 }
 
+// ----------------------------
+// Offload policies
+// ----------------------------
+static LARGEST_FILE_OFFLOAD_POLICY: LargestFileOffloadPolicy = LargestFileOffloadPolicy;
+static PRIORITY_OFFLOAD_POLICY: PriorityOffloadPolicy = PriorityOffloadPolicy;
+
+fn policy_from_kind_arc(
+    policy_kind: PrimaryVolumeOffloadPolicyKind,
+) -> Arc<dyn PrimaryOffloadPolicy> {
+    match policy_kind {
+        PrimaryVolumeOffloadPolicyKind::LargestFile => Arc::new(LargestFileOffloadPolicy),
+        PrimaryVolumeOffloadPolicyKind::Priority => Arc::new(PriorityOffloadPolicy),
+    }
+}
+
+fn policy_from_kind_ref(
+    policy_kind: PrimaryVolumeOffloadPolicyKind,
+) -> &'static dyn PrimaryOffloadPolicy {
+    match policy_kind {
+        PrimaryVolumeOffloadPolicyKind::LargestFile => &LARGEST_FILE_OFFLOAD_POLICY,
+        PrimaryVolumeOffloadPolicyKind::Priority => &PRIORITY_OFFLOAD_POLICY,
+    }
+}
+
+pub(crate) fn compare_primary_offload_file_refs(
+    policy_kind: PrimaryVolumeOffloadPolicyKind,
+    left: &PrimaryOffloadFileRef,
+    right: &PrimaryOffloadFileRef,
+) -> Ordering {
+    policy_from_kind_ref(policy_kind).compare_file_refs(left, right)
+}
+
 #[derive(Default)]
 pub(crate) struct LargestFileOffloadPolicy;
 
 impl PrimaryOffloadPolicy for LargestFileOffloadPolicy {
-    fn select_candidate(
+    fn compare_file_refs(
         &self,
-        candidates: &[(FileId, Arc<TrackedFile>)],
-        _source: &VolumePressure,
-        _target: &VolumePressure,
-    ) -> Option<FileId> {
-        candidates
-            .iter()
-            .max_by(|left, right| {
-                let left_size = left.1.size_bytes.load(std::sync::atomic::Ordering::SeqCst);
-                let right_size = right.1.size_bytes.load(std::sync::atomic::Ordering::SeqCst);
-                match left_size.cmp(&right_size) {
-                    std::cmp::Ordering::Equal => right.0.cmp(&left.0),
-                    ord => ord,
-                }
-            })
-            .map(|candidate| candidate.0)
+        left: &PrimaryOffloadFileRef,
+        right: &PrimaryOffloadFileRef,
+    ) -> Ordering {
+        right
+            .size_bytes
+            .cmp(&left.size_bytes)
+            .then_with(|| left.file_id.cmp(&right.file_id))
     }
 }
 
@@ -271,31 +324,21 @@ impl PrimaryOffloadPolicy for LargestFileOffloadPolicy {
 pub(crate) struct PriorityOffloadPolicy;
 
 impl PrimaryOffloadPolicy for PriorityOffloadPolicy {
-    fn select_candidate(
+    fn compare_file_refs(
         &self,
-        candidates: &[(FileId, Arc<TrackedFile>)],
-        _source: &VolumePressure,
-        _target: &VolumePressure,
-    ) -> Option<FileId> {
-        candidates
-            .iter()
-            .min_by(|left, right| {
-                let left_priority = left.1.priority();
-                let right_priority = right.1.priority();
-                left_priority
-                    .cmp(&right_priority)
-                    .then_with(|| {
-                        let left_size = left.1.size_bytes.load(std::sync::atomic::Ordering::SeqCst);
-                        let right_size =
-                            right.1.size_bytes.load(std::sync::atomic::Ordering::SeqCst);
-                        right_size.cmp(&left_size)
-                    })
-                    .then_with(|| left.0.cmp(&right.0))
-            })
-            .map(|candidate| candidate.0)
+        left: &PrimaryOffloadFileRef,
+        right: &PrimaryOffloadFileRef,
+    ) -> Ordering {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| right.size_bytes.cmp(&left.size_bytes))
+            .then_with(|| left.file_id.cmp(&right.file_id))
     }
 }
 
+// ----------------------------
+// File Manager offload logic
+// ----------------------------
 impl FileManager {
     fn create_untracked_data_file_writer_on_volume(
         &self,

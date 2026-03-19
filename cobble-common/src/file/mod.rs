@@ -35,5 +35,6 @@ pub use self::files::{
 };
 #[allow(unused_imports)]
 pub(crate) use self::offload::{
-    LargestFileOffloadPolicy, OffloadRuntime, PrimaryOffloadPolicy, VolumePressure,
+    LargestFileOffloadPolicy, OffloadRuntime, PrimaryOffloadFileRef, PrimaryOffloadPolicy,
+    VolumePressure, compare_primary_offload_file_refs,
 };

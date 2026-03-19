@@ -1,9 +1,13 @@
 use super::Db;
 use crate::Config;
+use crate::config::PrimaryVolumeOffloadPolicyKind;
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
-use crate::file::{FileManager, RestoreCopyResourceRegistry, TrackedFileId};
+use crate::file::{
+    FileManager, PrimaryOffloadFileRef, RestoreCopyResourceRegistry, TrackedFileId,
+    VLOG_FILE_PRIORITY, compare_primary_offload_file_refs, lsm_file_priority_for_level,
+};
 use crate::lsm::LSMTreeVersion;
 use crate::merge_operator::MergeOperatorResolver;
 use crate::metrics_manager::MetricsManager;
@@ -11,10 +15,9 @@ use crate::metrics_registry;
 use crate::snapshot::{
     ManifestSnapshot, build_tree_versions_from_manifest, build_vlog_version_from_manifest,
     list_snapshot_manifest_ids, load_manifest_entry, load_manifest_for_snapshot,
-    manifest_data_file_refs,
 };
 use crate::util::init_logging;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Builder;
@@ -71,11 +74,14 @@ fn prepare_manifest_data_files_for_restore(
     file_manager: &Arc<FileManager>,
     manifest: &ManifestSnapshot,
 ) -> Result<HashMap<u64, Option<u64>>> {
-    let refs: Vec<(u64, String)> = manifest_data_file_refs(manifest).collect();
+    let refs = ordered_manifest_data_file_refs_for_restore(
+        manifest,
+        file_manager.options.primary_volume_offload_policy,
+    );
     if refs.is_empty() {
         return Ok(HashMap::new());
     }
-    if let Some(max_file_id) = refs.iter().map(|(file_id, _)| *file_id).max() {
+    if let Some(max_file_id) = refs.iter().map(|item| item.file_id).max() {
         let min_next_file_id = max_file_id.saturating_add(1);
         if file_manager.peek_next_file_id() < min_next_file_id {
             file_manager.set_next_file_id(min_next_file_id);
@@ -95,7 +101,12 @@ fn prepare_manifest_data_files_for_restore(
             .enable_all()
             .build()
             .map_err(|err| Error::IoError(format!("Failed to build restore runtime: {}", err)))?;
-        runtime.block_on(run_restore_prepare_jobs(file_manager, refs, registry))
+        runtime.block_on(run_restore_prepare_jobs(
+            file_manager,
+            refs,
+            registry,
+            worker_threads.max(1),
+        ))
     })
     .join()
     .map_err(|_| Error::IoError("Restore worker thread panicked".to_string()))??;
@@ -105,26 +116,105 @@ fn prepare_manifest_data_files_for_restore(
 
 async fn run_restore_prepare_jobs(
     file_manager: Arc<FileManager>,
-    refs: Vec<(u64, String)>,
+    refs: Vec<RestoreFileRef>,
     registry: Arc<dyn RestoreCopyResourceRegistry + Send + Sync>,
+    worker_count: usize,
 ) -> Result<HashMap<u64, Option<u64>>> {
+    let worker_count = worker_count.max(1);
+    let queue = Arc::new(Mutex::new(VecDeque::from(refs)));
     let mut join_set = JoinSet::new();
-    for (file_id, path) in refs {
+    for _ in 0..worker_count {
         let file_manager = Arc::clone(&file_manager);
+        let queue = Arc::clone(&queue);
         let registry = Arc::clone(&registry);
-        join_set.spawn_blocking(move || {
-            file_manager
-                .register_data_file_for_restore(file_id, &path, Some(registry))
-                .map(|restored| (file_id, restored.snapshot_link_file_id))
+        join_set.spawn_blocking(move || -> Result<Vec<(u64, Option<u64>)>> {
+            let mut completed = Vec::new();
+            loop {
+                let next = {
+                    let mut guard = queue.lock().unwrap();
+                    guard.pop_front()
+                };
+                let Some(file) = next else {
+                    break;
+                };
+                let restored = file_manager.register_data_file_for_restore(
+                    file.file_id,
+                    &file.path,
+                    Some(file.size_bytes),
+                    Some(Arc::clone(&registry)),
+                )?;
+                completed.push((file.file_id, restored.snapshot_link_file_id));
+            }
+            Ok(completed)
         });
     }
     let mut links = HashMap::new();
     while let Some(joined) = join_set.join_next().await {
-        let (file_id, snapshot_link_file_id) = joined
+        let completed = joined
             .map_err(|err| Error::IoError(format!("Restore worker join failed: {}", err)))??;
-        links.insert(file_id, snapshot_link_file_id);
+        for (file_id, snapshot_link_file_id) in completed {
+            links.insert(file_id, snapshot_link_file_id);
+        }
     }
     Ok(links)
+}
+
+#[derive(Clone, Debug)]
+struct RestoreFileRef {
+    file_id: u64,
+    path: String,
+    size_bytes: u64,
+    priority: u8,
+}
+
+fn ordered_manifest_data_file_refs_for_restore(
+    manifest: &ManifestSnapshot,
+    policy: PrimaryVolumeOffloadPolicyKind,
+) -> Vec<RestoreFileRef> {
+    let mut refs: HashMap<u64, RestoreFileRef> = HashMap::new();
+    for tree_levels in &manifest.tree_levels {
+        for level in tree_levels {
+            let level_priority = lsm_file_priority_for_level(level.ordinal);
+            for file in &level.files {
+                let entry = refs.entry(file.file_id).or_insert_with(|| RestoreFileRef {
+                    file_id: file.file_id,
+                    path: file.path.clone(),
+                    size_bytes: file.size as u64,
+                    priority: level_priority,
+                });
+                if file.size as u64 > entry.size_bytes {
+                    entry.size_bytes = file.size as u64;
+                }
+                if level_priority < entry.priority {
+                    entry.priority = level_priority;
+                }
+            }
+        }
+    }
+    for file in &manifest.vlog_files {
+        let entry = refs.entry(file.file_id).or_insert_with(|| RestoreFileRef {
+            file_id: file.file_id,
+            path: file.path.clone(),
+            size_bytes: 0,
+            priority: VLOG_FILE_PRIORITY,
+        });
+        entry.priority = entry.priority.min(VLOG_FILE_PRIORITY);
+    }
+    let mut ordered: Vec<RestoreFileRef> = refs.into_values().collect();
+    ordered.sort_by(|left, right| {
+        let left_ref = PrimaryOffloadFileRef {
+            file_id: left.file_id,
+            size_bytes: left.size_bytes,
+            priority: left.priority,
+        };
+        let right_ref = PrimaryOffloadFileRef {
+            file_id: right.file_id,
+            size_bytes: right.size_bytes,
+            priority: right.priority,
+        };
+        compare_primary_offload_file_refs(policy, &left_ref, &right_ref)
+    });
+    ordered
 }
 
 fn apply_restore_snapshot_links(
@@ -359,5 +449,94 @@ impl Db {
         db.memtable_manager.open()?;
         db.db_lifecycle.mark_open()?;
         Ok(db)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(refs: Vec<RestoreFileRef>) -> Vec<u64> {
+        refs.into_iter().map(|item| item.file_id).collect()
+    }
+
+    #[test]
+    fn restore_ref_order_priority_policy() {
+        let mut refs = vec![
+            RestoreFileRef {
+                file_id: 3,
+                path: "a".to_string(),
+                size_bytes: 100,
+                priority: 10,
+            },
+            RestoreFileRef {
+                file_id: 1,
+                path: "b".to_string(),
+                size_bytes: 200,
+                priority: 2,
+            },
+            RestoreFileRef {
+                file_id: 2,
+                path: "c".to_string(),
+                size_bytes: 50,
+                priority: 2,
+            },
+        ];
+        refs.sort_by(|left, right| {
+            compare_primary_offload_file_refs(
+                PrimaryVolumeOffloadPolicyKind::Priority,
+                &PrimaryOffloadFileRef {
+                    file_id: left.file_id,
+                    size_bytes: left.size_bytes,
+                    priority: left.priority,
+                },
+                &PrimaryOffloadFileRef {
+                    file_id: right.file_id,
+                    size_bytes: right.size_bytes,
+                    priority: right.priority,
+                },
+            )
+        });
+        assert_eq!(ids(refs), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn restore_ref_order_largest_file_policy() {
+        let mut refs = vec![
+            RestoreFileRef {
+                file_id: 3,
+                path: "a".to_string(),
+                size_bytes: 100,
+                priority: 10,
+            },
+            RestoreFileRef {
+                file_id: 1,
+                path: "b".to_string(),
+                size_bytes: 200,
+                priority: 2,
+            },
+            RestoreFileRef {
+                file_id: 2,
+                path: "c".to_string(),
+                size_bytes: 200,
+                priority: 8,
+            },
+        ];
+        refs.sort_by(|left, right| {
+            compare_primary_offload_file_refs(
+                PrimaryVolumeOffloadPolicyKind::LargestFile,
+                &PrimaryOffloadFileRef {
+                    file_id: left.file_id,
+                    size_bytes: left.size_bytes,
+                    priority: left.priority,
+                },
+                &PrimaryOffloadFileRef {
+                    file_id: right.file_id,
+                    size_bytes: right.size_bytes,
+                    priority: right.priority,
+                },
+            )
+        });
+        assert_eq!(ids(refs), vec![1, 2, 3]);
     }
 }
