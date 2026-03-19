@@ -323,7 +323,7 @@ impl Db {
             multi_lsm_version,
             vlog_version,
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: can_incremental_base.then_some(snapshot_id),
         });
         let db = Self::open_with_state(
@@ -429,7 +429,7 @@ impl Db {
             multi_lsm_version,
             vlog_version,
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: can_incremental_base.then_some(latest.snapshot_id),
         });
         let db = Self::open_with_state(

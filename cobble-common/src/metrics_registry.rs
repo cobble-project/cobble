@@ -76,12 +76,8 @@ impl HistogramState {
             self.min = value;
             self.max = value;
         } else {
-            if value < self.min {
-                self.min = value;
-            }
-            if value > self.max {
-                self.max = value;
-            }
+            self.min = self.min.min(value);
+            self.max = self.max.max(value);
         }
     }
 
@@ -173,24 +169,10 @@ impl MetricEntry {
 }
 
 impl MetricStore {
-    fn register_counter(&self, key: &Key) -> Arc<MetricEntry> {
+    fn register(&self, key: &Key, factory: fn() -> MetricEntry) -> Arc<MetricEntry> {
         self.entries
             .entry(key.clone())
-            .or_insert_with(|| Arc::new(MetricEntry::counter()))
-            .clone()
-    }
-
-    fn register_gauge(&self, key: &Key) -> Arc<MetricEntry> {
-        self.entries
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(MetricEntry::gauge()))
-            .clone()
-    }
-
-    fn register_histogram(&self, key: &Key) -> Arc<MetricEntry> {
-        self.entries
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(MetricEntry::histogram()))
+            .or_insert_with(|| Arc::new(factory()))
             .clone()
     }
 }
@@ -261,17 +243,17 @@ impl Recorder for MetricsRecorder {
     }
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
-        let entry = self.store.register_counter(key);
+        let entry = self.store.register(key, MetricEntry::counter);
         Counter::from_arc(Arc::new(CounterHandle { entry }))
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-        let entry = self.store.register_gauge(key);
+        let entry = self.store.register(key, MetricEntry::gauge);
         Gauge::from_arc(Arc::new(GaugeHandle { entry }))
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
-        let entry = self.store.register_histogram(key);
+        let entry = self.store.register(key, MetricEntry::histogram);
         Histogram::from_arc(Arc::new(HistogramHandle { entry }))
     }
 }

@@ -675,6 +675,13 @@ impl LSMTree {
         Arc::clone(&self.ttl_provider)
     }
 
+    /// Evaluate whether a compaction task should be scheduled for a tree.
+    ///
+    /// Compaction trigger: checks the target tree's version for L0 overflow
+    /// or level-size pressure, consults the compaction policy for file
+    /// selection, and submits the task to the compaction worker. Also checks
+    /// for auto-split conditions (contaminated files or size trigger) and
+    /// performs tree splitting before scheduling compaction on split trees.
     fn maybe_trigger_compaction_locked(&self, state: &mut LSMTreeState, tree_idx: usize) {
         if self.db_lifecycle.ensure_open().is_err() {
             return;
@@ -1096,6 +1103,7 @@ mod tests {
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::{Column, Key, Value, ValueType};
     use crate::vlog::VlogVersion;
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     static mut FILE_ID_COUNTER: FileId = 0;
@@ -1105,21 +1113,16 @@ mod tests {
             let id = FILE_ID_COUNTER;
             FILE_ID_COUNTER += 1;
             let bucket_range = DataFile::bucket_range_from_keys(start, end);
-            Arc::new(DataFile {
-                file_type: DataFileType::SSTable,
-                start_key: start.to_vec(),
-                end_key: end.to_vec(),
-                file_id: id,
-                tracked_id: TrackedFileId::detached(id),
-                schema_id: 0,
-                size: 0, // Test file, size doesn't matter
-                bucket_range: bucket_range.clone(),
-                effective_bucket_range: bucket_range,
-                vlog_file_seq_offset: 0,
-                has_separated_values: false,
-                snapshot_data_file: Default::default(),
-                meta_bytes: Default::default(),
-            })
+            Arc::new(DataFile::new_detached(
+                DataFileType::SSTable,
+                start.to_vec(),
+                end.to_vec(),
+                id,
+                0,
+                0,
+                bucket_range.clone(),
+                bucket_range,
+            ))
         }
     }
 
@@ -1128,21 +1131,16 @@ mod tests {
             let id = FILE_ID_COUNTER;
             FILE_ID_COUNTER += 1;
             let bucket_range = DataFile::bucket_range_from_keys(start, end);
-            Arc::new(DataFile {
-                file_type: DataFileType::SSTable,
-                start_key: start.to_vec(),
-                end_key: end.to_vec(),
-                file_id: id,
-                tracked_id: TrackedFileId::detached(id),
-                schema_id: 0,
+            Arc::new(DataFile::new_detached(
+                DataFileType::SSTable,
+                start.to_vec(),
+                end.to_vec(),
+                id,
+                0,
                 size,
-                bucket_range: bucket_range.clone(),
-                effective_bucket_range: bucket_range,
-                vlog_file_seq_offset: 0,
-                has_separated_values: false,
-                snapshot_data_file: Default::default(),
-                meta_bytes: Default::default(),
-            })
+                bucket_range.clone(),
+                bucket_range,
+            ))
         }
     }
 
@@ -1186,21 +1184,17 @@ mod tests {
         }
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
-        let data_file = DataFile {
-            file_type: DataFileType::SSTable,
-            start_key: first_key,
-            end_key: last_key,
+        let data_file = DataFile::new(
+            DataFileType::SSTable,
+            first_key,
+            last_key,
             file_id,
-            tracked_id: TrackedFileId::new(file_manager, file_id),
-            schema_id: 0,
-            size: file_size,
-            bucket_range: bucket_range.clone(),
-            effective_bucket_range: bucket_range,
-            vlog_file_seq_offset: 0,
-            has_separated_values: false,
-            snapshot_data_file: Default::default(),
-            meta_bytes: Default::default(),
-        };
+            TrackedFileId::new(file_manager, file_id),
+            0,
+            file_size,
+            bucket_range.clone(),
+            bucket_range,
+        );
         data_file.set_meta_bytes(footer_bytes);
         Ok(Arc::new(data_file))
     }
@@ -1254,7 +1248,7 @@ mod tests {
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -1338,7 +1332,7 @@ mod tests {
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
@@ -1418,7 +1412,7 @@ mod tests {
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = Arc::new(LSMTree::with_state(
@@ -1523,7 +1517,7 @@ mod tests {
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
@@ -1625,7 +1619,7 @@ mod tests {
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -1681,7 +1675,7 @@ mod tests {
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -1763,7 +1757,7 @@ mod tests {
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -1805,7 +1799,7 @@ mod tests {
             multi_lsm_version: initial_multi,
             vlog_version: VlogVersion::new(),
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -1828,7 +1822,7 @@ mod tests {
             multi_lsm_version: shifted_multi,
             vlog_version: VlogVersion::new(),
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: None,
         });
 
@@ -1858,7 +1852,7 @@ mod tests {
             multi_lsm_version: initial_multi,
             vlog_version: VlogVersion::new(),
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -1911,7 +1905,7 @@ mod tests {
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);

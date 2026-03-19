@@ -4,10 +4,12 @@ use foyer::{
     HybridCacheBuilder, PsyncIoEngineConfig,
 };
 use log::warn;
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub trait CacheHandle<K, V>: Send + Sync {
     fn get(&self, key: &K) -> Option<V>;
@@ -172,9 +174,9 @@ where
 
 #[derive(Clone)]
 pub struct MockCache<K, V> {
-    values: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<K, V>>>,
-    get_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    insert_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    values: Arc<Mutex<HashMap<K, V>>>,
+    get_count: Arc<AtomicUsize>,
+    insert_count: Arc<AtomicUsize>,
 }
 
 impl<K, V> MockCache<K, V>
@@ -184,18 +186,18 @@ where
 {
     pub fn new() -> Self {
         Self {
-            values: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            get_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            insert_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            values: Arc::new(Mutex::new(HashMap::new())),
+            get_count: Arc::new(AtomicUsize::new(0)),
+            insert_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub fn get_count(&self) -> usize {
-        self.get_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.get_count.load(Ordering::Relaxed)
     }
 
     pub fn insert_count(&self) -> usize {
-        self.insert_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.insert_count.load(Ordering::Relaxed)
     }
 }
 
@@ -205,14 +207,12 @@ where
     V: Clone + Send + Sync + 'static,
 {
     fn get(&self, key: &K) -> Option<V> {
-        self.get_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.get_count.fetch_add(1, Ordering::Relaxed);
         self.values.lock().unwrap().get(key).cloned()
     }
 
     fn insert(&self, key: K, value: V) {
-        self.insert_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.insert_count.fetch_add(1, Ordering::Relaxed);
         self.values.lock().unwrap().insert(key, value);
     }
 }

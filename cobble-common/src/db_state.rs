@@ -228,6 +228,10 @@ impl MultiLSMTreeVersion {
     }
 }
 
+/// Immutable snapshot of the entire database state at a point in time.
+/// Swapped atomically via ArcSwap in DbStateHandle so readers see a
+/// consistent view without locking. Each mutation (flush, compaction,
+/// split) produces a new DbState and publishes it via CAS.
 pub(crate) struct DbState {
     pub(crate) seq_id: u64,
     pub(crate) bucket_ranges: Vec<RangeInclusive<u16>>,
@@ -239,6 +243,9 @@ pub(crate) struct DbState {
     pub(crate) suggested_base_snapshot_id: Option<u64>,
 }
 
+/// Thread-safe handle for reading and mutating DbState.
+/// Uses ArcSwap for lock-free reads (`load()`) and a Mutex for
+/// serializing state mutations (flush apply, compaction apply, split).
 pub(crate) struct DbStateHandle {
     current: ArcSwap<DbState>,
     lock: Mutex<()>,

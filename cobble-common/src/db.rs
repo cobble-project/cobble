@@ -369,6 +369,11 @@ impl Db {
     }
 
     /// Write a batch of operations to the database.
+    ///
+    /// Write path: merges batch entries by (bucket, key) into consolidated
+    /// Values, then writes each merged entry to the active memtable via
+    /// put_ref. The memtable manager handles flush-to-L0 when the memtable
+    /// is full, separated value extraction to VLOG, and schema validation.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.ensure_open()?;
         let mut pending: std::collections::BTreeMap<(u16, Bytes), Value> =
@@ -512,6 +517,12 @@ impl Db {
         ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id)
     }
 
+    /// Initialize the Db runtime from a pre-loaded DbState.
+    ///
+    /// Sets up all runtime components: TTL provider, LSM tree with block
+    /// cache and multi-LSM bucket mapping, compaction worker (local or
+    /// remote), VLOG store, snapshot manager, and memtable manager with
+    /// flush/reclaim workers. Called by both fresh open and restore paths.
     #[allow(clippy::too_many_arguments)]
     fn open_with_state(
         config: Config,
@@ -693,6 +704,12 @@ impl Db {
     }
 
     /// Lookup a key in a bucket across the memtable and LSM levels.
+    ///
+    /// Read path: snapshot DbState for consistent view → search active
+    /// and immutable memtables → probe LSM levels L0..Ln via block cache →
+    /// merge column values across levels using per-column MergeOperator →
+    /// resolve VLOG pointers for separated values → apply TTL expiration
+    /// and schema evolution when SST schema differs from current.
     pub fn get(
         &self,
         bucket: u16,

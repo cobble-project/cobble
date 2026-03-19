@@ -552,41 +552,25 @@ pub(crate) fn manifest_data_file_refs(
 pub(crate) fn build_tree_versions_from_manifest_untracked(
     manifest: &ManifestSnapshot,
 ) -> Result<Vec<LSMTreeVersion>> {
-    let mut tree_versions = Vec::with_capacity(manifest.tree_levels.len());
-    for levels in &manifest.tree_levels {
-        let mut out_levels = Vec::with_capacity(levels.len());
-        for level in levels {
-            let mut files = Vec::with_capacity(level.files.len());
-            for file in &level.files {
-                let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
-                let start_key = from_hex(&file.start_key)?;
-                let end_key = from_hex(&file.end_key)?;
-                files.push(Arc::new(DataFile {
-                    file_type,
-                    start_key,
-                    end_key,
-                    file_id: file.file_id,
-                    tracked_id: TrackedFileId::detached(file.file_id),
-                    schema_id: file.schema_id,
-                    size: file.size,
-                    bucket_range: file.bucket_range_start..=file.bucket_range_end,
-                    effective_bucket_range: file.effective_bucket_range_start
-                        ..=file.effective_bucket_range_end,
-                    vlog_file_seq_offset: file.vlog_file_seq_offset,
-                    has_separated_values: file.has_separated_values,
-                    snapshot_data_file: Default::default(),
-                    meta_bytes: Default::default(),
-                }));
-            }
-            out_levels.push(Level {
-                ordinal: level.ordinal,
-                tiered: level.tiered,
-                files,
-            });
-        }
-        tree_versions.push(LSMTreeVersion { levels: out_levels });
-    }
-    Ok(tree_versions)
+    build_tree_versions_internal(manifest, |file, _ordinal| {
+        let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
+        let start_key = from_hex(&file.start_key)?;
+        let end_key = from_hex(&file.end_key)?;
+        Ok(Arc::new(
+            DataFile::new_detached(
+                file_type,
+                start_key,
+                end_key,
+                file.file_id,
+                file.schema_id,
+                file.size,
+                file.bucket_range_start..=file.bucket_range_end,
+                file.effective_bucket_range_start..=file.effective_bucket_range_end,
+            )
+            .with_vlog_offset(file.vlog_file_seq_offset)
+            .with_separated_values(file.has_separated_values),
+        ))
+    })
 }
 
 pub(crate) fn build_vlog_version_from_manifest_untracked(
@@ -611,58 +595,56 @@ pub(crate) fn build_tree_versions_from_manifest(
     manifest: &ManifestSnapshot,
     read_only: bool,
 ) -> Result<Vec<LSMTreeVersion>> {
+    build_tree_versions_internal(manifest, |file, ordinal| {
+        let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
+        let start_key = from_hex(&file.start_key)?;
+        let end_key = from_hex(&file.end_key)?;
+        let tracked_id = if read_only {
+            file_manager.register_data_file_readonly(file.file_id, &file.path)?;
+            file_manager
+                .set_data_file_priority(file.file_id, lsm_file_priority_for_level(ordinal))?;
+            TrackedFileId::detached(file.file_id)
+        } else {
+            if !file_manager.has_data_file(file.file_id) {
+                return Err(Error::IoError(format!(
+                    "Restored file {} is not tracked by FileManager",
+                    file.file_id
+                )));
+            }
+            file_manager
+                .set_data_file_priority(file.file_id, lsm_file_priority_for_level(ordinal))?;
+            TrackedFileId::new(file_manager, file.file_id)
+        };
+        let data_file = DataFile::new(
+            file_type,
+            start_key,
+            end_key,
+            file.file_id,
+            tracked_id,
+            file.schema_id,
+            file.size,
+            file.bucket_range_start..=file.bucket_range_end,
+            file.effective_bucket_range_start..=file.effective_bucket_range_end,
+        )
+        .with_vlog_offset(file.vlog_file_seq_offset)
+        .with_separated_values(file.has_separated_values);
+        Ok(Arc::new(data_file))
+    })
+}
+
+/// Shared tree-version builder: iterates manifest levels and delegates
+/// per-file DataFile construction to the provided closure.
+fn build_tree_versions_internal(
+    manifest: &ManifestSnapshot,
+    build_file: impl Fn(&ManifestFile, u8) -> Result<Arc<DataFile>>,
+) -> Result<Vec<LSMTreeVersion>> {
     let mut tree_versions = Vec::with_capacity(manifest.tree_levels.len());
     for levels in &manifest.tree_levels {
         let mut out_levels = Vec::with_capacity(levels.len());
         for level in levels {
             let mut files = Vec::with_capacity(level.files.len());
             for file in &level.files {
-                let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
-                let start_key = from_hex(&file.start_key)?;
-                let end_key = from_hex(&file.end_key)?;
-                let (tracked_id, snapshot_data_file_id) = if read_only {
-                    file_manager.register_data_file_readonly(file.file_id, &file.path)?;
-                    file_manager.set_data_file_priority(
-                        file.file_id,
-                        lsm_file_priority_for_level(level.ordinal),
-                    )?;
-                    (TrackedFileId::detached(file.file_id), None)
-                } else {
-                    if !file_manager.has_data_file(file.file_id) {
-                        return Err(Error::IoError(format!(
-                            "Restored file {} is not tracked by FileManager",
-                            file.file_id
-                        )));
-                    }
-                    file_manager.set_data_file_priority(
-                        file.file_id,
-                        lsm_file_priority_for_level(level.ordinal),
-                    )?;
-                    (TrackedFileId::new(file_manager, file.file_id), None)
-                };
-                let data_file = DataFile {
-                    file_type,
-                    start_key,
-                    end_key,
-                    file_id: file.file_id,
-                    tracked_id,
-                    schema_id: file.schema_id,
-                    size: file.size,
-                    bucket_range: file.bucket_range_start..=file.bucket_range_end,
-                    effective_bucket_range: file.effective_bucket_range_start
-                        ..=file.effective_bucket_range_end,
-                    vlog_file_seq_offset: file.vlog_file_seq_offset,
-                    has_separated_values: file.has_separated_values,
-                    snapshot_data_file: Default::default(),
-                    meta_bytes: Default::default(),
-                };
-                if !read_only && let Some(snapshot_data_file_id) = snapshot_data_file_id {
-                    data_file.set_snapshot_data_file(TrackedFileId::new(
-                        file_manager,
-                        snapshot_data_file_id,
-                    ));
-                }
-                files.push(Arc::new(data_file));
+                files.push(build_file(file, level.ordinal)?);
             }
             out_levels.push(Level {
                 ordinal: level.ordinal,

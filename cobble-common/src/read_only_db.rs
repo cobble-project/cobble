@@ -18,6 +18,7 @@ use crate::r#type::{RefKey, Value};
 use crate::vlog::VlogStore;
 use crate::{Config, ReadOptions, ScanOptions};
 use bytes::Bytes;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -117,7 +118,7 @@ impl ReadOnlyDb {
             multi_lsm_version,
             vlog_version,
             active: None,
-            immutables: Vec::new().into(),
+            immutables: VecDeque::new(),
             suggested_base_snapshot_id: Some(snapshot_id),
         });
         let mut lsm_tree = LSMTree::with_state_and_ttl(

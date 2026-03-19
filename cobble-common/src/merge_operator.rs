@@ -91,56 +91,68 @@ pub(crate) fn merge_operator_by_id(
     resolver: Option<&Arc<dyn MergeOperatorResolver>>,
 ) -> Result<Arc<dyn MergeOperator>> {
     if id == BytesMergeOperator.id().as_str() {
-        Ok(Arc::new(BytesMergeOperator))
-    } else if id == U32CounterMergeOperator.id().as_str() {
-        Ok(Arc::new(U32CounterMergeOperator))
-    } else if id == U64CounterMergeOperator.id().as_str() {
-        Ok(Arc::new(U64CounterMergeOperator))
-    } else {
-        if let Some(resolver) = resolver
-            && let Some(operator) = resolver.resolve(id, metadata)
-        {
-            return Ok(operator);
-        }
-        Err(Error::FileFormatError(format!(
-            "Unknown merge operator id '{}' and no resolver could resolve it",
-            id
-        )))
+        return Ok(Arc::new(BytesMergeOperator));
+    }
+    if id == U32CounterMergeOperator.id().as_str() {
+        return Ok(Arc::new(U32CounterMergeOperator));
+    }
+    if id == U64CounterMergeOperator.id().as_str() {
+        return Ok(Arc::new(U64CounterMergeOperator));
+    }
+    if let Some(resolver) = resolver
+        && let Some(operator) = resolver.resolve(id, metadata)
+    {
+        return Ok(operator);
+    }
+    Err(Error::FileFormatError(format!(
+        "Unknown merge operator id '{}' and no resolver could resolve it",
+        id
+    )))
+}
+
+fn decode_counter<T, const N: usize>(value: &Bytes, type_name: &str, label: &str) -> Result<T>
+where
+    T: Default + From<[u8; N]>,
+{
+    if value.is_empty() {
+        return Ok(T::default());
+    }
+    if value.len() != N {
+        return Err(Error::InputError(format!(
+            "{} expects {} bytes for {}, got {}",
+            type_name,
+            N,
+            label,
+            value.len()
+        )));
+    }
+    let bytes: [u8; N] = value.as_ref().try_into().expect("length checked");
+    Ok(T::from(bytes))
+}
+
+/// Wrapper type so we can implement From<[u8; 4]> for counter decoding.
+#[derive(Default)]
+struct LeU32(u32);
+impl From<[u8; 4]> for LeU32 {
+    fn from(bytes: [u8; 4]) -> Self {
+        Self(u32::from_le_bytes(bytes))
+    }
+}
+
+#[derive(Default)]
+struct LeU64(u64);
+impl From<[u8; 8]> for LeU64 {
+    fn from(bytes: [u8; 8]) -> Self {
+        Self(u64::from_le_bytes(bytes))
     }
 }
 
 fn decode_u32_counter(value: &Bytes, label: &str) -> Result<u32> {
-    if value.is_empty() {
-        return Ok(0);
-    }
-    if value.len() != std::mem::size_of::<u32>() {
-        return Err(Error::InputError(format!(
-            "U32CounterMergeOperator expects {} bytes for {}, got {}",
-            std::mem::size_of::<u32>(),
-            label,
-            value.len()
-        )));
-    }
-    let bytes: [u8; std::mem::size_of::<u32>()] =
-        value.as_ref().try_into().expect("length checked");
-    Ok(u32::from_le_bytes(bytes))
+    decode_counter::<LeU32, 4>(value, "U32CounterMergeOperator", label).map(|v| v.0)
 }
 
 fn decode_u64_counter(value: &Bytes, label: &str) -> Result<u64> {
-    if value.is_empty() {
-        return Ok(0);
-    }
-    if value.len() != std::mem::size_of::<u64>() {
-        return Err(Error::InputError(format!(
-            "U64CounterMergeOperator expects {} bytes for {}, got {}",
-            std::mem::size_of::<u64>(),
-            label,
-            value.len()
-        )));
-    }
-    let bytes: [u8; std::mem::size_of::<u64>()] =
-        value.as_ref().try_into().expect("length checked");
-    Ok(u64::from_le_bytes(bytes))
+    decode_counter::<LeU64, 8>(value, "U64CounterMergeOperator", label).map(|v| v.0)
 }
 
 impl MergeOperator for BytesMergeOperator {

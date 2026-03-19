@@ -430,23 +430,22 @@ impl CompactionExecutor {
                         task.output_level, file_id, file_size
                     );
 
-                    let data_file = DataFile {
-                        file_type: task.data_file_type,
-                        start_key: first_key,
-                        end_key: last_key,
+                    let data_file = DataFile::new(
+                        task.data_file_type,
+                        first_key,
+                        last_key,
                         file_id,
-                        tracked_id: TrackedFileId::new(&task.file_manager, file_id),
-                        schema_id: target_schema.version(),
-                        size: file_size,
-                        bucket_range: bucket_range.clone(),
-                        effective_bucket_range: bucket_range,
-                        vlog_file_seq_offset: 0,
-                        has_separated_values: merge_collector
+                        TrackedFileId::new(&task.file_manager, file_id),
+                        target_schema.version(),
+                        file_size,
+                        bucket_range.clone(),
+                        bucket_range,
+                    )
+                    .with_separated_values(
+                        merge_collector
                             .as_ref()
                             .is_some_and(|collector| collector.borrow().has_separated_values()),
-                        snapshot_data_file: Default::default(),
-                        meta_bytes: Default::default(),
-                    };
+                    );
                     data_file.set_meta_bytes(footer_bytes);
                     output_files.push(Arc::new(data_file));
                     written_bytes = written_bytes.saturating_add(file_size as u64);
@@ -474,23 +473,22 @@ impl CompactionExecutor {
                 task.output_level, file_id, file_size
             );
 
-            let data_file = DataFile {
-                file_type: task.data_file_type,
-                start_key: first_key,
-                end_key: last_key,
+            let data_file = DataFile::new(
+                task.data_file_type,
+                first_key,
+                last_key,
                 file_id,
-                tracked_id: TrackedFileId::new(&task.file_manager, file_id),
-                schema_id: target_schema.version(),
-                size: file_size,
-                bucket_range: bucket_range.clone(),
-                effective_bucket_range: bucket_range,
-                vlog_file_seq_offset: 0,
-                has_separated_values: merge_collector
+                TrackedFileId::new(&task.file_manager, file_id),
+                target_schema.version(),
+                file_size,
+                bucket_range.clone(),
+                bucket_range,
+            )
+            .with_separated_values(
+                merge_collector
                     .as_ref()
                     .is_some_and(|collector| collector.borrow().has_separated_values()),
-                snapshot_data_file: Default::default(),
-                meta_bytes: Default::default(),
-            };
+            );
             data_file.set_meta_bytes(footer_bytes);
             output_files.push(Arc::new(data_file));
             written_bytes = written_bytes.saturating_add(file_size as u64);
@@ -613,21 +611,18 @@ mod tests {
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
 
-        let data_file = DataFile {
-            file_type: DataFileType::SSTable,
-            start_key: first_key,
-            end_key: last_key,
+        let data_file = DataFile::new(
+            DataFileType::SSTable,
+            first_key,
+            last_key,
             file_id,
-            tracked_id: TrackedFileId::new(file_manager, file_id),
-            schema_id: 0,
-            size: file_size,
-            bucket_range: bucket_range.clone(),
-            effective_bucket_range: bucket_range,
-            vlog_file_seq_offset: 0,
-            has_separated_values: true,
-            snapshot_data_file: Default::default(),
-            meta_bytes: Default::default(),
-        };
+            TrackedFileId::new(file_manager, file_id),
+            0,
+            file_size,
+            bucket_range.clone(),
+            bucket_range,
+        )
+        .with_separated_values(true);
         data_file.set_meta_bytes(footer_bytes);
         Ok(Arc::new(data_file))
     }
@@ -1196,21 +1191,17 @@ mod tests {
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range().unwrap();
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
 
-        let file = DataFile {
-            file_type: DataFileType::SSTable,
-            start_key: first_key,
-            end_key: last_key,
+        let file = DataFile::new(
+            DataFileType::SSTable,
+            first_key,
+            last_key,
             file_id,
-            tracked_id: TrackedFileId::new(&file_manager, file_id),
-            schema_id: 0,
-            size: file_size,
-            bucket_range: bucket_range.clone(),
-            effective_bucket_range: bucket_range,
-            vlog_file_seq_offset: 0,
-            has_separated_values: false,
-            snapshot_data_file: Default::default(),
-            meta_bytes: Default::default(),
-        };
+            TrackedFileId::new(&file_manager, file_id),
+            0,
+            file_size,
+            bucket_range.clone(),
+            bucket_range,
+        );
         file.set_meta_bytes(footer_bytes);
         let file = Arc::new(file);
 

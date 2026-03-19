@@ -1387,6 +1387,13 @@ impl Drop for MemtableManager {
     }
 }
 
+/// Flush a sealed memtable to L0 SST files.
+///
+/// Flush path: (1) write separated blob payloads to VLOG if the memtable
+/// has a vlog recorder, (2) iterate memtable entries in sorted order,
+/// (3) route each key to the correct LSM tree by bucket, (4) write per-tree
+/// L0 SST files via FileBuilder, (5) return data files and vlog edit for
+/// atomic LSM version update.
 #[allow(clippy::too_many_arguments)]
 fn flush_memtable(
     memtable: &impl Memtable,
@@ -1490,21 +1497,19 @@ fn flush_memtable(
     for (tree_idx, (file_id, builder, min_bucket, max_bucket)) in builders {
         let (start_key, end_key, file_size, footer_bytes) = builder.finish()?;
         let bucket_range = min_bucket..=max_bucket;
-        let data_file = DataFile {
-            file_type: DataFileType::SSTable,
+        let data_file = DataFile::new(
+            DataFileType::SSTable,
             start_key,
             end_key,
             file_id,
-            tracked_id: TrackedFileId::new(&file_manager, file_id),
-            size: file_size,
-            schema_id: schema.version(),
-            bucket_range: bucket_range.clone(),
-            effective_bucket_range: bucket_range,
-            vlog_file_seq_offset,
-            has_separated_values,
-            snapshot_data_file: Default::default(),
-            meta_bytes: Default::default(),
-        };
+            TrackedFileId::new(&file_manager, file_id),
+            schema.version(),
+            file_size,
+            bucket_range.clone(),
+            bucket_range,
+        )
+        .with_vlog_offset(vlog_file_seq_offset)
+        .with_separated_values(has_separated_values);
         data_file.set_meta_bytes(footer_bytes);
         data_files_by_tree.push((tree_idx, Arc::new(data_file)));
     }

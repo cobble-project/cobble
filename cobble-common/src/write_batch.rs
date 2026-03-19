@@ -32,6 +32,17 @@ impl WriteBatch {
         }
     }
 
+    fn insert_op(&mut self, bucket: u16, key: Bytes, column: u16, op: WriteOp) {
+        let key_and_seq = KeyAndSeq {
+            bucket,
+            key: key.clone(),
+            column,
+            seq: self.current_seq,
+        };
+        self.ops.insert(key_and_seq, op);
+        self.current_seq += 1;
+    }
+
     pub fn put<K, V>(&mut self, bucket: u16, key: K, column: u16, value: V)
     where
         K: AsRef<[u8]>,
@@ -51,34 +62,27 @@ impl WriteBatch {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        let key_and_seq = KeyAndSeq {
+        let key_bytes = Bytes::copy_from_slice(key.as_ref());
+        let value = Bytes::copy_from_slice(value.as_ref());
+        self.insert_op(
             bucket,
-            key: Bytes::copy_from_slice(key.as_ref()),
+            key_bytes.clone(),
             column,
-            seq: self.current_seq,
-        };
-        let write_op = WriteOp::Put(
-            key_and_seq.key.clone(),
-            Bytes::copy_from_slice(value.as_ref()),
-            ttl_seconds,
+            WriteOp::Put(key_bytes, value, ttl_seconds),
         );
-        self.ops.insert(key_and_seq, write_op);
-        self.current_seq += 1;
     }
 
     pub fn delete<K>(&mut self, bucket: u16, key: K, column: u16)
     where
         K: AsRef<[u8]>,
     {
-        let key_and_seq = KeyAndSeq {
+        let key_bytes = Bytes::copy_from_slice(key.as_ref());
+        self.insert_op(
             bucket,
-            key: Bytes::copy_from_slice(key.as_ref()),
+            key_bytes.clone(),
             column,
-            seq: self.current_seq,
-        };
-        let write_op = WriteOp::Delete(key_and_seq.key.clone());
-        self.ops.insert(key_and_seq, write_op);
-        self.current_seq += 1;
+            WriteOp::Delete(key_bytes),
+        );
     }
 
     pub fn merge<K, V>(&mut self, bucket: u16, key: K, column: u16, value: V)
@@ -100,19 +104,14 @@ impl WriteBatch {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        let key_and_seq = KeyAndSeq {
+        let key_bytes = Bytes::copy_from_slice(key.as_ref());
+        let value = Bytes::copy_from_slice(value.as_ref());
+        self.insert_op(
             bucket,
-            key: Bytes::copy_from_slice(key.as_ref()),
+            key_bytes.clone(),
             column,
-            seq: self.current_seq,
-        };
-        let write_op = WriteOp::Merge(
-            key_and_seq.key.clone(),
-            Bytes::copy_from_slice(value.as_ref()),
-            ttl_seconds,
+            WriteOp::Merge(key_bytes, value, ttl_seconds),
         );
-        self.ops.insert(key_and_seq, write_op);
-        self.current_seq += 1;
     }
 }
 

@@ -215,6 +215,15 @@ impl SnapshotManager {
         *self.bucket_ranges.write().unwrap() = bucket_ranges;
     }
 
+    /// Complete a snapshot: persist manifest and manage lifecycle.
+    ///
+    /// Snapshot flow: (1) capture current LSM tree versions, VLOG version,
+    /// and active memtable incremental data from DbState, (2) determine if
+    /// this is a full or incremental snapshot (based on suggested base),
+    /// (3) encode and write manifest JSON to snapshot volume, (4) persist
+    /// schema files up to the latest referenced schema id, (5) register
+    /// the snapshot in the manager's state with ref-counted dependency
+    /// tracking, (6) auto-expire old snapshots if retention is configured.
     pub(crate) fn finish_snapshot(
         &self,
         id: u64,
@@ -830,21 +839,18 @@ fn remap_snapshot_tree_file_ids(
                                 .get(&file.file_id)
                                 .copied()
                                 .unwrap_or(file.file_id);
-                            let detached = DataFile {
-                                file_type: file.file_type,
-                                start_key: file.start_key.clone(),
-                                end_key: file.end_key.clone(),
-                                file_id: file.file_id,
-                                tracked_id: TrackedFileId::detached(file.file_id),
-                                schema_id: file.schema_id,
-                                size: file.size,
-                                bucket_range: file.bucket_range.clone(),
-                                effective_bucket_range: file.effective_bucket_range.clone(),
-                                vlog_file_seq_offset: file.vlog_file_seq_offset,
-                                has_separated_values: file.has_separated_values,
-                                snapshot_data_file: Default::default(),
-                                meta_bytes: Default::default(),
-                            };
+                            let detached = DataFile::new_detached(
+                                file.file_type,
+                                file.start_key.clone(),
+                                file.end_key.clone(),
+                                file.file_id,
+                                file.schema_id,
+                                file.size,
+                                file.bucket_range.clone(),
+                                file.effective_bucket_range.clone(),
+                            )
+                            .with_vlog_offset(file.vlog_file_seq_offset)
+                            .with_separated_values(file.has_separated_values);
                             if mapped_file_id != file.file_id {
                                 if file_manager.is_data_file_on_snapshot_volume(mapped_file_id) {
                                     detached.set_snapshot_data_file(TrackedFileId::new(
@@ -860,9 +866,7 @@ fn remap_snapshot_tree_file_ids(
                                     snapshot_file_id,
                                 ));
                             }
-                            if let Some(meta_bytes) = file.meta_bytes() {
-                                detached.set_meta_bytes(meta_bytes);
-                            }
+                            detached.copy_meta_from(file);
                             Arc::new(detached)
                         })
                         .collect(),
@@ -962,21 +966,18 @@ fn clone_lsm_tree_version_untracked(
                     .files
                     .iter()
                     .map(|file| {
-                        let detached = DataFile {
-                            file_type: file.file_type,
-                            start_key: file.start_key.clone(),
-                            end_key: file.end_key.clone(),
-                            file_id: file.file_id,
-                            tracked_id: TrackedFileId::detached(file.file_id),
-                            schema_id: file.schema_id,
-                            size: file.size,
-                            bucket_range: file.bucket_range.clone(),
-                            effective_bucket_range: file.effective_bucket_range.clone(),
-                            vlog_file_seq_offset: file.vlog_file_seq_offset,
-                            has_separated_values: file.has_separated_values,
-                            snapshot_data_file: Default::default(),
-                            meta_bytes: Default::default(),
-                        };
+                        let detached = DataFile::new_detached(
+                            file.file_type,
+                            file.start_key.clone(),
+                            file.end_key.clone(),
+                            file.file_id,
+                            file.schema_id,
+                            file.size,
+                            file.bucket_range.clone(),
+                            file.effective_bucket_range.clone(),
+                        )
+                        .with_vlog_offset(file.vlog_file_seq_offset)
+                        .with_separated_values(file.has_separated_values);
                         if let Some(snapshot_file_id) = file.snapshot_data_file_id()
                             && file_manager.is_data_file_on_snapshot_volume(snapshot_file_id)
                         {
@@ -985,9 +986,7 @@ fn clone_lsm_tree_version_untracked(
                                 snapshot_file_id,
                             ));
                         }
-                        if let Some(meta_bytes) = file.meta_bytes() {
-                            detached.set_meta_bytes(meta_bytes);
-                        }
+                        detached.copy_meta_from(file);
                         Arc::new(detached)
                     })
                     .collect(),

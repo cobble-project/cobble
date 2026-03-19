@@ -533,25 +533,19 @@ fn compare_overlap(candidate: (usize, u64, usize), current: (usize, u64, usize))
 mod tests {
     use super::*;
     use crate::data_file::DataFileType;
-    use crate::file::TrackedFileId;
 
     fn make_file(id: FileId, start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
         let bucket_range = DataFile::bucket_range_from_keys(start, end);
-        Arc::new(DataFile {
-            file_type: DataFileType::SSTable,
-            start_key: start.to_vec(),
-            end_key: end.to_vec(),
-            file_id: id,
-            tracked_id: TrackedFileId::detached(id),
-            schema_id: 0,
+        Arc::new(DataFile::new_detached(
+            DataFileType::SSTable,
+            start.to_vec(),
+            end.to_vec(),
+            id,
+            0,
             size,
-            bucket_range: bucket_range.clone(),
-            effective_bucket_range: bucket_range,
-            vlog_file_seq_offset: 0,
-            has_separated_values: false,
-            snapshot_data_file: Default::default(),
-            meta_bytes: Default::default(),
-        })
+            bucket_range.clone(),
+            bucket_range,
+        ))
     }
 
     #[test]

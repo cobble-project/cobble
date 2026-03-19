@@ -63,6 +63,36 @@ pub struct DataFile {
 }
 
 impl DataFile {
+    /// Create a new DataFile with the given tracked_id and required fields.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        file_type: DataFileType,
+        start_key: Vec<u8>,
+        end_key: Vec<u8>,
+        file_id: FileId,
+        tracked_id: Arc<TrackedFileId>,
+        schema_id: u64,
+        size: usize,
+        bucket_range: RangeInclusive<u16>,
+        effective_bucket_range: RangeInclusive<u16>,
+    ) -> Self {
+        Self {
+            file_type,
+            start_key,
+            end_key,
+            file_id,
+            tracked_id,
+            schema_id,
+            size,
+            bucket_range,
+            effective_bucket_range,
+            vlog_file_seq_offset: 0,
+            has_separated_values: false,
+            snapshot_data_file: Default::default(),
+            meta_bytes: Default::default(),
+        }
+    }
+
     pub(crate) fn bucket_range_from_keys(start_key: &[u8], end_key: &[u8]) -> RangeInclusive<u16> {
         let start = key_bucket(start_key).unwrap_or(0);
         let end = key_bucket(end_key).unwrap_or(u16::MAX);
@@ -95,10 +125,52 @@ impl DataFile {
             ),
             meta_bytes: Default::default(),
         };
-        if let Some(meta_bytes) = self.meta_bytes() {
-            data_file.set_meta_bytes(meta_bytes);
-        }
+        data_file.copy_meta_from(self);
         data_file
+    }
+
+    /// Create a detached DataFile (for snapshots / read-only use).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_detached(
+        file_type: DataFileType,
+        start_key: Vec<u8>,
+        end_key: Vec<u8>,
+        file_id: FileId,
+        schema_id: u64,
+        size: usize,
+        bucket_range: RangeInclusive<u16>,
+        effective_bucket_range: RangeInclusive<u16>,
+    ) -> Self {
+        Self::new(
+            file_type,
+            start_key,
+            end_key,
+            file_id,
+            TrackedFileId::detached(file_id),
+            schema_id,
+            size,
+            bucket_range,
+            effective_bucket_range,
+        )
+    }
+
+    /// Builder-style setter for vlog_file_seq_offset.
+    pub(crate) fn with_vlog_offset(mut self, offset: u32) -> Self {
+        self.vlog_file_seq_offset = offset;
+        self
+    }
+
+    /// Builder-style setter for has_separated_values.
+    pub(crate) fn with_separated_values(mut self, separated: bool) -> Self {
+        self.has_separated_values = separated;
+        self
+    }
+
+    /// Copy meta_bytes from another DataFile if present.
+    pub(crate) fn copy_meta_from(&self, source: &DataFile) {
+        if let Some(meta_bytes) = source.meta_bytes() {
+            self.set_meta_bytes(meta_bytes);
+        }
     }
 
     pub(crate) fn needs_bucket_filter(&self) -> bool {

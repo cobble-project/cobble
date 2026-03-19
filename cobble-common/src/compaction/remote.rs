@@ -148,22 +148,19 @@ impl RemoteDataFile {
         } else {
             file_manager.register_data_file(file_id, &path)?;
         }
-        let data_file = DataFile {
+        let data_file = DataFile::new(
             file_type,
-            start_key: self.start_key,
-            end_key: self.end_key,
+            self.start_key,
+            self.end_key,
             file_id,
-            tracked_id: TrackedFileId::new(file_manager, file_id),
-            schema_id: self.schema_id,
-            size: self.size,
-            bucket_range: self.bucket_range_start..=self.bucket_range_end,
-            effective_bucket_range: self.effective_bucket_range_start
-                ..=self.effective_bucket_range_end,
-            vlog_file_seq_offset: self.vlog_file_seq_offset,
-            has_separated_values: self.has_separated_values,
-            snapshot_data_file: Default::default(),
-            meta_bytes: Default::default(),
-        };
+            TrackedFileId::new(file_manager, file_id),
+            self.schema_id,
+            self.size,
+            self.bucket_range_start..=self.bucket_range_end,
+            self.effective_bucket_range_start..=self.effective_bucket_range_end,
+        )
+        .with_vlog_offset(self.vlog_file_seq_offset)
+        .with_separated_values(self.has_separated_values);
         if let Some(bytes) = self.meta_bytes.map(Bytes::from) {
             data_file.set_meta_bytes(bytes);
         }
@@ -869,21 +866,17 @@ mod tests {
 
         let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
-        let data_file = DataFile {
-            file_type: DataFileType::SSTable,
-            start_key: first_key,
-            end_key: last_key,
+        let data_file = DataFile::new(
+            DataFileType::SSTable,
+            first_key,
+            last_key,
             file_id,
-            tracked_id: TrackedFileId::new(file_manager, file_id),
-            schema_id: 0,
-            size: file_size,
-            bucket_range: bucket_range.clone(),
-            effective_bucket_range: bucket_range,
-            vlog_file_seq_offset: 0,
-            has_separated_values: false,
-            snapshot_data_file: Default::default(),
-            meta_bytes: Default::default(),
-        };
+            TrackedFileId::new(file_manager, file_id),
+            0,
+            file_size,
+            bucket_range.clone(),
+            bucket_range,
+        );
         data_file.set_meta_bytes(footer_bytes);
         Ok(Arc::new(data_file))
     }
