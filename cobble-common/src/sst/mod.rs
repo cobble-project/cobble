@@ -1,4 +1,3 @@
-pub(crate) mod block_cache;
 pub(crate) mod bloom;
 pub(crate) mod compression;
 pub(crate) mod format;

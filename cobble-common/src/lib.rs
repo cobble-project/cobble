@@ -1,6 +1,7 @@
 #![crate_type = "lib"]
 #![allow(dead_code)]
 
+mod block_cache;
 mod cache;
 mod compaction;
 mod config;

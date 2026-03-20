@@ -1,3 +1,4 @@
+use crate::block_cache::{BlockCache, new_block_cache_with_config};
 use crate::config::VolumeUsageKind;
 use crate::coordinator::GlobalSnapshotManifest;
 use crate::db_state::{bucket_range_fits_total, bucket_range_last, bucket_slots_for_total};
@@ -10,7 +11,6 @@ use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
 use crate::paths::{
     global_snapshot_current_path, global_snapshot_manifest_path_by_pointer, snapshot_manifest_name,
 };
-use crate::sst::block_cache::{BlockCache, new_block_cache_with_config};
 use crate::{Config, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, VolumeDescriptor};
 use bytes::Bytes;
 use serde_json::Error as SerdeError;

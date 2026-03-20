@@ -1,11 +1,11 @@
 //! Factory for creating iterators from data files based on their type.
 
+use crate::block_cache::BlockCache;
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
 use crate::file::FileManager;
 use crate::iterator::{BucketFilterIterator, KvIterator};
 use crate::parquet::ParquetIterator;
-use crate::sst::block_cache::BlockCache;
 use crate::sst::{SSTIterator, SSTIteratorOptions};
 use std::sync::Arc;
 
@@ -55,7 +55,11 @@ pub fn create_iterator(
         }
         DataFileType::Parquet => {
             let reader = file_manager.open_data_file_reader(file.file_id)?;
-            let iter = ParquetIterator::from_data_file(Box::new(reader), file)?;
+            let iter = ParquetIterator::from_data_file(
+                Box::new(reader),
+                file,
+                options.block_cache.clone(),
+            )?;
             if file.needs_bucket_filter() {
                 Ok(Box::new(BucketFilterIterator::new(
                     iter,

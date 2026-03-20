@@ -1,8 +1,8 @@
+use crate::block_cache::{BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock};
 use crate::data_file::DataFile;
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
 use crate::iterator::KvIterator;
-use crate::sst::block_cache::{BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock};
 use crate::sst::bloom::BloomFilter;
 use crate::sst::compression::decode_block_bytes;
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
@@ -205,6 +205,11 @@ impl SSTIterator {
                 match cached {
                     CachedBlock::Block(block) => block,
                     CachedBlock::BloomFilter(_) => {
+                        return Err(Error::IoError(
+                            "Index block cache entry invalid".to_string(),
+                        ));
+                    }
+                    CachedBlock::ParquetBlock(_) => {
                         return Err(Error::IoError(
                             "Index block cache entry invalid".to_string(),
                         ));
@@ -412,6 +417,9 @@ impl SSTIterator {
                     CachedBlock::BloomFilter(_) => {
                         return Err(Error::IoError("Index partition cache invalid".to_string()));
                     }
+                    CachedBlock::ParquetBlock(_) => {
+                        return Err(Error::IoError("Index partition cache invalid".to_string()));
+                    }
                 }
             } else {
                 self.metrics.index_misses.increment(1);
@@ -469,6 +477,9 @@ impl SSTIterator {
                     CachedBlock::BloomFilter(_) => {
                         return Err(Error::IoError("Block cache entry invalid".to_string()));
                     }
+                    CachedBlock::ParquetBlock(_) => {
+                        return Err(Error::IoError("Block cache entry invalid".to_string()));
+                    }
                 }
             } else {
                 self.metrics.data_misses.increment(1);
@@ -508,6 +519,9 @@ impl SSTIterator {
                 match cached {
                     CachedBlock::Block(block) => block,
                     CachedBlock::BloomFilter(_) => {
+                        return Err(Error::IoError("Filter index cache invalid".to_string()));
+                    }
+                    CachedBlock::ParquetBlock(_) => {
                         return Err(Error::IoError("Filter index cache invalid".to_string()));
                     }
                 }
@@ -589,6 +603,9 @@ impl SSTIterator {
                 match cached {
                     CachedBlock::BloomFilter(filter) => filter,
                     CachedBlock::Block(_) => {
+                        return Err(Error::IoError("Filter cache entry invalid".to_string()));
+                    }
+                    CachedBlock::ParquetBlock(_) => {
                         return Err(Error::IoError("Filter cache entry invalid".to_string()));
                     }
                 }

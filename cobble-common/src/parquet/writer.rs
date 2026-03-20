@@ -180,7 +180,7 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
     }
 
     pub(crate) fn offset(&self) -> usize {
-        self.writer.bytes_written() as usize
+        self.writer.bytes_written()
     }
 
     pub(crate) fn is_empty(&self) -> bool {

@@ -1,3 +1,4 @@
+use crate::block_cache::new_block_cache_with_config;
 use crate::data_file::DataFileType;
 use crate::db_builder::DbBuilder;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
@@ -14,7 +15,6 @@ use crate::snapshot::{
     ActiveMemtableSnapshotData, LoadedManifest, SnapshotCallback, SnapshotManager,
     snapshot_manifest_name,
 };
-use crate::sst::block_cache::new_block_cache_with_config;
 use crate::sst::row_codec::{decode_value, decode_value_masked, encode_key_ref_into};
 use crate::r#type::decode_merge_separated_array;
 use crate::r#type::{Column, RefColumn, RefKey, RefValue, Value, ValueType};

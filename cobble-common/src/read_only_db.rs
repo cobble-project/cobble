@@ -1,3 +1,4 @@
+use crate::block_cache::{BlockCache, new_block_cache_with_config};
 use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
@@ -11,7 +12,6 @@ use crate::schema::SchemaManager;
 use crate::snapshot::{
     build_tree_versions_from_manifest, build_vlog_version_from_manifest, load_manifest_for_snapshot,
 };
-use crate::sst::block_cache::{BlockCache, new_block_cache_with_config};
 use crate::sst::row_codec::encode_key_ref_into;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::r#type::{RefKey, Value};

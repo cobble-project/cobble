@@ -350,7 +350,8 @@ impl CompactionExecutor {
                         }
                     }
                     DataFileType::Parquet => {
-                        let iter = crate::parquet::ParquetIterator::from_data_file(reader, file)?;
+                        let iter =
+                            crate::parquet::ParquetIterator::from_data_file(reader, file, None)?;
                         if file.needs_bucket_filter() {
                             Box::new(BucketFilterIterator::new(
                                 iter,
@@ -1506,7 +1507,8 @@ mod tests {
         );
         let output = result.new_files()[0].clone();
         let reader = file_manager.open_data_file_reader(output.file_id).unwrap();
-        let mut iter = ParquetIterator::from_data_file(Box::new(reader), output.as_ref()).unwrap();
+        let mut iter =
+            ParquetIterator::from_data_file(Box::new(reader), output.as_ref(), None).unwrap();
         iter.seek_to_first().unwrap();
         let mut keys = Vec::new();
         while iter.valid() {
@@ -1587,7 +1589,8 @@ mod tests {
         let result = executor.execute_blocking(task, None).unwrap();
         let output = result.new_files()[0].clone();
         let reader = file_manager.open_data_file_reader(output.file_id).unwrap();
-        let mut iter = ParquetIterator::from_data_file(Box::new(reader), output.as_ref()).unwrap();
+        let mut iter =
+            ParquetIterator::from_data_file(Box::new(reader), output.as_ref(), None).unwrap();
         iter.seek_to_first().unwrap();
         let mut rows = Vec::new();
         while iter.valid() {

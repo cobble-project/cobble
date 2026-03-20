@@ -14,6 +14,7 @@ use url::Url;
 pub enum CachedBlock {
     Block(Arc<Block>),
     BloomFilter(Arc<BloomFilter>),
+    ParquetBlock(Bytes),
 }
 
 impl CachedBlock {
@@ -21,6 +22,7 @@ impl CachedBlock {
         match self {
             CachedBlock::Block(block) => block.size_in_bytes(),
             CachedBlock::BloomFilter(filter) => filter.size_in_bytes(),
+            CachedBlock::ParquetBlock(bytes) => bytes.len(),
         }
     }
 }
@@ -34,18 +36,28 @@ pub enum BlockCacheKind {
     IndexTop,
     FilterPartition,
     FilterIndex,
+    ParquetData(u32),
 }
 
 impl Code for BlockCacheKind {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
-        let tag = match self {
-            BlockCacheKind::Data => 0u8,
-            BlockCacheKind::IndexPartition => 1u8,
-            BlockCacheKind::IndexTop => 2u8,
-            BlockCacheKind::FilterPartition => 3u8,
-            BlockCacheKind::FilterIndex => 4u8,
-        };
-        writer.write_all(&[tag]).map_err(FoyerError::io_error)
+        match self {
+            BlockCacheKind::Data => writer.write_all(&[0u8]).map_err(FoyerError::io_error),
+            BlockCacheKind::IndexPartition => {
+                writer.write_all(&[1u8]).map_err(FoyerError::io_error)
+            }
+            BlockCacheKind::IndexTop => writer.write_all(&[2u8]).map_err(FoyerError::io_error),
+            BlockCacheKind::FilterPartition => {
+                writer.write_all(&[3u8]).map_err(FoyerError::io_error)
+            }
+            BlockCacheKind::FilterIndex => writer.write_all(&[4u8]).map_err(FoyerError::io_error),
+            BlockCacheKind::ParquetData(length) => {
+                writer.write_all(&[5u8]).map_err(FoyerError::io_error)?;
+                writer
+                    .write_all(&length.to_le_bytes())
+                    .map_err(FoyerError::io_error)
+            }
+        }
     }
 
     fn decode(reader: &mut impl Read) -> foyer::Result<Self>
@@ -60,6 +72,13 @@ impl Code for BlockCacheKind {
             2 => Ok(BlockCacheKind::IndexTop),
             3 => Ok(BlockCacheKind::FilterPartition),
             4 => Ok(BlockCacheKind::FilterIndex),
+            5 => {
+                let mut length = [0u8; 4];
+                reader
+                    .read_exact(&mut length)
+                    .map_err(FoyerError::io_error)?;
+                Ok(BlockCacheKind::ParquetData(u32::from_le_bytes(length)))
+            }
             kind => Err(FoyerError::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Unknown block cache kind tag: {}", kind),
@@ -68,7 +87,10 @@ impl Code for BlockCacheKind {
     }
 
     fn estimated_size(&self) -> usize {
-        1
+        match self {
+            BlockCacheKind::ParquetData(_) => 1 + 4,
+            _ => 1,
+        }
     }
 }
 
@@ -120,6 +142,7 @@ impl Code for CachedBlock {
         let (tag, payload) = match self {
             CachedBlock::Block(block) => (0u8, block.encode()),
             CachedBlock::BloomFilter(filter) => (1u8, filter.encode()),
+            CachedBlock::ParquetBlock(bytes) => (2u8, bytes.clone()),
         };
         writer.write_all(&[tag]).map_err(FoyerError::io_error)?;
         let len = payload.len() as u32;
@@ -160,6 +183,7 @@ impl Code for CachedBlock {
                 })?;
                 Ok(CachedBlock::BloomFilter(Arc::new(filter)))
             }
+            2 => Ok(CachedBlock::ParquetBlock(payload)),
             kind => Err(FoyerError::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Unknown cached block tag: {}", kind),
@@ -229,11 +253,13 @@ fn build_hybrid_cache_dir(base_dir: &str, db_id: &str) -> Result<PathBuf> {
 mod tests {
     use std::sync::Arc;
 
+    use crate::block_cache::{BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock};
     use crate::cache::MockCache;
     use crate::file::FileSystemRegistry;
-    use crate::sst::block_cache::{BlockCache, BlockCacheKey, CachedBlock};
     use crate::sst::iterator::{SSTIterator, SSTIteratorOptions};
     use crate::sst::writer::{SSTWriter, SSTWriterOptions};
+    use bytes::Bytes;
+    use foyer::Code;
 
     #[test]
     #[serial_test::serial(file)]
@@ -293,5 +319,30 @@ mod tests {
         assert!(mock_cache.get_count() > 0);
 
         let _ = std::fs::remove_dir_all("/tmp/cache_it_test");
+    }
+
+    #[test]
+    fn test_parquet_cache_key_and_value_codec() {
+        let key = BlockCacheKey {
+            file_id: 42,
+            block_id: 1024,
+            kind: BlockCacheKind::ParquetData(4096),
+        };
+        let block = CachedBlock::ParquetBlock(Bytes::from_static(b"parquet-page"));
+
+        let mut key_buf = Vec::new();
+        key.encode(&mut key_buf).unwrap();
+        let mut key_read = key_buf.as_slice();
+        let decoded_key = BlockCacheKey::decode(&mut key_read).unwrap();
+        assert_eq!(decoded_key, key);
+
+        let mut block_buf = Vec::new();
+        block.encode(&mut block_buf).unwrap();
+        let mut block_read = block_buf.as_slice();
+        let decoded_block = CachedBlock::decode(&mut block_read).unwrap();
+        match decoded_block {
+            CachedBlock::ParquetBlock(bytes) => assert_eq!(bytes.as_ref(), b"parquet-page"),
+            _ => panic!("expected parquet block"),
+        }
     }
 }

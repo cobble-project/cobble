@@ -1,3 +1,4 @@
+use crate::block_cache::BlockCache;
 use crate::data_file::DataFile;
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
@@ -17,6 +18,8 @@ type ByteArrayColumnReader = ColumnReaderImpl<ByteArrayType>;
 
 pub(crate) struct ParquetIterator {
     file: Arc<dyn RandomAccessFile>,
+    file_id: Option<u64>,
+    block_cache: Option<BlockCache>,
     row_group_ranges: Option<Vec<ParquetRowGroupRange>>,
     total_row_groups: usize,
     current_row_group_idx: usize,
@@ -32,26 +35,31 @@ pub(crate) struct ParquetIterator {
 
 impl ParquetIterator {
     pub(crate) fn new(file: Box<dyn RandomAccessFile>) -> Result<Self> {
-        Self::new_with_ranges(file, None)
+        Self::new_with_ranges(file, None, None, None)
     }
 
     pub(crate) fn from_data_file(
         file: Box<dyn RandomAccessFile>,
         data_file: &DataFile,
+        block_cache: Option<BlockCache>,
     ) -> Result<Self> {
         let row_group_ranges = decode_meta_row_group_ranges(data_file.meta_bytes())?;
-        Self::new_with_ranges(file, row_group_ranges)
+        Self::new_with_ranges(file, row_group_ranges, Some(data_file.file_id), block_cache)
     }
 
     fn new_with_ranges(
         file: Box<dyn RandomAccessFile>,
         row_group_ranges: Option<Vec<ParquetRowGroupRange>>,
+        file_id: Option<u64>,
+        block_cache: Option<BlockCache>,
     ) -> Result<Self> {
         let file = Arc::from(file);
-        let total_row_groups = Self::row_group_count(&file)?;
+        let total_row_groups = Self::row_group_count(&file, file_id, block_cache.clone())?;
         let row_group_ranges = row_group_ranges.filter(|ranges| ranges.len() == total_row_groups);
         Ok(Self {
             file,
+            file_id,
+            block_cache,
             row_group_ranges,
             total_row_groups,
             current_row_group_idx: 0,
@@ -66,8 +74,13 @@ impl ParquetIterator {
         })
     }
 
-    fn row_group_count(file: &Arc<dyn RandomAccessFile>) -> Result<usize> {
-        let chunk_reader = RandomAccessChunkReader::from_arc(Arc::clone(file));
+    fn row_group_count(
+        file: &Arc<dyn RandomAccessFile>,
+        file_id: Option<u64>,
+        block_cache: Option<BlockCache>,
+    ) -> Result<usize> {
+        let chunk_reader =
+            RandomAccessChunkReader::from_arc_with_cache(Arc::clone(file), file_id, block_cache);
         let reader = SerializedFileReader::new(chunk_reader)
             .map_err(|err| Error::IoError(format!("Failed to open parquet reader: {}", err)))?;
         let metadata = reader.metadata();
@@ -92,8 +105,11 @@ impl ParquetIterator {
     fn open_row_group_readers(
         file: &Arc<dyn RandomAccessFile>,
         row_group_idx: usize,
+        file_id: Option<u64>,
+        block_cache: Option<BlockCache>,
     ) -> Result<(usize, ByteArrayColumnReader, ByteArrayColumnReader)> {
-        let chunk_reader = RandomAccessChunkReader::from_arc(Arc::clone(file));
+        let chunk_reader =
+            RandomAccessChunkReader::from_arc_with_cache(Arc::clone(file), file_id, block_cache);
         let reader = SerializedFileReader::new(chunk_reader)
             .map_err(|err| Error::IoError(format!("Failed to open parquet reader: {}", err)))?;
         let row_group = reader.get_row_group(row_group_idx).map_err(|err| {
@@ -140,8 +156,12 @@ impl ParquetIterator {
             {
                 return Ok(true);
             }
-            let (rows, key_reader, value_reader) =
-                Self::open_row_group_readers(&self.file, self.current_row_group_idx)?;
+            let (rows, key_reader, value_reader) = Self::open_row_group_readers(
+                &self.file,
+                self.current_row_group_idx,
+                self.file_id,
+                self.block_cache.clone(),
+            )?;
             self.current_group_rows = rows;
             self.current_group_rows_loaded = 0;
             self.key_reader = Some(key_reader);

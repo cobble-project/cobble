@@ -1,3 +1,4 @@
+use crate::block_cache::BlockCache;
 use crate::compaction::{
     CompactionConfig, CompactionPlan, CompactionPolicy, CompactionWorker, MinOverlapPolicy,
     RoundRobinPolicy, build_runs_for_plan, level_threshold,
@@ -11,7 +12,6 @@ use crate::iterator::{
 };
 use crate::metrics_manager::MetricsManager;
 use crate::schema::{Schema, SchemaManager};
-use crate::sst::block_cache::BlockCache;
 use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 use crate::r#type::{Value, key_bucket};
