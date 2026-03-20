@@ -1,3 +1,4 @@
+use crate::data_file::DataFileType;
 use crate::db_builder::DbBuilder;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::{DbStateHandle, bucket_range_fits_total};
@@ -624,6 +625,7 @@ impl Db {
                 memtable_type: config.memtable_type,
                 sst_options,
                 file_builder_factory: None,
+                data_file_type: DataFileType::SSTable,
                 num_columns: runtime_num_columns,
                 write_stall_limit: config.resolved_write_stall_limit(),
                 schema_manager: Some(Arc::clone(&schema_manager)),

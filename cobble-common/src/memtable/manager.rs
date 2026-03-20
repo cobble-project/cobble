@@ -17,6 +17,7 @@ use crate::memtable::vlog::{MemtableVlogRecorder, rewrite_ref_value_for_memtable
 use crate::memtable::{HashMemtable, VecMemtable};
 use crate::memtable::{Memtable, MemtableImpl, MemtableKvIter, MemtableReclaimer};
 use crate::metrics_manager::MetricsManager;
+use crate::parquet::{ParquetWriter, ParquetWriterOptions};
 use crate::paths::snapshot_active_data_relative_path;
 use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotManager};
@@ -40,6 +41,7 @@ pub(crate) struct MemtableManagerOptions {
     pub(crate) buffer_count: usize,
     pub(crate) sst_options: SSTWriterOptions,
     pub(crate) file_builder_factory: Option<Arc<FileBuilderFactory>>,
+    pub(crate) data_file_type: DataFileType,
     pub(crate) num_columns: usize,
     pub(crate) memtable_type: MemtableType,
     pub(crate) write_stall_limit: usize,
@@ -79,6 +81,7 @@ impl Default for MemtableManagerOptions {
                 ..SSTWriterOptions::default()
             },
             file_builder_factory: None,
+            data_file_type: DataFileType::SSTable,
             num_columns: 1,
             memtable_type: MemtableType::Hash,
             write_stall_limit: 8,
@@ -98,6 +101,7 @@ pub(crate) struct MemtableManager {
     flush_done: Arc<Condvar>,
     file_manager: Arc<FileManager>,
     file_builder_factory: Arc<FileBuilderFactory>,
+    data_file_type: DataFileType,
     lsm_tree: Arc<LSMTree>,
     db_state: Arc<DbStateHandle>,
     db_lifecycle: Arc<DbLifecycle>,
@@ -371,9 +375,12 @@ impl MemtableManager {
             options.memtable_capacity,
             options.memtable_type,
         );
-        let file_builder_factory = options
-            .file_builder_factory
-            .unwrap_or_else(|| Arc::new(make_sst_builder_factory(options.sst_options.clone())));
+        let file_builder_factory = options.file_builder_factory.unwrap_or_else(|| {
+            Arc::new(make_data_file_builder_factory(
+                options.data_file_type,
+                options.sst_options.clone(),
+            ))
+        });
         let vlog_store = options.vlog_store.unwrap_or_else(|| {
             Arc::new(VlogStore::new(
                 Arc::clone(&file_manager),
@@ -387,6 +394,7 @@ impl MemtableManager {
             Arc::clone(&flush_done),
             Arc::clone(&file_manager),
             Arc::clone(&file_builder_factory),
+            options.data_file_type,
             Arc::clone(&lsm_tree),
             lsm_tree.ttl_provider(),
             Arc::clone(&db_lifecycle),
@@ -399,6 +407,7 @@ impl MemtableManager {
             flush_done,
             file_manager,
             file_builder_factory,
+            data_file_type: options.data_file_type,
             lsm_tree,
             db_state,
             db_lifecycle,
@@ -451,6 +460,7 @@ impl MemtableManager {
         flush_done: Arc<Condvar>,
         file_manager: Arc<FileManager>,
         file_builder_factory: Arc<FileBuilderFactory>,
+        data_file_type: DataFileType,
         lsm_tree: Arc<LSMTree>,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
         db_lifecycle: Arc<DbLifecycle>,
@@ -496,6 +506,7 @@ impl MemtableManager {
                             Arc::clone(&vlog_store_clone),
                             multi_lsm_version,
                             0,
+                            data_file_type,
                         );
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
@@ -1316,6 +1327,7 @@ impl MemtableManager {
                 Arc::clone(&self.vlog_store),
                 multi_lsm_version,
                 vlog_file_seq_offset,
+                self.data_file_type,
             )?;
             self.metrics.flushes_total.increment(1);
             let flushed_bytes: u64 = result
@@ -1405,6 +1417,7 @@ fn flush_memtable(
     vlog_store: Arc<VlogStore>,
     multi_lsm_version: MultiLSMTreeVersion,
     vlog_file_seq_offset: u32,
+    data_file_type: DataFileType,
 ) -> Result<MemtableFlushResult> {
     // Step 1: If there is a vlog recorder with entries, flush it to the vlog store and get the resulting edit.
     let mut vlog_edit = None;
@@ -1498,7 +1511,7 @@ fn flush_memtable(
         let (start_key, end_key, file_size, footer_bytes) = builder.finish()?;
         let bucket_range = min_bucket..=max_bucket;
         let data_file = DataFile::new(
-            DataFileType::SSTable,
+            data_file_type,
             start_key,
             end_key,
             file_id,
@@ -1764,6 +1777,27 @@ fn make_sst_builder_factory(options: SSTWriterOptions) -> FileBuilderFactory {
             },
         )) as Box<dyn FileBuilder>
     })
+}
+
+fn make_data_file_builder_factory(
+    data_file_type: DataFileType,
+    sst_options: SSTWriterOptions,
+) -> FileBuilderFactory {
+    match data_file_type {
+        DataFileType::SSTable => make_sst_builder_factory(sst_options),
+        DataFileType::Parquet => Box::new(move |writer| {
+            Box::new(
+                ParquetWriter::with_options(
+                    writer,
+                    ParquetWriterOptions {
+                        buffer_size: sst_options.buffer_size,
+                        ..ParquetWriterOptions::default()
+                    },
+                )
+                .expect("failed to create parquet writer"),
+            ) as Box<dyn FileBuilder>
+        }),
+    }
 }
 
 #[cfg(test)]

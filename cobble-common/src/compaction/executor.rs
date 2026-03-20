@@ -326,21 +326,40 @@ impl CompactionExecutor {
                 } else {
                     Box::new(reader)
                 };
-                let sst_options = SSTIteratorOptions {
-                    metrics: Some(Arc::clone(&sst_metrics)),
-                    num_columns: source_schema.num_columns(),
-                    bloom_filter_enabled: options.bloom_filter_enabled,
-                    ..SSTIteratorOptions::default()
-                };
-                let iter =
-                    crate::sst::SSTIterator::with_cache_and_file(reader, file, sst_options, None)?;
-                let base_iter: Box<dyn for<'a> KvIterator<'a>> = if file.needs_bucket_filter() {
-                    Box::new(BucketFilterIterator::new(
-                        iter,
-                        file.effective_bucket_range.clone(),
-                    ))
-                } else {
-                    Box::new(iter)
+                let base_iter: Box<dyn for<'a> KvIterator<'a>> = match file.file_type {
+                    DataFileType::SSTable => {
+                        let sst_options = SSTIteratorOptions {
+                            metrics: Some(Arc::clone(&sst_metrics)),
+                            num_columns: source_schema.num_columns(),
+                            bloom_filter_enabled: options.bloom_filter_enabled,
+                            ..SSTIteratorOptions::default()
+                        };
+                        let iter = crate::sst::SSTIterator::with_cache_and_file(
+                            reader,
+                            file,
+                            sst_options,
+                            None,
+                        )?;
+                        if file.needs_bucket_filter() {
+                            Box::new(BucketFilterIterator::new(
+                                iter,
+                                file.effective_bucket_range.clone(),
+                            ))
+                        } else {
+                            Box::new(iter)
+                        }
+                    }
+                    DataFileType::Parquet => {
+                        let iter = crate::parquet::ParquetIterator::from_data_file(reader, file)?;
+                        if file.needs_bucket_filter() {
+                            Box::new(BucketFilterIterator::new(
+                                iter,
+                                file.effective_bucket_range.clone(),
+                            ))
+                        } else {
+                            Box::new(iter)
+                        }
+                    }
                 };
                 let iter: Box<dyn for<'a> KvIterator<'a>> =
                     if file.schema_id == target_schema.version() {
@@ -564,6 +583,7 @@ mod tests {
     use super::*;
     use crate::file::{FileSystemRegistry, TrackedFileId};
     use crate::metrics_manager::MetricsManager;
+    use crate::parquet::ParquetIterator;
     use crate::schema::Schema;
     use crate::sst::row_codec::encode_value;
     use crate::sst::{SSTWriter, SSTWriterOptions};
@@ -624,6 +644,32 @@ mod tests {
         )
         .with_separated_values(true);
         data_file.set_meta_bytes(footer_bytes);
+        Ok(Arc::new(data_file))
+    }
+
+    fn create_test_parquet(
+        file_manager: &Arc<FileManager>,
+        entries: Vec<(&[u8], &[u8])>,
+    ) -> Result<Arc<DataFile>> {
+        let (file_id, writer_file) = file_manager.create_data_file_with_offload()?;
+        let mut writer = crate::parquet::ParquetWriter::new(writer_file)?;
+        for (key, value) in entries {
+            writer.add(key, value)?;
+        }
+        let (first_key, last_key, file_size, meta_bytes) = writer.finish()?;
+        let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
+        let data_file = DataFile::new(
+            DataFileType::Parquet,
+            first_key,
+            last_key,
+            file_id,
+            TrackedFileId::new(file_manager, file_id),
+            0,
+            file_size,
+            bucket_range.clone(),
+            bucket_range,
+        );
+        data_file.set_meta_bytes(meta_bytes);
         Ok(Arc::new(data_file))
     }
 
@@ -1383,6 +1429,178 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(deltas.get(&9).copied(), Some(-1));
+        cleanup_test_dir(test_dir);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_compaction_output_parquet() {
+        let test_dir = "/tmp/compaction_output_parquet_test";
+        cleanup_test_dir(test_dir);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", test_dir))
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
+        let num_columns = 1;
+        let file1 = create_test_sst(
+            &file_manager,
+            vec![
+                (b"a", &make_value_bytes(b"v1", num_columns)),
+                (b"c", &make_value_bytes(b"v3", num_columns)),
+            ],
+        )
+        .unwrap();
+        let file2 = create_test_sst(
+            &file_manager,
+            vec![
+                (b"b", &make_value_bytes(b"v2", num_columns)),
+                (b"d", &make_value_bytes(b"v4", num_columns)),
+            ],
+        )
+        .unwrap();
+        let options = CompactionConfig {
+            num_columns,
+            target_file_size: 1024 * 1024,
+            ..Default::default()
+        };
+        let factory = crate::compaction::make_data_file_builder_factory(
+            DataFileType::Parquet,
+            SSTWriterOptions {
+                metrics: None,
+                block_size: options.block_size,
+                buffer_size: options.buffer_size,
+                num_columns: options.num_columns,
+                bloom_filter_enabled: options.bloom_filter_enabled,
+                bloom_bits_per_key: options.bloom_bits_per_key,
+                partitioned_index: options.partitioned_index,
+                compression: crate::SstCompressionAlgorithm::None,
+            },
+        );
+        let task = CompactionTask::new(
+            Arc::new(CompactionTaskMetrics::new("test")),
+            Arc::new(crate::sst::SSTIteratorMetrics::new("test")),
+            0,
+            vec![
+                SortedRun::new(0, vec![file1]),
+                SortedRun::new(1, vec![file2]),
+            ],
+            1,
+            Arc::clone(&file_manager),
+            factory,
+            DataFileType::Parquet,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
+            schema_manager_for(num_columns),
+        );
+        let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+        assert!(!result.new_files().is_empty());
+        assert!(
+            result
+                .new_files()
+                .iter()
+                .all(|file| file.file_type == DataFileType::Parquet)
+        );
+        let output = result.new_files()[0].clone();
+        let reader = file_manager.open_data_file_reader(output.file_id).unwrap();
+        let mut iter = ParquetIterator::from_data_file(Box::new(reader), output.as_ref()).unwrap();
+        iter.seek_to_first().unwrap();
+        let mut keys = Vec::new();
+        while iter.valid() {
+            keys.push(iter.key().unwrap().unwrap().to_vec());
+            iter.next().unwrap();
+        }
+        assert_eq!(
+            keys,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+        );
+        cleanup_test_dir(test_dir);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_compaction_input_parquet_output_parquet() {
+        let test_dir = "/tmp/compaction_parquet_to_parquet_test";
+        cleanup_test_dir(test_dir);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", test_dir))
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
+        let num_columns = 1;
+        let file1 = create_test_parquet(
+            &file_manager,
+            vec![
+                (b"a", &make_value_bytes(b"new_a", num_columns)),
+                (b"b", &make_value_bytes(b"new_b", num_columns)),
+            ],
+        )
+        .unwrap();
+        let file2 = create_test_parquet(
+            &file_manager,
+            vec![
+                (b"a", &make_value_bytes(b"old_a", num_columns)),
+                (b"c", &make_value_bytes(b"old_c", num_columns)),
+            ],
+        )
+        .unwrap();
+        let options = CompactionConfig {
+            num_columns,
+            target_file_size: 1024 * 1024,
+            ..Default::default()
+        };
+        let factory = crate::compaction::make_data_file_builder_factory(
+            DataFileType::Parquet,
+            SSTWriterOptions {
+                metrics: None,
+                block_size: options.block_size,
+                buffer_size: options.buffer_size,
+                num_columns: options.num_columns,
+                bloom_filter_enabled: options.bloom_filter_enabled,
+                bloom_bits_per_key: options.bloom_bits_per_key,
+                partitioned_index: options.partitioned_index,
+                compression: crate::SstCompressionAlgorithm::None,
+            },
+        );
+        let task = CompactionTask::new(
+            Arc::new(CompactionTaskMetrics::new("test")),
+            Arc::new(crate::sst::SSTIteratorMetrics::new("test")),
+            0,
+            vec![
+                SortedRun::new(0, vec![file1]),
+                SortedRun::new(1, vec![file2]),
+            ],
+            1,
+            Arc::clone(&file_manager),
+            factory,
+            DataFileType::Parquet,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
+            schema_manager_for(num_columns),
+        );
+        let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+        let output = result.new_files()[0].clone();
+        let reader = file_manager.open_data_file_reader(output.file_id).unwrap();
+        let mut iter = ParquetIterator::from_data_file(Box::new(reader), output.as_ref()).unwrap();
+        iter.seek_to_first().unwrap();
+        let mut rows = Vec::new();
+        while iter.valid() {
+            rows.push((
+                iter.key().unwrap().unwrap().to_vec(),
+                iter.value().unwrap().unwrap().to_vec(),
+            ));
+            iter.next().unwrap();
+        }
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, b"a".to_vec());
+        assert_eq!(rows[1].0, b"b".to_vec());
+        assert_eq!(rows[2].0, b"c".to_vec());
         cleanup_test_dir(test_dir);
     }
 }

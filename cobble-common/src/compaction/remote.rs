@@ -624,7 +624,8 @@ impl RemoteCompactionServer {
         let mut sst_options = request.sst_options.into_sst_options();
         sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
         let num_columns = sst_options.num_columns;
-        let file_builder_factory = super::make_sst_builder_factory(sst_options);
+        let file_builder_factory =
+            super::make_data_file_builder_factory(data_file_type, sst_options);
         let sorted_runs = request
             .runs
             .into_iter()

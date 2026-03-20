@@ -28,6 +28,7 @@ use crate::error::Result;
 use crate::iterator::SortedRun;
 use crate::lsm::VersionEdit;
 use crate::metrics_manager::MetricsManager;
+use crate::parquet::{ParquetWriter, ParquetWriterOptions};
 use crate::schema::SchemaManager;
 use crate::sst::SSTWriterOptions;
 use log::info;
@@ -114,7 +115,7 @@ impl LocalCompactionWorker {
             self.metrics_manager
                 .sst_writer_metrics(sst_options.compression),
         );
-        let file_builder_factory = make_sst_builder_factory(sst_options);
+        let file_builder_factory = make_data_file_builder_factory(data_file_type, sst_options);
         let task = CompactionTask::new(
             Arc::clone(&self.compaction_metrics),
             sst_metrics,
@@ -164,6 +165,32 @@ pub(crate) fn make_sst_builder_factory(options: SSTWriterOptions) -> Arc<FileBui
     Arc::new(Box::new(move |writer| {
         Box::new(crate::sst::SSTWriter::new(writer, options.clone())) as Box<dyn FileBuilder>
     }))
+}
+
+pub(crate) fn make_parquet_builder_factory(
+    options: ParquetWriterOptions,
+) -> Arc<FileBuilderFactory> {
+    Arc::new(Box::new(move |writer| {
+        Box::new(
+            ParquetWriter::with_options(writer, options.clone())
+                .expect("failed to create parquet writer"),
+        ) as Box<dyn FileBuilder>
+    }))
+}
+
+pub(crate) fn make_data_file_builder_factory(
+    data_file_type: crate::data_file::DataFileType,
+    sst_options: SSTWriterOptions,
+) -> Arc<FileBuilderFactory> {
+    match data_file_type {
+        crate::data_file::DataFileType::SSTable => make_sst_builder_factory(sst_options),
+        crate::data_file::DataFileType::Parquet => {
+            make_parquet_builder_factory(ParquetWriterOptions {
+                buffer_size: sst_options.buffer_size,
+                ..ParquetWriterOptions::default()
+            })
+        }
+    }
 }
 
 pub(crate) fn build_sst_writer_options(config: &crate::Config, level: u8) -> SSTWriterOptions {
