@@ -121,7 +121,9 @@ impl LocalCompactionWorker {
                         .sst_writer_metrics(sst_options.compression),
                 );
             }
-            WriterOptions::Parquet(_) => {}
+            WriterOptions::Parquet(parquet_options) => {
+                parquet_options.num_columns = runtime_num_columns;
+            }
         }
         let file_builder_factory = make_data_file_builder_factory(writer_options);
         let task = CompactionTask::new(
@@ -198,6 +200,7 @@ pub(crate) fn make_data_file_builder_factory(
 pub(crate) fn build_parquet_writer_options(config: &crate::Config) -> ParquetWriterOptions {
     ParquetWriterOptions {
         row_group_size_bytes: config.parquet_row_group_size_bytes.max(1),
+        num_columns: config.num_columns,
         ..ParquetWriterOptions::default()
     }
 }

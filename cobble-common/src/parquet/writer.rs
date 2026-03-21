@@ -3,20 +3,13 @@ use crate::file::{File, SequentialWriteFile};
 use crate::format::FileBuilder;
 use crate::parquet::file_adapter::SequentialWriteFileAdapter;
 use crate::parquet::meta::{ParquetMeta, ParquetRowGroupRange};
+use crate::sst::row_codec::decode_value;
 use bytes::Bytes;
-use parquet::data_type::{ByteArray, ByteArrayType};
+use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use std::mem;
 use std::sync::Arc;
-
-/// TODO: use column-aware schema.
-const PARQUET_KV_SCHEMA: &str = r#"
-message schema {
-  REQUIRED BINARY key;
-  REQUIRED BINARY value;
-}
-"#;
 
 const DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES: usize = 256 * 1024;
 
@@ -24,6 +17,7 @@ const DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES: usize = 256 * 1024;
 pub(crate) struct ParquetWriterOptions {
     pub(crate) row_group_size_bytes: usize,
     pub(crate) buffer_size: usize,
+    pub(crate) num_columns: usize,
 }
 
 impl Default for ParquetWriterOptions {
@@ -31,8 +25,19 @@ impl Default for ParquetWriterOptions {
         Self {
             row_group_size_bytes: DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES,
             buffer_size: 8192,
+            num_columns: 1,
         }
     }
+}
+
+fn parquet_schema(num_columns: usize) -> String {
+    let mut schema =
+        String::from("message schema {\n  REQUIRED BINARY key;\n  REQUIRED INT64 expired_at;\n");
+    for idx in 0..num_columns {
+        schema.push_str(&format!("  OPTIONAL BINARY c{};\n", idx));
+    }
+    schema.push('}');
+    schema
 }
 
 pub(crate) struct ParquetWriter<W: SequentialWriteFile> {
@@ -45,7 +50,9 @@ pub(crate) struct ParquetWriter<W: SequentialWriteFile> {
     current_group_end_key: Vec<u8>,
     current_group_bytes: usize,
     keys: Vec<ByteArray>,
-    values: Vec<ByteArray>,
+    expired_ats: Vec<i64>,
+    column_payload_values: Vec<Vec<ByteArray>>,
+    column_payload_def_levels: Vec<Vec<i16>>,
     row_group_ranges: Vec<ParquetRowGroupRange>,
 }
 
@@ -55,11 +62,13 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
     }
 
     pub(crate) fn with_options(writer: W, options: ParquetWriterOptions) -> Result<Self> {
+        let num_columns = options.num_columns.max(1);
         let row_group_size_bytes = options.row_group_size_bytes.max(1);
-        let schema =
-            Arc::new(parse_message_type(PARQUET_KV_SCHEMA).map_err(|err| {
+        let schema = Arc::new(
+            parse_message_type(&parquet_schema(num_columns)).map_err(|err| {
                 Error::IoError(format!("Failed to parse parquet schema: {}", err))
-            })?);
+            })?,
+        );
         let writer = SerializedFileWriter::new(
             SequentialWriteFileAdapter::new_buffered(writer, options.buffer_size),
             schema,
@@ -70,6 +79,7 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
             writer,
             options: ParquetWriterOptions {
                 row_group_size_bytes,
+                num_columns,
                 ..options
             },
             total_rows: 0,
@@ -79,7 +89,9 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
             current_group_end_key: Vec::new(),
             current_group_bytes: 0,
             keys: Vec::new(),
-            values: Vec::new(),
+            expired_ats: Vec::new(),
+            column_payload_values: vec![Vec::new(); num_columns],
+            column_payload_def_levels: vec![Vec::new(); num_columns],
             row_group_ranges: Vec::new(),
         })
     }
@@ -106,13 +118,44 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
         {
             let mut col = row_group
                 .next_column()
-                .map_err(|err| Error::IoError(format!("Failed to open value column: {}", err)))?
-                .ok_or_else(|| Error::IoError("Missing value column".to_string()))?;
+                .map_err(|err| {
+                    Error::IoError(format!("Failed to open expired_at column: {}", err))
+                })?
+                .ok_or_else(|| Error::IoError("Missing expired_at column".to_string()))?;
+            col.typed::<Int64Type>()
+                .write_batch(&self.expired_ats, None, None)
+                .map_err(|err| {
+                    Error::IoError(format!("Failed to write expired_at column: {}", err))
+                })?;
+            col.close().map_err(|err| {
+                Error::IoError(format!("Failed to close expired_at column: {}", err))
+            })?;
+        }
+        for idx in 0..self.options.num_columns {
+            let mut col = row_group
+                .next_column()
+                .map_err(|err| {
+                    Error::IoError(format!("Failed to open column payload {}: {}", idx, err))
+                })?
+                .ok_or_else(|| Error::IoError(format!("Missing parquet payload column {}", idx)))?;
             col.typed::<ByteArrayType>()
-                .write_batch(&self.values, None, None)
-                .map_err(|err| Error::IoError(format!("Failed to write value column: {}", err)))?;
-            col.close()
-                .map_err(|err| Error::IoError(format!("Failed to close value column: {}", err)))?;
+                .write_batch(
+                    &self.column_payload_values[idx],
+                    Some(&self.column_payload_def_levels[idx]),
+                    None,
+                )
+                .map_err(|err| {
+                    Error::IoError(format!(
+                        "Failed to write parquet payload column {}: {}",
+                        idx, err
+                    ))
+                })?;
+            col.close().map_err(|err| {
+                Error::IoError(format!(
+                    "Failed to close parquet payload column {}: {}",
+                    idx, err
+                ))
+            })?;
         }
         row_group
             .close()
@@ -125,7 +168,13 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
         self.row_group_ranges
             .push(ParquetRowGroupRange { start_key, end_key });
         self.keys.clear();
-        self.values.clear();
+        self.expired_ats.clear();
+        for col_values in &mut self.column_payload_values {
+            col_values.clear();
+        }
+        for col_levels in &mut self.column_payload_def_levels {
+            col_levels.clear();
+        }
         self.current_group_bytes = 0;
         Ok(())
     }
@@ -141,6 +190,8 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
             self.first_key = Some(key.to_vec());
         }
 
+        let mut encoded_value = Bytes::copy_from_slice(value);
+        let decoded = decode_value(&mut encoded_value, self.options.num_columns)?;
         let entry_bytes = key.len() + value.len();
         let should_flush = !self.keys.is_empty()
             && self.current_group_bytes + entry_bytes > self.options.row_group_size_bytes;
@@ -156,8 +207,19 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
         self.last_key = key.to_vec();
         self.total_rows += 1;
         self.keys.push(ByteArray::from(Bytes::copy_from_slice(key)));
-        self.values
-            .push(ByteArray::from(Bytes::copy_from_slice(value)));
+        self.expired_ats
+            .push(decoded.expired_at().unwrap_or(0) as i64);
+        for idx in 0..self.options.num_columns {
+            if let Some(column) = decoded.columns().get(idx).and_then(|col| col.as_ref()) {
+                let mut payload = Vec::with_capacity(1 + column.data().len());
+                payload.push(column.value_type().encode_tag());
+                payload.extend_from_slice(column.data());
+                self.column_payload_values[idx].push(ByteArray::from(Bytes::from(payload)));
+                self.column_payload_def_levels[idx].push(1);
+            } else {
+                self.column_payload_def_levels[idx].push(0);
+            }
+        }
         Ok(())
     }
 

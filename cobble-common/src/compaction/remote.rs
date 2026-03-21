@@ -104,6 +104,7 @@ impl RemoteParquetOptions {
         ParquetWriterOptions {
             row_group_size_bytes: self.row_group_size_bytes,
             buffer_size: self.buffer_size,
+            num_columns: self.num_columns,
         }
     }
 }
@@ -417,8 +418,13 @@ impl RemoteCompactionWorker {
         let schema = self.schema_manager.latest_schema();
         let mut writer_options =
             super::build_writer_options(&self.config, output_level, data_file_type);
-        if let WriterOptions::Sst(sst_options) = &mut writer_options {
-            sst_options.num_columns = schema.num_columns();
+        match &mut writer_options {
+            WriterOptions::Sst(sst_options) => {
+                sst_options.num_columns = schema.num_columns();
+            }
+            WriterOptions::Parquet(parquet_options) => {
+                parquet_options.num_columns = schema.num_columns();
+            }
         }
         let merge_operator_ids = schema.operator_ids(schema.num_columns());
         for merge_operator_id in &merge_operator_ids {
@@ -966,6 +972,7 @@ mod tests {
             make_data_file_builder_factory(WriterOptions::Parquet(ParquetWriterOptions {
                 row_group_size_bytes: 256 * 1024,
                 buffer_size: 8192,
+                num_columns: 1,
             }));
         let mut writer = factory(Box::new(writer_file));
         for (key, value) in entries {

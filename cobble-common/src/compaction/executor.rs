@@ -584,7 +584,7 @@ mod tests {
     use super::*;
     use crate::file::{FileSystemRegistry, TrackedFileId};
     use crate::metrics_manager::MetricsManager;
-    use crate::parquet::ParquetIterator;
+    use crate::parquet::{ParquetIterator, ParquetWriter};
     use crate::parquet::ParquetWriterOptions;
     use crate::schema::Schema;
     use crate::sst::row_codec::encode_value;
@@ -655,7 +655,13 @@ mod tests {
         entries: Vec<(&[u8], &[u8])>,
     ) -> Result<Arc<DataFile>> {
         let (file_id, writer_file) = file_manager.create_data_file_with_offload()?;
-        let mut writer = crate::parquet::ParquetWriter::new(writer_file)?;
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            ParquetWriterOptions {
+                num_columns: 1,
+                ..ParquetWriterOptions::default()
+            },
+        )?;
         for (key, value) in entries {
             writer.add(key, value)?;
         }
@@ -1474,6 +1480,7 @@ mod tests {
             ParquetWriterOptions {
                 row_group_size_bytes: 256 * 1024,
                 buffer_size: options.buffer_size,
+                num_columns,
             },
         ));
         let task = CompactionTask::new(
@@ -1556,6 +1563,7 @@ mod tests {
             ParquetWriterOptions {
                 row_group_size_bytes: 256 * 1024,
                 buffer_size: options.buffer_size,
+                num_columns,
             },
         ));
         let task = CompactionTask::new(

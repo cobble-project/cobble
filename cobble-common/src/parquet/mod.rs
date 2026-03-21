@@ -15,6 +15,8 @@ mod tests {
     use super::*;
     use crate::file::{FileSystemRegistry, RandomAccessFile};
     use crate::parquet::meta::decode_meta_row_group_ranges;
+    use crate::sst::row_codec::{decode_value, encode_value};
+    use crate::r#type::{Column, Value, ValueType};
 
     fn cleanup_test_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
@@ -34,10 +36,23 @@ mod tests {
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(root).unwrap();
         let writer_file = fs.open_write("test.parquet").unwrap();
-        let mut writer = ParquetWriter::new(writer_file).unwrap();
-        writer.add(b"aa", b"11").unwrap();
-        writer.add(b"bb", b"22").unwrap();
-        writer.add(b"cc", b"33").unwrap();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            ParquetWriterOptions {
+                num_columns: 1,
+                ..ParquetWriterOptions::default()
+            },
+        )
+        .unwrap();
+        let encode = |v: &[u8]| {
+            encode_value(
+                &Value::new(vec![Some(Column::new(ValueType::Put, v.to_vec()))]),
+                1,
+            )
+        };
+        writer.add(b"aa", &encode(b"11")).unwrap();
+        writer.add(b"bb", &encode(b"22")).unwrap();
+        writer.add(b"cc", &encode(b"33")).unwrap();
         let (_, _, _, meta) = writer.finish().unwrap();
         assert_eq!(decode_meta_row_count(Some(meta)).unwrap(), Some(3));
 
@@ -45,7 +60,12 @@ mod tests {
         iter.seek_to_first().unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key().unwrap().unwrap().as_ref(), b"aa");
-        assert_eq!(iter.value().unwrap().unwrap().as_ref(), b"11");
+        let mut value = iter.value().unwrap().unwrap();
+        let decoded = decode_value(&mut value, 1).unwrap();
+        assert_eq!(
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"11"
+        );
         assert!(iter.next().unwrap());
         assert_eq!(iter.key().unwrap().unwrap().as_ref(), b"bb");
         assert!(iter.next().unwrap());
@@ -63,9 +83,22 @@ mod tests {
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(root).unwrap();
         let writer_file = fs.open_write("test.parquet").unwrap();
-        let mut writer = ParquetWriter::new(writer_file).unwrap();
-        writer.add(b"bb", b"11").unwrap();
-        let err = writer.add(b"aa", b"22").unwrap_err();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            ParquetWriterOptions {
+                num_columns: 1,
+                ..ParquetWriterOptions::default()
+            },
+        )
+        .unwrap();
+        let encode = |v: &[u8]| {
+            encode_value(
+                &Value::new(vec![Some(Column::new(ValueType::Put, v.to_vec()))]),
+                1,
+            )
+        };
+        writer.add(b"bb", &encode(b"11")).unwrap();
+        let err = writer.add(b"aa", &encode(b"22")).unwrap_err();
         assert!(err.to_string().contains("sorted order"));
         cleanup_test_root("/tmp/parquet_writer_order_test");
     }
@@ -78,10 +111,23 @@ mod tests {
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(root).unwrap();
         let writer_file = fs.open_write("test.parquet").unwrap();
-        let mut writer = ParquetWriter::new(writer_file).unwrap();
-        writer.add(b"aa", b"11").unwrap();
-        writer.add(b"bb", b"22").unwrap();
-        writer.add(b"dd", b"44").unwrap();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            ParquetWriterOptions {
+                num_columns: 1,
+                ..ParquetWriterOptions::default()
+            },
+        )
+        .unwrap();
+        let encode = |v: &[u8]| {
+            encode_value(
+                &Value::new(vec![Some(Column::new(ValueType::Put, v.to_vec()))]),
+                1,
+            )
+        };
+        writer.add(b"aa", &encode(b"11")).unwrap();
+        writer.add(b"bb", &encode(b"22")).unwrap();
+        writer.add(b"dd", &encode(b"44")).unwrap();
         writer.finish().unwrap();
 
         let mut iter = ParquetIterator::new(build_reader(root)).unwrap();
@@ -101,11 +147,25 @@ mod tests {
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(root).unwrap();
         let writer_file = fs.open_write("test.parquet").unwrap();
-        let mut writer = ParquetWriter::new(writer_file).unwrap();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            ParquetWriterOptions {
+                num_columns: 1,
+                ..ParquetWriterOptions::default()
+            },
+        )
+        .unwrap();
         for i in 0..5000u32 {
             let key = format!("k{:05}", i);
             let value = format!("v{:05}", i);
-            writer.add(key.as_bytes(), value.as_bytes()).unwrap();
+            let encoded = encode_value(
+                &Value::new(vec![Some(Column::new(
+                    ValueType::Put,
+                    value.as_bytes().to_vec(),
+                ))]),
+                1,
+            );
+            writer.add(key.as_bytes(), &encoded).unwrap();
         }
         writer.finish().unwrap();
 
@@ -113,7 +173,12 @@ mod tests {
         iter.seek(b"k04990").unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key().unwrap().unwrap().as_ref(), b"k04990");
-        assert_eq!(iter.value().unwrap().unwrap().as_ref(), b"v04990");
+        let mut value = iter.value().unwrap().unwrap();
+        let decoded = decode_value(&mut value, 1).unwrap();
+        assert_eq!(
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"v04990"
+        );
         assert!(iter.next().unwrap());
         assert_eq!(iter.key().unwrap().unwrap().as_ref(), b"k04991");
         cleanup_test_root("/tmp/parquet_iterator_large_seek_test");
@@ -132,13 +197,18 @@ mod tests {
             ParquetWriterOptions {
                 row_group_size_bytes: 6,
                 buffer_size: 8192,
+                num_columns: 1,
             },
         )
         .unwrap();
-        writer.add(b"a1", b"v").unwrap();
-        writer.add(b"b1", b"v").unwrap();
-        writer.add(b"c1", b"v").unwrap();
-        writer.add(b"d1", b"v").unwrap();
+        let encoded = encode_value(
+            &Value::new(vec![Some(Column::new(ValueType::Put, b"v".to_vec()))]),
+            1,
+        );
+        writer.add(b"a1", &encoded).unwrap();
+        writer.add(b"b1", &encoded).unwrap();
+        writer.add(b"c1", &encoded).unwrap();
+        writer.add(b"d1", &encoded).unwrap();
         let (_, _, _, meta) = writer.finish().unwrap();
         let groups = decode_meta_row_group_ranges(Some(meta)).unwrap().unwrap();
         assert!(groups.len() >= 2);

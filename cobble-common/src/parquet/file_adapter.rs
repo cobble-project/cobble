@@ -228,6 +228,8 @@ mod tests {
     use crate::cache::MockCache;
     use crate::file::FileSystemRegistry;
     use crate::parquet::ParquetWriter;
+    use crate::sst::row_codec::encode_value;
+    use crate::r#type::{Column, Value, ValueType};
     use parquet::file::reader::ChunkReader;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -278,11 +280,25 @@ mod tests {
             .get_or_register("file:///tmp/parquet_cache_bytes_test")
             .unwrap();
         let writer_file = fs.open_write("test.parquet").unwrap();
-        let mut writer = ParquetWriter::new(writer_file).unwrap();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            crate::parquet::ParquetWriterOptions {
+                num_columns: 1,
+                ..crate::parquet::ParquetWriterOptions::default()
+            },
+        )
+        .unwrap();
         for i in 0..5000u32 {
             let key = format!("k{:05}", i);
             let value = format!("value_{:05}_abcdefghijklmnopqrstuvwxyz", i);
-            writer.add(key.as_bytes(), value.as_bytes()).unwrap();
+            let encoded = encode_value(
+                &Value::new(vec![Some(Column::new(
+                    ValueType::Put,
+                    value.as_bytes().to_vec(),
+                ))]),
+                1,
+            );
+            writer.add(key.as_bytes(), &encoded).unwrap();
         }
         writer.finish().unwrap();
         let reader = fs.open_read("test.parquet").unwrap();
@@ -317,11 +333,25 @@ mod tests {
             .get_or_register("file:///tmp/parquet_cache_read_test")
             .unwrap();
         let writer_file = fs.open_write("test.parquet").unwrap();
-        let mut writer = ParquetWriter::new(writer_file).unwrap();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            crate::parquet::ParquetWriterOptions {
+                num_columns: 1,
+                ..crate::parquet::ParquetWriterOptions::default()
+            },
+        )
+        .unwrap();
         for i in 0..5000u32 {
             let key = format!("k{:05}", i);
             let value = format!("value_{:05}_abcdefghijklmnopqrstuvwxyz", i);
-            writer.add(key.as_bytes(), value.as_bytes()).unwrap();
+            let encoded = encode_value(
+                &Value::new(vec![Some(Column::new(
+                    ValueType::Put,
+                    value.as_bytes().to_vec(),
+                ))]),
+                1,
+            );
+            writer.add(key.as_bytes(), &encoded).unwrap();
         }
         writer.finish().unwrap();
         let reader = fs.open_read("test.parquet").unwrap();

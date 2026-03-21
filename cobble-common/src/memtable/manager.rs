@@ -1789,6 +1789,7 @@ fn make_data_file_builder_factory(writer_options: WriterOptions) -> FileBuilderF
                     ParquetWriterOptions {
                         row_group_size_bytes: parquet_options.row_group_size_bytes,
                         buffer_size: parquet_options.buffer_size,
+                        num_columns: parquet_options.num_columns,
                     },
                 )
                 .expect("failed to create parquet writer"),

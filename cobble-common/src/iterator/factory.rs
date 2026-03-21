@@ -97,6 +97,8 @@ mod tests {
     use crate::file::{FileManager, FileSystemRegistry, TrackedFileId};
     use crate::metrics_manager::MetricsManager;
     use crate::parquet::ParquetWriter;
+    use crate::sst::row_codec::{decode_value, encode_value};
+    use crate::r#type::{Column, Value, ValueType};
 
     fn cleanup_test_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
@@ -114,9 +116,24 @@ mod tests {
         let file_manager = Arc::new(FileManager::with_defaults(fs, metrics).unwrap());
 
         let (file_id, writer_file) = file_manager.create_data_file().unwrap();
-        let mut writer = ParquetWriter::new(writer_file).unwrap();
-        writer.add(&[1, 0, b'a'], b"v1").unwrap();
-        writer.add(&[2, 0, b'b'], b"v2").unwrap();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            crate::parquet::ParquetWriterOptions {
+                num_columns: 1,
+                ..crate::parquet::ParquetWriterOptions::default()
+            },
+        )
+        .unwrap();
+        let encoded_v1 = encode_value(
+            &Value::new(vec![Some(Column::new(ValueType::Put, b"v1".to_vec()))]),
+            1,
+        );
+        let encoded_v2 = encode_value(
+            &Value::new(vec![Some(Column::new(ValueType::Put, b"v2".to_vec()))]),
+            1,
+        );
+        writer.add(&[1, 0, b'a'], &encoded_v1).unwrap();
+        writer.add(&[2, 0, b'b'], &encoded_v2).unwrap();
         let (start_key, end_key, file_size, meta) = writer.finish().unwrap();
 
         let data_file = DataFile::new(
@@ -138,8 +155,12 @@ mod tests {
         assert!(iter.valid());
         let key = iter.key().unwrap().unwrap();
         assert_eq!(key.as_ref(), &[2, 0, b'b']);
-        let value = iter.value().unwrap().unwrap();
-        assert_eq!(value.as_ref(), b"v2");
+        let mut value = iter.value().unwrap().unwrap();
+        let decoded = decode_value(&mut value, 1).unwrap();
+        assert_eq!(
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"v2"
+        );
         assert!(!iter.next().unwrap());
 
         cleanup_test_root("/tmp/iterator_factory_parquet_filter_test");

@@ -562,9 +562,15 @@ impl Db {
         let lsm_tree = Arc::new(lsm_tree);
         let mut memtable_writer_options =
             crate::compaction::build_writer_options(&config, 0, config.data_file_type);
-        if let WriterOptions::Sst(sst_options) = &mut memtable_writer_options {
-            sst_options.num_columns = runtime_num_columns;
-            sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
+        match &mut memtable_writer_options {
+            WriterOptions::Sst(sst_options) => {
+                sst_options.num_columns = runtime_num_columns;
+                sst_options.metrics =
+                    Some(metrics_manager.sst_writer_metrics(sst_options.compression));
+            }
+            WriterOptions::Parquet(parquet_options) => {
+                parquet_options.num_columns = runtime_num_columns;
+            }
         }
         let vlog_store = Arc::new(VlogStore::new(
             Arc::clone(&file_manager),
