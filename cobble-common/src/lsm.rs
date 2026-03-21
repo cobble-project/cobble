@@ -3,7 +3,7 @@ use crate::compaction::{
     CompactionConfig, CompactionPlan, CompactionPolicy, CompactionWorker, MinOverlapPolicy,
     RoundRobinPolicy, build_runs_for_plan, level_threshold,
 };
-use crate::data_file::{DataFile, intersect_bucket_ranges};
+use crate::data_file::{DataFile, DataFileType, intersect_bucket_ranges};
 use crate::db_status::DbLifecycle;
 use crate::error::Result;
 use crate::file::{FileManager, ReadAheadBufferedReader, lsm_file_priority_for_level};
@@ -11,6 +11,7 @@ use crate::iterator::{
     BucketFilterIterator, KvIterator, SchemaEvolvingIterator, SortedRun, VlogSeqOffsetIterator,
 };
 use crate::metrics_manager::MetricsManager;
+use crate::parquet::ParquetIterator;
 use crate::schema::{Schema, SchemaManager};
 use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
@@ -942,18 +943,27 @@ impl LSMTree {
                 } else {
                     Box::new(reader)
                 };
-                let sst_options = SSTIteratorOptions {
-                    metrics: Some(Arc::clone(&sst_metrics)),
-                    num_columns: source_schema.num_columns(),
-                    bloom_filter_enabled: true,
-                    ..SSTIteratorOptions::default()
+                let iter: DynKvIterator = match file.file_type {
+                    DataFileType::SSTable => {
+                        let sst_options = SSTIteratorOptions {
+                            metrics: Some(Arc::clone(&sst_metrics)),
+                            num_columns: source_schema.num_columns(),
+                            bloom_filter_enabled: true,
+                            ..SSTIteratorOptions::default()
+                        };
+                        Box::new(SSTIterator::with_cache_and_file(
+                            reader,
+                            file,
+                            sst_options,
+                            block_cache.clone(),
+                        )?)
+                    }
+                    DataFileType::Parquet => Box::new(ParquetIterator::from_data_file(
+                        reader,
+                        file,
+                        block_cache.clone(),
+                    )?),
                 };
-                let iter = SSTIterator::with_cache_and_file(
-                    reader,
-                    file,
-                    sst_options,
-                    block_cache.clone(),
-                )?;
                 let base_iter: DynKvIterator = if file.needs_bucket_filter() {
                     Box::new(BucketFilterIterator::new(
                         iter,
@@ -1015,27 +1025,51 @@ impl LSMTree {
             return Ok(true);
         }
         let reader = file_manager.open_data_file_reader(file.file_id)?;
-        let mut iter = SSTIterator::with_cache_and_file(
-            Box::new(reader),
-            file.as_ref(),
-            SSTIteratorOptions {
-                num_columns: source_num_columns,
-                metrics: Some(Arc::clone(&self.sst_metrics)),
-                bloom_filter_enabled: true,
-                ..SSTIteratorOptions::default()
-            },
-            self.block_cache.clone(),
-        )?;
-        if iter.may_contain(encoded_key)? {
-            iter.seek(encoded_key)?;
-        } else {
-            return Ok(true);
-        }
-        if iter.valid()
-            && let Some(current_key) = iter.key()?
-            && current_key.as_ref() == encoded_key
-            && let Some(value_bytes) = iter.value()?
-        {
+        let value_bytes_opt = match file.file_type {
+            DataFileType::SSTable => {
+                let mut iter = SSTIterator::with_cache_and_file(
+                    Box::new(reader),
+                    file.as_ref(),
+                    SSTIteratorOptions {
+                        num_columns: source_num_columns,
+                        metrics: Some(Arc::clone(&self.sst_metrics)),
+                        bloom_filter_enabled: true,
+                        ..SSTIteratorOptions::default()
+                    },
+                    self.block_cache.clone(),
+                )?;
+                if iter.may_contain(encoded_key)? {
+                    iter.seek(encoded_key)?;
+                    if iter.valid()
+                        && let Some(current_key) = iter.key()?
+                        && current_key.as_ref() == encoded_key
+                    {
+                        iter.value()?
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            DataFileType::Parquet => {
+                let mut iter = ParquetIterator::from_data_file(
+                    Box::new(reader),
+                    file.as_ref(),
+                    self.block_cache.clone(),
+                )?;
+                iter.seek(encoded_key)?;
+                if iter.valid()
+                    && let Some(current_key) = iter.key()?
+                    && current_key.as_ref() == encoded_key
+                {
+                    iter.value()?
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(value_bytes) = value_bytes_opt {
             let value = if file.schema_id == target_schema_id {
                 let mut value_bytes = value_bytes;
                 let value = decode_value_masked(

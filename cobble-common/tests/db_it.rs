@@ -137,6 +137,62 @@ fn snapshot_vlog_file_paths(manifest_json: &JsonValue) -> Vec<String> {
         .collect()
 }
 
+fn config_with_data_file_type(config: Config, data_file_type: &str) -> Config {
+    let mut json = serde_json::to_value(config).expect("serialize config");
+    json["data_file_type"] = JsonValue::String(data_file_type.to_string());
+    serde_json::from_value(json).expect("deserialize config with data_file_type")
+}
+
+fn snapshot_tree_file_types(manifest_json: &JsonValue) -> Vec<String> {
+    let mut kinds = Vec::new();
+    if let Some(tree_levels) = manifest_json
+        .get("tree_levels")
+        .and_then(|value| value.as_array())
+    {
+        for levels in tree_levels {
+            for level in levels.as_array().into_iter().flatten() {
+                for file in level
+                    .get("files")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(file_type) = file.get("file_type").and_then(|value| value.as_str())
+                    {
+                        kinds.push(file_type.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tree_edits) = manifest_json
+        .get("tree_level_edits")
+        .and_then(|value| value.as_array())
+    {
+        for tree_edit in tree_edits {
+            for level_edit in tree_edit
+                .get("level_edits")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+            {
+                for file in level_edit
+                    .get("new_files")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(file_type) = file.get("file_type").and_then(|value| value.as_str())
+                    {
+                        kinds.push(file_type.to_string());
+                    }
+                }
+            }
+        }
+    }
+    kinds
+}
+
 fn open_db(config: Config) -> Db {
     let total_buckets = config.total_buckets;
     let full_range = 0u16..=u16::try_from(total_buckets - 1).expect("total_buckets must fit u16");
@@ -1591,6 +1647,66 @@ fn test_db_multi_lsm_snapshot_restore_and_resume() {
     let bucket_snapshot = resumed.shard_snapshot_input(snapshot_id).unwrap();
     assert_eq!(bucket_snapshot.ranges, ranges);
     resumed.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_parquet_snapshot_restore_and_read_only() {
+    let root = "/tmp/db_parquet_snapshot_restore_readonly";
+    cleanup_test_root(root);
+    let config = config_with_data_file_type(
+        Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            memtable_capacity: 256,
+            memtable_buffer_count: 2,
+            num_columns: 1,
+            total_buckets: 4,
+            block_cache_size: 0,
+            ..Config::default()
+        },
+        "parquet",
+    );
+    let ranges = vec![0u16..=1u16, 2u16..=3u16];
+    let db = Db::open(config.clone(), ranges.clone()).unwrap();
+    db.put(0, b"k-left", 0, b"v-left").unwrap();
+    db.put(3, b"k-right", 0, b"v-right").unwrap();
+    let snapshot_id = db.snapshot().unwrap();
+    let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&manifest).unwrap();
+    let file_types = snapshot_tree_file_types(&manifest_json);
+    assert!(
+        !file_types.is_empty() && file_types.iter().all(|t| t == "parquet"),
+        "expected parquet files in manifest, got {:?}",
+        file_types
+    );
+    db.close().unwrap();
+
+    let read_only = Db::open_read_only(config.clone(), snapshot_id, db.id().to_string()).unwrap();
+    let left = read_only
+        .get(0, b"k-left", &ReadOptions::default())
+        .unwrap()
+        .expect("left value");
+    assert_eq!(left[0].as_ref().unwrap().as_ref(), b"v-left");
+    let right = read_only
+        .get(3, b"k-right", &ReadOptions::default())
+        .unwrap()
+        .expect("right value");
+    assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
+
+    let restored =
+        Db::open_from_snapshot(config.clone(), snapshot_id, db.id().to_string()).unwrap();
+    let left = restored
+        .get(0, b"k-left", &ReadOptions::default())
+        .unwrap()
+        .expect("left value after restore");
+    assert_eq!(left[0].as_ref().unwrap().as_ref(), b"v-left");
+    let right = restored
+        .get(3, b"k-right", &ReadOptions::default())
+        .unwrap()
+        .expect("right value after restore");
+    assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
+    restored.close().unwrap();
     cleanup_test_root(root);
 }
 
