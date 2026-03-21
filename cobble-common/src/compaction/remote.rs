@@ -15,12 +15,14 @@ use crate::merge_operator::{
     default_merge_operator,
 };
 use crate::metrics_manager::MetricsManager;
+use crate::parquet::ParquetWriterOptions;
 use crate::schema::{Schema, SchemaManager};
 use crate::sst::SSTWriterOptions;
 use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::util::init_logging;
 use crate::vlog::VlogEdit;
+use crate::writer_options::WriterOptions;
 use bytes::Bytes;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -78,6 +80,76 @@ impl RemoteSstOptions {
             bloom_bits_per_key: self.bloom_bits_per_key,
             partitioned_index: self.partitioned_index,
             compression: self.compression,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RemoteParquetOptions {
+    row_group_size_bytes: usize,
+    buffer_size: usize,
+    num_columns: usize,
+}
+
+impl RemoteParquetOptions {
+    fn from_parquet_options(options: &ParquetWriterOptions, num_columns: usize) -> Self {
+        Self {
+            row_group_size_bytes: options.row_group_size_bytes,
+            buffer_size: options.buffer_size,
+            num_columns,
+        }
+    }
+
+    fn into_parquet_options(self) -> ParquetWriterOptions {
+        ParquetWriterOptions {
+            row_group_size_bytes: self.row_group_size_bytes,
+            buffer_size: self.buffer_size,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "options", rename_all = "snake_case")]
+enum RemoteWriterOptions {
+    Sst(RemoteSstOptions),
+    Parquet(RemoteParquetOptions),
+}
+
+impl RemoteWriterOptions {
+    fn from_writer_options(options: &WriterOptions, num_columns: usize) -> Self {
+        match options {
+            WriterOptions::Sst(sst_options) => {
+                Self::Sst(RemoteSstOptions::from_sst_options(sst_options))
+            }
+            WriterOptions::Parquet(parquet_options) => Self::Parquet(
+                RemoteParquetOptions::from_parquet_options(parquet_options, num_columns),
+            ),
+        }
+    }
+
+    fn data_file_type(&self) -> DataFileType {
+        match self {
+            Self::Sst(_) => DataFileType::SSTable,
+            Self::Parquet(_) => DataFileType::Parquet,
+        }
+    }
+
+    fn num_columns(&self) -> usize {
+        match self {
+            Self::Sst(options) => options.num_columns,
+            Self::Parquet(options) => options.num_columns,
+        }
+    }
+
+    fn into_writer_options(self, metrics_manager: &MetricsManager) -> WriterOptions {
+        match self {
+            Self::Sst(options) => {
+                let mut sst_options = options.into_sst_options();
+                sst_options.metrics =
+                    Some(metrics_manager.sst_writer_metrics(sst_options.compression));
+                WriterOptions::Sst(sst_options)
+            }
+            Self::Parquet(options) => WriterOptions::Parquet(options.into_parquet_options()),
         }
     }
 }
@@ -197,8 +269,7 @@ struct RemoteCompactionRequest {
     db_id: String,
     lsm_tree_idx: usize,
     output_level: u8,
-    data_file_type: String,
-    sst_options: RemoteSstOptions,
+    writer_options: RemoteWriterOptions,
     ttl_config: RemoteTtlConfig,
     ttl_now_seconds: u32,
     runs: Vec<RemoteSortedRun>,
@@ -218,7 +289,7 @@ impl fmt::Display for RemoteCompactionRequest {
             self.db_id,
             self.lsm_tree_idx,
             self.output_level,
-            self.data_file_type,
+            self.writer_options.data_file_type(),
             self.runs.len(),
             file_count
         )
@@ -344,8 +415,11 @@ impl RemoteCompactionWorker {
             .map(|run| RemoteSortedRun::from_sorted_run(run, &self.file_manager))
             .collect::<Result<Vec<_>>>()?;
         let schema = self.schema_manager.latest_schema();
-        let mut sst_options = super::build_sst_writer_options(&self.config, output_level);
-        sst_options.num_columns = schema.num_columns();
+        let mut writer_options =
+            super::build_writer_options(&self.config, output_level, data_file_type);
+        if let WriterOptions::Sst(sst_options) = &mut writer_options {
+            sst_options.num_columns = schema.num_columns();
+        }
         let merge_operator_ids = schema.operator_ids(schema.num_columns());
         for merge_operator_id in &merge_operator_ids {
             if !self
@@ -363,8 +437,10 @@ impl RemoteCompactionWorker {
             db_id: self.metrics_manager.db_id().to_string(),
             lsm_tree_idx,
             output_level,
-            data_file_type: data_file_type.to_string(),
-            sst_options: RemoteSstOptions::from_sst_options(&sst_options),
+            writer_options: RemoteWriterOptions::from_writer_options(
+                &writer_options,
+                schema.num_columns(),
+            ),
             ttl_config: RemoteTtlConfig {
                 enabled: self.ttl_config.enabled,
                 default_ttl_seconds: self.ttl_config.default_ttl_seconds,
@@ -619,13 +695,10 @@ impl RemoteCompactionServer {
     ) -> Result<RemoteCompactionOutput> {
         let file_manager =
             Self::file_manager_for_with(config, &data_volumes, &request.db_id, &metrics_manager)?;
-        let data_file_type =
-            DataFileType::from_str(&request.data_file_type).map_err(Error::IoError)?;
-        let mut sst_options = request.sst_options.into_sst_options();
-        sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
-        let num_columns = sst_options.num_columns;
-        let file_builder_factory =
-            super::make_data_file_builder_factory(data_file_type, sst_options);
+        let data_file_type = request.writer_options.data_file_type();
+        let num_columns = request.writer_options.num_columns();
+        let writer_options = request.writer_options.into_writer_options(&metrics_manager);
+        let file_builder_factory = super::make_data_file_builder_factory(writer_options);
         let sorted_runs = request
             .runs
             .into_iter()
@@ -835,11 +908,13 @@ fn send_compaction_request_to(
 mod tests {
     use super::*;
     use crate::VolumeDescriptor;
-    use crate::compaction::build_sst_writer_options;
+    use crate::compaction::{build_sst_writer_options, make_data_file_builder_factory};
     use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
     use crate::lsm::{LSMTree, LSMTreeVersion, Level};
+    use crate::parquet::ParquetIterator;
     use crate::sst::row_codec::{decode_value, encode_value};
     use crate::r#type::{Column, Value, ValueType};
+    use crate::writer_options::WriterOptions;
     use serial_test::serial;
     use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
@@ -869,6 +944,37 @@ mod tests {
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
         let data_file = DataFile::new(
             DataFileType::SSTable,
+            first_key,
+            last_key,
+            file_id,
+            TrackedFileId::new(file_manager, file_id),
+            0,
+            file_size,
+            bucket_range.clone(),
+            bucket_range,
+        );
+        data_file.set_meta_bytes(footer_bytes);
+        Ok(Arc::new(data_file))
+    }
+
+    fn create_test_parquet(
+        file_manager: &Arc<FileManager>,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Arc<DataFile>> {
+        let (file_id, writer_file) = file_manager.create_data_file_with_offload()?;
+        let factory =
+            make_data_file_builder_factory(WriterOptions::Parquet(ParquetWriterOptions {
+                row_group_size_bytes: 256 * 1024,
+                buffer_size: 8192,
+            }));
+        let mut writer = factory(Box::new(writer_file));
+        for (key, value) in entries {
+            writer.add(&key, &value)?;
+        }
+        let (first_key, last_key, file_size, footer_bytes) = writer.finish()?;
+        let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
+        let data_file = DataFile::new(
+            DataFileType::Parquet,
             first_key,
             last_key,
             file_id,
@@ -1174,6 +1280,134 @@ mod tests {
             }
         }
         assert_eq!(actual, expected);
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_remote_compaction_roundtrip_parquet_output() {
+        let root = "/tmp/remote_compaction_roundtrip_parquet";
+        cleanup_test_root(root);
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            base_file_size: 128,
+            sst_bloom_filter_enabled: true,
+            compaction_threads: 2,
+            ..Config::default()
+        };
+        let db_id = "remote-compaction-roundtrip-parquet".to_string();
+        let metrics_manager = Arc::new(MetricsManager::new(&db_id));
+        let file_manager = Arc::new(
+            FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
+        );
+        let num_columns = config.num_columns;
+        let entries_a = (0..40)
+            .map(|idx| {
+                let key = format!("a{:03}", idx).into_bytes();
+                let value = make_typed_value_bytes(ValueType::Put, b"va", num_columns);
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+        let entries_b = (0..40)
+            .map(|idx| {
+                let key = format!("b{:03}", idx).into_bytes();
+                let value = make_typed_value_bytes(ValueType::Put, b"vb", num_columns);
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+        let file_a = create_test_parquet(&file_manager, entries_a).unwrap();
+        let file_b = create_test_parquet(&file_manager, entries_b).unwrap();
+
+        let lsm_version = LSMTreeVersion {
+            levels: vec![
+                Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: vec![Arc::clone(&file_a), Arc::clone(&file_b)],
+                },
+                Level {
+                    ordinal: 1,
+                    tiered: false,
+                    files: Vec::new(),
+                },
+            ],
+        };
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::clone(&db_state),
+            Arc::clone(&metrics_manager),
+        ));
+
+        let remote_timeout = Duration::from_millis(config.compaction_remote_timeout_ms);
+        let server = Arc::new(RemoteCompactionServer::new(config.clone()).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = {
+            let server = Arc::clone(&server);
+            std::thread::spawn(move || {
+                for _ in 0..2 {
+                    if let Ok((stream, _)) = listener.accept() {
+                        server.handle_connection(stream).unwrap();
+                    }
+                }
+            })
+        };
+        let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
+        let worker = RemoteCompactionWorker::new(
+            addr.to_string(),
+            Arc::clone(&file_manager),
+            Arc::downgrade(&lsm_tree),
+            config.clone(),
+            TtlConfig {
+                enabled: false,
+                default_ttl_seconds: None,
+            },
+            remote_timeout,
+            Arc::clone(&metrics_manager),
+            Arc::clone(&schema_manager),
+        )
+        .unwrap();
+
+        let runs = vec![
+            SortedRun::new(0, vec![file_a]),
+            SortedRun::new(0, vec![file_b]),
+        ];
+        let handle = worker
+            .submit_runs(
+                0,
+                runs,
+                1,
+                DataFileType::Parquet,
+                Arc::new(TTLProvider::disabled()),
+            )
+            .expect("compaction handle");
+        let runtime = Runtime::new().unwrap();
+        runtime.block_on(handle).unwrap().unwrap();
+        let _ = server_thread.join();
+
+        let level1 = lsm_tree.level_files(1);
+        assert!(!level1.is_empty());
+        assert!(
+            level1
+                .iter()
+                .all(|file| file.file_type == DataFileType::Parquet)
+        );
+        for file in level1 {
+            let reader = file_manager.open_data_file_reader(file.file_id).unwrap();
+            let mut iter =
+                ParquetIterator::from_data_file(Box::new(reader), file.as_ref(), None).unwrap();
+            iter.seek_to_first().unwrap();
+            assert!(iter.valid());
+        }
         cleanup_test_root(root);
     }
 }

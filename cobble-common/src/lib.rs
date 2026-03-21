@@ -37,6 +37,7 @@ mod r#type;
 mod util;
 mod vlog;
 mod write_batch;
+mod writer_options;
 
 pub use compaction::RemoteCompactionServer;
 pub use config::{

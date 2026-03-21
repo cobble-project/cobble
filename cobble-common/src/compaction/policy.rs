@@ -1,5 +1,6 @@
 use crate::config::CompactionPolicyKind;
 use crate::data_file::DataFile;
+use crate::data_file::DataFileType;
 use crate::file::FileId;
 use crate::iterator::SortedRun;
 use crate::lsm::Level;
@@ -25,6 +26,7 @@ pub(crate) struct CompactionConfig {
     pub(crate) partitioned_index: bool,
     pub(crate) max_threads: usize,
     pub(crate) split_trigger_level: Option<u8>,
+    pub(crate) output_file_type: DataFileType,
 }
 
 impl Default for CompactionConfig {
@@ -46,6 +48,7 @@ impl Default for CompactionConfig {
             partitioned_index: false,
             max_threads: 4,
             split_trigger_level: None,
+            output_file_type: DataFileType::SSTable,
         }
     }
 }

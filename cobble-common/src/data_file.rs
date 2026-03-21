@@ -1,14 +1,18 @@
 use crate::file::{FileId, TrackedFileId};
 use crate::r#type::key_bucket;
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub enum DataFileType {
+    #[default]
+    #[serde(rename = "sst")]
     SSTable,
+    #[serde(rename = "parquet")]
     Parquet,
 }
 

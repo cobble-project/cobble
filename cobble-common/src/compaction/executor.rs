@@ -585,11 +585,13 @@ mod tests {
     use crate::file::{FileSystemRegistry, TrackedFileId};
     use crate::metrics_manager::MetricsManager;
     use crate::parquet::ParquetIterator;
+    use crate::parquet::ParquetWriterOptions;
     use crate::schema::Schema;
     use crate::sst::row_codec::encode_value;
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::Value;
     use crate::r#type::{Column, ValueType, decode_merge_separated_array};
+    use crate::writer_options::WriterOptions;
 
     fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {
         let value = Value::new(vec![Some(Column::new(ValueType::Put, data.to_vec()))]);
@@ -1468,19 +1470,12 @@ mod tests {
             target_file_size: 1024 * 1024,
             ..Default::default()
         };
-        let factory = crate::compaction::make_data_file_builder_factory(
-            DataFileType::Parquet,
-            SSTWriterOptions {
-                metrics: None,
-                block_size: options.block_size,
+        let factory = crate::compaction::make_data_file_builder_factory(WriterOptions::Parquet(
+            ParquetWriterOptions {
+                row_group_size_bytes: 256 * 1024,
                 buffer_size: options.buffer_size,
-                num_columns: options.num_columns,
-                bloom_filter_enabled: options.bloom_filter_enabled,
-                bloom_bits_per_key: options.bloom_bits_per_key,
-                partitioned_index: options.partitioned_index,
-                compression: crate::SstCompressionAlgorithm::None,
             },
-        );
+        ));
         let task = CompactionTask::new(
             Arc::new(CompactionTaskMetrics::new("test")),
             Arc::new(crate::sst::SSTIteratorMetrics::new("test")),
@@ -1557,19 +1552,12 @@ mod tests {
             target_file_size: 1024 * 1024,
             ..Default::default()
         };
-        let factory = crate::compaction::make_data_file_builder_factory(
-            DataFileType::Parquet,
-            SSTWriterOptions {
-                metrics: None,
-                block_size: options.block_size,
+        let factory = crate::compaction::make_data_file_builder_factory(WriterOptions::Parquet(
+            ParquetWriterOptions {
+                row_group_size_bytes: 256 * 1024,
                 buffer_size: options.buffer_size,
-                num_columns: options.num_columns,
-                bloom_filter_enabled: options.bloom_filter_enabled,
-                bloom_bits_per_key: options.bloom_bits_per_key,
-                partitioned_index: options.partitioned_index,
-                compression: crate::SstCompressionAlgorithm::None,
             },
-        );
+        ));
         let task = CompactionTask::new(
             Arc::new(CompactionTaskMetrics::new("test")),
             Arc::new(crate::sst::SSTIteratorMetrics::new("test")),

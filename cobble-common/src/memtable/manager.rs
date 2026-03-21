@@ -24,6 +24,7 @@ use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotManager};
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use crate::r#type::{RefKey, RefValue};
 use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
+use crate::writer_options::WriterOptions;
 use log::{debug, trace, warn};
 use metrics::{Counter, counter};
 use uuid::Uuid;
@@ -39,9 +40,8 @@ pub(crate) struct MemtableFlushResult {
 pub(crate) struct MemtableManagerOptions {
     pub(crate) memtable_capacity: usize,
     pub(crate) buffer_count: usize,
-    pub(crate) sst_options: SSTWriterOptions,
+    pub(crate) writer_options: WriterOptions,
     pub(crate) file_builder_factory: Option<Arc<FileBuilderFactory>>,
-    pub(crate) data_file_type: DataFileType,
     pub(crate) num_columns: usize,
     pub(crate) memtable_type: MemtableType,
     pub(crate) write_stall_limit: usize,
@@ -76,12 +76,11 @@ impl Default for MemtableManagerOptions {
         Self {
             memtable_capacity: 1024 * 1024,
             buffer_count: 2,
-            sst_options: SSTWriterOptions {
+            writer_options: WriterOptions::Sst(SSTWriterOptions {
                 bloom_filter_enabled: true,
                 ..SSTWriterOptions::default()
-            },
+            }),
             file_builder_factory: None,
-            data_file_type: DataFileType::SSTable,
             num_columns: 1,
             memtable_type: MemtableType::Hash,
             write_stall_limit: 8,
@@ -101,7 +100,7 @@ pub(crate) struct MemtableManager {
     flush_done: Arc<Condvar>,
     file_manager: Arc<FileManager>,
     file_builder_factory: Arc<FileBuilderFactory>,
-    data_file_type: DataFileType,
+    writer_options: WriterOptions,
     lsm_tree: Arc<LSMTree>,
     db_state: Arc<DbStateHandle>,
     db_lifecycle: Arc<DbLifecycle>,
@@ -351,10 +350,10 @@ impl MemtableManager {
         let flush_done = Arc::new(Condvar::new());
         let db_state = lsm_tree.db_state();
         if let Some(manager) = &options.metrics_manager
-            && options.sst_options.metrics.is_none()
+            && let WriterOptions::Sst(sst_options) = &mut options.writer_options
+            && sst_options.metrics.is_none()
         {
-            options.sst_options.metrics =
-                Some(manager.sst_writer_metrics(options.sst_options.compression));
+            sst_options.metrics = Some(manager.sst_writer_metrics(sst_options.compression));
         }
         let metrics = options
             .metrics_manager
@@ -377,8 +376,7 @@ impl MemtableManager {
         );
         let file_builder_factory = options.file_builder_factory.unwrap_or_else(|| {
             Arc::new(make_data_file_builder_factory(
-                options.data_file_type,
-                options.sst_options.clone(),
+                options.writer_options.clone(),
             ))
         });
         let vlog_store = options.vlog_store.unwrap_or_else(|| {
@@ -394,7 +392,7 @@ impl MemtableManager {
             Arc::clone(&flush_done),
             Arc::clone(&file_manager),
             Arc::clone(&file_builder_factory),
-            options.data_file_type,
+            options.writer_options.clone(),
             Arc::clone(&lsm_tree),
             lsm_tree.ttl_provider(),
             Arc::clone(&db_lifecycle),
@@ -407,7 +405,7 @@ impl MemtableManager {
             flush_done,
             file_manager,
             file_builder_factory,
-            data_file_type: options.data_file_type,
+            writer_options: options.writer_options,
             lsm_tree,
             db_state,
             db_lifecycle,
@@ -460,7 +458,7 @@ impl MemtableManager {
         flush_done: Arc<Condvar>,
         file_manager: Arc<FileManager>,
         file_builder_factory: Arc<FileBuilderFactory>,
-        data_file_type: DataFileType,
+        writer_options: WriterOptions,
         lsm_tree: Arc<LSMTree>,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
         db_lifecycle: Arc<DbLifecycle>,
@@ -472,6 +470,7 @@ impl MemtableManager {
         let flush_done_clone = Arc::clone(&flush_done);
         let file_manager_clone = Arc::clone(&file_manager);
         let file_builder_factory_clone = Arc::clone(&file_builder_factory);
+        let writer_options_clone = writer_options.clone();
         let lsm_tree_clone = Arc::clone(&lsm_tree);
         let db_state_clone = lsm_tree_clone.db_state();
         let ttl_provider_clone = Arc::clone(&ttl_provider);
@@ -506,7 +505,7 @@ impl MemtableManager {
                             Arc::clone(&vlog_store_clone),
                             multi_lsm_version,
                             0,
-                            data_file_type,
+                            writer_options_clone.data_file_type(),
                         );
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
@@ -1327,7 +1326,7 @@ impl MemtableManager {
                 Arc::clone(&self.vlog_store),
                 multi_lsm_version,
                 vlog_file_seq_offset,
-                self.data_file_type,
+                self.writer_options.data_file_type(),
             )?;
             self.metrics.flushes_total.increment(1);
             let flushed_bytes: u64 = result
@@ -1779,19 +1778,17 @@ fn make_sst_builder_factory(options: SSTWriterOptions) -> FileBuilderFactory {
     })
 }
 
-fn make_data_file_builder_factory(
-    data_file_type: DataFileType,
-    sst_options: SSTWriterOptions,
-) -> FileBuilderFactory {
-    match data_file_type {
-        DataFileType::SSTable => make_sst_builder_factory(sst_options),
-        DataFileType::Parquet => Box::new(move |writer| {
+fn make_data_file_builder_factory(writer_options: WriterOptions) -> FileBuilderFactory {
+    match writer_options {
+        WriterOptions::Sst(sst_options) => make_sst_builder_factory(sst_options),
+        WriterOptions::Parquet(parquet_options) => Box::new(move |writer| {
+            let parquet_options = parquet_options.clone();
             Box::new(
                 ParquetWriter::with_options(
                     writer,
                     ParquetWriterOptions {
-                        buffer_size: sst_options.buffer_size,
-                        ..ParquetWriterOptions::default()
+                        row_group_size_bytes: parquet_options.row_group_size_bytes,
+                        buffer_size: parquet_options.buffer_size,
                     },
                 )
                 .expect("failed to create parquet writer"),
@@ -1836,10 +1833,10 @@ mod tests {
             MemtableManagerOptions {
                 memtable_capacity: 256,
                 buffer_count: 2,
-                sst_options: SSTWriterOptions {
+                writer_options: WriterOptions::Sst(SSTWriterOptions {
                     bloom_filter_enabled: true,
                     ..SSTWriterOptions::default()
-                },
+                }),
                 file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
@@ -2112,10 +2109,10 @@ mod tests {
             MemtableManagerOptions {
                 memtable_capacity: 256,
                 buffer_count: 2,
-                sst_options: SSTWriterOptions {
+                writer_options: WriterOptions::Sst(SSTWriterOptions {
                     bloom_filter_enabled: true,
                     ..SSTWriterOptions::default()
-                },
+                }),
                 file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
@@ -2165,10 +2162,10 @@ mod tests {
                 memtable_capacity: 192,
                 buffer_count: 2,
                 memtable_type: MemtableType::Vec,
-                sst_options: SSTWriterOptions {
+                writer_options: WriterOptions::Sst(SSTWriterOptions {
                     bloom_filter_enabled: true,
                     ..SSTWriterOptions::default()
-                },
+                }),
                 file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,

@@ -104,10 +104,11 @@ impl ReadOnlyDb {
             &lsm_tree_bucket_ranges,
             tree_versions.into_iter().map(Arc::new).collect(),
         )?;
-        let sst_options = crate::compaction::build_sst_writer_options(&config, 0);
+        let writer_options =
+            crate::compaction::build_writer_options(&config, 0, config.data_file_type);
         let vlog_store = Arc::new(VlogStore::new(
             Arc::clone(&file_manager),
-            sst_options.buffer_size,
+            writer_options.buffer_size(),
             config.value_separation_threshold,
         ));
 

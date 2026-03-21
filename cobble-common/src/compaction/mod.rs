@@ -23,6 +23,7 @@ pub(crate) use remote::RemoteCompactionWorker;
 #[allow(unused_imports)]
 pub(crate) use crate::format::{FileBuilder, FileBuilderFactory};
 
+use crate::data_file::DataFileType;
 use crate::db_status::DbLifecycle;
 use crate::error::Result;
 use crate::iterator::SortedRun;
@@ -31,6 +32,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::parquet::{ParquetWriter, ParquetWriterOptions};
 use crate::schema::SchemaManager;
 use crate::sst::SSTWriterOptions;
+use crate::writer_options::WriterOptions;
 use log::info;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -40,7 +42,7 @@ pub(crate) trait CompactionWorker: Send + Sync {
         lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
-        data_file_type: crate::data_file::DataFileType,
+        data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>>;
     fn shutdown(&self);
@@ -98,7 +100,7 @@ impl LocalCompactionWorker {
         lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
-        data_file_type: crate::data_file::DataFileType,
+        data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>> {
         if sorted_runs.is_empty() {
@@ -109,13 +111,19 @@ impl LocalCompactionWorker {
             return None;
         }
         let sst_metrics = tree.sst_metrics();
-        let mut sst_options = build_sst_writer_options(&self.config, output_level);
-        sst_options.num_columns = self.schema_manager.current_num_columns();
-        sst_options.metrics = Some(
-            self.metrics_manager
-                .sst_writer_metrics(sst_options.compression),
-        );
-        let file_builder_factory = make_data_file_builder_factory(data_file_type, sst_options);
+        let runtime_num_columns = self.schema_manager.current_num_columns();
+        let mut writer_options = build_writer_options(&self.config, output_level, data_file_type);
+        match &mut writer_options {
+            WriterOptions::Sst(sst_options) => {
+                sst_options.num_columns = runtime_num_columns;
+                sst_options.metrics = Some(
+                    self.metrics_manager
+                        .sst_writer_metrics(sst_options.compression),
+                );
+            }
+            WriterOptions::Parquet(_) => {}
+        }
+        let file_builder_factory = make_data_file_builder_factory(writer_options);
         let task = CompactionTask::new(
             Arc::clone(&self.compaction_metrics),
             sst_metrics,
@@ -144,7 +152,7 @@ impl CompactionWorker for LocalCompactionWorker {
         lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
-        data_file_type: crate::data_file::DataFileType,
+        data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>> {
         self.submit_runs_inner(
@@ -179,17 +187,18 @@ pub(crate) fn make_parquet_builder_factory(
 }
 
 pub(crate) fn make_data_file_builder_factory(
-    data_file_type: crate::data_file::DataFileType,
-    sst_options: SSTWriterOptions,
+    writer_options: WriterOptions,
 ) -> Arc<FileBuilderFactory> {
-    match data_file_type {
-        crate::data_file::DataFileType::SSTable => make_sst_builder_factory(sst_options),
-        crate::data_file::DataFileType::Parquet => {
-            make_parquet_builder_factory(ParquetWriterOptions {
-                buffer_size: sst_options.buffer_size,
-                ..ParquetWriterOptions::default()
-            })
-        }
+    match writer_options {
+        WriterOptions::Sst(options) => make_sst_builder_factory(options),
+        WriterOptions::Parquet(options) => make_parquet_builder_factory(options),
+    }
+}
+
+pub(crate) fn build_parquet_writer_options(config: &crate::Config) -> ParquetWriterOptions {
+    ParquetWriterOptions {
+        row_group_size_bytes: config.parquet_row_group_size_bytes.max(1),
+        ..ParquetWriterOptions::default()
     }
 }
 
@@ -201,6 +210,17 @@ pub(crate) fn build_sst_writer_options(config: &crate::Config, level: u8) -> SST
         partitioned_index: config.sst_partitioned_index,
         compression: config.sst_compression_for_level(level),
         ..SSTWriterOptions::default()
+    }
+}
+
+pub(crate) fn build_writer_options(
+    config: &crate::Config,
+    level: u8,
+    data_file_type: DataFileType,
+) -> WriterOptions {
+    match data_file_type {
+        DataFileType::SSTable => WriterOptions::Sst(build_sst_writer_options(config, level)),
+        DataFileType::Parquet => WriterOptions::Parquet(build_parquet_writer_options(config)),
     }
 }
 
@@ -219,6 +239,7 @@ pub(crate) fn build_compaction_config(config: &crate::Config) -> CompactionConfi
         read_ahead_enabled: config.compaction_read_ahead_enabled,
         max_threads: config.compaction_threads,
         split_trigger_level: config.lsm_split_trigger_level,
+        output_file_type: config.data_file_type,
         ..CompactionConfig::default()
     }
 }

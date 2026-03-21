@@ -1,4 +1,5 @@
 use crate::SstCompressionAlgorithm;
+use crate::data_file::DataFileType;
 use crate::error::Result;
 use crate::time::TimeProviderKind;
 use crate::util::normalize_storage_path_to_url;
@@ -359,6 +360,10 @@ pub struct Config {
     pub sst_bloom_bits_per_key: u32,
     /// Whether to enable two-level index and filter blocks in SST files.
     pub sst_partitioned_index: bool,
+    /// Output data-file format used by flush/compaction writers.
+    pub data_file_type: DataFileType,
+    /// Target parquet row-group size in bytes when parquet output format is selected.
+    pub parquet_row_group_size_bytes: usize,
     /// Compression algorithm per level (index by level number).
     pub sst_compression_by_level: Vec<SstCompressionAlgorithm>,
     /// Whether TTL is enabled. If false, TTL metadata is ignored.
@@ -423,6 +428,8 @@ impl Default for Config {
             sst_bloom_filter_enabled: false,
             sst_bloom_bits_per_key: 10,
             sst_partitioned_index: false,
+            data_file_type: DataFileType::SSTable,
+            parquet_row_group_size_bytes: 256 * 1024,
             sst_compression_by_level: vec![
                 SstCompressionAlgorithm::None,
                 SstCompressionAlgorithm::None,
@@ -667,6 +674,7 @@ mod tests {
         VolumeDescriptor, VolumeUsageKind,
     };
     use crate::SstCompressionAlgorithm;
+    use crate::data_file::DataFileType;
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::Builder;
@@ -704,6 +712,8 @@ mod tests {
             sst_bloom_filter_enabled: true,
             sst_bloom_bits_per_key: 11,
             sst_partitioned_index: true,
+            data_file_type: DataFileType::Parquet,
+            parquet_row_group_size_bytes: 4096,
             sst_compression_by_level: vec![
                 SstCompressionAlgorithm::None,
                 SstCompressionAlgorithm::None,
@@ -764,6 +774,8 @@ mod tests {
             PrimaryVolumeOffloadPolicyKind::LargestFile
         );
         assert_eq!(decoded.value_separation_threshold, 4096);
+        assert_eq!(decoded.data_file_type, DataFileType::Parquet);
+        assert_eq!(decoded.parquet_row_group_size_bytes, 4096);
         assert_eq!(decoded.read_proxy.block_cache_size, 2048);
         assert_eq!(decoded.read_proxy.reload_tolerance_seconds, 5);
         assert!(decoded.block_cache_hybrid_enabled);
@@ -889,5 +901,30 @@ mod tests {
         )];
         let err = config.resolve_hybrid_cache_volume_plan(2048).unwrap_err();
         assert!(matches!(err, crate::error::Error::ConfigError(_)));
+    }
+
+    #[test]
+    fn test_data_file_type_defaults_to_sst_when_missing() {
+        let json = r#"{
+            "volumes": [{"base_dir":"file:///tmp/cobble","kinds":["meta","primary_data_priority_high"]}],
+            "num_columns": 1
+        }"#;
+        let decoded: Config =
+            serde_json::from_str(json).expect("Cannot deserialize partial config");
+        assert_eq!(decoded.data_file_type, DataFileType::SSTable);
+        assert_eq!(decoded.parquet_row_group_size_bytes, 256 * 1024);
+    }
+
+    #[test]
+    fn test_data_file_type_parquet_round_trip() {
+        let json = r#"{
+            "volumes": [{"base_dir":"file:///tmp/cobble","kinds":["meta","primary_data_priority_high"]}],
+            "data_file_type":"parquet",
+            "parquet_row_group_size_bytes": 8192
+        }"#;
+        let decoded: Config =
+            serde_json::from_str(json).expect("Cannot deserialize parquet config");
+        assert_eq!(decoded.data_file_type, DataFileType::Parquet);
+        assert_eq!(decoded.parquet_row_group_size_bytes, 8192);
     }
 }

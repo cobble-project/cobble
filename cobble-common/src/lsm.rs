@@ -727,7 +727,7 @@ impl LSMTree {
             tree_idx,
             runs,
             plan.output_level,
-            crate::data_file::DataFileType::SSTable,
+            state.compaction_config.output_file_type,
             self.ttl_provider(),
         ) {
             state.pending_compaction.insert(tree_idx, expected_range);
@@ -1207,6 +1207,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingCompactionWorker {
         submitted_tree_idxs: Mutex<Vec<usize>>,
+        submitted_data_file_types: Mutex<Vec<DataFileType>>,
     }
 
     impl CompactionWorker for RecordingCompactionWorker {
@@ -1219,6 +1220,10 @@ mod tests {
             _ttl_provider: Arc<TTLProvider>,
         ) -> Option<tokio::task::JoinHandle<Result<crate::compaction::CompactionResult>>> {
             self.submitted_tree_idxs.lock().unwrap().push(lsm_tree_idx);
+            self.submitted_data_file_types
+                .lock()
+                .unwrap()
+                .push(_data_file_type);
             None
         }
 
@@ -1639,6 +1644,103 @@ mod tests {
         let mut submitted = worker.submitted_tree_idxs.lock().unwrap().clone();
         submitted.sort_unstable();
         assert_eq!(submitted, vec![0]);
+    }
+
+    #[test]
+    fn test_lsm_compaction_submits_configured_output_file_type() {
+        let db_state = Arc::new(DbStateHandle::new());
+        let multi_lsm_version = MultiLSMTreeVersion::from_parts(
+            1,
+            vec![0u32],
+            vec![Arc::new(LSMTreeVersion {
+                levels: vec![
+                    Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: vec![create_data_file_with_size(b"a", b"b", 1)],
+                    },
+                    Level {
+                        ordinal: 1,
+                        tiered: false,
+                        files: Vec::new(),
+                    },
+                ],
+            })],
+        );
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version,
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+        let worker = Arc::new(RecordingCompactionWorker::default());
+        let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
+        let mut config = crate::compaction::CompactionConfig::default();
+        config.l0_file_limit = 0;
+        config.output_file_type = DataFileType::Parquet;
+        lsm_tree.configure_compaction(config, Some(worker_dyn));
+        lsm_tree.apply_edit(
+            0,
+            VersionEdit {
+                level_edits: Vec::new(),
+            },
+            None,
+        );
+        let submitted = worker.submitted_data_file_types.lock().unwrap().clone();
+        assert_eq!(submitted, vec![DataFileType::Parquet]);
+    }
+
+    #[test]
+    fn test_lsm_compaction_submits_default_sst_output_file_type() {
+        let db_state = Arc::new(DbStateHandle::new());
+        let multi_lsm_version = MultiLSMTreeVersion::from_parts(
+            1,
+            vec![0u32],
+            vec![Arc::new(LSMTreeVersion {
+                levels: vec![
+                    Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: vec![create_data_file_with_size(b"a", b"b", 1)],
+                    },
+                    Level {
+                        ordinal: 1,
+                        tiered: false,
+                        files: Vec::new(),
+                    },
+                ],
+            })],
+        );
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version,
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+        let worker = Arc::new(RecordingCompactionWorker::default());
+        let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
+        let mut config = crate::compaction::CompactionConfig::default();
+        config.l0_file_limit = 0;
+        lsm_tree.configure_compaction(config, Some(worker_dyn));
+        lsm_tree.apply_edit(
+            0,
+            VersionEdit {
+                level_edits: Vec::new(),
+            },
+            None,
+        );
+        let submitted = worker.submitted_data_file_types.lock().unwrap().clone();
+        assert_eq!(submitted, vec![DataFileType::SSTable]);
     }
 
     #[test]

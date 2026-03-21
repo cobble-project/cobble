@@ -1,5 +1,4 @@
 use crate::block_cache::new_block_cache_with_config;
-use crate::data_file::DataFileType;
 use crate::db_builder::DbBuilder;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::{DbStateHandle, bucket_range_fits_total};
@@ -20,6 +19,7 @@ use crate::r#type::decode_merge_separated_array;
 use crate::r#type::{Column, RefColumn, RefKey, RefValue, Value, ValueType};
 use crate::vlog::{VlogPointer, VlogStore};
 use crate::write_batch::{WriteBatch, WriteOp};
+use crate::writer_options::WriterOptions;
 use crate::{Config, ReadOptions, ScanOptions, TimeProvider};
 use bytes::{Bytes, BytesMut};
 use log::info;
@@ -560,12 +560,15 @@ impl Db {
         }
         db_state.configure_multi_lsm(config.total_buckets, &bucket_ranges)?;
         let lsm_tree = Arc::new(lsm_tree);
-        let mut sst_options = crate::compaction::build_sst_writer_options(&config, 0);
-        sst_options.num_columns = runtime_num_columns;
-        sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
+        let mut memtable_writer_options =
+            crate::compaction::build_writer_options(&config, 0, config.data_file_type);
+        if let WriterOptions::Sst(sst_options) = &mut memtable_writer_options {
+            sst_options.num_columns = runtime_num_columns;
+            sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
+        }
         let vlog_store = Arc::new(VlogStore::new(
             Arc::clone(&file_manager),
-            sst_options.buffer_size,
+            memtable_writer_options.buffer_size(),
             config.value_separation_threshold,
         ));
         vlog_store.ensure_next_file_seq_at_least(initial_vlog_file_seq);
@@ -623,9 +626,8 @@ impl Db {
                 memtable_capacity: config.memtable_capacity,
                 buffer_count: config.memtable_buffer_count,
                 memtable_type: config.memtable_type,
-                sst_options,
+                writer_options: memtable_writer_options,
                 file_builder_factory: None,
-                data_file_type: DataFileType::SSTable,
                 num_columns: runtime_num_columns,
                 write_stall_limit: config.resolved_write_stall_limit(),
                 schema_manager: Some(Arc::clone(&schema_manager)),
