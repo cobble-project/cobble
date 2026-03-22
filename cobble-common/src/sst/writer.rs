@@ -5,7 +5,7 @@ use crate::sst::bloom::BloomFilterBuilder;
 use crate::sst::compression::{SstCompressionAlgorithm, write_block};
 use crate::sst::format::{BlockBuilder, Footer};
 use crate::sst::row_codec::{encode_key, encode_value};
-use crate::r#type::{Key, Value};
+use crate::r#type::{Key, KvValue, Value};
 use bytes::{BufMut, Bytes, BytesMut};
 use metrics::{Histogram, histogram};
 
@@ -413,8 +413,14 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
 
 /// Implement FileBuilder trait for SSTWriter to support compaction.
 impl<W: SequentialWriteFile + 'static> FileBuilder for SSTWriter<W> {
-    fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        SSTWriter::add(self, key, value)
+    fn add(&mut self, key: &[u8], value: &KvValue) -> Result<()> {
+        match value {
+            KvValue::Encoded(bytes) => SSTWriter::add(self, key, bytes),
+            KvValue::Decoded(v) => {
+                let encoded = encode_value(v, v.columns().len());
+                SSTWriter::add(self, key, &encoded)
+            }
+        }
     }
 
     fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>, usize, Bytes)> {

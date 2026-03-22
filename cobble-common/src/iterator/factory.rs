@@ -97,7 +97,7 @@ mod tests {
     use crate::file::{FileManager, FileSystemRegistry, TrackedFileId};
     use crate::metrics_manager::MetricsManager;
     use crate::parquet::ParquetWriter;
-    use crate::sst::row_codec::{decode_value, encode_value};
+    use crate::sst::row_codec::encode_value;
     use crate::r#type::{Column, Value, ValueType};
 
     fn cleanup_test_root(path: &str) {
@@ -155,8 +155,7 @@ mod tests {
         assert!(iter.valid());
         let key = iter.key().unwrap().unwrap();
         assert_eq!(key, &[2, 0, b'b']);
-        let mut value = iter.take_value().unwrap().unwrap().unwrap_encoded();
-        let decoded = decode_value(&mut value, 1).unwrap();
+        let decoded = iter.take_value().unwrap().unwrap().into_decoded(1).unwrap();
         assert_eq!(
             decoded.columns()[0].as_ref().unwrap().data().as_ref(),
             b"v2"

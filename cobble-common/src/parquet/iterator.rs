@@ -33,7 +33,7 @@ pub(crate) struct ParquetIterator {
     expired_at_reader: Option<Int64ColumnReader>,
     column_readers: Vec<Option<ByteArrayColumnReader>>,
     batch_keys: Vec<ByteArray>,
-    batch_values: Vec<Bytes>,
+    batch_values: Vec<Value>,
     current_idx: Option<usize>,
     previous_key: Option<Bytes>,
 }
@@ -354,8 +354,7 @@ impl ParquetIterator {
                         Some(expired_at as u32)
                     },
                 );
-                self.batch_values
-                    .push(encode_value(&value, self.num_columns));
+                self.batch_values.push(value);
             }
 
             if self.batch_keys.len() != self.batch_values.len() {
@@ -447,7 +446,9 @@ impl ParquetIterator {
     }
 
     pub(crate) fn value(&self) -> Result<Option<Bytes>> {
-        Ok(self.current_idx.map(|idx| self.batch_values[idx].clone()))
+        Ok(self
+            .current_idx
+            .map(|idx| encode_value(&self.batch_values[idx], self.num_columns)))
     }
 }
 
@@ -480,6 +481,8 @@ impl<'a> KvIterator<'a> for ParquetIterator {
     }
 
     fn take_value(&mut self) -> Result<Option<KvValue>> {
-        Ok(ParquetIterator::value(self)?.map(KvValue::Encoded))
+        Ok(self
+            .current_idx
+            .map(|idx| KvValue::Decoded(self.batch_values[idx].clone())))
     }
 }

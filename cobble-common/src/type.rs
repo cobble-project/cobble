@@ -72,6 +72,7 @@ pub(crate) struct RefColumn<'a> {
     data: &'a [u8],
 }
 
+#[derive(Clone)]
 pub(crate) struct Value {
     /// A value may consist of multiple logical columns/fields.
     /// Each column is optional and may be absent within a value.

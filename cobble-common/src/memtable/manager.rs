@@ -1481,11 +1481,10 @@ fn flush_memtable(
                     bucket,
                 ));
             }
-            let value_bytes = kv_value.into_encoded(schema.num_columns());
             let (_, builder, min_bucket, max_bucket) = builders
                 .get_mut(&tree_idx)
                 .expect("builder should exist for tree");
-            builder.add(&key, &value_bytes)?;
+            builder.add(&key, &kv_value)?;
             *min_bucket = (*min_bucket).min(bucket);
             *max_bucket = (*max_bucket).max(bucket);
         }

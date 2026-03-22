@@ -919,7 +919,7 @@ mod tests {
     use crate::lsm::{LSMTree, LSMTreeVersion, Level};
     use crate::parquet::ParquetIterator;
     use crate::sst::row_codec::{decode_value, encode_value};
-    use crate::r#type::{Column, Value, ValueType};
+    use crate::r#type::{Column, KvValue, Value, ValueType};
     use crate::writer_options::WriterOptions;
     use serial_test::serial;
     use std::collections::{HashMap, VecDeque};
@@ -976,7 +976,7 @@ mod tests {
             }));
         let mut writer = factory(Box::new(writer_file));
         for (key, value) in entries {
-            writer.add(&key, &value)?;
+            writer.add(&key, &KvValue::Encoded(Bytes::from(value)))?;
         }
         let (first_key, last_key, file_size, footer_bytes) = writer.finish()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);

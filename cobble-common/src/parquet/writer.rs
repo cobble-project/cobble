@@ -4,6 +4,7 @@ use crate::format::FileBuilder;
 use crate::parquet::file_adapter::SequentialWriteFileAdapter;
 use crate::parquet::meta::{ParquetMeta, ParquetRowGroupRange};
 use crate::sst::row_codec::decode_value;
+use crate::r#type::{KvValue, Value};
 use bytes::Bytes;
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::writer::SerializedFileWriter;
@@ -180,6 +181,23 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
     }
 
     pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut encoded_value = Bytes::copy_from_slice(value);
+        let decoded = decode_value(&mut encoded_value, self.options.num_columns)?;
+        self.add_value(
+            key,
+            &decoded,
+            key.len() + value.len(),
+            self.options.num_columns,
+        )
+    }
+
+    fn add_value(
+        &mut self,
+        key: &[u8],
+        decoded: &Value,
+        entry_bytes: usize,
+        num_columns: usize,
+    ) -> Result<()> {
         if !self.last_key.is_empty() && key <= self.last_key.as_slice() {
             return Err(Error::IoError(format!(
                 "Keys must be added in sorted order: {:?} <= {:?}",
@@ -190,9 +208,6 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
             self.first_key = Some(key.to_vec());
         }
 
-        let mut encoded_value = Bytes::copy_from_slice(value);
-        let decoded = decode_value(&mut encoded_value, self.options.num_columns)?;
-        let entry_bytes = key.len() + value.len();
         let should_flush = !self.keys.is_empty()
             && self.current_group_bytes + entry_bytes > self.options.row_group_size_bytes;
         if should_flush {
@@ -209,7 +224,7 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
         self.keys.push(ByteArray::from(Bytes::copy_from_slice(key)));
         self.expired_ats
             .push(decoded.expired_at().unwrap_or(0) as i64);
-        for idx in 0..self.options.num_columns {
+        for idx in 0..num_columns {
             if let Some(column) = decoded.columns().get(idx).and_then(|col| col.as_ref()) {
                 let mut payload = Vec::with_capacity(1 + column.data().len());
                 payload.push(column.value_type().encode_tag());
@@ -251,8 +266,22 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
 }
 
 impl<W: SequentialWriteFile + Send + 'static> FileBuilder for ParquetWriter<W> {
-    fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        ParquetWriter::add(self, key, value)
+    fn add(&mut self, key: &[u8], value: &KvValue) -> Result<()> {
+        match value {
+            KvValue::Encoded(bytes) => ParquetWriter::add(self, key, bytes),
+            KvValue::Decoded(v) => {
+                // Estimate entry size for row group flushing decisions.
+                let value_bytes_estimate = v
+                    .columns()
+                    .iter()
+                    .map(|c| c.as_ref().map_or(0, |col| 1 + col.data().len()))
+                    .sum::<usize>()
+                    + 4;
+                // Use the decoded value's column count for consistent encoding.
+                let num_cols = v.columns().len().min(self.options.num_columns);
+                self.add_value(key, v, key.len() + value_bytes_estimate, num_cols)
+            }
+        }
     }
 
     fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>, usize, Bytes)> {

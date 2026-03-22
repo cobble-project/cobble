@@ -7,7 +7,7 @@
 use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::schema::Schema;
-use crate::sst::row_codec::{decode_value, encode_value, value_expired_at, value_is_terminal};
+use crate::sst::row_codec::{decode_value, value_expired_at, value_is_terminal};
 use crate::ttl::TTLProvider;
 use crate::r#type::{Column, KvValue};
 use bytes::Bytes;
@@ -38,7 +38,7 @@ pub struct DeduplicatingIterator<I> {
     /// Current merged key (if valid).
     current_key: Option<Bytes>,
     /// Current merged value (if valid).
-    current_value: Option<Bytes>,
+    current_value: Option<KvValue>,
     /// TTL provider to evaluate expiration.
     ttl_provider: Arc<TTLProvider>,
     /// Callback invoked for every merged column pair (older, newer).
@@ -176,7 +176,7 @@ impl<I> DeduplicatingIterator<I> {
 
             if let Some(value) = selected_value {
                 self.current_key = Some(current_key);
-                self.current_value = Some(value);
+                self.current_value = Some(KvValue::Encoded(value));
                 return Ok(());
             }
 
@@ -222,9 +222,9 @@ impl<I> DeduplicatingIterator<I> {
                 }
             }
 
-            // Encode the merged value
+            // Store the merged value as Decoded to avoid re-encoding
             self.current_key = Some(current_key);
-            self.current_value = Some(encode_value(&merged_value, self.num_columns));
+            self.current_value = Some(KvValue::Decoded(merged_value));
 
             return Ok(());
         }
@@ -271,7 +271,7 @@ where
     }
 
     fn take_value(&mut self) -> Result<Option<KvValue>> {
-        Ok(self.current_value.take().map(KvValue::Encoded))
+        Ok(self.current_value.take())
     }
 }
 
@@ -337,8 +337,7 @@ mod tests {
         let mut results = vec![];
         while dedup.valid() {
             let (k, kv) = dedup.take_current().unwrap().unwrap();
-            let mut v = kv.unwrap_encoded();
-            let decoded = decode_value(&mut v, num_columns).unwrap();
+            let decoded = kv.into_decoded(num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();
         }
@@ -391,8 +390,7 @@ mod tests {
         let mut results = vec![];
         while dedup.valid() {
             let (k, kv) = dedup.take_current().unwrap().unwrap();
-            let mut v = kv.unwrap_encoded();
-            let decoded = decode_value(&mut v, num_columns).unwrap();
+            let decoded = kv.into_decoded(num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();
         }
@@ -480,8 +478,7 @@ mod tests {
         dedup.seek_to_first().unwrap();
 
         let (k, kv) = dedup.take_current().unwrap().unwrap();
-        let mut v = kv.unwrap_encoded();
-        let decoded = decode_value(&mut v, num_columns).unwrap();
+        let decoded = kv.into_decoded(num_columns).unwrap();
 
         assert_eq!(k.as_ref(), b"a");
         // The merge operation concatenates: "base" + "_suffix" should be how it works
@@ -539,8 +536,7 @@ mod tests {
         dedup.seek_to_first().unwrap();
 
         let (k, kv) = dedup.take_current().unwrap().unwrap();
-        let mut v = kv.unwrap_encoded();
-        let decoded = decode_value(&mut v, num_columns).unwrap();
+        let decoded = kv.into_decoded(num_columns).unwrap();
 
         assert_eq!(k.as_ref(), b"a");
         // Merge order: oldest to newest
@@ -585,8 +581,7 @@ mod tests {
         dedup.seek_to_first().unwrap();
 
         let (k, kv) = dedup.take_current().unwrap().unwrap();
-        let mut v = kv.unwrap_encoded();
-        let decoded = decode_value(&mut v, num_columns).unwrap();
+        let decoded = kv.into_decoded(num_columns).unwrap();
 
         assert_eq!(k.as_ref(), b"a");
         // Delete replaces the old value
@@ -688,8 +683,7 @@ mod tests {
         dedup.seek_to_first().unwrap();
 
         let (k, kv) = dedup.take_current().unwrap().unwrap();
-        let mut v = kv.unwrap_encoded();
-        let decoded = decode_value(&mut v, num_columns).unwrap();
+        let decoded = kv.into_decoded(num_columns).unwrap();
         let cols = decoded.columns();
 
         assert_eq!(k.as_ref(), b"a");
@@ -773,8 +767,7 @@ mod tests {
         let mut results = vec![];
         while dedup.valid() {
             let (k, kv) = dedup.take_current().unwrap().unwrap();
-            let mut v = kv.unwrap_encoded();
-            let decoded = decode_value(&mut v, num_columns).unwrap();
+            let decoded = kv.into_decoded(num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();
         }
@@ -851,8 +844,7 @@ mod tests {
         let mut results = vec![];
         while dedup.valid() {
             let (k, kv) = dedup.take_current().unwrap().unwrap();
-            let mut v = kv.unwrap_encoded();
-            let decoded = decode_value(&mut v, num_columns).unwrap();
+            let decoded = kv.into_decoded(num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();
         }
