@@ -419,7 +419,7 @@ impl CompactionExecutor {
             if let Some(collector) = merge_collector.as_ref() {
                 collector.borrow_mut().check_error()?;
             }
-            let (key, value) = match dedup_iter.current_slice()? {
+            let (key, kv_value) = match dedup_iter.take_current()? {
                 Some(kv) => kv,
                 None => break,
             };
@@ -435,9 +435,10 @@ impl CompactionExecutor {
                 current_builder = Some((task.file_builder_factory)(Box::new(writer)));
             }
 
+            let value_bytes = kv_value.into_encoded(target_schema.num_columns());
             // Add entry to current file
             if let Some(ref mut builder) = current_builder {
-                builder.add(key, value)?;
+                builder.add(&key, &value_bytes)?;
 
                 // Check if we should close this file and start a new one
                 if builder.offset() >= options.target_file_size {
@@ -584,8 +585,8 @@ mod tests {
     use super::*;
     use crate::file::{FileSystemRegistry, TrackedFileId};
     use crate::metrics_manager::MetricsManager;
-    use crate::parquet::{ParquetIterator, ParquetWriter};
     use crate::parquet::ParquetWriterOptions;
+    use crate::parquet::{ParquetIterator, ParquetWriter};
     use crate::schema::Schema;
     use crate::sst::row_codec::encode_value;
     use crate::sst::{SSTWriter, SSTWriterOptions};

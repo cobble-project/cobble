@@ -1,5 +1,6 @@
 use crate::error::Result;
 use crate::iterator::KvIterator;
+use crate::r#type::KvValue;
 use bytes::Bytes;
 use std::cmp::Ordering;
 
@@ -34,7 +35,7 @@ impl<I> MergingIterator<I> {
     {
         let mut indices = Vec::new();
         for (idx, iter) in self.iterators.iter().enumerate() {
-            if iter.valid() && iter.key_slice()?.is_some() {
+            if iter.valid() && iter.key()?.is_some() {
                 indices.push(idx);
             }
         }
@@ -52,8 +53,8 @@ impl<I> MergingIterator<I> {
     where
         I: KvIterator<'a>,
     {
-        let left = self.iterators[left_idx].key_slice()?;
-        let right = self.iterators[right_idx].key_slice()?;
+        let left = self.iterators[left_idx].key()?;
+        let right = self.iterators[right_idx].key()?;
         let ord = match (left, right) {
             (Some(left), Some(right)) => left.cmp(right),
             (None, Some(_)) => Ordering::Greater,
@@ -171,7 +172,7 @@ where
             iter.next()?;
 
             // Re-add to heap if still valid
-            if iter.valid() && iter.key_slice()?.is_some() {
+            if iter.valid() && iter.key()?.is_some() {
                 self.push_heap(iter_idx)?;
             }
         }
@@ -186,7 +187,7 @@ where
         self.current_idx.is_some()
     }
 
-    fn key(&self) -> Result<Option<Bytes>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         if let Some(idx) = self.current_idx {
             self.iterators[idx].key()
         } else {
@@ -194,25 +195,17 @@ where
         }
     }
 
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
         if let Some(idx) = self.current_idx {
-            self.iterators[idx].key_slice()
+            self.iterators[idx].take_key()
         } else {
             Ok(None)
         }
     }
 
-    fn value(&self) -> Result<Option<Bytes>> {
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
         if let Some(idx) = self.current_idx {
-            self.iterators[idx].value()
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        if let Some(idx) = self.current_idx {
-            self.iterators[idx].value_slice()
+            self.iterators[idx].take_value()
         } else {
             Ok(None)
         }
@@ -234,7 +227,8 @@ mod tests {
 
         let mut results = vec![];
         while merger.valid() {
-            let (k, v) = merger.current().unwrap().unwrap();
+            let (k, kv) = merger.take_current().unwrap().unwrap();
+            let v = kv.unwrap_encoded();
             results.push((k, v));
             merger.next().unwrap();
         }
@@ -267,7 +261,8 @@ mod tests {
 
         let mut results = vec![];
         while merger.valid() {
-            let (k, v) = merger.current().unwrap().unwrap();
+            let (k, kv) = merger.take_current().unwrap().unwrap();
+            let v = kv.unwrap_encoded();
             results.push((k, v));
             merger.next().unwrap();
         }
@@ -294,17 +289,17 @@ mod tests {
         // Seek to "c"
         merger.seek(b"c").unwrap();
         assert!(merger.valid());
-        assert_eq!(merger.key().unwrap().unwrap().as_ref(), b"c");
+        assert_eq!(merger.key().unwrap().unwrap(), b"c");
 
         // Seek to "d"
         merger.seek(b"d").unwrap();
         assert!(merger.valid());
-        assert_eq!(merger.key().unwrap().unwrap().as_ref(), b"d");
+        assert_eq!(merger.key().unwrap().unwrap(), b"d");
 
         // Seek to non-existent key between entries
         merger.seek(b"ca").unwrap();
         assert!(merger.valid());
-        assert_eq!(merger.key().unwrap().unwrap().as_ref(), b"d");
+        assert_eq!(merger.key().unwrap().unwrap(), b"d");
     }
 
     #[test]
@@ -316,7 +311,7 @@ mod tests {
         merger.seek_to_first().unwrap();
 
         assert!(!merger.valid());
-        assert!(merger.current().unwrap().is_none());
+        assert!(merger.take_current().unwrap().is_none());
     }
 
     #[test]
@@ -346,7 +341,7 @@ mod tests {
 
         let mut results = vec![];
         while merger.valid() {
-            let (k, _) = merger.current().unwrap().unwrap();
+            let (k, _) = merger.take_current().unwrap().unwrap();
             results.push(k);
             merger.next().unwrap();
         }
@@ -371,7 +366,7 @@ mod tests {
 
         let mut results = vec![];
         while merger.valid() {
-            let (k, _) = merger.current().unwrap().unwrap();
+            let (k, _) = merger.take_current().unwrap().unwrap();
             results.push(k);
             merger.next().unwrap();
         }

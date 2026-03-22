@@ -2,6 +2,7 @@
 //! This is used for compaction and flushing to ensure that entries are processed in the correct order.
 use crate::error::Result;
 use crate::iterator::KvIterator;
+use crate::r#type::KvValue;
 use bytes::Bytes;
 use std::cmp::Ordering;
 
@@ -91,19 +92,17 @@ impl<'a> KvIterator<'a> for OrderedMemtableKvIterator<'a> {
         self.current_key.is_some() && self.current_value.is_some()
     }
 
-    fn key(&self) -> Result<Option<Bytes>> {
-        Ok(self.current_key.map(Bytes::copy_from_slice))
-    }
-
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         Ok(self.current_key)
     }
 
-    fn value(&self) -> Result<Option<Bytes>> {
-        Ok(self.current_value.map(Bytes::copy_from_slice))
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        Ok(self.current_key.map(Bytes::copy_from_slice))
     }
 
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        Ok(self.current_value)
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        Ok(self
+            .current_value
+            .map(|v| KvValue::Encoded(Bytes::copy_from_slice(v))))
     }
 }

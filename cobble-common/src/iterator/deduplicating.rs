@@ -9,7 +9,7 @@ use crate::iterator::KvIterator;
 use crate::schema::Schema;
 use crate::sst::row_codec::{decode_value, encode_value, value_expired_at, value_is_terminal};
 use crate::ttl::TTLProvider;
-use crate::r#type::Column;
+use crate::r#type::{Column, KvValue};
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -49,10 +49,11 @@ pub struct DeduplicatingIterator<I> {
     schema: Arc<Schema>,
 }
 
-/// Collects a value slice into the values vector or selects it as the final value.
+/// Collects a value into the values vector or selects it as the final value.
 /// This function checks for expiration and terminal status.
+/// Takes ownership of the value bytes to avoid unnecessary copies.
 fn collect_value(
-    value_slice: &[u8],
+    value: Bytes,
     num_columns: usize,
     ttl_provider: &TTLProvider,
     allow_terminal_shortcut: bool,
@@ -60,17 +61,17 @@ fn collect_value(
     selected_value: &mut Option<Bytes>,
     stop_collecting: &mut bool,
 ) -> Result<()> {
-    let expired_at = value_expired_at(value_slice)?;
+    let expired_at = value_expired_at(&value)?;
     if ttl_provider.expired(&expired_at) {
         return Ok(());
     }
-    let is_terminal = value_is_terminal(value_slice, num_columns)?;
+    let is_terminal = value_is_terminal(&value, num_columns)?;
     if allow_terminal_shortcut && selected_value.is_none() && values.is_empty() && is_terminal {
-        *selected_value = Some(Bytes::copy_from_slice(value_slice));
+        *selected_value = Some(value);
         *stop_collecting = true;
         return Ok(());
     }
-    values.push(Bytes::copy_from_slice(value_slice));
+    values.push(value);
     if is_terminal {
         *stop_collecting = true;
     }
@@ -123,22 +124,20 @@ impl<I> DeduplicatingIterator<I> {
                 return Ok(());
             }
 
-            // Get the first key-value pair
-            let current = self.inner.current_slice()?;
-            let Some((key_slice, value_slice)) = current else {
+            // Take the first key-value pair
+            let Some((current_key, first_value)) = self.inner.take_current()? else {
                 self.current_key = None;
                 self.current_value = None;
                 return Ok(());
             };
-
-            let current_key = Bytes::copy_from_slice(key_slice);
+            let first_value_bytes = first_value.into_encoded(self.num_columns);
 
             let mut values: Vec<Bytes> = Vec::new();
             let mut selected_value: Option<Bytes> = None;
             let mut stop_collecting = false;
 
             collect_value(
-                value_slice,
+                first_value_bytes,
                 self.num_columns,
                 &self.ttl_provider,
                 allow_terminal_shortcut,
@@ -149,8 +148,7 @@ impl<I> DeduplicatingIterator<I> {
 
             // Advance to next entry and check for same key
             while self.inner.next()? {
-                let next_key = self.inner.key_slice()?;
-                let Some(next_key) = next_key else {
+                let Some(next_key) = self.inner.key()? else {
                     break;
                 };
                 if next_key != current_key.as_ref() {
@@ -161,8 +159,9 @@ impl<I> DeduplicatingIterator<I> {
                     continue;
                 }
 
-                // Same key, collect the value
-                if let Some(next_value_bytes) = self.inner.value_slice()? {
+                // Same key, take the value
+                if let Some(next_kv_value) = self.inner.take_value()? {
+                    let next_value_bytes = next_kv_value.into_encoded(self.num_columns);
                     collect_value(
                         next_value_bytes,
                         self.num_columns,
@@ -263,20 +262,16 @@ where
         self.current_key.is_some()
     }
 
-    fn key(&self) -> Result<Option<Bytes>> {
-        Ok(self.current_key.clone())
-    }
-
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         Ok(self.current_key.as_deref())
     }
 
-    fn value(&self) -> Result<Option<Bytes>> {
-        Ok(self.current_value.clone())
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        Ok(self.current_key.take())
     }
 
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        Ok(self.current_value.as_deref())
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        Ok(self.current_value.take().map(KvValue::Encoded))
     }
 }
 
@@ -341,7 +336,8 @@ mod tests {
 
         let mut results = vec![];
         while dedup.valid() {
-            let (k, mut v) = dedup.current().unwrap().unwrap();
+            let (k, kv) = dedup.take_current().unwrap().unwrap();
+            let mut v = kv.unwrap_encoded();
             let decoded = decode_value(&mut v, num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();
@@ -394,7 +390,8 @@ mod tests {
 
         let mut results = vec![];
         while dedup.valid() {
-            let (k, mut v) = dedup.current().unwrap().unwrap();
+            let (k, kv) = dedup.take_current().unwrap().unwrap();
+            let mut v = kv.unwrap_encoded();
             let decoded = decode_value(&mut v, num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();
@@ -482,7 +479,8 @@ mod tests {
         );
         dedup.seek_to_first().unwrap();
 
-        let (k, mut v) = dedup.current().unwrap().unwrap();
+        let (k, kv) = dedup.take_current().unwrap().unwrap();
+        let mut v = kv.unwrap_encoded();
         let decoded = decode_value(&mut v, num_columns).unwrap();
 
         assert_eq!(k.as_ref(), b"a");
@@ -540,7 +538,8 @@ mod tests {
         );
         dedup.seek_to_first().unwrap();
 
-        let (k, mut v) = dedup.current().unwrap().unwrap();
+        let (k, kv) = dedup.take_current().unwrap().unwrap();
+        let mut v = kv.unwrap_encoded();
         let decoded = decode_value(&mut v, num_columns).unwrap();
 
         assert_eq!(k.as_ref(), b"a");
@@ -585,7 +584,8 @@ mod tests {
         );
         dedup.seek_to_first().unwrap();
 
-        let (k, mut v) = dedup.current().unwrap().unwrap();
+        let (k, kv) = dedup.take_current().unwrap().unwrap();
+        let mut v = kv.unwrap_encoded();
         let decoded = decode_value(&mut v, num_columns).unwrap();
 
         assert_eq!(k.as_ref(), b"a");
@@ -650,7 +650,7 @@ mod tests {
 
         dedup.seek(b"b").unwrap();
         assert!(dedup.valid());
-        assert_eq!(dedup.key().unwrap().unwrap().as_ref(), b"b");
+        assert_eq!(dedup.key().unwrap().unwrap(), b"b");
     }
 
     #[test]
@@ -687,7 +687,8 @@ mod tests {
         );
         dedup.seek_to_first().unwrap();
 
-        let (k, mut v) = dedup.current().unwrap().unwrap();
+        let (k, kv) = dedup.take_current().unwrap().unwrap();
+        let mut v = kv.unwrap_encoded();
         let decoded = decode_value(&mut v, num_columns).unwrap();
         let cols = decoded.columns();
 
@@ -771,7 +772,8 @@ mod tests {
 
         let mut results = vec![];
         while dedup.valid() {
-            let (k, mut v) = dedup.current().unwrap().unwrap();
+            let (k, kv) = dedup.take_current().unwrap().unwrap();
+            let mut v = kv.unwrap_encoded();
             let decoded = decode_value(&mut v, num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();
@@ -848,7 +850,8 @@ mod tests {
 
         let mut results = vec![];
         while dedup.valid() {
-            let (k, mut v) = dedup.current().unwrap().unwrap();
+            let (k, kv) = dedup.take_current().unwrap().unwrap();
+            let mut v = kv.unwrap_encoded();
             let decoded = decode_value(&mut v, num_columns).unwrap();
             results.push((k, decoded));
             dedup.next().unwrap();

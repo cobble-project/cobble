@@ -1,4 +1,5 @@
 use crate::iterator::KvIterator;
+use crate::r#type::KvValue;
 use bytes::Bytes;
 
 /// A simple mock iterator for testing
@@ -52,15 +53,7 @@ impl<'a> KvIterator<'a> for MockIterator {
         self.index < self.entries.len()
     }
 
-    fn key(&self) -> crate::error::Result<Option<Bytes>> {
-        if self.valid() {
-            Ok(Some(self.entries[self.index].0.clone()))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn key_slice(&self) -> crate::error::Result<Option<&[u8]>> {
+    fn key(&self) -> crate::error::Result<Option<&[u8]>> {
         if self.valid() {
             Ok(Some(self.entries[self.index].0.as_ref()))
         } else {
@@ -68,17 +61,17 @@ impl<'a> KvIterator<'a> for MockIterator {
         }
     }
 
-    fn value(&self) -> crate::error::Result<Option<Bytes>> {
+    fn take_key(&mut self) -> crate::error::Result<Option<Bytes>> {
         if self.valid() {
-            Ok(Some(self.entries[self.index].1.clone()))
+            Ok(Some(self.entries[self.index].0.clone()))
         } else {
             Ok(None)
         }
     }
 
-    fn value_slice(&self) -> crate::error::Result<Option<&[u8]>> {
+    fn take_value(&mut self) -> crate::error::Result<Option<KvValue>> {
         if self.valid() {
-            Ok(Some(self.entries[self.index].1.as_ref()))
+            Ok(Some(KvValue::Encoded(self.entries[self.index].1.clone())))
         } else {
             Ok(None)
         }

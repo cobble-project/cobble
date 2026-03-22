@@ -8,7 +8,7 @@ mod vlog;
 
 use crate::error::Result;
 use crate::iterator::KvIterator;
-use crate::r#type::{RefKey, RefValue};
+use crate::r#type::{KvValue, RefKey, RefValue};
 pub(crate) use hash::HashMemtable;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -126,31 +126,24 @@ impl<'a> KvIterator<'a> for MemtableKvIter<'a> {
         }
     }
 
-    fn key(&self) -> Result<Option<bytes::Bytes>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         match self {
             Self::Hash(iter) => iter.key(),
             Self::Vec(iter) => iter.key(),
         }
     }
 
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
+    fn take_key(&mut self) -> Result<Option<bytes::Bytes>> {
         match self {
-            Self::Hash(iter) => iter.key_slice(),
-            Self::Vec(iter) => iter.key_slice(),
+            Self::Hash(iter) => iter.take_key(),
+            Self::Vec(iter) => iter.take_key(),
         }
     }
 
-    fn value(&self) -> Result<Option<bytes::Bytes>> {
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
         match self {
-            Self::Hash(iter) => iter.value(),
-            Self::Vec(iter) => iter.value(),
-        }
-    }
-
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        match self {
-            Self::Hash(iter) => iter.value_slice(),
-            Self::Vec(iter) => iter.value_slice(),
+            Self::Hash(iter) => iter.take_value(),
+            Self::Vec(iter) => iter.take_value(),
         }
     }
 }

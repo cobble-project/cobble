@@ -75,7 +75,7 @@ impl<'a> DbIterator<'a> {
 
     fn next_row(&mut self) -> Result<Option<(Bytes, Vec<Option<Bytes>>)>> {
         while self.inner.valid() {
-            let Some((mut encoded_key, mut encoded_value)) = self.inner.current()? else {
+            let Some((mut encoded_key, kv_value)) = self.inner.take_current()? else {
                 self.inner.next()?;
                 continue;
             };
@@ -84,6 +84,7 @@ impl<'a> DbIterator<'a> {
                 return Ok(None);
             }
             let key = decode_key(&mut encoded_key)?;
+            let mut encoded_value = kv_value.into_encoded(self.num_columns);
             let value = decode_value(&mut encoded_value, self.num_columns)?;
             let columns = value_to_vec_of_columns_with_vlog(
                 value,

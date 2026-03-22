@@ -1,6 +1,7 @@
 use crate::data_file::DataFile;
 use crate::error::Result;
 use crate::iterator::KvIterator;
+use crate::r#type::KvValue;
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -209,7 +210,7 @@ where
         self.current_iter.as_ref().is_some_and(|i| i.valid())
     }
 
-    fn key(&self) -> Result<Option<Bytes>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         if let Some(iter) = &self.current_iter {
             iter.key()
         } else {
@@ -217,25 +218,17 @@ where
         }
     }
 
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
-        if let Some(iter) = &self.current_iter {
-            iter.key_slice()
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        if let Some(iter) = &mut self.current_iter {
+            iter.take_key()
         } else {
             Ok(None)
         }
     }
 
-    fn value(&self) -> Result<Option<Bytes>> {
-        if let Some(iter) = &self.current_iter {
-            iter.value()
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        if let Some(iter) = &self.current_iter {
-            iter.value_slice()
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        if let Some(iter) = &mut self.current_iter {
+            iter.take_value()
         } else {
             Ok(None)
         }
@@ -340,7 +333,8 @@ mod tests {
 
         let mut results = vec![];
         while iter.valid() {
-            let (k, v) = iter.current().unwrap().unwrap();
+            let (k, kv) = iter.take_current().unwrap().unwrap();
+            let v = kv.unwrap_encoded();
             results.push((k, v));
             iter.next().unwrap();
         }
@@ -377,16 +371,16 @@ mod tests {
         // Seek to middle of first file
         iter.seek(b"b").unwrap();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap().unwrap().as_ref(), b"b");
+        assert_eq!(iter.key().unwrap().unwrap(), b"b");
 
         // Seek to second file
         iter.seek(b"e").unwrap();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap().unwrap().as_ref(), b"e");
+        assert_eq!(iter.key().unwrap().unwrap(), b"e");
 
         // Seek to exact boundary
         iter.seek(b"d").unwrap();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap().unwrap().as_ref(), b"d");
+        assert_eq!(iter.key().unwrap().unwrap(), b"d");
     }
 }

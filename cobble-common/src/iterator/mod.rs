@@ -30,6 +30,7 @@ pub(crate) use sorted_run::SortedRun;
 pub(crate) use vlog_seq_offset::VlogSeqOffsetIterator;
 
 use crate::error::Result;
+use crate::r#type::KvValue;
 use bytes::Bytes;
 
 /// A trait for key-value iterators.
@@ -49,44 +50,27 @@ pub(crate) trait KvIterator<'a>: 'a {
     /// Check if the iterator is valid (has a current entry).
     fn valid(&self) -> bool;
 
-    /// Get the current key.
+    /// Borrow the current key as a slice.
+    /// Can be called multiple times per position.
     /// Returns `None` if the iterator is not valid.
-    fn key(&self) -> Result<Option<Bytes>>;
+    fn key(&self) -> Result<Option<&[u8]>>;
 
-    /// Get the current key as a temporary slice.
-    /// Returns `None` if the iterator is not valid.
-    fn key_slice(&self) -> Result<Option<&[u8]>>;
+    /// Take ownership of the current key.
+    /// Consumes from internal cache; should be called at most once per position.
+    fn take_key(&mut self) -> Result<Option<Bytes>>;
 
-    /// Get the current value.
-    /// Returns `None` if the iterator is not valid.
-    fn value(&self) -> Result<Option<Bytes>>;
+    /// Take ownership of the current value as a KvValue.
+    /// Consumes from internal cache; should be called at most once per position.
+    fn take_value(&mut self) -> Result<Option<KvValue>>;
 
-    /// Get the current value as a temporary slice.
-    /// Returns `None` if the iterator is not valid.
-    fn value_slice(&self) -> Result<Option<&[u8]>>;
-
-    /// Get the current key-value pair.
-    /// Returns `None` if the iterator is not valid.
-    fn current(&self) -> Result<Option<(Bytes, Bytes)>> {
+    /// Take ownership of both key and value.
+    /// Consumes from internal cache; should be called at most once per position.
+    fn take_current(&mut self) -> Result<Option<(Bytes, KvValue)>> {
         if !self.valid() {
             return Ok(None);
         }
-        let key = self.key()?;
-        let value = self.value()?;
-        match (key, value) {
-            (Some(k), Some(v)) => Ok(Some((k, v))),
-            _ => Ok(None),
-        }
-    }
-
-    /// Get the current key-value pair as temporary slices.
-    /// Returns `None` if the iterator is not valid.
-    fn current_slice(&self) -> Result<Option<(&[u8], &[u8])>> {
-        if !self.valid() {
-            return Ok(None);
-        }
-        let key = self.key_slice()?;
-        let value = self.value_slice()?;
+        let key = self.take_key()?;
+        let value = self.take_value()?;
         match (key, value) {
             (Some(k), Some(v)) => Ok(Some((k, v))),
             _ => Ok(None),
@@ -112,19 +96,15 @@ impl<'a> KvIterator<'a> for Box<dyn for<'b> KvIterator<'b>> {
         (**self).valid()
     }
 
-    fn key(&self) -> Result<Option<Bytes>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         (**self).key()
     }
 
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
-        (**self).key_slice()
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        (**self).take_key()
     }
 
-    fn value(&self) -> Result<Option<Bytes>> {
-        (**self).value()
-    }
-
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        (**self).value_slice()
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        (**self).take_value()
     }
 }

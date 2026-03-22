@@ -22,7 +22,7 @@ use crate::paths::snapshot_active_data_relative_path;
 use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotManager};
 use crate::sst::{SSTWriter, SSTWriterOptions};
-use crate::r#type::{RefKey, RefValue};
+use crate::r#type::{KvValue, RefKey, RefValue};
 use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
 use crate::writer_options::WriterOptions;
 use log::{debug, trace, warn};
@@ -210,7 +210,14 @@ impl MemtableScanIterator {
                 return Ok(None);
             }
         }
-        iter.current()
+        match iter.take_current()? {
+            Some((key, kv_value)) => {
+                // Memtable iterators always produce encoded values.
+                let value = kv_value.unwrap_encoded();
+                Ok(Some((key, value)))
+            }
+            None => Ok(None),
+        }
     }
 
     fn read_entry_at_offset(&self, offset: usize) -> Result<Option<(Bytes, Bytes)>> {
@@ -273,20 +280,16 @@ impl<'a> KvIterator<'a> for MemtableScanIterator {
         self.current_key.is_some() && self.current_value.is_some()
     }
 
-    fn key(&self) -> Result<Option<Bytes>> {
-        Ok(self.current_key.clone())
-    }
-
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         Ok(self.current_key.as_deref())
     }
 
-    fn value(&self) -> Result<Option<Bytes>> {
-        Ok(self.current_value.clone())
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        Ok(self.current_key.take())
     }
 
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        Ok(self.current_value.as_deref())
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        Ok(self.current_value.take().map(KvValue::Encoded))
     }
 }
 
@@ -1457,7 +1460,7 @@ fn flush_memtable(
         if let Some(collector) = merge_collector.as_ref() {
             collector.borrow_mut().check_error()?;
         }
-        if let (Some(key), Some(value)) = (dedup_iter.key_slice()?, dedup_iter.value_slice()?) {
+        if let Some((key, kv_value)) = dedup_iter.take_current()? {
             if key.len() < 2 {
                 return Err(Error::InvalidState(
                     "encoded key missing bucket prefix".to_string(),
@@ -1478,10 +1481,11 @@ fn flush_memtable(
                     bucket,
                 ));
             }
+            let value_bytes = kv_value.into_encoded(schema.num_columns());
             let (_, builder, min_bucket, max_bucket) = builders
                 .get_mut(&tree_idx)
                 .expect("builder should exist for tree");
-            builder.add(key, value)?;
+            builder.add(&key, &value_bytes)?;
             *min_bucket = (*min_bucket).min(bucket);
             *max_bucket = (*max_bucket).max(bucket);
         }
@@ -1743,20 +1747,16 @@ where
         self.inner.valid()
     }
 
-    fn key(&self) -> Result<Option<Bytes>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         self.inner.key()
     }
 
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
-        self.inner.key_slice()
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        self.inner.take_key()
     }
 
-    fn value(&self) -> Result<Option<Bytes>> {
-        self.inner.value()
-    }
-
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        self.inner.value_slice()
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        self.inner.take_value()
     }
 }
 

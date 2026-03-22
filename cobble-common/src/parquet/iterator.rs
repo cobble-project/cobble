@@ -6,7 +6,7 @@ use crate::iterator::KvIterator;
 use crate::parquet::file_adapter::RandomAccessChunkReader;
 use crate::parquet::meta::{ParquetRowGroupRange, decode_meta_row_group_ranges};
 use crate::sst::row_codec::encode_value;
-use crate::r#type::{Column, Value, ValueType};
+use crate::r#type::{Column, KvValue, Value, ValueType};
 use bytes::Bytes;
 use parquet::column::reader::{ColumnReaderImpl, get_typed_column_reader};
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
@@ -341,7 +341,10 @@ impl ParquetIterator {
                         )));
                     }
                     let value_type = ValueType::decode_tag(payload[0])?;
-                    cols.push(Some(Column::new(value_type, Bytes::copy_from_slice(&payload[1..]))));
+                    cols.push(Some(Column::new(
+                        value_type,
+                        Bytes::copy_from_slice(&payload[1..]),
+                    )));
                 }
                 let value = Value::new_with_expired_at(
                     cols,
@@ -465,25 +468,18 @@ impl<'a> KvIterator<'a> for ParquetIterator {
         ParquetIterator::valid(self)
     }
 
-    fn key(&self) -> Result<Option<Bytes>> {
-        ParquetIterator::key(self)
-    }
-
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         if let Some(idx) = self.current_idx {
             return Ok(self.batch_keys.get(idx).map(|key| key.data()));
         }
         Ok(None)
     }
 
-    fn value(&self) -> Result<Option<Bytes>> {
-        ParquetIterator::value(self)
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        ParquetIterator::key(self)
     }
 
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        if let Some(idx) = self.current_idx {
-            return Ok(self.batch_values.get(idx).map(|value| value.as_ref()));
-        }
-        Ok(None)
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        Ok(ParquetIterator::value(self)?.map(KvValue::Encoded))
     }
 }

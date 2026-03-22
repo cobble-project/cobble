@@ -467,7 +467,6 @@ impl Drop for HashMemtable {
 mod tests {
     use super::*;
     use crate::iterator::KvIterator;
-    use bytes::Bytes;
 
     #[test]
     fn put_and_get() {
@@ -546,16 +545,17 @@ mod tests {
         iter.seek_to_first().unwrap();
         let mut collected = Vec::new();
         while iter.next().unwrap() {
-            let (k, v) = (iter.key().unwrap().unwrap(), iter.value().unwrap().unwrap());
+            let k = iter.take_key().unwrap().unwrap();
+            let v = iter.take_value().unwrap().unwrap().unwrap_encoded();
             collected.push((k, v));
         }
-        let expected = vec![
-            (Bytes::from("a"), Bytes::from("x2")),
-            (Bytes::from("a"), Bytes::from("x1")),
-            (Bytes::from("b"), Bytes::from("v1")),
-            (Bytes::from("c"), Bytes::from("z1")),
-        ];
-        assert_eq!(collected, expected);
+        let expected: Vec<(&[u8], &[u8])> =
+            vec![(b"a", b"x2"), (b"a", b"x1"), (b"b", b"v1"), (b"c", b"z1")];
+        assert_eq!(collected.len(), expected.len());
+        for (got, exp) in collected.iter().zip(expected.iter()) {
+            assert_eq!(got.0.as_ref(), exp.0);
+            assert_eq!(got.1.as_ref(), exp.1);
+        }
     }
 
     #[test]
@@ -574,16 +574,14 @@ mod tests {
         iter.seek_to_first().unwrap();
         let mut entries = Vec::new();
         while iter.next().unwrap() {
-            let key = iter.key().unwrap().unwrap();
-            let value = iter.value().unwrap().unwrap();
+            let key = iter.take_key().unwrap().unwrap();
+            let value = iter.take_value().unwrap().unwrap().unwrap_encoded();
             entries.push((key, value));
         }
-        assert_eq!(
-            entries,
-            vec![
-                (Bytes::from("k1"), Bytes::from("v1")),
-                (Bytes::from("k2"), Bytes::from("v2"))
-            ]
-        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0.as_ref(), b"k1");
+        assert_eq!(entries[0].1.as_ref(), b"v1");
+        assert_eq!(entries[1].0.as_ref(), b"k2");
+        assert_eq!(entries[1].1.as_ref(), b"v2");
     }
 }

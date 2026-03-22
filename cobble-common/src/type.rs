@@ -88,6 +88,78 @@ pub(crate) struct RefValue<'a> {
     pub(crate) expired_at: Option<u32>,
 }
 
+/// A value in the iterator pipeline that can be either raw encoded bytes
+/// or a decoded structured value. This avoids unnecessary encode/decode
+/// cycles when passing data between iterators, compaction, and file writers.
+pub(crate) enum KvValue {
+    /// Raw encoded bytes (from SST files, memtables, etc.)
+    Encoded(Bytes),
+    /// Decoded structured value with per-column data (from parquet, after merge, etc.)
+    Decoded(Value),
+}
+
+impl KvValue {
+    /// Returns true if this is an encoded value.
+    #[inline]
+    pub(crate) fn is_encoded(&self) -> bool {
+        matches!(self, KvValue::Encoded(_))
+    }
+
+    /// Returns a reference to the encoded bytes, if this is an Encoded variant.
+    #[inline]
+    pub(crate) fn as_encoded(&self) -> Option<&Bytes> {
+        match self {
+            KvValue::Encoded(b) => Some(b),
+            KvValue::Decoded(_) => None,
+        }
+    }
+
+    /// Returns a slice of the encoded bytes, if this is an Encoded variant.
+    #[inline]
+    pub(crate) fn as_encoded_slice(&self) -> Option<&[u8]> {
+        match self {
+            KvValue::Encoded(b) => Some(b.as_ref()),
+            KvValue::Decoded(_) => None,
+        }
+    }
+
+    /// Consumes this KvValue and returns encoded bytes.
+    /// If already Encoded, returns the bytes directly (no copy).
+    /// If Decoded, encodes using the row codec format.
+    pub(crate) fn into_encoded(self, num_columns: usize) -> Bytes {
+        match self {
+            KvValue::Encoded(b) => b,
+            KvValue::Decoded(v) => {
+                use crate::sst::row_codec::encode_value;
+                encode_value(&v, num_columns)
+            }
+        }
+    }
+
+    /// Consumes this KvValue and returns the encoded bytes, panicking if Decoded.
+    /// Use only when the variant is known to be Encoded.
+    #[inline]
+    pub(crate) fn unwrap_encoded(self) -> Bytes {
+        match self {
+            KvValue::Encoded(b) => b,
+            KvValue::Decoded(_) => panic!("expected KvValue::Encoded, got Decoded"),
+        }
+    }
+
+    /// Consumes this KvValue and returns a decoded Value.
+    /// If already Decoded, returns the value directly (no copy).
+    /// If Encoded, decodes using the row codec format.
+    pub(crate) fn into_decoded(self, num_columns: usize) -> Result<Value> {
+        match self {
+            KvValue::Encoded(mut b) => {
+                use crate::sst::row_codec::decode_value;
+                decode_value(&mut b, num_columns)
+            }
+            KvValue::Decoded(v) => Ok(v),
+        }
+    }
+}
+
 impl Key {
     /// Creates a new `Key`.
     ///

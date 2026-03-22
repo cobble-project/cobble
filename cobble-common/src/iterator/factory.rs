@@ -154,8 +154,8 @@ mod tests {
         iter.seek_to_first().unwrap();
         assert!(iter.valid());
         let key = iter.key().unwrap().unwrap();
-        assert_eq!(key.as_ref(), &[2, 0, b'b']);
-        let mut value = iter.value().unwrap().unwrap();
+        assert_eq!(key, &[2, 0, b'b']);
+        let mut value = iter.take_value().unwrap().unwrap().unwrap_encoded();
         let decoded = decode_value(&mut value, 1).unwrap();
         assert_eq!(
             decoded.columns()[0].as_ref().unwrap().data().as_ref(),

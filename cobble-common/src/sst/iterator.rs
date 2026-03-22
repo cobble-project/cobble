@@ -7,7 +7,7 @@ use crate::sst::bloom::BloomFilter;
 use crate::sst::compression::decode_block_bytes;
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
-use crate::r#type::{Key, Value};
+use crate::r#type::{Key, KvValue, Value};
 use crate::util::unsafe_bytes;
 use bytes::Bytes;
 use metrics::{Counter, counter};
@@ -831,11 +831,7 @@ impl<'a> KvIterator<'a> for SSTIterator {
         SSTIterator::valid(self)
     }
 
-    fn key(&self) -> Result<Option<Bytes>> {
-        SSTIterator::key(self)
-    }
-
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         self.ensure_cached_bytes()?;
         let cached = self.cached_key_bytes.borrow();
         if let Some(bytes) = cached.as_ref() {
@@ -848,21 +844,16 @@ impl<'a> KvIterator<'a> for SSTIterator {
         Ok(None)
     }
 
-    fn value(&self) -> Result<Option<Bytes>> {
-        SSTIterator::value(self)
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        SSTIterator::key(self)
     }
 
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        self.ensure_cached_bytes()?;
-        let cached = self.cached_value_bytes.borrow();
-        if let Some(bytes) = cached.as_ref() {
-            let ptr = bytes.as_ptr();
-            let len = bytes.len();
-            drop(cached);
-            // SAFETY: cached bytes live as long as the iterator entry remains unchanged.
-            return Ok(Some(unsafe { std::slice::from_raw_parts(ptr, len) }));
-        }
-        Ok(None)
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        Ok(SSTIterator::value(self)?.map(KvValue::Encoded))
+    }
+
+    fn take_current(&mut self) -> Result<Option<(Bytes, KvValue)>> {
+        Ok(SSTIterator::current(self)?.map(|(k, v)| (k, KvValue::Encoded(v))))
     }
 }
 

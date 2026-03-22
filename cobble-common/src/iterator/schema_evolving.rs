@@ -1,10 +1,9 @@
 use crate::error::{Error, Result};
 use crate::iterator::KvIterator;
 use crate::schema::{Schema, SchemaManager};
-use crate::sst::row_codec::{decode_value, encode_value};
-use crate::util::unsafe_bytes;
+use crate::sst::row_codec::encode_value;
+use crate::r#type::KvValue;
 use bytes::Bytes;
-use std::cell::RefCell;
 use std::sync::Arc;
 
 /// An iterator wrapper that evolves values from a source schema to a target schema on-the-fly.
@@ -13,7 +12,6 @@ pub(crate) struct SchemaEvolvingIterator<I> {
     source_schema: Arc<Schema>,
     target_schema: Arc<Schema>,
     schema_manager: Arc<SchemaManager>,
-    evolved_value_cache: RefCell<Option<Bytes>>,
 }
 
 impl<I> SchemaEvolvingIterator<I> {
@@ -28,29 +26,7 @@ impl<I> SchemaEvolvingIterator<I> {
             source_schema,
             target_schema,
             schema_manager,
-            evolved_value_cache: RefCell::new(None),
         }
-    }
-
-    fn evolve_value_if_needed(&self, mut encoded: Bytes) -> Result<Bytes> {
-        let source_schema_id = self.source_schema.version();
-        let target_schema_id = self.target_schema.version();
-        if source_schema_id == target_schema_id {
-            return Ok(encoded);
-        }
-        if source_schema_id > target_schema_id {
-            return Err(Error::InvalidState(format!(
-                "Source schema {} is newer than target schema {}",
-                source_schema_id, target_schema_id
-            )));
-        }
-        let value = decode_value(&mut encoded, self.source_schema.num_columns())?;
-        let evolved = self.schema_manager.evolve_value(
-            value,
-            source_schema_id,
-            self.target_schema.version(),
-        )?;
-        Ok(encode_value(&evolved, self.target_schema.num_columns()))
     }
 
     fn should_evolve(&self) -> Result<bool> {
@@ -68,25 +44,17 @@ impl<I> SchemaEvolvingIterator<I> {
         Ok(true)
     }
 
-    fn clear_cache(&self) {
-        self.evolved_value_cache.borrow_mut().take();
-    }
-
-    fn ensure_evolved_value_cached<'a>(&self) -> Result<Option<()>>
-    where
-        I: KvIterator<'a>,
-    {
-        if self.evolved_value_cache.borrow().is_some() {
-            return Ok(Some(()));
-        }
-        let Some(value_slice) = self.inner.value_slice()? else {
-            self.clear_cache();
-            return Ok(None);
-        };
-        let encoded = unsafe_bytes(value_slice);
-        let evolved = self.evolve_value_if_needed(encoded)?;
-        *self.evolved_value_cache.borrow_mut() = Some(evolved);
-        Ok(Some(()))
+    fn evolve_value(&self, kv_value: KvValue) -> Result<KvValue> {
+        let value = kv_value.into_decoded(self.source_schema.num_columns())?;
+        let evolved = self.schema_manager.evolve_value(
+            value,
+            self.source_schema.version(),
+            self.target_schema.version(),
+        )?;
+        Ok(KvValue::Encoded(encode_value(
+            &evolved,
+            self.target_schema.num_columns(),
+        )))
     }
 }
 
@@ -95,17 +63,14 @@ where
     I: KvIterator<'a>,
 {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
-        self.clear_cache();
         self.inner.seek(target)
     }
 
     fn seek_to_first(&mut self) -> Result<()> {
-        self.clear_cache();
         self.inner.seek_to_first()
     }
 
     fn next(&mut self) -> Result<bool> {
-        self.clear_cache();
         self.inner.next()
     }
 
@@ -113,41 +78,21 @@ where
         self.inner.valid()
     }
 
-    fn key(&self) -> Result<Option<Bytes>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         self.inner.key()
     }
 
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
-        self.inner.key_slice()
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        self.inner.take_key()
     }
 
-    fn value(&self) -> Result<Option<Bytes>> {
-        if !self.should_evolve()? {
-            self.clear_cache();
-            return self.inner.value();
-        }
-        let Some(()) = self.ensure_evolved_value_cached()? else {
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        let Some(value) = self.inner.take_value()? else {
             return Ok(None);
         };
-        Ok(self.evolved_value_cache.borrow().as_ref().cloned())
-    }
-
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
         if !self.should_evolve()? {
-            self.clear_cache();
-            return self.inner.value_slice();
+            return Ok(Some(value));
         }
-        let Some(()) = self.ensure_evolved_value_cached()? else {
-            return Ok(None);
-        };
-        let cached = self.evolved_value_cache.borrow();
-        if let Some(bytes) = cached.as_ref() {
-            let ptr = bytes.as_ptr();
-            let len = bytes.len();
-            drop(cached);
-            // SAFETY: cached evolved bytes remain valid until iterator position changes.
-            return Ok(Some(unsafe { std::slice::from_raw_parts(ptr, len) }));
-        }
-        Ok(None)
+        Ok(Some(self.evolve_value(value)?))
     }
 }

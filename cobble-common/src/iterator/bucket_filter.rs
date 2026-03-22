@@ -1,7 +1,7 @@
 //! A `KvIterator` wrapper that filters keys based on their bucket.
 use crate::error::Result;
 use crate::iterator::KvIterator;
-use crate::r#type::key_bucket;
+use crate::r#type::{KvValue, key_bucket};
 use bytes::Bytes;
 use std::ops::RangeInclusive;
 
@@ -27,7 +27,7 @@ where
 
     fn advance_to_in_range(&mut self) -> Result<()> {
         while self.inner.valid() {
-            let Some(key) = self.inner.key_slice()? else {
+            let Some(key) = self.inner.key()? else {
                 break;
             };
             if self.key_in_range(key) {
@@ -67,19 +67,15 @@ where
         self.inner.valid()
     }
 
-    fn key(&self) -> Result<Option<Bytes>> {
+    fn key(&self) -> Result<Option<&[u8]>> {
         self.inner.key()
     }
 
-    fn key_slice(&self) -> Result<Option<&[u8]>> {
-        self.inner.key_slice()
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        self.inner.take_key()
     }
 
-    fn value(&self) -> Result<Option<Bytes>> {
-        self.inner.value()
-    }
-
-    fn value_slice(&self) -> Result<Option<&[u8]>> {
-        self.inner.value_slice()
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        self.inner.take_value()
     }
 }
