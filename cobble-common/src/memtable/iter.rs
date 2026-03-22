@@ -3,6 +3,7 @@
 use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::r#type::KvValue;
+use crate::util::unsafe_bytes;
 use bytes::Bytes;
 use std::cmp::Ordering;
 
@@ -97,12 +98,18 @@ impl<'a> KvIterator<'a> for OrderedMemtableKvIterator<'a> {
     }
 
     fn take_key(&mut self) -> Result<Option<Bytes>> {
-        Ok(self.current_key.map(Bytes::copy_from_slice))
+        // Safety: In flush, we keep the memtable alive until the flush completes, so the bytes we
+        // return here will remain valid for the caller to use. In lookup or scan, the unsafe bytes
+        // will be converted to decoded key before returning, so it's also safe.
+        Ok(self.current_key.map(unsafe_bytes))
     }
 
     fn take_value(&mut self) -> Result<Option<KvValue>> {
+        // Safety: In flush, we keep the memtable alive until the flush completes, so the bytes we
+        // return here will remain valid for the caller to use. In lookup or scan, the unsafe bytes
+        // will be converted to decoded value before returning, so it's also safe.
         Ok(self
             .current_value
-            .map(|v| KvValue::Encoded(Bytes::copy_from_slice(v))))
+            .map(|v| KvValue::Encoded(unsafe_bytes(v))))
     }
 }
