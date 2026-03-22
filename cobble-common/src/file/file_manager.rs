@@ -1362,13 +1362,20 @@ impl FileManager {
             return Ok((source_file_id, false));
         }
         let snapshot_volume = self.select_snapshot_persistable_volume()?;
-        let source_tracked = self.data_files.get(&source_file_id).ok_or_else(|| {
-            Error::IoError(format!(
-                "Data file {} is not tracked by FileManager",
-                source_file_id
-            ))
-        })?;
-        let source_reader = source_tracked.fs().open_read(source_tracked.path())?;
+        // Extract needed data from DashMap Ref and drop it before insert to
+        // avoid self-deadlock when source and target IDs hash to the same shard.
+        let (source_reader, source_priority) = {
+            let source_tracked = self.data_files.get(&source_file_id).ok_or_else(|| {
+                Error::IoError(format!(
+                    "Data file {} is not tracked by FileManager",
+                    source_file_id
+                ))
+            })?;
+            let reader = source_tracked.fs().open_read(source_tracked.path())?;
+            let priority = source_tracked.priority();
+            (reader, priority)
+            // drop source_tracked here to release the lock shard before we insert the new tracked file
+        };
         let target_file_id = self.allocate_file_id();
         let mut writer = self.create_data_file_writer_on_volume(target_file_id, snapshot_volume)?;
 
@@ -1378,7 +1385,7 @@ impl FileManager {
             let _ = self.remove_data_file(target_file_id);
             return Err(err);
         }
-        writer.tracked.set_priority(source_tracked.priority());
+        writer.tracked.set_priority(source_priority);
         if let Some(registry) = resource_registry {
             registry.register_temp_copied_file(target_file_id);
         }
