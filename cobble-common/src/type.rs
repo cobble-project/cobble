@@ -106,24 +106,6 @@ impl KvValue {
         matches!(self, KvValue::Encoded(_))
     }
 
-    /// Returns a reference to the encoded bytes, if this is an Encoded variant.
-    #[inline]
-    pub(crate) fn as_encoded(&self) -> Option<&Bytes> {
-        match self {
-            KvValue::Encoded(b) => Some(b),
-            KvValue::Decoded(_) => None,
-        }
-    }
-
-    /// Returns a slice of the encoded bytes, if this is an Encoded variant.
-    #[inline]
-    pub(crate) fn as_encoded_slice(&self) -> Option<&[u8]> {
-        match self {
-            KvValue::Encoded(b) => Some(b.as_ref()),
-            KvValue::Decoded(_) => None,
-        }
-    }
-
     /// Consumes this KvValue and returns encoded bytes.
     /// If already Encoded, returns the bytes directly (no copy).
     /// If Decoded, encodes using the row codec format.
@@ -157,6 +139,28 @@ impl KvValue {
                 decode_value(&mut b, num_columns)
             }
             KvValue::Decoded(v) => Ok(v),
+        }
+    }
+
+    /// Returns the expired_at timestamp without consuming the value.
+    pub(crate) fn expired_at(&self) -> Result<Option<u32>> {
+        match self {
+            KvValue::Encoded(b) => {
+                use crate::sst::row_codec::value_expired_at;
+                value_expired_at(b)
+            }
+            KvValue::Decoded(v) => Ok(v.expired_at),
+        }
+    }
+
+    /// Returns whether all columns are terminal without consuming the value.
+    pub(crate) fn is_terminal(&self, num_columns: usize) -> Result<bool> {
+        match self {
+            KvValue::Encoded(b) => {
+                use crate::sst::row_codec::value_is_terminal;
+                value_is_terminal(b, num_columns)
+            }
+            KvValue::Decoded(v) => Ok(v.is_terminal()),
         }
     }
 }

@@ -1,7 +1,6 @@
 use crate::error::{Error, Result};
 use crate::iterator::KvIterator;
 use crate::schema::{Schema, SchemaManager};
-use crate::sst::row_codec::encode_value;
 use crate::r#type::KvValue;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -51,10 +50,7 @@ impl<I> SchemaEvolvingIterator<I> {
             self.source_schema.version(),
             self.target_schema.version(),
         )?;
-        Ok(KvValue::Encoded(encode_value(
-            &evolved,
-            self.target_schema.num_columns(),
-        )))
+        Ok(KvValue::Decoded(evolved))
     }
 }
 

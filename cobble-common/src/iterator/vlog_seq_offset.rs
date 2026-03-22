@@ -1,6 +1,5 @@
 use crate::error::Result;
 use crate::iterator::KvIterator;
-use crate::sst::row_codec::{decode_value, encode_value};
 use crate::r#type::KvValue;
 use crate::vlog::apply_vlog_offset_to_value;
 use bytes::Bytes;
@@ -24,10 +23,9 @@ impl<I> VlogSeqOffsetIterator<I> {
         if self.file_seq_offset == 0 {
             return Ok(kv_value);
         }
-        let mut encoded = kv_value.into_encoded(self.num_columns);
-        let value = decode_value(&mut encoded, self.num_columns)?;
+        let value = kv_value.into_decoded(self.num_columns)?;
         let shifted = apply_vlog_offset_to_value(value, self.file_seq_offset)?;
-        Ok(KvValue::Encoded(encode_value(&shifted, self.num_columns)))
+        Ok(KvValue::Decoded(shifted))
     }
 }
 

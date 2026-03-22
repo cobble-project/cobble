@@ -7,7 +7,6 @@
 use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::schema::Schema;
-use crate::sst::row_codec::{decode_value, value_expired_at, value_is_terminal};
 use crate::ttl::TTLProvider;
 use crate::r#type::{Column, KvValue};
 use bytes::Bytes;
@@ -51,21 +50,21 @@ pub struct DeduplicatingIterator<I> {
 
 /// Collects a value into the values vector or selects it as the final value.
 /// This function checks for expiration and terminal status.
-/// Takes ownership of the value bytes to avoid unnecessary copies.
+/// Takes ownership of the KvValue to avoid unnecessary copies.
 fn collect_value(
-    value: Bytes,
+    value: KvValue,
     num_columns: usize,
     ttl_provider: &TTLProvider,
     allow_terminal_shortcut: bool,
-    values: &mut Vec<Bytes>,
-    selected_value: &mut Option<Bytes>,
+    values: &mut Vec<KvValue>,
+    selected_value: &mut Option<KvValue>,
     stop_collecting: &mut bool,
 ) -> Result<()> {
-    let expired_at = value_expired_at(&value)?;
+    let expired_at = value.expired_at()?;
     if ttl_provider.expired(&expired_at) {
         return Ok(());
     }
-    let is_terminal = value_is_terminal(&value, num_columns)?;
+    let is_terminal = value.is_terminal(num_columns)?;
     if allow_terminal_shortcut && selected_value.is_none() && values.is_empty() && is_terminal {
         *selected_value = Some(value);
         *stop_collecting = true;
@@ -130,14 +129,13 @@ impl<I> DeduplicatingIterator<I> {
                 self.current_value = None;
                 return Ok(());
             };
-            let first_value_bytes = first_value.into_encoded(self.num_columns);
 
-            let mut values: Vec<Bytes> = Vec::new();
-            let mut selected_value: Option<Bytes> = None;
+            let mut values: Vec<KvValue> = Vec::new();
+            let mut selected_value: Option<KvValue> = None;
             let mut stop_collecting = false;
 
             collect_value(
-                first_value_bytes,
+                first_value,
                 self.num_columns,
                 &self.ttl_provider,
                 allow_terminal_shortcut,
@@ -161,9 +159,8 @@ impl<I> DeduplicatingIterator<I> {
 
                 // Same key, take the value
                 if let Some(next_kv_value) = self.inner.take_value()? {
-                    let next_value_bytes = next_kv_value.into_encoded(self.num_columns);
                     collect_value(
-                        next_value_bytes,
+                        next_kv_value,
                         self.num_columns,
                         &self.ttl_provider,
                         allow_terminal_shortcut,
@@ -176,7 +173,7 @@ impl<I> DeduplicatingIterator<I> {
 
             if let Some(value) = selected_value {
                 self.current_key = Some(current_key);
-                self.current_value = Some(KvValue::Encoded(value));
+                self.current_value = Some(value);
                 return Ok(());
             }
 
@@ -189,8 +186,7 @@ impl<I> DeduplicatingIterator<I> {
             // The last value in the list is the oldest, the first is the newest
             let mut values_iter = values.into_iter().rev();
             let first = values_iter.next().expect("values is non-empty");
-            let mut first = first;
-            let mut merged_value = decode_value(&mut first, self.num_columns)?;
+            let mut merged_value = first.into_decoded(self.num_columns)?;
 
             if let Some(callback) = self.on_merge.as_deref_mut() {
                 // The first column is invoked with callback(None, first_column) to indicate it's the oldest column being merged.
@@ -201,8 +197,7 @@ impl<I> DeduplicatingIterator<I> {
                 }
                 // Then for each newer value, we invoke the callback for each column pair (older, newer) before merging.
                 for newer_value in values_iter {
-                    let mut newer_value = newer_value;
-                    let newer_value = decode_value(&mut newer_value, self.num_columns)?;
+                    let newer_value = newer_value.into_decoded(self.num_columns)?;
                     merged_value = merged_value.merge_with_callback(
                         newer_value,
                         &self.schema,
@@ -212,8 +207,7 @@ impl<I> DeduplicatingIterator<I> {
                 }
             } else {
                 for newer_value in values_iter {
-                    let mut newer_value = newer_value;
-                    let newer_value = decode_value(&mut newer_value, self.num_columns)?;
+                    let newer_value = newer_value.into_decoded(self.num_columns)?;
                     merged_value = merged_value.merge(
                         newer_value,
                         &self.schema,

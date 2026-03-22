@@ -7,7 +7,7 @@ use crate::iterator::{DeduplicatingIterator, MergingIterator};
 use crate::lsm::DynKvIterator;
 use crate::memtable::MemtableManager;
 use crate::schema::{Schema, SchemaManager};
-use crate::sst::row_codec::{decode_key, decode_value};
+use crate::sst::row_codec::decode_key;
 use crate::ttl::TTLProvider;
 use crate::vlog::VlogStore;
 use bytes::Bytes;
@@ -84,8 +84,7 @@ impl<'a> DbIterator<'a> {
                 return Ok(None);
             }
             let key = decode_key(&mut encoded_key)?;
-            let mut encoded_value = kv_value.into_encoded(self.num_columns);
-            let value = decode_value(&mut encoded_value, self.num_columns)?;
+            let value = kv_value.into_decoded(self.num_columns)?;
             let columns = value_to_vec_of_columns_with_vlog(
                 value,
                 |pointer| match self
