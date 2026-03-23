@@ -193,13 +193,13 @@ fn supports_primary_data(volume: &VolumeDescriptor) -> bool {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
-pub struct ReadProxyConfigEntry {
+pub struct ReaderConfigEntry {
     pub pin_partition_in_memory_count: usize,
     pub block_cache_size: usize,
     pub reload_tolerance_seconds: u64,
 }
 
-impl Default for ReadProxyConfigEntry {
+impl Default for ReaderConfigEntry {
     fn default() -> Self {
         Self {
             pin_partition_in_memory_count: 1,
@@ -352,7 +352,7 @@ pub struct Config {
     /// If unset, defaults to the in-memory block cache size.
     pub block_cache_hybrid_disk_size: Option<usize>,
     /// Read proxy configuration overrides.
-    pub read_proxy: ReadProxyConfigEntry,
+    pub reader: ReaderConfigEntry,
     /// Target base SST file size in bytes.
     pub base_file_size: usize,
     /// Enable bloom filter in SST files.
@@ -424,7 +424,7 @@ impl Default for Config {
             block_cache_size: 64 * 1024 * 1024,
             block_cache_hybrid_enabled: false,
             block_cache_hybrid_disk_size: None,
-            read_proxy: ReadProxyConfigEntry::default(),
+            reader: ReaderConfigEntry::default(),
             base_file_size: 64 * 1024 * 1024,
             sst_bloom_filter_enabled: false,
             sst_bloom_bits_per_key: 10,
@@ -671,8 +671,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, MemtableType, PrimaryVolumeOffloadPolicyKind, ReadProxyConfigEntry,
-        VolumeDescriptor, VolumeUsageKind,
+        Config, MemtableType, PrimaryVolumeOffloadPolicyKind, ReaderConfigEntry, VolumeDescriptor,
+        VolumeUsageKind,
     };
     use crate::SstCompressionAlgorithm;
     use crate::data_file::DataFileType;
@@ -704,7 +704,7 @@ mod tests {
             block_cache_size: 256,
             block_cache_hybrid_enabled: true,
             block_cache_hybrid_disk_size: Some(1024),
-            read_proxy: ReadProxyConfigEntry {
+            reader: ReaderConfigEntry {
                 pin_partition_in_memory_count: 2,
                 block_cache_size: 2048,
                 reload_tolerance_seconds: 5,
@@ -777,8 +777,8 @@ mod tests {
         assert_eq!(decoded.value_separation_threshold, 4096);
         assert_eq!(decoded.data_file_type, DataFileType::Parquet);
         assert_eq!(decoded.parquet_row_group_size_bytes, 4096);
-        assert_eq!(decoded.read_proxy.block_cache_size, 2048);
-        assert_eq!(decoded.read_proxy.reload_tolerance_seconds, 5);
+        assert_eq!(decoded.reader.block_cache_size, 2048);
+        assert_eq!(decoded.reader.reload_tolerance_seconds, 5);
         assert!(decoded.block_cache_hybrid_enabled);
         assert_eq!(decoded.block_cache_hybrid_disk_size, Some(1024));
 
@@ -793,14 +793,14 @@ mod tests {
         yaml_file.flush().expect("Should able to flush yaml");
         let decoded_yaml: Config =
             Config::from_path(yaml_file.path()).expect("Cannot deserialize yaml");
-        assert_eq!(decoded_yaml.read_proxy.block_cache_size, 2048);
+        assert_eq!(decoded_yaml.reader.block_cache_size, 2048);
 
         let mut path_buf = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path_buf.push("tests/testdata/config.ini");
 
         let decoded_ini =
             Config::from_path(path_buf.as_path()).expect("Cannot deserialize ini config");
-        assert_eq!(decoded_ini.read_proxy.reload_tolerance_seconds, 5);
+        assert_eq!(decoded_ini.reader.reload_tolerance_seconds, 5);
         assert!(decoded_ini.volumes[0].supports(VolumeUsageKind::Meta));
     }
 

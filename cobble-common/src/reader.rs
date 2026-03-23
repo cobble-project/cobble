@@ -6,11 +6,12 @@ use crate::error::{Error, Result};
 use crate::file::{File, FileSystem, FileSystemRegistry};
 use crate::lru::LruCache;
 use crate::metrics_manager::MetricsManager;
+use crate::paths::{
+    SNAPSHOT_DIR, global_snapshot_current_path, global_snapshot_manifest_path_by_pointer,
+    snapshot_manifest_name,
+};
 #[cfg(test)]
 use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
-use crate::paths::{
-    global_snapshot_current_path, global_snapshot_manifest_path_by_pointer, snapshot_manifest_name,
-};
 use crate::{Config, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, VolumeDescriptor};
 use bytes::Bytes;
 use serde_json::Error as SerdeError;
@@ -20,7 +21,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
-pub struct ReadProxyConfig {
+pub struct ReaderConfig {
     pub volumes: Vec<VolumeDescriptor>,
     pub total_buckets: u32,
     pub pin_partition_in_memory_count: usize,
@@ -30,7 +31,7 @@ pub struct ReadProxyConfig {
     pub reload_tolerance: Duration,
 }
 
-impl Default for ReadProxyConfig {
+impl Default for ReaderConfig {
     fn default() -> Self {
         let default_config = Config::default();
         Self {
@@ -45,16 +46,16 @@ impl Default for ReadProxyConfig {
     }
 }
 
-impl ReadProxyConfig {
+impl ReaderConfig {
     pub fn from_config(config: &Config) -> Self {
         Self {
             volumes: config.volumes.clone(),
             total_buckets: config.total_buckets,
-            pin_partition_in_memory_count: config.read_proxy.pin_partition_in_memory_count,
-            block_cache_size: config.read_proxy.block_cache_size,
+            pin_partition_in_memory_count: config.reader.pin_partition_in_memory_count,
+            block_cache_size: config.reader.block_cache_size,
             block_cache_hybrid_enabled: config.block_cache_hybrid_enabled,
             block_cache_hybrid_disk_size: config.block_cache_hybrid_disk_size,
-            reload_tolerance: Duration::from_secs(config.read_proxy.reload_tolerance_seconds),
+            reload_tolerance: Duration::from_secs(config.reader.reload_tolerance_seconds),
         }
     }
 }
@@ -65,8 +66,16 @@ struct BucketSnapshotKey {
     snapshot_id: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalSnapshotSummary {
+    pub id: u64,
+    pub total_buckets: u32,
+    pub shard_snapshot_count: usize,
+    pub is_current: bool,
+}
+
 /// Read proxy that routes reads to bucket snapshots and caches them with LRU eviction.
-pub struct ReadProxy {
+pub struct Reader {
     config: Config,
     global_snapshot: GlobalSnapshotManifest,
     bucket_map: Vec<Option<Arc<BucketSnapshotKey>>>,
@@ -78,12 +87,13 @@ pub struct ReadProxy {
     last_pointer: Option<String>,
     last_pointer_modified: Option<u64>,
     auto_refresh: bool,
+    fixed_snapshot_id: Option<u64>,
     reload_tolerance: Duration,
     last_refresh_at: Option<Instant>,
 }
 
-impl ReadProxy {
-    pub fn open(read_config: ReadProxyConfig, global_snapshot_id: u64) -> Result<Self> {
+impl Reader {
+    pub fn open(read_config: ReaderConfig, global_snapshot_id: u64) -> Result<Self> {
         let config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
@@ -130,12 +140,13 @@ impl ReadProxy {
             last_pointer: Some(manifest_name),
             last_pointer_modified: None,
             auto_refresh: false,
+            fixed_snapshot_id: Some(global_snapshot_id),
             reload_tolerance: read_config.reload_tolerance,
             last_refresh_at: None,
         })
     }
 
-    pub fn open_current(read_config: ReadProxyConfig) -> Result<Self> {
+    pub fn open_current(read_config: ReaderConfig) -> Result<Self> {
         let config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
@@ -183,6 +194,7 @@ impl ReadProxy {
             last_pointer: Some(pointer),
             last_pointer_modified: modified,
             auto_refresh: true,
+            fixed_snapshot_id: None,
             reload_tolerance: read_config.reload_tolerance,
             last_refresh_at: Some(Instant::now()),
         })
@@ -220,6 +232,43 @@ impl ReadProxy {
         let snapshot_key = self.snapshot_key_for_bucket(bucket_id)?;
         let db = self.load_snapshot(&snapshot_key)?;
         db.scan(bucket_id, range, options)
+    }
+
+    pub fn read_mode(&self) -> &'static str {
+        if self.fixed_snapshot_id.is_some() {
+            "snapshot"
+        } else {
+            "current"
+        }
+    }
+
+    pub fn configured_snapshot_id(&self) -> Option<u64> {
+        self.fixed_snapshot_id
+    }
+
+    pub fn current_global_snapshot(&self) -> &GlobalSnapshotManifest {
+        &self.global_snapshot
+    }
+
+    pub fn list_global_snapshots(&self) -> Result<Vec<GlobalSnapshotSummary>> {
+        let current_snapshot_id = read_manifest_pointer(&self.fs, None)?
+            .and_then(|(pointer, _)| parse_snapshot_id(&pointer));
+        let mut snapshots = Vec::new();
+        for entry in self.fs.list(SNAPSHOT_DIR)? {
+            let manifest_name = entry.rsplit('/').next().unwrap_or(entry.as_str()).trim();
+            let Some(snapshot_id) = parse_snapshot_id(manifest_name) else {
+                continue;
+            };
+            let manifest = load_global_snapshot_by_name(&self.fs, manifest_name)?;
+            snapshots.push(GlobalSnapshotSummary {
+                id: manifest.id,
+                total_buckets: manifest.total_buckets,
+                shard_snapshot_count: manifest.shard_snapshots.len(),
+                is_current: current_snapshot_id == Some(snapshot_id),
+            });
+        }
+        snapshots.sort_by_key(|snapshot| snapshot.id);
+        Ok(snapshots)
     }
 
     fn load_snapshot(&mut self, key: &Arc<BucketSnapshotKey>) -> Result<Arc<ReadOnlyDb>> {
@@ -297,6 +346,12 @@ fn decode_global_snapshot(bytes: &[u8]) -> Result<GlobalSnapshotManifest> {
     serde_json::from_slice(bytes).map_err(|err: SerdeError| {
         Error::IoError(format!("Failed to decode global manifest: {}", err))
     })
+}
+
+fn parse_snapshot_id(manifest_name: &str) -> Option<u64> {
+    let trimmed = manifest_name.trim();
+    let id = trimmed.strip_prefix("SNAPSHOT-")?;
+    id.parse::<u64>().ok()
 }
 
 fn load_global_snapshot_by_name(
@@ -470,7 +525,7 @@ mod tests {
     #[test]
     #[serial_test::serial(file)]
     fn test_read_proxy_routes_and_evicts() {
-        let root = "/tmp/read_proxy";
+        let root = "/tmp/reader";
         cleanup_root(root);
         let registry = FileSystemRegistry::new();
         let fs = registry
@@ -509,10 +564,10 @@ mod tests {
         coordinator.materialize_global_snapshot(&global).unwrap();
         wait_for_pointer(root, global.id);
 
-        let mut proxy = ReadProxy::open_current(ReadProxyConfig {
+        let mut proxy = Reader::open_current(ReaderConfig {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             total_buckets: 4,
-            ..ReadProxyConfig::default()
+            ..ReaderConfig::default()
         })
         .unwrap();
         let value_a = proxy.get(0, b"key-a", &ReadOptions::default()).unwrap();
@@ -573,10 +628,10 @@ mod tests {
         coordinator.materialize_global_snapshot(&global_a).unwrap();
         wait_for_pointer(root, global_a.id);
 
-        let mut proxy = ReadProxy::open_current(ReadProxyConfig {
+        let mut proxy = Reader::open_current(ReaderConfig {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             total_buckets: 4,
-            ..ReadProxyConfig::default()
+            ..ReaderConfig::default()
         })
         .unwrap();
         proxy.reload_tolerance = Duration::from_millis(0);

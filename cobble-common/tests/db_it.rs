@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::{
-    CompactionPolicyKind, Config, Db, MemtableType, MetricValue, ReadOptions, ReadProxy,
-    ReadProxyConfig, ScanOptions, SingleNodeDb, TimeProviderKind, U64CounterMergeOperator,
-    VolumeDescriptor, VolumeUsageKind, WriteBatch,
+    CompactionPolicyKind, Config, Db, MemtableType, MetricValue, ReadOptions, Reader, ReaderConfig,
+    ScanOptions, SingleNodeDb, TimeProviderKind, U64CounterMergeOperator, VolumeDescriptor,
+    VolumeUsageKind, WriteBatch,
 };
 use serde_json::Value as JsonValue;
 use std::path::Path;
@@ -865,7 +865,7 @@ fn test_single_node_db_snapshot_updates_global_manifest() {
         .expect("snapshot materialized");
     assert_eq!(global_id, callback_id);
 
-    let mut proxy = ReadProxy::open_current(ReadProxyConfig::from_config(&config)).unwrap();
+    let mut proxy = Reader::open_current(ReaderConfig::from_config(&config)).unwrap();
     let value = proxy
         .get(0, b"k1", &ReadOptions::default())
         .unwrap()
@@ -911,7 +911,7 @@ fn test_single_node_db_close_waits_snapshot_global_materialization() {
     let _global_snapshot_id = db.snapshot().unwrap();
     db.close().unwrap();
 
-    let mut proxy = ReadProxy::open_current(ReadProxyConfig::from_config(&config)).unwrap();
+    let mut proxy = Reader::open_current(ReaderConfig::from_config(&config)).unwrap();
     let value = proxy
         .get(0, b"k1", &ReadOptions::default())
         .unwrap()

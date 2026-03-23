@@ -26,7 +26,7 @@ mod metrics_registry;
 mod parquet;
 pub mod paths;
 mod read_only_db;
-mod read_proxy;
+mod reader;
 mod schema;
 mod single_node_db;
 mod snapshot;
@@ -59,7 +59,7 @@ pub use merge_operator::{
 pub use metrics_manager::MetricsManager;
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
 pub use read_only_db::ReadOnlyDb;
-pub use read_proxy::{ReadProxy, ReadProxyConfig};
+pub use reader::{GlobalSnapshotSummary, Reader, ReaderConfig};
 pub use schema::{Schema, SchemaBuilder};
 pub use single_node_db::SingleNodeDb;
 pub use sst::SstCompressionAlgorithm;

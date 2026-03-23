@@ -1,4 +1,4 @@
-use cobble::{Config, ReadOptions, ReadProxy, ReadProxyConfig, SingleNodeDb, VolumeDescriptor};
+use cobble::{Config, ReadOptions, Reader, ReaderConfig, SingleNodeDb, VolumeDescriptor};
 use log::LevelFilter::Debug;
 use rand_core::Rng;
 use rand_core::SeedableRng;
@@ -292,7 +292,7 @@ fn run(args: Args) -> Result<(), String> {
                 args.db_path.display(),
                 args.seed
             );
-            let mut proxy = ReadProxy::open_current(ReadProxyConfig::from_config(&config))
+            let mut proxy = Reader::open_current(ReaderConfig::from_config(&config))
                 .map_err(|err| format!("Failed to open read proxy: {err}"))?;
             let progress_every = (read_count / 100).max(1);
             let start = Instant::now();

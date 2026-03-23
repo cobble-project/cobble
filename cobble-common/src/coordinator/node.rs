@@ -160,6 +160,20 @@ impl DbCoordinator {
         self.load_global_snapshot(snapshot_id).map(Some)
     }
 
+    /// List all materialized global snapshots under the snapshot directory.
+    pub fn list_global_snapshots(&self) -> Result<Vec<GlobalSnapshotManifest>> {
+        let mut snapshots = Vec::new();
+        for entry in self.fs.list(SNAPSHOT_DIR)? {
+            let manifest_name = entry.rsplit('/').next().unwrap_or(entry.as_str()).trim();
+            let Ok(snapshot_id) = parse_snapshot_id(manifest_name) else {
+                continue;
+            };
+            snapshots.push(self.load_global_snapshot(snapshot_id)?);
+        }
+        snapshots.sort_by_key(|snapshot| snapshot.id);
+        Ok(snapshots)
+    }
+
     fn publish_manifest_pointer(&self, manifest_name: &str) -> Result<()> {
         let pointer_path = global_snapshot_current_path();
         let mut writer = MetadataWriter::new(&pointer_path, &self.fs)?;
@@ -286,6 +300,65 @@ mod tests {
         assert_eq!(loaded.shard_snapshots, snapshot.shard_snapshots);
         assert_eq!(loaded.shard_snapshots[0].manifest_path, path_a);
         assert_eq!(loaded.shard_snapshots[1].manifest_path, path_b);
+
+        cleanup_root(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_list_global_snapshots_returns_sorted() {
+        let root = "/tmp/coordinator_list_global_snapshots";
+        cleanup_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let path_a = write_bucket_snapshot(Arc::clone(&fs), root, "db-a", 1);
+        let path_b = write_bucket_snapshot(Arc::clone(&fs), root, "db-b", 2);
+
+        let node = DbCoordinator::open(CoordinatorConfig {
+            volumes: vec![crate::config::VolumeDescriptor::new(
+                format!("file://{}", root),
+                vec![
+                    crate::config::VolumeUsageKind::PrimaryDataPriorityHigh,
+                    crate::config::VolumeUsageKind::Meta,
+                ],
+            )],
+        })
+        .unwrap();
+
+        let snapshot_2 = node
+            .take_global_snapshot_with_id(
+                4,
+                vec![ShardSnapshotInput {
+                    ranges: vec![0u16..=3u16],
+                    db_id: "db-a".to_string(),
+                    snapshot_id: 1,
+                    manifest_path: path_a.clone(),
+                }],
+                2,
+            )
+            .unwrap();
+        node.materialize_global_snapshot(&snapshot_2).unwrap();
+
+        let snapshot_1 = node
+            .take_global_snapshot_with_id(
+                4,
+                vec![ShardSnapshotInput {
+                    ranges: vec![0u16..=3u16],
+                    db_id: "db-b".to_string(),
+                    snapshot_id: 2,
+                    manifest_path: path_b.clone(),
+                }],
+                1,
+            )
+            .unwrap();
+        node.materialize_global_snapshot(&snapshot_1).unwrap();
+
+        let listed = node.list_global_snapshots().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, 1);
+        assert_eq!(listed[1].id, 2);
 
         cleanup_root(root);
     }
