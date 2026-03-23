@@ -1053,10 +1053,16 @@ impl LSMTree {
                 }
             }
             DataFileType::Parquet => {
-                let mut iter = ParquetIterator::from_data_file(
+                let parquet_read_columns = if file.schema_id == target_schema_id {
+                    selected_columns
+                } else {
+                    None
+                };
+                let mut iter = ParquetIterator::from_data_file_with_columns(
                     Box::new(reader),
                     file.as_ref(),
                     self.block_cache.clone(),
+                    parquet_read_columns,
                 )?;
                 iter.seek(encoded_key)?;
                 if iter.valid()

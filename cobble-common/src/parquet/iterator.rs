@@ -29,6 +29,7 @@ pub(crate) struct ParquetIterator {
     current_group_rows: usize,
     current_group_rows_loaded: usize,
     num_columns: usize,
+    read_column_indices: Option<Vec<usize>>,
     key_reader: Option<ByteArrayColumnReader>,
     expired_at_reader: Option<Int64ColumnReader>,
     column_readers: Vec<Option<ByteArrayColumnReader>>,
@@ -40,7 +41,15 @@ pub(crate) struct ParquetIterator {
 
 impl ParquetIterator {
     pub(crate) fn new(file: Box<dyn RandomAccessFile>) -> Result<Self> {
-        Self::new_with_ranges(file, None, None, None)
+        Self::new_with_ranges(file, None, None, None, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_columns(
+        file: Box<dyn RandomAccessFile>,
+        column_indices: Option<&[usize]>,
+    ) -> Result<Self> {
+        Self::new_with_ranges(file, None, None, None, column_indices)
     }
 
     pub(crate) fn from_data_file(
@@ -48,8 +57,23 @@ impl ParquetIterator {
         data_file: &DataFile,
         block_cache: Option<BlockCache>,
     ) -> Result<Self> {
+        Self::from_data_file_with_columns(file, data_file, block_cache, None)
+    }
+
+    pub(crate) fn from_data_file_with_columns(
+        file: Box<dyn RandomAccessFile>,
+        data_file: &DataFile,
+        block_cache: Option<BlockCache>,
+        column_indices: Option<&[usize]>,
+    ) -> Result<Self> {
         let row_group_ranges = decode_meta_row_group_ranges(data_file.meta_bytes())?;
-        Self::new_with_ranges(file, row_group_ranges, Some(data_file.file_id), block_cache)
+        Self::new_with_ranges(
+            file,
+            row_group_ranges,
+            Some(data_file.file_id),
+            block_cache,
+            column_indices,
+        )
     }
 
     fn new_with_ranges(
@@ -57,11 +81,13 @@ impl ParquetIterator {
         row_group_ranges: Option<Vec<ParquetRowGroupRange>>,
         file_id: Option<u64>,
         block_cache: Option<BlockCache>,
+        column_indices: Option<&[usize]>,
     ) -> Result<Self> {
         let file = Arc::from(file);
         let total_row_groups = Self::row_group_count(&file, file_id, block_cache.clone())?;
         let row_group_ranges = row_group_ranges.filter(|ranges| ranges.len() == total_row_groups);
         let num_columns = Self::num_columns(&file, file_id, block_cache.clone())?;
+        let read_column_indices = column_indices.map(|v| v.to_vec());
         Ok(Self {
             file,
             file_id,
@@ -72,6 +98,7 @@ impl ParquetIterator {
             current_group_rows: 0,
             current_group_rows_loaded: 0,
             num_columns,
+            read_column_indices,
             key_reader: None,
             expired_at_reader: None,
             column_readers: (0..num_columns).map(|_| None).collect(),
@@ -138,13 +165,14 @@ impl ParquetIterator {
         file: &Arc<dyn RandomAccessFile>,
         row_group_idx: usize,
         num_columns: usize,
+        read_column_indices: Option<&[usize]>,
         file_id: Option<u64>,
         block_cache: Option<BlockCache>,
     ) -> Result<(
         usize,
         ByteArrayColumnReader,
         Int64ColumnReader,
-        Vec<ByteArrayColumnReader>,
+        Vec<Option<ByteArrayColumnReader>>,
     )> {
         let chunk_reader =
             RandomAccessChunkReader::from_arc_with_cache(Arc::clone(file), file_id, block_cache);
@@ -171,18 +199,37 @@ impl ParquetIterator {
             .get_column_reader(1)
             .map_err(|err| Error::IoError(format!("Failed to get expired_at reader: {}", err)))
             .map(get_typed_column_reader::<Int64Type>)?;
-        let mut column_readers = Vec::with_capacity(num_columns);
-        for idx in 0..num_columns {
-            let reader = row_group
-                .get_column_reader(idx + 2)
-                .map_err(|err| {
-                    Error::IoError(format!(
-                        "Failed to get payload reader for column {}: {}",
-                        idx, err
-                    ))
-                })
-                .map(get_typed_column_reader::<ByteArrayType>)?;
-            column_readers.push(reader);
+        let mut column_readers = (0..num_columns).map(|_| None).collect::<Vec<_>>();
+        match read_column_indices {
+            Some(indices) => {
+                for &idx in indices {
+                    debug_assert!(idx < num_columns);
+                    let reader = row_group
+                        .get_column_reader(idx + 2)
+                        .map_err(|err| {
+                            Error::IoError(format!(
+                                "Failed to get payload reader for column {}: {}",
+                                idx, err
+                            ))
+                        })
+                        .map(get_typed_column_reader::<ByteArrayType>)?;
+                    column_readers[idx] = Some(reader);
+                }
+            }
+            None => {
+                for (idx, reader_slot) in column_readers.iter_mut().enumerate().take(num_columns) {
+                    let reader = row_group
+                        .get_column_reader(idx + 2)
+                        .map_err(|err| {
+                            Error::IoError(format!(
+                                "Failed to get payload reader for column {}: {}",
+                                idx, err
+                            ))
+                        })
+                        .map(get_typed_column_reader::<ByteArrayType>)?;
+                    *reader_slot = Some(reader);
+                }
+            }
         }
         Ok((row_count, key_reader, expired_at_reader, column_readers))
     }
@@ -204,7 +251,15 @@ impl ParquetIterator {
         while self.current_row_group_idx < self.total_row_groups {
             if self.key_reader.is_some()
                 && self.expired_at_reader.is_some()
-                && self.column_readers.iter().all(Option::is_some)
+                && match self.read_column_indices.as_deref() {
+                    Some(indices) => indices.iter().all(|&idx| {
+                        self.column_readers
+                            .get(idx)
+                            .and_then(Option::as_ref)
+                            .is_some()
+                    }),
+                    None => self.column_readers.iter().all(Option::is_some),
+                }
                 && self.current_group_rows_loaded < self.current_group_rows
             {
                 return Ok(true);
@@ -214,6 +269,7 @@ impl ParquetIterator {
                     &self.file,
                     self.current_row_group_idx,
                     self.num_columns,
+                    self.read_column_indices.as_deref(),
                     self.file_id,
                     self.block_cache.clone(),
                 )?;
@@ -221,7 +277,7 @@ impl ParquetIterator {
             self.current_group_rows_loaded = 0;
             self.key_reader = Some(key_reader);
             self.expired_at_reader = Some(expired_at_reader);
-            self.column_readers = column_readers.into_iter().map(Some).collect();
+            self.column_readers = column_readers;
             if rows > 0 {
                 return Ok(true);
             }
@@ -281,47 +337,74 @@ impl ParquetIterator {
             }
 
             let mut payload_values_per_column: Vec<Vec<ByteArray>> =
-                Vec::with_capacity(self.num_columns);
+                (0..self.num_columns).map(|_| Vec::new()).collect();
             let mut payload_def_levels_per_column: Vec<Vec<i16>> =
-                Vec::with_capacity(self.num_columns);
-            for idx in 0..self.num_columns {
-                let reader = self.column_readers[idx].as_mut().ok_or_else(|| {
-                    Error::IoError(format!("Missing parquet payload reader {}", idx))
-                })?;
-                let mut values = Vec::new();
-                let mut def_levels = Vec::new();
-                let (records, _, _) = reader
-                    .read_records(key_records, Some(&mut def_levels), None, &mut values)
-                    .map_err(|err| {
-                        Error::IoError(format!(
-                            "Failed to read parquet payload column {} records: {}",
-                            idx, err
-                        ))
-                    })?;
-                if records != key_records {
-                    return Err(Error::IoError(format!(
-                        "Parquet payload records mismatch at column {}: expected {} got {}",
-                        idx, key_records, records
-                    )));
+                (0..self.num_columns).map(|_| Vec::new()).collect();
+            match self.read_column_indices.as_deref() {
+                Some(indices) => {
+                    for &idx in indices {
+                        let reader = self.column_readers[idx].as_mut().ok_or_else(|| {
+                            Error::IoError(format!("Missing parquet payload reader {}", idx))
+                        })?;
+                        let mut values = Vec::new();
+                        let mut def_levels = Vec::new();
+                        let (records, _, _) = reader
+                            .read_records(key_records, Some(&mut def_levels), None, &mut values)
+                            .map_err(|err| {
+                                Error::IoError(format!(
+                                    "Failed to read parquet payload column {} records: {}",
+                                    idx, err
+                                ))
+                            })?;
+                        if records != key_records {
+                            return Err(Error::IoError(format!(
+                                "Parquet payload records mismatch at column {}: expected {} got {}",
+                                idx, key_records, records
+                            )));
+                        }
+                        payload_values_per_column[idx] = values;
+                        payload_def_levels_per_column[idx] = def_levels;
+                    }
                 }
-                payload_values_per_column.push(values);
-                payload_def_levels_per_column.push(def_levels);
+                None => {
+                    for idx in 0..self.num_columns {
+                        let reader = self.column_readers[idx].as_mut().ok_or_else(|| {
+                            Error::IoError(format!("Missing parquet payload reader {}", idx))
+                        })?;
+                        let mut values = Vec::new();
+                        let mut def_levels = Vec::new();
+                        let (records, _, _) = reader
+                            .read_records(key_records, Some(&mut def_levels), None, &mut values)
+                            .map_err(|err| {
+                                Error::IoError(format!(
+                                    "Failed to read parquet payload column {} records: {}",
+                                    idx, err
+                                ))
+                            })?;
+                        if records != key_records {
+                            return Err(Error::IoError(format!(
+                                "Parquet payload records mismatch at column {}: expected {} got {}",
+                                idx, key_records, records
+                            )));
+                        }
+                        payload_values_per_column[idx] = values;
+                        payload_def_levels_per_column[idx] = def_levels;
+                    }
+                }
             }
 
             self.batch_values.clear();
             self.batch_values.reserve(key_records);
             let mut payload_offsets = vec![0usize; self.num_columns];
-            for (row_idx, &expired_at) in batch_expired_ats.iter().enumerate().take(key_records) {
-                let mut cols = Vec::with_capacity(self.num_columns);
-                for col_idx in 0..self.num_columns {
+            let mut decode_column_payload =
+                |cols: &mut [Option<Column>], col_idx: usize, row_idx: usize| -> Result<()> {
                     let is_present = payload_def_levels_per_column[col_idx]
                         .get(row_idx)
                         .copied()
                         .unwrap_or(0)
                         > 0;
                     if !is_present {
-                        cols.push(None);
-                        continue;
+                        return Ok(());
                     }
                     let payload_idx = payload_offsets[col_idx];
                     payload_offsets[col_idx] = payload_idx + 1;
@@ -341,10 +424,25 @@ impl ParquetIterator {
                         )));
                     }
                     let value_type = ValueType::decode_tag(payload[0])?;
-                    cols.push(Some(Column::new(
+                    cols[col_idx] = Some(Column::new(
                         value_type,
                         Bytes::copy_from_slice(&payload[1..]),
-                    )));
+                    ));
+                    Ok(())
+                };
+            for (row_idx, &expired_at) in batch_expired_ats.iter().enumerate().take(key_records) {
+                let mut cols = vec![None; self.num_columns];
+                match self.read_column_indices.as_deref() {
+                    Some(indices) => {
+                        for &col_idx in indices {
+                            decode_column_payload(cols.as_mut_slice(), col_idx, row_idx)?;
+                        }
+                    }
+                    None => {
+                        for col_idx in 0..self.num_columns {
+                            decode_column_payload(cols.as_mut_slice(), col_idx, row_idx)?;
+                        }
+                    }
                 }
                 let value = Value::new_with_expired_at(
                     cols,

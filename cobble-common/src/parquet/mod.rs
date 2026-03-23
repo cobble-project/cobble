@@ -186,6 +186,48 @@ mod tests {
 
     #[test]
     #[serial_test::serial(file)]
+    fn test_parquet_iterator_column_projection() {
+        let root = "file:///tmp/parquet_iterator_column_projection_test";
+        cleanup_test_root("/tmp/parquet_iterator_column_projection_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(root).unwrap();
+        let writer_file = fs.open_write("test.parquet").unwrap();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            ParquetWriterOptions {
+                num_columns: 3,
+                ..ParquetWriterOptions::default()
+            },
+        )
+        .unwrap();
+        let encoded = encode_value(
+            &Value::new(vec![
+                Some(Column::new(ValueType::Put, b"c0".to_vec())),
+                Some(Column::new(ValueType::Put, b"c1".to_vec())),
+                Some(Column::new(ValueType::Put, b"c2".to_vec())),
+            ]),
+            3,
+        );
+        writer.add(b"k1", &encoded).unwrap();
+        writer.finish().unwrap();
+
+        let mut iter = ParquetIterator::new_with_columns(build_reader(root), Some(&[1])).unwrap();
+        iter.seek_to_first().unwrap();
+        assert!(iter.valid());
+        let mut value = iter.value().unwrap().unwrap();
+        let decoded = decode_value(&mut value, 3).unwrap();
+        assert!(decoded.columns()[0].is_none());
+        assert_eq!(
+            decoded.columns()[1].as_ref().unwrap().data().as_ref(),
+            b"c1"
+        );
+        assert!(decoded.columns()[2].is_none());
+
+        cleanup_test_root("/tmp/parquet_iterator_column_projection_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
     fn test_parquet_meta_row_group_ranges() {
         let root = "file:///tmp/parquet_row_group_meta_test";
         cleanup_test_root("/tmp/parquet_row_group_meta_test");
