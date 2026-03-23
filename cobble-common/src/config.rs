@@ -101,6 +101,7 @@ pub enum PrimaryVolumeOffloadPolicyKind {
 pub enum MemtableType {
     #[default]
     Hash,
+    Skiplist,
     Vec,
 }
 

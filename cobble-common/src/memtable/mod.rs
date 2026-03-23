@@ -3,6 +3,7 @@
 mod hash;
 mod iter;
 mod manager;
+mod skiplist;
 mod vec;
 mod vlog;
 
@@ -10,6 +11,7 @@ use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::r#type::{KvValue, RefKey, RefValue};
 pub(crate) use hash::HashMemtable;
+pub(crate) use skiplist::SkiplistMemtable;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 pub(crate) use vec::VecMemtable;
@@ -73,11 +75,13 @@ pub(crate) trait Memtable {
 
 pub(crate) enum MemtableImpl {
     Hash(HashMemtable),
+    Skiplist(SkiplistMemtable),
     Vec(VecMemtable),
 }
 
 pub(crate) enum MemtableValueIter<'a> {
     Hash(hash::MemtableValueIter<'a>),
+    Skiplist(skiplist::MemtableValueIter<'a>),
     Vec(vec::MemtableValueIter<'a>),
 }
 
@@ -87,6 +91,7 @@ impl<'a> Iterator for MemtableValueIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Hash(iter) => iter.next(),
+            Self::Skiplist(iter) => iter.next(),
             Self::Vec(iter) => iter.next(),
         }
     }
@@ -94,6 +99,7 @@ impl<'a> Iterator for MemtableValueIter<'a> {
 
 pub(crate) enum MemtableKvIter<'a> {
     Hash(hash::MemtableKvIterator<'a>),
+    Skiplist(skiplist::MemtableKvIterator<'a>),
     Vec(vec::MemtableKvIterator<'a>),
 }
 
@@ -101,6 +107,7 @@ impl<'a> KvIterator<'a> for MemtableKvIter<'a> {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
         match self {
             Self::Hash(iter) => iter.seek(target),
+            Self::Skiplist(iter) => iter.seek(target),
             Self::Vec(iter) => iter.seek(target),
         }
     }
@@ -108,6 +115,7 @@ impl<'a> KvIterator<'a> for MemtableKvIter<'a> {
     fn seek_to_first(&mut self) -> Result<()> {
         match self {
             Self::Hash(iter) => iter.seek_to_first(),
+            Self::Skiplist(iter) => iter.seek_to_first(),
             Self::Vec(iter) => iter.seek_to_first(),
         }
     }
@@ -115,6 +123,7 @@ impl<'a> KvIterator<'a> for MemtableKvIter<'a> {
     fn next(&mut self) -> Result<bool> {
         match self {
             Self::Hash(iter) => iter.next(),
+            Self::Skiplist(iter) => iter.next(),
             Self::Vec(iter) => iter.next(),
         }
     }
@@ -122,6 +131,7 @@ impl<'a> KvIterator<'a> for MemtableKvIter<'a> {
     fn valid(&self) -> bool {
         match self {
             Self::Hash(iter) => iter.valid(),
+            Self::Skiplist(iter) => iter.valid(),
             Self::Vec(iter) => iter.valid(),
         }
     }
@@ -129,6 +139,7 @@ impl<'a> KvIterator<'a> for MemtableKvIter<'a> {
     fn key(&self) -> Result<Option<&[u8]>> {
         match self {
             Self::Hash(iter) => iter.key(),
+            Self::Skiplist(iter) => iter.key(),
             Self::Vec(iter) => iter.key(),
         }
     }
@@ -136,6 +147,7 @@ impl<'a> KvIterator<'a> for MemtableKvIter<'a> {
     fn take_key(&mut self) -> Result<Option<bytes::Bytes>> {
         match self {
             Self::Hash(iter) => iter.take_key(),
+            Self::Skiplist(iter) => iter.take_key(),
             Self::Vec(iter) => iter.take_key(),
         }
     }
@@ -143,6 +155,7 @@ impl<'a> KvIterator<'a> for MemtableKvIter<'a> {
     fn take_value(&mut self) -> Result<Option<KvValue>> {
         match self {
             Self::Hash(iter) => iter.take_value(),
+            Self::Skiplist(iter) => iter.take_value(),
             Self::Vec(iter) => iter.take_value(),
         }
     }
@@ -152,6 +165,7 @@ impl Memtable for MemtableImpl {
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         match self {
             Self::Hash(memtable) => memtable.put(key, value),
+            Self::Skiplist(memtable) => memtable.put(key, value),
             Self::Vec(memtable) => memtable.put(key, value),
         }
     }
@@ -164,6 +178,7 @@ impl Memtable for MemtableImpl {
     ) -> Result<()> {
         match self {
             Self::Hash(memtable) => memtable.put_ref(key, value, num_columns),
+            Self::Skiplist(memtable) => memtable.put_ref(key, value, num_columns),
             Self::Vec(memtable) => memtable.put_ref(key, value, num_columns),
         }
     }
@@ -176,6 +191,7 @@ impl Memtable for MemtableImpl {
     ) -> Result<()> {
         match self {
             Self::Hash(memtable) => memtable.put_ref_rewritten(key, plan, num_columns),
+            Self::Skiplist(memtable) => memtable.put_ref_rewritten(key, plan, num_columns),
             Self::Vec(memtable) => memtable.put_ref_rewritten(key, plan, num_columns),
         }
     }
@@ -183,6 +199,7 @@ impl Memtable for MemtableImpl {
     fn get(&self, key: &[u8]) -> Option<&[u8]> {
         match self {
             Self::Hash(memtable) => memtable.get(key),
+            Self::Skiplist(memtable) => memtable.get(key),
             Self::Vec(memtable) => memtable.get(key),
         }
     }
@@ -190,6 +207,7 @@ impl Memtable for MemtableImpl {
     fn get_all(&self, key: &[u8]) -> Self::ValueIter<'_> {
         match self {
             Self::Hash(memtable) => MemtableValueIter::Hash(memtable.get_all(key)),
+            Self::Skiplist(memtable) => MemtableValueIter::Skiplist(memtable.get_all(key)),
             Self::Vec(memtable) => MemtableValueIter::Vec(memtable.get_all(key)),
         }
     }
@@ -197,6 +215,7 @@ impl Memtable for MemtableImpl {
     fn remaining_capacity(&self) -> usize {
         match self {
             Self::Hash(memtable) => memtable.remaining_capacity(),
+            Self::Skiplist(memtable) => memtable.remaining_capacity(),
             Self::Vec(memtable) => memtable.remaining_capacity(),
         }
     }
@@ -204,6 +223,7 @@ impl Memtable for MemtableImpl {
     fn is_empty(&self) -> bool {
         match self {
             Self::Hash(memtable) => memtable.is_empty(),
+            Self::Skiplist(memtable) => memtable.is_empty(),
             Self::Vec(memtable) => memtable.is_empty(),
         }
     }
@@ -211,6 +231,7 @@ impl Memtable for MemtableImpl {
     fn append_blob(&mut self, data: &[u8]) -> Result<usize> {
         match self {
             Self::Hash(memtable) => memtable.append_blob(data),
+            Self::Skiplist(memtable) => memtable.append_blob(data),
             Self::Vec(memtable) => memtable.append_blob(data),
         }
     }
@@ -218,6 +239,7 @@ impl Memtable for MemtableImpl {
     fn read_blob(&self, offset: usize, len: usize) -> Option<&[u8]> {
         match self {
             Self::Hash(memtable) => memtable.read_blob(offset, len),
+            Self::Skiplist(memtable) => memtable.read_blob(offset, len),
             Self::Vec(memtable) => memtable.read_blob(offset, len),
         }
     }
@@ -229,6 +251,7 @@ impl Memtable for MemtableImpl {
     ) -> Result<()> {
         match self {
             Self::Hash(memtable) => memtable.flush_blobs_to_vlog_writer(entries, writer),
+            Self::Skiplist(memtable) => memtable.flush_blobs_to_vlog_writer(entries, writer),
             Self::Vec(memtable) => memtable.flush_blobs_to_vlog_writer(entries, writer),
         }
     }
@@ -241,6 +264,7 @@ impl Memtable for MemtableImpl {
     ) -> Result<usize> {
         match self {
             Self::Hash(memtable) => memtable.write_vlog_data_since(entries, offset, writer),
+            Self::Skiplist(memtable) => memtable.write_vlog_data_since(entries, offset, writer),
             Self::Vec(memtable) => memtable.write_vlog_data_since(entries, offset, writer),
         }
     }
@@ -248,6 +272,7 @@ impl Memtable for MemtableImpl {
     fn blob_cursor_checkpoint(&self) -> usize {
         match self {
             Self::Hash(memtable) => memtable.blob_cursor_checkpoint(),
+            Self::Skiplist(memtable) => memtable.blob_cursor_checkpoint(),
             Self::Vec(memtable) => memtable.blob_cursor_checkpoint(),
         }
     }
@@ -255,6 +280,7 @@ impl Memtable for MemtableImpl {
     fn rollback_blob_cursor(&mut self, checkpoint: usize) {
         match self {
             Self::Hash(memtable) => memtable.rollback_blob_cursor(checkpoint),
+            Self::Skiplist(memtable) => memtable.rollback_blob_cursor(checkpoint),
             Self::Vec(memtable) => memtable.rollback_blob_cursor(checkpoint),
         }
     }
@@ -262,6 +288,7 @@ impl Memtable for MemtableImpl {
     fn data_offset(&self) -> usize {
         match self {
             Self::Hash(memtable) => memtable.data_offset(),
+            Self::Skiplist(memtable) => memtable.data_offset(),
             Self::Vec(memtable) => memtable.data_offset(),
         }
     }
@@ -273,6 +300,7 @@ impl Memtable for MemtableImpl {
     ) -> Result<usize> {
         match self {
             Self::Hash(memtable) => memtable.write_data_since(offset, writer),
+            Self::Skiplist(memtable) => memtable.write_data_since(offset, writer),
             Self::Vec(memtable) => memtable.write_data_since(offset, writer),
         }
     }
@@ -280,6 +308,7 @@ impl Memtable for MemtableImpl {
     fn iter(&self) -> Self::KvIter<'_> {
         match self {
             Self::Hash(memtable) => MemtableKvIter::Hash(memtable.iter()),
+            Self::Skiplist(memtable) => MemtableKvIter::Skiplist(memtable.iter()),
             Self::Vec(memtable) => MemtableKvIter::Vec(memtable.iter()),
         }
     }

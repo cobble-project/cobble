@@ -14,7 +14,7 @@ use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{DeduplicatingIterator, KvIterator, SchemaEvolvingIterator};
 use crate::lsm::LSMTree;
 use crate::memtable::vlog::{MemtableVlogRecorder, rewrite_ref_value_for_memtable};
-use crate::memtable::{HashMemtable, VecMemtable};
+use crate::memtable::{HashMemtable, SkiplistMemtable, VecMemtable};
 use crate::memtable::{Memtable, MemtableImpl, MemtableKvIter, MemtableReclaimer};
 use crate::metrics_manager::MetricsManager;
 use crate::parquet::{ParquetWriter, ParquetWriterOptions};
@@ -651,6 +651,7 @@ impl MemtableManager {
             .ok_or_else(|| InvalidState("Active memtable missing".to_string()))?;
         let memtable_type = match memtable {
             MemtableImpl::Hash(_) => MemtableType::Hash,
+            MemtableImpl::Skiplist(_) => MemtableType::Skiplist,
             MemtableImpl::Vec(_) => MemtableType::Vec,
         };
         let mut segments = snapshot_manager.active_memtable_snapshot_segments(
@@ -748,6 +749,13 @@ impl MemtableManager {
                 MemtableType::Hash => {
                     let buffer = vec![0u8; memtable_capacity];
                     MemtableImpl::Hash(HashMemtable::with_buffer_and_reclaimer(
+                        buffer,
+                        reclaimer.clone(),
+                    ))
+                }
+                MemtableType::Skiplist => {
+                    let buffer = vec![0u8; memtable_capacity];
+                    MemtableImpl::Skiplist(SkiplistMemtable::with_buffer_and_reclaimer(
                         buffer,
                         reclaimer.clone(),
                     ))
@@ -1314,7 +1322,7 @@ impl MemtableManager {
         }
         let result = (|| {
             let (memtable, vlog_recorder) =
-                decode_active_snapshot_segments_into_vec_memtable(source_file_manager, segments)?;
+                decode_active_snapshot_segments_into_memtable(source_file_manager, segments)?;
             if memtable.is_empty() {
                 return Ok(false);
             }
@@ -1539,7 +1547,7 @@ fn flush_memtable(
     })
 }
 
-fn decode_active_snapshot_segments_into_vec_memtable(
+fn decode_active_snapshot_segments_into_memtable(
     file_manager: &Arc<FileManager>,
     segments: &[ActiveMemtableSnapshotData],
 ) -> Result<(VecMemtable, Option<MemtableVlogRecorder>)> {
@@ -1627,7 +1635,7 @@ fn decode_active_snapshot_segments_into_vec_memtable(
                 MemtableType::Hash => {
                     u32::from_be_bytes(kv_bytes[kv_pos..kv_pos + 4].try_into().unwrap()) as usize
                 }
-                MemtableType::Vec => {
+                MemtableType::Skiplist | MemtableType::Vec => {
                     u32::from_le_bytes(kv_bytes[kv_pos..kv_pos + 4].try_into().unwrap()) as usize
                 }
             };
@@ -1636,7 +1644,7 @@ fn decode_active_snapshot_segments_into_vec_memtable(
                     u32::from_be_bytes(kv_bytes[kv_pos + 4..kv_pos + 8].try_into().unwrap())
                         as usize
                 }
-                MemtableType::Vec => {
+                MemtableType::Skiplist | MemtableType::Vec => {
                     u32::from_le_bytes(kv_bytes[kv_pos + 4..kv_pos + 8].try_into().unwrap())
                         as usize
                 }
@@ -2232,6 +2240,54 @@ mod tests {
         let state = manager.state.lock().unwrap();
         assert_eq!(state.in_flight, 0);
         assert_eq!(state.budget, 0);
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_skiplist_memtable_triggers_flush_on_full() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(crate::lsm::LSMTree::with_state(
+            Arc::new(crate::db_state::DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
+        let manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 224,
+                buffer_count: 2,
+                memtable_type: MemtableType::Skiplist,
+                writer_options: WriterOptions::Sst(SSTWriterOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTWriterOptions::default()
+                }),
+                file_builder_factory: None,
+                num_columns: 1,
+                write_stall_limit: 8,
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        manager.open().unwrap();
+
+        let key1 = RefKey::new(0, b"k1");
+        let key2 = RefKey::new(0, b"k2");
+        let large_value = vec![b'v'; 96];
+        let value = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, &large_value))]);
+        manager.put(&key1, &value).unwrap();
+        manager.put(&key2, &value).unwrap();
+
+        let results = manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        assert_eq!(lsm_tree.level_files(0).len(), 1);
         cleanup_test_root();
     }
 }
