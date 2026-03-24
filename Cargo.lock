@@ -385,6 +385,7 @@ name = "cobble-cli"
 version = "0.0.1"
 dependencies = [
  "cobble",
+ "cobble-web-monitor",
  "log",
 ]
 

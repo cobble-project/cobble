@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 cobble = { path = "../cobble-common" }
+cobble-web-monitor = { path = "../cobble-web-monitor" }
 log = "0.4.29"
