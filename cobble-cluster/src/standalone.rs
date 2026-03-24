@@ -326,7 +326,7 @@ fn establish_connection(
 pub struct StandaloneCoordinator {
     // Shared Tokio runtime used by listener and async RPC workers.
     runtime: Arc<Runtime>,
-    // Core coordinator logic from cobble-common (global snapshot materialization).
+    // Core coordinator logic from cobble (global snapshot materialization).
     coordinator: Arc<DbCoordinator>,
     // Local filesystem governance write path kept on coordinator side.
     local_governance: Arc<FileSystemDbGovernance>,

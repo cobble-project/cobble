@@ -4,7 +4,7 @@ members = [
     "cobble-bench",
     "cobble-cli",
     "cobble-cluster",
-    "cobble-common",
+    "cobble",
     "cobble-data-structure",
     "cobble-web-monitor",
 ]

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::{
     CompactionPolicyKind, Config, Db, MemtableType, MetricValue, ReadOptions, Reader, ReaderConfig,
-    ScanOptions, SingleNodeDb, TimeProviderKind, U64CounterMergeOperator, VolumeDescriptor,
+    ScanOptions, SingleDb, TimeProviderKind, U64CounterMergeOperator, VolumeDescriptor,
     VolumeUsageKind, WriteBatch,
 };
 use serde_json::Value as JsonValue;
@@ -835,8 +835,8 @@ fn test_db_snapshot_creates_manifest() {
 
 #[test]
 #[serial_test::serial(file)]
-fn test_single_node_db_snapshot_updates_global_manifest() {
-    let root = "/tmp/single_node_db_snapshot";
+fn test_single_db_snapshot_updates_global_manifest() {
+    let root = "/tmp/single_db_snapshot";
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
@@ -848,7 +848,7 @@ fn test_single_node_db_snapshot_updates_global_manifest() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = SingleNodeDb::open(config.clone()).unwrap();
+    let db = SingleDb::open(config.clone()).unwrap();
 
     db.put(0, b"k1", 0, b"v1".to_vec()).unwrap();
     db.put(0, b"k2", 0, b"v2".to_vec()).unwrap();
@@ -893,8 +893,8 @@ fn test_single_node_db_snapshot_updates_global_manifest() {
 
 #[test]
 #[serial_test::serial(file)]
-fn test_single_node_db_close_waits_snapshot_global_materialization() {
-    let root = "/tmp/single_node_db_close_waits_snapshot";
+fn test_single_db_close_waits_snapshot_global_materialization() {
+    let root = "/tmp/single_db_close_waits_snapshot";
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
@@ -906,7 +906,7 @@ fn test_single_node_db_close_waits_snapshot_global_materialization() {
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let db = SingleNodeDb::open(config.clone()).unwrap();
+    let db = SingleDb::open(config.clone()).unwrap();
     db.put(0, b"k1", 0, b"v1".to_vec()).unwrap();
     let _global_snapshot_id = db.snapshot().unwrap();
     db.close().unwrap();

@@ -7,7 +7,7 @@ build = "build.rs"
 [dependencies]
 axum = "0.8.4"
 base64 = "0.22.1"
-cobble = { path = "../cobble-common" }
+cobble = { path = "../cobble" }
 include_dir = "0.7.4"
 log = "0.4.29"
 serde = { version = "1.0.219", features = ["derive"] }

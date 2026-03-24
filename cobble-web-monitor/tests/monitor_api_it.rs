@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use cobble::{Config, ReadOptions, SingleNodeDb, VolumeDescriptor};
+use cobble::{Config, ReadOptions, SingleDb, VolumeDescriptor};
 use cobble_web_monitor::{MonitorConfig, MonitorConfigSource, MonitorServer};
 use serde_json::{Value as JsonValue, json};
 use serial_test::serial;
@@ -50,7 +50,7 @@ fn test_monitor_snapshots_mode_switch_and_inspect() {
     let root = test_root("monitor_mode_switch");
     let (_config_path, config) = write_config_file(&root);
 
-    let db = SingleNodeDb::open(config.clone()).unwrap();
+    let db = SingleDb::open(config.clone()).unwrap();
     db.put(0, b"user:0001", 0, b"alice").unwrap();
     let snapshot_id_1 = db.snapshot().unwrap();
 
@@ -183,7 +183,7 @@ fn test_monitor_config_source_config_path_works() {
     let root = test_root("monitor_config_path");
     let (config_path, config) = write_config_file(&root);
 
-    let db = SingleNodeDb::open(config).unwrap();
+    let db = SingleDb::open(config).unwrap();
     db.put(0, b"k1", 0, b"v1").unwrap();
     let _snapshot = db.snapshot().unwrap();
     db.close().unwrap();
@@ -224,7 +224,7 @@ fn test_monitor_reject_invalid_mode_switch() {
     let root = test_root("monitor_invalid_mode_switch");
     let (_config_path, config) = write_config_file(&root);
 
-    let db = SingleNodeDb::open(config.clone()).unwrap();
+    let db = SingleDb::open(config.clone()).unwrap();
     db.put(0, b"k1", 0, b"v1").unwrap();
     let _snapshot_id = db.snapshot().unwrap();
     db.close().unwrap();
@@ -270,7 +270,7 @@ fn test_monitor_scan_empty_prefix_returns_rows() {
     let root = test_root("monitor_scan_empty_prefix");
     let (_config_path, config) = write_config_file(&root);
 
-    let db = SingleNodeDb::open(config.clone()).unwrap();
+    let db = SingleDb::open(config.clone()).unwrap();
     db.put(0, b"a-key", 0, b"v-a").unwrap();
     db.put(0, b"b-key", 0, b"v-b").unwrap();
     let _snapshot_id = db.snapshot().unwrap();
@@ -319,7 +319,7 @@ fn test_monitor_lookup_items_support_row_bucket() {
     let root = test_root("monitor_lookup_row_bucket");
     let (_config_path, config) = write_config_file(&root);
 
-    let db = SingleNodeDb::open(config.clone()).unwrap();
+    let db = SingleDb::open(config.clone()).unwrap();
     db.put(0, b"k-bucket-0", 0, b"v0").unwrap();
     db.put(1, b"k-bucket-1", 0, b"v1").unwrap();
     let _snapshot = db.snapshot().unwrap();

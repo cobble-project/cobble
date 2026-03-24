@@ -14,7 +14,7 @@ struct SingleNodeSnapshotState {
 }
 
 /// Single node database that proxies reads/writes and emits global snapshots.
-pub struct SingleNodeDb {
+pub struct SingleDb {
     db: Arc<Db>,
     coordinator: Arc<DbCoordinator>,
     total_buckets: u32,
@@ -22,7 +22,7 @@ pub struct SingleNodeDb {
     snapshot_done: Arc<Condvar>,
 }
 
-impl SingleNodeDb {
+impl SingleDb {
     pub fn open(config: Config) -> Result<Self> {
         let total_buckets = config.total_buckets;
         if total_buckets == 0 || total_buckets > (u16::MAX as u32) + 1 {
@@ -50,7 +50,7 @@ impl SingleNodeDb {
         let mut state = self.snapshot_state.lock().unwrap();
         if state.closing {
             return Err(Error::InvalidState(
-                "SingleNodeDb is closing; cannot create new snapshot".to_string(),
+                "SingleDb is closing; cannot create new snapshot".to_string(),
             ));
         }
         state.in_flight += 1;
@@ -195,7 +195,7 @@ impl SingleNodeDb {
     }
 }
 
-impl Deref for SingleNodeDb {
+impl Deref for SingleDb {
     type Target = Db;
 
     fn deref(&self) -> &Self::Target {

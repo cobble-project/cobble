@@ -4,6 +4,6 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
-cobble = { path = "../cobble-common" }
+cobble = { path = "../cobble" }
 cobble-web-monitor = { path = "../cobble-web-monitor" }
 log = "0.4.29"

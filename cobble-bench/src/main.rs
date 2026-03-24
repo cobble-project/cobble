@@ -1,4 +1,4 @@
-use cobble::{Config, ReadOptions, Reader, ReaderConfig, SingleNodeDb, VolumeDescriptor};
+use cobble::{Config, ReadOptions, Reader, ReaderConfig, SingleDb, VolumeDescriptor};
 use log::LevelFilter::Debug;
 use rand_core::Rng;
 use rand_core::SeedableRng;
@@ -224,7 +224,7 @@ fn run(args: Args) -> Result<(), String> {
 
     match args.mode {
         BenchMode::BulkLoad | BenchMode::BulkLoadSeparated => {
-            let db = SingleNodeDb::open(config.clone())
+            let db = SingleDb::open(config.clone())
                 .map_err(|err| format!("Failed to open db: {err}"))?;
 
             println!(

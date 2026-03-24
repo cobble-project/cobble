@@ -9,7 +9,7 @@ This repository is a Rust + Cargo project implementing an LSM-style KV storage e
 
 ## Workspace Organization
 - The project is organized as a Cargo workspace.
-- The main crate is `cobble`, located in the `cobble-common/`
+- The main crate is `cobble`, located in the `cobble/`
 - Other crates include:
   - `cobble-bench`: Benchmarking tools.
   - `cobble-cli`: Command-line interface for interacting with the database.
