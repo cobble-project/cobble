@@ -116,11 +116,17 @@ fn test_monitor_snapshots_mode_switch_and_inspect() {
     assert_eq!(meta_resp["read_mode"], "snapshot");
     assert_eq!(meta_resp["configured_snapshot_id"], snapshot_id_2);
 
+    let lookup_items_payload = serde_json::to_string(&json!([
+        {"bucket": 0, "key_b64": STANDARD.encode(b"user:0001")},
+        {"bucket": 0, "key_b64": STANDARD.encode(b"user:9999")}
+    ]))
+    .expect("serialize lookup payload");
     let lookup_resp: JsonValue = client
-        .get(format!(
-            "{}/api/v1/inspect?mode=lookup&bucket=0&keys=user:0001,user:9999",
-            base_url
-        ))
+        .get(format!("{}/api/v1/inspect", base_url))
+        .query(&[
+            ("mode", "lookup"),
+            ("lookup_items", lookup_items_payload.as_str()),
+        ])
         .send()
         .expect("inspect lookup request")
         .error_for_status()
@@ -132,6 +138,7 @@ fn test_monitor_snapshots_mode_switch_and_inspect() {
 
     let lookup_items = lookup_resp["lookup"].as_array().expect("lookup array");
     assert_eq!(lookup_items.len(), 2);
+    assert_eq!(lookup_items[0]["bucket"], 0);
     let col0_b64 = lookup_items[0]["value"][0]["b64"]
         .as_str()
         .expect("column b64");
@@ -252,6 +259,119 @@ fn test_monitor_reject_invalid_mode_switch() {
         .send()
         .expect("mode request invalid mode");
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.shutdown().expect("shutdown monitor server");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[serial(file)]
+fn test_monitor_scan_empty_prefix_returns_rows() {
+    let root = test_root("monitor_scan_empty_prefix");
+    let (_config_path, config) = write_config_file(&root);
+
+    let db = SingleNodeDb::open(config.clone()).unwrap();
+    db.put(0, b"a-key", 0, b"v-a").unwrap();
+    db.put(0, b"b-key", 0, b"v-b").unwrap();
+    let _snapshot_id = db.snapshot().unwrap();
+    db.close().unwrap();
+
+    let mut server = MonitorServer::new(MonitorConfig {
+        source: MonitorConfigSource::Config(Box::new(config)),
+        bind_addr: "127.0.0.1:0".to_string(),
+        global_snapshot_id: None,
+        inspect_default_limit: 10,
+        inspect_max_limit: 100,
+    })
+    .expect("create monitor server");
+    let handle = server.serve().expect("serve monitor server");
+    let base_url = handle.base_url();
+    wait_until_ready(&base_url);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client");
+
+    let scan_resp: JsonValue = client
+        .get(format!(
+            "{}/api/v1/inspect?mode=scan&bucket=0&prefix=&limit=5",
+            base_url
+        ))
+        .send()
+        .expect("inspect scan request")
+        .error_for_status()
+        .expect("inspect scan status")
+        .json()
+        .expect("inspect scan json");
+    assert_eq!(scan_resp["mode"], "scan");
+    let scan = scan_resp["scan"].as_object().expect("scan object");
+    let items = scan["items"].as_array().expect("items array");
+    assert!(!items.is_empty());
+
+    server.shutdown().expect("shutdown monitor server");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[serial(file)]
+fn test_monitor_lookup_items_support_row_bucket() {
+    let root = test_root("monitor_lookup_row_bucket");
+    let (_config_path, config) = write_config_file(&root);
+
+    let db = SingleNodeDb::open(config.clone()).unwrap();
+    db.put(0, b"k-bucket-0", 0, b"v0").unwrap();
+    db.put(1, b"k-bucket-1", 0, b"v1").unwrap();
+    let _snapshot = db.snapshot().unwrap();
+    db.close().unwrap();
+
+    let mut server = MonitorServer::new(MonitorConfig {
+        source: MonitorConfigSource::Config(Box::new(config)),
+        bind_addr: "127.0.0.1:0".to_string(),
+        global_snapshot_id: None,
+        inspect_default_limit: 10,
+        inspect_max_limit: 100,
+    })
+    .expect("create monitor server");
+    let handle = server.serve().expect("serve monitor server");
+    let base_url = handle.base_url();
+    wait_until_ready(&base_url);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client");
+
+    let row_items = serde_json::to_string(&json!([
+        {"bucket": 0, "key_b64": STANDARD.encode(b"k-bucket-0")},
+        {"bucket": 1, "key_b64": STANDARD.encode(b"k-bucket-1")}
+    ]))
+    .expect("serialize row items");
+    let lookup_resp: JsonValue = client
+        .get(format!("{}/api/v1/inspect", base_url))
+        .query(&[("mode", "lookup"), ("lookup_items", row_items.as_str())])
+        .send()
+        .expect("lookup request")
+        .error_for_status()
+        .expect("lookup status")
+        .json()
+        .expect("lookup json");
+    let items = lookup_resp["lookup"].as_array().expect("lookup array");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["bucket"], 0);
+    assert_eq!(items[1]["bucket"], 1);
+    assert_eq!(
+        STANDARD
+            .decode(items[0]["value"][0]["b64"].as_str().unwrap())
+            .unwrap(),
+        b"v0"
+    );
+    assert_eq!(
+        STANDARD
+            .decode(items[1]["value"][0]["b64"].as_str().unwrap())
+            .unwrap(),
+        b"v1"
+    );
 
     server.shutdown().expect("shutdown monitor server");
     let _ = std::fs::remove_dir_all(root);

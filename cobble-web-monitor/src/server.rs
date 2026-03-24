@@ -1,13 +1,16 @@
 use crate::error::{Error, Result};
 use axum::Router;
-use axum::extract::{Json as AxumJson, Query, State};
+use axum::extract::{Json as AxumJson, Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json};
+use axum::http::header::CONTENT_TYPE;
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cobble::{Config, ReadOptions, Reader, ReaderConfig, ScanOptions};
+use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::path::Path as FsPath;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::net::TcpListener;
@@ -17,6 +20,7 @@ use tokio::task::JoinHandle;
 
 const DEFAULT_INSPECT_LIMIT: usize = 100;
 const DEFAULT_INSPECT_MAX_LIMIT: usize = 1000;
+static UI_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web-ui/dist");
 
 #[derive(Clone, Debug)]
 pub enum MonitorConfigSource {
@@ -70,10 +74,16 @@ pub enum InspectMode {
 pub struct InspectQuery {
     pub mode: InspectMode,
     pub bucket: u16,
-    pub keys: Vec<Vec<u8>>,
+    pub lookup_items: Vec<LookupQueryItem>,
     pub prefix: Option<Vec<u8>>,
     pub start_after: Option<Vec<u8>>,
     pub limit: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LookupQueryItem {
+    pub bucket: u16,
+    pub key: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -233,6 +243,9 @@ impl MonitorServer {
             .route("/api/v1/inspect", get(inspect_handler))
             .route("/api/v1/snapshots", get(list_snapshots_handler))
             .route("/api/v1/mode", post(switch_mode_handler))
+            .route("/assets/{*path}", get(ui_assets_handler))
+            .route("/", get(ui_index_handler))
+            .route("/{*path}", get(ui_spa_handler))
             .with_state(Arc::clone(&self.state));
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -244,7 +257,7 @@ impl MonitorServer {
             let _ = serve.await;
         }));
 
-        log::info!("cobble-web-monitor listening on {}", bind_addr);
+        log::info!("cobble-web-monitor listening on http://{}/", bind_addr);
         Ok(MonitorServerHandle { bind_addr })
     }
 
@@ -294,6 +307,30 @@ async fn healthz_handler() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
+async fn ui_index_handler() -> Response {
+    serve_ui_entry_response()
+}
+
+async fn ui_assets_handler(Path(path): Path<String>) -> Response {
+    let raw = format!("assets/{}", path);
+    serve_ui_file_response(raw.as_str()).unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+}
+
+async fn ui_spa_handler(Path(path): Path<String>) -> Response {
+    let raw = path.trim();
+    if raw.is_empty() {
+        return serve_ui_entry_response();
+    }
+    if raw == "healthz" || raw.starts_with("api/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if has_file_extension(raw) {
+        return serve_ui_file_response(raw)
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+    serve_ui_entry_response()
+}
+
 async fn meta_handler(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<MetaResponse>, Error> {
@@ -307,6 +344,7 @@ struct InspectParams {
     bucket: Option<u16>,
     keys: Option<String>,
     keys_b64: Option<String>,
+    lookup_items: Option<String>,
     prefix: Option<String>,
     prefix_b64: Option<String>,
     start_after: Option<String>,
@@ -424,41 +462,35 @@ fn parse_inspect_query(
         }
     };
 
-    let bucket = params
-        .bucket
-        .ok_or_else(|| Error::InputError("query param `bucket` is required".to_string()))?;
-
     match mode {
         InspectMode::Lookup => {
-            let keys = parse_keys(params)?;
-            if keys.is_empty() {
+            let default_bucket = params.bucket.unwrap_or(0);
+            let lookup_items = parse_lookup_items(params, default_bucket)?;
+            if lookup_items.is_empty() {
                 return Err(Error::InputError(
-                    "lookup mode requires non-empty `keys` or `keys_b64`".to_string(),
+                    "lookup mode requires non-empty `keys`, `keys_b64`, or `lookup_items`"
+                        .to_string(),
                 ));
             }
             Ok(InspectQuery {
                 mode,
-                bucket,
-                keys,
+                bucket: default_bucket,
+                lookup_items,
                 prefix: None,
                 start_after: None,
                 limit: default_limit,
             })
         }
         InspectMode::Scan => {
+            let bucket = params
+                .bucket
+                .ok_or_else(|| Error::InputError("query param `bucket` is required".to_string()))?;
             let prefix = decode_optional_bytes(
                 params.prefix.as_deref(),
                 params.prefix_b64.as_deref(),
                 "prefix_b64",
             )?
-            .ok_or_else(|| {
-                Error::InputError("scan mode requires `prefix` or `prefix_b64`".to_string())
-            })?;
-            if prefix.is_empty() {
-                return Err(Error::InputError(
-                    "`prefix` must not be empty in scan mode".to_string(),
-                ));
-            }
+            .unwrap_or_default();
 
             let start_after = decode_optional_bytes(
                 params.start_after.as_deref(),
@@ -466,6 +498,7 @@ fn parse_inspect_query(
                 "start_after_b64",
             )?;
             if let Some(start_after) = start_after.as_ref()
+                && !prefix.is_empty()
                 && !start_after.starts_with(prefix.as_slice())
             {
                 return Err(Error::InputError(
@@ -483,7 +516,7 @@ fn parse_inspect_query(
             Ok(InspectQuery {
                 mode,
                 bucket,
-                keys: Vec::new(),
+                lookup_items: Vec::new(),
                 prefix: Some(prefix),
                 start_after,
                 limit: limit.min(max_limit),
@@ -492,7 +525,10 @@ fn parse_inspect_query(
     }
 }
 
-fn parse_keys(params: &InspectParams) -> Result<Vec<Vec<u8>>> {
+fn parse_lookup_items(params: &InspectParams, default_bucket: u16) -> Result<Vec<LookupQueryItem>> {
+    if let Some(raw) = params.lookup_items.as_deref() {
+        return parse_lookup_items_json(raw, default_bucket);
+    }
     if let Some(raw) = params.keys_b64.as_deref() {
         let mut output = Vec::new();
         for part in raw.split(',') {
@@ -500,12 +536,16 @@ fn parse_keys(params: &InspectParams) -> Result<Vec<Vec<u8>>> {
             if trimmed.is_empty() {
                 continue;
             }
-            output.push(STANDARD.decode(trimmed).map_err(|err| {
+            let key = STANDARD.decode(trimmed).map_err(|err| {
                 Error::InputError(format!(
                     "invalid `keys_b64` base64 item `{}`: {}",
                     trimmed, err
                 ))
-            })?);
+            })?;
+            output.push(LookupQueryItem {
+                bucket: default_bucket,
+                key,
+            });
         }
         return Ok(output);
     }
@@ -514,11 +554,41 @@ fn parse_keys(params: &InspectParams) -> Result<Vec<Vec<u8>>> {
             .split(',')
             .map(str::trim)
             .filter(|part| !part.is_empty())
-            .map(|part| part.as_bytes().to_vec())
+            .map(|part| LookupQueryItem {
+                bucket: default_bucket,
+                key: part.as_bytes().to_vec(),
+            })
             .collect();
         return Ok(output);
     }
     Ok(Vec::new())
+}
+
+#[derive(Debug, Deserialize)]
+struct LookupItemInput {
+    key_b64: String,
+    #[serde(default)]
+    bucket: Option<u16>,
+}
+
+fn parse_lookup_items_json(raw: &str, default_bucket: u16) -> Result<Vec<LookupQueryItem>> {
+    let parsed: Vec<LookupItemInput> = serde_json::from_str(raw).map_err(|err| {
+        Error::InputError(format!(
+            "invalid `lookup_items` JSON (expect [{{\"key_b64\":\"...\",\"bucket\":0}}]): {}",
+            err
+        ))
+    })?;
+    let mut output = Vec::with_capacity(parsed.len());
+    for item in parsed {
+        let key = STANDARD.decode(item.key_b64.as_str()).map_err(|err| {
+            Error::InputError(format!("invalid `lookup_items[].key_b64`: {}", err))
+        })?;
+        output.push(LookupQueryItem {
+            bucket: item.bucket.unwrap_or(default_bucket),
+            key,
+        });
+    }
+    Ok(output)
 }
 
 fn decode_optional_bytes(
@@ -544,6 +614,7 @@ enum InspectModeResponse {
 
 #[derive(Serialize)]
 struct LookupResultItem {
+    bucket: u16,
     key_b64: String,
     key_utf8: Option<String>,
     value: Option<Vec<Option<InspectColumnValue>>>,
@@ -582,12 +653,13 @@ fn run_inspect_query(state: &Arc<AppState>, query: &InspectQuery) -> Result<Insp
 
     match query.mode {
         InspectMode::Lookup => {
-            let mut output = Vec::with_capacity(query.keys.len());
-            for key in &query.keys {
-                let value = guard.get(query.bucket, key.as_slice(), &ReadOptions::default())?;
+            let mut output = Vec::with_capacity(query.lookup_items.len());
+            for item in &query.lookup_items {
+                let value = guard.get(item.bucket, item.key.as_slice(), &ReadOptions::default())?;
                 output.push(LookupResultItem {
-                    key_b64: STANDARD.encode(key),
-                    key_utf8: std::str::from_utf8(key.as_slice())
+                    bucket: item.bucket,
+                    key_b64: STANDARD.encode(item.key.as_slice()),
+                    key_utf8: std::str::from_utf8(item.key.as_slice())
                         .ok()
                         .map(|value| value.to_string()),
                     value: value.map(convert_columns),
@@ -606,18 +678,22 @@ fn run_inspect_query(state: &Arc<AppState>, query: &InspectQuery) -> Result<Insp
                 .prefix
                 .as_ref()
                 .ok_or_else(|| Error::InputError("scan query missing prefix".to_string()))?;
-            let range_end = next_prefix(prefix.as_slice()).ok_or_else(|| {
-                Error::InputError(
-                    "prefix is all 0xFF bytes and cannot build an exclusive upper bound"
-                        .to_string(),
-                )
-            })?;
 
             let scan_start = query
                 .start_after
                 .as_ref()
                 .cloned()
                 .unwrap_or_else(|| prefix.clone());
+            let range_end = if prefix.is_empty() {
+                vec![0xFFu8; 32]
+            } else {
+                next_prefix(prefix.as_slice()).ok_or_else(|| {
+                    Error::InputError(
+                        "prefix is all 0xFF bytes and cannot build an exclusive upper bound"
+                            .to_string(),
+                    )
+                })?
+            };
 
             let mut iter = guard.scan(
                 query.bucket,
@@ -738,6 +814,93 @@ fn status_for_error(err: &Error) -> StatusCode {
     }
 }
 
+fn serve_ui_entry_response() -> Response {
+    if let Some(response) = serve_ui_file_response("index.html") {
+        return response;
+    }
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/html; charset=utf-8")],
+        MISSING_UI_HTML,
+    )
+        .into_response()
+}
+
+fn serve_ui_file_response(relative: &str) -> Option<Response> {
+    let path = normalize_ui_relative_path(relative)?;
+    let body = UI_DIST.get_file(path.as_str())?.contents().to_vec();
+    let content_type = mime_for_path(relative);
+    Some(([(CONTENT_TYPE, content_type)], body).into_response())
+}
+
+fn normalize_ui_relative_path(relative: &str) -> Option<String> {
+    let mut sanitized = Vec::new();
+    for segment in relative.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." || segment.contains('\\') {
+            return None;
+        }
+        sanitized.push(segment.to_string());
+    }
+    if sanitized.is_empty() {
+        return None;
+    }
+    Some(sanitized.join("/"))
+}
+
+fn has_file_extension(path: &str) -> bool {
+    FsPath::new(path).extension().is_some()
+}
+
+fn mime_for_path(path: &str) -> &'static str {
+    match FsPath::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+    {
+        "js" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+const MISSING_UI_HTML: &str = r#"<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cobble Web Monitor</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: #17120f; color: #fff; }
+      main { max-width: 880px; margin: 48px auto; padding: 24px; border: 1px solid #3a2c22; border-radius: 12px; background: #211812; }
+      h1 { margin-top: 0; color: #f8f3ee; }
+      code { background: #2b211b; border-radius: 6px; padding: 2px 6px; }
+      pre { background: #2b211b; border-radius: 10px; padding: 12px; overflow-x: auto; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Cobble Web Monitor UI is not built yet.</h1>
+      <p>Build the frontend first, then restart the monitor server.</p>
+      <pre><code>cd cobble-web-monitor/web-ui
+npm install
+npm run build</code></pre>
+    </main>
+  </body>
+</html>
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,6 +919,7 @@ mod tests {
             bucket: Some(7),
             keys: None,
             keys_b64: None,
+            lookup_items: None,
             prefix: Some("user:".to_string()),
             prefix_b64: None,
             start_after: None,
@@ -780,6 +944,7 @@ mod tests {
                 STANDARD.encode(b"k1"),
                 STANDARD.encode(b"k2")
             )),
+            lookup_items: None,
             prefix: None,
             prefix_b64: None,
             start_after: None,
@@ -788,7 +953,10 @@ mod tests {
         };
         let query = parse_inspect_query(&params, 50, 100).expect("parse query");
         assert_eq!(query.mode, InspectMode::Lookup);
-        assert_eq!(query.keys, vec![b"k1".to_vec(), b"k2".to_vec()]);
+        assert_eq!(query.lookup_items.len(), 2);
+        assert_eq!(query.lookup_items[0].bucket, 1);
+        assert_eq!(query.lookup_items[0].key, b"k1".to_vec());
+        assert_eq!(query.lookup_items[1].key, b"k2".to_vec());
         assert_eq!(query.limit, 50);
     }
 
@@ -799,13 +967,77 @@ mod tests {
             bucket: Some(0),
             keys: None,
             keys_b64: None,
+            lookup_items: None,
             prefix: Some(String::new()),
             prefix_b64: None,
             start_after: None,
             start_after_b64: None,
             limit: None,
         };
-        let err = parse_inspect_query(&params, 10, 20).expect_err("empty prefix rejected");
-        assert!(err.to_string().contains("must not be empty"));
+        let query = parse_inspect_query(&params, 10, 20).expect("empty prefix should be accepted");
+        assert_eq!(query.prefix, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_parse_lookup_items_json() {
+        let params = InspectParams {
+            mode: Some("lookup".to_string()),
+            bucket: Some(3),
+            keys: None,
+            keys_b64: None,
+            lookup_items: Some(format!(
+                "[{{\"bucket\":2,\"key_b64\":\"{}\"}},{{\"key_b64\":\"{}\"}}]",
+                STANDARD.encode(b"k-a"),
+                STANDARD.encode(b"k-b")
+            )),
+            prefix: None,
+            prefix_b64: None,
+            start_after: None,
+            start_after_b64: None,
+            limit: None,
+        };
+        let query = parse_inspect_query(&params, 10, 20).expect("lookup_items parse");
+        assert_eq!(query.lookup_items.len(), 2);
+        assert_eq!(query.lookup_items[0].bucket, 2);
+        assert_eq!(query.lookup_items[0].key, b"k-a".to_vec());
+        assert_eq!(query.lookup_items[1].bucket, 3);
+        assert_eq!(query.lookup_items[1].key, b"k-b".to_vec());
+    }
+
+    #[test]
+    fn test_parse_lookup_without_bucket_uses_default_zero() {
+        let params = InspectParams {
+            mode: Some("lookup".to_string()),
+            bucket: None,
+            keys: Some("k0".to_string()),
+            keys_b64: None,
+            lookup_items: None,
+            prefix: None,
+            prefix_b64: None,
+            start_after: None,
+            start_after_b64: None,
+            limit: None,
+        };
+        let query = parse_inspect_query(&params, 10, 20).expect("lookup without bucket");
+        assert_eq!(query.bucket, 0);
+        assert_eq!(query.lookup_items.len(), 1);
+        assert_eq!(query.lookup_items[0].bucket, 0);
+        assert_eq!(query.lookup_items[0].key, b"k0".to_vec());
+    }
+
+    #[test]
+    fn test_resolve_ui_dist_path_rejects_parent_escape() {
+        assert!(normalize_ui_relative_path("../index.html").is_none());
+        assert!(normalize_ui_relative_path("assets/../../secret").is_none());
+    }
+
+    #[test]
+    fn test_mime_for_path() {
+        assert_eq!(
+            mime_for_path("a.js"),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(mime_for_path("a.css"), "text/css; charset=utf-8");
+        assert_eq!(mime_for_path("a.bin"), "application/octet-stream");
     }
 }
