@@ -6,6 +6,7 @@ members = [
     "cobble-cluster",
     "cobble-common",
     "cobble-data-structure",
+    "cobble-web-monitor",
 ]
 
 [profile.release]
