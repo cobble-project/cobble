@@ -15,9 +15,11 @@ use crate::snapshot::{
 use crate::sst::row_codec::encode_key_ref_into;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::r#type::{RefKey, Value};
+use crate::util::{build_commit_short_id, build_version_string};
 use crate::vlog::VlogStore;
 use crate::{Config, ReadOptions, ScanOptions};
 use bytes::Bytes;
+use log::info;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
@@ -66,6 +68,11 @@ impl ReadOnlyDb {
         metrics_manager: Arc<MetricsManager>,
     ) -> Result<Self> {
         let config = config.normalize_volume_paths()?;
+        info!(
+            "Cobble read-only db ({}, Rev:{}) start.",
+            build_version_string(),
+            build_commit_short_id()
+        );
         metrics_registry::init_metrics();
         let file_manager =
             FileManager::from_config(&config, &snapshot_db_id, Arc::clone(&metrics_manager))?;

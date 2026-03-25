@@ -16,7 +16,7 @@ use crate::snapshot::{
     ManifestSnapshot, build_tree_versions_from_manifest, build_vlog_version_from_manifest,
     list_snapshot_manifest_ids, load_manifest_entry, load_manifest_for_snapshot,
 };
-use crate::util::init_logging;
+use crate::util::{build_commit_short_id, build_version_string, init_logging};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -267,6 +267,11 @@ impl Db {
     ) -> Result<Self> {
         let config = config.normalize_volume_paths()?;
         init_logging(&config);
+        log::info!(
+            "cobble=db runtime start version={} build_commit={}",
+            build_version_string(),
+            build_commit_short_id()
+        );
         metrics_registry::init_metrics();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         let hybrid_cache_plan = config.resolve_hybrid_cache_volume_plan(config.block_cache_size)?;
@@ -356,6 +361,11 @@ impl Db {
     ) -> Result<Self> {
         let config = config.normalize_volume_paths()?;
         init_logging(&config);
+        log::info!(
+            "Cobble db ({}, Rev:{}) start.",
+            build_version_string(),
+            build_commit_short_id()
+        );
         metrics_registry::init_metrics();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         let hybrid_cache_plan = config.resolve_hybrid_cache_volume_plan(config.block_cache_size)?;

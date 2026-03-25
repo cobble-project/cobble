@@ -8,6 +8,8 @@ use crate::paths::{
     SNAPSHOT_DIR, global_snapshot_current_path, global_snapshot_manifest_path,
     snapshot_manifest_name,
 };
+use crate::util::{build_commit_short_id, build_version_string};
+use log::info;
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -48,6 +50,11 @@ pub struct DbCoordinator {
 
 impl DbCoordinator {
     pub fn open(config: CoordinatorConfig) -> Result<Self> {
+        info!(
+            "Cobble db coordinator ({}, Rev:{}) start.",
+            build_version_string(),
+            build_commit_short_id()
+        );
         let registry = FileSystemRegistry::new();
         let volumes = if config.volumes.is_empty() {
             return Err(IoError(

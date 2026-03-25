@@ -36,6 +36,14 @@ pub(crate) fn init_logging(config: &Config) {
     });
 }
 
+pub(crate) fn build_commit_short_id() -> &'static str {
+    option_env!("COBBLE_BUILD_COMMIT_GENERATED").unwrap_or("unknown")
+}
+
+pub(crate) fn build_version_string() -> &'static str {
+    concat!("v", env!("CARGO_PKG_VERSION"))
+}
+
 pub(crate) fn ranges_overlap(left: &RangeInclusive<u16>, right: &RangeInclusive<u16>) -> bool {
     !(*left.end() < *right.start() || *right.end() < *left.start())
 }

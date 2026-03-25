@@ -37,6 +37,9 @@ function selectInspectSub(sub) {
 function openLookupFromScan() {
   selectInspectSub('lookup')
 }
+
+const buildVersion = import.meta.env.VITE_COBBLE_VERSION || 'unknown'
+const buildCommit = import.meta.env.VITE_COBBLE_COMMIT || 'unknown'
 </script>
 
 <template>
@@ -54,6 +57,7 @@ function openLookupFromScan() {
       <main class="flex-1 bg-white px-6 py-6">
         <header class="mb-5 border-b border-stone-200 pb-4">
           <h2 class="text-xl font-semibold text-stone-800">{{ pageTitle }}</h2>
+          <p class="info-text mt-1">cobble-ui version {{ buildVersion }} · commit {{ buildCommit }}</p>
         </header>
 
         <SnapshotsPage v-if="activeMain === 'snapshots'" />

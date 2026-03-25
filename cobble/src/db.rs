@@ -32,7 +32,7 @@ use crate::governance::create_default_db_governance;
 use crate::metrics_registry;
 use crate::read_only_db::ReadOnlyDb;
 use crate::ttl::{TTLProvider, TtlConfig};
-use crate::util::init_logging;
+use crate::util::{build_commit_short_id, build_version_string, init_logging};
 #[path = "db_rescale.rs"]
 mod rescale;
 #[path = "db_restore.rs"]
@@ -223,6 +223,11 @@ impl Db {
         }
         let config = config.normalize_volume_paths()?;
         init_logging(&config);
+        info!(
+            "Cobble db ({}, Rev:{}) start.",
+            build_version_string(),
+            build_commit_short_id()
+        );
         metrics_registry::init_metrics();
         let id = db_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let metrics_manager = Arc::new(MetricsManager::new(&id));

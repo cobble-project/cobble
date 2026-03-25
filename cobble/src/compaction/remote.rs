@@ -20,7 +20,7 @@ use crate::schema::{Schema, SchemaManager};
 use crate::sst::SSTWriterOptions;
 use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
-use crate::util::init_logging;
+use crate::util::{build_commit_short_id, build_version_string, init_logging};
 use crate::vlog::VlogEdit;
 use crate::writer_options::WriterOptions;
 use bytes::Bytes;
@@ -384,6 +384,12 @@ impl RemoteCompactionWorker {
             fetch_supported_merge_operator_ids(&address, remote_timeout)?
                 .into_iter()
                 .collect();
+        info!(
+            "Cobble remote compactor ({}, Rev:{}) start at addr: {}.",
+            build_version_string(),
+            build_commit_short_id(),
+            address
+        );
         Ok(Self {
             address,
             file_manager,
@@ -543,7 +549,11 @@ impl CompactionWorker for RemoteCompactionWorker {
     }
 
     fn shutdown(&self) {
-        info!("remote compaction worker shutdown");
+        info!(
+            "cobble=remote compaction worker shutdown version={} build_commit={}",
+            build_version_string(),
+            build_commit_short_id()
+        );
         if let Some(runtime) = self.runtime.lock().unwrap().take() {
             runtime.shutdown_timeout(Duration::from_secs(5));
         }
@@ -621,7 +631,9 @@ impl RemoteCompactionServer {
         init_logging(&self.config);
         let listener = TcpListener::bind(address).map_err(|e| Error::IoError(e.to_string()))?;
         info!(
-            "remote compaction server listening on {}",
+            "cobble=remote compaction server start version={} build_commit={} addr={}",
+            build_version_string(),
+            build_commit_short_id(),
             listener.local_addr().unwrap()
         );
         for stream in listener.incoming() {

@@ -12,8 +12,10 @@ use crate::paths::{
 };
 #[cfg(test)]
 use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
+use crate::util::{build_commit_short_id, build_version_string};
 use crate::{Config, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, VolumeDescriptor};
 use bytes::Bytes;
+use log::info;
 use serde_json::Error as SerdeError;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
@@ -102,6 +104,11 @@ impl Reader {
             ..Config::default()
         }
         .normalize_volume_paths()?;
+        info!(
+            "Cobble reader ({}, Rev:{}) start.",
+            build_version_string(),
+            build_commit_short_id()
+        );
         let registry = FileSystemRegistry::new();
         let volumes = if config.volumes.is_empty() {
             return Err(Error::ConfigError("No volumes configured".to_string()));
@@ -155,6 +162,11 @@ impl Reader {
             ..Config::default()
         }
         .normalize_volume_paths()?;
+        info!(
+            "cobble=reader runtime start version={} build_commit={}",
+            build_version_string(),
+            build_commit_short_id()
+        );
         let registry = FileSystemRegistry::new();
         let volumes = if config.volumes.is_empty() {
             return Err(Error::ConfigError("No volumes configured".to_string()));
