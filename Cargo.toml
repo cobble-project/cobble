@@ -5,6 +5,7 @@ members = [
     "cobble-cli",
     "cobble-cluster",
     "cobble",
+    "cobble-java",
     "cobble-data-structure",
     "cobble-web-monitor",
 ]

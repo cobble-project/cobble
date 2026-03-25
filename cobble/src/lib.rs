@@ -66,3 +66,11 @@ pub use sst::SstCompressionAlgorithm;
 pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProviderKind};
 pub use r#type::ValueType;
 pub use write_batch::WriteBatch;
+
+pub fn build_commit_short_id() -> &'static str {
+    util::build_commit_short_id()
+}
+
+pub fn build_version_string() -> &'static str {
+    util::build_version_string()
+}

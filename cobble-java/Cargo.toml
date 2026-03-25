@@ -1,0 +1,12 @@
+[package]
+name = "cobble-java"
+version = "0.0.1"
+edition = "2024"
+
+[lib]
+name = "cobblejni"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cobble = { path = "../cobble" }
+jni = "0.21"
