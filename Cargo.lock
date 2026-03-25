@@ -422,7 +422,10 @@ name = "cobble-java"
 version = "0.0.1"
 dependencies = [
  "cobble",
+ "cobble-data-structure",
  "jni",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
