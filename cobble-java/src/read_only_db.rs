@@ -1,0 +1,186 @@
+use crate::util::{
+    decode_column_index, decode_java_bytes, decode_java_string, decode_u16, decode_u64_from_jlong,
+    throw_illegal_argument, throw_illegal_state,
+};
+use cobble::{Config, ReadOnlyDb, ReadOptions};
+use jni::JNIEnv;
+use jni::objects::{JByteArray, JClass, JObject, JString};
+use jni::sys::{jbyteArray, jint, jlong};
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ReadOnlyDb_openHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let db_id = match decode_java_string(&mut env, db_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let db = match ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id) {
+        Ok(db) => db,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(db)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ReadOnlyDb_openHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let db_id = match decode_java_string(&mut env, db_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match serde_json::from_str::<Config>(&json) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_argument(&mut env, format!("invalid config json: {}", err));
+            return 0;
+        }
+    };
+    let db = match ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id) {
+        Ok(db) => db,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(db)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ReadOnlyDb_disposeInternal(
+    mut env: JNIEnv,
+    _obj: JObject,
+    native_handle: jlong,
+) {
+    if native_handle == 0 {
+        throw_illegal_state(
+            &mut env,
+            "readonly db handle is already disposed".to_string(),
+        );
+        return;
+    }
+    let ptr = native_handle as *mut ReadOnlyDb;
+    // SAFETY: `native_handle` is returned by `ReadOnlyDb.openHandle` from `Box<ReadOnlyDb>`.
+    let _boxed = unsafe { Box::from_raw(ptr) };
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ReadOnlyDb_get(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+) -> jbyteArray {
+    let Some(db) = read_only_db_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let column_index = match decode_column_index(column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let options = ReadOptions::for_column(column_index);
+    let values = match db.get(bucket, &key, &options) {
+        Ok(values) => values,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let Some(columns) = values else {
+        return std::ptr::null_mut();
+    };
+    let Some(Some(value)) = columns.get(column_index) else {
+        return std::ptr::null_mut();
+    };
+    match env.byte_array_from_slice(value) {
+        Ok(bytes) => bytes.into_raw(),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn read_only_db_from_handle_or_throw(
+    env: &mut JNIEnv,
+    native_handle: jlong,
+) -> Option<&'static ReadOnlyDb> {
+    if native_handle == 0 {
+        throw_illegal_state(env, "readonly db handle is disposed".to_string());
+        return None;
+    }
+    // SAFETY: `native_handle` is created from `Box<ReadOnlyDb>` and valid until `disposeInternal`.
+    Some(unsafe { &*(native_handle as *const ReadOnlyDb) })
+}

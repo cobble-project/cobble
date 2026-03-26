@@ -36,6 +36,11 @@ class NativeLoaderTest {
         assertNotNull(Db.class);
         assertNotNull(SingleDb.class);
         assertNotNull(StructuredDb.class);
+        assertNotNull(ReadOnlyDb.class);
+        assertNotNull(Reader.class);
+        assertNotNull(DbCoordinator.class);
+        assertNotNull(ShardSnapshot.class);
+        assertNotNull(GlobalSnapshot.class);
     }
 
     @Test

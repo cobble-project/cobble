@@ -283,6 +283,19 @@ impl Reader {
         Ok(snapshots)
     }
 
+    pub fn list_global_snapshot_manifests(&self) -> Result<Vec<GlobalSnapshotManifest>> {
+        let mut manifests = Vec::new();
+        for entry in self.fs.list(SNAPSHOT_DIR)? {
+            let manifest_name = entry.rsplit('/').next().unwrap_or(entry.as_str()).trim();
+            if parse_snapshot_id(manifest_name).is_none() {
+                continue;
+            }
+            manifests.push(load_global_snapshot_by_name(&self.fs, manifest_name)?);
+        }
+        manifests.sort_by_key(|snapshot| snapshot.id);
+        Ok(manifests)
+    }
+
     fn load_snapshot(&mut self, key: &Arc<BucketSnapshotKey>) -> Result<Arc<ReadOnlyDb>> {
         if let Some(db) = self.cache.get(key) {
             return Ok(Arc::clone(db));

@@ -1,6 +1,6 @@
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jint, jstring};
+use jni::sys::{jint, jlong, jstring};
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Utils_versionString(env: JNIEnv, class: JClass) -> jstring {
@@ -43,6 +43,20 @@ pub(crate) fn decode_u16(name: &str, value: jint) -> std::result::Result<u16, St
     Ok(value as u16)
 }
 
+pub(crate) fn decode_u32(name: &str, value: jint) -> std::result::Result<u32, String> {
+    if value < 0 {
+        return Err(format!("{} out of range: {}", name, value));
+    }
+    Ok(value as u32)
+}
+
+pub(crate) fn decode_u64_from_jlong(name: &str, value: jlong) -> std::result::Result<u64, String> {
+    if value < 0 {
+        return Err(format!("{} out of range: {}", name, value));
+    }
+    Ok(value as u64)
+}
+
 pub(crate) fn decode_column_index(value: jint) -> std::result::Result<usize, String> {
     if value < 0 {
         return Err(format!("column out of range: {}", value));
@@ -56,4 +70,14 @@ pub(crate) fn throw_illegal_state(env: &mut JNIEnv, message: String) {
 
 pub(crate) fn throw_illegal_argument(env: &mut JNIEnv, message: String) {
     let _ = env.throw_new("java/lang/IllegalArgumentException", message);
+}
+
+pub(crate) fn to_java_string_or_throw(env: &mut JNIEnv, value: String) -> jstring {
+    match env.new_string(value) {
+        Ok(s) => s.into_raw(),
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
 }

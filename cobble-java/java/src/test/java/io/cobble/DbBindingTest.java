@@ -6,6 +6,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collections;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -114,6 +117,106 @@ class DbBindingTest {
                     assertArrayEquals(valueBytes("structured-json-v", i), value);
                 }
             }
+        }
+    }
+
+    @Test
+    void snapshotReadonlyReaderAndCoordinatorFlow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-snapshot-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        Path configPath = writeConfigFile(dataDir, config);
+        try (Db db = Db.open(config)) {
+            String dbId = db.id();
+            int count = 220;
+            for (int i = 0; i < count; i++) {
+                db.put(0, keyBytes("snapshot", i), 0, valueBytes("snapshot-v", i));
+            }
+            Future<ShardSnapshot> shardSnapshotFuture = db.asyncSnapshot();
+            ShardSnapshot shardSnapshot = awaitSnapshot(shardSnapshotFuture);
+            assertNotNull(shardSnapshot);
+            assertTrue(shardSnapshot.snapshotId >= 0);
+            assertNotNull(shardSnapshot.manifestPath);
+            assertFalse(shardSnapshot.manifestPath.isEmpty());
+            assertNotNull(shardSnapshot.ranges);
+            assertFalse(shardSnapshot.ranges.isEmpty());
+            assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
+
+            try (ReadOnlyDb readOnlyDb =
+                    ReadOnlyDb.open(configPath.toString(), shardSnapshot.snapshotId, dbId)) {
+                for (int i = 0; i < 220; i++) {
+                    assertArrayEquals(
+                            valueBytes("snapshot-v", i),
+                            readOnlyDb.get(0, keyBytes("snapshot", i), 0));
+                }
+            }
+
+            try (DbCoordinator coordinator = DbCoordinator.open(configPath.toString())) {
+                GlobalSnapshot materialized =
+                        coordinator.materializeGlobalSnapshot(
+                                1,
+                                shardSnapshot.snapshotId,
+                                Collections.singletonList(shardSnapshot));
+                assertNotNull(materialized);
+                assertEquals(shardSnapshot.snapshotId, materialized.id);
+                GlobalSnapshot globalSnapshot =
+                        coordinator.getGlobalSnapshot(shardSnapshot.snapshotId);
+                assertNotNull(globalSnapshot);
+                assertEquals(shardSnapshot.snapshotId, globalSnapshot.id);
+                assertNotNull(globalSnapshot.shardSnapshots);
+                assertEquals(1, globalSnapshot.shardSnapshots.size());
+                assertFalse(coordinator.listGlobalSnapshots().isEmpty());
+            }
+
+            try (Reader reader = Reader.openCurrent(configPath.toString())) {
+                assertEquals("current", reader.readMode());
+                assertEquals(-1L, reader.configuredSnapshotId());
+                for (int i = 0; i < 220; i++) {
+                    assertArrayEquals(
+                            valueBytes("snapshot-v", i), reader.get(0, keyBytes("snapshot", i), 0));
+                }
+                reader.refresh();
+                assertFalse(reader.listGlobalSnapshots().isEmpty());
+            }
+        }
+    }
+
+    @Test
+    void snapshotRestoreAndResumeFlow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-restore-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        Path configPath = writeConfigFile(dataDir, config);
+        String dbId;
+        try (Db db = Db.open(config)) {
+            dbId = db.id();
+            int count = 180;
+            for (int i = 0; i < count; i++) {
+                db.put(0, keyBytes("restore", i), 0, valueBytes("restore-v", i));
+            }
+            ShardSnapshot shardSnapshot = db.snapshot();
+            assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
+            try (Db restored = Db.restore(configPath.toString(), shardSnapshot.snapshotId, dbId)) {
+                for (int i = 0; i < 180; i++) {
+                    assertArrayEquals(
+                            valueBytes("restore-v", i), restored.get(0, keyBytes("restore", i), 0));
+                }
+            }
+            try (Db resumed = Db.resume(configPath.toString(), dbId)) {
+                for (int i = 0; i < 180; i++) {
+                    assertArrayEquals(
+                            valueBytes("restore-v", i), resumed.get(0, keyBytes("restore", i), 0));
+                }
+            }
+        }
+    }
+
+    private static ShardSnapshot awaitSnapshot(Future<ShardSnapshot> future) {
+        try {
+            return future.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while waiting snapshot future", e);
+        } catch (ExecutionException e) {
+            throw new IllegalStateException("snapshot future failed", e);
         }
     }
 

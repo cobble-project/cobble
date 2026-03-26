@@ -103,7 +103,7 @@ impl DbCoordinator {
         Self::build_global_snapshot(total_buckets, shard_snapshots, id)
     }
 
-    pub fn allocate_snapshot_id(&self) -> u64 {
+    pub(crate) fn allocate_snapshot_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
