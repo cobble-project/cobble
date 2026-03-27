@@ -2468,6 +2468,150 @@ fn test_db_scan_put_range_keeps_latest_value() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_db_scan_with_column_indices_flush_and_read_only_sst() {
+    run_scan_with_column_indices_flush_and_read_only_case(
+        "/tmp/db_it_scan_column_indices_flush_ro_sst",
+        "sst",
+    );
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_scan_with_column_indices_flush_and_read_only_parquet() {
+    run_scan_with_column_indices_flush_and_read_only_case(
+        "/tmp/db_it_scan_column_indices_flush_ro_parquet",
+        "parquet",
+    );
+}
+
+fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_type: &str) {
+    cleanup_test_root(root);
+    let config = config_with_data_file_type(
+        Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            memtable_capacity: 1024,
+            memtable_buffer_count: 2,
+            num_columns: 3,
+            block_cache_size: 0,
+            sst_bloom_filter_enabled: true,
+            ..Config::default()
+        },
+        data_file_type,
+    );
+    let db = open_db(config.clone());
+
+    for i in 0..256u32 {
+        let key = format!("proj:{:04}", i).into_bytes();
+        db.put(0, &key, 0, format!("c0-{i:04}").into_bytes())
+            .unwrap();
+        db.put(0, &key, 1, format!("c1-{i:04}").into_bytes())
+            .unwrap();
+        db.put(0, &key, 2, format!("c2-{i:04}").into_bytes())
+            .unwrap();
+    }
+    db.put(0, b"proj:0042", 0, b"c0-updated".to_vec()).unwrap();
+    db.put(0, b"proj:0042", 2, b"c2-updated".to_vec()).unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&manifest).unwrap();
+    let file_types = snapshot_tree_file_types(&manifest_json);
+    assert!(
+        !file_types.is_empty() && file_types.iter().all(|t| t == data_file_type),
+        "expected {data_file_type} files in manifest, got {:?}",
+        file_types
+    );
+
+    let mut scan_options = ScanOptions::for_columns(vec![2, 0]);
+    scan_options.read_ahead_bytes = 256;
+    let mut iter = db
+        .scan(
+            0,
+            b"proj:0000".as_slice()..b"proj:9999".as_slice(),
+            &scan_options,
+        )
+        .unwrap();
+    let mut seen: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = HashMap::new();
+    while let Some(row) = iter.next() {
+        let (key, columns) = row.unwrap();
+        assert_eq!(columns.len(), 2);
+        let col2 = columns[0]
+            .as_ref()
+            .expect("projected col2 present")
+            .to_vec();
+        let col0 = columns[1]
+            .as_ref()
+            .expect("projected col0 present")
+            .to_vec();
+        seen.insert(key.to_vec(), (col2, col0));
+    }
+    assert_eq!(seen.len(), 256);
+    for i in 0..256u32 {
+        let key = format!("proj:{:04}", i).into_bytes();
+        let expected_col0 = if i == 42 {
+            b"c0-updated".to_vec()
+        } else {
+            format!("c0-{i:04}").into_bytes()
+        };
+        let expected_col2 = if i == 42 {
+            b"c2-updated".to_vec()
+        } else {
+            format!("c2-{i:04}").into_bytes()
+        };
+        let (actual_col2, actual_col0) = seen.get(&key).expect("row exists");
+        assert_eq!(actual_col2.as_slice(), expected_col2.as_slice());
+        assert_eq!(actual_col0.as_slice(), expected_col0.as_slice());
+    }
+
+    db.close().unwrap();
+
+    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    let mut ro_iter = ro
+        .scan(
+            0,
+            b"proj:0000".as_slice()..b"proj:9999".as_slice(),
+            &ScanOptions::for_columns(vec![2, 0]),
+        )
+        .unwrap();
+    let mut ro_seen = 0usize;
+    while let Some(row) = ro_iter.next() {
+        let (key, columns) = row.unwrap();
+        assert_eq!(columns.len(), 2);
+        let key_str = std::str::from_utf8(key.as_ref()).unwrap();
+        let i: u32 = key_str["proj:".len()..].parse().unwrap();
+        let expected_col0 = if i == 42 {
+            b"c0-updated".to_vec()
+        } else {
+            format!("c0-{i:04}").into_bytes()
+        };
+        let expected_col2 = if i == 42 {
+            b"c2-updated".to_vec()
+        } else {
+            format!("c2-{i:04}").into_bytes()
+        };
+        assert_eq!(
+            columns[0]
+                .as_ref()
+                .expect("projected col2 present")
+                .as_ref(),
+            expected_col2.as_slice()
+        );
+        assert_eq!(
+            columns[1]
+                .as_ref()
+                .expect("projected col0 present")
+                .as_ref(),
+            expected_col0.as_slice()
+        );
+        ro_seen += 1;
+    }
+    assert_eq!(ro_seen, 256);
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_skiplist_large_write_flush_and_scan() {
     let root = "/tmp/db_it_skiplist_large_scan";
     cleanup_test_root(root);

@@ -4,6 +4,7 @@
 //! the underlying data file format (SST, etc.), allowing for future extensibility.
 
 mod bucket_filter;
+mod column_masking;
 mod deduplicating;
 mod factory;
 mod merging;
@@ -16,6 +17,8 @@ mod vlog_seq_offset;
 // These are currently unused within this crate but are exported for external usage.
 #[allow(unused_imports)]
 pub(crate) use bucket_filter::BucketFilterIterator;
+#[allow(unused_imports)]
+pub(crate) use column_masking::ColumnMaskingIterator;
 #[allow(unused_imports)]
 pub(crate) use deduplicating::DeduplicatingIterator;
 #[allow(unused_imports)]

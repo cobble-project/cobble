@@ -877,15 +877,29 @@ impl Db {
         self.ensure_open()?;
         let snapshot = self.db_state.load();
         let schema = self.schema_manager.latest_schema();
+        let num_columns = schema.num_columns();
+        if let Some(max_index) = options.max_index()
+            && max_index >= num_columns
+        {
+            return Err(Error::IoError(format!(
+                "max_index {} in ScanOptions exceeds num_columns {}",
+                max_index, num_columns
+            )));
+        }
         let memtable_iters = self
             .memtable_manager
-            .scan_memtable_iterators_with_snapshot(Arc::clone(&snapshot), Arc::clone(&schema))?;
+            .scan_memtable_iterators_with_snapshot(
+                Arc::clone(&snapshot),
+                Arc::clone(&schema),
+                options.columns(),
+            )?;
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
             Arc::clone(&schema),
             Arc::clone(&self.schema_manager),
             options.read_ahead_bytes,
+            options.columns(),
         );
         let lsm_iters = match lsm_iters {
             Ok(iters) => iters,
@@ -1740,6 +1754,49 @@ mod tests {
 
     #[test]
     #[serial(file)]
+    fn test_db_scan_with_column_indices() {
+        let root = "/tmp/db_scan_column_indices";
+        cleanup_test_root(root);
+        let config = Config {
+            num_columns: 2,
+            ..config_with_small_memtable(root)
+        };
+        let db = open_db(config);
+
+        let mut batch = WriteBatch::new();
+        batch.put(0, b"k1", 0, b"c0-1".to_vec());
+        batch.put(0, b"k1", 1, b"c1-1".to_vec());
+        batch.put(0, b"k2", 0, b"c0-2".to_vec());
+        batch.put(0, b"k2", 1, b"c1-2".to_vec());
+        db.write_batch(batch).unwrap();
+
+        let mut iter = db
+            .scan(
+                0,
+                b"k1".as_slice()..b"k3".as_slice(),
+                &ScanOptions::for_columns(vec![1, 0]),
+            )
+            .unwrap();
+
+        let (k1, cols1) = iter.next().unwrap().unwrap();
+        assert_eq!(k1.as_ref(), b"k1");
+        assert_eq!(cols1.len(), 2);
+        assert_eq!(cols1[0].as_ref().unwrap().as_ref(), b"c1-1");
+        assert_eq!(cols1[1].as_ref().unwrap().as_ref(), b"c0-1");
+
+        let (k2, cols2) = iter.next().unwrap().unwrap();
+        assert_eq!(k2.as_ref(), b"k2");
+        assert_eq!(cols2.len(), 2);
+        assert_eq!(cols2[0].as_ref().unwrap().as_ref(), b"c1-2");
+        assert_eq!(cols2[1].as_ref().unwrap().as_ref(), b"c0-2");
+
+        assert!(iter.next().is_none());
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
     fn test_db_scan_with_read_ahead_option() {
         let root = "/tmp/db_scan_read_ahead";
         cleanup_test_root(root);
@@ -1756,14 +1813,10 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
+            let mut options = ScanOptions::default();
+            options.read_ahead_bytes = 128;
             let mut iter = db
-                .scan(
-                    0,
-                    b"".as_slice()..b"\xff".as_slice(),
-                    &ScanOptions {
-                        read_ahead_bytes: 128,
-                    },
-                )
+                .scan(0, b"".as_slice()..b"\xff".as_slice(), &options)
                 .unwrap();
             let mut keys = Vec::new();
             while let Some(row) = iter.next() {

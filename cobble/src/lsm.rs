@@ -8,7 +8,8 @@ use crate::db_status::DbLifecycle;
 use crate::error::Result;
 use crate::file::{FileManager, ReadAheadBufferedReader, lsm_file_priority_for_level};
 use crate::iterator::{
-    BucketFilterIterator, KvIterator, SchemaEvolvingIterator, SortedRun, VlogSeqOffsetIterator,
+    BucketFilterIterator, ColumnMaskingIterator, KvIterator, SchemaEvolvingIterator, SortedRun,
+    VlogSeqOffsetIterator,
 };
 use crate::metrics_manager::MetricsManager;
 use crate::parquet::ParquetIterator;
@@ -912,7 +913,9 @@ impl LSMTree {
         target_schema: Arc<Schema>,
         schema_manager: Arc<SchemaManager>,
         read_ahead_bytes: usize,
+        selected_columns: Option<&[usize]>,
     ) -> Result<Vec<DynKvIterator>> {
+        let selected_columns = selected_columns.map(|columns| columns.to_vec());
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let use_read_ahead = read_ahead_bytes > 0 && tokio::runtime::Handle::try_current().is_ok();
         let mut runs: Vec<SortedRun> = Vec::new();
@@ -935,6 +938,7 @@ impl LSMTree {
             let sst_metrics = Arc::clone(&self.sst_metrics);
             let target_schema = Arc::clone(&target_schema);
             let schema_manager = Arc::clone(&schema_manager);
+            let selected_columns = selected_columns.clone();
             let run_iter = run.iter(move |file| {
                 let source_schema = schema_manager.schema(file.schema_id)?;
                 let reader = file_manager.open_data_file_reader(file.file_id)?;
@@ -958,11 +962,19 @@ impl LSMTree {
                             block_cache.clone(),
                         )?)
                     }
-                    DataFileType::Parquet => Box::new(ParquetIterator::from_data_file(
-                        reader,
-                        file,
-                        block_cache.clone(),
-                    )?),
+                    DataFileType::Parquet => {
+                        let parquet_read_columns = if file.schema_id == target_schema.version() {
+                            selected_columns.as_deref()
+                        } else {
+                            None
+                        };
+                        Box::new(ParquetIterator::from_data_file_with_columns(
+                            reader,
+                            file,
+                            block_cache.clone(),
+                            parquet_read_columns,
+                        )?)
+                    }
                 };
                 let base_iter: DynKvIterator = if file.needs_bucket_filter() {
                     Box::new(BucketFilterIterator::new(
@@ -982,15 +994,25 @@ impl LSMTree {
                         Arc::clone(&schema_manager),
                     ))
                 };
-                if file.vlog_file_seq_offset == 0 {
-                    Ok(iter)
+                let iter: DynKvIterator = if file.vlog_file_seq_offset == 0 {
+                    iter
                 } else {
-                    Ok(Box::new(VlogSeqOffsetIterator::new(
+                    Box::new(VlogSeqOffsetIterator::new(
                         iter,
                         target_schema.num_columns(),
                         file.vlog_file_seq_offset,
-                    )))
-                }
+                    ))
+                };
+                let iter: DynKvIterator = if let Some(columns) = selected_columns.as_deref() {
+                    Box::new(ColumnMaskingIterator::new(
+                        iter,
+                        target_schema.num_columns(),
+                        columns,
+                    ))
+                } else {
+                    iter
+                };
+                Ok(iter)
             });
             iterators.push(Box::new(run_iter));
         }

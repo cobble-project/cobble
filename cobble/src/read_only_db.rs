@@ -231,12 +231,22 @@ impl ReadOnlyDb {
     ) -> Result<DbIterator<'static>> {
         let snapshot = self.lsm_tree.db_state().load();
         let schema = self.schema_manager.latest_schema();
+        let num_columns = schema.num_columns();
+        if let Some(max_index) = options.max_index()
+            && max_index >= num_columns
+        {
+            return Err(Error::IoError(format!(
+                "max_index {} in ScanOptions exceeds num_columns {}",
+                max_index, num_columns
+            )));
+        }
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
             Arc::clone(&schema),
             Arc::clone(&self.schema_manager),
             options.read_ahead_bytes,
+            options.columns(),
         )?;
         let encode_scan_key = |key: &[u8]| {
             let mut encoded = bytes::BytesMut::with_capacity(2 + key.len());

@@ -11,7 +11,9 @@ use crate::error::Error::InvalidState;
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
-use crate::iterator::{DeduplicatingIterator, KvIterator, SchemaEvolvingIterator};
+use crate::iterator::{
+    ColumnMaskingIterator, DeduplicatingIterator, KvIterator, SchemaEvolvingIterator,
+};
 use crate::lsm::LSMTree;
 use crate::memtable::vlog::{MemtableVlogRecorder, rewrite_ref_value_for_memtable};
 use crate::memtable::{HashMemtable, SkiplistMemtable, VecMemtable};
@@ -1080,7 +1082,9 @@ impl MemtableManager {
         &self,
         snapshot: Arc<DbState>,
         target_schema: Arc<Schema>,
+        selected_columns: Option<&[usize]>,
     ) -> Result<Vec<DynKvIterator>> {
+        let selected_columns = selected_columns.map(|columns| columns.to_vec());
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         if let Some(active) = &snapshot.active {
             let source_schema = {
@@ -1098,6 +1102,15 @@ impl MemtableManager {
                     Arc::clone(&self.schema_manager),
                 ))
             };
+            let iter: DynKvIterator = if let Some(columns) = selected_columns.as_deref() {
+                Box::new(ColumnMaskingIterator::new(
+                    iter,
+                    target_schema.num_columns(),
+                    columns,
+                ))
+            } else {
+                iter
+            };
             iterators.push(iter);
         }
         for immutable in snapshot.immutables.iter().rev() {
@@ -1111,6 +1124,15 @@ impl MemtableManager {
                     Arc::clone(&target_schema),
                     Arc::clone(&self.schema_manager),
                 ))
+            };
+            let iter: DynKvIterator = if let Some(columns) = selected_columns.as_deref() {
+                Box::new(ColumnMaskingIterator::new(
+                    iter,
+                    target_schema.num_columns(),
+                    columns,
+                ))
+            } else {
+                iter
             };
             iterators.push(iter);
         }

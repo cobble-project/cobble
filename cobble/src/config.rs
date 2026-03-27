@@ -219,6 +219,8 @@ pub struct ReadOptions {
 #[derive(Clone, Debug, Default)]
 pub struct ScanOptions {
     pub read_ahead_bytes: usize,
+    pub column_indices: Option<Vec<usize>>,
+    max_index: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +237,35 @@ impl Default for ReadOptions {
             max_index: None,
             cached_masks: Arc::new(Mutex::new(None)),
         }
+    }
+}
+
+impl ScanOptions {
+    pub fn for_column(column_index: usize) -> Self {
+        Self::new_with_indices(Some(vec![column_index]))
+    }
+
+    pub fn for_columns(column_indices: Vec<usize>) -> Self {
+        Self::new_with_indices(Some(column_indices))
+    }
+
+    fn new_with_indices(column_indices: Option<Vec<usize>>) -> Self {
+        let max_index = column_indices
+            .as_ref()
+            .and_then(|indices| indices.iter().max().cloned());
+        Self {
+            read_ahead_bytes: 0,
+            column_indices,
+            max_index,
+        }
+    }
+
+    pub(crate) fn columns(&self) -> Option<&[usize]> {
+        self.column_indices.as_deref()
+    }
+
+    pub(crate) fn max_index(&self) -> Option<usize> {
+        self.max_index
     }
 }
 
