@@ -1,8 +1,9 @@
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::util::{
-    decode_java_bytes, decode_java_string, decode_u16, throw_illegal_argument, throw_illegal_state,
-    to_java_optional_bytes_2d,
+    decode_java_bytes, decode_java_string, decode_u16, decode_u32, throw_illegal_argument,
+    throw_illegal_state, to_java_optional_bytes_2d,
 };
+use crate::write_options::write_options_from_handle_or_throw;
 use cobble::{Config, SingleDb};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString};
@@ -133,6 +134,168 @@ pub extern "system" fn Java_io_cobble_SingleDb_put(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_putWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+    write_options_handle: jlong,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let value = match decode_java_bytes(&mut env, value) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let Some(write_options_handle) =
+        write_options_from_handle_or_throw(&mut env, write_options_handle)
+    else {
+        return;
+    };
+    if let Err(err) = db.put_with_options(
+        bucket,
+        key,
+        column,
+        value,
+        write_options_handle.write_options(),
+    ) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_merge(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let value = match decode_java_bytes(&mut env, value) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    if let Err(err) = db.merge(bucket, key, column, value) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_mergeWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+    write_options_handle: jlong,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let value = match decode_java_bytes(&mut env, value) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let Some(write_options_handle) =
+        write_options_from_handle_or_throw(&mut env, write_options_handle)
+    else {
+        return;
+    };
+    if let Err(err) = db.merge_with_options(
+        bucket,
+        key,
+        column,
+        value,
+        write_options_handle.write_options(),
+    ) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_SingleDb_get(
     mut env: JNIEnv,
     _class: JClass,
@@ -218,6 +381,26 @@ pub extern "system" fn Java_io_cobble_SingleDb_delete(
     if let Err(err) = db.delete(bucket, key, column) {
         throw_illegal_state(&mut env, err.to_string());
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_setTime(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    next_seconds: jint,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let next = match decode_u32("nextSeconds", next_seconds) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    db.set_time(next);
 }
 
 fn single_db_from_handle_or_throw(

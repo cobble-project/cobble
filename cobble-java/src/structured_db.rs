@@ -2,6 +2,7 @@ use crate::util::{
     decode_column_index, decode_java_bytes, decode_java_string, decode_u16, throw_illegal_argument,
     throw_illegal_state,
 };
+use crate::write_options::write_options_from_handle_or_throw;
 use cobble::Config;
 use cobble_data_structure::{DataStructureDb, StructuredColumnValue, StructuredSchema};
 use jni::JNIEnv;
@@ -149,6 +150,168 @@ pub extern "system" fn Java_io_cobble_StructuredDb_put(
         }
     };
     if let Err(err) = db.put(bucket, key, column, StructuredColumnValue::from(value)) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_StructuredDb_putWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+    write_options_handle: jlong,
+) {
+    let Some(db) = structured_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let value = match decode_java_bytes(&mut env, value) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let Some(write_options_handle) =
+        write_options_from_handle_or_throw(&mut env, write_options_handle)
+    else {
+        return;
+    };
+    if let Err(err) = db.put_with_options(
+        bucket,
+        key,
+        column,
+        StructuredColumnValue::from(value),
+        write_options_handle.write_options(),
+    ) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_StructuredDb_merge(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+) {
+    let Some(db) = structured_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let value = match decode_java_bytes(&mut env, value) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    if let Err(err) = db.merge(bucket, key, column, StructuredColumnValue::from(value)) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_StructuredDb_mergeWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+    write_options_handle: jlong,
+) {
+    let Some(db) = structured_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let value = match decode_java_bytes(&mut env, value) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let Some(write_options_handle) =
+        write_options_from_handle_or_throw(&mut env, write_options_handle)
+    else {
+        return;
+    };
+    if let Err(err) = db.merge_with_options(
+        bucket,
+        key,
+        column,
+        StructuredColumnValue::from(value),
+        write_options_handle.write_options(),
+    ) {
         throw_illegal_state(&mut env, err.to_string());
     }
 }

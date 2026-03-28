@@ -43,6 +43,7 @@ class NativeLoaderTest {
         assertNotNull(GlobalSnapshot.class);
         assertNotNull(ScanOptions.class);
         assertNotNull(ReadOptions.class);
+        assertNotNull(WriteOptions.class);
         assertNotNull(ScanCursor.class);
         assertNotNull(ScanBatch.class);
     }

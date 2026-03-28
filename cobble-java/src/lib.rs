@@ -9,3 +9,4 @@ mod scan;
 mod single_db;
 mod structured_db;
 mod util;
+mod write_options;

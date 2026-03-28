@@ -31,6 +31,22 @@ public final class StructuredDb extends NativeObject {
         put(nativeHandle, bucket, key, column, value);
     }
 
+    public void putWithOptions(
+            int bucket, byte[] key, int column, byte[] value, WriteOptions options) {
+        long writeOptionsHandle = options == null ? 0L : options.nativeHandle;
+        putWithOptions(nativeHandle, bucket, key, column, value, writeOptionsHandle);
+    }
+
+    public void merge(int bucket, byte[] key, int column, byte[] value) {
+        merge(nativeHandle, bucket, key, column, value);
+    }
+
+    public void mergeWithOptions(
+            int bucket, byte[] key, int column, byte[] value, WriteOptions options) {
+        long writeOptionsHandle = options == null ? 0L : options.nativeHandle;
+        mergeWithOptions(nativeHandle, bucket, key, column, value, writeOptionsHandle);
+    }
+
     public byte[] get(int bucket, byte[] key, int column) {
         return get(nativeHandle, bucket, key, column);
     }
@@ -48,6 +64,25 @@ public final class StructuredDb extends NativeObject {
 
     private static native void put(
             long nativeHandle, int bucket, byte[] key, int column, byte[] value);
+
+    private static native void putWithOptions(
+            long nativeHandle,
+            int bucket,
+            byte[] key,
+            int column,
+            byte[] value,
+            long writeOptionsHandle);
+
+    private static native void merge(
+            long nativeHandle, int bucket, byte[] key, int column, byte[] value);
+
+    private static native void mergeWithOptions(
+            long nativeHandle,
+            int bucket,
+            byte[] key,
+            int column,
+            byte[] value,
+            long writeOptionsHandle);
 
     private static native byte[] get(long nativeHandle, int bucket, byte[] key, int column);
 

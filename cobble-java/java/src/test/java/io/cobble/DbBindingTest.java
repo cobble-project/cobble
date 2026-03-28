@@ -140,6 +140,20 @@ class DbBindingTest {
                 db.put(0, key, 0, value);
             }
 
+            byte[] mergeKey = keyBytes("structured-json-merge", 1);
+            db.put(0, mergeKey, 0, "base".getBytes(StandardCharsets.UTF_8));
+            db.merge(0, mergeKey, 0, "-m1".getBytes(StandardCharsets.UTF_8));
+            assertEquals("base-m1", new String(db.get(0, mergeKey, 0), StandardCharsets.UTF_8));
+            try (WriteOptions options = WriteOptions.withTtl(60)) {
+                db.putWithOptions(
+                        0, mergeKey, 1, "ttl-structured".getBytes(StandardCharsets.UTF_8), options);
+                db.mergeWithOptions(
+                        0, mergeKey, 0, "-m2".getBytes(StandardCharsets.UTF_8), options);
+            }
+            assertEquals("base-m1-m2", new String(db.get(0, mergeKey, 0), StandardCharsets.UTF_8));
+            assertArrayEquals(
+                    "ttl-structured".getBytes(StandardCharsets.UTF_8), db.get(0, mergeKey, 1));
+
             for (int i = 0; i < count; i++) {
                 byte[] key = keyBytes("structured-json", i);
                 assertArrayEquals(valueBytes("structured-json-v", i), db.get(0, key, 0));
@@ -420,6 +434,97 @@ class DbBindingTest {
             assertTrue(
                     scannedBytes >= minimumScannedBytes,
                     "expected scanned bytes >= 128MB, actual=" + scannedBytes);
+        }
+    }
+
+    @Test
+    void dbMergeAndWriteOptionsWithTtl() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-db-merge-ttl-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        config.ttlEnabled = true;
+        config.defaultTtlSeconds = null;
+        config.timeProvider = Config.TimeProviderKind.MANUAL;
+
+        try (Db db = Db.open(config)) {
+            byte[] key = keyBytes("db-merge-ttl", 1);
+            db.put(0, key, 0, "a".getBytes(StandardCharsets.UTF_8));
+            db.merge(0, key, 0, "b".getBytes(StandardCharsets.UTF_8));
+            db.merge(0, key, 0, "c".getBytes(StandardCharsets.UTF_8));
+            assertEquals("abc", new String(db.get(0, key, 0), StandardCharsets.UTF_8));
+
+            try (WriteOptions options = WriteOptions.withTtl(10)) {
+                db.putWithOptions(0, key, 1, "ttl-put".getBytes(StandardCharsets.UTF_8), options);
+            }
+
+            assertArrayEquals("ttl-put".getBytes(StandardCharsets.UTF_8), db.get(0, key, 1));
+            db.setTime(11);
+            assertNull(db.get(0, key, 1), "ttl put should expire after manual time advances");
+
+            byte[] mergeTtlKey = keyBytes("db-merge-ttl", 2);
+            db.put(0, mergeTtlKey, 0, "x".getBytes(StandardCharsets.UTF_8));
+            try (WriteOptions options = new WriteOptions().ttlSeconds(10)) {
+                db.mergeWithOptions(
+                        0, mergeTtlKey, 0, "y".getBytes(StandardCharsets.UTF_8), options);
+            }
+            assertEquals("xy", new String(db.get(0, mergeTtlKey, 0), StandardCharsets.UTF_8));
+            db.setTime(22);
+            assertEquals(
+                    "x",
+                    new String(db.get(0, mergeTtlKey, 0), StandardCharsets.UTF_8),
+                    "expired merge operand should fall back to base put value");
+
+            byte[] mergeOnlyTtlKey = keyBytes("db-merge-ttl", 3);
+            try (WriteOptions options = new WriteOptions().ttlSeconds(5)) {
+                db.mergeWithOptions(
+                        0, mergeOnlyTtlKey, 0, "z".getBytes(StandardCharsets.UTF_8), options);
+            }
+            assertNotNull(db.get(0, mergeOnlyTtlKey, 0));
+            db.setTime(28);
+            assertNull(
+                    db.get(0, mergeOnlyTtlKey, 0),
+                    "ttl merge should expire merge-only value after manual time advances");
+        }
+    }
+
+    @Test
+    void singleDbMergeAndWriteOptionsWithTtl() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-single-merge-ttl-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        config.ttlEnabled = true;
+        config.defaultTtlSeconds = null;
+        config.timeProvider = Config.TimeProviderKind.MANUAL;
+
+        try (SingleDb db = SingleDb.open(config)) {
+            byte[] key = keyBytes("single-merge-ttl", 1);
+            db.put(0, key, 0, "m".getBytes(StandardCharsets.UTF_8));
+            db.merge(0, key, 0, "n".getBytes(StandardCharsets.UTF_8));
+            assertEquals("mn", new String(db.get(0, key, 0), StandardCharsets.UTF_8));
+
+            try (WriteOptions options = WriteOptions.withTtl(5)) {
+                db.putWithOptions(0, key, 1, "ttl".getBytes(StandardCharsets.UTF_8), options);
+            }
+            assertArrayEquals("ttl".getBytes(StandardCharsets.UTF_8), db.get(0, key, 1));
+            db.setTime(6);
+            assertNull(db.get(0, key, 1));
+
+            byte[] mergeTtlKey = keyBytes("single-merge-ttl", 2);
+            db.put(0, mergeTtlKey, 0, "p".getBytes(StandardCharsets.UTF_8));
+            try (WriteOptions options = new WriteOptions().ttlSeconds(5)) {
+                db.mergeWithOptions(
+                        0, mergeTtlKey, 0, "q".getBytes(StandardCharsets.UTF_8), options);
+            }
+            assertEquals("pq", new String(db.get(0, mergeTtlKey, 0), StandardCharsets.UTF_8));
+            db.setTime(12);
+            assertEquals("p", new String(db.get(0, mergeTtlKey, 0), StandardCharsets.UTF_8));
+
+            byte[] mergeOnlyTtlKey = keyBytes("single-merge-ttl", 3);
+            try (WriteOptions options = new WriteOptions().ttlSeconds(3)) {
+                db.mergeWithOptions(
+                        0, mergeOnlyTtlKey, 0, "r".getBytes(StandardCharsets.UTF_8), options);
+            }
+            assertNotNull(db.get(0, mergeOnlyTtlKey, 0));
+            db.setTime(16);
+            assertNull(db.get(0, mergeOnlyTtlKey, 0));
         }
     }
 

@@ -137,6 +137,25 @@ public final class Db extends NativeObject {
         put(nativeHandle, bucket, key, column, value);
     }
 
+    /** Put one column value for a key with explicit write options (native handle mode). */
+    public void putWithOptions(
+            int bucket, byte[] key, int column, byte[] value, WriteOptions options) {
+        long writeOptionsHandle = options == null ? 0L : options.nativeHandle;
+        putWithOptions(nativeHandle, bucket, key, column, value, writeOptionsHandle);
+    }
+
+    /** Merge one column value for a key. */
+    public void merge(int bucket, byte[] key, int column, byte[] value) {
+        merge(nativeHandle, bucket, key, column, value);
+    }
+
+    /** Merge one column value for a key with explicit write options (native handle mode). */
+    public void mergeWithOptions(
+            int bucket, byte[] key, int column, byte[] value, WriteOptions options) {
+        long writeOptionsHandle = options == null ? 0L : options.nativeHandle;
+        mergeWithOptions(nativeHandle, bucket, key, column, value, writeOptionsHandle);
+    }
+
     /** Get one column by index. */
     public byte[] get(int bucket, byte[] key, int column) {
         try (ReadOptions options = ReadOptions.forColumn(column)) {
@@ -186,6 +205,14 @@ public final class Db extends NativeObject {
      */
     public void delete(int bucket, byte[] key, int column) {
         delete(nativeHandle, bucket, key, column);
+    }
+
+    /** Set manual time provider seconds (only effective when config uses manual time provider). */
+    public void setTime(int nextSeconds) {
+        if (nextSeconds < 0) {
+            throw new IllegalArgumentException("nextSeconds must be >= 0");
+        }
+        setTime(nativeHandle, nextSeconds);
     }
 
     /**
@@ -315,6 +342,25 @@ public final class Db extends NativeObject {
     private static native void put(
             long nativeHandle, int bucket, byte[] key, int column, byte[] value);
 
+    private static native void putWithOptions(
+            long nativeHandle,
+            int bucket,
+            byte[] key,
+            int column,
+            byte[] value,
+            long writeOptionsHandle);
+
+    private static native void merge(
+            long nativeHandle, int bucket, byte[] key, int column, byte[] value);
+
+    private static native void mergeWithOptions(
+            long nativeHandle,
+            int bucket,
+            byte[] key,
+            int column,
+            byte[] value,
+            long writeOptionsHandle);
+
     private static native byte[][] get(
             long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
 
@@ -337,6 +383,8 @@ public final class Db extends NativeObject {
             long scanOptionsHandle);
 
     private static native void delete(long nativeHandle, int bucket, byte[] key, int column);
+
+    private static native void setTime(long nativeHandle, int nextSeconds);
 
     private static native String id(long nativeHandle);
 
