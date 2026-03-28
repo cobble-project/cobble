@@ -20,7 +20,7 @@ use crate::r#type::{Column, RefColumn, RefKey, RefValue, Value, ValueType};
 use crate::vlog::{VlogPointer, VlogStore};
 use crate::write_batch::{WriteBatch, WriteOp};
 use crate::writer_options::WriterOptions;
-use crate::{Config, ReadOptions, ScanOptions, TimeProvider};
+use crate::{Config, ReadOptions, ScanOptions, TimeProvider, WriteOptions};
 use bytes::{Bytes, BytesMut};
 use log::info;
 use std::ops::{Range, RangeInclusive};
@@ -292,7 +292,7 @@ impl Db {
         column: u16,
         value_type: ValueType,
         value: V,
-        ttl_seconds: Option<u32>,
+        options: &WriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -308,7 +308,9 @@ impl Db {
             )));
         }
         let column = RefColumn::new(value_type, value.as_ref());
-        let expired_at = self.ttl_provider.get_expiration_timestamp(ttl_seconds);
+        let expired_at = self
+            .ttl_provider
+            .get_expiration_timestamp(options.ttl_seconds);
         let mut columns: Vec<Option<RefColumn<'_>>> = vec![None; num_columns];
         columns[column_idx] = Some(column);
         let record = RefValue::new_with_expired_at(columns, expired_at);
@@ -322,23 +324,23 @@ impl Db {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.put_with_ttl(bucket, key, column, value, None)
+        self.put_with_options(bucket, key, column, value, &WriteOptions::default())
     }
 
-    /// Insert a single key/value pair into the given bucket and column with a TTL.
-    pub fn put_with_ttl<K, V>(
+    /// Insert a single key/value pair into the given bucket and column with write options.
+    pub fn put_with_options<K, V>(
         &self,
         bucket: u16,
         key: K,
         column: u16,
         value: V,
-        ttl_seconds: Option<u32>,
+        options: &WriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.write_ref(bucket, key, column, ValueType::Put, value, ttl_seconds)
+        self.write_ref(bucket, key, column, ValueType::Put, value, options)
     }
 
     /// Delete a single column value in the given bucket.
@@ -346,7 +348,14 @@ impl Db {
     where
         K: AsRef<[u8]>,
     {
-        self.write_ref(bucket, key, column, ValueType::Delete, [], None)
+        self.write_ref(
+            bucket,
+            key,
+            column,
+            ValueType::Delete,
+            [],
+            &WriteOptions::default(),
+        )
     }
 
     /// Merge a value into the given bucket and column.
@@ -355,23 +364,23 @@ impl Db {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.merge_with_ttl(bucket, key, column, value, None)
+        self.merge_with_options(bucket, key, column, value, &WriteOptions::default())
     }
 
-    /// Merge a value into the given bucket and column with a TTL.
-    pub fn merge_with_ttl<K, V>(
+    /// Merge a value into the given bucket and column with write options.
+    pub fn merge_with_options<K, V>(
         &self,
         bucket: u16,
         key: K,
         column: u16,
         value: V,
-        ttl_seconds: Option<u32>,
+        options: &WriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.write_ref(bucket, key, column, ValueType::Merge, value, ttl_seconds)
+        self.write_ref(bucket, key, column, ValueType::Merge, value, options)
     }
 
     /// Write a batch of operations to the database.
@@ -1343,7 +1352,7 @@ mod tests {
             ValueType::PutSeparatedArray,
         ] {
             let err = db
-                .write_ref(0, b"k1", 0, value_type, b"value", None)
+                .write_ref(0, b"k1", 0, value_type, b"value", &WriteOptions::default())
                 .unwrap_err();
             assert!(matches!(err, Error::InputError(_)));
         }

@@ -731,7 +731,13 @@ fn test_db_ttl_put_get_with_manual_time() {
 
     // Put with explicit TTL of 10 seconds
     let mut batch = WriteBatch::new();
-    batch.put_with_ttl(0, b"key", 0, b"value".to_vec(), Some(10));
+    batch.put_with_options(
+        0,
+        b"key",
+        0,
+        b"value".to_vec(),
+        &cobble::WriteOptions::with_ttl(10),
+    );
     db.write_batch(batch).unwrap();
 
     // At t=1000, value should be visible

@@ -42,7 +42,7 @@ mod writer_options;
 pub use compaction::RemoteCompactionServer;
 pub use config::{
     CompactionPolicyKind, Config, MemtableType, PrimaryVolumeOffloadPolicyKind, ReadOptions,
-    ScanOptions, VolumeDescriptor, VolumeUsageKind,
+    ScanOptions, VolumeDescriptor, VolumeUsageKind, WriteOptions,
 };
 pub use coordinator::{
     CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef,

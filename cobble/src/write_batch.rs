@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use std::collections::BTreeMap;
 
+use crate::WriteOptions;
+
 #[derive(PartialEq, Clone)]
 pub(crate) enum WriteOp {
     Put(Bytes, Bytes, Option<u32>),
@@ -48,16 +50,16 @@ impl WriteBatch {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.put_with_ttl(bucket, key, column, value, None);
+        self.put_with_options(bucket, key, column, value, &WriteOptions::default());
     }
 
-    pub fn put_with_ttl<K, V>(
+    pub fn put_with_options<K, V>(
         &mut self,
         bucket: u16,
         key: K,
         column: u16,
         value: V,
-        ttl_seconds: Option<u32>,
+        options: &WriteOptions,
     ) where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -68,7 +70,7 @@ impl WriteBatch {
             bucket,
             key_bytes.clone(),
             column,
-            WriteOp::Put(key_bytes, value, ttl_seconds),
+            WriteOp::Put(key_bytes, value, options.ttl_seconds),
         );
     }
 
@@ -90,16 +92,16 @@ impl WriteBatch {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.merge_with_ttl(bucket, key, column, value, None);
+        self.merge_with_options(bucket, key, column, value, &WriteOptions::default());
     }
 
-    pub fn merge_with_ttl<K, V>(
+    pub fn merge_with_options<K, V>(
         &mut self,
         bucket: u16,
         key: K,
         column: u16,
         value: V,
-        ttl_seconds: Option<u32>,
+        options: &WriteOptions,
     ) where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -110,7 +112,7 @@ impl WriteBatch {
             bucket,
             key_bytes.clone(),
             column,
-            WriteOp::Merge(key_bytes, value, ttl_seconds),
+            WriteOp::Merge(key_bytes, value, options.ttl_seconds),
         );
     }
 }

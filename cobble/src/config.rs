@@ -223,6 +223,19 @@ pub struct ScanOptions {
     max_index: Option<usize>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct WriteOptions {
+    pub ttl_seconds: Option<u32>,
+}
+
+impl WriteOptions {
+    pub fn with_ttl(ttl_seconds: u32) -> Self {
+        Self {
+            ttl_seconds: Some(ttl_seconds),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ReadOptionsMasks {
     pub(crate) num_columns: usize,

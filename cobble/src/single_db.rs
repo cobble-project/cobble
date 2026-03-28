@@ -1,7 +1,7 @@
 use crate::coordinator::{CoordinatorConfig, DbCoordinator};
 use crate::db_state::full_bucket_range;
 use crate::error::{Error, Result};
-use crate::{Config, Db, ReadOptions, WriteBatch};
+use crate::{Config, Db, ReadOptions, WriteBatch, WriteOptions};
 use bytes::Bytes;
 use log::error;
 use std::ops::Deref;
@@ -129,20 +129,20 @@ impl SingleDb {
         self.db.put(bucket, key, column, value)
     }
 
-    pub fn put_with_ttl<K, V>(
+    pub fn put_with_options<K, V>(
         &self,
         bucket: u16,
         key: K,
         column: u16,
         value: V,
-        ttl_seconds: Option<u32>,
+        options: &WriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
         self.db
-            .put_with_ttl(bucket, key, column, value, ttl_seconds)
+            .put_with_options(bucket, key, column, value, options)
     }
 
     pub fn delete<K>(&self, bucket: u16, key: K, column: u16) -> Result<()>
@@ -160,20 +160,20 @@ impl SingleDb {
         self.db.merge(bucket, key, column, value)
     }
 
-    pub fn merge_with_ttl<K, V>(
+    pub fn merge_with_options<K, V>(
         &self,
         bucket: u16,
         key: K,
         column: u16,
         value: V,
-        ttl_seconds: Option<u32>,
+        options: &WriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
         self.db
-            .merge_with_ttl(bucket, key, column, value, ttl_seconds)
+            .merge_with_options(bucket, key, column, value, options)
     }
 
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {

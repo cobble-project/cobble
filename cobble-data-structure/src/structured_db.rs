@@ -5,7 +5,7 @@ use crate::list::{
 use bytes::Bytes;
 use cobble::{
     Config, Db, DbIterator, Error, MergeOperatorResolver, Result, ScanOptions, SchemaBuilder,
-    WriteBatch,
+    WriteBatch, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -54,16 +54,16 @@ impl<'a> StructuredWriteBatch<'a> {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        self.put_with_ttl(bucket, key, column, value, None)
+        self.put_with_options(bucket, key, column, value, &WriteOptions::default())
     }
 
-    pub fn put_with_ttl<K, V>(
+    pub fn put_with_options<K, V>(
         &mut self,
         bucket: u16,
         key: K,
         column: u16,
         value: V,
-        ttl_seconds: Option<u32>,
+        options: &WriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -71,9 +71,9 @@ impl<'a> StructuredWriteBatch<'a> {
     {
         let encoded = self
             .db
-            .encode_for_write(column, value.into(), ttl_seconds)?;
+            .encode_for_write(column, value.into(), options.ttl_seconds)?;
         self.inner
-            .put_with_ttl(bucket, key, column, encoded, ttl_seconds);
+            .put_with_options(bucket, key, column, encoded, options);
         Ok(())
     }
 
@@ -89,16 +89,16 @@ impl<'a> StructuredWriteBatch<'a> {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        self.merge_with_ttl(bucket, key, column, value, None)
+        self.merge_with_options(bucket, key, column, value, &WriteOptions::default())
     }
 
-    pub fn merge_with_ttl<K, V>(
+    pub fn merge_with_options<K, V>(
         &mut self,
         bucket: u16,
         key: K,
         column: u16,
         value: V,
-        ttl_seconds: Option<u32>,
+        options: &WriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -106,9 +106,9 @@ impl<'a> StructuredWriteBatch<'a> {
     {
         let encoded = self
             .db
-            .encode_for_write(column, value.into(), ttl_seconds)?;
+            .encode_for_write(column, value.into(), options.ttl_seconds)?;
         self.inner
-            .merge_with_ttl(bucket, key, column, encoded, ttl_seconds);
+            .merge_with_options(bucket, key, column, encoded, options);
         Ok(())
     }
 
@@ -213,24 +213,24 @@ impl DataStructureDb {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        self.put_with_ttl(bucket, key, column, value, None)
+        self.put_with_options(bucket, key, column, value, &WriteOptions::default())
     }
 
-    pub fn put_with_ttl<K, V>(
+    pub fn put_with_options<K, V>(
         &self,
         bucket: u16,
         key: K,
         column: u16,
         value: V,
-        ttl_seconds: Option<u32>,
+        options: &WriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        let encoded = self.encode_for_write(column, value.into(), ttl_seconds)?;
+        let encoded = self.encode_for_write(column, value.into(), options.ttl_seconds)?;
         self.db
-            .put_with_ttl(bucket, key, column, encoded, ttl_seconds)
+            .put_with_options(bucket, key, column, encoded, options)
     }
 
     pub fn merge<K, V>(&self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
@@ -238,24 +238,24 @@ impl DataStructureDb {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        self.merge_with_ttl(bucket, key, column, value, None)
+        self.merge_with_options(bucket, key, column, value, &WriteOptions::default())
     }
 
-    pub fn merge_with_ttl<K, V>(
+    pub fn merge_with_options<K, V>(
         &self,
         bucket: u16,
         key: K,
         column: u16,
         value: V,
-        ttl_seconds: Option<u32>,
+        options: &WriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        let encoded = self.encode_for_write(column, value.into(), ttl_seconds)?;
+        let encoded = self.encode_for_write(column, value.into(), options.ttl_seconds)?;
         self.db
-            .merge_with_ttl(bucket, key, column, encoded, ttl_seconds)
+            .merge_with_options(bucket, key, column, encoded, options)
     }
 
     pub fn delete<K>(&self, bucket: u16, key: K, column: u16) -> Result<()>
