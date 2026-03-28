@@ -137,28 +137,30 @@ public final class Db extends NativeObject {
         put(nativeHandle, bucket, key, column, value);
     }
 
-    /**
-     * Get one column value for a key.
-     *
-     * @return column bytes, or {@code null} when missing
-     */
+    /** Get one column by index. */
     public byte[] get(int bucket, byte[] key, int column) {
-        return get(nativeHandle, bucket, key, column);
+        try (ReadOptions options = ReadOptions.forColumn(column)) {
+            return singleColumnOrNull(get(nativeHandle, bucket, key, options.nativeHandle));
+        }
+    }
+
+    /** Get selected columns for one key using reusable native-backed read options. */
+    public byte[][] get(int bucket, byte[] key, ReadOptions options) {
+        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
+        return get(nativeHandle, bucket, key, readOptionsHandle);
     }
 
     /** Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive). */
     public ScanCursor scan(
             int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, ScanOptions options) {
-        if (options == null) {
-            throw new IllegalArgumentException("options must not be null");
-        }
+        long scanOptionsHandle = options == null ? 0L : options.nativeHandle;
         long handle =
                 openScanCursor(
                         nativeHandle,
                         bucket,
                         startKeyInclusive,
                         endKeyExclusive,
-                        options.nativeHandle);
+                        scanOptionsHandle);
         if (handle == 0L) {
             throw new IllegalStateException("failed to open scan cursor");
         }
@@ -303,7 +305,19 @@ public final class Db extends NativeObject {
     private static native void put(
             long nativeHandle, int bucket, byte[] key, int column, byte[] value);
 
-    private static native byte[] get(long nativeHandle, int bucket, byte[] key, int column);
+    private static native byte[][] get(
+            long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
+
+    private static byte[] singleColumnOrNull(byte[][] columns) {
+        if (columns == null) {
+            return null;
+        }
+        if (columns.length != 1) {
+            throw new IllegalStateException(
+                    "expected exactly one selected column, got " + columns.length);
+        }
+        return columns[0];
+    }
 
     private static native long openScanCursor(
             long nativeHandle,

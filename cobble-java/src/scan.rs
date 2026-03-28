@@ -6,6 +6,7 @@ use cobble::{DbIterator, Result, ScanOptions};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JValue};
 use jni::sys::{jint, jlong, jobject};
+use std::sync::OnceLock;
 
 const DEFAULT_SCAN_BATCH_SIZE: usize = 256;
 
@@ -336,12 +337,11 @@ pub extern "system" fn Java_io_cobble_ScanCursor_nextBatchInternal(
 }
 
 pub(crate) fn scan_options_from_handle_or_throw(
-    env: &mut JNIEnv,
+    _env: &mut JNIEnv,
     native_handle: jlong,
 ) -> Option<&'static ScanOptionsHandle> {
     if native_handle == 0 {
-        throw_illegal_state(env, "scan options handle is disposed".to_string());
-        return None;
+        return Some(default_scan_options_handle());
     }
     // SAFETY: `native_handle` is created from `Box<ScanOptionsHandle>` and valid until dispose.
     Some(unsafe { &*(native_handle as *const ScanOptionsHandle) })
@@ -397,6 +397,11 @@ fn to_java_scan_batch(env: &mut JNIEnv, batch: ScanBatch) -> std::result::Result
         )
         .map_err(|err| err.to_string())?;
     Ok(result.into_raw())
+}
+
+fn default_scan_options_handle() -> &'static ScanOptionsHandle {
+    static DEFAULT_SCAN_OPTIONS_HANDLE: OnceLock<ScanOptionsHandle> = OnceLock::new();
+    DEFAULT_SCAN_OPTIONS_HANDLE.get_or_init(ScanOptionsHandle::new)
 }
 
 fn to_java_bytes_array(

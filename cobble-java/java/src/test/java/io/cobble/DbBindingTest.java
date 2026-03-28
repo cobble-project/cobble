@@ -34,6 +34,30 @@ class DbBindingTest {
                 assertArrayEquals(expected, db.get(0, key, 0));
             }
 
+            try (ReadOptions options = ReadOptions.forColumn(0)) {
+                for (int i = 0; i < count; i++) {
+                    byte[] key = keyBytes("db-json", i);
+                    byte[] expected = valueBytes("db-json-v", i);
+                    assertArrayEquals(expected, requiredSingleColumn(db.get(0, key, options)));
+                }
+            }
+            try (ReadOptions options = ReadOptions.forColumns(0, 1)) {
+                for (int i = 0; i < count; i++) {
+                    byte[] key = keyBytes("db-json", i);
+                    byte[][] columns = db.get(0, key, options);
+                    assertNotNull(columns);
+                    assertEquals(2, columns.length);
+                    assertArrayEquals(valueBytes("db-json-v", i), columns[0]);
+                    assertNull(columns[1]);
+                }
+            }
+            for (int i = 0; i < count; i++) {
+                byte[] key = keyBytes("db-json", i);
+                byte[] expected = valueBytes("db-json-v", i);
+                assertArrayEquals(
+                        expected, requiredSingleColumn(db.get(0, key, (ReadOptions) null)));
+            }
+
             for (int i = 0; i < count; i += 3) {
                 byte[] key = keyBytes("db-json", i);
                 db.delete(0, key, 0);
@@ -70,6 +94,22 @@ class DbBindingTest {
             for (int i = 0; i < count; i++) {
                 byte[] key = keyBytes("single-path", i);
                 assertArrayEquals(valueBytes("single-path-v", i), db.get(0, key, 0));
+            }
+            for (int i = 0; i < count; i++) {
+                byte[] key = keyBytes("single-path", i);
+                assertArrayEquals(
+                        valueBytes("single-path-v", i),
+                        requiredSingleColumn(db.get(0, key, (ReadOptions) null)));
+            }
+            try (ReadOptions options = ReadOptions.forColumns(0, 1)) {
+                for (int i = 0; i < count; i++) {
+                    byte[] key = keyBytes("single-path", i);
+                    byte[][] columns = db.get(0, key, options);
+                    assertNotNull(columns);
+                    assertEquals(2, columns.length);
+                    assertArrayEquals(valueBytes("single-path-v", i), columns[0]);
+                    assertNull(columns[1]);
+                }
             }
 
             for (int i = 1; i < count; i += 4) {
@@ -260,6 +300,21 @@ class DbBindingTest {
                     assertEquals("scan-db-v1-value-" + index + "-payload", value1.get(i));
                 }
             }
+            try (ScanCursor cursor =
+                    db.scan(0, scanKeyBytes("scan-db", 100), scanKeyBytes("scan-db", 900), null)) {
+                int rows = 0;
+                while (true) {
+                    ScanBatch batch = cursor.nextBatch();
+                    rows += batch.keys.length;
+                    for (int i = 0; i < batch.values.length; i++) {
+                        assertEquals(1, batch.values[i].length);
+                    }
+                    if (!batch.hasMore) {
+                        break;
+                    }
+                }
+                assertTrue(rows > 0);
+            }
         }
     }
 
@@ -386,6 +441,24 @@ class DbBindingTest {
             assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
             try (ReadOnlyDb readOnlyDb =
                     ReadOnlyDb.open(configPath.toString(), shardSnapshot.snapshotId, dbId)) {
+                assertArrayEquals(
+                        valueBytes("scan-ro-v0", 10),
+                        requiredSingleColumn(
+                                readOnlyDb.get(
+                                        0, scanKeyBytes("scan-ro", 10), (ReadOptions) null)));
+                try (ReadOptions readOptions = ReadOptions.forColumn(0)) {
+                    assertArrayEquals(
+                            valueBytes("scan-ro-v0", 10),
+                            requiredSingleColumn(
+                                    readOnlyDb.get(0, scanKeyBytes("scan-ro", 10), readOptions)));
+                }
+                try (ReadOptions readOptions = ReadOptions.forColumns(0, 1)) {
+                    byte[][] columns = readOnlyDb.get(0, scanKeyBytes("scan-ro", 10), readOptions);
+                    assertNotNull(columns);
+                    assertEquals(2, columns.length);
+                    assertArrayEquals(valueBytes("scan-ro-v0", 10), columns[0]);
+                    assertArrayEquals(valueBytes("scan-ro-v1", 10), columns[1]);
+                }
                 try (ScanOptions options = new ScanOptions().batchSize(96).columns(0, 1);
                         ScanCursor cursor =
                                 readOnlyDb.scan(
@@ -429,6 +502,23 @@ class DbBindingTest {
                         1, shardSnapshot.snapshotId, Collections.singletonList(shardSnapshot));
             }
             try (Reader reader = Reader.openCurrent(configPath.toString())) {
+                assertArrayEquals(
+                        valueBytes("scan-ro-v0", 400),
+                        requiredSingleColumn(
+                                reader.get(0, scanKeyBytes("scan-ro", 400), (ReadOptions) null)));
+                try (ReadOptions readOptions = ReadOptions.forColumn(0)) {
+                    assertArrayEquals(
+                            valueBytes("scan-ro-v0", 400),
+                            requiredSingleColumn(
+                                    reader.get(0, scanKeyBytes("scan-ro", 400), readOptions)));
+                }
+                try (ReadOptions readOptions = ReadOptions.forColumns(0, 1)) {
+                    byte[][] columns = reader.get(0, scanKeyBytes("scan-ro", 400), readOptions);
+                    assertNotNull(columns);
+                    assertEquals(2, columns.length);
+                    assertArrayEquals(valueBytes("scan-ro-v0", 400), columns[0]);
+                    assertArrayEquals(valueBytes("scan-ro-v1", 400), columns[1]);
+                }
                 try (ScanOptions options =
                                 new ScanOptions()
                                         .batchSize(80)
@@ -490,6 +580,16 @@ class DbBindingTest {
         Path configPath = Files.createTempFile("cobble-java-config-", ".json");
         Files.write(configPath, config.toJson().getBytes(StandardCharsets.UTF_8));
         return configPath;
+    }
+
+    private static byte[] requiredSingleColumn(byte[][] columns) {
+        if (columns == null) {
+            return null;
+        }
+        if (columns.length != 1) {
+            throw new IllegalStateException("expected exactly one column, got " + columns.length);
+        }
+        return columns[0];
     }
 
     private static byte[] keyBytes(String prefix, int i) {

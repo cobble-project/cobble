@@ -1,6 +1,7 @@
+use bytes::Bytes;
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jint, jlong, jstring};
+use jni::objects::{JByteArray, JClass, JObject, JString};
+use jni::sys::{jint, jlong, jobject, jstring};
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Utils_versionString(env: JNIEnv, class: JClass) -> jstring {
@@ -80,4 +81,24 @@ pub(crate) fn to_java_string_or_throw(env: &mut JNIEnv, value: String) -> jstrin
             std::ptr::null_mut()
         }
     }
+}
+
+pub(crate) fn to_java_optional_bytes_2d(
+    env: &mut JNIEnv,
+    columns: &[Option<Bytes>],
+) -> std::result::Result<jobject, String> {
+    let array = env
+        .new_object_array(columns.len() as i32, "[B", JObject::null())
+        .map_err(|err| err.to_string())?;
+    for (index, column) in columns.iter().enumerate() {
+        let Some(bytes) = column.as_ref() else {
+            continue;
+        };
+        let value = env
+            .byte_array_from_slice(bytes)
+            .map_err(|err| err.to_string())?;
+        env.set_object_array_element(&array, index as i32, value)
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(array.into_raw() as jobject)
 }

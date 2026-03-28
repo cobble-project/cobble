@@ -32,7 +32,14 @@ public final class SingleDb extends NativeObject {
     }
 
     public byte[] get(int bucket, byte[] key, int column) {
-        return get(nativeHandle, bucket, key, column);
+        try (ReadOptions options = ReadOptions.forColumn(column)) {
+            return singleColumnOrNull(get(nativeHandle, bucket, key, options.nativeHandle));
+        }
+    }
+
+    public byte[][] get(int bucket, byte[] key, ReadOptions options) {
+        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
+        return get(nativeHandle, bucket, key, readOptionsHandle);
     }
 
     public void delete(int bucket, byte[] key, int column) {
@@ -49,7 +56,19 @@ public final class SingleDb extends NativeObject {
     private static native void put(
             long nativeHandle, int bucket, byte[] key, int column, byte[] value);
 
-    private static native byte[] get(long nativeHandle, int bucket, byte[] key, int column);
+    private static native byte[][] get(
+            long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
 
     private static native void delete(long nativeHandle, int bucket, byte[] key, int column);
+
+    private static byte[] singleColumnOrNull(byte[][] columns) {
+        if (columns == null) {
+            return null;
+        }
+        if (columns.length != 1) {
+            throw new IllegalStateException(
+                    "expected exactly one selected column, got " + columns.length);
+        }
+        return columns[0];
+    }
 }

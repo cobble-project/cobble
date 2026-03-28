@@ -1,12 +1,13 @@
+use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{ScanCursorHandle, decode_scan_open_args};
 use crate::util::{
-    decode_column_index, decode_java_bytes, decode_java_string, decode_u16, decode_u64_from_jlong,
-    throw_illegal_argument, throw_illegal_state,
+    decode_java_bytes, decode_java_string, decode_u16, decode_u64_from_jlong,
+    throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
 };
-use cobble::{Config, ReadOnlyDb, ReadOptions};
+use cobble::{Config, ReadOnlyDb};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString};
-use jni::sys::{jbyteArray, jint, jlong};
+use jni::sys::{jint, jlong, jobject};
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_ReadOnlyDb_openHandle(
@@ -125,19 +126,12 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_get(
     native_handle: jlong,
     bucket: jint,
     key: JByteArray,
-    column: jint,
-) -> jbyteArray {
+    read_options_handle: jlong,
+) -> jobject {
     let Some(db) = read_only_db_from_handle_or_throw(&mut env, native_handle) else {
         return std::ptr::null_mut();
     };
     let bucket = match decode_u16("bucket", bucket) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_argument(&mut env, err);
-            return std::ptr::null_mut();
-        }
-    };
-    let column_index = match decode_column_index(column) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
@@ -151,8 +145,12 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_get(
             return std::ptr::null_mut();
         }
     };
-    let options = ReadOptions::for_column(column_index);
-    let values = match db.get(bucket, &key, &options) {
+    let Some(read_options_handle) =
+        read_options_from_handle_or_throw(&mut env, read_options_handle)
+    else {
+        return std::ptr::null_mut();
+    };
+    let values = match db.get(bucket, &key, read_options_handle.read_options()) {
         Ok(values) => values,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -162,11 +160,8 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_get(
     let Some(columns) = values else {
         return std::ptr::null_mut();
     };
-    let Some(Some(value)) = columns.get(column_index) else {
-        return std::ptr::null_mut();
-    };
-    match env.byte_array_from_slice(value) {
-        Ok(bytes) => bytes.into_raw(),
+    match to_java_optional_bytes_2d(&mut env, columns.as_slice()) {
+        Ok(array) => array,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
             std::ptr::null_mut()
@@ -199,7 +194,7 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openScanCursor(
     let iter = match db.scan(
         args.bucket,
         args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
-        &args.scan_options,
+        args.scan_options_handle.scan_options(),
     ) {
         Ok(v) => v,
         Err(err) => {
@@ -209,7 +204,7 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openScanCursor(
     };
     Box::into_raw(Box::new(ScanCursorHandle::from_static_iter(
         iter,
-        args.batch_size,
+        args.scan_options_handle.batch_size(),
     ))) as jlong
 }
 
