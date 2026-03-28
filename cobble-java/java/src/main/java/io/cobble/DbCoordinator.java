@@ -83,6 +83,16 @@ public final class DbCoordinator extends NativeObject {
         return GlobalSnapshot.listFromJson(listGlobalSnapshotsJson(nativeHandle));
     }
 
+    /** Retain one global snapshot to protect it from auto-retention cleanup. */
+    public boolean retainSnapshot(long snapshotId) {
+        return retainSnapshot(nativeHandle, snapshotId);
+    }
+
+    /** Expire one global snapshot (also removes retain protection if present). */
+    public boolean expireSnapshot(long snapshotId) {
+        return expireSnapshot(nativeHandle, snapshotId);
+    }
+
     @Override
     protected native void disposeInternal(long nativeHandle);
 
@@ -96,4 +106,8 @@ public final class DbCoordinator extends NativeObject {
     private static native String getGlobalSnapshotJson(long nativeHandle, long snapshotId);
 
     private static native String listGlobalSnapshotsJson(long nativeHandle);
+
+    private static native boolean retainSnapshot(long nativeHandle, long snapshotId);
+
+    private static native boolean expireSnapshot(long nativeHandle, long snapshotId);
 }

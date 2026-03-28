@@ -1148,6 +1148,7 @@ mod tests {
                     VolumeUsageKind::PrimaryDataPriorityHigh,
                 ],
             )],
+            snapshot_retention: None,
         })
         .expect("open standalone coordinator")
     }

@@ -573,6 +573,7 @@ mod tests {
 
         let coordinator = DbCoordinator::open(CoordinatorConfig {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            snapshot_retention: None,
         })
         .unwrap();
         let global = coordinator
@@ -645,6 +646,7 @@ mod tests {
 
         let coordinator = DbCoordinator::open(CoordinatorConfig {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            snapshot_retention: None,
         })
         .unwrap();
         let global_a = coordinator

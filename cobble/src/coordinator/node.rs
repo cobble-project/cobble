@@ -9,6 +9,7 @@ use crate::paths::{
     snapshot_manifest_name,
 };
 use crate::util::{build_commit_short_id, build_version_string};
+use dashmap::DashSet;
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
@@ -46,6 +47,7 @@ pub struct DbCoordinator {
     config: CoordinatorConfig,
     fs: Arc<dyn FileSystem>,
     next_id: AtomicU64,
+    retained: DashSet<u64>,
 }
 
 impl DbCoordinator {
@@ -74,6 +76,7 @@ impl DbCoordinator {
         }
         let config = CoordinatorConfig {
             volumes: config.volumes,
+            snapshot_retention: config.snapshot_retention,
         };
         // determine next snapshot id, load from current pointer
         let next_id = load_latest_snapshot_id(&fs)?.map_or(0, |id| id + 1);
@@ -81,6 +84,7 @@ impl DbCoordinator {
             config,
             fs,
             next_id: AtomicU64::new(next_id),
+            retained: DashSet::new(),
         })
     }
 
@@ -147,6 +151,7 @@ impl DbCoordinator {
         encode_global_manifest(&mut buffered, snapshot)?;
         buffered.close()?;
         self.publish_manifest_pointer(&snapshot_manifest_name(snapshot.id))?;
+        self.process_retention()?;
         Ok(())
     }
 
@@ -181,11 +186,73 @@ impl DbCoordinator {
         Ok(snapshots)
     }
 
+    /// Retain a global snapshot id so auto-retention and expire won't delete it.
+    pub fn retain_snapshot(&self, snapshot_id: u64) -> bool {
+        let manifest_path = global_snapshot_manifest_path(snapshot_id);
+        match self.fs.exists(&manifest_path) {
+            Ok(false) | Err(_) => false,
+            Ok(true) => {
+                self.retained.insert(snapshot_id);
+                true
+            }
+        }
+    }
+
+    /// Expire one global snapshot manifest if it exists.
+    /// This call first removes retain protection on the snapshot, then attempts deletion.
+    /// CURRENT pointer snapshot is still protected.
+    pub fn expire_snapshot(&self, snapshot_id: u64) -> Result<bool> {
+        self.retained.remove(&snapshot_id);
+        self.expire_snapshot_if_allowed(snapshot_id)
+    }
+
+    fn expire_snapshot_if_allowed(&self, snapshot_id: u64) -> Result<bool> {
+        let pointer_id = load_latest_snapshot_id(&self.fs)?;
+        if pointer_id == Some(snapshot_id) {
+            return Ok(false);
+        }
+        if self.retained.contains(&snapshot_id) {
+            return Ok(false);
+        }
+        let manifest_path = global_snapshot_manifest_path(snapshot_id);
+        if !self.fs.exists(&manifest_path)? {
+            return Ok(false);
+        }
+        self.fs.delete(&manifest_path)?;
+        Ok(true)
+    }
+
     fn publish_manifest_pointer(&self, manifest_name: &str) -> Result<()> {
         let pointer_path = global_snapshot_current_path();
         let mut writer = MetadataWriter::new(&pointer_path, &self.fs)?;
         writer.write(manifest_name.as_bytes())?;
         writer.close()?;
+        Ok(())
+    }
+
+    fn process_retention(&self) -> Result<()> {
+        let Some(retention) = self.config.snapshot_retention else {
+            return Ok(());
+        };
+        let mut snapshots = Vec::new();
+        for entry in self.fs.list(SNAPSHOT_DIR)? {
+            let manifest_name = entry.rsplit('/').next().unwrap_or(entry.as_str()).trim();
+            let Ok(snapshot_id) = parse_snapshot_id(manifest_name) else {
+                continue;
+            };
+            snapshots.push(snapshot_id);
+        }
+        if snapshots.len() <= retention {
+            return Ok(());
+        }
+        let current_id = load_latest_snapshot_id(&self.fs)?;
+        let keep_from = snapshots.len().saturating_sub(retention);
+        for snapshot in snapshots.into_iter().take(keep_from) {
+            if current_id == Some(snapshot) || self.retained.contains(&snapshot) {
+                continue;
+            }
+            let _ = self.expire_snapshot_if_allowed(snapshot)?;
+        }
         Ok(())
     }
 }
@@ -278,6 +345,7 @@ mod tests {
                     crate::config::VolumeUsageKind::Meta,
                 ],
             )],
+            snapshot_retention: None,
         })
         .unwrap();
 
@@ -331,6 +399,7 @@ mod tests {
                     crate::config::VolumeUsageKind::Meta,
                 ],
             )],
+            snapshot_retention: None,
         })
         .unwrap();
 
@@ -366,6 +435,129 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, 1);
         assert_eq!(listed[1].id, 2);
+
+        cleanup_root(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_global_snapshot_auto_retention() {
+        let root = "/tmp/coordinator_snapshot_retention";
+        cleanup_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let path = write_bucket_snapshot(Arc::clone(&fs), root, "db-a", 1);
+
+        let node = DbCoordinator::open(CoordinatorConfig {
+            volumes: vec![crate::config::VolumeDescriptor::new(
+                format!("file://{}", root),
+                vec![
+                    crate::config::VolumeUsageKind::PrimaryDataPriorityHigh,
+                    crate::config::VolumeUsageKind::Meta,
+                ],
+            )],
+            snapshot_retention: Some(1),
+        })
+        .unwrap();
+
+        let snapshot_1 = node
+            .take_global_snapshot_with_id(
+                4,
+                vec![ShardSnapshotInput {
+                    ranges: vec![0u16..=3u16],
+                    db_id: "db-a".to_string(),
+                    snapshot_id: 1,
+                    manifest_path: path.clone(),
+                }],
+                1,
+            )
+            .unwrap();
+        node.materialize_global_snapshot(&snapshot_1).unwrap();
+
+        let snapshot_2 = node
+            .take_global_snapshot_with_id(
+                4,
+                vec![ShardSnapshotInput {
+                    ranges: vec![0u16..=3u16],
+                    db_id: "db-a".to_string(),
+                    snapshot_id: 1,
+                    manifest_path: path,
+                }],
+                2,
+            )
+            .unwrap();
+        node.materialize_global_snapshot(&snapshot_2).unwrap();
+
+        let listed = node.list_global_snapshots().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, 2);
+
+        cleanup_root(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_global_snapshot_retain_expire() {
+        let root = "/tmp/coordinator_snapshot_retain_expire";
+        cleanup_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let path = write_bucket_snapshot(Arc::clone(&fs), root, "db-a", 1);
+
+        let node = DbCoordinator::open(CoordinatorConfig {
+            volumes: vec![crate::config::VolumeDescriptor::new(
+                format!("file://{}", root),
+                vec![
+                    crate::config::VolumeUsageKind::PrimaryDataPriorityHigh,
+                    crate::config::VolumeUsageKind::Meta,
+                ],
+            )],
+            snapshot_retention: Some(1),
+        })
+        .unwrap();
+
+        let snapshot_1 = node
+            .take_global_snapshot_with_id(
+                4,
+                vec![ShardSnapshotInput {
+                    ranges: vec![0u16..=3u16],
+                    db_id: "db-a".to_string(),
+                    snapshot_id: 1,
+                    manifest_path: path.clone(),
+                }],
+                1,
+            )
+            .unwrap();
+        node.materialize_global_snapshot(&snapshot_1).unwrap();
+        assert!(node.retain_snapshot(1));
+
+        let snapshot_2 = node
+            .take_global_snapshot_with_id(
+                4,
+                vec![ShardSnapshotInput {
+                    ranges: vec![0u16..=3u16],
+                    db_id: "db-a".to_string(),
+                    snapshot_id: 1,
+                    manifest_path: path,
+                }],
+                2,
+            )
+            .unwrap();
+        node.materialize_global_snapshot(&snapshot_2).unwrap();
+
+        let listed = node.list_global_snapshots().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|s| s.id == 1));
+        assert!(listed.iter().any(|s| s.id == 2));
+
+        assert!(node.expire_snapshot(1).unwrap());
+        let listed = node.list_global_snapshots().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, 2);
 
         cleanup_root(root);
     }

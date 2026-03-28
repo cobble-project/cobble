@@ -5,7 +5,7 @@ use crate::util::{
 use cobble::{Config, CoordinatorConfig, DbCoordinator, ShardSnapshotInput};
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jint, jlong, jstring};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jstring};
 use serde::Deserialize;
 use std::ops::RangeInclusive;
 
@@ -251,6 +251,57 @@ pub extern "system" fn Java_io_cobble_DbCoordinator_listGlobalSnapshotsJson(
         }
     };
     to_java_string_or_throw(&mut env, json)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_DbCoordinator_retainSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    snapshot_id: jlong,
+) -> jboolean {
+    let Some(coordinator) = coordinator_from_handle_or_throw(&mut env, native_handle) else {
+        return JNI_FALSE;
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return JNI_FALSE;
+        }
+    };
+    if coordinator.retain_snapshot(snapshot_id) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_DbCoordinator_expireSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    snapshot_id: jlong,
+) -> jboolean {
+    let Some(coordinator) = coordinator_from_handle_or_throw(&mut env, native_handle) else {
+        return JNI_FALSE;
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return JNI_FALSE;
+        }
+    };
+    match coordinator.expire_snapshot(snapshot_id) {
+        Ok(true) => JNI_TRUE,
+        Ok(false) => JNI_FALSE,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            JNI_FALSE
+        }
+    }
 }
 
 fn coordinator_from_handle_or_throw(

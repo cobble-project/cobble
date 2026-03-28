@@ -1,4 +1,4 @@
-use crate::coordinator::{CoordinatorConfig, DbCoordinator};
+use crate::coordinator::{CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest};
 use crate::db_state::full_bucket_range;
 use crate::error::{Error, Result};
 use crate::{Config, Db, ReadOptions, WriteBatch, WriteOptions};
@@ -106,6 +106,39 @@ impl SingleDb {
             return Err(err);
         }
         Ok(global_snapshot_id)
+    }
+
+    /// Retain a global snapshot and its underlying local shard snapshot(s).
+    pub fn retain_snapshot(&self, global_snapshot_id: u64) -> Result<bool> {
+        let shard_snapshot_ids = self.local_shard_snapshot_ids(global_snapshot_id)?;
+        for snapshot_id in &shard_snapshot_ids {
+            if !self.db.retain_snapshot(*snapshot_id) {
+                return Ok(false);
+            }
+        }
+        Ok(self.coordinator.retain_snapshot(global_snapshot_id))
+    }
+
+    /// Expire a global snapshot and its underlying local shard snapshot(s).
+    pub fn expire_snapshot(&self, global_snapshot_id: u64) -> Result<bool> {
+        let shard_snapshot_ids = self.local_shard_snapshot_ids(global_snapshot_id)?;
+        if !self.coordinator.expire_snapshot(global_snapshot_id)? {
+            return Ok(false);
+        }
+        for snapshot_id in shard_snapshot_ids {
+            let _ = self.db.expire_snapshot(snapshot_id)?;
+        }
+        Ok(true)
+    }
+
+    /// List global snapshots materialized by this single node coordinator.
+    pub fn list_snapshots(&self) -> Result<Vec<GlobalSnapshotManifest>> {
+        self.coordinator.list_global_snapshots()
+    }
+
+    /// Load one global snapshot by id.
+    pub fn get_snapshot(&self, snapshot_id: u64) -> Result<GlobalSnapshotManifest> {
+        self.coordinator.load_global_snapshot(snapshot_id)
     }
 
     pub fn db(&self) -> &Db {
@@ -240,4 +273,24 @@ fn materialize_global_snapshot(
     )?;
     coordinator.materialize_global_snapshot(&global_snapshot)?;
     Ok(global_snapshot.id)
+}
+
+impl SingleDb {
+    fn local_shard_snapshot_ids(&self, global_snapshot_id: u64) -> Result<Vec<u64>> {
+        let global = self.coordinator.load_global_snapshot(global_snapshot_id)?;
+        let db_id = self.db.id();
+        let shard_ids: Vec<u64> = global
+            .shard_snapshots
+            .into_iter()
+            .filter(|shard| shard.db_id == db_id)
+            .map(|shard| shard.snapshot_id)
+            .collect();
+        if shard_ids.is_empty() {
+            return Err(Error::InvalidState(format!(
+                "Global snapshot {} has no shard snapshot for db {}",
+                global_snapshot_id, db_id
+            )));
+        }
+        Ok(shard_ids)
+    }
 }

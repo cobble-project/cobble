@@ -94,6 +94,7 @@ fn standalone_cluster_end_to_end_checkpoint_flow() {
                 VolumeUsageKind::PrimaryDataPriorityHigh,
             ],
         )],
+        snapshot_retention: None,
     })
     .expect("open coordinator");
     let coordinator_addr = free_addr();

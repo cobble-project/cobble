@@ -236,6 +236,66 @@ class DbBindingTest {
     }
 
     @Test
+    void coordinatorRetentionAndRetainExpireFlow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-coordinator-retention-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        config.snapshotRetention = 1;
+        Path configPath = writeConfigFile(dataDir, config);
+
+        try (Db db = Db.open(configPath.toString());
+                DbCoordinator coordinator = DbCoordinator.open(configPath.toString())) {
+            db.put(0, keyBytes("coord-ret", 1), 0, valueBytes("coord-ret-v", 1));
+            ShardSnapshot s1 = db.snapshot();
+            GlobalSnapshot g1 =
+                    coordinator.materializeGlobalSnapshot(
+                            1, s1.snapshotId, Collections.singletonList(s1));
+            assertTrue(coordinator.retainSnapshot(g1.id));
+
+            db.put(0, keyBytes("coord-ret", 2), 0, valueBytes("coord-ret-v", 2));
+            ShardSnapshot s2 = db.snapshot();
+            GlobalSnapshot g2 =
+                    coordinator.materializeGlobalSnapshot(
+                            1, s2.snapshotId, Collections.singletonList(s2));
+
+            List<GlobalSnapshot> listed = coordinator.listGlobalSnapshots();
+            assertEquals(2, listed.size());
+            assertTrue(listed.stream().anyMatch(s -> s.id == g1.id));
+            assertTrue(listed.stream().anyMatch(s -> s.id == g2.id));
+
+            assertTrue(coordinator.expireSnapshot(g1.id));
+            listed = coordinator.listGlobalSnapshots();
+            assertEquals(1, listed.size());
+            assertEquals(g2.id, listed.get(0).id);
+        }
+    }
+
+    @Test
+    void singleDbSnapshotRetainExpireAndListSnapshots() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-single-snapshot-lifecycle-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        config.snapshotRetention = 1;
+
+        try (SingleDb db = SingleDb.open(config)) {
+            db.put(0, keyBytes("single-snap", 1), 0, valueBytes("single-snap-v", 1));
+            GlobalSnapshot global1 = db.snapshot();
+            assertTrue(db.retainSnapshot(global1.id));
+
+            db.put(0, keyBytes("single-snap", 2), 0, valueBytes("single-snap-v", 2));
+            GlobalSnapshot global2 = db.snapshot();
+
+            List<GlobalSnapshot> listed = db.listSnapshots();
+            assertEquals(2, listed.size());
+            assertTrue(listed.stream().anyMatch(s -> s.id == global1.id));
+            assertTrue(listed.stream().anyMatch(s -> s.id == global2.id));
+
+            assertTrue(db.expireSnapshot(global1.id));
+            listed = db.listSnapshots();
+            assertEquals(1, listed.size());
+            assertEquals(global2.id, listed.get(0).id);
+        }
+    }
+
+    @Test
     void snapshotRestoreAndResumeFlow() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-restore-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
