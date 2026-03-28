@@ -1,4 +1,4 @@
-use cobble::{Config, CoordinatorConfig, ReadOptions, VolumeDescriptor, VolumeUsageKind};
+use cobble::{Config, CoordinatorConfig, VolumeDescriptor, VolumeUsageKind};
 use cobble_cluster::{StandaloneCoordinator, StandaloneShardNode};
 use std::thread;
 use std::time::Duration;
@@ -38,7 +38,7 @@ fn write_bulk(
 fn assert_sample_value(shard: &StandaloneShardNode, bucket: u16, key: &str, expected: &str) {
     let value = shard
         .db()
-        .get(bucket, key.as_bytes(), &ReadOptions::default())
+        .get(bucket, key.as_bytes())
         .expect("get value")
         .expect("value exists");
     assert_eq!(

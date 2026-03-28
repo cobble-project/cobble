@@ -112,13 +112,34 @@ impl SingleDb {
         self.db.as_ref()
     }
 
-    pub fn get(
+    pub fn get(&self, bucket: u16, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
+        self.get_with_options(bucket, key, &ReadOptions::default())
+    }
+
+    pub fn get_with_options(
         &self,
         bucket: u16,
         key: &[u8],
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<Bytes>>>> {
-        self.db.get(bucket, key, options)
+        self.db.get_with_options(bucket, key, options)
+    }
+
+    pub fn scan<'a>(
+        &'a self,
+        bucket: u16,
+        range: std::ops::Range<&[u8]>,
+    ) -> Result<crate::DbIterator<'a>> {
+        self.scan_with_options(bucket, range, &crate::ScanOptions::default())
+    }
+
+    pub fn scan_with_options<'a>(
+        &'a self,
+        bucket: u16,
+        range: std::ops::Range<&[u8]>,
+        options: &crate::ScanOptions,
+    ) -> Result<crate::DbIterator<'a>> {
+        self.db.scan_with_options(bucket, range, options)
     }
 
     pub fn put<K, V>(&self, bucket: u16, key: K, column: u16, value: V) -> Result<()>

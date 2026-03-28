@@ -242,10 +242,7 @@ fn test_db_put_get_large_dataset() {
     }
 
     for (key, expected_value) in expected.iter() {
-        let value = db
-            .get(0, key, &ReadOptions::default())
-            .unwrap()
-            .expect("Value present");
+        let value = db.get(0, key).unwrap().expect("Value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), expected_value.as_slice());
     }
@@ -297,10 +294,7 @@ fn test_db_writebatch_get_large_dataset() {
     }
 
     for (key, expected_value) in expected.iter() {
-        let value = db
-            .get(0, key, &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, key).unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), expected_value.as_slice());
     }
@@ -352,10 +346,7 @@ fn test_db_put_get_large_dataset_with_separated_values() {
     }
 
     for (key, expected_value) in expected.iter() {
-        let value = db
-            .get(0, key, &ReadOptions::default())
-            .unwrap()
-            .expect("Value present");
+        let value = db.get(0, key).unwrap().expect("Value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), expected_value.as_slice());
     }
@@ -408,10 +399,7 @@ fn test_db_writebatch_get_large_dataset_with_separated_values() {
     }
 
     for (key, expected_value) in expected.iter() {
-        let value = db
-            .get(0, key, &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, key).unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), expected_value.as_slice());
     }
@@ -491,10 +479,7 @@ fn test_db_counter_merge_large_dataset_with_compaction_and_file_read() {
     }
 
     for (key, expected_sum) in expected {
-        let value = db
-            .get(0, &key, &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, &key).unwrap().expect("value present");
         let bytes = value[0].as_ref().unwrap();
         let actual = u64::from_le_bytes(bytes.as_ref().try_into().unwrap());
         assert_eq!(actual, expected_sum);
@@ -549,30 +534,19 @@ fn test_schema_persisted_and_restored_across_open_modes() {
 
     let read_only = Db::open_read_only(config.clone(), snapshot_id, db_id.clone()).unwrap();
     assert_eq!(
-        read_counter(
-            read_only
-                .get(0, b"counter", &ReadOptions::default())
-                .unwrap()
-        ),
+        read_counter(read_only.get(0, b"counter").unwrap()),
         expected
     );
 
     let from_snapshot = Db::open_from_snapshot(config.clone(), snapshot_id, db_id.clone()).unwrap();
     assert_eq!(
-        read_counter(
-            from_snapshot
-                .get(0, b"counter", &ReadOptions::default())
-                .unwrap()
-        ),
+        read_counter(from_snapshot.get(0, b"counter").unwrap()),
         expected
     );
     from_snapshot.close().unwrap();
 
     let resumed = Db::resume(config, db_id).unwrap();
-    assert_eq!(
-        read_counter(resumed.get(0, b"counter", &ReadOptions::default()).unwrap()),
-        expected
-    );
+    assert_eq!(read_counter(resumed.get(0, b"counter").unwrap()), expected);
     resumed.close().unwrap();
     cleanup_test_root(root);
 }
@@ -607,7 +581,7 @@ fn test_db_get_filters_columns() {
     for i in 0..1000 {
         let key = format!("key{:04}", i).into_bytes();
         let value = db
-            .get(0, &key, &options)
+            .get_with_options(0, &key, &options)
             .unwrap()
             .expect("Value should present");
         assert_eq!(value.len(), 2);
@@ -652,11 +626,7 @@ fn test_db_delete_with_large_values() {
         db.put(0, key.as_bytes(), 0, payload.clone()).unwrap();
     }
 
-    assert!(
-        db.get(0, b"key", &ReadOptions::default())
-            .unwrap()
-            .is_none()
-    );
+    assert!(db.get(0, b"key").unwrap().is_none());
     cleanup_test_root(root);
 }
 
@@ -689,10 +659,7 @@ fn test_db_merge_with_large_values() {
         db.put(0, key.as_bytes(), 0, base.clone()).unwrap();
     }
 
-    let value = db
-        .get(0, b"key", &ReadOptions::default())
-        .unwrap()
-        .expect("value present");
+    let value = db.get(0, b"key").unwrap().expect("value present");
     let mut expected = base;
     expected.extend_from_slice(&suffix);
     assert_eq!(value[0].as_ref().unwrap().as_ref(), expected.as_slice());
@@ -741,16 +708,12 @@ fn test_db_ttl_put_get_with_manual_time() {
     db.write_batch(batch).unwrap();
 
     // At t=1000, value should be visible
-    let v = db.get(0, b"key", &ReadOptions::default()).unwrap().unwrap();
+    let v = db.get(0, b"key").unwrap().unwrap();
     assert_eq!(v[0].as_ref().unwrap().as_ref(), b"value");
 
     // Advance time past expiry
     db.set_time(1_011);
-    assert!(
-        db.get(0, b"key", &ReadOptions::default())
-            .unwrap()
-            .is_none()
-    );
+    assert!(db.get(0, b"key").unwrap().is_none());
 
     cleanup_test_root(root);
 }
@@ -791,19 +754,11 @@ fn test_db_ttl_default_ttl_with_manual_time() {
     db.write_batch(batch).unwrap();
 
     // Before expiry
-    assert!(
-        db.get(0, b"foo", &ReadOptions::default())
-            .unwrap()
-            .is_some()
-    );
+    assert!(db.get(0, b"foo").unwrap().is_some());
 
     // Move to expiry boundary
     db.set_time(5_005);
-    assert!(
-        db.get(0, b"foo", &ReadOptions::default())
-            .unwrap()
-            .is_none()
-    );
+    assert!(db.get(0, b"foo").unwrap().is_none());
 
     cleanup_test_root(root);
 }
@@ -872,19 +827,10 @@ fn test_single_db_snapshot_updates_global_manifest() {
     assert_eq!(global_id, callback_id);
 
     let mut proxy = Reader::open_current(ReaderConfig::from_config(&config)).unwrap();
-    let value = proxy
-        .get(0, b"k1", &ReadOptions::default())
-        .unwrap()
-        .expect("value present");
+    let value = proxy.get(0, b"k1").unwrap().expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
-    let mut iter = proxy
-        .scan(
-            0,
-            b"k1".as_slice()..b"kz".as_slice(),
-            &ScanOptions::default(),
-        )
-        .unwrap();
+    let mut iter = proxy.scan(0, b"k1".as_slice()..b"kz".as_slice()).unwrap();
     let mut rows = Vec::new();
     while let Some(row) = iter.next() {
         rows.push(row.unwrap());
@@ -918,10 +864,7 @@ fn test_single_db_close_waits_snapshot_global_materialization() {
     db.close().unwrap();
 
     let mut proxy = Reader::open_current(ReaderConfig::from_config(&config)).unwrap();
-    let value = proxy
-        .get(0, b"k1", &ReadOptions::default())
-        .unwrap()
-        .expect("value present");
+    let value = proxy.get(0, b"k1").unwrap().expect("value present");
     assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
     cleanup_test_root(root);
 }
@@ -956,10 +899,7 @@ fn test_db_snapshot_read_only_get_with_vec_memtable() {
 
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
     for (key, expected_value) in expected.iter() {
-        let value = ro
-            .get(0, key, &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = ro.get(0, key).unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), expected_value.as_slice());
     }
@@ -997,10 +937,7 @@ fn test_db_snapshot_read_only_get_with_vec_memtable_separated_values() {
 
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
     for (key, expected_value) in expected.iter() {
-        let value = ro
-            .get(0, key, &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = ro.get(0, key).unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), expected_value.as_slice());
     }
@@ -1037,10 +974,7 @@ fn test_db_snapshot_read_only_get_with_skiplist_memtable() {
 
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
     for (key, expected_value) in expected.iter() {
-        let value = ro
-            .get(0, key, &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = ro.get(0, key).unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), expected_value.as_slice());
     }
@@ -1078,10 +1012,7 @@ fn test_db_snapshot_read_only_get_with_skiplist_memtable_separated_values() {
 
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
     for (key, expected_value) in expected.iter() {
-        let value = ro
-            .get(0, key, &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = ro.get(0, key).unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), expected_value.as_slice());
     }
@@ -1113,10 +1044,7 @@ fn test_db_snapshot_read_only_get() {
     db.close().unwrap();
 
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
-    let value = ro
-        .get(0, b"k1", &ReadOptions::default())
-        .unwrap()
-        .expect("value present");
+    let value = ro.get(0, b"k1").unwrap().expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
 
@@ -1150,10 +1078,7 @@ fn test_db_snapshot_read_only_get_with_separated_value() {
     db.close().unwrap();
 
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
-    let value = ro
-        .get(0, b"k1", &ReadOptions::default())
-        .unwrap()
-        .expect("value present");
+    let value = ro.get(0, b"k1").unwrap().expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), large);
 
@@ -1187,13 +1112,7 @@ fn test_db_snapshot_read_only_scan_with_separated_value() {
     db.close().unwrap();
 
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
-    let mut iter = ro
-        .scan(
-            0,
-            b"k1".as_slice()..b"kz".as_slice(),
-            &ScanOptions::default(),
-        )
-        .unwrap();
+    let mut iter = ro.scan(0, b"k1".as_slice()..b"kz".as_slice()).unwrap();
     let mut rows = Vec::new();
     while let Some(row) = iter.next() {
         rows.push(row.unwrap());
@@ -1241,28 +1160,16 @@ fn test_db_incremental_snapshot_restore() {
 
     let ro =
         Db::open_read_only(config.clone(), incremental_snapshot_id, db.id().to_string()).unwrap();
-    let value1 = ro
-        .get(0, b"k1", &ReadOptions::default())
-        .unwrap()
-        .expect("k1 value present");
+    let value1 = ro.get(0, b"k1").unwrap().expect("k1 value present");
     assert_eq!(value1[0].as_ref().unwrap().as_ref(), b"v1");
-    let value2 = ro
-        .get(0, b"k2", &ReadOptions::default())
-        .unwrap()
-        .expect("k2 value present");
+    let value2 = ro.get(0, b"k2").unwrap().expect("k2 value present");
     assert_eq!(value2[0].as_ref().unwrap().as_ref(), b"v2");
 
     let writable =
         Db::open_from_snapshot(config, incremental_snapshot_id, db.id().to_string()).unwrap();
-    let value1 = writable
-        .get(0, b"k1", &ReadOptions::default())
-        .unwrap()
-        .expect("k1 value present");
+    let value1 = writable.get(0, b"k1").unwrap().expect("k1 value present");
     assert_eq!(value1[0].as_ref().unwrap().as_ref(), b"v1");
-    let value2 = writable
-        .get(0, b"k2", &ReadOptions::default())
-        .unwrap()
-        .expect("k2 value present");
+    let value2 = writable.get(0, b"k2").unwrap().expect("k2 value present");
     assert_eq!(value2[0].as_ref().unwrap().as_ref(), b"v2");
 
     cleanup_test_root(root);
@@ -1421,10 +1328,7 @@ fn test_db_restore_from_readonly_snapshot_volume_migrates_files_and_disables_fir
         ..Config::default()
     };
     let restored = Db::open_from_snapshot(restore_config, snapshot_id, db_id.clone()).unwrap();
-    let restored_value = restored
-        .get(0, b"k0001", &ReadOptions::default())
-        .unwrap()
-        .expect("restored value");
+    let restored_value = restored.get(0, b"k0001").unwrap().expect("restored value");
     assert_eq!(restored_value[0].as_ref().unwrap().as_ref(), b"value");
     let new_primary_data_dir = format!("{}/{}/data", new_primary_root, db_id);
     assert!(Path::new(&new_primary_data_dir).exists());
@@ -1601,17 +1505,11 @@ fn test_db_open_from_snapshot_allows_writes() {
     batch.put(0, b"k2", 0, b"v2".to_vec());
     writable.write_batch(batch).unwrap();
 
-    let value = writable
-        .get(0, b"k1", &ReadOptions::default())
-        .unwrap()
-        .expect("value present");
+    let value = writable.get(0, b"k1").unwrap().expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
 
-    let value = writable
-        .get(0, b"k2", &ReadOptions::default())
-        .unwrap()
-        .expect("value present");
+    let value = writable.get(0, b"k2").unwrap().expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v2");
 
@@ -1708,26 +1606,20 @@ fn test_db_multi_lsm_snapshot_restore_and_resume() {
 
     let restored =
         Db::open_from_snapshot(config.clone(), snapshot_id, db.id().to_string()).unwrap();
-    let left = restored
-        .get(0, b"k-left", &ReadOptions::default())
-        .unwrap()
-        .expect("left value");
+    let left = restored.get(0, b"k-left").unwrap().expect("left value");
     assert_eq!(left[0].as_ref().unwrap().as_ref(), b"v-left");
-    let right = restored
-        .get(3, b"k-right", &ReadOptions::default())
-        .unwrap()
-        .expect("right value");
+    let right = restored.get(3, b"k-right").unwrap().expect("right value");
     assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
     restored.close().unwrap();
 
     let resumed = Db::resume(config, db.id().to_string()).unwrap();
     let left = resumed
-        .get(0, b"k-left", &ReadOptions::default())
+        .get(0, b"k-left")
         .unwrap()
         .expect("left value after resume");
     assert_eq!(left[0].as_ref().unwrap().as_ref(), b"v-left");
     let right = resumed
-        .get(3, b"k-right", &ReadOptions::default())
+        .get(3, b"k-right")
         .unwrap()
         .expect("right value after resume");
     assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
@@ -1770,26 +1662,20 @@ fn test_db_parquet_snapshot_restore_and_read_only() {
     db.close().unwrap();
 
     let read_only = Db::open_read_only(config.clone(), snapshot_id, db.id().to_string()).unwrap();
-    let left = read_only
-        .get(0, b"k-left", &ReadOptions::default())
-        .unwrap()
-        .expect("left value");
+    let left = read_only.get(0, b"k-left").unwrap().expect("left value");
     assert_eq!(left[0].as_ref().unwrap().as_ref(), b"v-left");
-    let right = read_only
-        .get(3, b"k-right", &ReadOptions::default())
-        .unwrap()
-        .expect("right value");
+    let right = read_only.get(3, b"k-right").unwrap().expect("right value");
     assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
 
     let restored =
         Db::open_from_snapshot(config.clone(), snapshot_id, db.id().to_string()).unwrap();
     let left = restored
-        .get(0, b"k-left", &ReadOptions::default())
+        .get(0, b"k-left")
         .unwrap()
         .expect("left value after restore");
     assert_eq!(left[0].as_ref().unwrap().as_ref(), b"v-left");
     let right = restored
-        .get(3, b"k-right", &ReadOptions::default())
+        .get(3, b"k-right")
         .unwrap()
         .expect("right value after restore");
     assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
@@ -2060,10 +1946,7 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
     let expected_first_size =
         (first_data_end - first_data_start) + (first_vlog_end - first_vlog_start);
     assert_eq!(first_data.len() as u64, expected_first_size);
-    let value1 = db
-        .get(0, b"k1", &ReadOptions::default())
-        .unwrap()
-        .expect("k1 value");
+    let value1 = db.get(0, b"k1").unwrap().expect("k1 value");
     assert_eq!(value1[0].as_ref().unwrap().as_ref(), v1.as_slice());
 
     let v2 = vec![b'b'; 128];
@@ -2127,10 +2010,7 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
     let expected_second_size =
         (second_data_end - second_data_start) + (second_vlog_end - second_vlog_start);
     assert_eq!(second_data.len() as u64, expected_second_size);
-    let value2 = db
-        .get(0, b"k2", &ReadOptions::default())
-        .unwrap()
-        .expect("k2 value");
+    let value2 = db.get(0, b"k2").unwrap().expect("k2 value");
     assert_eq!(value2[0].as_ref().unwrap().as_ref(), v2.as_slice());
 
     let db_id = db.id().to_string();
@@ -2138,28 +2018,16 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
 
     let from_snapshot = Db::open_from_snapshot(config.clone(), second_snapshot, db_id.clone())
         .expect("open from snapshot with active memtable replay");
-    let restored_v1 = from_snapshot
-        .get(0, b"k1", &ReadOptions::default())
-        .unwrap()
-        .expect("restored k1");
+    let restored_v1 = from_snapshot.get(0, b"k1").unwrap().expect("restored k1");
     assert_eq!(restored_v1[0].as_ref().unwrap().as_ref(), v1.as_slice());
-    let restored_v2 = from_snapshot
-        .get(0, b"k2", &ReadOptions::default())
-        .unwrap()
-        .expect("restored k2");
+    let restored_v2 = from_snapshot.get(0, b"k2").unwrap().expect("restored k2");
     assert_eq!(restored_v2[0].as_ref().unwrap().as_ref(), v2.as_slice());
     from_snapshot.close().unwrap();
 
     let resumed = Db::resume(config, db_id).expect("resume with active memtable replay");
-    let resumed_v1 = resumed
-        .get(0, b"k1", &ReadOptions::default())
-        .unwrap()
-        .expect("resumed k1");
+    let resumed_v1 = resumed.get(0, b"k1").unwrap().expect("resumed k1");
     assert_eq!(resumed_v1[0].as_ref().unwrap().as_ref(), v1.as_slice());
-    let resumed_v2 = resumed
-        .get(0, b"k2", &ReadOptions::default())
-        .unwrap()
-        .expect("resumed k2");
+    let resumed_v2 = resumed.get(0, b"k2").unwrap().expect("resumed k2");
     assert_eq!(resumed_v2[0].as_ref().unwrap().as_ref(), v2.as_slice());
     resumed.close().unwrap();
 
@@ -2204,7 +2072,7 @@ fn test_db_resume_can_continue_writes_after_active_memtable_snapshot() {
         (b"k4".as_slice(), b"v4".as_slice()),
     ] {
         let value = resumed
-            .get(0, key, &ReadOptions::default())
+            .get(0, key)
             .unwrap()
             .expect("value present after resume");
         assert_eq!(value[0].as_ref().unwrap().as_ref(), expected);
@@ -2384,11 +2252,7 @@ fn test_db_scan_put_reads_from_memtable_and_sst() {
     db.put(0, b"zzz:outside", 0, b"ignore-right").unwrap();
 
     let mut iter = db
-        .scan(
-            0,
-            b"fill:0000".as_slice()..b"mix;".as_slice(),
-            &ScanOptions::default(),
-        )
+        .scan(0, b"fill:0000".as_slice()..b"mix;".as_slice())
         .unwrap();
     let mut seen: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     while let Some(row) = iter.next() {
@@ -2448,11 +2312,7 @@ fn test_db_scan_put_range_keeps_latest_value() {
     db.put(0, b"s:outside", 0, b"right").unwrap();
 
     let mut iter = db
-        .scan(
-            0,
-            b"r:0000".as_slice()..b"r:0100".as_slice(),
-            &ScanOptions::default(),
-        )
+        .scan(0, b"r:0000".as_slice()..b"r:0100".as_slice())
         .unwrap();
     let mut seen: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     while let Some(row) = iter.next() {
@@ -2531,7 +2391,7 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
     let mut scan_options = ScanOptions::for_columns(vec![2, 0]);
     scan_options.read_ahead_bytes = 256;
     let mut iter = db
-        .scan(
+        .scan_with_options(
             0,
             b"proj:0000".as_slice()..b"proj:9999".as_slice(),
             &scan_options,
@@ -2573,7 +2433,7 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
 
     let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
     let mut ro_iter = ro
-        .scan(
+        .scan_with_options(
             0,
             b"proj:0000".as_slice()..b"proj:9999".as_slice(),
             &ScanOptions::for_columns(vec![2, 0]),
@@ -2673,11 +2533,7 @@ fn test_db_skiplist_large_write_flush_and_scan() {
     );
 
     let mut iter = db
-        .scan(
-            0,
-            b"scan:00000".as_slice()..b"scan:02000".as_slice(),
-            &ScanOptions::default(),
-        )
+        .scan(0, b"scan:00000".as_slice()..b"scan:02000".as_slice())
         .unwrap();
     let mut seen: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     while let Some(row) = iter.next() {

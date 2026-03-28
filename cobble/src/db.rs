@@ -734,7 +734,11 @@ impl Db {
     /// merge column values across levels using per-column MergeOperator →
     /// resolve VLOG pointers for separated values → apply TTL expiration
     /// and schema evolution when SST schema differs from current.
-    pub fn get(
+    pub fn get(&self, bucket: u16, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
+        self.get_with_options(bucket, key, &ReadOptions::default())
+    }
+
+    pub fn get_with_options(
         &self,
         bucket: u16,
         key: &[u8],
@@ -877,7 +881,11 @@ impl Db {
         }
     }
 
-    pub fn scan<'a>(
+    pub fn scan<'a>(&'a self, bucket: u16, range: Range<&[u8]>) -> Result<DbIterator<'a>> {
+        self.scan_with_options(bucket, range, &ScanOptions::default())
+    }
+
+    pub fn scan_with_options<'a>(
         &'a self,
         bucket: u16,
         range: Range<&[u8]>,
@@ -1030,7 +1038,7 @@ mod tests {
 
         let put_err = db.put(0, b"k2", 0, b"v2").unwrap_err();
         assert!(matches!(put_err, Error::InvalidState(_)));
-        let get_err = db.get(0, b"k1", &ReadOptions::default()).unwrap_err();
+        let get_err = db.get(0, b"k1").unwrap_err();
         assert!(matches!(get_err, Error::InvalidState(_)));
         let snapshot_err = db.snapshot().unwrap_err();
         assert!(matches!(snapshot_err, Error::InvalidState(_)));
@@ -1135,10 +1143,7 @@ mod tests {
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"new");
 
@@ -1172,10 +1177,7 @@ mod tests {
         db.merge(0, b"k1", 1, b"a").unwrap();
         db.merge(0, b"k1", 1, b"b").unwrap();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         assert_eq!(value[0].as_ref().unwrap().as_ref(), b"base0|a|b");
         assert_eq!(value[1].as_ref().unwrap().as_ref(), b"base1ab");
 
@@ -1184,10 +1186,7 @@ mod tests {
         batch.merge(0, b"k2", 0, b"b");
         db.write_batch(batch).unwrap();
 
-        let value = db
-            .get(0, b"k2", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k2").unwrap().expect("value present");
         assert_eq!(value[0].as_ref().unwrap().as_ref(), b"a|b");
 
         cleanup_test_root(root);
@@ -1222,10 +1221,7 @@ mod tests {
         db.put(0, b"k1", 1, 100u64.to_le_bytes()).unwrap();
         db.merge(0, b"k1", 1, 11u64.to_le_bytes()).unwrap();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         assert_eq!(
             decode_u32_counter(value[0].as_ref().unwrap().as_ref()),
             15u32
@@ -1242,10 +1238,7 @@ mod tests {
         batch.merge(0, b"k2", 1, 8u64.to_le_bytes());
         db.write_batch(batch).unwrap();
 
-        let value = db
-            .get(0, b"k2", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k2").unwrap().expect("value present");
         assert_eq!(
             decode_u32_counter(value[0].as_ref().unwrap().as_ref()),
             9u32
@@ -1281,10 +1274,7 @@ mod tests {
         schema.add_column(1, None, None).unwrap();
         let _ = schema.commit();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         assert_eq!(value.len(), 2);
         assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
         assert!(value[1].is_none());
@@ -1313,21 +1303,12 @@ mod tests {
         schema.add_column(1, None, None).unwrap();
         let _ = schema.commit();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         assert_eq!(value.len(), 2);
         assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
         assert!(value[1].is_none());
 
-        let mut iter = db
-            .scan(
-                0,
-                b"k1".as_slice()..b"k2".as_slice(),
-                &ScanOptions::default(),
-            )
-            .unwrap();
+        let mut iter = db.scan(0, b"k1".as_slice()..b"k2".as_slice()).unwrap();
         let (scan_key, columns) = iter.next().unwrap().unwrap();
         assert_eq!(scan_key.as_ref(), b"k1");
         assert_eq!(columns.len(), 2);
@@ -1373,10 +1354,7 @@ mod tests {
         let large = b"value-larger-than-threshold";
         db.put(0, b"k1", 0, large).unwrap();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         assert_eq!(value[0].as_ref().unwrap().as_ref(), large);
 
         cleanup_test_root(root);
@@ -1429,10 +1407,7 @@ mod tests {
         assert_eq!(column.value_type, ValueType::PutSeparated);
         assert_eq!(column.data().len(), 8);
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         assert_eq!(value[0].as_ref().unwrap().as_ref(), large);
 
         cleanup_test_root(root);
@@ -1452,10 +1427,7 @@ mod tests {
         db.put(0, b"k1", 0, b"base-separated").unwrap();
         db.merge(0, b"k1", 0, b"-suffix-separated").unwrap();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         assert_eq!(
             value[0].as_ref().unwrap().as_ref(),
             b"base-separated-suffix-separated"
@@ -1488,10 +1460,7 @@ mod tests {
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"new");
 
@@ -1522,10 +1491,7 @@ mod tests {
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"base_x");
 
@@ -1552,10 +1518,7 @@ mod tests {
         batch.put(0, b"k1", 0, b"new".to_vec());
         db.write_batch(batch).unwrap();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"new");
 
@@ -1582,10 +1545,7 @@ mod tests {
         batch.merge(0, b"k1", 0, b"_x".to_vec());
         db.write_batch(batch).unwrap();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"base_x");
 
@@ -1616,10 +1576,7 @@ mod tests {
         batch.put(0, b"k1", 1, b"c1-new".to_vec());
         db.write_batch(batch).unwrap();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         let col0 = value[0].as_ref().unwrap();
         let col1 = value[1].as_ref().unwrap();
         assert_eq!(col0.as_ref(), b"c0-old");
@@ -1656,10 +1613,7 @@ mod tests {
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
-        let value = db
-            .get(0, b"k1", &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, b"k1").unwrap().expect("value present");
         let col0 = value[0].as_ref().unwrap();
         let col1 = value[1].as_ref().unwrap();
         assert_eq!(col0.as_ref(), b"c0");
@@ -1685,7 +1639,7 @@ mod tests {
         db.write_batch(batch).unwrap();
 
         let value = db
-            .get(0, b"k1", &ReadOptions::for_columns(vec![1, 0]))
+            .get_with_options(0, b"k1", &ReadOptions::for_columns(vec![1, 0]))
             .unwrap()
             .expect("value present");
         assert_eq!(value.len(), 2);
@@ -1714,13 +1668,7 @@ mod tests {
         db.put(0, b"k1", 0, b"new").unwrap();
         db.put(0, b"k2", 0, b"v2").unwrap();
 
-        let mut iter = db
-            .scan(
-                0,
-                b"k1".as_slice()..b"k3".as_slice(),
-                &ScanOptions::default(),
-            )
-            .unwrap();
+        let mut iter = db.scan(0, b"k1".as_slice()..b"k3".as_slice()).unwrap();
         let mut rows = Vec::new();
         while let Some(row) = iter.next() {
             let (key, columns) = row.unwrap();
@@ -1744,13 +1692,7 @@ mod tests {
         let db = open_db(config);
 
         db.put(0, b"k1", 0, b"old").unwrap();
-        let mut iter = db
-            .scan(
-                0,
-                b"".as_slice()..b"\xff".as_slice(),
-                &ScanOptions::default(),
-            )
-            .unwrap();
+        let mut iter = db.scan(0, b"".as_slice()..b"\xff".as_slice()).unwrap();
         db.put(0, b"k1", 0, b"new").unwrap();
 
         let (key, columns) = iter.next().unwrap().unwrap();
@@ -1780,7 +1722,7 @@ mod tests {
         db.write_batch(batch).unwrap();
 
         let mut iter = db
-            .scan(
+            .scan_with_options(
                 0,
                 b"k1".as_slice()..b"k3".as_slice(),
                 &ScanOptions::for_columns(vec![1, 0]),
@@ -1825,7 +1767,7 @@ mod tests {
             let mut options = ScanOptions::default();
             options.read_ahead_bytes = 128;
             let mut iter = db
-                .scan(0, b"".as_slice()..b"\xff".as_slice(), &options)
+                .scan_with_options(0, b"".as_slice()..b"\xff".as_slice(), &options)
                 .unwrap();
             let mut keys = Vec::new();
             while let Some(row) = iter.next() {

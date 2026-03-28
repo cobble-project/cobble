@@ -209,7 +209,7 @@ pub extern "system" fn Java_io_cobble_Reader_get(
     else {
         return std::ptr::null_mut();
     };
-    let values = match reader.get(bucket, &key, read_options_handle.read_options()) {
+    let values = match reader.get_with_options(bucket, &key, read_options_handle.read_options()) {
         Ok(values) => values,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -250,7 +250,7 @@ pub extern "system" fn Java_io_cobble_Reader_openScanCursor(
     ) else {
         return 0;
     };
-    let iter = match reader.scan(
+    let iter = match reader.scan_with_options(
         args.bucket,
         args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
         args.scan_options_handle.scan_options(),

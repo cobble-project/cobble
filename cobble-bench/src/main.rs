@@ -1,4 +1,4 @@
-use cobble::{Config, ReadOptions, Reader, ReaderConfig, SingleDb, VolumeDescriptor};
+use cobble::{Config, Reader, ReaderConfig, SingleDb, VolumeDescriptor};
 use log::LevelFilter::Debug;
 use rand_core::Rng;
 use rand_core::SeedableRng;
@@ -299,10 +299,9 @@ fn run(args: Args) -> Result<(), String> {
             let mut reads = 0u64;
             let mut hits = 0u64;
             let mut generator = RandomKeyGenerator::new(read_count, args.key_len, args.seed);
-            let read_options = ReadOptions::default();
             while let Some(key_bytes) = generator.next_key() {
                 if proxy
-                    .get(0, key_bytes, &read_options)
+                    .get(0, key_bytes)
                     .map_err(|err| format!("Read failed at key {}: {err}", reads + 1))?
                     .is_some()
                 {

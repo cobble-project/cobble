@@ -218,7 +218,11 @@ impl Reader {
         self.reload_if_changed(pointer, modified, true)
     }
 
-    pub fn get(
+    pub fn get(&mut self, bucket_id: u16, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
+        self.get_with_options(bucket_id, key, &ReadOptions::default())
+    }
+
+    pub fn get_with_options(
         &mut self,
         bucket_id: u16,
         key: &[u8],
@@ -229,10 +233,14 @@ impl Reader {
         }
         let snapshot_key = self.snapshot_key_for_bucket(bucket_id)?;
         let db = self.load_snapshot(&snapshot_key)?;
-        db.get(bucket_id, key, options)
+        db.get_with_options(bucket_id, key, options)
     }
 
-    pub fn scan(
+    pub fn scan(&mut self, bucket_id: u16, range: Range<&[u8]>) -> Result<DbIterator<'static>> {
+        self.scan_with_options(bucket_id, range, &ScanOptions::default())
+    }
+
+    pub fn scan_with_options(
         &mut self,
         bucket_id: u16,
         range: Range<&[u8]>,
@@ -243,7 +251,7 @@ impl Reader {
         }
         let snapshot_key = self.snapshot_key_for_bucket(bucket_id)?;
         let db = self.load_snapshot(&snapshot_key)?;
-        db.scan(bucket_id, range, options)
+        db.scan_with_options(bucket_id, range, options)
     }
 
     pub fn read_mode(&self) -> &'static str {
@@ -595,7 +603,7 @@ mod tests {
             ..ReaderConfig::default()
         })
         .unwrap();
-        let value_a = proxy.get(0, b"key-a", &ReadOptions::default()).unwrap();
+        let value_a = proxy.get(0, b"key-a").unwrap();
         assert!(value_a.is_none());
         assert_eq!(proxy.cache.len(), 1);
         assert!(proxy.cache.contains_key(&Arc::new(BucketSnapshotKey {
@@ -604,7 +612,7 @@ mod tests {
         })));
 
         proxy.reload_tolerance = Duration::from_millis(0);
-        let value_b = proxy.get(3, b"key-b", &ReadOptions::default()).unwrap();
+        let value_b = proxy.get(3, b"key-b").unwrap();
         assert!(value_b.is_none());
         assert_eq!(proxy.cache.len(), 1);
         assert!(!proxy.cache.contains_key(&Arc::new(BucketSnapshotKey {
@@ -660,7 +668,7 @@ mod tests {
         })
         .unwrap();
         proxy.reload_tolerance = Duration::from_millis(0);
-        let _ = proxy.get(0, b"key", &ReadOptions::default()).unwrap();
+        let _ = proxy.get(0, b"key").unwrap();
         assert!(proxy.cache.contains_key(&Arc::new(BucketSnapshotKey {
             db_id: db_a.clone(),
             snapshot_id: snap_a,
@@ -681,7 +689,7 @@ mod tests {
         wait_for_pointer(root, global_b.id);
 
         proxy.refresh().unwrap();
-        let _ = proxy.get(0, b"key", &ReadOptions::default()).unwrap();
+        let _ = proxy.get(0, b"key").unwrap();
         assert!(proxy.cache.contains_key(&Arc::new(BucketSnapshotKey {
             db_id: db_b,
             snapshot_id: snap_b,

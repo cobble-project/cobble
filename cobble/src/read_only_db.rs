@@ -166,7 +166,11 @@ impl ReadOnlyDb {
     }
 
     /// Lookup a key in a bucket across the snapshot LSM levels.
-    pub fn get(
+    pub fn get(&self, bucket: u16, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
+        self.get_with_options(bucket, key, &ReadOptions::default())
+    }
+
+    pub fn get_with_options(
         &self,
         bucket: u16,
         key: &[u8],
@@ -223,7 +227,11 @@ impl ReadOnlyDb {
         )
     }
 
-    pub fn scan(
+    pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<DbIterator<'static>> {
+        self.scan_with_options(bucket, range, &ScanOptions::default())
+    }
+
+    pub fn scan_with_options(
         &self,
         bucket: u16,
         range: Range<&[u8]>,

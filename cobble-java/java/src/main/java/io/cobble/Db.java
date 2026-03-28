@@ -144,14 +144,24 @@ public final class Db extends NativeObject {
         }
     }
 
+    /** Get default selected columns for one key (same as null/default read options). */
+    public byte[][] get(int bucket, byte[] key) {
+        return get(nativeHandle, bucket, key, 0L);
+    }
+
     /** Get selected columns for one key using reusable native-backed read options. */
-    public byte[][] get(int bucket, byte[] key, ReadOptions options) {
+    public byte[][] getWithOptions(int bucket, byte[] key, ReadOptions options) {
         long readOptionsHandle = options == null ? 0L : options.nativeHandle;
         return get(nativeHandle, bucket, key, readOptionsHandle);
     }
 
     /** Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive). */
-    public ScanCursor scan(
+    public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
+        return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
+    }
+
+    /** Open a high-throughput native scan cursor with explicit options handle mode. */
+    public ScanCursor scanWithOptions(
             int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, ScanOptions options) {
         long scanOptionsHandle = options == null ? 0L : options.nativeHandle;
         long handle =

@@ -283,9 +283,20 @@ impl DataStructureDb {
     where
         K: AsRef<[u8]>,
     {
-        let raw = self
-            .db
-            .get(bucket, key.as_ref(), &cobble::ReadOptions::default())?;
+        let raw = self.db.get(bucket, key.as_ref())?;
+        raw.map(|columns| self.decode_row(columns)).transpose()
+    }
+
+    pub fn get_with_options<K>(
+        &self,
+        bucket: u16,
+        key: K,
+        options: &cobble::ReadOptions,
+    ) -> Result<Option<Vec<Option<StructuredColumnValue>>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let raw = self.db.get_with_options(bucket, key.as_ref(), options)?;
         raw.map(|columns| self.decode_row(columns)).transpose()
     }
 
@@ -293,9 +304,17 @@ impl DataStructureDb {
         &'a self,
         bucket: u16,
         range: Range<&[u8]>,
+    ) -> Result<StructuredDbIterator<'a>> {
+        self.scan_with_options(bucket, range, &ScanOptions::default())
+    }
+
+    pub fn scan_with_options<'a>(
+        &'a self,
+        bucket: u16,
+        range: Range<&[u8]>,
         options: &ScanOptions,
     ) -> Result<StructuredDbIterator<'a>> {
-        let inner = self.db.scan(bucket, range, options)?;
+        let inner = self.db.scan_with_options(bucket, range, options)?;
         Ok(StructuredDbIterator {
             inner,
             structured_schema: Arc::clone(&self.structured_schema),
@@ -547,9 +566,7 @@ mod tests {
             ]))
         );
 
-        let mut iter = db
-            .scan(0, b"k0".as_ref()..b"k9".as_ref(), &ScanOptions::default())
-            .unwrap();
+        let mut iter = db.scan(0, b"k0".as_ref()..b"k9".as_ref()).unwrap();
         let first = iter.next().expect("one row").unwrap();
         assert_eq!(first.0.as_ref(), b"k1");
         assert_eq!(
@@ -611,9 +628,7 @@ mod tests {
                 Bytes::from_static(b"c")
             ]))
         );
-        let mut iter = db
-            .scan(0, b"k0".as_ref()..b"k9".as_ref(), &ScanOptions::default())
-            .unwrap();
+        let mut iter = db.scan(0, b"k0".as_ref()..b"k9".as_ref()).unwrap();
         let first = iter.next().expect("first row").unwrap();
         assert_eq!(first.0.as_ref(), b"k1");
         let second = iter.next().expect("second row").unwrap();

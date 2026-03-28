@@ -1,8 +1,6 @@
 use bytes::Bytes;
 use cobble::paths::bucket_snapshot_manifest_path;
-use cobble::{
-    CompactionPolicyKind, Config, Db, MetricValue, ReadOptions, ScanOptions, VolumeDescriptor,
-};
+use cobble::{CompactionPolicyKind, Config, Db, MetricValue, ReadOptions, VolumeDescriptor};
 use std::path::Path;
 
 const BASE_KEYS: usize = 6000;
@@ -132,10 +130,7 @@ fn test_schema_evolution_get_large_mixed_sst_memtable() {
     let db = setup_large_schema_evolution_dataset(root);
 
     for i in 0..BASE_KEYS {
-        let value = db
-            .get(0, &key(i), &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, &key(i)).unwrap().expect("value present");
         assert_eq!(value.len(), 2);
         let expected_col0 = if (UPDATED_START..UPDATED_END).contains(&i) && i % 2 == 0 {
             new_col0(i)
@@ -158,10 +153,7 @@ fn test_schema_evolution_get_large_mixed_sst_memtable() {
     }
 
     for i in MEMTABLE_ONLY_START..MEMTABLE_ONLY_END {
-        let value = db
-            .get(0, &key(i), &ReadOptions::default())
-            .unwrap()
-            .expect("value present");
+        let value = db.get(0, &key(i)).unwrap().expect("value present");
         assert_eq!(value.len(), 2);
         assert_eq!(value[0].as_ref().unwrap().as_ref(), new_col0(i).as_slice());
         assert_eq!(value[1].as_ref().unwrap().as_ref(), new_col1(i).as_slice());
@@ -178,11 +170,7 @@ fn test_schema_evolution_scan_large_mixed_sst_memtable() {
     let db = setup_large_schema_evolution_dataset(root);
 
     let mut iter = db
-        .scan(
-            0,
-            b"k000000".as_slice()..b"k999999".as_slice(),
-            &ScanOptions::default(),
-        )
+        .scan(0, b"k000000".as_slice()..b"k999999".as_slice())
         .unwrap();
     let mut seen = 0usize;
     let mut checkpoints = std::collections::HashMap::new();
@@ -253,7 +241,7 @@ fn test_schema_evolution_get_large_with_column_projection() {
         MEMTABLE_ONLY_END - 1,
     ] {
         let value = db
-            .get(0, &key(i), &options)
+            .get_with_options(0, &key(i), &options)
             .unwrap()
             .expect("value present");
         assert_eq!(value.len(), 2);

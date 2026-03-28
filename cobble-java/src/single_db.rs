@@ -163,7 +163,7 @@ pub extern "system" fn Java_io_cobble_SingleDb_get(
     else {
         return std::ptr::null_mut();
     };
-    let values = match db.get(bucket, &key, read_options_handle.read_options()) {
+    let values = match db.get_with_options(bucket, &key, read_options_handle.read_options()) {
         Ok(values) => values,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());

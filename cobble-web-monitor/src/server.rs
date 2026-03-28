@@ -6,7 +6,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use cobble::{Config, ReadOptions, Reader, ReaderConfig, ScanOptions};
+use cobble::{Config, Reader, ReaderConfig};
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -655,7 +655,7 @@ fn run_inspect_query(state: &Arc<AppState>, query: &InspectQuery) -> Result<Insp
         InspectMode::Lookup => {
             let mut output = Vec::with_capacity(query.lookup_items.len());
             for item in &query.lookup_items {
-                let value = guard.get(item.bucket, item.key.as_slice(), &ReadOptions::default())?;
+                let value = guard.get(item.bucket, item.key.as_slice())?;
                 output.push(LookupResultItem {
                     bucket: item.bucket,
                     key_b64: STANDARD.encode(item.key.as_slice()),
@@ -695,11 +695,7 @@ fn run_inspect_query(state: &Arc<AppState>, query: &InspectQuery) -> Result<Insp
                 })?
             };
 
-            let mut iter = guard.scan(
-                query.bucket,
-                scan_start.as_slice()..range_end.as_slice(),
-                &ScanOptions::default(),
-            )?;
+            let mut iter = guard.scan(query.bucket, scan_start.as_slice()..range_end.as_slice())?;
 
             let mut items = Vec::with_capacity(query.limit.saturating_add(1));
             for row in &mut iter {

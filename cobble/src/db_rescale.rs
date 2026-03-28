@@ -455,7 +455,7 @@ mod tests {
     use crate::db_state::full_bucket_range;
     use crate::file::FileManager;
     use crate::metrics_manager::MetricsManager;
-    use crate::{Config, ReadOptions, VolumeDescriptor};
+    use crate::{Config, VolumeDescriptor};
     use serial_test::serial;
     use std::sync::Arc;
     use std::sync::mpsc;
@@ -498,17 +498,11 @@ mod tests {
             .unwrap();
         assert_eq!(imported_snapshot, source_snapshot);
 
-        let value = target
-            .get(2, b"k1", &ReadOptions::default())
-            .unwrap()
-            .unwrap();
+        let value = target.get(2, b"k1").unwrap().unwrap();
         assert_eq!(value[0].as_deref(), Some(&b"v1"[..]));
 
         target.put(3, b"k2", 0, b"v2").unwrap();
-        let value = target
-            .get(3, b"k2", &ReadOptions::default())
-            .unwrap()
-            .unwrap();
+        let value = target.get(3, b"k2").unwrap().unwrap();
         assert_eq!(value[0].as_deref(), Some(&b"v2"[..]));
 
         drop(target);
@@ -587,10 +581,7 @@ mod tests {
             )
             .unwrap();
         target.put(2, b"k", 0, b"v").unwrap();
-        let got = target
-            .get(2, b"k", &ReadOptions::default())
-            .unwrap()
-            .unwrap();
+        let got = target.get(2, b"k").unwrap().unwrap();
         assert_eq!(got[0].as_deref(), Some(&b"v"[..]));
         drop(target);
         drop(source);
@@ -635,10 +626,7 @@ mod tests {
         target
             .expand_bucket(source.id().to_string(), Some(snapshot_id), None)
             .unwrap();
-        let got = target
-            .get(4, b"k-sep", &ReadOptions::default())
-            .unwrap()
-            .unwrap();
+        let got = target.get(4, b"k-sep").unwrap().unwrap();
         assert_eq!(got[0].as_deref(), Some(&b"payload-separated"[..]));
 
         drop(target);
@@ -668,9 +656,9 @@ mod tests {
         let bucket_input = db.shard_snapshot_input(shrink_snapshot).unwrap();
         assert_eq!(bucket_input.ranges, vec![0u16..=1u16]);
 
-        let kept = db.get(1, b"k1", &ReadOptions::default()).unwrap().unwrap();
+        let kept = db.get(1, b"k1").unwrap().unwrap();
         assert_eq!(kept[0].as_deref(), Some(&b"v1"[..]));
-        let removed = db.get(2, b"k2", &ReadOptions::default()).unwrap();
+        let removed = db.get(2, b"k2").unwrap();
         assert!(removed.is_none());
 
         let metrics = Arc::new(MetricsManager::new("shrink-manifest"));

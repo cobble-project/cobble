@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use cobble::{Config, ReadOptions, SingleDb, VolumeDescriptor};
+use cobble::{Config, SingleDb, VolumeDescriptor};
 use cobble_web_monitor::{MonitorConfig, MonitorConfigSource, MonitorServer};
 use serde_json::{Value as JsonValue, json};
 use serial_test::serial;
@@ -59,7 +59,7 @@ fn test_monitor_snapshots_mode_switch_and_inspect() {
     let snapshot_id_2 = db.snapshot().unwrap();
 
     let row = db
-        .get(0, b"user:0001", &ReadOptions::default())
+        .get(0, b"user:0001")
         .unwrap()
         .expect("source value exists");
     assert_eq!(row[0].as_ref().unwrap().as_ref(), b"alice-v2");

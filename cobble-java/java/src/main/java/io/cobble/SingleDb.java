@@ -37,7 +37,11 @@ public final class SingleDb extends NativeObject {
         }
     }
 
-    public byte[][] get(int bucket, byte[] key, ReadOptions options) {
+    public byte[][] get(int bucket, byte[] key) {
+        return get(nativeHandle, bucket, key, 0L);
+    }
+
+    public byte[][] getWithOptions(int bucket, byte[] key, ReadOptions options) {
         long readOptionsHandle = options == null ? 0L : options.nativeHandle;
         return get(nativeHandle, bucket, key, readOptionsHandle);
     }

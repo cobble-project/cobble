@@ -38,13 +38,14 @@ class DbBindingTest {
                 for (int i = 0; i < count; i++) {
                     byte[] key = keyBytes("db-json", i);
                     byte[] expected = valueBytes("db-json-v", i);
-                    assertArrayEquals(expected, requiredSingleColumn(db.get(0, key, options)));
+                    assertArrayEquals(
+                            expected, requiredSingleColumn(db.getWithOptions(0, key, options)));
                 }
             }
             try (ReadOptions options = ReadOptions.forColumns(0, 1)) {
                 for (int i = 0; i < count; i++) {
                     byte[] key = keyBytes("db-json", i);
-                    byte[][] columns = db.get(0, key, options);
+                    byte[][] columns = db.getWithOptions(0, key, options);
                     assertNotNull(columns);
                     assertEquals(2, columns.length);
                     assertArrayEquals(valueBytes("db-json-v", i), columns[0]);
@@ -54,8 +55,7 @@ class DbBindingTest {
             for (int i = 0; i < count; i++) {
                 byte[] key = keyBytes("db-json", i);
                 byte[] expected = valueBytes("db-json-v", i);
-                assertArrayEquals(
-                        expected, requiredSingleColumn(db.get(0, key, (ReadOptions) null)));
+                assertArrayEquals(expected, requiredSingleColumn(db.get(0, key)));
             }
 
             for (int i = 0; i < count; i += 3) {
@@ -98,13 +98,12 @@ class DbBindingTest {
             for (int i = 0; i < count; i++) {
                 byte[] key = keyBytes("single-path", i);
                 assertArrayEquals(
-                        valueBytes("single-path-v", i),
-                        requiredSingleColumn(db.get(0, key, (ReadOptions) null)));
+                        valueBytes("single-path-v", i), requiredSingleColumn(db.get(0, key)));
             }
             try (ReadOptions options = ReadOptions.forColumns(0, 1)) {
                 for (int i = 0; i < count; i++) {
                     byte[] key = keyBytes("single-path", i);
-                    byte[][] columns = db.get(0, key, options);
+                    byte[][] columns = db.getWithOptions(0, key, options);
                     assertNotNull(columns);
                     assertEquals(2, columns.length);
                     assertArrayEquals(valueBytes("single-path-v", i), columns[0]);
@@ -268,7 +267,7 @@ class DbBindingTest {
                                     .batchSize(128)
                                     .columns(0, 1);
                     ScanCursor cursor =
-                            db.scan(
+                            db.scanWithOptions(
                                     0,
                                     scanKeyBytes("scan-db", 100),
                                     scanKeyBytes("scan-db", 900),
@@ -301,7 +300,7 @@ class DbBindingTest {
                 }
             }
             try (ScanCursor cursor =
-                    db.scan(0, scanKeyBytes("scan-db", 100), scanKeyBytes("scan-db", 900), null)) {
+                    db.scan(0, scanKeyBytes("scan-db", 100), scanKeyBytes("scan-db", 900))) {
                 int rows = 0;
                 while (true) {
                     ScanBatch batch = cursor.nextBatch();
@@ -332,7 +331,7 @@ class DbBindingTest {
             try (ScanOptions options = new ScanOptions().batchSize(64).columns(0, 1)) {
                 int firstRows = 0;
                 try (ScanCursor first =
-                        db.scan(
+                        db.scanWithOptions(
                                 0,
                                 scanKeyBytes("scan-reuse", 0),
                                 scanKeyBytes("scan-reuse", 220),
@@ -353,7 +352,7 @@ class DbBindingTest {
                 options.readAheadBytes(64 * 1024).batchSize(32);
                 int secondRows = 0;
                 try (ScanCursor second =
-                        db.scan(
+                        db.scanWithOptions(
                                 0,
                                 scanKeyBytes("scan-reuse", 0),
                                 scanKeyBytes("scan-reuse", 220),
@@ -394,7 +393,7 @@ class DbBindingTest {
             int scannedRows = 0;
             try (ScanOptions options = new ScanOptions().batchSize(256).columns(0, 2);
                     ScanCursor cursor =
-                            db.scan(
+                            db.scanWithOptions(
                                     0,
                                     scanKeyBytes("scan-large", 0),
                                     scanKeyBytes("scan-large", rowCount + 1),
@@ -443,17 +442,17 @@ class DbBindingTest {
                     ReadOnlyDb.open(configPath.toString(), shardSnapshot.snapshotId, dbId)) {
                 assertArrayEquals(
                         valueBytes("scan-ro-v0", 10),
-                        requiredSingleColumn(
-                                readOnlyDb.get(
-                                        0, scanKeyBytes("scan-ro", 10), (ReadOptions) null)));
+                        requiredSingleColumn(readOnlyDb.get(0, scanKeyBytes("scan-ro", 10))));
                 try (ReadOptions readOptions = ReadOptions.forColumn(0)) {
                     assertArrayEquals(
                             valueBytes("scan-ro-v0", 10),
                             requiredSingleColumn(
-                                    readOnlyDb.get(0, scanKeyBytes("scan-ro", 10), readOptions)));
+                                    readOnlyDb.getWithOptions(
+                                            0, scanKeyBytes("scan-ro", 10), readOptions)));
                 }
                 try (ReadOptions readOptions = ReadOptions.forColumns(0, 1)) {
-                    byte[][] columns = readOnlyDb.get(0, scanKeyBytes("scan-ro", 10), readOptions);
+                    byte[][] columns =
+                            readOnlyDb.getWithOptions(0, scanKeyBytes("scan-ro", 10), readOptions);
                     assertNotNull(columns);
                     assertEquals(2, columns.length);
                     assertArrayEquals(valueBytes("scan-ro-v0", 10), columns[0]);
@@ -461,7 +460,7 @@ class DbBindingTest {
                 }
                 try (ScanOptions options = new ScanOptions().batchSize(96).columns(0, 1);
                         ScanCursor cursor =
-                                readOnlyDb.scan(
+                                readOnlyDb.scanWithOptions(
                                         0,
                                         scanKeyBytes("scan-ro", 10),
                                         scanKeyBytes("scan-ro", 510),
@@ -504,16 +503,17 @@ class DbBindingTest {
             try (Reader reader = Reader.openCurrent(configPath.toString())) {
                 assertArrayEquals(
                         valueBytes("scan-ro-v0", 400),
-                        requiredSingleColumn(
-                                reader.get(0, scanKeyBytes("scan-ro", 400), (ReadOptions) null)));
+                        requiredSingleColumn(reader.get(0, scanKeyBytes("scan-ro", 400))));
                 try (ReadOptions readOptions = ReadOptions.forColumn(0)) {
                     assertArrayEquals(
                             valueBytes("scan-ro-v0", 400),
                             requiredSingleColumn(
-                                    reader.get(0, scanKeyBytes("scan-ro", 400), readOptions)));
+                                    reader.getWithOptions(
+                                            0, scanKeyBytes("scan-ro", 400), readOptions)));
                 }
                 try (ReadOptions readOptions = ReadOptions.forColumns(0, 1)) {
-                    byte[][] columns = reader.get(0, scanKeyBytes("scan-ro", 400), readOptions);
+                    byte[][] columns =
+                            reader.getWithOptions(0, scanKeyBytes("scan-ro", 400), readOptions);
                     assertNotNull(columns);
                     assertEquals(2, columns.length);
                     assertArrayEquals(valueBytes("scan-ro-v0", 400), columns[0]);
@@ -525,7 +525,7 @@ class DbBindingTest {
                                         .readAheadBytes(128 * 1024)
                                         .columns(0, 1);
                         ScanCursor cursor =
-                                reader.scan(
+                                reader.scanWithOptions(
                                         0,
                                         scanKeyBytes("scan-ro", 400),
                                         scanKeyBytes("scan-ro", 900),
