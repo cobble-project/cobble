@@ -6,7 +6,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 
@@ -209,6 +211,269 @@ class DbBindingTest {
         }
     }
 
+    @Test
+    void dbScanWithBatchCursor() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-db-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        try (Db db = Db.open(config)) {
+            int count = 1200;
+            for (int i = 0; i < count; i++) {
+                byte[] key = scanKeyBytes("scan-db", i);
+                db.put(0, key, 0, valueBytes("scan-db-v0", i));
+                db.put(0, key, 1, valueBytes("scan-db-v1", i));
+            }
+            try (ScanOptions options =
+                            new ScanOptions()
+                                    .readAheadBytes(256 * 1024)
+                                    .batchSize(128)
+                                    .columns(0, 1);
+                    ScanCursor cursor =
+                            db.scan(
+                                    0,
+                                    scanKeyBytes("scan-db", 100),
+                                    scanKeyBytes("scan-db", 900),
+                                    options)) {
+                List<String> keys = new ArrayList<String>();
+                List<String> value0 = new ArrayList<String>();
+                List<String> value1 = new ArrayList<String>();
+                while (true) {
+                    ScanBatch batch = cursor.nextBatch();
+                    assertNotNull(batch);
+                    assertEquals(batch.keys.length, batch.values.length);
+                    for (int i = 0; i < batch.keys.length; i++) {
+                        keys.add(new String(batch.keys[i], StandardCharsets.UTF_8));
+                        assertEquals(2, batch.values[i].length);
+                        value0.add(new String(batch.values[i][0], StandardCharsets.UTF_8));
+                        value1.add(new String(batch.values[i][1], StandardCharsets.UTF_8));
+                    }
+                    if (!batch.hasMore) {
+                        break;
+                    }
+                    assertNotNull(batch.nextStartAfterExclusive);
+                }
+                assertFalse(keys.isEmpty());
+                for (int i = 0; i < keys.size(); i++) {
+                    String key = keys.get(i);
+                    int index = Integer.parseInt(key.substring(key.lastIndexOf('-') + 1));
+                    assertTrue(index >= 100 && index < 900);
+                    assertEquals("scan-db-v0-value-" + index + "-payload", value0.get(i));
+                    assertEquals("scan-db-v1-value-" + index + "-payload", value1.get(i));
+                }
+            }
+        }
+    }
+
+    @Test
+    void dbScanReusesNativeScanOptionsHandle() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-db-scan-reuse-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        try (Db db = Db.open(config)) {
+            int count = 220;
+            for (int i = 0; i < count; i++) {
+                byte[] key = scanKeyBytes("scan-reuse", i);
+                db.put(0, key, 0, valueBytes("scan-reuse-v0", i));
+                db.put(0, key, 1, valueBytes("scan-reuse-v1", i));
+            }
+            try (ScanOptions options = new ScanOptions().batchSize(64).columns(0, 1)) {
+                int firstRows = 0;
+                try (ScanCursor first =
+                        db.scan(
+                                0,
+                                scanKeyBytes("scan-reuse", 0),
+                                scanKeyBytes("scan-reuse", 220),
+                                options)) {
+                    while (true) {
+                        ScanBatch batch = first.nextBatch();
+                        for (int i = 0; i < batch.values.length; i++) {
+                            assertEquals(2, batch.values[i].length);
+                        }
+                        firstRows += batch.keys.length;
+                        if (!batch.hasMore) {
+                            break;
+                        }
+                    }
+                }
+                assertTrue(firstRows > 0);
+
+                options.readAheadBytes(64 * 1024).batchSize(32);
+                int secondRows = 0;
+                try (ScanCursor second =
+                        db.scan(
+                                0,
+                                scanKeyBytes("scan-reuse", 0),
+                                scanKeyBytes("scan-reuse", 220),
+                                options)) {
+                    while (true) {
+                        ScanBatch batch = second.nextBatch();
+                        for (int i = 0; i < batch.values.length; i++) {
+                            assertEquals(2, batch.values[i].length);
+                        }
+                        secondRows += batch.keys.length;
+                        if (!batch.hasMore) {
+                            break;
+                        }
+                    }
+                }
+                assertEquals(firstRows, secondRows);
+            }
+        }
+    }
+
+    @Test
+    void dbScanLargeDatasetWithProjectedColumnsOverWideSchema() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-db-scan-large-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(4).totalBuckets(1);
+        final int rowCount = 18_000;
+        final int selectedColumnPayloadBytes = 4 * 1024;
+        final long minimumScannedBytes = 128L * 1024L * 1024L;
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < rowCount; i++) {
+                byte[] key = scanKeyBytes("scan-large", i);
+                db.put(0, key, 0, largeValueBytes("scan-large-c0", i, selectedColumnPayloadBytes));
+                db.put(0, key, 1, valueBytes("scan-large-c1", i));
+                db.put(0, key, 2, largeValueBytes("scan-large-c2", i, selectedColumnPayloadBytes));
+            }
+
+            long scannedBytes = 0L;
+            int scannedRows = 0;
+            try (ScanOptions options = new ScanOptions().batchSize(256).columns(0, 2);
+                    ScanCursor cursor =
+                            db.scan(
+                                    0,
+                                    scanKeyBytes("scan-large", 0),
+                                    scanKeyBytes("scan-large", rowCount + 1),
+                                    options)) {
+                while (true) {
+                    ScanBatch batch = cursor.nextBatch();
+                    assertEquals(batch.keys.length, batch.values.length);
+                    for (int i = 0; i < batch.values.length; i++) {
+                        assertEquals(
+                                2,
+                                batch.values[i].length,
+                                "only selected columns should be returned");
+                        scannedBytes += batch.values[i][0].length;
+                        scannedBytes += batch.values[i][1].length;
+                        scannedRows++;
+                    }
+                    if (!batch.hasMore) {
+                        break;
+                    }
+                }
+            }
+
+            assertTrue(scannedRows > 0);
+            assertTrue(
+                    scannedBytes >= minimumScannedBytes,
+                    "expected scanned bytes >= 128MB, actual=" + scannedBytes);
+        }
+    }
+
+    @Test
+    void readOnlyAndReaderScanWithBatchCursor() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-ro-reader-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        Path configPath = writeConfigFile(dataDir, config);
+        try (Db db = Db.open(config)) {
+            String dbId = db.id();
+            int count = 950;
+            for (int i = 0; i < count; i++) {
+                byte[] key = scanKeyBytes("scan-ro", i);
+                db.put(0, key, 0, valueBytes("scan-ro-v0", i));
+                db.put(0, key, 1, valueBytes("scan-ro-v1", i));
+            }
+            ShardSnapshot shardSnapshot = db.snapshot();
+            assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
+            try (ReadOnlyDb readOnlyDb =
+                    ReadOnlyDb.open(configPath.toString(), shardSnapshot.snapshotId, dbId)) {
+                try (ScanOptions options = new ScanOptions().batchSize(96).columns(0, 1);
+                        ScanCursor cursor =
+                                readOnlyDb.scan(
+                                        0,
+                                        scanKeyBytes("scan-ro", 10),
+                                        scanKeyBytes("scan-ro", 510),
+                                        options)) {
+                    int rows = 0;
+                    String first = null;
+                    String last = null;
+                    while (true) {
+                        ScanBatch batch = cursor.nextBatch();
+                        for (int i = 0; i < batch.keys.length; i++) {
+                            String key = new String(batch.keys[i], StandardCharsets.UTF_8);
+                            assertEquals(2, batch.values[i].length);
+                            String value0 = new String(batch.values[i][0], StandardCharsets.UTF_8);
+                            String value1 = new String(batch.values[i][1], StandardCharsets.UTF_8);
+                            if (first == null) {
+                                first = key + "|" + value0 + "|" + value1;
+                            }
+                            last = key + "|" + value0 + "|" + value1;
+                            rows++;
+                        }
+                        if (!batch.hasMore) {
+                            break;
+                        }
+                    }
+                    assertEquals(500, rows);
+                    assertEquals(
+                            scanKeyString("scan-ro", 10)
+                                    + "|scan-ro-v0-value-10-payload|scan-ro-v1-value-10-payload",
+                            first);
+                    assertEquals(
+                            scanKeyString("scan-ro", 509)
+                                    + "|scan-ro-v0-value-509-payload|scan-ro-v1-value-509-payload",
+                            last);
+                }
+            }
+            try (DbCoordinator coordinator = DbCoordinator.open(configPath.toString())) {
+                coordinator.materializeGlobalSnapshot(
+                        1, shardSnapshot.snapshotId, Collections.singletonList(shardSnapshot));
+            }
+            try (Reader reader = Reader.openCurrent(configPath.toString())) {
+                try (ScanOptions options =
+                                new ScanOptions()
+                                        .batchSize(80)
+                                        .readAheadBytes(128 * 1024)
+                                        .columns(0, 1);
+                        ScanCursor cursor =
+                                reader.scan(
+                                        0,
+                                        scanKeyBytes("scan-ro", 400),
+                                        scanKeyBytes("scan-ro", 900),
+                                        options)) {
+                    int rows = 0;
+                    String first = null;
+                    String last = null;
+                    while (true) {
+                        ScanBatch batch = cursor.nextBatch();
+                        for (int i = 0; i < batch.keys.length; i++) {
+                            String key = new String(batch.keys[i], StandardCharsets.UTF_8);
+                            assertEquals(2, batch.values[i].length);
+                            String value0 = new String(batch.values[i][0], StandardCharsets.UTF_8);
+                            String value1 = new String(batch.values[i][1], StandardCharsets.UTF_8);
+                            if (first == null) {
+                                first = key + "|" + value0 + "|" + value1;
+                            }
+                            last = key + "|" + value0 + "|" + value1;
+                            rows++;
+                        }
+                        if (!batch.hasMore) {
+                            break;
+                        }
+                    }
+                    assertEquals(500, rows);
+                    assertEquals(
+                            scanKeyString("scan-ro", 400)
+                                    + "|scan-ro-v0-value-400-payload|scan-ro-v1-value-400-payload",
+                            first);
+                    assertEquals(
+                            scanKeyString("scan-ro", 899)
+                                    + "|scan-ro-v0-value-899-payload|scan-ro-v1-value-899-payload",
+                            last);
+                }
+            }
+        }
+    }
+
     private static ShardSnapshot awaitSnapshot(Future<ShardSnapshot> future) {
         try {
             return future.get();
@@ -231,7 +496,30 @@ class DbBindingTest {
         return (prefix + "-k-" + i).getBytes(StandardCharsets.UTF_8);
     }
 
+    private static byte[] scanKeyBytes(String prefix, int i) {
+        return scanKeyString(prefix, i).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static String scanKeyString(String prefix, int i) {
+        return String.format("%s-k-%05d", prefix, i);
+    }
+
     private static byte[] valueBytes(String prefix, int i) {
         return (prefix + "-value-" + i + "-payload").getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static byte[] largeValueBytes(String prefix, int i, int bytes) {
+        if (bytes <= 0) {
+            throw new IllegalArgumentException("bytes must be > 0");
+        }
+        byte[] value = new byte[bytes];
+        byte[] marker = (prefix + "-" + i + "|").getBytes(StandardCharsets.UTF_8);
+        int markerLength = Math.min(marker.length, value.length);
+        System.arraycopy(marker, 0, value, 0, markerLength);
+        byte fill = (byte) ('a' + (i % 26));
+        for (int pos = markerLength; pos < value.length; pos++) {
+            value[pos] = fill;
+        }
+        return value;
     }
 }

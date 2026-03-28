@@ -421,6 +421,7 @@ dependencies = [
 name = "cobble-java"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "cobble",
  "cobble-data-structure",
  "jni",

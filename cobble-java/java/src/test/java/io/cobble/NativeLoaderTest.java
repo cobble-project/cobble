@@ -41,6 +41,9 @@ class NativeLoaderTest {
         assertNotNull(DbCoordinator.class);
         assertNotNull(ShardSnapshot.class);
         assertNotNull(GlobalSnapshot.class);
+        assertNotNull(ScanOptions.class);
+        assertNotNull(ScanCursor.class);
+        assertNotNull(ScanBatch.class);
     }
 
     @Test

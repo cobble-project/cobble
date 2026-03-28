@@ -146,6 +146,25 @@ public final class Db extends NativeObject {
         return get(nativeHandle, bucket, key, column);
     }
 
+    /** Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive). */
+    public ScanCursor scan(
+            int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, ScanOptions options) {
+        if (options == null) {
+            throw new IllegalArgumentException("options must not be null");
+        }
+        long handle =
+                openScanCursor(
+                        nativeHandle,
+                        bucket,
+                        startKeyInclusive,
+                        endKeyExclusive,
+                        options.nativeHandle);
+        if (handle == 0L) {
+            throw new IllegalStateException("failed to open scan cursor");
+        }
+        return new ScanCursor(handle);
+    }
+
     /**
      * Delete one column value for a key.
      *
@@ -285,6 +304,13 @@ public final class Db extends NativeObject {
             long nativeHandle, int bucket, byte[] key, int column, byte[] value);
 
     private static native byte[] get(long nativeHandle, int bucket, byte[] key, int column);
+
+    private static native long openScanCursor(
+            long nativeHandle,
+            int bucket,
+            byte[] startKeyInclusive,
+            byte[] endKeyExclusive,
+            long scanOptionsHandle);
 
     private static native void delete(long nativeHandle, int bucket, byte[] key, int column);
 
