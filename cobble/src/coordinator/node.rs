@@ -242,6 +242,7 @@ impl DbCoordinator {
             };
             snapshots.push(snapshot_id);
         }
+        snapshots.sort();
         if snapshots.len() <= retention {
             return Ok(());
         }
