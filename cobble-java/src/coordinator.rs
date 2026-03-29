@@ -254,6 +254,33 @@ pub extern "system" fn Java_io_cobble_DbCoordinator_listGlobalSnapshotsJson(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_DbCoordinator_loadCurrentGlobalSnapshotJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jstring {
+    let Some(coordinator) = coordinator_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let snapshot = match coordinator.load_current_global_snapshot() {
+        Ok(Some(v)) => v,
+        Ok(None) => return std::ptr::null_mut(),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let json = match serde_json::to_string(&snapshot) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    to_java_string_or_throw(&mut env, json)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_DbCoordinator_retainSnapshot(
     mut env: JNIEnv,
     _class: JClass,

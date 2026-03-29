@@ -224,6 +224,15 @@ public final class Db extends NativeObject {
         return id(nativeHandle);
     }
 
+    /**
+     * Return current time in seconds from the DB's time provider.
+     *
+     * @return current epoch seconds (u32 range)
+     */
+    public int nowSeconds() {
+        return nowSeconds(nativeHandle);
+    }
+
     /** Trigger snapshot creation asynchronously and return a future of shard snapshot payload. */
     public Future<ShardSnapshot> asyncSnapshot() {
         CompletableFuture<Long> snapshotIdFuture = new CompletableFuture<Long>();
@@ -401,6 +410,8 @@ public final class Db extends NativeObject {
     private static native void setTime(long nativeHandle, int nextSeconds);
 
     private static native String id(long nativeHandle);
+
+    private static native int nowSeconds(long nativeHandle);
 
     private static native void asyncSnapshot(
             long nativeHandle, CompletableFuture<Long> snapshotIdFuture);

@@ -3,11 +3,12 @@ use crate::scan::{ScanCursorHandle, decode_scan_open_args};
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_u16, decode_u64_from_jlong,
     throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
+    to_java_string_or_throw,
 };
 use cobble::{Config, ReadOnlyDb};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString};
-use jni::sys::{jint, jlong, jobject};
+use jni::sys::{jint, jlong, jobject, jstring};
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_ReadOnlyDb_openHandle(
@@ -206,6 +207,18 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openScanCursor(
         iter,
         args.scan_options_handle.batch_size(),
     ))) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ReadOnlyDb_id(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jstring {
+    let Some(db) = read_only_db_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    to_java_string_or_throw(&mut env, db.id().to_string())
 }
 
 fn read_only_db_from_handle_or_throw(

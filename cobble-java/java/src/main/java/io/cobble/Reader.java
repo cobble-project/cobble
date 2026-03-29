@@ -143,6 +143,15 @@ public final class Reader extends NativeObject {
         return GlobalSnapshot.listFromJson(listGlobalSnapshotsJson(nativeHandle));
     }
 
+    /**
+     * Return the current global snapshot this reader is using.
+     *
+     * @return current global snapshot
+     */
+    public GlobalSnapshot currentGlobalSnapshot() {
+        return GlobalSnapshot.fromJson(currentGlobalSnapshotJson(nativeHandle));
+    }
+
     @Override
     protected native void disposeInternal(long nativeHandle);
 
@@ -169,6 +178,8 @@ public final class Reader extends NativeObject {
     private static native String readMode(long nativeHandle);
 
     private static native long configuredSnapshotId(long nativeHandle);
+
+    private static native String currentGlobalSnapshotJson(long nativeHandle);
 
     private static native String listGlobalSnapshotsJson(long nativeHandle);
 

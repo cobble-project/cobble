@@ -83,6 +83,16 @@ public final class DbCoordinator extends NativeObject {
         return GlobalSnapshot.listFromJson(listGlobalSnapshotsJson(nativeHandle));
     }
 
+    /**
+     * Load the current (latest) global snapshot, or null if none exists.
+     *
+     * @return current global snapshot or null
+     */
+    public GlobalSnapshot loadCurrentGlobalSnapshot() {
+        String json = loadCurrentGlobalSnapshotJson(nativeHandle);
+        return json == null ? null : GlobalSnapshot.fromJson(json);
+    }
+
     /** Retain one global snapshot to protect it from auto-retention cleanup. */
     public boolean retainSnapshot(long snapshotId) {
         return retainSnapshot(nativeHandle, snapshotId);
@@ -106,6 +116,8 @@ public final class DbCoordinator extends NativeObject {
     private static native String getGlobalSnapshotJson(long nativeHandle, long snapshotId);
 
     private static native String listGlobalSnapshotsJson(long nativeHandle);
+
+    private static native String loadCurrentGlobalSnapshotJson(long nativeHandle);
 
     private static native boolean retainSnapshot(long nativeHandle, long snapshotId);
 

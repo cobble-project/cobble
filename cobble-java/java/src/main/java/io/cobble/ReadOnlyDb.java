@@ -86,12 +86,23 @@ public final class ReadOnlyDb extends NativeObject {
         return new ScanCursor(handle);
     }
 
+    /**
+     * Return the database id.
+     *
+     * @return unique db id string
+     */
+    public String id() {
+        return id(nativeHandle);
+    }
+
     @Override
     protected native void disposeInternal(long nativeHandle);
 
     private static native long openHandle(String configPath, long snapshotId, String dbId);
 
     private static native long openHandleFromJson(String configJson, long snapshotId, String dbId);
+
+    private static native String id(long nativeHandle);
 
     private static native byte[][] get(
             long nativeHandle, int bucket, byte[] key, long readOptionsHandle);

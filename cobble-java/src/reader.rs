@@ -326,6 +326,26 @@ pub extern "system" fn Java_io_cobble_Reader_listGlobalSnapshotsJson(
     to_java_string_or_throw(&mut env, json)
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_currentGlobalSnapshotJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jstring {
+    let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let manifest = reader.current_global_snapshot();
+    let json = match serde_json::to_string(manifest) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    to_java_string_or_throw(&mut env, json)
+}
+
 fn reader_from_handle_or_throw(
     env: &mut JNIEnv,
     native_handle: jlong,

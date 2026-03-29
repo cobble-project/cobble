@@ -645,6 +645,18 @@ pub extern "system" fn Java_io_cobble_Db_id(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_nowSeconds(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jint {
+    let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    db.now_seconds() as jint
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Db_asyncSnapshot(
     mut env: JNIEnv,
     _class: JClass,
