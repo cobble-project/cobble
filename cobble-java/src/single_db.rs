@@ -1,4 +1,5 @@
 use crate::read_options::read_options_from_handle_or_throw;
+use crate::scan::{ScanCursorHandle, decode_scan_open_args};
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong,
     throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
@@ -518,6 +519,45 @@ pub extern "system" fn Java_io_cobble_SingleDb_listSnapshotsJson(
         }
     };
     to_java_string_or_throw(&mut env, json)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openScanCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    start_key_inclusive: JByteArray,
+    end_key_exclusive: JByteArray,
+    scan_options_handle: jlong,
+) -> jlong {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    let Some(args) = decode_scan_open_args(
+        &mut env,
+        bucket,
+        start_key_inclusive,
+        end_key_exclusive,
+        scan_options_handle,
+    ) else {
+        return 0;
+    };
+    let iter = match db.scan_with_options(
+        args.bucket,
+        args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+        args.scan_options_handle.scan_options(),
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(ScanCursorHandle::from_static_iter(
+        iter,
+        args.scan_options_handle.batch_size(),
+    ))) as jlong
 }
 
 fn single_db_from_handle_or_throw(

@@ -124,6 +124,40 @@ class DbBindingTest {
                     assertArrayEquals(valueBytes("single-path-v", i), value);
                 }
             }
+
+            // Verify scan and scanWithOptions
+            byte[] scanStart = new byte[] {0};
+            byte[] scanEnd = new byte[] {(byte) 0xFF};
+            int scannedRows = 0;
+            try (ScanCursor cursor = db.scan(0, scanStart, scanEnd)) {
+                while (true) {
+                    ScanBatch batch = cursor.nextBatch();
+                    scannedRows += batch.keys.length;
+                    if (!batch.hasMore) {
+                        break;
+                    }
+                }
+            }
+            int expectedAlive = count - ((count - 1) / 4 + (1 < count ? 0 : -1));
+            // count=280, deleted every i%4==1 from i=1: 70 deleted, 210 alive
+            assertEquals(210, scannedRows);
+
+            try (ScanOptions scanOptions = new ScanOptions().columns(0)) {
+                try (ScanCursor cursor = db.scanWithOptions(0, scanStart, scanEnd, scanOptions)) {
+                    int rows = 0;
+                    while (true) {
+                        ScanBatch batch = cursor.nextBatch();
+                        rows += batch.keys.length;
+                        for (int i = 0; i < batch.values.length; i++) {
+                            assertEquals(1, batch.values[i].length);
+                        }
+                        if (!batch.hasMore) {
+                            break;
+                        }
+                    }
+                    assertEquals(210, rows);
+                }
+            }
         }
     }
 

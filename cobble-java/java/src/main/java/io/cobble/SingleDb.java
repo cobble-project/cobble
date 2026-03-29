@@ -67,6 +67,28 @@ public final class SingleDb extends NativeObject {
         return get(nativeHandle, bucket, key, readOptionsHandle);
     }
 
+    /** Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive). */
+    public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
+        return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
+    }
+
+    /** Open a high-throughput native scan cursor with explicit options. */
+    public ScanCursor scanWithOptions(
+            int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, ScanOptions options) {
+        long scanOptionsHandle = options == null ? 0L : options.nativeHandle;
+        long handle =
+                openScanCursor(
+                        nativeHandle,
+                        bucket,
+                        startKeyInclusive,
+                        endKeyExclusive,
+                        scanOptionsHandle);
+        if (handle == 0L) {
+            throw new IllegalStateException("failed to open scan cursor");
+        }
+        return new ScanCursor(handle);
+    }
+
     public void delete(int bucket, byte[] key, int column) {
         delete(nativeHandle, bucket, key, column);
     }
@@ -144,6 +166,13 @@ public final class SingleDb extends NativeObject {
 
     private static native byte[][] get(
             long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
+
+    private static native long openScanCursor(
+            long nativeHandle,
+            int bucket,
+            byte[] startKeyInclusive,
+            byte[] endKeyExclusive,
+            long scanOptionsHandle);
 
     private static native void delete(long nativeHandle, int bucket, byte[] key, int column);
 
