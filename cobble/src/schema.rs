@@ -181,6 +181,11 @@ impl Schema {
             .collect()
     }
 
+    /// Return the merge operator id strings for all columns.
+    pub fn all_operator_ids(&self) -> Vec<String> {
+        self.operator_ids(self.num_columns)
+    }
+
     pub(crate) fn empty() -> Arc<Self> {
         Arc::new(Self::new(0, 0, Vec::new()))
     }

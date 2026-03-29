@@ -89,6 +89,20 @@ public final class SingleDb extends NativeObject {
         return new ScanCursor(handle);
     }
 
+    /** Return the current schema snapshot. */
+    public Schema currentSchema() {
+        return Schema.fromJson(currentSchemaJson(nativeHandle));
+    }
+
+    /** Start a schema update transaction. Commit with {@link SchemaBuilder#commit()}. */
+    public SchemaBuilder updateSchema() {
+        long builderHandle = createSchemaBuilder(nativeHandle);
+        if (builderHandle == 0L) {
+            throw new IllegalStateException("failed to create schema builder");
+        }
+        return new SchemaBuilder(builderHandle);
+    }
+
     public void delete(int bucket, byte[] key, int column) {
         delete(nativeHandle, bucket, key, column);
     }
@@ -186,6 +200,10 @@ public final class SingleDb extends NativeObject {
     private static native boolean expireSnapshot(long nativeHandle, long snapshotId);
 
     private static native String listSnapshotsJson(long nativeHandle);
+
+    static native String currentSchemaJson(long nativeHandle);
+
+    static native long createSchemaBuilder(long nativeHandle);
 
     private GlobalSnapshot waitForGlobalSnapshotReady(long snapshotId) {
         IllegalStateException lastError = null;

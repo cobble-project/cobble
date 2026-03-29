@@ -54,7 +54,7 @@ pub use error::{Error, Result};
 pub use governance::{DbGovernance, FileSystemDbGovernance};
 pub use merge_operator::{
     BytesMergeOperator, MergeOperator, MergeOperatorResolver, U32CounterMergeOperator,
-    U64CounterMergeOperator,
+    U64CounterMergeOperator, merge_operator_by_id,
 };
 pub use metrics_manager::MetricsManager;
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};

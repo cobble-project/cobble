@@ -821,4 +821,76 @@ class DbBindingTest {
         }
         return value;
     }
+
+    @Test
+    void singleDbSchemaUpdateAndCurrentSchema() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-schema-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        try (SingleDb db = SingleDb.open(config)) {
+            // Read initial schema
+            Schema initial = db.currentSchema();
+            assertEquals(2, initial.numColumns);
+            assertEquals(0, initial.version);
+            assertNotNull(initial.operatorIds);
+            assertEquals(2, initial.operatorIds.size());
+
+            // Set column 0 to U32CounterMergeOperator via MergeOperatorType enum
+            Schema updated =
+                    db.updateSchema().setColumnOperator(0, MergeOperatorType.U32_COUNTER).commit();
+            assertEquals(2, updated.numColumns);
+            assertTrue(updated.version > initial.version);
+            assertEquals(MergeOperatorType.U32_COUNTER.operatorId(), updated.mergeOperatorId(0));
+
+            // Verify currentSchema reflects the update
+            Schema current = db.currentSchema();
+            assertEquals(updated.version, current.version);
+            assertEquals(MergeOperatorType.U32_COUNTER.operatorId(), current.mergeOperatorId(0));
+
+            // Test merge with u32 counter operator
+            byte[] key = "counter-key".getBytes(StandardCharsets.UTF_8);
+            byte[] val5 = new byte[] {5, 0, 0, 0};
+            byte[] val3 = new byte[] {3, 0, 0, 0};
+            db.merge(0, key, 0, val5);
+            db.merge(0, key, 0, val3);
+            byte[] result = db.get(0, key, 0);
+            assertNotNull(result);
+            assertEquals(4, result.length);
+            int sum =
+                    (result[0] & 0xFF)
+                            | ((result[1] & 0xFF) << 8)
+                            | ((result[2] & 0xFF) << 16)
+                            | ((result[3] & 0xFF) << 24);
+            assertEquals(8, sum);
+
+            // Add a column
+            Schema added = db.updateSchema().addColumn(2, null, null).commit();
+            assertEquals(3, added.numColumns);
+            assertTrue(added.version > updated.version);
+
+            // Delete a column
+            Schema deleted = db.updateSchema().deleteColumn(2).commit();
+            assertEquals(2, deleted.numColumns);
+            assertTrue(deleted.version > added.version);
+        }
+    }
+
+    @Test
+    void dbSchemaUpdateAndCurrentSchema() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-db-schema-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            Schema initial = db.currentSchema();
+            assertEquals(1, initial.numColumns);
+
+            Schema updated =
+                    db.updateSchema().setColumnOperator(0, MergeOperatorType.U64_COUNTER).commit();
+            assertTrue(updated.version > initial.version);
+            assertEquals(MergeOperatorType.U64_COUNTER.operatorId(), updated.mergeOperatorId(0));
+
+            Schema current = db.currentSchema();
+            assertEquals(updated.version, current.version);
+        }
+    }
 }

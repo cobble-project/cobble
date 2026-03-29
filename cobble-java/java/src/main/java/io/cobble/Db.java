@@ -268,6 +268,20 @@ public final class Db extends NativeObject {
         return retainSnapshot(nativeHandle, snapshotId);
     }
 
+    /** Return the current schema snapshot. */
+    public Schema currentSchema() {
+        return Schema.fromJson(currentSchemaJson(nativeHandle));
+    }
+
+    /** Start a schema update transaction. Commit with {@link SchemaBuilder#commit()}. */
+    public SchemaBuilder updateSchema() {
+        long builderHandle = createSchemaBuilder(nativeHandle);
+        if (builderHandle == 0L) {
+            throw new IllegalStateException("failed to create schema builder");
+        }
+        return new SchemaBuilder(builderHandle);
+    }
+
     /**
      * Build one {@link ShardSnapshot} from a DB snapshot id.
      *
@@ -396,4 +410,8 @@ public final class Db extends NativeObject {
     private static native boolean retainSnapshot(long nativeHandle, long snapshotId);
 
     private static native String getShardSnapshotJson(long nativeHandle, long snapshotId);
+
+    static native String currentSchemaJson(long nativeHandle);
+
+    static native long createSchemaBuilder(long nativeHandle);
 }

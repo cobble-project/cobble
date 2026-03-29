@@ -85,7 +85,7 @@ pub(crate) fn default_merge_operator_ref() -> &'static Arc<dyn MergeOperator> {
     &DEFAULT_MERGE_OPERATOR
 }
 
-pub(crate) fn merge_operator_by_id(
+pub fn merge_operator_by_id(
     id: &str,
     metadata: Option<&JsonValue>,
     resolver: Option<&Arc<dyn MergeOperatorResolver>>,
