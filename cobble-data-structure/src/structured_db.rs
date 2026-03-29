@@ -1,11 +1,11 @@
 use crate::list::{
-    ListConfig, decode_list_for_read, encode_list_for_write, list_operator,
+    LIST_OPERATOR_ID, ListConfig, decode_list_for_read, encode_list_for_write, list_operator,
     list_operator_from_metadata,
 };
 use bytes::Bytes;
 use cobble::{
-    Config, Db, DbIterator, Error, MergeOperatorResolver, Result, ScanOptions, SchemaBuilder,
-    WriteBatch, WriteOptions,
+    Config, Db, DbIterator, Error, MergeOperatorResolver, ReadOptions, Result, ScanOptions, Schema,
+    SchemaBuilder, WriteBatch, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -32,19 +32,113 @@ pub enum StructuredColumnValue {
     List(Vec<Bytes>),
 }
 
+// ── Shared helpers (used by all Structured* wrappers) ───────────────────────
+
+pub(crate) fn column_type(schema: &StructuredSchema, column: u16) -> &StructuredColumnType {
+    schema
+        .columns
+        .get(&column)
+        .unwrap_or(&StructuredColumnType::Bytes)
+}
+
+pub(crate) fn encode_for_write(
+    schema: &StructuredSchema,
+    now_seconds: u32,
+    column: u16,
+    value: StructuredColumnValue,
+    ttl_seconds: Option<u32>,
+) -> Result<Bytes> {
+    match (column_type(schema, column), value) {
+        (StructuredColumnType::Bytes, StructuredColumnValue::Bytes(value)) => Ok(value),
+        (StructuredColumnType::List(config), StructuredColumnValue::List(elements)) => {
+            encode_list_for_write(elements, config, ttl_seconds, now_seconds)
+        }
+        (_, _) => Err(Error::InputError(format!(
+            "column {} expects a different type of value",
+            column,
+        ))),
+    }
+}
+
+pub(crate) fn decode_row(
+    schema: &StructuredSchema,
+    now_seconds: u32,
+    columns: Vec<Option<Bytes>>,
+) -> Result<Vec<Option<StructuredColumnValue>>> {
+    columns
+        .into_iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            let Some(raw) = column else {
+                return Ok(None);
+            };
+            match column_type(schema, idx as u16) {
+                StructuredColumnType::Bytes => Ok(Some(StructuredColumnValue::Bytes(raw))),
+                StructuredColumnType::List(config) => Ok(Some(StructuredColumnValue::List(
+                    decode_list_for_read(&raw, config, now_seconds)?,
+                ))),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn load_structured_schema_from_cobble_schema(
+    schema: &Schema,
+) -> Result<StructuredSchema> {
+    let operator_ids = schema.all_operator_ids();
+    let mut columns = BTreeMap::new();
+    for column_idx in 0..schema.num_columns() {
+        let operator_id = operator_ids
+            .get(column_idx)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if operator_id == LIST_OPERATOR_ID {
+            let metadata_value = schema.column_metadata_at(column_idx).ok_or_else(|| {
+                Error::FileFormatError(format!("list column {} missing metadata", column_idx))
+            })?;
+            let config =
+                serde_json::from_value::<ListConfig>(metadata_value.clone()).map_err(|err| {
+                    Error::FileFormatError(format!(
+                        "failed to decode list config at column {}: {}",
+                        column_idx, err
+                    ))
+                })?;
+            columns.insert(column_idx as u16, StructuredColumnType::List(config));
+        }
+    }
+    Ok(StructuredSchema { columns })
+}
+
+pub(crate) fn combined_resolver(
+    custom: Option<Arc<dyn MergeOperatorResolver>>,
+) -> Arc<dyn MergeOperatorResolver> {
+    Arc::new(move |id: &str, metadata: Option<&JsonValue>| {
+        if let Some(operator) = list_operator_from_metadata(id, metadata) {
+            return Some(operator);
+        }
+        custom
+            .as_ref()
+            .and_then(|resolver| resolver.resolve(id, metadata))
+    })
+}
+
+// ── StructuredWriteBatch ────────────────────────────────────────────────────
+
 /// Structured write batch wrapper.
 ///
 /// Each operation is encoded and written into the inner `cobble::WriteBatch` immediately, so we
 /// avoid a second typed-op staging buffer and an extra conversion pass at flush time.
-pub struct StructuredWriteBatch<'a> {
-    db: &'a DataStructureDb,
+pub struct StructuredWriteBatch {
+    structured_schema: Arc<StructuredSchema>,
+    now_seconds: u32,
     inner: WriteBatch,
 }
 
-impl<'a> StructuredWriteBatch<'a> {
-    pub fn new(db: &'a DataStructureDb) -> Self {
+impl StructuredWriteBatch {
+    pub(crate) fn new(structured_schema: Arc<StructuredSchema>, now_seconds: u32) -> Self {
         Self {
-            db,
+            structured_schema,
+            now_seconds,
             inner: WriteBatch::new(),
         }
     }
@@ -69,9 +163,13 @@ impl<'a> StructuredWriteBatch<'a> {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        let encoded = self
-            .db
-            .encode_for_write(column, value.into(), options.ttl_seconds)?;
+        let encoded = encode_for_write(
+            &self.structured_schema,
+            self.now_seconds,
+            column,
+            value.into(),
+            options.ttl_seconds,
+        )?;
         self.inner
             .put_with_options(bucket, key, column, encoded, options);
         Ok(())
@@ -104,18 +202,24 @@ impl<'a> StructuredWriteBatch<'a> {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        let encoded = self
-            .db
-            .encode_for_write(column, value.into(), options.ttl_seconds)?;
+        let encoded = encode_for_write(
+            &self.structured_schema,
+            self.now_seconds,
+            column,
+            value.into(),
+            options.ttl_seconds,
+        )?;
         self.inner
             .merge_with_options(bucket, key, column, encoded, options);
         Ok(())
     }
 
-    fn into_inner(self) -> WriteBatch {
+    pub(crate) fn into_inner(self) -> WriteBatch {
         self.inner
     }
 }
+
+// ── StructuredColumnValue conversions ───────────────────────────────────────
 
 impl From<Bytes> for StructuredColumnValue {
     fn from(value: Bytes) -> Self {
@@ -141,12 +245,14 @@ impl From<Vec<Vec<u8>>> for StructuredColumnValue {
     }
 }
 
-pub struct DataStructureDb {
+// ── StructuredDb (formerly DataStructureDb) ─────────────────────────────────
+
+pub struct StructuredDb {
     db: Db,
     structured_schema: Arc<StructuredSchema>,
 }
 
-impl DataStructureDb {
+impl StructuredDb {
     pub fn open(
         config: Config,
         bucket_ranges: Vec<RangeInclusive<u16>>,
@@ -176,7 +282,7 @@ impl DataStructureDb {
             db_id,
             Some(combined_resolver(resolver)),
         )?;
-        let structured_schema = load_structured_schema(&db)?;
+        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
         Ok(Self {
             db,
             structured_schema: Arc::new(structured_schema),
@@ -193,7 +299,7 @@ impl DataStructureDb {
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
         let db = Db::resume_with_resolver(config, db_id, Some(combined_resolver(resolver)))?;
-        let structured_schema = load_structured_schema(&db)?;
+        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
         Ok(Self {
             db,
             structured_schema: Arc::new(structured_schema),
@@ -228,7 +334,13 @@ impl DataStructureDb {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        let encoded = self.encode_for_write(column, value.into(), options.ttl_seconds)?;
+        let encoded = encode_for_write(
+            &self.structured_schema,
+            self.db.now_seconds(),
+            column,
+            value.into(),
+            options.ttl_seconds,
+        )?;
         self.db
             .put_with_options(bucket, key, column, encoded, options)
     }
@@ -253,7 +365,13 @@ impl DataStructureDb {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        let encoded = self.encode_for_write(column, value.into(), options.ttl_seconds)?;
+        let encoded = encode_for_write(
+            &self.structured_schema,
+            self.db.now_seconds(),
+            column,
+            value.into(),
+            options.ttl_seconds,
+        )?;
         self.db
             .merge_with_options(bucket, key, column, encoded, options)
     }
@@ -265,17 +383,11 @@ impl DataStructureDb {
         self.db.delete(bucket, key, column)
     }
 
-    pub fn new_write_batch(&self) -> StructuredWriteBatch<'_> {
-        StructuredWriteBatch::new(self)
+    pub fn new_write_batch(&self) -> StructuredWriteBatch {
+        StructuredWriteBatch::new(Arc::clone(&self.structured_schema), self.db.now_seconds())
     }
 
-    pub fn write_batch(&self, batch: StructuredWriteBatch<'_>) -> Result<()> {
-        if !std::ptr::eq(self, batch.db) {
-            return Err(Error::InputError(
-                "structured write batch belongs to a different DataStructureDb instance"
-                    .to_string(),
-            ));
-        }
+    pub fn write_batch(&self, batch: StructuredWriteBatch) -> Result<()> {
         self.db.write_batch(batch.into_inner())
     }
 
@@ -284,20 +396,22 @@ impl DataStructureDb {
         K: AsRef<[u8]>,
     {
         let raw = self.db.get(bucket, key.as_ref())?;
-        raw.map(|columns| self.decode_row(columns)).transpose()
+        raw.map(|columns| decode_row(&self.structured_schema, 0, columns))
+            .transpose()
     }
 
     pub fn get_with_options<K>(
         &self,
         bucket: u16,
         key: K,
-        options: &cobble::ReadOptions,
+        options: &ReadOptions,
     ) -> Result<Option<Vec<Option<StructuredColumnValue>>>>
     where
         K: AsRef<[u8]>,
     {
         let raw = self.db.get_with_options(bucket, key.as_ref(), options)?;
-        raw.map(|columns| self.decode_row(columns)).transpose()
+        raw.map(|columns| decode_row(&self.structured_schema, 0, columns))
+            .transpose()
     }
 
     pub fn scan<'a>(
@@ -315,11 +429,11 @@ impl DataStructureDb {
         options: &ScanOptions,
     ) -> Result<StructuredDbIterator<'a>> {
         let inner = self.db.scan_with_options(bucket, range, options)?;
-        Ok(StructuredDbIterator {
+        Ok(StructuredDbIterator::new(
             inner,
-            structured_schema: Arc::clone(&self.structured_schema),
-            now_seconds: self.db.now_seconds(),
-        })
+            Arc::clone(&self.structured_schema),
+            0,
+        ))
     }
 
     pub fn snapshot(&self) -> Result<u64> {
@@ -329,59 +443,31 @@ impl DataStructureDb {
     pub fn close(&self) -> Result<()> {
         self.db.close()
     }
-
-    fn encode_for_write(
-        &self,
-        column: u16,
-        value: StructuredColumnValue,
-        ttl_seconds: Option<u32>,
-    ) -> Result<Bytes> {
-        match (self.column_type(column), value) {
-            (StructuredColumnType::Bytes, StructuredColumnValue::Bytes(value)) => Ok(value),
-            (StructuredColumnType::List(config), StructuredColumnValue::List(elements)) => {
-                encode_list_for_write(elements, config, ttl_seconds, self.db.now_seconds())
-            }
-            (_, _) => Err(Error::InputError(format!(
-                "column {} expects a different type of value",
-                column,
-            ))),
-        }
-    }
-
-    fn decode_row(
-        &self,
-        columns: Vec<Option<Bytes>>,
-    ) -> Result<Vec<Option<StructuredColumnValue>>> {
-        let now_seconds = self.db.now_seconds();
-        columns
-            .into_iter()
-            .enumerate()
-            .map(|(idx, column)| {
-                let Some(raw) = column else {
-                    return Ok(None);
-                };
-                match self.column_type(idx as u16) {
-                    StructuredColumnType::Bytes => Ok(Some(StructuredColumnValue::Bytes(raw))),
-                    StructuredColumnType::List(config) => Ok(Some(StructuredColumnValue::List(
-                        decode_list_for_read(&raw, config, now_seconds)?,
-                    ))),
-                }
-            })
-            .collect()
-    }
-
-    fn column_type(&self, column: u16) -> &StructuredColumnType {
-        self.structured_schema
-            .columns
-            .get(&column)
-            .unwrap_or(&StructuredColumnType::Bytes)
-    }
 }
+
+/// Type alias for backward compatibility.
+pub type DataStructureDb = StructuredDb;
+
+// ── StructuredDbIterator ────────────────────────────────────────────────────
 
 pub struct StructuredDbIterator<'a> {
     inner: DbIterator<'a>,
     structured_schema: Arc<StructuredSchema>,
     now_seconds: u32,
+}
+
+impl<'a> StructuredDbIterator<'a> {
+    pub(crate) fn new(
+        inner: DbIterator<'a>,
+        structured_schema: Arc<StructuredSchema>,
+        now_seconds: u32,
+    ) -> Self {
+        Self {
+            inner,
+            structured_schema,
+            now_seconds,
+        }
+    }
 }
 
 impl Iterator for StructuredDbIterator<'_> {
@@ -390,59 +476,26 @@ impl Iterator for StructuredDbIterator<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|item| {
             let (key, columns) = item?;
-            let decoded_columns = columns
-                .into_iter()
-                .enumerate()
-                .map(|(idx, column)| {
-                    let Some(raw) = column else {
-                        return Ok(None);
-                    };
-                    match self
-                        .structured_schema
-                        .columns
-                        .get(&(idx as u16))
-                        .unwrap_or(&StructuredColumnType::Bytes)
-                    {
-                        StructuredColumnType::Bytes => Ok(Some(StructuredColumnValue::Bytes(raw))),
-                        StructuredColumnType::List(config) => {
-                            Ok(Some(StructuredColumnValue::List(decode_list_for_read(
-                                &raw,
-                                config,
-                                self.now_seconds,
-                            )?)))
-                        }
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok((key, decoded_columns))
+            let decoded = decode_row(&self.structured_schema, self.now_seconds, columns)?;
+            Ok((key, decoded))
         })
     }
 }
 
-fn persist_structured_schema(db: &Db, structured_schema: &StructuredSchema) -> Result<()> {
+// ── Internal helpers ────────────────────────────────────────────────────────
+
+pub(crate) fn persist_structured_schema_on_db(
+    db: &Db,
+    structured_schema: &StructuredSchema,
+) -> Result<()> {
     let mut schema = db.update_schema();
     apply_structured_schema(&mut schema, structured_schema)?;
     schema.commit();
     Ok(())
 }
 
-fn load_structured_schema(db: &Db) -> Result<StructuredSchema> {
-    let schema = db.current_schema();
-    let mut columns = BTreeMap::new();
-    for column_idx in 0..schema.num_columns() {
-        let Some(metadata_value) = schema.column_metadata_at(column_idx) else {
-            continue;
-        };
-        let column_type = serde_json::from_value::<StructuredColumnType>(metadata_value.clone())
-            .map_err(|err| {
-                Error::FileFormatError(format!(
-                    "failed to decode structured column metadata at column {}: {}",
-                    column_idx, err
-                ))
-            })?;
-        columns.insert(column_idx as u16, column_type);
-    }
-    Ok(StructuredSchema { columns })
+fn persist_structured_schema(db: &Db, structured_schema: &StructuredSchema) -> Result<()> {
+    persist_structured_schema_on_db(db, structured_schema)
 }
 
 fn apply_structured_schema(
@@ -454,32 +507,19 @@ fn apply_structured_schema(
             StructuredColumnType::Bytes => {}
             StructuredColumnType::List(config) => {
                 schema.set_column_operator(*column as usize, list_operator(config.clone()))?;
+                schema.set_column_metadata(
+                    *column as usize,
+                    serde_json::to_value(config).map_err(|err| {
+                        Error::FileFormatError(format!(
+                            "failed to encode list config metadata: {}",
+                            err
+                        ))
+                    })?,
+                )?;
             }
         }
-        schema.set_column_metadata(
-            *column as usize,
-            serde_json::to_value(column_type).map_err(|err| {
-                Error::FileFormatError(format!(
-                    "failed to encode structured column metadata: {}",
-                    err
-                ))
-            })?,
-        )?;
     }
     Ok(())
-}
-
-fn combined_resolver(
-    custom: Option<Arc<dyn MergeOperatorResolver>>,
-) -> Arc<dyn MergeOperatorResolver> {
-    Arc::new(move |id: &str, metadata: Option<&JsonValue>| {
-        if let Some(operator) = list_operator_from_metadata(id, metadata) {
-            return Some(operator);
-        }
-        custom
-            .as_ref()
-            .and_then(|resolver| resolver.resolve(id, metadata))
-    })
 }
 
 #[cfg(test)]
@@ -492,7 +532,7 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn test_data_structure_db_resume_loads_structured_schema() {
+    fn test_structured_db_resume_loads_structured_schema() {
         let root = format!("/tmp/ds_structured_resume_{}", Uuid::new_v4());
         let config = Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
@@ -510,9 +550,8 @@ mod tests {
                 }),
             )]),
         };
-        let db =
-            DataStructureDb::open(config.clone(), vec![0u16..=0u16], structured_schema.clone())
-                .unwrap();
+        let db = StructuredDb::open(config.clone(), vec![0u16..=0u16], structured_schema.clone())
+            .unwrap();
         db.merge(0, b"k", 1, vec![Bytes::from_static(b"a")])
             .unwrap();
         let _ = db.snapshot().unwrap();
@@ -520,14 +559,14 @@ mod tests {
         let db_id = db.id().to_string();
         db.close().unwrap();
 
-        let resumed = DataStructureDb::resume(config, db_id).unwrap();
+        let resumed = StructuredDb::resume(config, db_id).unwrap();
         assert_eq!(resumed.structured_schema(), &structured_schema);
         resumed.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn test_data_structure_db_get_and_scan_return_structured_values() {
+    fn test_structured_db_get_and_scan_return_structured_values() {
         let root = format!("/tmp/ds_structured_get_scan_{}", Uuid::new_v4());
         let config = Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
@@ -544,7 +583,7 @@ mod tests {
                 }),
             )]),
         };
-        let db = DataStructureDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        let db = StructuredDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
             .unwrap();
@@ -600,7 +639,7 @@ mod tests {
                 }),
             )]),
         };
-        let db = DataStructureDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        let db = StructuredDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
         let mut batch = db.new_write_batch();
         batch.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         batch
@@ -657,7 +696,7 @@ mod tests {
                 }),
             )]),
         };
-        let db = DataStructureDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        let db = StructuredDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
         let mut batch = db.new_write_batch();
         assert!(
             batch

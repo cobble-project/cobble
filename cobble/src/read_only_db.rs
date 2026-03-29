@@ -8,7 +8,7 @@ use crate::file::FileManager;
 use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
-use crate::schema::SchemaManager;
+use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::{
     build_tree_versions_from_manifest, build_vlog_version_from_manifest, load_manifest_for_snapshot,
 };
@@ -17,7 +17,7 @@ use crate::ttl::{TTLProvider, TtlConfig};
 use crate::r#type::{RefKey, Value};
 use crate::util::{build_commit_short_id, build_version_string};
 use crate::vlog::VlogStore;
-use crate::{Config, ReadOptions, ScanOptions};
+use crate::{Config, MergeOperatorResolver, ReadOptions, ScanOptions};
 use bytes::Bytes;
 use log::info;
 use std::collections::VecDeque;
@@ -44,6 +44,24 @@ impl ReadOnlyDb {
         Self::open_with_db_id_and_cache(config, snapshot_id, snapshot_db_id, None)
     }
 
+    /// Open with a merge operator resolver for custom operator restoration.
+    pub fn open_with_db_id_and_resolver(
+        config: Config,
+        snapshot_id: u64,
+        snapshot_db_id: String,
+        resolver: Arc<dyn MergeOperatorResolver>,
+    ) -> Result<Self> {
+        let metrics_manager = Arc::new(MetricsManager::new(&snapshot_db_id));
+        Self::open_internal(
+            config,
+            snapshot_id,
+            snapshot_db_id,
+            None,
+            metrics_manager,
+            Some(resolver),
+        )
+    }
+
     pub fn open_with_db_id_and_cache(
         config: Config,
         snapshot_id: u64,
@@ -51,12 +69,13 @@ impl ReadOnlyDb {
         block_cache: Option<BlockCache>,
     ) -> Result<Self> {
         let metrics_manager = Arc::new(MetricsManager::new(&snapshot_db_id));
-        Self::open_with_db_id_and_cache_with_metrics(
+        Self::open_internal(
             config,
             snapshot_id,
             snapshot_db_id,
             block_cache,
             metrics_manager,
+            None,
         )
     }
 
@@ -66,6 +85,42 @@ impl ReadOnlyDb {
         snapshot_db_id: String,
         block_cache: Option<BlockCache>,
         metrics_manager: Arc<MetricsManager>,
+    ) -> Result<Self> {
+        Self::open_internal(
+            config,
+            snapshot_id,
+            snapshot_db_id,
+            block_cache,
+            metrics_manager,
+            None,
+        )
+    }
+
+    pub fn open_with_db_id_and_cache_with_metrics_and_resolver(
+        config: Config,
+        snapshot_id: u64,
+        snapshot_db_id: String,
+        block_cache: Option<BlockCache>,
+        metrics_manager: Arc<MetricsManager>,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        Self::open_internal(
+            config,
+            snapshot_id,
+            snapshot_db_id,
+            block_cache,
+            metrics_manager,
+            resolver,
+        )
+    }
+
+    fn open_internal(
+        config: Config,
+        snapshot_id: u64,
+        snapshot_db_id: String,
+        block_cache: Option<BlockCache>,
+        metrics_manager: Arc<MetricsManager>,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
         let config = config.normalize_volume_paths()?;
         info!(
@@ -102,7 +157,7 @@ impl ReadOnlyDb {
             &file_manager,
             &manifest,
             config.num_columns,
-            None,
+            resolver,
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let tree_versions = build_tree_versions_from_manifest(&file_manager, &manifest, true)?;
@@ -158,6 +213,11 @@ impl ReadOnlyDb {
 
     pub fn id(&self) -> &str {
         self.metrics_manager.db_id()
+    }
+
+    /// Return the current schema for this read-only database.
+    pub fn current_schema(&self) -> Arc<Schema> {
+        self.schema_manager.latest_schema()
     }
 
     /// Return the metrics samples for this database.

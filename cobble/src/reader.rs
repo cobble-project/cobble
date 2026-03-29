@@ -5,6 +5,7 @@ use crate::db_state::{bucket_range_fits_total, bucket_range_last, bucket_slots_f
 use crate::error::{Error, Result};
 use crate::file::{File, FileSystem, FileSystemRegistry};
 use crate::lru::LruCache;
+use crate::merge_operator::MergeOperatorResolver;
 use crate::metrics_manager::MetricsManager;
 use crate::paths::{
     SNAPSHOT_DIR, global_snapshot_current_path, global_snapshot_manifest_path_by_pointer,
@@ -92,10 +93,19 @@ pub struct Reader {
     fixed_snapshot_id: Option<u64>,
     reload_tolerance: Duration,
     last_refresh_at: Option<Instant>,
+    resolver: Option<Arc<dyn MergeOperatorResolver>>,
 }
 
 impl Reader {
     pub fn open(read_config: ReaderConfig, global_snapshot_id: u64) -> Result<Self> {
+        Self::open_with_resolver(read_config, global_snapshot_id, None)
+    }
+
+    pub fn open_with_resolver(
+        read_config: ReaderConfig,
+        global_snapshot_id: u64,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
         let config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
@@ -150,10 +160,18 @@ impl Reader {
             fixed_snapshot_id: Some(global_snapshot_id),
             reload_tolerance: read_config.reload_tolerance,
             last_refresh_at: None,
+            resolver,
         })
     }
 
     pub fn open_current(read_config: ReaderConfig) -> Result<Self> {
+        Self::open_current_with_resolver(read_config, None)
+    }
+
+    pub fn open_current_with_resolver(
+        read_config: ReaderConfig,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
         let config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
@@ -209,6 +227,7 @@ impl Reader {
             fixed_snapshot_id: None,
             reload_tolerance: read_config.reload_tolerance,
             last_refresh_at: Some(Instant::now()),
+            resolver,
         })
     }
 
@@ -308,13 +327,16 @@ impl Reader {
         if let Some(db) = self.cache.get(key) {
             return Ok(Arc::clone(db));
         }
-        let db = Arc::new(ReadOnlyDb::open_with_db_id_and_cache_with_metrics(
-            self.config.clone(),
-            key.snapshot_id,
-            key.db_id.clone(),
-            self.block_cache.clone(),
-            Arc::clone(&self.metrics_manager),
-        )?);
+        let db = Arc::new(
+            ReadOnlyDb::open_with_db_id_and_cache_with_metrics_and_resolver(
+                self.config.clone(),
+                key.snapshot_id,
+                key.db_id.clone(),
+                self.block_cache.clone(),
+                Arc::clone(&self.metrics_manager),
+                self.resolver.clone(),
+            )?,
+        );
         self.cache.insert(Arc::clone(key), Arc::clone(&db));
         Ok(db)
     }
