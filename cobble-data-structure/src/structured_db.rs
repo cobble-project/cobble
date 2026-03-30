@@ -122,6 +122,17 @@ pub(crate) fn combined_resolver(
     })
 }
 
+/// Returns a `MergeOperatorResolver` that can resolve all structured data type
+/// merge operators (e.g. list) from their metadata.
+pub fn structured_merge_operator_resolver() -> Arc<dyn MergeOperatorResolver> {
+    combined_resolver(None)
+}
+
+/// Returns the merge operator IDs that `structured_merge_operator_resolver` can resolve.
+pub fn structured_resolvable_operator_ids() -> Vec<String> {
+    vec![LIST_OPERATOR_ID.to_string()]
+}
+
 // ── StructuredWriteBatch ────────────────────────────────────────────────────
 
 /// Structured write batch wrapper.

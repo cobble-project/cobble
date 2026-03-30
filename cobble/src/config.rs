@@ -388,6 +388,10 @@ pub struct Config {
     pub compaction_threads: usize,
     /// Remote compaction network timeout in milliseconds.
     pub compaction_remote_timeout_ms: u64,
+    /// Maximum number of concurrent requests the remote compaction server will process.
+    pub compaction_server_max_concurrent: usize,
+    /// Maximum number of queued requests before the server rejects new connections.
+    pub compaction_server_max_queued: usize,
     /// Size of the block cache in bytes. If zero, cache is disabled.
     pub block_cache_size: usize,
     /// Enable foyer hybrid block cache (memory + local disk).
@@ -465,6 +469,8 @@ impl Default for Config {
             compaction_remote_addr: None,
             compaction_threads: 4,
             compaction_remote_timeout_ms: 300_000,
+            compaction_server_max_concurrent: 4,
+            compaction_server_max_queued: 64,
             block_cache_size: 64 * 1024 * 1024,
             block_cache_hybrid_enabled: false,
             block_cache_hybrid_disk_size: None,
@@ -782,6 +788,8 @@ mod tests {
             compaction_remote_addr: Some("127.0.0.1:9999".to_string()),
             compaction_threads: 6,
             compaction_remote_timeout_ms: 120_000,
+            compaction_server_max_concurrent: 8,
+            compaction_server_max_queued: 32,
         };
 
         let serialized = serde_json::to_string(&config).expect("Cannot serialize config");
@@ -819,6 +827,8 @@ mod tests {
             PrimaryVolumeOffloadPolicyKind::LargestFile
         );
         assert_eq!(decoded.value_separation_threshold, 4096);
+        assert_eq!(decoded.compaction_server_max_concurrent, 8);
+        assert_eq!(decoded.compaction_server_max_queued, 32);
         assert_eq!(decoded.data_file_type, DataFileType::Parquet);
         assert_eq!(decoded.parquet_row_group_size_bytes, 4096);
         assert_eq!(decoded.reader.block_cache_size, 2048);
