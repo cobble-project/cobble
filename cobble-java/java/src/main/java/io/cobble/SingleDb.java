@@ -116,10 +116,9 @@ public final class SingleDb extends NativeObject {
 
     /** Trigger snapshot creation asynchronously and return future of global snapshot payload. */
     public Future<GlobalSnapshot> asyncSnapshot() {
-        CompletableFuture<Long> snapshotIdFuture = new CompletableFuture<Long>();
-        asyncSnapshot(nativeHandle, snapshotIdFuture);
-        return snapshotIdFuture.thenApply(
-                sid -> GlobalSnapshot.waitForReady(sid, this::listSnapshots));
+        CompletableFuture<String> snapshotJsonFuture = new CompletableFuture<>();
+        asyncSnapshot(nativeHandle, snapshotJsonFuture);
+        return snapshotJsonFuture.thenApply(GlobalSnapshot::fromJson);
     }
 
     /** Trigger snapshot creation and block until global snapshot manifest is materialized. */
@@ -194,7 +193,7 @@ public final class SingleDb extends NativeObject {
     private static native void setTime(long nativeHandle, int nextSeconds);
 
     private static native void asyncSnapshot(
-            long nativeHandle, CompletableFuture<Long> snapshotIdFuture);
+            long nativeHandle, CompletableFuture<String> snapshotJsonFuture);
 
     private static native boolean retainSnapshot(long nativeHandle, long snapshotId);
 

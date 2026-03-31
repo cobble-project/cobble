@@ -166,7 +166,7 @@ impl StructuredSingleDb {
 
     pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
     where
-        F: Fn(Result<u64>) + Send + Sync + 'static,
+        F: Fn(Result<cobble::GlobalSnapshotManifest>) + Send + Sync + 'static,
     {
         self.db.snapshot_with_callback(callback)
     }

@@ -78,22 +78,20 @@ impl SingleDb {
 
     pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
     where
-        F: Fn(Result<u64>) + Send + Sync + 'static,
+        F: Fn(Result<GlobalSnapshotManifest>) + Send + Sync + 'static,
     {
         self.begin_snapshot_in_flight()?;
 
         let global_snapshot_id = self.coordinator.allocate_snapshot_id();
-        let db = Arc::clone(&self.db);
         let coordinator = Arc::clone(&self.coordinator);
         let total_buckets = self.total_buckets;
         let snapshot_state = Arc::clone(&self.snapshot_state);
         let snapshot_done = Arc::clone(&self.snapshot_done);
         if let Err(err) = self.db.snapshot_with_callback(move |result| {
             let global_result = match result {
-                Ok(snapshot_id) => materialize_global_snapshot(
+                Ok(shard_input) => materialize_global_snapshot(
                     &coordinator,
-                    &db,
-                    snapshot_id,
+                    shard_input,
                     total_buckets,
                     global_snapshot_id,
                 ),
@@ -259,20 +257,17 @@ impl Deref for SingleDb {
 
 fn materialize_global_snapshot(
     coordinator: &Arc<DbCoordinator>,
-    db: &Arc<Db>,
-    snapshot_id: u64,
+    shard_input: crate::coordinator::ShardSnapshotInput,
     total_buckets: u32,
     global_snapshot_id: u64,
-) -> Result<u64> {
-    // materialize global snapshot from bucket snapshot
-    let bucket_snapshot = db.shard_snapshot_input(snapshot_id)?;
+) -> Result<GlobalSnapshotManifest> {
     let global_snapshot = coordinator.take_global_snapshot_with_id(
         total_buckets,
-        vec![bucket_snapshot],
+        vec![shard_input],
         global_snapshot_id,
     )?;
     coordinator.materialize_global_snapshot(&global_snapshot)?;
-    Ok(global_snapshot.id)
+    Ok(global_snapshot)
 }
 
 impl SingleDb {

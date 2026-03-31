@@ -488,7 +488,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap(),
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
             source_snapshot
         );
 
@@ -534,7 +537,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap(),
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
             snapshot_id
         );
         let err = target
@@ -569,7 +575,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap(),
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
             snapshot_id
         );
         let target = Db::open(config, std::iter::once(full_bucket_range(2)).collect()).unwrap();
@@ -612,7 +621,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap(),
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
             snapshot_id
         );
         let source_metrics = Arc::new(MetricsManager::new("rescale-source-manifest"));

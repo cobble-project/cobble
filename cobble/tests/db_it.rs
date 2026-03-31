@@ -820,11 +820,11 @@ fn test_single_db_snapshot_updates_global_manifest() {
             let _ = tx.send(result);
         })
         .unwrap();
-    let callback_id = rx
+    let manifest = rx
         .recv()
         .expect("snapshot callback dropped")
         .expect("snapshot materialized");
-    assert_eq!(global_id, callback_id);
+    assert_eq!(global_id, manifest.id);
 
     let mut proxy = Reader::open_current(ReaderConfig::from_config(&config)).unwrap();
     let value = proxy.get(0, b"k1").unwrap().expect("value present");

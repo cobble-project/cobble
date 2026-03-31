@@ -790,7 +790,19 @@ pub extern "system" fn Java_io_cobble_structured_Db_asyncSnapshot(
         }
     };
     match db.snapshot_with_callback(move |result| {
-        complete_snapshot_id_future(&vm, &future_ref, result);
+        complete_snapshot_json_future(
+            &vm,
+            &future_ref,
+            result.map(|input| {
+                serde_json::to_string(&cobble::ShardSnapshotRef {
+                    ranges: input.ranges,
+                    db_id: input.db_id,
+                    snapshot_id: input.snapshot_id,
+                    manifest_path: input.manifest_path,
+                })
+                .unwrap_or_default()
+            }),
+        );
     }) {
         Ok(_) => {}
         Err(err) => {
@@ -1271,24 +1283,20 @@ fn build_shard_snapshot_payload(
     .to_string())
 }
 
-fn complete_snapshot_id_future(vm: &JavaVM, future: &GlobalRef, result: cobble::Result<u64>) {
+fn complete_snapshot_json_future(vm: &JavaVM, future: &GlobalRef, result: cobble::Result<String>) {
     let mut env = match vm.attach_current_thread() {
         Ok(v) => v,
         Err(_) => return,
     };
     match result {
-        Ok(snapshot_id) => {
-            let snapshot_id_obj = match env.new_object(
-                "java/lang/Long",
-                "(J)V",
-                &[JValue::Long(snapshot_id as jlong)],
-            ) {
-                Ok(v) => v,
+        Ok(json) => {
+            let json_obj = match env.new_string(&json) {
+                Ok(v) => JObject::from(v),
                 Err(_) => {
                     complete_future_exceptionally(
                         &mut env,
                         future.as_obj(),
-                        "failed to allocate snapshot id object",
+                        "failed to allocate json string",
                     );
                     return;
                 }
@@ -1297,7 +1305,7 @@ fn complete_snapshot_id_future(vm: &JavaVM, future: &GlobalRef, result: cobble::
                 future.as_obj(),
                 "complete",
                 "(Ljava/lang/Object;)Z",
-                &[JValue::Object(&snapshot_id_obj)],
+                &[JValue::Object(&json_obj)],
             );
         }
         Err(err) => {

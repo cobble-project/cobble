@@ -41,7 +41,16 @@ pub(crate) struct DbSnapshot {
     pub callback: Option<SnapshotCallback>,
 }
 
-pub(crate) type SnapshotCallback = Arc<dyn Fn(Result<u64>) + Send + Sync + 'static>;
+/// Information about a materialized snapshot, passed to snapshot callbacks.
+#[derive(Clone)]
+pub(crate) struct SnapshotManifestInfo {
+    pub id: u64,
+    pub manifest_path: String,
+    pub bucket_ranges: Vec<RangeInclusive<u16>>,
+}
+
+pub(crate) type SnapshotCallback =
+    Arc<dyn Fn(Result<SnapshotManifestInfo>) + Send + Sync + 'static>;
 
 impl DbSnapshot {
     pub(crate) fn new(id: u64, manifest_path: &str, callback: Option<SnapshotCallback>) -> Self {

@@ -3,7 +3,9 @@ use super::manifest::{
     build_vlog_version_from_manifest_untracked, encode_manifest, manifest_data_file_refs,
     snapshot_manifest_name,
 };
-use super::{ActiveMemtableSnapshotData, DbSnapshot, SnapshotCallback, memtable};
+use super::{
+    ActiveMemtableSnapshotData, DbSnapshot, SnapshotCallback, SnapshotManifestInfo, memtable,
+};
 use crate::config::MemtableType;
 use crate::data_file::DataFile;
 use crate::db_state::{DbState, DbStateHandle};
@@ -431,6 +433,11 @@ impl SnapshotManager {
                 .cloned();
             (snapshot, callback, base_snapshot)
         };
+        let manifest_info = snapshot.as_ref().map(|s| SnapshotManifestInfo {
+            id: s.id,
+            manifest_path: s.manifest_path.clone(),
+            bucket_ranges: s.bucket_ranges.clone(),
+        });
         let mut incremental_base_id = None;
         let result = match snapshot {
             Some(snapshot) => {
@@ -478,7 +485,11 @@ impl SnapshotManager {
             None => Err(Error::IoError(format!("Snapshot {} not found", id))),
         };
         if let Some(callback) = callback {
-            callback(result.clone().map(|_| id));
+            callback(
+                result
+                    .clone()
+                    .map(|()| manifest_info.expect("snapshot present when result is Ok")),
+            );
         }
         let mut state = self.state.lock().unwrap();
         state.in_flight = state.in_flight.saturating_sub(1);

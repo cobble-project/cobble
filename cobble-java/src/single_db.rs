@@ -435,7 +435,11 @@ pub extern "system" fn Java_io_cobble_SingleDb_asyncSnapshot(
         }
     };
     if let Err(err) = db.snapshot_with_callback(move |result| {
-        complete_snapshot_id_future(&vm, &future, result);
+        complete_snapshot_json_future(
+            &vm,
+            &future,
+            result.map(|manifest| serde_json::to_string(&manifest).unwrap_or_default()),
+        );
     }) {
         throw_illegal_state(&mut env, err.to_string());
     }
@@ -572,24 +576,20 @@ fn single_db_from_handle_or_throw(
     Some(unsafe { &*(native_handle as *const SingleDb) })
 }
 
-fn complete_snapshot_id_future(vm: &JavaVM, future: &GlobalRef, result: cobble::Result<u64>) {
+fn complete_snapshot_json_future(vm: &JavaVM, future: &GlobalRef, result: cobble::Result<String>) {
     let mut env = match vm.attach_current_thread() {
         Ok(v) => v,
         Err(_) => return,
     };
     match result {
-        Ok(snapshot_id) => {
-            let snapshot_id_obj = match env.new_object(
-                "java/lang/Long",
-                "(J)V",
-                &[JValue::Long(snapshot_id as jlong)],
-            ) {
-                Ok(v) => v,
+        Ok(json) => {
+            let json_obj = match env.new_string(&json) {
+                Ok(v) => JObject::from(v),
                 Err(_) => {
                     complete_future_exceptionally(
                         &mut env,
                         future.as_obj(),
-                        "failed to allocate snapshot id object",
+                        "failed to allocate json string",
                     );
                     return;
                 }
@@ -598,7 +598,7 @@ fn complete_snapshot_id_future(vm: &JavaVM, future: &GlobalRef, result: cobble::
                 future.as_obj(),
                 "complete",
                 "(Ljava/lang/Object;)Z",
-                &[JValue::Object(&snapshot_id_obj)],
+                &[JValue::Object(&json_obj)],
             );
         }
         Err(err) => {

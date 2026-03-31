@@ -12,7 +12,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::schema::{Schema, SchemaBuilder, SchemaManager};
 use crate::snapshot::{
     ActiveMemtableSnapshotData, LoadedManifest, SnapshotCallback, SnapshotManager,
-    snapshot_manifest_name,
+    SnapshotManifestInfo, snapshot_manifest_name,
 };
 use crate::sst::row_codec::{decode_value, decode_value_masked, encode_key_ref_into};
 use crate::r#type::decode_merge_separated_array;
@@ -480,11 +480,19 @@ impl Db {
 
     pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
     where
-        F: Fn(Result<u64>) + Send + Sync + 'static,
+        F: Fn(Result<crate::coordinator::ShardSnapshotInput>) + Send + Sync + 'static,
     {
         self.ensure_open()?;
-        let callback: SnapshotCallback = Arc::new(callback);
-        let snapshot = self.snapshot_manager.create_snapshot(Some(callback));
+        let db_id = self.id.clone();
+        let wrapper: SnapshotCallback = Arc::new(move |result: Result<SnapshotManifestInfo>| {
+            callback(result.map(|info| crate::coordinator::ShardSnapshotInput {
+                ranges: info.bucket_ranges,
+                db_id: db_id.clone(),
+                snapshot_id: info.id,
+                manifest_path: info.manifest_path,
+            }));
+        });
+        let snapshot = self.snapshot_manager.create_snapshot(Some(wrapper));
         self.memtable_manager
             .flush_snapshot(snapshot.id, self.snapshot_manager.clone())?;
         Ok(snapshot.id)

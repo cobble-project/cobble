@@ -1,10 +1,5 @@
 package io.cobble;
 
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
@@ -235,9 +230,9 @@ public final class Db extends NativeObject {
 
     /** Trigger snapshot creation asynchronously and return a future of shard snapshot payload. */
     public Future<ShardSnapshot> asyncSnapshot() {
-        CompletableFuture<Long> snapshotIdFuture = new CompletableFuture<Long>();
-        asyncSnapshot(nativeHandle, snapshotIdFuture);
-        return snapshotIdFuture.thenApply(this::waitForShardSnapshotReady);
+        CompletableFuture<String> snapshotJsonFuture = new CompletableFuture<>();
+        asyncSnapshot(nativeHandle, snapshotJsonFuture);
+        return snapshotJsonFuture.thenApply(ShardSnapshot::fromJson);
     }
 
     /**
@@ -302,47 +297,6 @@ public final class Db extends NativeObject {
      */
     public ShardSnapshot getShardSnapshot(long snapshotId) {
         return ShardSnapshot.fromJson(getShardSnapshotJson(nativeHandle, snapshotId));
-    }
-
-    private ShardSnapshot waitForShardSnapshotReady(long snapshotId) {
-        IllegalStateException lastError = null;
-        for (int i = 0; i < 120; i++) {
-            try {
-                ShardSnapshot snapshot = getShardSnapshot(snapshotId);
-                if (snapshot != null
-                        && snapshot.manifestPath != null
-                        && !snapshot.manifestPath.isEmpty()
-                        && manifestExists(snapshot.manifestPath)) {
-                    return snapshot;
-                }
-            } catch (IllegalStateException e) {
-                lastError = e;
-            }
-            try {
-                Thread.sleep(50L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException("interrupted while waiting snapshot ready", e);
-            }
-        }
-        if (lastError != null) {
-            throw lastError;
-        }
-        throw new IllegalStateException("snapshot manifest is unavailable: " + snapshotId);
-    }
-
-    public static boolean manifestExists(String manifestPath) {
-        try {
-            Path path;
-            if (manifestPath.startsWith("file://")) {
-                path = Paths.get(new URI(manifestPath));
-            } else {
-                path = Paths.get(manifestPath);
-            }
-            return Files.exists(path);
-        } catch (URISyntaxException | IllegalArgumentException e) {
-            return true;
-        }
     }
 
     @Override
@@ -414,7 +368,7 @@ public final class Db extends NativeObject {
     private static native int nowSeconds(long nativeHandle);
 
     private static native void asyncSnapshot(
-            long nativeHandle, CompletableFuture<Long> snapshotIdFuture);
+            long nativeHandle, CompletableFuture<String> snapshotJsonFuture);
 
     private static native boolean expireSnapshot(long nativeHandle, long snapshotId);
 
