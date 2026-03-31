@@ -297,6 +297,16 @@ impl ReadOnlyDb {
         range: Range<&[u8]>,
         options: &ScanOptions,
     ) -> Result<DbIterator<'static>> {
+        self.scan_with_options_bounds(bucket, Some(range.start), Some(range.end), options)
+    }
+
+    pub(crate) fn scan_with_options_bounds(
+        &self,
+        bucket: u16,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        options: &ScanOptions,
+    ) -> Result<DbIterator<'static>> {
         let snapshot = self.lsm_tree.db_state().load();
         let schema = self.schema_manager.latest_schema();
         let num_columns = schema.num_columns();
@@ -321,8 +331,8 @@ impl ReadOnlyDb {
             encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded);
             encoded.freeze()
         };
-        let start_key = encode_scan_key(range.start);
-        let end_bound = Some((encode_scan_key(range.end), false));
+        let start_key = encode_scan_key(start.unwrap_or(&[]));
+        let end_bound = end.map(|key| (encode_scan_key(key), false));
         let mut iter: DbIterator<'static> = DbIterator::new(
             Vec::new(),
             lsm_iters,
