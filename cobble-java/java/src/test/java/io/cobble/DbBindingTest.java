@@ -1093,4 +1093,63 @@ class DbBindingTest {
             assertTrue(now >= 0);
         }
     }
+
+    @Test
+    void scanCursorForEachLoop() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-scan-foreach-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        try (Db db = Db.open(config)) {
+            int count = 50;
+            for (int i = 0; i < count; i++) {
+                byte[] key = scanKeyBytes("foreach", i);
+                db.put(0, key, 0, valueBytes("c0", i));
+                db.put(0, key, 1, valueBytes("c1", i));
+            }
+            try (ScanCursor cursor =
+                    db.scan(0, scanKeyBytes("foreach", 10), scanKeyBytes("foreach", 40))) {
+                List<String> keys = new ArrayList<>();
+                for (ScanCursor.Entry entry : cursor) {
+                    keys.add(new String(entry.key, StandardCharsets.UTF_8));
+                    assertNotNull(entry.columns);
+                }
+                assertEquals(30, keys.size());
+                for (int i = 0; i < keys.size(); i++) {
+                    String key = keys.get(i);
+                    int idx = Integer.parseInt(key.substring(key.lastIndexOf('-') + 1));
+                    assertEquals(10 + i, idx);
+                }
+            }
+        }
+    }
+
+    @Test
+    void structuredScanCursorForEachLoop() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-structured-foreach-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        try (io.cobble.structured.Db db = io.cobble.structured.Db.open(config)) {
+            int count = 50;
+            for (int i = 0; i < count; i++) {
+                byte[] key = scanKeyBytes("sfore", i);
+                db.put(0, key, 0, valueBytes("sc0", i));
+                db.put(0, key, 1, valueBytes("sc1", i));
+            }
+            try (io.cobble.structured.ScanCursor cursor =
+                    db.scan(0, scanKeyBytes("sfore", 5), scanKeyBytes("sfore", 25))) {
+                List<Row> rows = new ArrayList<>();
+                for (Row row : cursor) {
+                    rows.add(row);
+                    assertNotNull(row.getKey());
+                }
+                assertEquals(20, rows.size());
+                for (int i = 0; i < rows.size(); i++) {
+                    Row row = rows.get(i);
+                    String key = new String(row.getKey(), StandardCharsets.UTF_8);
+                    int idx = Integer.parseInt(key.substring(key.lastIndexOf('-') + 1));
+                    assertEquals(5 + i, idx);
+                    assertNotNull(row.getColumnValue(0));
+                    assertTrue(row.getColumnValue(0).isBytes());
+                }
+            }
+        }
+    }
 }

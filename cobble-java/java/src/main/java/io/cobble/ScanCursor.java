@@ -1,11 +1,30 @@
 package io.cobble;
 
+import java.util.Iterator;
+
 /**
  * Native-backed scan cursor for one bucket/range.
  *
- * <p>Use {@link #nextBatch()} repeatedly until {@code hasMore=false}, then close.
+ * <p>Supports Java enhanced for-each loops via {@link Iterable}. Each element is a {@link Entry}
+ * containing the key and its column values.
+ *
+ * <p>A cursor is single-traversal: {@link #iterator()} may only be called once.
  */
-public final class ScanCursor extends NativeObject {
+public final class ScanCursor extends NativeObject implements Iterable<ScanCursor.Entry> {
+
+    /** A single row from a scan: key + column values. */
+    public static final class Entry {
+        public final byte[] key;
+        public final byte[][] columns;
+
+        Entry(byte[] key, byte[][] columns) {
+            this.key = key;
+            this.columns = columns;
+        }
+    }
+
+    private boolean iteratorCreated = false;
+
     ScanCursor(long nativeHandle) {
         super(nativeHandle);
     }
@@ -24,6 +43,34 @@ public final class ScanCursor extends NativeObject {
             return ScanBatch.empty();
         }
         return batch;
+    }
+
+    @Override
+    public Iterator<Entry> iterator() {
+        if (iteratorCreated) {
+            throw new IllegalStateException("ScanCursor supports only a single traversal");
+        }
+        iteratorCreated = true;
+        return new BatchIterator<>(
+                () -> {
+                    ScanBatch b = nextBatch();
+                    return new BatchIterator.Batch<Entry>() {
+                        @Override
+                        public int size() {
+                            return b.keys.length;
+                        }
+
+                        @Override
+                        public Entry get(int i) {
+                            return new Entry(b.keys[i], b.values[i]);
+                        }
+
+                        @Override
+                        public boolean hasMore() {
+                            return b.hasMore;
+                        }
+                    };
+                });
     }
 
     @Override

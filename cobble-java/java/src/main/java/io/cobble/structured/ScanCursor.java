@@ -1,13 +1,20 @@
 package io.cobble.structured;
 
+import io.cobble.BatchIterator;
 import io.cobble.NativeObject;
+
+import java.util.Iterator;
 
 /**
  * A native-backed scan cursor that yields typed rows from a structured database.
  *
- * <p>Use {@link #nextBatch()} repeatedly until {@link ScanBatch#hasMore} is false, then close.
+ * <p>Supports Java enhanced for-each loops via {@link Iterable}. Each element is a {@link Row}.
+ *
+ * <p>A cursor is single-traversal: {@link #iterator()} may only be called once.
  */
-public final class ScanCursor extends NativeObject {
+public final class ScanCursor extends NativeObject implements Iterable<Row> {
+
+    private boolean iteratorCreated = false;
 
     ScanCursor(long nativeHandle) {
         super(nativeHandle);
@@ -27,6 +34,34 @@ public final class ScanCursor extends NativeObject {
             return ScanBatch.empty();
         }
         return batch;
+    }
+
+    @Override
+    public Iterator<Row> iterator() {
+        if (iteratorCreated) {
+            throw new IllegalStateException("ScanCursor supports only a single traversal");
+        }
+        iteratorCreated = true;
+        return new BatchIterator<>(
+                () -> {
+                    ScanBatch b = nextBatch();
+                    return new BatchIterator.Batch<Row>() {
+                        @Override
+                        public int size() {
+                            return b.size();
+                        }
+
+                        @Override
+                        public Row get(int i) {
+                            return b.getRow(i);
+                        }
+
+                        @Override
+                        public boolean hasMore() {
+                            return b.hasMore;
+                        }
+                    };
+                });
     }
 
     @Override
