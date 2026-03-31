@@ -11,6 +11,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -110,6 +111,10 @@ impl BuiltinSchemaEvolution {
 }
 
 /// Runtime schema for merge semantics.
+///
+/// When `projection` is set, this schema is a lightweight view over the
+/// original: `operator(i)` and `column_metadata_at(i)` remap through
+/// `projection[i]` without cloning operators or metadata.
 #[derive(Clone)]
 pub struct Schema {
     version: u64,
@@ -117,6 +122,9 @@ pub struct Schema {
     operators: Arc<Vec<Arc<dyn MergeOperator>>>,
     evolution: BuiltinSchemaEvolution,
     pub(crate) column_metadata: Arc<Vec<Option<JsonValue>>>,
+    /// When set, column index `i` maps to `projection[i]` in the original
+    /// operators/metadata vectors.
+    projection: Option<Vec<usize>>,
 }
 
 impl Schema {
@@ -157,6 +165,7 @@ impl Schema {
             operators: Arc::new(operators),
             evolution,
             column_metadata: Arc::new(column_metadata),
+            projection: None,
         }
     }
 
@@ -168,9 +177,30 @@ impl Schema {
         self.num_columns
     }
 
+    /// Creates a projected schema for the given column indices.
+    ///
+    /// The returned schema shares the original operators and metadata via `Arc`
+    /// (no content clone). `operator(i)` remaps through `selected_columns[i]`
+    /// to the original schema, so merge semantics remain correct after
+    /// `ColumnMaskingIterator` re-indexes columns.
+    pub(crate) fn project(&self, selected_columns: &[usize]) -> Arc<Schema> {
+        Arc::new(Schema {
+            version: self.version,
+            num_columns: selected_columns.len(),
+            operators: Arc::clone(&self.operators),
+            evolution: BuiltinSchemaEvolution::Noop,
+            column_metadata: Arc::clone(&self.column_metadata),
+            projection: Some(selected_columns.to_vec()),
+        })
+    }
+
     pub(crate) fn operator(&self, column_idx: usize) -> &dyn MergeOperator {
+        let actual_idx = match &self.projection {
+            Some(projection) => projection[column_idx],
+            None => column_idx,
+        };
         self.operators
-            .get(column_idx)
+            .get(actual_idx)
             .unwrap_or_else(|| default_merge_operator_ref())
             .as_ref()
     }
@@ -194,13 +224,25 @@ impl Schema {
         self.evolution.clone()
     }
 
-    pub(crate) fn column_metadata(&self) -> &[Option<JsonValue>] {
-        self.column_metadata.as_ref()
+    pub(crate) fn column_metadata(&self) -> Cow<'_, [Option<JsonValue>]> {
+        match &self.projection {
+            None => Cow::Borrowed(self.column_metadata.as_ref()),
+            Some(projection) => Cow::Owned(
+                projection
+                    .iter()
+                    .map(|&idx| self.column_metadata.get(idx).cloned().flatten())
+                    .collect(),
+            ),
+        }
     }
 
     pub fn column_metadata_at(&self, column_idx: usize) -> Option<&JsonValue> {
+        let actual_idx = match &self.projection {
+            Some(projection) => projection[column_idx],
+            None => column_idx,
+        };
         self.column_metadata
-            .get(column_idx)
+            .get(actual_idx)
             .and_then(|metadata| metadata.as_ref())
     }
 }

@@ -308,7 +308,7 @@ impl ReadOnlyDb {
                 max_index, num_columns
             )));
         }
-        let lsm_iters = self.lsm_tree.scan_with_snapshot(
+        let (lsm_iters, effective_schema) = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
             Arc::clone(&schema),
@@ -332,7 +332,7 @@ impl ReadOnlyDb {
                 memtable_manager: None,
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
-                schema_manager: Arc::clone(&self.schema_manager),
+                schema: effective_schema,
             },
         );
         iter.seek(start_key.as_ref())?;

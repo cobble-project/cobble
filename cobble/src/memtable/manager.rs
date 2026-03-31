@@ -1084,7 +1084,6 @@ impl MemtableManager {
         target_schema: Arc<Schema>,
         selected_columns: Option<&[usize]>,
     ) -> Result<Vec<DynKvIterator>> {
-        let selected_columns = selected_columns.map(|columns| columns.to_vec());
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         if let Some(active) = &snapshot.active {
             let source_schema = {
@@ -1102,7 +1101,7 @@ impl MemtableManager {
                     Arc::clone(&self.schema_manager),
                 ))
             };
-            let iter: DynKvIterator = if let Some(columns) = selected_columns.as_deref() {
+            let iter: DynKvIterator = if let Some(columns) = selected_columns {
                 Box::new(ColumnMaskingIterator::new(
                     iter,
                     target_schema.num_columns(),
@@ -1125,7 +1124,7 @@ impl MemtableManager {
                     Arc::clone(&self.schema_manager),
                 ))
             };
-            let iter: DynKvIterator = if let Some(columns) = selected_columns.as_deref() {
+            let iter: DynKvIterator = if let Some(columns) = selected_columns {
                 Box::new(ColumnMaskingIterator::new(
                     iter,
                     target_schema.num_columns(),

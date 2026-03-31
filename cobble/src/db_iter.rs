@@ -6,7 +6,7 @@ use crate::iterator::KvIterator;
 use crate::iterator::{DeduplicatingIterator, MergingIterator};
 use crate::lsm::DynKvIterator;
 use crate::memtable::MemtableManager;
-use crate::schema::{Schema, SchemaManager};
+use crate::schema::Schema;
 use crate::sst::row_codec::decode_key;
 use crate::ttl::TTLProvider;
 use crate::vlog::VlogStore;
@@ -19,7 +19,10 @@ pub(crate) struct DbIteratorOptions<'a> {
     pub(crate) memtable_manager: Option<&'a MemtableManager>,
     pub(crate) vlog_store: Arc<VlogStore>,
     pub(crate) ttl_provider: Arc<TTLProvider>,
-    pub(crate) schema_manager: Arc<SchemaManager>,
+    /// Effective schema for merge and value resolution.
+    /// When column projection is active, this is a projected schema
+    /// with remapped operators matching the selected column indices.
+    pub(crate) schema: Arc<Schema>,
 }
 
 pub struct DbIterator<'a> {
@@ -39,7 +42,7 @@ impl<'a> DbIterator<'a> {
         mut lsm_iters: Vec<DynKvIterator>,
         options: DbIteratorOptions<'a>,
     ) -> Self {
-        let schema = options.schema_manager.latest_schema();
+        let schema = options.schema;
         let num_columns = schema.num_columns();
         memtable_iters.append(&mut lsm_iters);
         let inner = DeduplicatingIterator::new(

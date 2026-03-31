@@ -918,8 +918,8 @@ impl Db {
             options.read_ahead_bytes,
             options.columns(),
         );
-        let lsm_iters = match lsm_iters {
-            Ok(iters) => iters,
+        let (lsm_iters, effective_schema) = match lsm_iters {
+            Ok(result) => result,
             Err(err) => {
                 self.maybe_mark_error_on_read(&err);
                 return Err(err);
@@ -941,7 +941,7 @@ impl Db {
                 memtable_manager: Some(&self.memtable_manager),
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
-                schema_manager: Arc::clone(&self.schema_manager),
+                schema: effective_schema,
             },
         );
         if let Err(err) = iter.seek(start_key.as_ref()) {
