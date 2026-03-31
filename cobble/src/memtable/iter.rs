@@ -60,10 +60,18 @@ impl<'a> OrderedMemtableKvIterator<'a> {
 
 impl<'a> KvIterator<'a> for OrderedMemtableKvIterator<'a> {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
-        match self.entries.binary_search_by(|entry| entry.key.cmp(target)) {
-            Ok(idx) => self.idx = idx,
-            Err(idx) => self.idx = idx,
-        }
+        let idx = match self.entries.binary_search_by(|entry| entry.key.cmp(target)) {
+            Ok(mut idx) => {
+                // Walk backwards to the first entry with this key,
+                // since binary_search may land on any matching entry.
+                while idx > 0 && self.entries[idx - 1].key == target {
+                    idx -= 1;
+                }
+                idx
+            }
+            Err(idx) => idx,
+        };
+        self.idx = idx;
         self.current_key = None;
         self.current_value = None;
         Ok(())
