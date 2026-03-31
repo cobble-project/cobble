@@ -18,7 +18,7 @@ pub(crate) struct ScanOptionsHandle {
 impl ScanOptionsHandle {
     fn new() -> ScanOptionsHandle {
         ScanOptionsHandle {
-            scan_options: ScanOptions::for_column(0),
+            scan_options: ScanOptions::default(),
             batch_size: DEFAULT_SCAN_BATCH_SIZE,
         }
     }
@@ -80,7 +80,7 @@ pub(crate) struct ScanCursorHandle {
     inner: Box<StaticScanCursorInner>,
 }
 
-type ScanValues = Vec<Vec<u8>>;
+type ScanValues = Vec<Option<Vec<u8>>>;
 type ScanRow = (Vec<u8>, ScanValues);
 
 impl ScanCursorHandle {
@@ -166,10 +166,14 @@ impl StaticScanCursorInner {
 
 fn convert_row(row: (Bytes, Vec<Option<Bytes>>)) -> Option<(Vec<u8>, ScanValues)> {
     let (key, columns) = row;
-    let mut values = Vec::with_capacity(columns.len());
-    for column in columns {
-        values.push(column?.to_vec());
+    // Skip rows where all columns are None (fully deleted/empty rows)
+    if columns.iter().all(|c| c.is_none()) {
+        return None;
     }
+    let values: ScanValues = columns
+        .into_iter()
+        .map(|col| col.map(|b| b.to_vec()))
+        .collect();
     Some((key.to_vec(), values))
 }
 
@@ -433,11 +437,14 @@ fn to_java_3d_bytes_array(
             .new_object_array(columns.len() as i32, "[B", JObject::null())
             .map_err(|err| err.to_string())?;
         for (column_index, bytes) in columns.into_iter().enumerate() {
-            let column_bytes = env
-                .byte_array_from_slice(&bytes)
-                .map_err(|err| err.to_string())?;
-            env.set_object_array_element(&column_array, column_index as i32, column_bytes)
-                .map_err(|err| err.to_string())?;
+            if let Some(bytes) = bytes {
+                let column_bytes = env
+                    .byte_array_from_slice(&bytes)
+                    .map_err(|err| err.to_string())?;
+                env.set_object_array_element(&column_array, column_index as i32, column_bytes)
+                    .map_err(|err| err.to_string())?;
+            }
+            // None columns remain null in the Java array
         }
         env.set_object_array_element(&array, index as i32, column_array)
             .map_err(|err| err.to_string())?;
