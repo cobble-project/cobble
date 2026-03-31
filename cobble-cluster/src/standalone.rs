@@ -70,6 +70,8 @@ struct StandaloneShardSnapshot {
     pub snapshot_id: u64,
     /// Snapshot manifest path used by coordinator-side global manifest.
     pub manifest_path: String,
+    /// Timestamp (seconds) when the shard snapshot was initiated.
+    pub timestamp_seconds: u32,
 }
 
 impl From<ShardSnapshotInput> for StandaloneShardSnapshot {
@@ -79,6 +81,7 @@ impl From<ShardSnapshotInput> for StandaloneShardSnapshot {
             db_id: input.db_id,
             snapshot_id: input.snapshot_id,
             manifest_path: input.manifest_path,
+            timestamp_seconds: input.timestamp_seconds,
         }
     }
 }
@@ -90,6 +93,7 @@ impl From<StandaloneShardSnapshot> for ShardSnapshotInput {
             db_id: snapshot.db_id,
             snapshot_id: snapshot.snapshot_id,
             manifest_path: snapshot.manifest_path,
+            timestamp_seconds: snapshot.timestamp_seconds,
         }
     }
 }

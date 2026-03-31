@@ -25,6 +25,10 @@ public final class GlobalSnapshot implements Serializable {
     @SerializedName("shard_snapshots")
     public List<ShardSnapshot> shardSnapshots = new ArrayList<ShardSnapshot>();
 
+    /** Watermark: the minimum timestamp (seconds) across all shard snapshots. */
+    @SerializedName("watermark_seconds")
+    public long watermarkSeconds;
+
     public static GlobalSnapshot fromJson(String json) {
         return GSON.fromJson(json, GlobalSnapshot.class);
     }

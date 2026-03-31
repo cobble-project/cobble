@@ -35,6 +35,10 @@ public final class ShardSnapshot implements Serializable {
     @SerializedName("manifest_path")
     public String manifestPath;
 
+    /** Timestamp (seconds) when the shard snapshot was initiated. */
+    @SerializedName("timestamp_seconds")
+    public long timestampSeconds;
+
     public static ShardSnapshot fromJson(String json) {
         return GSON.fromJson(json, ShardSnapshot.class);
     }

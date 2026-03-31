@@ -484,12 +484,14 @@ impl Db {
     {
         self.ensure_open()?;
         let db_id = self.id.clone();
+        let timestamp_seconds = self.now_seconds();
         let wrapper: SnapshotCallback = Arc::new(move |result: Result<SnapshotManifestInfo>| {
             callback(result.map(|info| crate::coordinator::ShardSnapshotInput {
                 ranges: info.bucket_ranges,
                 db_id: db_id.clone(),
                 snapshot_id: info.id,
                 manifest_path: info.manifest_path,
+                timestamp_seconds,
             }));
         });
         let snapshot = self.snapshot_manager.create_snapshot(Some(wrapper));
@@ -530,6 +532,7 @@ impl Db {
             db_id: self.id.clone(),
             snapshot_id,
             manifest_path,
+            timestamp_seconds: 0,
         })
     }
 

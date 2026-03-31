@@ -607,12 +607,14 @@ mod tests {
                         db_id: db_a.clone(),
                         snapshot_id: snap_a,
                         manifest_path: path_a,
+                        timestamp_seconds: 0,
                     },
                     ShardSnapshotInput {
                         ranges: vec![2u16..=3u16],
                         db_id: db_b.clone(),
                         snapshot_id: snap_b,
                         manifest_path: path_b,
+                        timestamp_seconds: 0,
                     },
                 ],
             )
@@ -679,6 +681,7 @@ mod tests {
                     db_id: db_a.clone(),
                     snapshot_id: snap_a,
                     manifest_path: path_a,
+                    timestamp_seconds: 0,
                 }],
             )
             .unwrap();
@@ -706,6 +709,7 @@ mod tests {
                     db_id: db_b.clone(),
                     snapshot_id: snap_b,
                     manifest_path: path_b,
+                    timestamp_seconds: 0,
                 }],
             )
             .unwrap();

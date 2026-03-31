@@ -23,6 +23,8 @@ pub struct ShardSnapshotInput {
     pub db_id: String,
     pub snapshot_id: u64,
     pub manifest_path: String,
+    /// Timestamp (seconds) when the shard snapshot was initiated.
+    pub timestamp_seconds: u32,
 }
 
 /// Bucket snapshot reference stored in a global manifest.
@@ -32,6 +34,8 @@ pub struct ShardSnapshotRef {
     pub db_id: String,
     pub snapshot_id: u64,
     pub manifest_path: String,
+    /// Timestamp (seconds) when the shard snapshot was initiated.
+    pub timestamp_seconds: u32,
 }
 
 /// Global snapshot manifest referencing bucket-level snapshots.
@@ -40,6 +44,8 @@ pub struct GlobalSnapshotManifest {
     pub id: u64,
     pub total_buckets: u32,
     pub shard_snapshots: Vec<ShardSnapshotRef>,
+    /// Watermark: the minimum timestamp (seconds) across all shard snapshots.
+    pub watermark_seconds: u32,
 }
 
 /// Coordinator node that materializes global snapshots on shared storage.
@@ -121,6 +127,7 @@ impl DbCoordinator {
                 "bucket snapshots required to build global snapshot".to_string(),
             ));
         }
+        let mut watermark_seconds = u32::MAX;
         let mut bucket_refs = Vec::with_capacity(shard_snapshots.len());
         for bucket in shard_snapshots {
             if bucket.manifest_path.is_empty() {
@@ -129,17 +136,20 @@ impl DbCoordinator {
                     bucket.db_id, bucket.snapshot_id
                 )));
             }
+            watermark_seconds = watermark_seconds.min(bucket.timestamp_seconds);
             bucket_refs.push(ShardSnapshotRef {
                 ranges: bucket.ranges,
                 db_id: bucket.db_id,
                 snapshot_id: bucket.snapshot_id,
                 manifest_path: bucket.manifest_path,
+                timestamp_seconds: bucket.timestamp_seconds,
             });
         }
         Ok(GlobalSnapshotManifest {
             id,
             total_buckets,
             shard_snapshots: bucket_refs,
+            watermark_seconds,
         })
     }
 
@@ -359,12 +369,14 @@ mod tests {
                         db_id: "db-a".to_string(),
                         snapshot_id: 1,
                         manifest_path: path_a.clone(),
+                        timestamp_seconds: 0,
                     },
                     ShardSnapshotInput {
                         ranges: vec![2u16..=3u16],
                         db_id: "db-b".to_string(),
                         snapshot_id: 2,
                         manifest_path: path_b.clone(),
+                        timestamp_seconds: 0,
                     },
                 ],
             )
@@ -412,6 +424,7 @@ mod tests {
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path_a.clone(),
+                    timestamp_seconds: 0,
                 }],
                 2,
             )
@@ -426,6 +439,7 @@ mod tests {
                     db_id: "db-b".to_string(),
                     snapshot_id: 2,
                     manifest_path: path_b.clone(),
+                    timestamp_seconds: 0,
                 }],
                 1,
             )
@@ -471,6 +485,7 @@ mod tests {
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path.clone(),
+                    timestamp_seconds: 0,
                 }],
                 1,
             )
@@ -485,6 +500,7 @@ mod tests {
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path,
+                    timestamp_seconds: 0,
                 }],
                 2,
             )
@@ -529,6 +545,7 @@ mod tests {
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path.clone(),
+                    timestamp_seconds: 0,
                 }],
                 1,
             )
@@ -544,6 +561,7 @@ mod tests {
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path,
+                    timestamp_seconds: 0,
                 }],
                 2,
             )

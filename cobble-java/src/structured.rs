@@ -799,6 +799,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_asyncSnapshot(
                     db_id: input.db_id,
                     snapshot_id: input.snapshot_id,
                     manifest_path: input.manifest_path,
+                    timestamp_seconds: input.timestamp_seconds,
                 })
                 .unwrap_or_default()
             }),
