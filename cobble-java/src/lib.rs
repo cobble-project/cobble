@@ -8,6 +8,7 @@ mod reader;
 mod scan;
 mod schema;
 mod single_db;
-mod structured_db;
+mod structured;
+mod structured_single_db;
 mod util;
 mod write_options;

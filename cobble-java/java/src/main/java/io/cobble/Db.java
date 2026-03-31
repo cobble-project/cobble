@@ -331,7 +331,7 @@ public final class Db extends NativeObject {
         throw new IllegalStateException("snapshot manifest is unavailable: " + snapshotId);
     }
 
-    private static boolean manifestExists(String manifestPath) {
+    public static boolean manifestExists(String manifestPath) {
         try {
             Path path;
             if (manifestPath.startsWith("file://")) {

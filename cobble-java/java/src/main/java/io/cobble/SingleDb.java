@@ -118,7 +118,8 @@ public final class SingleDb extends NativeObject {
     public Future<GlobalSnapshot> asyncSnapshot() {
         CompletableFuture<Long> snapshotIdFuture = new CompletableFuture<Long>();
         asyncSnapshot(nativeHandle, snapshotIdFuture);
-        return snapshotIdFuture.thenApply(this::waitForGlobalSnapshotReady);
+        return snapshotIdFuture.thenApply(
+                sid -> GlobalSnapshot.waitForReady(sid, this::listSnapshots));
     }
 
     /** Trigger snapshot creation and block until global snapshot manifest is materialized. */
@@ -204,38 +205,6 @@ public final class SingleDb extends NativeObject {
     static native String currentSchemaJson(long nativeHandle);
 
     static native long createSchemaBuilder(long nativeHandle);
-
-    private GlobalSnapshot waitForGlobalSnapshotReady(long snapshotId) {
-        IllegalStateException lastError = null;
-        for (int i = 0; i < 120; i++) {
-            try {
-                GlobalSnapshot snapshot = getSnapshot(snapshotId);
-                if (snapshot != null) {
-                    return snapshot;
-                }
-            } catch (IllegalStateException e) {
-                lastError = e;
-            }
-            try {
-                Thread.sleep(50L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException(
-                        "interrupted while waiting global snapshot ready", e);
-            }
-        }
-        if (lastError != null) {
-            throw lastError;
-        }
-        throw new IllegalStateException("global snapshot is unavailable: " + snapshotId);
-    }
-
-    private GlobalSnapshot getSnapshot(long snapshotId) {
-        return listSnapshots().stream()
-                .filter(snapshot -> snapshot.id == snapshotId)
-                .findFirst()
-                .orElseThrow(() -> new IllegalStateException("snapshot not found: " + snapshotId));
-    }
 
     private static byte[] singleColumnOrNull(byte[][] columns) {
         if (columns == null) {

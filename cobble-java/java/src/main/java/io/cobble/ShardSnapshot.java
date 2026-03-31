@@ -35,7 +35,7 @@ public final class ShardSnapshot implements Serializable {
     @SerializedName("manifest_path")
     public String manifestPath;
 
-    static ShardSnapshot fromJson(String json) {
+    public static ShardSnapshot fromJson(String json) {
         return GSON.fromJson(json, ShardSnapshot.class);
     }
 

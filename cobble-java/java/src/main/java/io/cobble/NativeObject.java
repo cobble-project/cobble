@@ -11,6 +11,11 @@ public abstract class NativeObject implements AutoCloseable {
         this.nativeHandle = nativeHandle;
     }
 
+    /** Returns the raw native handle. For cross-package internal use. */
+    public long getNativeHandle() {
+        return nativeHandle;
+    }
+
     @Override
     public void close() {
         if (disposed.compareAndSet(false, true)) {

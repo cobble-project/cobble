@@ -5,7 +5,7 @@ use crate::list::{
 use bytes::Bytes;
 use cobble::{
     Config, Db, DbIterator, Error, MergeOperatorResolver, ReadOptions, Result, ScanOptions, Schema,
-    SchemaBuilder, WriteBatch, WriteOptions,
+    SchemaBuilder, ShardSnapshotInput, WriteBatch, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -451,6 +451,51 @@ impl StructuredDb {
         self.db.snapshot()
     }
 
+    pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
+    where
+        F: Fn(Result<u64>) + Send + Sync + 'static,
+    {
+        self.db.snapshot_with_callback(callback)
+    }
+
+    pub fn expire_snapshot(&self, snapshot_id: u64) -> Result<bool> {
+        self.db.expire_snapshot(snapshot_id)
+    }
+
+    pub fn retain_snapshot(&self, snapshot_id: u64) -> bool {
+        self.db.retain_snapshot(snapshot_id)
+    }
+
+    pub fn shard_snapshot_input(&self, snapshot_id: u64) -> Result<ShardSnapshotInput> {
+        self.db.shard_snapshot_input(snapshot_id)
+    }
+
+    pub fn set_time(&self, next: u32) {
+        self.db.set_time(next);
+    }
+
+    pub fn now_seconds(&self) -> u32 {
+        self.db.now_seconds()
+    }
+
+    pub fn get_raw_with_options(
+        &self,
+        bucket: u16,
+        key: &[u8],
+        options: &ReadOptions,
+    ) -> Result<Option<Vec<Option<Bytes>>>> {
+        self.db.get_with_options(bucket, key, options)
+    }
+
+    pub fn scan_raw<'a>(
+        &'a self,
+        bucket: u16,
+        range: Range<&[u8]>,
+        options: &ScanOptions,
+    ) -> Result<DbIterator<'a>> {
+        self.db.scan_with_options(bucket, range, options)
+    }
+
     pub fn close(&self) -> Result<()> {
         self.db.close()
     }
@@ -619,6 +664,11 @@ mod tests {
         let mut iter = db.scan(0, b"k0".as_ref()..b"k9".as_ref()).unwrap();
         let first = iter.next().expect("one row").unwrap();
         assert_eq!(first.0.as_ref(), b"k1");
+        assert_eq!(first.1.len(), 2, "scan row should have 2 columns");
+        assert_eq!(
+            first.1[0],
+            Some(StructuredColumnValue::Bytes(Bytes::from_static(b"v0")))
+        );
         assert_eq!(
             first.1[1],
             Some(StructuredColumnValue::List(vec![

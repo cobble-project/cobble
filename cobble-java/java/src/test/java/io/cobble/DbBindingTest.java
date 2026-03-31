@@ -1,5 +1,8 @@
 package io.cobble;
 
+import io.cobble.structured.ColumnValue;
+import io.cobble.structured.Row;
+
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -166,7 +169,7 @@ class DbBindingTest {
         Path dataDir = Files.createTempDirectory("cobble-java-structured-json-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
 
-        try (StructuredDb db = StructuredDb.open(config)) {
+        try (io.cobble.structured.Db db = io.cobble.structured.Db.open(config)) {
             int count = 300;
             for (int i = 0; i < count; i++) {
                 byte[] key = keyBytes("structured-json", i);
@@ -177,20 +180,32 @@ class DbBindingTest {
             byte[] mergeKey = keyBytes("structured-json-merge", 1);
             db.put(0, mergeKey, 0, "base".getBytes(StandardCharsets.UTF_8));
             db.merge(0, mergeKey, 0, "-m1".getBytes(StandardCharsets.UTF_8));
-            assertEquals("base-m1", new String(db.get(0, mergeKey, 0), StandardCharsets.UTF_8));
+            Row mergeRow = db.get(0, mergeKey);
+            assertEquals("base-m1", new String(mergeRow.getBytes(0), StandardCharsets.UTF_8));
             try (WriteOptions options = WriteOptions.withTtl(60)) {
                 db.putWithOptions(
-                        0, mergeKey, 1, "ttl-structured".getBytes(StandardCharsets.UTF_8), options);
+                        0,
+                        mergeKey,
+                        1,
+                        ColumnValue.ofBytes("ttl-structured".getBytes(StandardCharsets.UTF_8)),
+                        options);
                 db.mergeWithOptions(
-                        0, mergeKey, 0, "-m2".getBytes(StandardCharsets.UTF_8), options);
+                        0,
+                        mergeKey,
+                        0,
+                        ColumnValue.ofBytes("-m2".getBytes(StandardCharsets.UTF_8)),
+                        options);
             }
-            assertEquals("base-m1-m2", new String(db.get(0, mergeKey, 0), StandardCharsets.UTF_8));
+            assertEquals(
+                    "base-m1-m2",
+                    new String(db.get(0, mergeKey).getBytes(0), StandardCharsets.UTF_8));
             assertArrayEquals(
-                    "ttl-structured".getBytes(StandardCharsets.UTF_8), db.get(0, mergeKey, 1));
+                    "ttl-structured".getBytes(StandardCharsets.UTF_8),
+                    db.get(0, mergeKey).getBytes(1));
 
             for (int i = 0; i < count; i++) {
                 byte[] key = keyBytes("structured-json", i);
-                assertArrayEquals(valueBytes("structured-json-v", i), db.get(0, key, 0));
+                assertArrayEquals(valueBytes("structured-json-v", i), db.get(0, key).getBytes(0));
             }
 
             for (int i = 2; i < count; i += 5) {
@@ -199,11 +214,117 @@ class DbBindingTest {
 
             for (int i = 0; i < count; i++) {
                 byte[] key = keyBytes("structured-json", i);
-                byte[] value = db.get(0, key, 0);
+                Row row = db.get(0, key);
+                byte[] value = row != null ? row.getBytes(0) : null;
                 if (i % 5 == 2) {
                     assertNull(value);
                 } else {
                     assertArrayEquals(valueBytes("structured-json-v", i), value);
+                }
+            }
+        }
+    }
+
+    @Test
+    void structuredDbScanAndRawGet() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-structured-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        try (io.cobble.structured.Db db = io.cobble.structured.Db.open(config)) {
+            int count = 500;
+            for (int i = 0; i < count; i++) {
+                byte[] key = scanKeyBytes("st-scan", i);
+                db.put(0, key, 0, valueBytes("st-scan-v0", i));
+            }
+
+            // single-column get
+            assertArrayEquals(
+                    valueBytes("st-scan-v0", 42),
+                    db.get(0, scanKeyBytes("st-scan", 42)).getBytes(0));
+
+            // get with ReadOptions column projection
+            try (ReadOptions readOpts = new ReadOptions().forColumns(0)) {
+                Row projected = db.getWithOptions(0, scanKeyBytes("st-scan", 42), readOpts);
+                assertNotNull(projected);
+                assertArrayEquals(valueBytes("st-scan-v0", 42), projected.getBytes(0));
+            }
+
+            // scan with options
+            try (ScanOptions scanOpts = new ScanOptions().batchSize(64).columns(0);
+                    io.cobble.structured.ScanCursor cursor =
+                            db.scanWithOptions(
+                                    0,
+                                    scanKeyBytes("st-scan", 100),
+                                    scanKeyBytes("st-scan", 300),
+                                    scanOpts)) {
+                int rows = 0;
+                while (true) {
+                    io.cobble.structured.ScanBatch batch = cursor.nextBatch();
+                    assertNotNull(batch);
+                    rows += batch.size();
+                    if (!batch.hasMore) {
+                        break;
+                    }
+                }
+                assertEquals(200, rows);
+            }
+
+            // default scan (no options)
+            try (io.cobble.structured.ScanCursor cursor =
+                    db.scan(0, scanKeyBytes("st-scan", 0), scanKeyBytes("st-scan", count))) {
+                int rows = 0;
+                while (true) {
+                    io.cobble.structured.ScanBatch batch = cursor.nextBatch();
+                    rows += batch.size();
+                    if (!batch.hasMore) {
+                        break;
+                    }
+                }
+                assertEquals(count, rows);
+            }
+
+            // id and time metadata
+            assertNotNull(db.id());
+            assertTrue(db.nowSeconds() >= 0);
+        }
+    }
+
+    @Test
+    void structuredDbSnapshotRestoreAndResume() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-structured-snap-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        Path configPath = writeConfigFile(dataDir, config);
+        String dbId;
+        try (io.cobble.structured.Db db = io.cobble.structured.Db.open(config)) {
+            dbId = db.id();
+            int count = 180;
+            for (int i = 0; i < count; i++) {
+                db.put(0, keyBytes("st-snap", i), 0, valueBytes("st-snap-v", i));
+            }
+
+            ShardSnapshot shardSnapshot = db.snapshot();
+            assertNotNull(shardSnapshot);
+            assertTrue(shardSnapshot.snapshotId >= 0);
+            assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
+
+            // restore
+            try (io.cobble.structured.Db restored =
+                    io.cobble.structured.Db.restore(
+                            configPath.toString(), shardSnapshot.snapshotId, dbId)) {
+                for (int i = 0; i < count; i++) {
+                    assertArrayEquals(
+                            valueBytes("st-snap-v", i),
+                            restored.get(0, keyBytes("st-snap", i)).getBytes(0));
+                }
+            }
+
+            // resume
+            try (io.cobble.structured.Db resumed =
+                    io.cobble.structured.Db.resume(configPath.toString(), dbId)) {
+                for (int i = 0; i < count; i++) {
+                    assertArrayEquals(
+                            valueBytes("st-snap-v", i),
+                            resumed.get(0, keyBytes("st-snap", i)).getBytes(0));
                 }
             }
         }
@@ -414,7 +535,7 @@ class DbBindingTest {
                     ScanBatch batch = cursor.nextBatch();
                     rows += batch.keys.length;
                     for (int i = 0; i < batch.values.length; i++) {
-                        assertEquals(1, batch.values[i].length);
+                        assertEquals(2, batch.values[i].length);
                     }
                     if (!batch.hasMore) {
                         break;
@@ -891,6 +1012,85 @@ class DbBindingTest {
 
             Schema current = db.currentSchema();
             assertEquals(updated.version, current.version);
+        }
+    }
+
+    // ── structured SingleDb ───────────────────────────────────────────────────
+
+    @Test
+    void structuredSingleDbReadWriteAndSnapshot() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-structured-single-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        io.cobble.structured.Schema schema =
+                io.cobble.structured.Schema.builder().addBytesColumn(0).addBytesColumn(1).build();
+
+        try (io.cobble.structured.SingleDb db =
+                io.cobble.structured.SingleDb.open(config, schema)) {
+            // basic put / get
+            int count = 100;
+            for (int i = 0; i < count; i++) {
+                byte[] key = scanKeyBytes("single-struct", i);
+                byte[] value = valueBytes("single-struct-v", i);
+                db.put(0, key, 0, value);
+            }
+
+            for (int i = 0; i < count; i++) {
+                byte[] key = scanKeyBytes("single-struct", i);
+                Row row = db.get(0, key);
+                assertNotNull(row);
+                assertArrayEquals(valueBytes("single-struct-v", i), row.getBytes(0));
+            }
+
+            // typed put with ColumnValue
+            byte[] mergeKey = scanKeyBytes("single-struct-merge", 1);
+            db.put(0, mergeKey, 0, ColumnValue.ofBytes("base".getBytes(StandardCharsets.UTF_8)));
+            db.merge(
+                    0,
+                    mergeKey,
+                    0,
+                    ColumnValue.ofBytes("-appended".getBytes(StandardCharsets.UTF_8)));
+            Row mergeRow = db.get(0, mergeKey);
+            assertNotNull(mergeRow);
+            assertEquals("base-appended", new String(mergeRow.getBytes(0), StandardCharsets.UTF_8));
+
+            // delete
+            db.delete(0, scanKeyBytes("single-struct", 0), 0);
+            assertNull(db.get(0, scanKeyBytes("single-struct", 0)));
+
+            // scan
+            assertNotNull(
+                    db.get(0, scanKeyBytes("single-struct", 1)), "key must exist before scan");
+            byte[] scanStart = scanKeyBytes("single-struct", 1);
+            byte[] scanEnd = scanKeyBytes("single-struct", 10);
+            try (io.cobble.structured.ScanCursor cursor = db.scan(0, scanStart, scanEnd)) {
+                int scanned = 0;
+                io.cobble.structured.ScanBatch batch;
+                do {
+                    batch = cursor.nextBatch();
+                    for (int b = 0; b < batch.size(); b++) {
+                        Row r = batch.getRow(b);
+                        assertNotNull(r.getKey());
+                        scanned++;
+                    }
+                } while (batch.hasMore);
+                assertEquals(9, scanned);
+            }
+
+            // snapshot lifecycle
+            GlobalSnapshot snap = db.snapshot();
+            assertNotNull(snap);
+            assertTrue(snap.id >= 0);
+
+            List<GlobalSnapshot> snapshots = db.listSnapshots();
+            assertFalse(snapshots.isEmpty());
+
+            db.retainSnapshot(snap.id);
+            db.expireSnapshot(snap.id);
+
+            // nowSeconds / setTime
+            int now = db.nowSeconds();
+            assertTrue(now >= 0);
         }
     }
 }

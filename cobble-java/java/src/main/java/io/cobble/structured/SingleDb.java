@@ -1,0 +1,317 @@
+package io.cobble.structured;
+
+import io.cobble.Config;
+import io.cobble.GlobalSnapshot;
+import io.cobble.NativeLoader;
+import io.cobble.NativeObject;
+import io.cobble.ReadOptions;
+import io.cobble.ScanOptions;
+import io.cobble.WriteOptions;
+
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+
+/**
+ * A structured single-node database with typed column support (Bytes and List).
+ *
+ * <p>Wraps an underlying single-node Cobble DB and provides typed read/write interfaces that
+ * automatically encode/decode column values according to the schema.
+ *
+ * <p>Unlike {@link Db}, this variant manages a single-node coordinator internally, producing {@link
+ * GlobalSnapshot} on snapshot operations.
+ *
+ * <p>Example:
+ *
+ * <pre>{@code
+ * Schema schema = Schema.builder()
+ *     .addBytesColumn(0)
+ *     .addListColumn(1, ListConfig.of(100, ListRetainMode.LAST))
+ *     .build();
+ * SingleDb db = SingleDb.open(config, schema);
+ *
+ * db.put(0, key, 0, ColumnValue.ofBytes(data));
+ * db.merge(0, key, 1, ColumnValue.ofList(new byte[][] { elem1 }));
+ *
+ * Row row = db.get(0, key);
+ * }</pre>
+ */
+public final class SingleDb extends NativeObject {
+
+    private SingleDb(long nativeHandle) {
+        super(nativeHandle);
+    }
+
+    // ── open ──────────────────────────────────────────────────────────────────
+
+    /** Open a structured single DB from a config file path with default schema. */
+    public static SingleDb open(String configPath) {
+        return open(configPath, Schema.defaults());
+    }
+
+    /** Open a structured single DB from a config file path with the given schema. */
+    public static SingleDb open(String configPath, Schema schema) {
+        NativeLoader.load();
+        String schemaJson = schema == null ? null : schema.toJson();
+        long h = openHandle(configPath, schemaJson);
+        if (h == 0L) {
+            throw new IllegalStateException("failed to open structured single db");
+        }
+        return new SingleDb(h);
+    }
+
+    /** Open a structured single DB from Java {@link Config} with default schema. */
+    public static SingleDb open(Config config) {
+        return open(config, Schema.defaults());
+    }
+
+    /** Open a structured single DB from Java {@link Config} with the given schema. */
+    public static SingleDb open(Config config, Schema schema) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        NativeLoader.load();
+        String schemaJson = schema == null ? null : schema.toJson();
+        long h = openHandleFromJson(config.toJson(), schemaJson);
+        if (h == 0L) {
+            throw new IllegalStateException("failed to open structured single db from config json");
+        }
+        return new SingleDb(h);
+    }
+
+    // ── typed write operations ────────────────────────────────────────────────
+
+    /** Put a typed column value for a key. */
+    public void put(int bucket, byte[] key, int column, ColumnValue value) {
+        if (value.isBytes()) {
+            putBytes(nativeHandle, bucket, key, column, value.asBytes());
+        } else {
+            putList(nativeHandle, bucket, key, column, value.asList());
+        }
+    }
+
+    /** Convenience: put a bytes value for a column. */
+    public void put(int bucket, byte[] key, int column, byte[] value) {
+        putBytes(nativeHandle, bucket, key, column, value);
+    }
+
+    /** Put a typed column value with explicit write options. */
+    public void putWithOptions(
+            int bucket, byte[] key, int column, ColumnValue value, WriteOptions options) {
+        long woh = options == null ? 0L : options.getNativeHandle();
+        if (value.isBytes()) {
+            putBytesWithOptions(nativeHandle, bucket, key, column, value.asBytes(), woh);
+        } else {
+            putListWithOptions(nativeHandle, bucket, key, column, value.asList(), woh);
+        }
+    }
+
+    /** Merge a typed column value for a key. */
+    public void merge(int bucket, byte[] key, int column, ColumnValue value) {
+        if (value.isBytes()) {
+            mergeBytes(nativeHandle, bucket, key, column, value.asBytes());
+        } else {
+            mergeList(nativeHandle, bucket, key, column, value.asList());
+        }
+    }
+
+    /** Convenience: merge a bytes value for a column. */
+    public void merge(int bucket, byte[] key, int column, byte[] value) {
+        mergeBytes(nativeHandle, bucket, key, column, value);
+    }
+
+    /** Merge a typed column value with explicit write options. */
+    public void mergeWithOptions(
+            int bucket, byte[] key, int column, ColumnValue value, WriteOptions options) {
+        long woh = options == null ? 0L : options.getNativeHandle();
+        if (value.isBytes()) {
+            mergeBytesWithOptions(nativeHandle, bucket, key, column, value.asBytes(), woh);
+        } else {
+            mergeListWithOptions(nativeHandle, bucket, key, column, value.asList(), woh);
+        }
+    }
+
+    /** Delete one column value for a key. */
+    public void delete(int bucket, byte[] key, int column) {
+        delete(nativeHandle, bucket, key, column);
+    }
+
+    // ── typed read operations ─────────────────────────────────────────────────
+
+    /**
+     * Get all columns for a key as a typed {@link Row}.
+     *
+     * @return typed row, or null if key does not exist
+     */
+    public Row get(int bucket, byte[] key) {
+        Object[] raw = getTyped(nativeHandle, bucket, key);
+        return Row.fromRawColumns(key, raw);
+    }
+
+    /**
+     * Get columns for a key with read options (supports projection).
+     *
+     * @return typed row, or null if key does not exist
+     */
+    public Row getWithOptions(int bucket, byte[] key, ReadOptions options) {
+        long roh = options == null ? 0L : options.getNativeHandle();
+        Object[] raw = getTypedWithOptions(nativeHandle, bucket, key, roh);
+        return Row.fromRawColumns(key, raw);
+    }
+
+    /** Open a structured scan cursor within [startKeyInclusive, endKeyExclusive). */
+    public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
+        return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
+    }
+
+    /** Open a structured scan cursor with explicit scan options. */
+    public ScanCursor scanWithOptions(
+            int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, ScanOptions options) {
+        long soh = options == null ? 0L : options.getNativeHandle();
+        long h =
+                openStructuredScanCursor(
+                        nativeHandle, bucket, startKeyInclusive, endKeyExclusive, soh);
+        if (h == 0L) {
+            throw new IllegalStateException("failed to open structured scan cursor");
+        }
+        return new ScanCursor(h);
+    }
+
+    // ── metadata / time ───────────────────────────────────────────────────────
+
+    /** Return current time in seconds from the DB's time provider. */
+    public int nowSeconds() {
+        return nowSeconds(nativeHandle);
+    }
+
+    /** Set manual time provider seconds (only effective when config uses manual time). */
+    public void setTime(int nextSeconds) {
+        if (nextSeconds < 0) {
+            throw new IllegalArgumentException("nextSeconds must be >= 0");
+        }
+        setTime(nativeHandle, nextSeconds);
+    }
+
+    // ── snapshot lifecycle ────────────────────────────────────────────────────
+
+    /** Trigger snapshot creation asynchronously and return a future of global snapshot. */
+    public Future<GlobalSnapshot> asyncSnapshot() {
+        CompletableFuture<Long> snapshotIdFuture = new CompletableFuture<>();
+        asyncSnapshot(nativeHandle, snapshotIdFuture);
+        return snapshotIdFuture.thenApply(
+                sid -> GlobalSnapshot.waitForReady(sid, this::listSnapshots));
+    }
+
+    /** Trigger snapshot creation and block until global snapshot manifest is materialized. */
+    public GlobalSnapshot snapshot() {
+        try {
+            return asyncSnapshot().get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("snapshot interrupted", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            throw new IllegalStateException("snapshot failed: " + cause.getMessage(), cause);
+        }
+    }
+
+    /** Retain one global snapshot. */
+    public boolean retainSnapshot(long snapshotId) {
+        return retainSnapshot(nativeHandle, snapshotId);
+    }
+
+    /** Expire one global snapshot. */
+    public boolean expireSnapshot(long snapshotId) {
+        return expireSnapshot(nativeHandle, snapshotId);
+    }
+
+    /** List global snapshots materialized by this single-node coordinator. */
+    public List<GlobalSnapshot> listSnapshots() {
+        return GlobalSnapshot.listFromJson(listSnapshotsJson(nativeHandle));
+    }
+
+    // ── native methods ────────────────────────────────────────────────────────
+
+    @Override
+    protected native void disposeInternal(long nativeHandle);
+
+    private static native long openHandle(String configPath, String schemaJson);
+
+    private static native long openHandleFromJson(String configJson, String schemaJson);
+
+    // bytes put/merge
+    private static native void putBytes(
+            long nativeHandle, int bucket, byte[] key, int column, byte[] value);
+
+    private static native void putBytesWithOptions(
+            long nativeHandle,
+            int bucket,
+            byte[] key,
+            int column,
+            byte[] value,
+            long writeOptionsHandle);
+
+    private static native void mergeBytes(
+            long nativeHandle, int bucket, byte[] key, int column, byte[] value);
+
+    private static native void mergeBytesWithOptions(
+            long nativeHandle,
+            int bucket,
+            byte[] key,
+            int column,
+            byte[] value,
+            long writeOptionsHandle);
+
+    // list put/merge
+    private static native void putList(
+            long nativeHandle, int bucket, byte[] key, int column, byte[][] elements);
+
+    private static native void putListWithOptions(
+            long nativeHandle,
+            int bucket,
+            byte[] key,
+            int column,
+            byte[][] elements,
+            long writeOptionsHandle);
+
+    private static native void mergeList(
+            long nativeHandle, int bucket, byte[] key, int column, byte[][] elements);
+
+    private static native void mergeListWithOptions(
+            long nativeHandle,
+            int bucket,
+            byte[] key,
+            int column,
+            byte[][] elements,
+            long writeOptionsHandle);
+
+    private static native void delete(long nativeHandle, int bucket, byte[] key, int column);
+
+    // typed get
+    private static native Object[] getTyped(long nativeHandle, int bucket, byte[] key);
+
+    private static native Object[] getTypedWithOptions(
+            long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
+
+    // typed scan
+    private static native long openStructuredScanCursor(
+            long nativeHandle,
+            int bucket,
+            byte[] startKeyInclusive,
+            byte[] endKeyExclusive,
+            long scanOptionsHandle);
+
+    private static native int nowSeconds(long nativeHandle);
+
+    private static native void setTime(long nativeHandle, int nextSeconds);
+
+    private static native void asyncSnapshot(
+            long nativeHandle, CompletableFuture<Long> snapshotIdFuture);
+
+    private static native boolean retainSnapshot(long nativeHandle, long snapshotId);
+
+    private static native boolean expireSnapshot(long nativeHandle, long snapshotId);
+
+    private static native String listSnapshotsJson(long nativeHandle);
+}

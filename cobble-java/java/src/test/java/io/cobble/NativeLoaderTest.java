@@ -35,7 +35,6 @@ class NativeLoaderTest {
     void dbAndStructuredDbExposeNativeMethods() {
         assertNotNull(Db.class);
         assertNotNull(SingleDb.class);
-        assertNotNull(StructuredDb.class);
         assertNotNull(ReadOnlyDb.class);
         assertNotNull(Reader.class);
         assertNotNull(DbCoordinator.class);
