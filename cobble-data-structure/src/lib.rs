@@ -1,3 +1,46 @@
+//! Structured wrapper crate on top of `cobble`.
+//!
+//! This crate mirrors Cobble's main usage flows, but with typed structured
+//! columns (`Bytes` / `List`) and typed decode/encode wrappers.
+//!
+//! # 1) Single-machine embedded (`StructuredSingleDb`)
+//!
+//! ```rust,ignore
+//! use cobble::{Config, VolumeDescriptor};
+//! use cobble_data_structure::{StructuredSchema, StructuredSingleDb};
+//!
+//! let mut config = Config::default();
+//! config.num_columns = 2;
+//! config.total_buckets = 1;
+//! config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-ssingle".to_string());
+//!
+//! let db = StructuredSingleDb::open(config, StructuredSchema::default())?;
+//! db.put(0, b"k1", 0, b"v1".to_vec())?;
+//! let snapshot_id = db.snapshot()?;
+//! let snapshots = db.list_snapshots()?;
+//! # let _ = (snapshot_id, snapshots);
+//! # Ok::<(), cobble::Error>(())
+//! ```
+//!
+//! # 2) Distributed write path wrappers
+//!
+//! Use `StructuredDb` on shard writers and keep coordinator/global snapshot flow
+//! identical to `cobble::Db` + `cobble::DbCoordinator`.
+//!
+//! # 3) Real-time reading wrappers (`StructuredReader`)
+//!
+//! `StructuredReader` follows global snapshots like `cobble::Reader`, but returns
+//! typed structured rows.
+//!
+//! # 4) Distributed scan wrappers
+//!
+//! Use `StructuredScanPlan` / `StructuredScanSplit` / `StructuredScanSplitScanner`
+//! for snapshot-based distributed scan with structured row decoding.
+//!
+//! # 5) Fixed snapshot read wrappers
+//!
+//! Use `StructuredReadOnlyDb` for pinned-snapshot reads with structured decoding.
+//!
 #![crate_type = "lib"]
 
 mod list;

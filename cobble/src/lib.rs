@@ -1,3 +1,94 @@
+//! Cobble core Rust library.
+//!
+//! Cobble is an LSM-based key-value storage engine with snapshots, distributed
+//! coordination primitives, read proxies, and distributed scan planning.
+//!
+//! This crate supports step-0 config guidance + five common usage flows:
+//!
+//! # 0) Config and volume layout
+//!
+//! Define `Config` first, especially `volumes`:
+//!
+//! - `PrimaryDataPriorityHigh/Medium/Low`: primary data files (SST/parquet/VLOG)
+//! - `Meta`: metadata files (manifests, pointers, schema files)
+//! - `Snapshot`: snapshot materialization target
+//! - `Cache`: disk tier for hybrid block cache
+//! - `Readonly`: read-only source volume for historical loading
+//!
+//! Minimum practical configuration:
+//! `VolumeDescriptor::single_volume("file:///path".to_string())`.
+//!
+//! IMPORTANT: for any restore/resume flow, the runtime must be able to access all
+//! files referenced by the target snapshot manifests. Missing/inaccessible files
+//! will cause restore to fail.
+//!
+//! # 1) Single-machine embedded (`SingleDb`)
+//!
+//! Use `SingleDb` when you want one-process/one-node write+read with automatic
+//! single-node global snapshot materialization.
+//!
+//! ```rust,ignore
+//! use cobble::{Config, SingleDb, VolumeDescriptor};
+//!
+//! let mut config = Config::default();
+//! config.num_columns = 2;
+//! config.total_buckets = 1;
+//! config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-single".to_string());
+//!
+//! let db = SingleDb::open(config.clone())?;
+//! db.put(0, b"k1", 0, b"v1")?;
+//! let global_snapshot_id = db.snapshot()?;
+//!
+//! // Recovery/read-write path from a global snapshot:
+//! let resumed = SingleDb::resume(config, global_snapshot_id)?;
+//! let row = resumed.get(0, b"k1")?;
+//! # Ok::<(), cobble::Error>(())
+//! ```
+//!
+//! # 2) Distributed write path (`N x Db` + `1 x DbCoordinator`)
+//!
+//! Each shard runs one `Db` over its bucket ranges. A shared `DbCoordinator`
+//! materializes global snapshots from all shard snapshots.
+//!
+//! - Write/read normally on each shard `Db`.
+//! - Trigger `Db::snapshot` (or `snapshot_with_callback`) on each shard.
+//! - Build `ShardSnapshotInput` list and call:
+//!   - `DbCoordinator::take_global_snapshot(...)`
+//!   - `DbCoordinator::materialize_global_snapshot(...)`
+//!
+//! Restore sequence for historical recovery:
+//! - restore coordinator view first (load global snapshot / current pointer),
+//! - then restore each shard with `Db::open_from_snapshot(config, shard_snapshot_id, db_id)`,
+//! - continue read/write on restored shard DBs.
+//!
+//! Remote compaction (optional):
+//! - start `RemoteCompactionServer::new(server_config)?.serve("host:port")`,
+//! - set writer `Config.compaction_remote_addr = Some("host:port".to_string())`,
+//! - open `Db` as normal; compaction tasks are sent to remote worker.
+//!
+//! # 3) Real-time reading while writing (`Reader`)
+//!
+//! Use `Reader` to serve reads while writers keep writing and periodically
+//! materializing new global snapshots.
+//!
+//! - `Reader::open_current(reader_config)` follows current pointer.
+//! - call `reader.refresh()` to pick newer global snapshot.
+//! - use `reader.get(...)` / `reader.scan(...)` for query traffic.
+//!
+//! # 4) Distributed scan on one snapshot (`ScanPlan` / `ScanSplit`)
+//!
+//! Given one `GlobalSnapshotManifest`:
+//! - build `ScanPlan::new(manifest)`,
+//! - optionally set `with_start`/`with_end`,
+//! - distribute `ScanSplit`s to workers,
+//! - each worker calls `split.create_scanner(config, &scan_options)`.
+//!
+//! # 5) Structured wrappers
+//!
+//! For typed column wrappers, see `cobble-data-structure`:
+//! `StructuredDb`, `StructuredSingleDb`, `StructuredReader`,
+//! `StructuredReadOnlyDb`, `StructuredScanPlan`, and `StructuredScanSplit`.
+//!
 #![crate_type = "lib"]
 #![allow(dead_code)]
 
