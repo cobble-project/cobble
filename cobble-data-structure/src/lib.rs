@@ -5,6 +5,7 @@ mod structured_db;
 mod structured_read_only_db;
 mod structured_reader;
 mod structured_remote_compaction_server;
+mod structured_scan;
 mod structured_single_db;
 
 pub use list::{ListConfig, ListRetainMode};
@@ -16,4 +17,5 @@ pub use structured_db::{
 pub use structured_read_only_db::StructuredReadOnlyDb;
 pub use structured_reader::StructuredReader;
 pub use structured_remote_compaction_server::StructuredRemoteCompactionServer;
+pub use structured_scan::{StructuredScanPlan, StructuredScanSplit, StructuredScanSplitScanner};
 pub use structured_single_db::StructuredSingleDb;
