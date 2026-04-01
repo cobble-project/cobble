@@ -1,6 +1,7 @@
 use crate::structured_db::{
     StructuredColumnValue, StructuredDbIterator, StructuredSchema, combined_resolver, decode_row,
-    load_structured_schema_from_cobble_schema,
+    load_structured_schema_from_cobble_schema, project_decoded_row_for_read,
+    project_structured_schema_for_scan,
 };
 use cobble::{Config, MergeOperatorResolver, ReadOnlyDb, ReadOptions, Result, ScanOptions};
 use std::ops::Range;
@@ -59,9 +60,14 @@ impl StructuredReadOnlyDb {
         key: &[u8],
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<StructuredColumnValue>>>> {
-        let raw = self.db.get_with_options(bucket, key, options)?;
+        let raw = if options.column_indices.is_some() {
+            self.db.get(bucket, key)?
+        } else {
+            self.db.get_with_options(bucket, key, options)?
+        };
         raw.map(|columns| decode_row(&self.structured_schema, 0, columns))
             .transpose()
+            .map(|row| row.map(|decoded| project_decoded_row_for_read(decoded, options)))
     }
 
     pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<StructuredDbIterator<'static>> {
@@ -75,11 +81,8 @@ impl StructuredReadOnlyDb {
         options: &ScanOptions,
     ) -> Result<StructuredDbIterator<'static>> {
         let inner = self.db.scan_with_options(bucket, range, options)?;
-        Ok(StructuredDbIterator::new(
-            inner,
-            Arc::clone(&self.structured_schema),
-            0,
-        ))
+        let projected_schema = project_structured_schema_for_scan(&self.structured_schema, options);
+        Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 }
 
@@ -90,7 +93,7 @@ mod tests {
     use crate::list::{ListConfig, ListRetainMode};
     use crate::structured_db::StructuredDb;
     use bytes::Bytes;
-    use cobble::VolumeDescriptor;
+    use cobble::{ReadOptions, VolumeDescriptor};
     use std::collections::BTreeMap;
     use std::thread;
     use std::time::Duration;
@@ -178,6 +181,39 @@ mod tests {
 
         let rodb = StructuredReadOnlyDb::open(config, snap_id, db_id).unwrap();
         assert!(rodb.get(0, b"no-such-key").unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_structured_read_only_db_get_with_projection_reindexes_schema() {
+        let root = format!("/tmp/ds_readonly_get_projection_{}", Uuid::new_v4());
+        let config = test_config(&root);
+
+        let db = StructuredDb::open(config.clone(), vec![0u16..=0u16], test_schema()).unwrap();
+        db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
+            .unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"b")])
+            .unwrap();
+        let snap_id = db.snapshot().unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let db_id = db.id().to_string();
+        db.close().unwrap();
+
+        let rodb = StructuredReadOnlyDb::open(config, snap_id, db_id).unwrap();
+        let row = rodb
+            .get_with_options(0, b"k1", &ReadOptions::for_column(1))
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(row.len(), 1);
+        assert_eq!(
+            row[0],
+            Some(StructuredColumnValue::List(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]))
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

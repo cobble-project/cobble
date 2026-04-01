@@ -1,6 +1,7 @@
 use crate::structured_db::{
     StructuredColumnValue, StructuredDbIterator, StructuredSchema, combined_resolver, decode_row,
-    load_structured_schema_from_cobble_schema,
+    load_structured_schema_from_cobble_schema, project_decoded_row_for_read,
+    project_structured_schema_for_scan,
 };
 use cobble::{
     GlobalSnapshotManifest, GlobalSnapshotSummary, ReadOnlyDb, ReadOptions, Reader, ReaderConfig,
@@ -59,9 +60,14 @@ impl StructuredReader {
         key: &[u8],
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<StructuredColumnValue>>>> {
-        let raw = self.reader.get_with_options(bucket_id, key, options)?;
+        let raw = if options.column_indices.is_some() {
+            self.reader.get(bucket_id, key)?
+        } else {
+            self.reader.get_with_options(bucket_id, key, options)?
+        };
         raw.map(|columns| decode_row(&self.structured_schema, 0, columns))
             .transpose()
+            .map(|row| row.map(|decoded| project_decoded_row_for_read(decoded, options)))
     }
 
     pub fn scan(
@@ -79,11 +85,8 @@ impl StructuredReader {
         options: &ScanOptions,
     ) -> Result<StructuredDbIterator<'static>> {
         let inner = self.reader.scan_with_options(bucket_id, range, options)?;
-        Ok(StructuredDbIterator::new(
-            inner,
-            Arc::clone(&self.structured_schema),
-            0,
-        ))
+        let projected_schema = project_structured_schema_for_scan(&self.structured_schema, options);
+        Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
     // ── Snapshot management ─────────────────────────────────────────────
@@ -143,7 +146,7 @@ mod tests {
     use crate::list::{ListConfig, ListRetainMode};
     use crate::structured_single_db::StructuredSingleDb;
     use bytes::Bytes;
-    use cobble::VolumeDescriptor;
+    use cobble::{ReadOptions, VolumeDescriptor};
     use std::collections::BTreeMap;
     use std::thread;
     use std::time::Duration;
@@ -242,6 +245,42 @@ mod tests {
         assert_eq!(
             row[0],
             Some(StructuredColumnValue::Bytes(Bytes::from_static(b"v0")))
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_structured_reader_get_with_projection_reindexes_schema() {
+        let root = format!("/tmp/ds_reader_get_projection_{}", Uuid::new_v4());
+
+        let db = StructuredSingleDb::open(test_config(&root), test_schema()).unwrap();
+        db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
+            .unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"b")])
+            .unwrap();
+        let snap_id = db.snapshot().unwrap();
+        thread::sleep(Duration::from_millis(200));
+        db.close().unwrap();
+
+        let read_config = ReaderConfig {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            total_buckets: 2,
+            ..ReaderConfig::default()
+        };
+        let mut reader = StructuredReader::open(read_config, snap_id).unwrap();
+        let row = reader
+            .get_with_options(0, b"k1", &ReadOptions::for_column(1))
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(row.len(), 1);
+        assert_eq!(
+            row[0],
+            Some(StructuredColumnValue::List(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]))
         );
 
         let _ = std::fs::remove_dir_all(root);

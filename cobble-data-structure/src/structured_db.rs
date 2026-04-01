@@ -82,6 +82,42 @@ pub(crate) fn decode_row(
         .collect()
 }
 
+pub(crate) fn project_structured_schema_for_indices(
+    schema: &StructuredSchema,
+    column_indices: Option<&[usize]>,
+) -> Arc<StructuredSchema> {
+    let Some(indices) = column_indices else {
+        return Arc::new(schema.clone());
+    };
+    let mut columns = BTreeMap::new();
+    for (projected_idx, original_idx) in indices.iter().enumerate() {
+        if let Some(column_type) = schema.columns.get(&(*original_idx as u16)) {
+            columns.insert(projected_idx as u16, column_type.clone());
+        }
+    }
+    Arc::new(StructuredSchema { columns })
+}
+
+pub(crate) fn project_structured_schema_for_scan(
+    schema: &StructuredSchema,
+    options: &ScanOptions,
+) -> Arc<StructuredSchema> {
+    project_structured_schema_for_indices(schema, options.column_indices.as_deref())
+}
+
+pub(crate) fn project_decoded_row_for_read(
+    row: Vec<Option<StructuredColumnValue>>,
+    options: &ReadOptions,
+) -> Vec<Option<StructuredColumnValue>> {
+    let Some(indices) = options.column_indices.as_deref() else {
+        return row;
+    };
+    indices
+        .iter()
+        .map(|&idx| row.get(idx).cloned().unwrap_or(None))
+        .collect()
+}
+
 pub(crate) fn load_structured_schema_from_cobble_schema(
     schema: &Schema,
 ) -> Result<StructuredSchema> {
@@ -420,9 +456,14 @@ impl StructuredDb {
     where
         K: AsRef<[u8]>,
     {
-        let raw = self.db.get_with_options(bucket, key.as_ref(), options)?;
+        let raw = if options.column_indices.is_some() {
+            self.db.get(bucket, key.as_ref())?
+        } else {
+            self.db.get_with_options(bucket, key.as_ref(), options)?
+        };
         raw.map(|columns| decode_row(&self.structured_schema, 0, columns))
             .transpose()
+            .map(|row| row.map(|decoded| project_decoded_row_for_read(decoded, options)))
     }
 
     pub fn scan<'a>(
@@ -440,11 +481,8 @@ impl StructuredDb {
         options: &ScanOptions,
     ) -> Result<StructuredDbIterator<'a>> {
         let inner = self.db.scan_with_options(bucket, range, options)?;
-        Ok(StructuredDbIterator::new(
-            inner,
-            Arc::clone(&self.structured_schema),
-            0,
-        ))
+        let projected_schema = project_structured_schema_for_scan(&self.structured_schema, options);
+        Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
     pub fn snapshot(&self) -> Result<u64> {
@@ -582,7 +620,7 @@ fn apply_structured_schema(
 mod tests {
     use super::*;
     use crate::list::{ListConfig, ListRetainMode};
-    use cobble::VolumeDescriptor;
+    use cobble::{ReadOptions, VolumeDescriptor};
     use std::thread;
     use std::time::Duration;
     use uuid::Uuid;
@@ -759,11 +797,102 @@ mod tests {
         };
         let db = StructuredDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
         let mut batch = db.new_write_batch();
-        assert!(
-            batch
-                .put(0, b"k1", 1, Bytes::from_static(b"not-a-list"))
-                .is_err()
+        let err = batch
+            .put(0, b"k1", 1, Bytes::from_static(b"not-a-list"))
+            .expect_err("type mismatch should fail");
+        match err {
+            Error::InputError(msg) => assert!(msg.contains("column 1 expects")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_structured_scan_with_projection_reindexes_schema() {
+        let root = format!("/tmp/ds_structured_scan_projection_{}", Uuid::new_v4());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            num_columns: 2,
+            ..Config::default()
+        };
+        let structured_schema = StructuredSchema {
+            columns: BTreeMap::from([(
+                1,
+                StructuredColumnType::List(ListConfig {
+                    max_elements: Some(8),
+                    retain_mode: ListRetainMode::Last,
+                    preserve_element_ttl: false,
+                }),
+            )]),
+        };
+        let db = StructuredDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
+            .unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"b")])
+            .unwrap();
+
+        let mut iter = db
+            .scan_with_options(
+                0,
+                b"k0".as_ref()..b"k9".as_ref(),
+                &ScanOptions::for_column(1),
+            )
+            .unwrap();
+        let first = iter.next().expect("one row").unwrap();
+        assert_eq!(first.0.as_ref(), b"k1");
+        assert_eq!(first.1.len(), 1);
+        assert_eq!(
+            first.1[0],
+            Some(StructuredColumnValue::List(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]))
         );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_structured_get_with_projection_reindexes_schema() {
+        let root = format!("/tmp/ds_structured_get_projection_{}", Uuid::new_v4());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            num_columns: 2,
+            ..Config::default()
+        };
+        let structured_schema = StructuredSchema {
+            columns: BTreeMap::from([(
+                1,
+                StructuredColumnType::List(ListConfig {
+                    max_elements: Some(8),
+                    retain_mode: ListRetainMode::Last,
+                    preserve_element_ttl: false,
+                }),
+            )]),
+        };
+        let db = StructuredDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
+            .unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"b")])
+            .unwrap();
+
+        let row = db
+            .get_with_options(0, b"k1", &ReadOptions::for_column(1))
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(row.len(), 1);
+        assert_eq!(
+            row[0],
+            Some(StructuredColumnValue::List(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]))
+        );
+
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }

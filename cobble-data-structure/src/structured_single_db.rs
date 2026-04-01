@@ -1,6 +1,7 @@
 use crate::structured_db::{
     StructuredColumnValue, StructuredDbIterator, StructuredSchema, StructuredWriteBatch,
-    decode_row, encode_for_write, persist_structured_schema_on_db,
+    decode_row, encode_for_write, persist_structured_schema_on_db, project_decoded_row_for_read,
+    project_structured_schema_for_scan,
 };
 use cobble::{Config, ReadOptions, Result, ScanOptions, SingleDb, WriteOptions};
 use std::ops::Range;
@@ -131,9 +132,14 @@ impl StructuredSingleDb {
     where
         K: AsRef<[u8]>,
     {
-        let raw = self.db.get_with_options(bucket, key.as_ref(), options)?;
+        let raw = if options.column_indices.is_some() {
+            self.db.get(bucket, key.as_ref())?
+        } else {
+            self.db.get_with_options(bucket, key.as_ref(), options)?
+        };
         raw.map(|columns| decode_row(&self.structured_schema, 0, columns))
             .transpose()
+            .map(|row| row.map(|decoded| project_decoded_row_for_read(decoded, options)))
     }
 
     pub fn scan<'a>(
@@ -151,11 +157,8 @@ impl StructuredSingleDb {
         options: &ScanOptions,
     ) -> Result<StructuredDbIterator<'a>> {
         let inner = self.db.scan_with_options(bucket, range, options)?;
-        Ok(StructuredDbIterator::new(
-            inner,
-            Arc::clone(&self.structured_schema),
-            0,
-        ))
+        let projected_schema = project_structured_schema_for_scan(&self.structured_schema, options);
+        Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
     // ── Snapshot lifecycle ───────────────────────────────────────────────
@@ -198,7 +201,7 @@ mod tests {
     use crate::StructuredColumnType;
     use crate::list::{ListConfig, ListRetainMode};
     use bytes::Bytes;
-    use cobble::VolumeDescriptor;
+    use cobble::{ReadOptions, VolumeDescriptor};
     use std::collections::BTreeMap;
     use std::thread;
     use std::time::Duration;
@@ -319,6 +322,33 @@ mod tests {
         let snapshots = db.list_snapshots().unwrap();
         assert!(!snapshots.is_empty());
         assert_eq!(snapshots[0].id, snap_id);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_structured_single_db_get_with_projection_reindexes_schema() {
+        let root = format!("/tmp/ds_single_get_projection_{}", Uuid::new_v4());
+        let db = StructuredSingleDb::open(test_config(&root), test_schema()).unwrap();
+        db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
+            .unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"b")])
+            .unwrap();
+
+        let row = db
+            .get_with_options(0, b"k1", &ReadOptions::for_column(1))
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(row.len(), 1);
+        assert_eq!(
+            row[0],
+            Some(StructuredColumnValue::List(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]))
+        );
 
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
