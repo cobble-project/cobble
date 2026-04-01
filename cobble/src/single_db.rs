@@ -46,6 +46,49 @@ impl SingleDb {
         })
     }
 
+    /// Resume a single-node DB from a materialized global snapshot id.
+    ///
+    /// This restores the local writer state from the shard snapshot referenced by
+    /// `global_snapshot_id`, while keeping single-node snapshot APIs available.
+    pub fn resume(config: Config, global_snapshot_id: u64) -> Result<Self> {
+        let total_buckets = config.total_buckets;
+        if total_buckets == 0 || total_buckets > (u16::MAX as u32) + 1 {
+            return Err(Error::ConfigError(
+                "total_buckets must be in range 1..=65536".to_string(),
+            ));
+        }
+        let coordinator = Arc::new(DbCoordinator::open(CoordinatorConfig::from_config(
+            &config,
+        ))?);
+        let global = coordinator.load_global_snapshot(global_snapshot_id)?;
+        if global.total_buckets != total_buckets {
+            return Err(Error::ConfigError(format!(
+                "global snapshot total_buckets {} mismatches config total_buckets {}",
+                global.total_buckets, total_buckets
+            )));
+        }
+        if global.shard_snapshots.len() != 1 {
+            return Err(Error::InvalidState(format!(
+                "single db resume expects exactly 1 shard snapshot in global snapshot {}, got {}",
+                global_snapshot_id,
+                global.shard_snapshots.len()
+            )));
+        }
+        let shard = &global.shard_snapshots[0];
+        let db = Arc::new(Db::open_from_snapshot(
+            config,
+            shard.snapshot_id,
+            shard.db_id.clone(),
+        )?);
+        Ok(Self {
+            db,
+            coordinator,
+            total_buckets,
+            snapshot_state: Arc::new(Mutex::new(SingleNodeSnapshotState::default())),
+            snapshot_done: Arc::new(Condvar::new()),
+        })
+    }
+
     fn begin_snapshot_in_flight(&self) -> Result<()> {
         let mut state = self.snapshot_state.lock().unwrap();
         if state.closing {
@@ -287,5 +330,42 @@ impl SingleDb {
             )));
         }
         Ok(shard_ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VolumeDescriptor;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_single_db_resume_from_global_snapshot() {
+        let root = format!("/tmp/single_db_resume_{}", Uuid::new_v4());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            total_buckets: 1,
+            num_columns: 2,
+            ..Config::default()
+        };
+        let snapshot_id = {
+            let db = SingleDb::open(config.clone()).unwrap();
+            db.put(0, b"k1", 0, b"v1").unwrap();
+            db.put(0, b"k2", 1, b"v2").unwrap();
+            let snapshot_id = db.snapshot().unwrap();
+            db.close().unwrap();
+            snapshot_id
+        };
+
+        let resumed = SingleDb::resume(config, snapshot_id).unwrap();
+        let row1 = resumed.get(0, b"k1").unwrap().unwrap();
+        assert_eq!(row1[0].as_deref(), Some(&b"v1"[..]));
+        let row2 = resumed.get(0, b"k2").unwrap().unwrap();
+        assert_eq!(row2[1].as_deref(), Some(&b"v2"[..]));
+        resumed.put(0, b"k3", 0, b"v3").unwrap();
+        let row3 = resumed.get(0, b"k3").unwrap().unwrap();
+        assert_eq!(row3[0].as_deref(), Some(&b"v3"[..]));
+        resumed.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

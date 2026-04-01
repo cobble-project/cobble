@@ -32,6 +32,30 @@ public final class SingleDb extends NativeObject {
         return new SingleDb(nativeHandle);
     }
 
+    /** Resume a single-node DB from an existing global snapshot id. */
+    public static SingleDb resume(String configPath, long globalSnapshotId) {
+        NativeLoader.load();
+        long nativeHandle = openFromGlobalSnapshotHandle(configPath, globalSnapshotId);
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("failed to resume single db from global snapshot");
+        }
+        return new SingleDb(nativeHandle);
+    }
+
+    /** Resume a single-node DB from an existing global snapshot id. */
+    public static SingleDb resume(Config config, long globalSnapshotId) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle = openFromGlobalSnapshotHandleFromJson(config.toJson(), globalSnapshotId);
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException(
+                    "failed to resume single db from global snapshot config json");
+        }
+        return new SingleDb(nativeHandle);
+    }
+
     public void put(int bucket, byte[] key, int column, byte[] value) {
         put(nativeHandle, bucket, key, column, value);
     }
@@ -155,6 +179,12 @@ public final class SingleDb extends NativeObject {
     private static native long openHandle(String configPath);
 
     private static native long openHandleFromJson(String configJson);
+
+    private static native long openFromGlobalSnapshotHandle(
+            String configPath, long globalSnapshotId);
+
+    private static native long openFromGlobalSnapshotHandleFromJson(
+            String configJson, long globalSnapshotId);
 
     private static native void put(
             long nativeHandle, int bucket, byte[] key, int column, byte[] value);

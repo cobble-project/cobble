@@ -547,7 +547,7 @@ impl AtomicMetadataWriter {
         let mut writer = writer;
         writer.close()?;
         self.fs.rename(&self.temp_path, &self.final_path)?;
-        let tracked = Arc::new(TrackedFile::new(
+        let tracked = Arc::new(TrackedFile::readonly(
             self.final_path.clone(),
             Arc::clone(&self.fs),
             self.volume.clone(),
@@ -1487,7 +1487,7 @@ impl FileManager {
 
         // Track the file if not already tracked
         if !self.metadata_files.contains_key(name) {
-            let tracked = Arc::new(TrackedFile::new(
+            let tracked = Arc::new(TrackedFile::readonly(
                 path.to_string(),
                 Arc::clone(self.meta_volume.fs()),
                 Some(Arc::clone(&self.meta_volume)),

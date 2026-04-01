@@ -451,6 +451,37 @@ class DbBindingTest {
     }
 
     @Test
+    void singleDbResumeFromGlobalSnapshot() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-single-resume-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        Path configPath = writeConfigFile(dataDir, config);
+
+        long globalSnapshotId;
+        try (SingleDb db = SingleDb.open(configPath.toString())) {
+            for (int i = 0; i < 120; i++) {
+                db.put(0, keyBytes("single-resume", i), 0, valueBytes("single-resume-v", i));
+            }
+            GlobalSnapshot globalSnapshot = db.snapshot();
+            assertNotNull(globalSnapshot);
+            globalSnapshotId = globalSnapshot.id;
+            assertTrue(db.retainSnapshot(globalSnapshotId));
+        }
+
+        try (SingleDb resumed = SingleDb.resume(configPath.toString(), globalSnapshotId)) {
+            for (int i = 0; i < 120; i++) {
+                assertArrayEquals(
+                        valueBytes("single-resume-v", i),
+                        resumed.get(0, keyBytes("single-resume", i), 0));
+            }
+            resumed.put(
+                    0, keyBytes("single-resume-new", 1), 0, valueBytes("single-resume-new-v", 1));
+            assertArrayEquals(
+                    valueBytes("single-resume-new-v", 1),
+                    resumed.get(0, keyBytes("single-resume-new", 1), 0));
+        }
+    }
+
+    @Test
     void snapshotRestoreAndResumeFlow() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-restore-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);

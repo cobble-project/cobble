@@ -73,6 +73,82 @@ pub extern "system" fn Java_io_cobble_SingleDb_openHandleFromJson(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openFromGlobalSnapshotHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    global_snapshot_id: jlong,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let global_snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let db = match SingleDb::resume(config, global_snapshot_id) {
+        Ok(db) => db,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(db)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openFromGlobalSnapshotHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    global_snapshot_id: jlong,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match serde_json::from_str::<Config>(&json) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_argument(&mut env, format!("invalid config json: {}", err));
+            return 0;
+        }
+    };
+    let global_snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let db = match SingleDb::resume(config, global_snapshot_id) {
+        Ok(db) => db,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(db)) as jlong
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_SingleDb_disposeInternal(
     mut env: JNIEnv,
     _obj: JObject,
