@@ -1123,6 +1123,56 @@ class DbBindingTest {
     }
 
     @Test
+    void distributedScanPlanSplitCursorRoundTrip() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-dist-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        try (Db db = Db.open(config)) {
+            int count = 60;
+            for (int i = 0; i < count; i++) {
+                byte[] key = scanKeyBytes("dscan", i);
+                db.put(0, key, 0, valueBytes("dscan-v0", i));
+                db.put(0, key, 1, valueBytes("dscan-v1", i));
+            }
+            ShardSnapshot shardSnapshot = db.snapshot();
+            assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
+
+            GlobalSnapshot globalSnapshot;
+            try (DbCoordinator coordinator = DbCoordinator.open(config)) {
+                globalSnapshot =
+                        coordinator.materializeGlobalSnapshot(
+                                1,
+                                shardSnapshot.snapshotId,
+                                Collections.singletonList(shardSnapshot));
+            }
+            assertNotNull(globalSnapshot);
+
+            ScanPlan plan =
+                    ScanPlan.fromGlobalSnapshot(globalSnapshot)
+                            .withStart(scanKeyBytes("dscan", 10))
+                            .withEnd(scanKeyBytes("dscan", 30));
+            List<ScanSplit> splits = plan.splits();
+            assertEquals(1, splits.size());
+
+            ScanSplit split = ScanSplit.fromJson(splits.get(0).toJson());
+            try (ScanOptions options = new ScanOptions().batchSize(9).columns(1);
+                    ScanCursor cursor = split.openScannerWithOptions(config, options)) {
+                List<ScanCursor.Entry> entries = new ArrayList<ScanCursor.Entry>();
+                for (ScanCursor.Entry entry : cursor) {
+                    entries.add(entry);
+                }
+                assertEquals(20, entries.size());
+                for (int i = 0; i < entries.size(); i++) {
+                    int expected = 10 + i;
+                    ScanCursor.Entry entry = entries.get(i);
+                    assertArrayEquals(scanKeyBytes("dscan", expected), entry.key);
+                    assertEquals(1, entry.columns.length);
+                    assertArrayEquals(valueBytes("dscan-v1", expected), entry.columns[0]);
+                }
+            }
+        }
+    }
+
+    @Test
     void structuredScanCursorForEachLoop() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-structured-foreach-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);

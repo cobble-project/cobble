@@ -1,6 +1,10 @@
 package io.cobble.structured;
 
 import io.cobble.Config;
+import io.cobble.DbCoordinator;
+import io.cobble.GlobalSnapshot;
+import io.cobble.ScanOptions;
+import io.cobble.ShardSnapshot;
 
 import org.junit.jupiter.api.Test;
 
@@ -333,6 +337,82 @@ class StructuredDbTest {
             assertArrayEquals("c".getBytes(StandardCharsets.UTF_8), list[0]);
             assertArrayEquals("d".getBytes(StandardCharsets.UTF_8), list[1]);
             assertArrayEquals("e".getBytes(StandardCharsets.UTF_8), list[2]);
+        }
+    }
+
+    @Test
+    void structuredDistributedScanPlanSplitCursorRoundTrip() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-dist-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        Schema schema =
+                Schema.builder()
+                        .addBytesColumn(0)
+                        .addListColumn(1, ListConfig.of(50, ListRetainMode.LAST))
+                        .build();
+
+        try (Db db = Db.open(config, schema)) {
+            int count = 40;
+            for (int i = 0; i < count; i++) {
+                byte[] key = String.format("dscan-%04d", i).getBytes(StandardCharsets.UTF_8);
+                db.put(
+                        0,
+                        key,
+                        0,
+                        ColumnValue.ofBytes(("bytes-" + i).getBytes(StandardCharsets.UTF_8)));
+                db.merge(
+                        0,
+                        key,
+                        1,
+                        ColumnValue.ofList(
+                                new byte[][] {
+                                    ("el-" + i).getBytes(StandardCharsets.UTF_8),
+                                }));
+            }
+
+            ShardSnapshot shardSnapshot = db.snapshot();
+            assertNotNull(shardSnapshot);
+            assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
+
+            GlobalSnapshot globalSnapshot;
+            try (DbCoordinator coordinator = DbCoordinator.open(config)) {
+                globalSnapshot =
+                        coordinator.materializeGlobalSnapshot(
+                                1,
+                                shardSnapshot.snapshotId,
+                                java.util.Collections.singletonList(shardSnapshot));
+            }
+            assertNotNull(globalSnapshot);
+
+            StructuredScanPlan plan =
+                    StructuredScanPlan.fromGlobalSnapshot(globalSnapshot)
+                            .withStart("dscan-0010".getBytes(StandardCharsets.UTF_8))
+                            .withEnd("dscan-0030".getBytes(StandardCharsets.UTF_8));
+            java.util.List<StructuredScanSplit> splits = plan.splits();
+            assertEquals(1, splits.size());
+
+            StructuredScanSplit split = StructuredScanSplit.fromJson(splits.get(0).toJson());
+            try (ScanOptions options = new ScanOptions().batchSize(7).columns(1);
+                    ScanCursor cursor = split.openScannerWithOptions(config, options)) {
+                java.util.List<Row> rows = new ArrayList<Row>();
+                for (Row row : cursor) {
+                    rows.add(row);
+                }
+                assertEquals(20, rows.size());
+                for (int i = 0; i < rows.size(); i++) {
+                    int expected = 10 + i;
+                    Row row = rows.get(i);
+                    assertArrayEquals(
+                            String.format("dscan-%04d", expected).getBytes(StandardCharsets.UTF_8),
+                            row.getKey());
+                    assertEquals(1, row.getColumnCount());
+                    assertNotNull(row.getColumnValue(0));
+                    assertTrue(row.getColumnValue(0).isList());
+                    byte[][] list = row.getList(0);
+                    assertEquals(1, list.length);
+                    assertArrayEquals(("el-" + expected).getBytes(StandardCharsets.UTF_8), list[0]);
+                }
+            }
         }
     }
 

@@ -1,10 +1,11 @@
 use crate::util::{
-    decode_column_index, decode_java_bytes, decode_u16, throw_illegal_argument, throw_illegal_state,
+    decode_column_index, decode_java_bytes, decode_java_string, decode_u16, throw_illegal_argument,
+    throw_illegal_state,
 };
 use bytes::Bytes;
-use cobble::{DbIterator, Result, ScanOptions};
+use cobble::{Config, DbIterator, Result, ScanOptions, ScanSplit, ScanSplitScanner};
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JIntArray, JObject, JValue};
+use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString, JValue};
 use jni::sys::{jint, jlong, jobject};
 use std::sync::OnceLock;
 
@@ -83,6 +84,11 @@ pub(crate) struct ScanCursorHandle {
 type ScanValues = Vec<Option<Vec<u8>>>;
 type ScanRow = (Vec<u8>, ScanValues);
 
+enum ScanCursorIter {
+    Db(DbIterator<'static>),
+    Split(ScanSplitScanner),
+}
+
 impl ScanCursorHandle {
     pub(crate) fn from_static_iter(
         iter: DbIterator<'static>,
@@ -90,7 +96,21 @@ impl ScanCursorHandle {
     ) -> ScanCursorHandle {
         ScanCursorHandle {
             inner: Box::new(StaticScanCursorInner {
-                iter,
+                iter: ScanCursorIter::Db(iter),
+                batch_size,
+                pending: None,
+                exhausted: false,
+            }),
+        }
+    }
+
+    pub(crate) fn from_split_scanner(
+        iter: ScanSplitScanner,
+        batch_size: usize,
+    ) -> ScanCursorHandle {
+        ScanCursorHandle {
+            inner: Box::new(StaticScanCursorInner {
+                iter: ScanCursorIter::Split(iter),
                 batch_size,
                 pending: None,
                 exhausted: false,
@@ -104,7 +124,7 @@ impl ScanCursorHandle {
 }
 
 struct StaticScanCursorInner {
-    iter: DbIterator<'static>,
+    iter: ScanCursorIter,
     batch_size: usize,
     pending: Option<ScanRow>,
     exhausted: bool,
@@ -122,7 +142,7 @@ impl StaticScanCursorInner {
             values.push(value);
         }
         while keys.len() < self.batch_size {
-            let Some(row) = self.iter.next() else {
+            let Some(row) = self.next_row() else {
                 self.exhausted = true;
                 break;
             };
@@ -139,7 +159,7 @@ impl StaticScanCursorInner {
         let mut has_more = false;
         if !self.exhausted {
             loop {
-                match self.iter.next() {
+                match self.next_row() {
                     Some(Ok(row)) => {
                         if let Some(next_row) = convert_row(row) {
                             self.pending = Some(next_row);
@@ -161,6 +181,13 @@ impl StaticScanCursorInner {
             values,
             has_more,
         })
+    }
+
+    fn next_row(&mut self) -> Option<cobble::Result<(Bytes, Vec<Option<Bytes>>)>> {
+        match &mut self.iter {
+            ScanCursorIter::Db(iter) => iter.next(),
+            ScanCursorIter::Split(iter) => iter.next(),
+        }
     }
 }
 
@@ -338,6 +365,92 @@ pub extern "system" fn Java_io_cobble_ScanCursor_nextBatchInternal(
             std::ptr::null_mut()
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ScanSplit_openSplitScanCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    split_json: JString,
+    scan_options_handle: jlong,
+) -> jlong {
+    let config_path = match decode_java_string(&mut env, config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(&config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    open_split_scan_cursor(&mut env, config, split_json, scan_options_handle)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ScanSplit_openSplitScanCursorFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    split_json: JString,
+    scan_options_handle: jlong,
+) -> jlong {
+    let config_json = match decode_java_string(&mut env, config_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match serde_json::from_str::<Config>(&config_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, format!("invalid config json: {}", err));
+            return 0;
+        }
+    };
+    open_split_scan_cursor(&mut env, config, split_json, scan_options_handle)
+}
+
+fn open_split_scan_cursor(
+    env: &mut JNIEnv,
+    config: Config,
+    split_json: JString,
+    scan_options_handle: jlong,
+) -> jlong {
+    let split_json = match decode_java_string(env, split_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    let split = match serde_json::from_str::<ScanSplit>(&split_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, format!("invalid scan split json: {}", err));
+            return 0;
+        }
+    };
+    let Some(options_handle) = scan_options_from_handle_or_throw(env, scan_options_handle) else {
+        return 0;
+    };
+    let scanner = match split.create_scanner(config, options_handle.scan_options()) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(ScanCursorHandle::from_split_scanner(
+        scanner,
+        options_handle.batch_size(),
+    ))) as jlong
 }
 
 pub(crate) fn scan_options_from_handle_or_throw(

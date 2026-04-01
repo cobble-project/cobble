@@ -5,7 +5,7 @@
 // Typed scan cursor yields structured batches with mixed column types.
 
 use crate::read_options::read_options_from_handle_or_throw;
-use crate::scan::decode_scan_open_args;
+use crate::scan::{decode_scan_open_args, scan_options_from_handle_or_throw};
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_u16, decode_u64_from_jlong,
     throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
@@ -14,7 +14,8 @@ use crate::write_options::write_options_from_handle_or_throw;
 use bytes::Bytes;
 use cobble::Config;
 use cobble_data_structure::{
-    DataStructureDb, StructuredColumnValue, StructuredDbIterator, StructuredSchema,
+    DataStructureDb, StructuredColumnValue, StructuredDbIterator, StructuredScanSplit,
+    StructuredScanSplitScanner, StructuredSchema,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -717,6 +718,91 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredScanCursor(
     Box::into_raw(Box::new(cursor)) as jlong
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_StructuredScanSplit_openStructuredSplitScanCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    split_json: JString,
+    scan_options_handle: jlong,
+) -> jlong {
+    let config_path = match decode_java_string(&mut env, config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(&config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    open_structured_split_scan_cursor(&mut env, config, split_json, scan_options_handle)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_StructuredScanSplit_openStructuredSplitScanCursorFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    split_json: JString,
+    scan_options_handle: jlong,
+) -> jlong {
+    let config_json = match decode_java_string(&mut env, config_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match serde_json::from_str::<Config>(&config_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, format!("invalid config json: {}", err));
+            return 0;
+        }
+    };
+    open_structured_split_scan_cursor(&mut env, config, split_json, scan_options_handle)
+}
+
+fn open_structured_split_scan_cursor(
+    env: &mut JNIEnv,
+    config: Config,
+    split_json: JString,
+    scan_options_handle: jlong,
+) -> jlong {
+    let split_json = match decode_java_string(env, split_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    let split = match serde_json::from_str::<StructuredScanSplit>(&split_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, format!("invalid structured scan split json: {}", err));
+            return 0;
+        }
+    };
+    let Some(options_handle) = scan_options_from_handle_or_throw(env, scan_options_handle) else {
+        return 0;
+    };
+    let scanner = match split.create_scanner(config, options_handle.scan_options()) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            return 0;
+        }
+    };
+    let cursor =
+        StructuredScanCursorHandle::new_from_split_scanner(scanner, options_handle.batch_size());
+    Box::into_raw(Box::new(cursor)) as jlong
+}
+
 // ── metadata / time ─────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
@@ -893,16 +979,33 @@ pub extern "system" fn Java_io_cobble_structured_Db_getShardSnapshotJson(
 // ── structured scan cursor ──────────────────────────────────────────────────
 
 pub(crate) struct StructuredScanCursorHandle {
-    iter: StructuredDbIterator<'static>,
+    iter: StructuredScanCursorIter,
     batch_size: usize,
     pending: Option<(Bytes, Vec<Option<StructuredColumnValue>>)>,
     exhausted: bool,
 }
 
+pub(crate) enum StructuredScanCursorIter {
+    Db(StructuredDbIterator<'static>),
+    Split(StructuredScanSplitScanner),
+}
+
 impl StructuredScanCursorHandle {
     pub(crate) fn new(iter: StructuredDbIterator<'static>, batch_size: usize) -> Self {
         Self {
-            iter,
+            iter: StructuredScanCursorIter::Db(iter),
+            batch_size,
+            pending: None,
+            exhausted: false,
+        }
+    }
+
+    pub(crate) fn new_from_split_scanner(
+        scanner: StructuredScanSplitScanner,
+        batch_size: usize,
+    ) -> Self {
+        Self {
+            iter: StructuredScanCursorIter::Split(scanner),
             batch_size,
             pending: None,
             exhausted: false,
@@ -921,7 +1024,7 @@ impl StructuredScanCursorHandle {
             rows.push(cols);
         }
         while keys.len() < self.batch_size {
-            match self.iter.next() {
+            match self.next_row() {
                 Some(Ok((key, cols))) => {
                     keys.push(key.to_vec());
                     rows.push(cols);
@@ -939,7 +1042,7 @@ impl StructuredScanCursorHandle {
         }
         let mut has_more = false;
         if !self.exhausted {
-            match self.iter.next() {
+            match self.next_row() {
                 Some(Ok((key, cols))) => {
                     self.pending = Some((key, cols));
                     has_more = true;
@@ -956,6 +1059,13 @@ impl StructuredScanCursorHandle {
             rows,
             has_more,
         })
+    }
+
+    fn next_row(&mut self) -> Option<cobble::Result<(Bytes, Vec<Option<StructuredColumnValue>>)>> {
+        match &mut self.iter {
+            StructuredScanCursorIter::Db(iter) => iter.next(),
+            StructuredScanCursorIter::Split(iter) => iter.next(),
+        }
     }
 }
 
