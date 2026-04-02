@@ -40,8 +40,8 @@ impl StructuredReadOnlyDb {
         self.db.id()
     }
 
-    pub fn structured_schema(&self) -> &StructuredSchema {
-        self.structured_schema.as_ref()
+    pub fn current_schema(&self) -> StructuredSchema {
+        self.structured_schema.as_ref().clone()
     }
 
     pub fn get(
@@ -127,7 +127,8 @@ mod tests {
         let config = test_config(&root);
 
         // Write data using StructuredDb
-        let db = StructuredDb::open(config.clone(), vec![0u16..=0u16], test_schema()).unwrap();
+        let mut db = StructuredDb::open(config.clone(), vec![0u16..=0u16]).unwrap();
+        db.apply_schema(test_schema()).unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
             .unwrap();
@@ -142,7 +143,7 @@ mod tests {
         let rodb = StructuredReadOnlyDb::open(config, snap_id, db_id).unwrap();
 
         // Verify schema was auto-loaded
-        assert_eq!(rodb.structured_schema(), &test_schema());
+        assert_eq!(rodb.current_schema(), test_schema());
 
         // get
         let row = rodb.get(0, b"k1").unwrap().expect("row exists");
@@ -172,7 +173,8 @@ mod tests {
         let root = format!("/tmp/ds_readonly_missing_{}", Uuid::new_v4());
         let config = test_config(&root);
 
-        let db = StructuredDb::open(config.clone(), vec![0u16..=0u16], test_schema()).unwrap();
+        let mut db = StructuredDb::open(config.clone(), vec![0u16..=0u16]).unwrap();
+        db.apply_schema(test_schema()).unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         let snap_id = db.snapshot().unwrap();
         thread::sleep(Duration::from_millis(200));
@@ -190,7 +192,8 @@ mod tests {
         let root = format!("/tmp/ds_readonly_get_projection_{}", Uuid::new_v4());
         let config = test_config(&root);
 
-        let db = StructuredDb::open(config.clone(), vec![0u16..=0u16], test_schema()).unwrap();
+        let mut db = StructuredDb::open(config.clone(), vec![0u16..=0u16]).unwrap();
+        db.apply_schema(test_schema()).unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
             .unwrap();

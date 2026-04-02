@@ -1053,11 +1053,8 @@ class DbBindingTest {
         Path dataDir = Files.createTempDirectory("cobble-java-structured-single-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
 
-        io.cobble.structured.Schema schema =
-                io.cobble.structured.Schema.builder().addBytesColumn(0).addBytesColumn(1).build();
-
-        try (io.cobble.structured.SingleDb db =
-                io.cobble.structured.SingleDb.open(config, schema)) {
+        try (io.cobble.structured.SingleDb db = io.cobble.structured.SingleDb.open(config)) {
+            db.updateSchema().addBytesColumn(0).addBytesColumn(1).commit();
             // basic put / get
             int count = 100;
             for (int i = 0; i < count; i++) {

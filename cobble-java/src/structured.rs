@@ -15,13 +15,23 @@ use bytes::Bytes;
 use cobble::Config;
 use cobble_data_structure::{
     DataStructureDb, StructuredColumnValue, StructuredDbIterator, StructuredScanSplit,
-    StructuredScanSplitScanner, StructuredSchema,
+    StructuredScanSplitScanner,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JObjectArray, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
 use serde_json::json;
+
+pub(crate) enum StructuredSchemaBuilderHandle {
+    Db(cobble_data_structure::StructuredSchemaBuilder<'static, DataStructureDb>),
+    SingleDb(
+        cobble_data_structure::StructuredSchemaBuilder<
+            'static,
+            cobble_data_structure::StructuredSingleDb,
+        >,
+    ),
+}
 
 // ── open ────────────────────────────────────────────────────────────────────
 
@@ -30,7 +40,6 @@ pub extern "system" fn Java_io_cobble_structured_Db_openHandle(
     mut env: JNIEnv,
     _class: JClass,
     config_path: JString,
-    schema_json: JString,
 ) -> jlong {
     let config_path = match decode_java_string(&mut env, config_path) {
         Ok(v) => v,
@@ -46,7 +55,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_openHandle(
             return 0;
         }
     };
-    open_structured_db(&mut env, config, schema_json)
+    open_structured_db(&mut env, config)
 }
 
 #[unsafe(no_mangle)]
@@ -54,7 +63,6 @@ pub extern "system" fn Java_io_cobble_structured_Db_openHandleFromJson(
     mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
-    schema_json: JString,
 ) -> jlong {
     let config_json = match decode_java_string(&mut env, config_json) {
         Ok(v) => v,
@@ -70,14 +78,49 @@ pub extern "system" fn Java_io_cobble_structured_Db_openHandleFromJson(
             return 0;
         }
     };
-    open_structured_db(&mut env, config, schema_json)
+    open_structured_db(&mut env, config)
 }
 
-fn open_structured_db(env: &mut JNIEnv, config: Config, schema_json: JString) -> jlong {
-    let schema = match open_structured_schema(env, schema_json) {
-        Some(v) => v,
-        None => return 0,
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_currentSchemaJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
     };
+    match serde_json::to_string(&db.current_schema()) {
+        Ok(v) => to_java_string_or_throw(&mut env, v),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_createSchemaBuilder(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    let Some(db) = db_from_handle_mut(&mut env, handle) else {
+        return 0;
+    };
+    let builder = unsafe {
+        // JNI builder handle owns the lifetime; Java must commit/dispose before Db disposal.
+        let builder = (&mut *(db as *mut DataStructureDb)).update_schema();
+        std::mem::transmute::<
+            cobble_data_structure::StructuredSchemaBuilder<'_, DataStructureDb>,
+            cobble_data_structure::StructuredSchemaBuilder<'static, DataStructureDb>,
+        >(builder)
+    };
+    let handle = StructuredSchemaBuilderHandle::Db(builder);
+    Box::into_raw(Box::new(handle)) as jlong
+}
+
+fn open_structured_db(env: &mut JNIEnv, config: Config) -> jlong {
     let total_buckets = config.total_buckets;
     if total_buckets == 0 || total_buckets > (u16::MAX as u32) + 1 {
         throw_illegal_argument(
@@ -91,40 +134,11 @@ fn open_structured_db(env: &mut JNIEnv, config: Config, schema_json: JString) ->
         return 0;
     }
     let range = 0..=((total_buckets - 1) as u16);
-    match DataStructureDb::open(config, vec![range], schema) {
+    match DataStructureDb::open(config, vec![range]) {
         Ok(db) => Box::into_raw(Box::new(db)) as jlong,
         Err(err) => {
             throw_illegal_state(env, err.to_string());
             0
-        }
-    }
-}
-
-/// Parse a StructuredSchema from a JNI string (null → default).
-/// Returns None if an error was thrown.
-pub(crate) fn open_structured_schema(
-    env: &mut JNIEnv,
-    schema_json: JString,
-) -> Option<StructuredSchema> {
-    if env
-        .is_same_object(&schema_json, JObject::null())
-        .unwrap_or(true)
-    {
-        Some(StructuredSchema::default())
-    } else {
-        match decode_java_string(env, schema_json) {
-            Ok(s) if s.trim().is_empty() => Some(StructuredSchema::default()),
-            Ok(s) => match serde_json::from_str(&s) {
-                Ok(v) => Some(v),
-                Err(err) => {
-                    throw_illegal_argument(env, format!("invalid schema json: {}", err));
-                    None
-                }
-            },
-            Err(err) => {
-                throw_illegal_argument(env, err);
-                None
-            }
         }
     }
 }
@@ -1136,6 +1150,201 @@ fn db_from_handle(env: &mut JNIEnv, handle: jlong) -> Option<&'static DataStruct
         return None;
     }
     Some(unsafe { &*(handle as *const DataStructureDb) })
+}
+
+fn db_from_handle_mut(env: &mut JNIEnv, handle: jlong) -> Option<&'static mut DataStructureDb> {
+    if handle == 0 {
+        throw_illegal_state(env, "structured db handle is disposed".to_string());
+        return None;
+    }
+    Some(unsafe { &mut *(handle as *mut DataStructureDb) })
+}
+
+fn structured_builder_from_handle(
+    env: &mut JNIEnv,
+    handle: jlong,
+) -> Option<&'static mut StructuredSchemaBuilderHandle> {
+    if handle == 0 {
+        throw_illegal_state(
+            env,
+            "structured schema builder handle is disposed".to_string(),
+        );
+        return None;
+    }
+    Some(unsafe { &mut *(handle as *mut StructuredSchemaBuilderHandle) })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_disposeInternal(
+    mut env: JNIEnv,
+    _obj: JObject,
+    native_handle: jlong,
+) {
+    if native_handle == 0 {
+        throw_illegal_state(
+            &mut env,
+            "structured schema builder handle is already disposed".to_string(),
+        );
+        return;
+    }
+    let _boxed = unsafe { Box::from_raw(native_handle as *mut StructuredSchemaBuilderHandle) };
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeAddBytesColumn(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    column_idx: jint,
+) {
+    let Some(builder) = structured_builder_from_handle(&mut env, native_handle) else {
+        return;
+    };
+    let column = match decode_u16("column", column_idx) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    match builder {
+        StructuredSchemaBuilderHandle::Db(b) => {
+            b.add_bytes_column(column);
+        }
+        StructuredSchemaBuilderHandle::SingleDb(b) => {
+            b.add_bytes_column(column);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeAddListColumn(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    column_idx: jint,
+    max_elements: jint,
+    retain_mode: JString,
+    preserve_element_ttl: jboolean,
+) {
+    let Some(builder) = structured_builder_from_handle(&mut env, native_handle) else {
+        return;
+    };
+    let column = match decode_u16("column", column_idx) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let retain_mode = match decode_java_string(&mut env, retain_mode) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let retain_mode = match retain_mode.as_str() {
+        "first" => cobble_data_structure::ListRetainMode::First,
+        "last" => cobble_data_structure::ListRetainMode::Last,
+        _ => {
+            throw_illegal_argument(
+                &mut env,
+                format!(
+                    "retainMode must be 'first' or 'last', got '{}'",
+                    retain_mode
+                ),
+            );
+            return;
+        }
+    };
+    let max_elements = if max_elements < 0 {
+        None
+    } else {
+        Some(max_elements as usize)
+    };
+    match builder {
+        StructuredSchemaBuilderHandle::Db(b) => {
+            b.add_list_column(
+                column,
+                cobble_data_structure::ListConfig {
+                    max_elements,
+                    retain_mode,
+                    preserve_element_ttl: preserve_element_ttl == JNI_TRUE,
+                },
+            );
+        }
+        StructuredSchemaBuilderHandle::SingleDb(b) => {
+            b.add_list_column(
+                column,
+                cobble_data_structure::ListConfig {
+                    max_elements,
+                    retain_mode,
+                    preserve_element_ttl: preserve_element_ttl == JNI_TRUE,
+                },
+            );
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeDeleteColumn(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    column_idx: jint,
+) {
+    let Some(builder) = structured_builder_from_handle(&mut env, native_handle) else {
+        return;
+    };
+    let column = match decode_u16("column", column_idx) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    match builder {
+        StructuredSchemaBuilderHandle::Db(b) => {
+            b.delete_column(column);
+        }
+        StructuredSchemaBuilderHandle::SingleDb(b) => {
+            b.delete_column(column);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeCommit(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jstring {
+    if native_handle == 0 {
+        throw_illegal_state(
+            &mut env,
+            "structured schema builder handle is disposed".to_string(),
+        );
+        return std::ptr::null_mut();
+    }
+    let handle = unsafe { Box::from_raw(native_handle as *mut StructuredSchemaBuilderHandle) };
+    let commit_result = match *handle {
+        StructuredSchemaBuilderHandle::Db(mut builder) => builder.commit(),
+        StructuredSchemaBuilderHandle::SingleDb(mut builder) => builder.commit(),
+    };
+    match commit_result {
+        Ok(schema) => match serde_json::to_string(&schema) {
+            Ok(v) => to_java_string_or_throw(&mut env, v),
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
 }
 
 fn structured_scan_cursor_from_handle(

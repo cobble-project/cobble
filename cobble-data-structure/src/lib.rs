@@ -7,14 +7,22 @@
 //!
 //! ```rust,ignore
 //! use cobble::{Config, VolumeDescriptor};
-//! use cobble_data_structure::{StructuredSchema, StructuredSingleDb};
+//! use cobble_data_structure::{ListConfig, ListRetainMode, StructuredSingleDb};
 //!
 //! let mut config = Config::default();
 //! config.num_columns = 2;
 //! config.total_buckets = 1;
 //! config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-ssingle".to_string());
 //!
-//! let db = StructuredSingleDb::open(config, StructuredSchema::default())?;
+//! let mut db = StructuredSingleDb::open(config)?;
+//! db.update_schema().add_list_column(
+//!     1,
+//!     ListConfig {
+//!         max_elements: Some(100),
+//!         retain_mode: ListRetainMode::Last,
+//!         preserve_element_ttl: false,
+//!     },
+//! ).commit()?;
 //! db.put(0, b"k1", 0, b"v1".to_vec())?;
 //! let snapshot_id = db.snapshot()?;
 //! let snapshots = db.list_snapshots()?;
@@ -27,7 +35,7 @@
 //! Use `StructuredDb` on shard writers and keep coordinator/global snapshot flow
 //! identical to `cobble::Db` + `cobble::DbCoordinator`.
 //!
-//! # 3) Real-time reading wrappers (`StructuredReader`)
+//! # 3) Snapshot-following reading wrappers (`StructuredReader`)
 //!
 //! `StructuredReader` follows global snapshots like `cobble::Reader`, but returns
 //! typed structured rows.
@@ -54,7 +62,7 @@ mod structured_single_db;
 pub use list::{ListConfig, ListRetainMode};
 pub use structured_db::{
     DataStructureDb, StructuredColumnType, StructuredColumnValue, StructuredDb,
-    StructuredDbIterator, StructuredSchema, StructuredWriteBatch,
+    StructuredDbIterator, StructuredSchema, StructuredSchemaBuilder, StructuredWriteBatch,
     structured_merge_operator_resolver, structured_resolvable_operator_ids,
 };
 pub use structured_read_only_db::StructuredReadOnlyDb;

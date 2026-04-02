@@ -38,8 +38,8 @@ impl StructuredReader {
         })
     }
 
-    pub fn structured_schema(&self) -> &StructuredSchema {
-        self.structured_schema.as_ref()
+    pub fn current_schema(&self) -> StructuredSchema {
+        self.structured_schema.as_ref().clone()
     }
 
     // ── Read operations ─────────────────────────────────────────────────
@@ -180,7 +180,18 @@ mod tests {
         let root = format!("/tmp/ds_reader_get_scan_{}", Uuid::new_v4());
 
         // Write data via StructuredSingleDb and create a global snapshot
-        let db = StructuredSingleDb::open(test_config(&root), test_schema()).unwrap();
+        let mut db = StructuredSingleDb::open(test_config(&root)).unwrap();
+        db.update_schema()
+            .add_list_column(
+                1,
+                ListConfig {
+                    max_elements: Some(3),
+                    retain_mode: ListRetainMode::Last,
+                    preserve_element_ttl: false,
+                },
+            )
+            .commit()
+            .unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
             .unwrap();
@@ -199,7 +210,7 @@ mod tests {
         let mut reader = StructuredReader::open(read_config, snap_id).unwrap();
 
         // Verify schema was auto-loaded
-        assert_eq!(reader.structured_schema(), &test_schema());
+        assert_eq!(reader.current_schema(), test_schema());
 
         // get
         let row = reader.get(0, b"k1").unwrap().expect("row exists");
@@ -228,7 +239,18 @@ mod tests {
     fn test_structured_reader_open_current() {
         let root = format!("/tmp/ds_reader_current_{}", Uuid::new_v4());
 
-        let db = StructuredSingleDb::open(test_config(&root), test_schema()).unwrap();
+        let mut db = StructuredSingleDb::open(test_config(&root)).unwrap();
+        db.update_schema()
+            .add_list_column(
+                1,
+                ListConfig {
+                    max_elements: Some(3),
+                    retain_mode: ListRetainMode::Last,
+                    preserve_element_ttl: false,
+                },
+            )
+            .commit()
+            .unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         let _ = db.snapshot().unwrap();
         thread::sleep(Duration::from_millis(200));
@@ -254,7 +276,18 @@ mod tests {
     fn test_structured_reader_get_with_projection_reindexes_schema() {
         let root = format!("/tmp/ds_reader_get_projection_{}", Uuid::new_v4());
 
-        let db = StructuredSingleDb::open(test_config(&root), test_schema()).unwrap();
+        let mut db = StructuredSingleDb::open(test_config(&root)).unwrap();
+        db.update_schema()
+            .add_list_column(
+                1,
+                ListConfig {
+                    max_elements: Some(3),
+                    retain_mode: ListRetainMode::Last,
+                    preserve_element_ttl: false,
+                },
+            )
+            .commit()
+            .unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
             .unwrap();

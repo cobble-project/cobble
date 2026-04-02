@@ -1,7 +1,8 @@
 use crate::structured_db::{
-    StructuredColumnValue, StructuredDbIterator, StructuredSchema, StructuredWriteBatch,
-    decode_row, encode_for_write, persist_structured_schema_on_db, project_decoded_row_for_read,
-    project_structured_schema_for_scan,
+    StructuredColumnValue, StructuredDbIterator, StructuredSchema, StructuredSchemaBuilder,
+    StructuredSchemaOwner, StructuredWriteBatch, decode_row, encode_for_write,
+    load_structured_schema_from_cobble_schema, persist_structured_schema_on_db,
+    project_decoded_row_for_read, project_structured_schema_for_scan,
 };
 use cobble::{Config, ReadOptions, Result, ScanOptions, SingleDb, WriteOptions};
 use std::ops::Range;
@@ -13,9 +14,10 @@ pub struct StructuredSingleDb {
 }
 
 impl StructuredSingleDb {
-    pub fn open(config: Config, structured_schema: StructuredSchema) -> Result<Self> {
+    pub fn open(config: Config) -> Result<Self> {
         let db = SingleDb::open(config)?;
-        persist_structured_schema_on_db(db.db(), &structured_schema)?;
+        let structured_schema =
+            load_structured_schema_from_cobble_schema(&db.db().current_schema())?;
         Ok(Self {
             db,
             structured_schema: Arc::new(structured_schema),
@@ -26,8 +28,30 @@ impl StructuredSingleDb {
         &self.db
     }
 
-    pub fn structured_schema(&self) -> &StructuredSchema {
-        self.structured_schema.as_ref()
+    pub fn current_schema(&self) -> StructuredSchema {
+        self.structured_schema.as_ref().clone()
+    }
+
+    pub fn update_schema(&mut self) -> StructuredSchemaBuilder<'_, Self> {
+        StructuredSchemaBuilder::new(self)
+    }
+}
+
+impl StructuredSingleDb {
+    pub fn reload_schema(&mut self) -> Result<()> {
+        let schema = load_structured_schema_from_cobble_schema(&self.db.db().current_schema())?;
+        self.structured_schema = Arc::new(schema);
+        Ok(())
+    }
+
+    pub fn apply_schema(
+        &mut self,
+        structured_schema: StructuredSchema,
+    ) -> Result<StructuredSchema> {
+        persist_structured_schema_on_db(self.db.db(), &structured_schema)?;
+        let reloaded = load_structured_schema_from_cobble_schema(&self.db.db().current_schema())?;
+        self.structured_schema = Arc::new(reloaded.clone());
+        Ok(reloaded)
     }
 
     // ── Write operations ────────────────────────────────────────────────
@@ -195,29 +219,43 @@ impl StructuredSingleDb {
     }
 }
 
+impl StructuredSchemaOwner for StructuredSingleDb {
+    fn current_structured_schema(&self) -> StructuredSchema {
+        self.current_schema()
+    }
+
+    fn begin_core_schema_update(&self) -> cobble::SchemaBuilder {
+        self.db.db().update_schema()
+    }
+
+    fn reload_structured_schema_from_core(&mut self) -> Result<StructuredSchema> {
+        self.reload_schema()?;
+        Ok(self.current_schema())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::StructuredColumnType;
     use crate::list::{ListConfig, ListRetainMode};
     use bytes::Bytes;
     use cobble::{ReadOptions, VolumeDescriptor};
-    use std::collections::BTreeMap;
     use std::thread;
     use std::time::Duration;
     use uuid::Uuid;
 
-    fn test_schema() -> StructuredSchema {
-        StructuredSchema {
-            columns: BTreeMap::from([(
+    fn apply_test_schema(db: &mut StructuredSingleDb) {
+        db.update_schema()
+            .add_list_column(
                 1,
-                StructuredColumnType::List(ListConfig {
+                ListConfig {
                     max_elements: Some(3),
                     retain_mode: ListRetainMode::Last,
                     preserve_element_ttl: false,
-                }),
-            )]),
-        }
+                },
+            )
+            .commit()
+            .unwrap();
     }
 
     fn test_config(root: &str) -> Config {
@@ -233,7 +271,8 @@ mod tests {
     #[test]
     fn test_structured_single_db_put_get_scan() {
         let root = format!("/tmp/ds_single_put_get_{}", Uuid::new_v4());
-        let db = StructuredSingleDb::open(test_config(&root), test_schema()).unwrap();
+        let mut db = StructuredSingleDb::open(test_config(&root)).unwrap();
+        apply_test_schema(&mut db);
 
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
@@ -266,7 +305,8 @@ mod tests {
     #[test]
     fn test_structured_single_db_write_batch() {
         let root = format!("/tmp/ds_single_batch_{}", Uuid::new_v4());
-        let db = StructuredSingleDb::open(test_config(&root), test_schema()).unwrap();
+        let mut db = StructuredSingleDb::open(test_config(&root)).unwrap();
+        apply_test_schema(&mut db);
 
         let mut batch = db.new_write_batch();
         batch.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
@@ -294,7 +334,8 @@ mod tests {
     #[test]
     fn test_structured_single_db_delete() {
         let root = format!("/tmp/ds_single_delete_{}", Uuid::new_v4());
-        let db = StructuredSingleDb::open(test_config(&root), test_schema()).unwrap();
+        let mut db = StructuredSingleDb::open(test_config(&root)).unwrap();
+        apply_test_schema(&mut db);
 
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         assert!(db.get(0, b"k1").unwrap().is_some());
@@ -312,7 +353,8 @@ mod tests {
     #[test]
     fn test_structured_single_db_snapshot_lifecycle() {
         let root = format!("/tmp/ds_single_snap_{}", Uuid::new_v4());
-        let db = StructuredSingleDb::open(test_config(&root), test_schema()).unwrap();
+        let mut db = StructuredSingleDb::open(test_config(&root)).unwrap();
+        apply_test_schema(&mut db);
 
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         let snap_id = db.snapshot().unwrap();
@@ -330,7 +372,8 @@ mod tests {
     #[test]
     fn test_structured_single_db_get_with_projection_reindexes_schema() {
         let root = format!("/tmp/ds_single_get_projection_{}", Uuid::new_v4());
-        let db = StructuredSingleDb::open(test_config(&root), test_schema()).unwrap();
+        let mut db = StructuredSingleDb::open(test_config(&root)).unwrap();
+        apply_test_schema(&mut db);
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
             .unwrap();

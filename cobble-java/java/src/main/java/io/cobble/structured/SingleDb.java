@@ -25,11 +25,10 @@ import java.util.concurrent.Future;
  * <p>Example:
  *
  * <pre>{@code
- * Schema schema = Schema.builder()
- *     .addBytesColumn(0)
+ * SingleDb db = SingleDb.open(config);
+ * db.updateSchema()
  *     .addListColumn(1, ListConfig.of(100, ListRetainMode.LAST))
- *     .build();
- * SingleDb db = SingleDb.open(config, schema);
+ *     .commit();
  *
  * db.put(0, key, 0, ColumnValue.ofBytes(data));
  * db.merge(0, key, 1, ColumnValue.ofList(new byte[][] { elem1 }));
@@ -45,39 +44,39 @@ public final class SingleDb extends NativeObject {
 
     // ── open ──────────────────────────────────────────────────────────────────
 
-    /** Open a structured single DB from a config file path with default schema. */
+    /** Open a structured single DB from a config file path. */
     public static SingleDb open(String configPath) {
-        return open(configPath, Schema.defaults());
-    }
-
-    /** Open a structured single DB from a config file path with the given schema. */
-    public static SingleDb open(String configPath, Schema schema) {
         NativeLoader.load();
-        String schemaJson = schema == null ? null : schema.toJson();
-        long h = openHandle(configPath, schemaJson);
+        long h = openHandle(configPath);
         if (h == 0L) {
             throw new IllegalStateException("failed to open structured single db");
         }
         return new SingleDb(h);
     }
 
-    /** Open a structured single DB from Java {@link Config} with default schema. */
+    /** Open a structured single DB from Java {@link Config}. */
     public static SingleDb open(Config config) {
-        return open(config, Schema.defaults());
-    }
-
-    /** Open a structured single DB from Java {@link Config} with the given schema. */
-    public static SingleDb open(Config config, Schema schema) {
         if (config == null) {
             throw new IllegalArgumentException("config must not be null");
         }
         NativeLoader.load();
-        String schemaJson = schema == null ? null : schema.toJson();
-        long h = openHandleFromJson(config.toJson(), schemaJson);
+        long h = openHandleFromJson(config.toJson());
         if (h == 0L) {
             throw new IllegalStateException("failed to open structured single db from config json");
         }
         return new SingleDb(h);
+    }
+
+    public Schema currentSchema() {
+        return Schema.fromJson(currentSchemaJson(nativeHandle));
+    }
+
+    public StructuredSchemaBuilder updateSchema() {
+        long h = createSchemaBuilder(nativeHandle);
+        if (h == 0L) {
+            throw new IllegalStateException("failed to create structured schema builder");
+        }
+        return new StructuredSchemaBuilder(h);
     }
 
     // ── typed write operations ────────────────────────────────────────────────
@@ -235,9 +234,13 @@ public final class SingleDb extends NativeObject {
     @Override
     protected native void disposeInternal(long nativeHandle);
 
-    private static native long openHandle(String configPath, String schemaJson);
+    private static native long openHandle(String configPath);
 
-    private static native long openHandleFromJson(String configJson, String schemaJson);
+    private static native long openHandleFromJson(String configJson);
+
+    private static native String currentSchemaJson(long nativeHandle);
+
+    private static native long createSchemaBuilder(long nativeHandle);
 
     // bytes put/merge
     private static native void putBytes(

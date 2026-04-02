@@ -170,7 +170,17 @@ mod tests {
         structured_schema: StructuredSchema,
         writes: impl FnOnce(&StructuredDb),
     ) -> (StructuredDb, ShardSnapshotInput) {
-        let db = StructuredDb::open(config.clone(), vec![0u16..=3u16], structured_schema).unwrap();
+        let mut db = StructuredDb::open(config.clone(), vec![0u16..=3u16]).unwrap();
+        db.update_schema()
+            .add_list_column(
+                1,
+                match structured_schema.columns.get(&1) {
+                    Some(StructuredColumnType::List(cfg)) => cfg.clone(),
+                    _ => panic!("test schema missing list column 1"),
+                },
+            )
+            .commit()
+            .unwrap();
         writes(&db);
         let (tx, rx) = std::sync::mpsc::channel();
         db.snapshot_with_callback(move |result| {

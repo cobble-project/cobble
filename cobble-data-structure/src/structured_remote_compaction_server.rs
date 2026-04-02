@@ -51,27 +51,13 @@ impl StructuredRemoteCompactionServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StructuredColumnValue;
     use crate::list::{ListConfig, ListRetainMode};
-    use crate::{StructuredColumnType, StructuredColumnValue, StructuredSchema};
     use cobble::VolumeDescriptor;
-    use std::collections::BTreeMap;
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
     use uuid::Uuid;
-
-    fn test_schema() -> StructuredSchema {
-        StructuredSchema {
-            columns: BTreeMap::from([(
-                1,
-                StructuredColumnType::List(ListConfig {
-                    max_elements: Some(5),
-                    retain_mode: ListRetainMode::Last,
-                    preserve_element_ttl: false,
-                }),
-            )]),
-        }
-    }
 
     #[test]
     fn test_structured_remote_compaction_server_supported_ids() {
@@ -128,7 +114,18 @@ mod tests {
             compaction_remote_addr: Some(addr.to_string()),
             ..Config::default()
         };
-        let db = crate::StructuredSingleDb::open(db_config, test_schema()).unwrap();
+        let mut db = crate::StructuredSingleDb::open(db_config).unwrap();
+        db.update_schema()
+            .add_list_column(
+                1,
+                ListConfig {
+                    max_elements: Some(5),
+                    retain_mode: ListRetainMode::Last,
+                    preserve_element_ttl: false,
+                },
+            )
+            .commit()
+            .unwrap();
 
         // Write enough data to trigger flush and eventually compaction
         for i in 0..30u32 {

@@ -4,8 +4,8 @@ use crate::list::{
 };
 use bytes::Bytes;
 use cobble::{
-    Config, Db, DbIterator, Error, MergeOperatorResolver, ReadOptions, Result, ScanOptions, Schema,
-    SchemaBuilder, ShardSnapshotInput, WriteBatch, WriteOptions,
+    BytesMergeOperator, Config, Db, DbIterator, Error, MergeOperatorResolver, ReadOptions, Result,
+    ScanOptions, Schema, SchemaBuilder, ShardSnapshotInput, WriteBatch, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -299,14 +299,111 @@ pub struct StructuredDb {
     structured_schema: Arc<StructuredSchema>,
 }
 
+pub trait StructuredSchemaOwner {
+    fn current_structured_schema(&self) -> StructuredSchema;
+    fn begin_core_schema_update(&self) -> SchemaBuilder;
+    fn reload_structured_schema_from_core(&mut self) -> Result<StructuredSchema>;
+}
+
+pub struct StructuredSchemaBuilder<'a, O: StructuredSchemaOwner> {
+    owner: &'a mut O,
+    schema: StructuredSchema,
+    inner: Option<SchemaBuilder>,
+    pending_error: Option<Error>,
+}
+
+impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
+    pub fn new(owner: &'a mut O) -> Self {
+        let schema = owner.current_structured_schema();
+        let inner = owner.begin_core_schema_update();
+        Self {
+            owner,
+            schema,
+            inner: Some(inner),
+            pending_error: None,
+        }
+    }
+
+    pub fn add_bytes_column(&mut self, column: u16) -> &mut Self {
+        self.schema.columns.remove(&column);
+        self.apply_inner(|inner| {
+            inner.set_column_operator(column as usize, Arc::new(BytesMergeOperator))?;
+            inner.clear_column_metadata(column as usize)?;
+            Ok(())
+        });
+        self
+    }
+
+    pub fn add_list_column(&mut self, column: u16, config: ListConfig) -> &mut Self {
+        self.schema
+            .columns
+            .insert(column, StructuredColumnType::List(config.clone()));
+        self.apply_inner(|inner| {
+            inner.set_column_operator(column as usize, list_operator(config.clone()))?;
+            inner.set_column_metadata(
+                column as usize,
+                serde_json::to_value(config).map_err(|err| {
+                    Error::FileFormatError(format!(
+                        "failed to encode list config metadata: {}",
+                        err
+                    ))
+                })?,
+            )?;
+            Ok(())
+        });
+        self
+    }
+
+    pub fn delete_column(&mut self, column: u16) -> &mut Self {
+        // Structured delete means dropping structured typing for this column (back to Bytes).
+        self.schema.columns.remove(&column);
+        self.apply_inner(|inner| {
+            inner.set_column_operator(column as usize, Arc::new(BytesMergeOperator))?;
+            inner.clear_column_metadata(column as usize)?;
+            Ok(())
+        });
+        self
+    }
+
+    pub fn current_schema(&self) -> &StructuredSchema {
+        &self.schema
+    }
+
+    pub fn commit(&mut self) -> Result<StructuredSchema> {
+        if let Some(err) = self.pending_error.take() {
+            return Err(err);
+        }
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| Error::InvalidState("schema builder already committed".to_string()))?;
+        inner.commit();
+        self.owner.reload_structured_schema_from_core()
+    }
+
+    fn apply_inner<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut SchemaBuilder) -> Result<()>,
+    {
+        if self.pending_error.is_some() {
+            return;
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            self.pending_error = Some(Error::InvalidState(
+                "schema builder already committed".to_string(),
+            ));
+            return;
+        };
+        if let Err(err) = f(inner) {
+            self.pending_error = Some(err);
+        }
+    }
+}
+
 impl StructuredDb {
-    pub fn open(
-        config: Config,
-        bucket_ranges: Vec<RangeInclusive<u16>>,
-        structured_schema: StructuredSchema,
-    ) -> Result<Self> {
+    pub fn open(config: Config, bucket_ranges: Vec<RangeInclusive<u16>>) -> Result<Self> {
         let db = Db::open(config, bucket_ranges)?;
-        persist_structured_schema(&db, &structured_schema)?;
+        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
         Ok(Self {
             db,
             structured_schema: Arc::new(structured_schema),
@@ -357,8 +454,28 @@ impl StructuredDb {
         self.db.id()
     }
 
-    pub fn structured_schema(&self) -> &StructuredSchema {
-        self.structured_schema.as_ref()
+    pub fn current_schema(&self) -> StructuredSchema {
+        self.structured_schema.as_ref().clone()
+    }
+
+    pub fn update_schema(&mut self) -> StructuredSchemaBuilder<'_, Self> {
+        StructuredSchemaBuilder::new(self)
+    }
+
+    pub fn reload_schema(&mut self) -> Result<()> {
+        let schema = load_structured_schema_from_cobble_schema(&self.db.current_schema())?;
+        self.structured_schema = Arc::new(schema);
+        Ok(())
+    }
+
+    pub fn apply_schema(
+        &mut self,
+        structured_schema: StructuredSchema,
+    ) -> Result<StructuredSchema> {
+        persist_structured_schema(&self.db, &structured_schema)?;
+        let reloaded = load_structured_schema_from_cobble_schema(&self.db.current_schema())?;
+        self.structured_schema = Arc::new(reloaded.clone());
+        Ok(reloaded)
     }
 
     pub fn put<K, V>(&self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
@@ -539,6 +656,21 @@ impl StructuredDb {
     }
 }
 
+impl StructuredSchemaOwner for StructuredDb {
+    fn current_structured_schema(&self) -> StructuredSchema {
+        self.current_schema()
+    }
+
+    fn begin_core_schema_update(&self) -> SchemaBuilder {
+        self.db.update_schema()
+    }
+
+    fn reload_structured_schema_from_core(&mut self) -> Result<StructuredSchema> {
+        self.reload_schema()?;
+        Ok(self.current_schema())
+    }
+}
+
 /// Type alias for backward compatibility.
 pub type DataStructureDb = StructuredDb;
 
@@ -644,8 +776,8 @@ mod tests {
                 }),
             )]),
         };
-        let db = StructuredDb::open(config.clone(), vec![0u16..=0u16], structured_schema.clone())
-            .unwrap();
+        let mut db = StructuredDb::open(config.clone(), vec![0u16..=0u16]).unwrap();
+        db.apply_schema(structured_schema.clone()).unwrap();
         db.merge(0, b"k", 1, vec![Bytes::from_static(b"a")])
             .unwrap();
         let _ = db.snapshot().unwrap();
@@ -654,7 +786,7 @@ mod tests {
         db.close().unwrap();
 
         let resumed = StructuredDb::resume(config, db_id).unwrap();
-        assert_eq!(resumed.structured_schema(), &structured_schema);
+        assert_eq!(resumed.current_schema(), structured_schema);
         resumed.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -677,7 +809,8 @@ mod tests {
                 }),
             )]),
         };
-        let db = StructuredDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
+        db.apply_schema(structured_schema).unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
             .unwrap();
@@ -738,7 +871,8 @@ mod tests {
                 }),
             )]),
         };
-        let db = StructuredDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
+        db.apply_schema(structured_schema).unwrap();
         let mut batch = db.new_write_batch();
         batch.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         batch
@@ -795,7 +929,8 @@ mod tests {
                 }),
             )]),
         };
-        let db = StructuredDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
+        db.apply_schema(structured_schema).unwrap();
         let mut batch = db.new_write_batch();
         let err = batch
             .put(0, b"k1", 1, Bytes::from_static(b"not-a-list"))
@@ -826,7 +961,8 @@ mod tests {
                 }),
             )]),
         };
-        let db = StructuredDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
+        db.apply_schema(structured_schema).unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
             .unwrap();
@@ -873,7 +1009,8 @@ mod tests {
                 }),
             )]),
         };
-        let db = StructuredDb::open(config, vec![0u16..=0u16], structured_schema).unwrap();
+        let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
+        db.apply_schema(structured_schema).unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
         db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
             .unwrap();

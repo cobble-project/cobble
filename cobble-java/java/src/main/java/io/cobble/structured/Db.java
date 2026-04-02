@@ -21,11 +21,10 @@ import java.util.concurrent.Future;
  * <p>Example:
  *
  * <pre>{@code
- * Schema schema = Schema.builder()
- *     .addBytesColumn(0)
+ * Db db = Db.open(config);
+ * db.updateSchema()
  *     .addListColumn(1, ListConfig.of(100, ListRetainMode.LAST))
- *     .build();
- * Db db = Db.open(config, schema);
+ *     .commit();
  *
  * // Write bytes to column 0
  * db.put(0, key, 0, ColumnValue.ofBytes(data));
@@ -50,49 +49,39 @@ public final class Db extends NativeObject {
 
     // ── open / restore / resume ───────────────────────────────────────────
 
-    /** Open a structured DB from a config file path with default schema (all Bytes columns). */
+    /** Open a structured DB from a config file path. */
     public static Db open(String configPath) {
-        return open(configPath, Schema.defaults());
-    }
-
-    /**
-     * Open a structured DB from a config file path with the given schema.
-     *
-     * @param configPath path to config file
-     * @param schema structured column schema
-     */
-    public static Db open(String configPath, Schema schema) {
         NativeLoader.load();
-        String schemaJson = schema == null ? null : schema.toJson();
-        long h = openHandle(configPath, schemaJson);
+        long h = openHandle(configPath);
         if (h == 0L) {
             throw new IllegalStateException("failed to open structured db");
         }
         return new Db(h);
     }
 
-    /** Open a structured DB from Java {@link Config} with default schema. */
+    /** Open a structured DB from Java {@link Config}. */
     public static Db open(Config config) {
-        return open(config, Schema.defaults());
-    }
-
-    /**
-     * Open a structured DB from Java {@link Config} with the given schema.
-     *
-     * @param config Java-side config
-     * @param schema structured column schema
-     */
-    public static Db open(Config config, Schema schema) {
         if (config == null) {
             throw new IllegalArgumentException("config must not be null");
         }
         NativeLoader.load();
-        String schemaJson = schema == null ? null : schema.toJson();
-        long h = openHandleFromJson(config.toJson(), schemaJson);
+        long h = openHandleFromJson(config.toJson());
         if (h == 0L) {
             throw new IllegalStateException("failed to open structured db from config json");
         }
         return new Db(h);
+    }
+
+    public Schema currentSchema() {
+        return Schema.fromJson(currentSchemaJson(nativeHandle));
+    }
+
+    public StructuredSchemaBuilder updateSchema() {
+        long h = createSchemaBuilder(nativeHandle);
+        if (h == 0L) {
+            throw new IllegalStateException("failed to create structured schema builder");
+        }
+        return new StructuredSchemaBuilder(h);
     }
 
     /** Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot. */
@@ -315,9 +304,13 @@ public final class Db extends NativeObject {
     @Override
     protected native void disposeInternal(long nativeHandle);
 
-    private static native long openHandle(String configPath, String schemaJson);
+    private static native long openHandle(String configPath);
 
-    private static native long openHandleFromJson(String configJson, String schemaJson);
+    private static native long openHandleFromJson(String configJson);
+
+    private static native String currentSchemaJson(long nativeHandle);
+
+    private static native long createSchemaBuilder(long nativeHandle);
 
     private static native long openFromSnapshotHandle(
             String configPath, long snapshotId, String dbId);

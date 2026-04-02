@@ -7,8 +7,8 @@
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::decode_scan_open_args;
 use crate::structured::{
-    StructuredScanCursorHandle, decode_write_bytes_args, decode_write_list_args,
-    open_structured_schema, to_java_typed_columns,
+    StructuredScanCursorHandle, StructuredSchemaBuilderHandle, decode_write_bytes_args,
+    decode_write_list_args, to_java_typed_columns,
 };
 use crate::util::{
     decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong, throw_illegal_argument,
@@ -30,7 +30,6 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_openHandle(
     mut env: JNIEnv,
     _class: JClass,
     config_path: JString,
-    schema_json: JString,
 ) -> jlong {
     let config_path = match decode_java_string(&mut env, config_path) {
         Ok(v) => v,
@@ -46,7 +45,7 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_openHandle(
             return 0;
         }
     };
-    open_structured_single_db(&mut env, config, schema_json)
+    open_structured_single_db(&mut env, config)
 }
 
 #[unsafe(no_mangle)]
@@ -54,7 +53,6 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_openHandleFromJson(
     mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
-    schema_json: JString,
 ) -> jlong {
     let config_json = match decode_java_string(&mut env, config_json) {
         Ok(v) => v,
@@ -70,15 +68,57 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_openHandleFromJson(
             return 0;
         }
     };
-    open_structured_single_db(&mut env, config, schema_json)
+    open_structured_single_db(&mut env, config)
 }
 
-fn open_structured_single_db(env: &mut JNIEnv, config: Config, schema_json: JString) -> jlong {
-    let schema = match open_structured_schema(env, schema_json) {
-        Some(v) => v,
-        None => return 0,
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_currentSchemaJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
     };
-    match StructuredSingleDb::open(config, schema) {
+    match serde_json::to_string(&db.current_schema()) {
+        Ok(v) => to_java_string_or_throw(&mut env, v),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_createSchemaBuilder(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    let Some(db) = single_db_from_handle_mut(&mut env, handle) else {
+        return 0;
+    };
+    let builder = unsafe {
+        // JNI builder handle owns the lifetime; Java must commit/dispose before SingleDb disposal.
+        let builder =
+            (&mut *(db as *mut cobble_data_structure::StructuredSingleDb)).update_schema();
+        std::mem::transmute::<
+            cobble_data_structure::StructuredSchemaBuilder<
+                '_,
+                cobble_data_structure::StructuredSingleDb,
+            >,
+            cobble_data_structure::StructuredSchemaBuilder<
+                'static,
+                cobble_data_structure::StructuredSingleDb,
+            >,
+        >(builder)
+    };
+    let handle = StructuredSchemaBuilderHandle::SingleDb(builder);
+    Box::into_raw(Box::new(handle)) as jlong
+}
+
+fn open_structured_single_db(env: &mut JNIEnv, config: Config) -> jlong {
+    match StructuredSingleDb::open(config) {
         Ok(db) => Box::into_raw(Box::new(db)) as jlong,
         Err(err) => {
             throw_illegal_state(env, err.to_string());
@@ -688,6 +728,17 @@ fn single_db_from_handle(env: &mut JNIEnv, handle: jlong) -> Option<&'static Str
         return None;
     }
     Some(unsafe { &*(handle as *const StructuredSingleDb) })
+}
+
+fn single_db_from_handle_mut(
+    env: &mut JNIEnv,
+    handle: jlong,
+) -> Option<&'static mut StructuredSingleDb> {
+    if handle == 0 {
+        throw_illegal_state(env, "structured single db handle is disposed".to_string());
+        return None;
+    }
+    Some(unsafe { &mut *(handle as *mut StructuredSingleDb) })
 }
 
 fn complete_snapshot_json_future(vm: &JavaVM, future: &GlobalRef, result: cobble::Result<String>) {

@@ -24,13 +24,15 @@ class StructuredDbTest {
         Path dataDir = Files.createTempDirectory("cobble-structured-typed-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
 
-        Schema schema =
-                Schema.builder()
-                        .addBytesColumn(0)
-                        .addListColumn(1, ListConfig.of(100, ListRetainMode.LAST))
-                        .build();
-
-        try (Db db = Db.open(config, schema)) {
+        try (Db db = Db.open(config)) {
+            db.updateSchema().addListColumn(1, ListConfig.of(100, ListRetainMode.LAST)).commit();
+            Schema schema = db.currentSchema();
+            assertTrue(schema.getColumnType(0) instanceof Schema.ColumnType.Bytes);
+            Schema.ColumnType col1Type = schema.getColumnType(1);
+            assertTrue(col1Type instanceof Schema.ColumnType.List);
+            ListConfig col1Cfg = ((Schema.ColumnType.List) col1Type).getConfig();
+            assertEquals(100, col1Cfg.getMaxElements().intValue());
+            assertEquals(ListRetainMode.LAST, col1Cfg.getRetainMode());
             byte[] key = "row-1".getBytes(StandardCharsets.UTF_8);
 
             // Write bytes to column 0
@@ -76,13 +78,8 @@ class StructuredDbTest {
         Path dataDir = Files.createTempDirectory("cobble-structured-merge-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
 
-        Schema schema =
-                Schema.builder()
-                        .addBytesColumn(0)
-                        .addListColumn(1, ListConfig.of(100, ListRetainMode.LAST))
-                        .build();
-
-        try (Db db = Db.open(config, schema)) {
+        try (Db db = Db.open(config)) {
+            db.updateSchema().addListColumn(1, ListConfig.of(100, ListRetainMode.LAST)).commit();
             byte[] key = "merge-key".getBytes(StandardCharsets.UTF_8);
 
             // Initial list put
@@ -121,10 +118,8 @@ class StructuredDbTest {
         Path dataDir = Files.createTempDirectory("cobble-structured-delete-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
 
-        Schema schema =
-                Schema.builder().addBytesColumn(0).addListColumn(1, ListConfig.defaults()).build();
-
-        try (Db db = Db.open(config, schema)) {
+        try (Db db = Db.open(config)) {
+            db.updateSchema().addListColumn(1, ListConfig.defaults()).commit();
             byte[] key = "del-key".getBytes(StandardCharsets.UTF_8);
 
             // Put only column 0
@@ -154,13 +149,8 @@ class StructuredDbTest {
         Path dataDir = Files.createTempDirectory("cobble-structured-scan-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
 
-        Schema schema =
-                Schema.builder()
-                        .addBytesColumn(0)
-                        .addListColumn(1, ListConfig.of(50, ListRetainMode.LAST))
-                        .build();
-
-        try (Db db = Db.open(config, schema)) {
+        try (Db db = Db.open(config)) {
+            db.updateSchema().addListColumn(1, ListConfig.of(50, ListRetainMode.LAST)).commit();
             int count = 50;
             for (int i = 0; i < count; i++) {
                 byte[] key = String.format("scan-%04d", i).getBytes(StandardCharsets.UTF_8);
@@ -258,11 +248,8 @@ class StructuredDbTest {
         Path dataDir = Files.createTempDirectory("cobble-structured-default-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(3).totalBuckets(1);
 
-        // Only configure column 2 as list; columns 0 and 1 default to bytes
-        Schema schema =
-                Schema.builder().addListColumn(2, ListConfig.of(10, ListRetainMode.FIRST)).build();
-
-        try (Db db = Db.open(config, schema)) {
+        try (Db db = Db.open(config)) {
+            db.updateSchema().addListColumn(2, ListConfig.of(10, ListRetainMode.FIRST)).commit();
             byte[] key = "mixed".getBytes(StandardCharsets.UTF_8);
 
             // Write all three columns
@@ -299,11 +286,8 @@ class StructuredDbTest {
         Path dataDir = Files.createTempDirectory("cobble-structured-cap-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
 
-        // Cap at 3 elements, retain last
-        Schema schema =
-                Schema.builder().addListColumn(0, ListConfig.of(3, ListRetainMode.LAST)).build();
-
-        try (Db db = Db.open(config, schema)) {
+        try (Db db = Db.open(config)) {
+            db.updateSchema().addListColumn(0, ListConfig.of(3, ListRetainMode.LAST)).commit();
             byte[] key = "cap-key".getBytes(StandardCharsets.UTF_8);
 
             // Put initial list of 2
@@ -345,13 +329,8 @@ class StructuredDbTest {
         Path dataDir = Files.createTempDirectory("cobble-structured-dist-scan-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
 
-        Schema schema =
-                Schema.builder()
-                        .addBytesColumn(0)
-                        .addListColumn(1, ListConfig.of(50, ListRetainMode.LAST))
-                        .build();
-
-        try (Db db = Db.open(config, schema)) {
+        try (Db db = Db.open(config)) {
+            db.updateSchema().addListColumn(1, ListConfig.of(50, ListRetainMode.LAST)).commit();
             int count = 40;
             for (int i = 0; i < count; i++) {
                 byte[] key = String.format("dscan-%04d", i).getBytes(StandardCharsets.UTF_8);
