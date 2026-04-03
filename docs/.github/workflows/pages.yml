@@ -1,0 +1,58 @@
+name: Deploy versioned docs
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      docs_root:
+        description: "Docs root path (latest or semantic version like 0.2.0)"
+        required: false
+        default: "latest"
+      publish_branch:
+        description: "Git branch used for GitHub Pages content"
+        required: false
+        default: "gh-pages"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: "docs-versioned-pages"
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+          cache-version: 0
+          working-directory: '${{ github.workspace }}/docs'
+
+      - name: Deploy selected docs root
+        run: |
+          set -euo pipefail
+          DOCS_ROOT="${{ github.event.inputs.docs_root }}"
+          PUBLISH_BRANCH="${{ github.event.inputs.publish_branch }}"
+          if [[ -z "${DOCS_ROOT}" ]]; then
+            DOCS_ROOT="latest"
+          fi
+          if [[ -z "${PUBLISH_BRANCH}" ]]; then
+            PUBLISH_BRANCH="gh-pages"
+          fi
+          chmod +x scripts/deploy-versioned-pages.sh
+          scripts/deploy-versioned-pages.sh \
+            --root "${DOCS_ROOT}" \
+            --publish-branch "${PUBLISH_BRANCH}"

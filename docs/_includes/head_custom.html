@@ -1,0 +1,28 @@
+{% assign docs_root = site.docs_root_label | default: "latest" %}
+{% assign docs_commit = site.docs_commit_label | default: "" %}
+{% assign docs_commit_short = docs_commit | slice: 0, 8 %}
+{% assign docs_label = "" %}
+{% if docs_root == "latest" %}
+  {% if docs_commit_short != "" %}
+    {% assign docs_label = "(" | append: docs_commit_short | append: ")" %}
+  {% endif %}
+{% elsif docs_root != "" %}
+  {% assign docs_label = "(" | append: docs_root | append: ")" %}
+{% endif %}
+<style>
+  .site-title {
+    white-space: nowrap;
+  }
+
+  .site-title::after {
+    content: "{{ docs_label }}";
+    display: inline-block;
+    margin-left: 0.35rem;
+    font-size: 0.65rem;
+    font-weight: 400;
+    letter-spacing: 0.02em;
+    opacity: 0.72;
+    white-space: nowrap;
+  }
+
+</style>

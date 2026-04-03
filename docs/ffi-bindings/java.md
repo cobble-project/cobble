@@ -1,0 +1,133 @@
+---
+title: Java
+parent: FFI Bindings
+nav_order: 1
+---
+
+# Java Bindings
+
+The `cobble-java` crate provides JNI bindings that expose Cobble's functionality to JVM-based applications. The Java API mirrors the Rust API closely, covering all major components: `SingleDb`, `Db`, `Reader`, structured wrappers, and distributed scan.
+
+## Dependency
+
+We have published the Java API to Maven Central. You can add it as a dependency in your `pom.xml`:
+
+```xml
+<dependency>
+    <groupId>io.cobble</groupId>
+    <artifactId>cobble</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+</dependency>
+```
+
+## Java API Overview
+
+### SingleDb
+
+For single-machine embedded use. See [Single-Machine Embedded DB](../getting-started/single-db) for the full workflow.
+
+```java
+import io.cobble.SingleDb;
+import io.cobble.Config;
+import io.cobble.ReadOptions;
+
+Config config = Config.fromPath("config.yaml");
+SingleDb db = SingleDb.open(config);
+
+// Write
+db.put(0, "user:1".getBytes(), 0, "Alice".getBytes());
+
+// Read
+byte[] value = db.get(0, "user:1".getBytes(), 0);
+
+// Snapshot and resume
+long snapshotId = db.snapshot();
+db.close();
+db = SingleDb.resume(config, snapshotId);
+```
+
+### Db (Distributed)
+
+For multi-shard deployments. See [Distributed Deployment](../getting-started/distributed) for the full workflow.
+
+```java
+import io.cobble.Db;
+import io.cobble.ShardSnapshot;
+
+Db db = Db.open(config);
+db.put(0, "key".getBytes(), 0, "value".getBytes());
+
+// Create snapshot input for coordinator
+ShardSnapshot input = db.snapshot();
+```
+
+### Reader
+
+For snapshot-following reads. Reader visibility advances when new snapshots are materialized and reader refresh picks them up. See [Reader & Distributed Scan](../getting-started/reader-and-scan).
+
+```java
+import io.cobble.Reader;
+
+Reader reader = Reader.openCurrent(config);
+byte[] value = reader.get(0, "key".getBytes(), 0);
+reader.refresh();
+```
+
+### Structured Wrappers
+
+Structured wrappers are schema-driven and currently support typed `Bytes` and `List` columns. See [Structured DB](../getting-started/structured-db).
+
+```java
+import io.cobble.structured.SingleDb;
+import io.cobble.structured.ColumnValue;
+import io.cobble.structured.Row;
+
+SingleDb db = SingleDb.open(config);
+db.updateSchema()
+    .addListColumn(1, io.cobble.structured.ListConfig.of(100, io.cobble.structured.ListRetainMode.LAST))
+    .commit();
+db.put(0, "user:1".getBytes(), 0, ColumnValue.ofBytes("Alice".getBytes()));
+Row row = db.get(0, "user:1".getBytes());
+```
+
+### Distributed Scan
+
+For parallel analytical scans across shards. See [Reader & Distributed Scan](../getting-started/reader-and-scan).
+
+```java
+import io.cobble.ScanPlan;
+import io.cobble.ScanSplit;
+import io.cobble.ScanCursor;
+
+ScanPlan plan = ScanPlan.fromGlobalSnapshot(manifest);
+List<ScanSplit> splits = plan.splits();
+
+for (ScanSplit split : splits) {
+    try (ScanCursor cursor = split.openScannerWithOptions(config, scanOptions)) {
+        for (ScanCursor.Entry entry : cursor) {
+            byte[] key = entry.key;
+            byte[][] columns = entry.columns;
+        }
+    }
+}
+```
+
+## Memory Management
+
+Java objects hold opaque pointers to Rust `Arc<T>` allocations. Calling `close()` on a Java wrapper releases the underlying Rust resources. If `close()` is not called, resources will not be freed and **may lead to memory leaks**. It is recommended to use try-with-resources or ensure `close()` is called in a `finally` block.
+
+## Building
+
+If you want to customize your java APIs, you can compile by yourself. The Java binding consists of two parts:
+
+1. **Native library** (Rust → shared library via `cdylib`)
+2. **Java API** (Maven project with JNI wrappers)
+
+```bash
+# Build native library
+cargo build --release -p cobble-java
+
+# Build and test Java API
+cd cobble-java/java
+./mvnw package
+```

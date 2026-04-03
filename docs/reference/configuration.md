@@ -1,0 +1,263 @@
+---
+title: All Configuration
+parent: Reference
+nav_order: 1
+---
+
+# All Configuration
+
+Complete reference for all Cobble configuration parameters.
+
+## Config
+
+The main `Config` struct. Can be created programmatically or loaded from a file (`Config::from_path("config.yaml")`).
+
+Supported file formats: YAML (`.yaml`/`.yml`), JSON (`.json`), TOML (`.toml`), INI (`.ini`).
+
+### Storage
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `volumes` | `Vec<VolumeDescriptor>` | Single local volume at `/tmp/cobble` | Storage volume descriptors |
+| `data_file_type` | `DataFileType` | `SSTable` | Output format: `SSTable` or `Parquet` |
+
+### Memtable
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `memtable_capacity` | `usize` | 67,108,864 (64 MB) | Max memtable size in bytes before flush |
+| `memtable_buffer_count` | `usize` | 2 | Number of memtable buffers (active + immutable) |
+| `memtable_type` | `MemtableType` | `Hash` | Implementation: `Hash`, `Skiplist`, `Vec` |
+
+### LSM Tree
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `l0_file_limit` | `usize` | 4 | L0 file count that triggers compaction |
+| `write_stall_limit` | `Option<usize>` | `None` | Max immutable+L0 files before stall. Auto: `min(l0+4, l0×2)` |
+| `l1_base_bytes` | `usize` | 67,108,864 (64 MB) | Target size for level 1 |
+| `level_size_multiplier` | `usize` | 10 | Size multiplier per level |
+| `max_level` | `u8` | 6 | Maximum number of LSM levels |
+
+### SST Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `base_file_size` | `usize` | 67,108,864 (64 MB) | Target output file size |
+| `sst_bloom_filter_enabled` | `bool` | `false` | Enable bloom filter per SST file |
+| `sst_bloom_bits_per_key` | `u32` | 10 | Bits per key for bloom filter |
+| `sst_partitioned_index` | `bool` | `false` | Enable two-level partitioned index |
+| `sst_compression_by_level` | `Vec<SstCompressionAlgorithm>` | `[None, None, Lz4]` | Compression per level |
+
+### Parquet
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `parquet_row_group_size_bytes` | `usize` | 262,144 (256 KB) | Row group size in bytes |
+
+### Block Cache
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `block_cache_size` | `usize` | 67,108,864 (64 MB) | In-memory cache size (0 = disabled) |
+| `block_cache_hybrid_enabled` | `bool` | `false` | Enable memory + disk hybrid cache |
+| `block_cache_hybrid_disk_size` | `Option<usize>` | `None` | Disk tier capacity (defaults to memory size) |
+
+### Compaction
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `compaction_policy` | `CompactionPolicyKind` | `RoundRobin` | Policy: `RoundRobin` or `MinOverlap` |
+| `compaction_read_ahead_enabled` | `bool` | `true` | Buffered reads during compaction |
+| `compaction_remote_addr` | `Option<String>` | `None` | Remote compaction server address (host:port) |
+| `compaction_threads` | `usize` | 4 | Compaction thread pool size |
+| `compaction_remote_timeout_ms` | `u64` | 300,000 | Remote compaction timeout (milliseconds) |
+| `compaction_server_max_concurrent` | `usize` | 4 | Max concurrent tasks on remote server |
+| `compaction_server_max_queued` | `usize` | 64 | Max queued tasks before rejecting |
+
+### Value Separation
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `value_separation_threshold` | `usize` | `usize::MAX` | Byte threshold for VLOG separation (MAX = disabled) |
+
+### TTL
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ttl_enabled` | `bool` | `false` | Enable TTL metadata processing |
+| `default_ttl_seconds` | `Option<u32>` | `None` | Default TTL for entries (None = no expiration) |
+| `time_provider` | `TimeProviderKind` | `System` | Time source: `System` or `Manual` |
+
+### Snapshots
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `snapshot_on_flush` | `bool` | `false` | Auto-snapshot after each memtable flush |
+| `snapshot_retention` | `Option<usize>` | `None` | Keep only N most recent snapshots |
+| `active_memtable_incremental_snapshot_ratio` | `f64` | 0.0 | Ratio for incremental memtable snapshots (0 = disabled) |
+
+### Schema
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `num_columns` | `usize` | 1 | Number of value columns per key |
+| `total_buckets` | `u32` | 1 | Total buckets for sharding (1–65536) |
+
+### Volume Offload
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `primary_volume_write_stop_watermark` | `f64` | 0.95 | Usage ratio to stop writes |
+| `primary_volume_offload_trigger_watermark` | `f64` | 0.85 | Usage ratio to trigger offload |
+| `primary_volume_offload_policy` | `PrimaryVolumeOffloadPolicyKind` | `Priority` | Policy: `LargestFile` or `Priority` |
+
+### LSM Splitting
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `lsm_split_trigger_level` | `Option<u8>` | `None` | Level that triggers LSM tree splitting |
+
+### Logging
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `log_path` | `Option<String>` | `None` | Log file path (must be local) |
+| `log_console` | `bool` | `false` | Enable console logging |
+| `log_level` | `log::LevelFilter` | `Info` | Trace, Debug, Info, Warn, Error, Off |
+
+---
+
+## CoordinatorConfig
+
+Configuration for `DbCoordinator`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `volumes` | `Vec<VolumeDescriptor>` | Single local volume | Storage volumes for global manifests |
+| `snapshot_retention` | `Option<usize>` | `None` | Auto-expire old global snapshots |
+
+---
+
+## VolumeDescriptor
+
+Describes a storage volume.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `base_dir` | `String` | (required) | Base directory URL (`file://`, `s3://`, etc.) |
+| `access_id` | `Option<String>` | `None` | Access ID for remote storage |
+| `secret_key` | `Option<String>` | `None` | Secret key for remote storage |
+| `size_limit` | `Option<u64>` | `None` | Maximum volume size in bytes |
+| `kinds` | `u8` | 0 | Bitmask of `VolumeUsageKind` values |
+
+### VolumeUsageKind
+
+| Kind | Value | Description |
+|------|-------|-------------|
+| `Meta` | 0 | Metadata files (manifests, schemas) |
+| `PrimaryDataPriorityHigh` | 1 | High-priority data (SST, Parquet, VLOG) |
+| `PrimaryDataPriorityMedium` | 2 | Medium-priority data |
+| `PrimaryDataPriorityLow` | 3 | Low-priority data |
+| `Snapshot` | 4 | Snapshot materialization |
+| `Cache` | 5 | Block cache disk tier |
+| `Readonly` | 6 | Read-only data source |
+
+### Helper Methods
+
+| Method | Description |
+|--------|-------------|
+| `VolumeDescriptor::single_volume(url)` | Create single volume with `PrimaryDataPriorityHigh + Meta` |
+| `VolumeDescriptor::new(url, kinds)` | Create volume with specified usage kinds list (`Vec<VolumeUsageKind>`) |
+| `set_usage(kind)` | Add a usage kind to the volume |
+| `supports(kind)` | Check if volume supports a usage kind |
+
+---
+
+## ReadOptions
+
+Options for point lookups.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `column_indices` | `Option<Vec<usize>>` | `None` | Column projection (None = all columns) |
+
+---
+
+## ScanOptions
+
+Options for scan operations.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `read_ahead_bytes` | `usize` | 0 | Read-ahead buffer size (0 = disabled) |
+| `column_indices` | `Option<Vec<usize>>` | `None` | Column projection |
+
+---
+
+## WriteOptions
+
+Options for write operations.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ttl_seconds` | `Option<u32>` | `None` | TTL for this write (overrides default) |
+
+---
+
+## ReaderConfigEntry
+
+Configuration for the read proxy.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `pin_partition_in_memory_count` | `usize` | 1 | Partition snapshots pinned in memory |
+| `block_cache_size` | `usize` | 536,870,912 (512 MB) | Reader block cache size |
+| `reload_tolerance_seconds` | `u64` | 10 | Min interval between snapshot reload checks |
+
+---
+
+## Enums
+
+### DataFileType
+
+| Variant | Description |
+|---------|-------------|
+| `SSTable` | Row-based SST format (default) |
+| `Parquet` | Apache Parquet columnar format |
+
+### MemtableType
+
+| Variant | Description |
+|---------|-------------|
+| `Hash` | Hash table (default) |
+| `Skiplist` | Skip list |
+| `Vec` | Vector-based |
+
+### CompactionPolicyKind
+
+| Variant | Description |
+|---------|-------------|
+| `RoundRobin` | Fair round-robin level selection (default) |
+| `MinOverlap` | Minimize key range overlap |
+
+### SstCompressionAlgorithm
+
+| Variant | Description |
+|---------|-------------|
+| `None` | No compression (default) |
+| `Lz4` | LZ4 compression |
+
+### TimeProviderKind
+
+| Variant | Description |
+|---------|-------------|
+| `System` | System wall clock (default) |
+| `Manual` | Manual time control (starts at 0) |
+
+### PrimaryVolumeOffloadPolicyKind
+
+| Variant | Description |
+|---------|-------------|
+| `Priority` | Offload by file priority (default) |
+| `LargestFile` | Offload largest file first |
