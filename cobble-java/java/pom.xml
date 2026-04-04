@@ -8,7 +8,32 @@
   <artifactId>cobble</artifactId>
   <version>0.1.0</version>
   <name>cobble-java</name>
+  <description>Java JNI bindings for Cobble, an LSM-based key-value storage engine.</description>
+  <url>https://github.com/cobble-project/cobble</url>
   <packaging>jar</packaging>
+
+  <licenses>
+    <license>
+      <name>Apache License 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <scm>
+    <connection>scm:git:https://github.com/cobble-project/cobble.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/cobble-project/cobble.git</developerConnection>
+    <url>https://github.com/cobble-project/cobble</url>
+    <tag>HEAD</tag>
+  </scm>
+
+  <developers>
+    <developer>
+      <id>cobble-project</id>
+      <name>Cobble Project</name>
+      <url>https://github.com/cobble-project</url>
+    </developer>
+  </developers>
 
   <properties>
     <maven.compiler.source>8</maven.compiler.source>
@@ -164,6 +189,9 @@
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-source-plugin</artifactId>
             <version>3.3.1</version>
+            <configuration>
+              <excludeResources>true</excludeResources>
+            </configuration>
             <executions>
               <execution>
                 <id>attach-sources</id>
@@ -183,6 +211,26 @@
                 <goals>
                   <goal>jar</goal>
                 </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.7</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+                <configuration>
+                  <gpgArguments>
+                    <arg>--pinentry-mode</arg>
+                    <arg>loopback</arg>
+                  </gpgArguments>
+                </configuration>
               </execution>
             </executions>
           </plugin>
