@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   build-native:
@@ -138,8 +137,6 @@ jobs:
       MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
       MAVEN_GPG_PRIVATE_KEY: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
       MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
-      GITHUB_ACTOR: ${{ github.actor }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -160,7 +157,7 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Configure Maven repositories
+      - name: Configure Maven Central credentials
         run: |
           mkdir -p ~/.m2
           cat > ~/.m2/settings.xml <<EOF
@@ -172,11 +169,6 @@ jobs:
                 <id>central</id>
                 <username>${MAVEN_CENTRAL_USERNAME}</username>
                 <password>${MAVEN_CENTRAL_PASSWORD}</password>
-              </server>
-              <server>
-                <id>github</id>
-                <username>${GITHUB_ACTOR}</username>
-                <password>${GITHUB_TOKEN}</password>
               </server>
             </servers>
           </settings>
@@ -205,10 +197,6 @@ jobs:
           gpgconf --kill gpg-agent
           gpg --batch --list-secret-keys --keyid-format LONG
 
-      - name: Publish to Maven Central
+      - name: Publish to Maven Central (Portal plugin)
         working-directory: cobble-java/java
         run: ./mvnw --batch-mode -Prelease-publish -Dgpg.passphrase="${MAVEN_GPG_PASSPHRASE}" -DskipTests -Dexec.skip=true -Dcobble.skip.local.native.copy=true deploy -s ~/.m2/settings.xml
-
-      - name: Publish to GitHub Packages
-        working-directory: cobble-java/java
-        run: ./mvnw --batch-mode -Prelease-publish -Dgpg.passphrase="${MAVEN_GPG_PASSPHRASE}" -DskipTests -Dexec.skip=true -Dcobble.skip.local.native.copy=true deploy -DaltDeploymentRepository=github::https://maven.pkg.github.com/${GITHUB_REPOSITORY} -s ~/.m2/settings.xml

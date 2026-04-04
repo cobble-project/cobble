@@ -137,15 +137,12 @@ To produce a **single multi-platform jar** (including `debug` + `release` JNI li
 - Trigger: **Actions -> Build Java Multi-platform JAR -> Run workflow**
 - Output: downloadable jar artifact from the workflow run
 
-For publishing, the same workflow also runs on **GitHub Release published** events and deploys the multi-platform build to:
-
-- Maven Central
-- GitHub Packages
+For publishing, the same workflow also runs on **GitHub Release published** events and deploys the multi-platform build to **Maven Central** (via Sonatype `central-publishing-maven-plugin`).
 
 Required repository secrets for release publishing:
 
-- `MAVEN_CENTRAL_USERNAME`
-- `MAVEN_CENTRAL_PASSWORD`
+- `MAVEN_CENTRAL_USERNAME` (Central Portal user token username)
+- `MAVEN_CENTRAL_PASSWORD` (Central Portal user token password)
 - `MAVEN_GPG_PRIVATE_KEY` (ASCII-armored private key, or base64-encoded armored key)
 - `MAVEN_GPG_PASSPHRASE`
 
