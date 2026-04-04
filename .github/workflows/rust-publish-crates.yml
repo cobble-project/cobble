@@ -11,7 +11,8 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     env:
-      CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+      COBBLE_WEB_MONITOR_SKIP_UI_BUILD: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -21,21 +22,49 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Validate release tag and workspace version
+      - name: Validate release tag and crate versions
         shell: bash
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           version="${tag#v}"
-          workspace_version="$(sed -n 's/^version = \"\\(.*\\)\"$/\\1/p' Cargo.toml | head -n 1)"
-          if [[ -z "${workspace_version}" ]]; then
-            echo "Failed to read workspace.package version from Cargo.toml" >&2
+          if [[ -z "${version}" ]]; then
+            echo "Invalid release tag: ${tag}" >&2
             exit 1
           fi
-          if [[ "${version}" != "${workspace_version}" ]]; then
-            echo "Release tag (${tag}) does not match workspace version (${workspace_version})." >&2
-            exit 1
-          fi
+          python3 - "${version}" <<'PY'
+          import json
+          import subprocess
+          import sys
+          
+          release_version = sys.argv[1]
+          publish_crates = ["cobble", "cobble-data-structure", "cobble-web-monitor", "cobble-cli"]
+          
+          metadata = json.loads(
+              subprocess.check_output(
+                  ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                  text=True,
+              )
+          )
+          versions_by_name = {pkg["name"]: pkg["version"] for pkg in metadata["packages"]}
+          
+          missing = [name for name in publish_crates if name not in versions_by_name]
+          if missing:
+              print(f"Missing crates in workspace metadata: {', '.join(missing)}", file=sys.stderr)
+              sys.exit(1)
+          
+          mismatches = [
+              f"{name}={versions_by_name[name]}"
+              for name in publish_crates
+              if versions_by_name[name] != release_version
+          ]
+          if mismatches:
+              print(
+                  f"Release tag version ({release_version}) does not match crate versions: {', '.join(mismatches)}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          PY
 
       - name: Publish crates to crates.io
         shell: bash
@@ -44,6 +73,7 @@ jobs:
           crates=(
             "cobble"
             "cobble-data-structure"
+            "cobble-web-monitor"
             "cobble-cli"
           )
 

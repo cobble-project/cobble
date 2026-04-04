@@ -188,6 +188,16 @@ jobs:
         working-directory: cobble-java/java
         run: ./mvnw --batch-mode -Prelease-publish -DskipTests -Dexec.skip=true -Dcobble.skip.local.native.copy=true deploy -s ~/.m2/settings.xml
 
+      - name: Finalize upload to Central Portal
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth="$(printf '%s:%s' "${MAVEN_CENTRAL_USERNAME}" "${MAVEN_CENTRAL_PASSWORD}" | base64)"
+          curl --fail --show-error --silent \
+            -X POST \
+            -H "Authorization: Bearer ${auth}" \
+            "https://ossrh-staging-api.central.sonatype.com/manual/upload/defaultRepository/io.github.cobble-project?publishing_type=automatic"
+
       - name: Publish to GitHub Packages
         working-directory: cobble-java/java
         run: ./mvnw --batch-mode -Prelease-publish -DskipTests -Dexec.skip=true -Dcobble.skip.local.native.copy=true deploy -DaltDeploymentRepository=github::https://maven.pkg.github.com/${GITHUB_REPOSITORY} -s ~/.m2/settings.xml

@@ -25,14 +25,14 @@ Then open `http://127.0.0.1:4000`.
 `docs-pages.yml` only publishes in these two cases:
 
 1. Push to `main` / `master` **and** this push contains changes under `docs/**` -> publish `latest/`
-2. Push a version tag (tag name is the version, e.g. `0.3.0`) -> publish `<tag>/`
+2. Push a version tag with `v` prefix (e.g. `v0.3.0`) -> publish `<version>/` (e.g. `0.3.0/`)
 
 All other pushes/tags are ignored by deploy job.
 
 ### How to operate
 
 1. For `latest/`: update docs and push to `main` / `master`.
-2. For versioned docs: create and push a version tag (e.g. `0.3.0`).
+2. For versioned docs: create and push a version tag (e.g. `v0.3.0`).
 3. Workflow auto-builds and publishes to corresponding root on `gh-pages`.
 
 ### Versioned roots

@@ -5,8 +5,9 @@ use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let ui_dir = manifest_dir.join("web-ui");
-    let dist_dir = ui_dir.join("dist");
+    let dist_dir = out_dir.join("web-ui-dist");
     let package_json = ui_dir.join("package.json");
     let package_lock = ui_dir.join("package-lock.json");
     let build_version = format!(
@@ -44,12 +45,14 @@ fn main() {
 
     if env::var("COBBLE_WEB_MONITOR_SKIP_UI_BUILD").as_deref() == Ok("1") {
         write_fallback_dist(&dist_dir, &build_version, &build_commit);
+        emit_ui_dist_env(&dist_dir);
         println!("cargo:warning=COBBLE_WEB_MONITOR_SKIP_UI_BUILD=1; using fallback embedded UI");
         return;
     }
 
     if !package_json.exists() {
         write_fallback_dist(&dist_dir, &build_version, &build_commit);
+        emit_ui_dist_env(&dist_dir);
         println!("cargo:warning=web-ui/package.json not found; using fallback embedded UI");
         return;
     }
@@ -70,15 +73,16 @@ fn main() {
             &[],
         );
     }
-    run_npm(
+    run_npm_with_out_dir(
         &npm,
         &ui_dir,
-        &["run", "build"],
+        &dist_dir,
         &[
             ("VITE_COBBLE_VERSION", &build_version),
             ("VITE_COBBLE_COMMIT", &build_commit),
         ],
     );
+    emit_ui_dist_env(&dist_dir);
 }
 
 fn resolve_build_commit() -> String {
@@ -127,6 +131,21 @@ fn run_npm(npm: &str, cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) {
         cwd.display(),
         status
     );
+}
+
+fn run_npm_with_out_dir(npm: &str, cwd: &Path, dist_dir: &Path, extra_env: &[(&str, &str)]) {
+    let dist_dir_str = dist_dir.to_string_lossy().into_owned();
+    run_npm(
+        npm,
+        cwd,
+        &["run", "build", "--", "--outDir", dist_dir_str.as_str()],
+        extra_env,
+    );
+}
+
+fn emit_ui_dist_env(dist_dir: &Path) {
+    let dist_path = dist_dir.to_string_lossy().replace('\\', "/");
+    println!("cargo:rustc-env=COBBLE_WEB_MONITOR_UI_DIST={dist_path}");
 }
 
 fn write_fallback_dist(dist_dir: &Path, version: &str, commit: &str) {
