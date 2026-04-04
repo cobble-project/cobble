@@ -142,6 +142,13 @@ For publishing, the same workflow also runs on **GitHub Release published** even
 - Maven Central
 - GitHub Packages
 
+Required repository secrets for release publishing:
+
+- `MAVEN_CENTRAL_USERNAME`
+- `MAVEN_CENTRAL_PASSWORD`
+- `MAVEN_GPG_PRIVATE_KEY` (ASCII-armored private key, or base64-encoded armored key)
+- `MAVEN_GPG_PASSPHRASE`
+
 - `macos-aarch64`
 - `macos-x86_64`
 - `linux-x86_64`
