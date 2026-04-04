@@ -1,0 +1,138 @@
+name: Deploy Docs
+
+on:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs-pages.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: docs-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve publish root
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="${GITHUB_REF_NAME}"
+          root=""
+          if [[ "${branch}" == "main" || "${branch}" == "master" ]]; then
+            root="latest"
+          elif [[ "${branch}" =~ ^[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z._-]+)?$ ]]; then
+            root="${branch}"
+          elif [[ "${branch}" =~ ^release/([0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z._-]+)?)$ ]]; then
+            root="${BASH_REMATCH[1]}"
+          fi
+
+          if [[ -z "${root}" ]]; then
+            echo "deploy=false" >> "${GITHUB_OUTPUT}"
+            echo "reason=Skip docs publish for branch '${branch}'." >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "deploy=true" >> "${GITHUB_OUTPUT}"
+          echo "docs_root=${root}" >> "${GITHUB_OUTPUT}"
+
+      - name: Skip unsupported branch
+        if: steps.resolve.outputs.deploy != 'true'
+        run: echo "${{ steps.resolve.outputs.reason }}"
+
+      - name: Setup Ruby
+        if: steps.resolve.outputs.deploy == 'true'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+          cache-version: 0
+          working-directory: "${{ github.workspace }}/docs"
+
+      - name: Build docs
+        if: steps.resolve.outputs.deploy == 'true'
+        working-directory: docs
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="${{ steps.resolve.outputs.docs_root }}"
+          commit_short="$(git rev-parse --short=8 HEAD)"
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          baseurl="/${repo_name}/${root}"
+
+          tmp_config="$(mktemp "${RUNNER_TEMP}/docs-build-meta.XXXXXX.yml")"
+          trap 'rm -f "${tmp_config}"' EXIT
+          cat > "${tmp_config}" <<EOF
+          docs_root_label: ${root}
+          docs_commit_label: ${commit_short}
+          EOF
+
+          bundle exec jekyll build \
+            --strict_front_matter \
+            --baseurl "${baseurl}" \
+            --config "_config.yml,${tmp_config}"
+
+      - name: Publish to gh-pages
+        if: steps.resolve.outputs.deploy == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="${{ steps.resolve.outputs.docs_root }}"
+          remote_url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          publish_branch="gh-pages"
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "${tmp_dir}"' EXIT
+
+          if git ls-remote --exit-code --heads "${remote_url}" "${publish_branch}" >/dev/null 2>&1; then
+            git clone --depth 1 --branch "${publish_branch}" "${remote_url}" "${tmp_dir}" >/dev/null 2>&1
+          else
+            git init "${tmp_dir}" >/dev/null
+            git -C "${tmp_dir}" checkout -b "${publish_branch}" >/dev/null
+            git -C "${tmp_dir}" remote add origin "${remote_url}"
+          fi
+
+          mkdir -p "${tmp_dir}/${root}"
+          rsync -a --delete "docs/_site/" "${tmp_dir}/${root}/"
+          touch "${tmp_dir}/.nojekyll"
+
+          if [[ "${root}" == "latest" || ! -f "${tmp_dir}/index.html" ]]; then
+            cat > "${tmp_dir}/index.html" <<'EOF'
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8" />
+              <meta http-equiv="refresh" content="0; url=latest/" />
+              <meta name="robots" content="noindex" />
+              <title>Cobble Docs</title>
+            </head>
+            <body>
+              <p>Redirecting to <a href="latest/">latest docs</a>…</p>
+            </body>
+          </html>
+          EOF
+          fi
+
+          git -C "${tmp_dir}" add -A
+          if git -C "${tmp_dir}" diff --cached --quiet; then
+            echo "No docs changes to publish for root '${root}'."
+            exit 0
+          fi
+
+          git -C "${tmp_dir}" config user.name "github-actions[bot]"
+          git -C "${tmp_dir}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "${tmp_dir}" commit -m "docs: publish ${root}" >/dev/null
+          git -C "${tmp_dir}" push origin "HEAD:${publish_branch}" >/dev/null

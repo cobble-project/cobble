@@ -1,0 +1,33 @@
+name: Docs CI
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs-ci.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs-ci.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+          cache-version: 0
+          working-directory: "${{ github.workspace }}/docs"
+
+      - name: Build docs
+        run: bundle exec jekyll build --strict_front_matter
