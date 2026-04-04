@@ -12,4 +12,4 @@ categories = ["command-line-utilities", "database-implementations"]
 [dependencies]
 cobble = { workspace = true }
 cobble-web-monitor = { workspace = true }
-log = "0.4.29"
+log = { workspace = true }
