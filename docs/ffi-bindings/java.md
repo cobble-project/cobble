@@ -124,10 +124,26 @@ If you want to customize your java APIs, you can compile by yourself. The Java b
 2. **Java API** (Maven project with JNI wrappers)
 
 ```bash
-# Build native library
-cargo build --release -p cobble-java
-
-# Build and test Java API
+# Local debug build (current platform only, includes debug + release JNI libs)
 cd cobble-java/java
 ./mvnw package
 ```
+
+Local `mvn package` only bundles the current host platform into the jar (for fast debugging).
+
+To produce a **single multi-platform jar** (including `debug` + `release` JNI libs for common platforms), use the manual GitHub Actions workflow:
+
+- Workflow: `.github/workflows/java-multi-platform-jar.yml`
+- Trigger: **Actions -> Build Java Multi-platform JAR -> Run workflow**
+- Output: downloadable jar artifact from the workflow run
+
+For publishing, the same workflow also runs on **GitHub Release published** events and deploys the multi-platform build to:
+
+- Maven Central
+- GitHub Packages
+
+- `macos-aarch64`
+- `macos-x86_64`
+- `linux-x86_64`
+- `linux-aarch64`
+- `windows-x86_64`
