@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/cobble-project/cobble"
-homepage = "https://github.com/cobble-project/cobble"
+homepage = "https://cobble-project.github.io/cobble/latest/"
 
 [workspace.dependencies]
 cobble = { path = "cobble", version = "0.1.0" }

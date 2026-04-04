@@ -1,0 +1,83 @@
+name: Publish Rust crates
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Validate release tag and workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          workspace_version="$(sed -n 's/^version = \"\\(.*\\)\"$/\\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "${workspace_version}" ]]; then
+            echo "Failed to read workspace.package version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [[ "${version}" != "${workspace_version}" ]]; then
+            echo "Release tag (${tag}) does not match workspace version (${workspace_version})." >&2
+            exit 1
+          fi
+
+      - name: Publish crates to crates.io
+        shell: bash
+        run: |
+          set -euo pipefail
+          crates=(
+            "cobble"
+            "cobble-data-structure"
+            "cobble-cli"
+          )
+
+          publish_one() {
+            local crate="$1"
+            local attempts=8
+            local delay=30
+            local n=1
+            while true; do
+              set +e
+              output="$(cargo publish -p "${crate}" --locked --registry crates-io 2>&1)"
+              code=$?
+              set -e
+
+              if [[ $code -eq 0 ]]; then
+                echo "Published ${crate}."
+                return 0
+              fi
+              if echo "${output}" | grep -qi "already uploaded"; then
+                echo "${crate} is already uploaded. Continuing."
+                return 0
+              fi
+
+              echo "${output}" >&2
+              if [[ $n -ge $attempts ]]; then
+                echo "Failed to publish ${crate} after ${attempts} attempts." >&2
+                return 1
+              fi
+              n=$((n + 1))
+              echo "Retrying ${crate} in ${delay}s (${n}/${attempts})..."
+              sleep "${delay}"
+            done
+          }
+
+          for crate in "${crates[@]}"; do
+            publish_one "${crate}"
+          done
