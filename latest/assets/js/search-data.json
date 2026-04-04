@@ -421,7 +421,7 @@
   },"60": {
     "doc": "Java",
     "title": "Dependency",
-    "content": "We have published the Java API to Maven Central. You can add it as a dependency in your pom.xml: . &lt;dependency&gt; &lt;groupId&gt;io.cobble&lt;/groupId&gt; &lt;artifactId&gt;cobble&lt;/artifactId&gt; &lt;version&gt;0.0.1-SNAPSHOT&lt;/version&gt; &lt;/dependency&gt; . ",
+    "content": "We have published the Java API to Maven Central. You can add it as a dependency in your pom.xml: . &lt;dependency&gt; &lt;groupId&gt;io.github.cobble-project&lt;/groupId&gt; &lt;artifactId&gt;cobble&lt;/artifactId&gt; &lt;version&gt;0.1.0&lt;/version&gt; &lt;/dependency&gt; . ",
     "url": "/cobble/latest/ffi-bindings/java.html#dependency",
     
     "relUrl": "/ffi-bindings/java.html#dependency"
