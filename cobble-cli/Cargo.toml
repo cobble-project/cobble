@@ -1,9 +1,15 @@
 [package]
 name = "cobble-cli"
-version = "0.0.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line tools for Cobble storage engine"
+repository.workspace = true
+homepage.workspace = true
+keywords = ["cli", "kv", "storage"]
+categories = ["command-line-utilities", "database-implementations"]
 
 [dependencies]
-cobble = { path = "../cobble" }
-cobble-web-monitor = { path = "../cobble-web-monitor" }
+cobble = { workspace = true }
+cobble-web-monitor = { workspace = true }
 log = "0.4.29"

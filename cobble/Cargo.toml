@@ -1,8 +1,14 @@
 [package]
 name = "cobble"
-version = "0.0.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 build = "build.rs"
+license.workspace = true
+description = "A flexible embedded key-value storage engine for distributed systems as well as single-node applications."
+repository.workspace = true
+homepage.workspace = true
+keywords = ["kv", "lsm", "storage"]
+categories = ["database-implementations"]
 
 [dependencies]
 bytes = "1.11.0"

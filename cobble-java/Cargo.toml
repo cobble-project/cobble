@@ -1,15 +1,17 @@
 [package]
 name = "cobble-java"
-version = "0.0.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
 
 [lib]
 name = "cobblejni"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-cobble = { path = "../cobble" }
-cobble-data-structure = { path = "../cobble-data-structure" }
+cobble = { workspace = true }
+cobble-data-structure = { workspace = true }
 bytes = "1"
 jni = "0.21"
 serde = { version = "1", features = ["derive"] }

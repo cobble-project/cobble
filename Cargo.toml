@@ -10,6 +10,18 @@ members = [
     "cobble-web-monitor",
 ]
 
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/cobble-project/cobble"
+homepage = "https://github.com/cobble-project/cobble"
+
+[workspace.dependencies]
+cobble = { path = "cobble", version = "0.0.1" }
+cobble-data-structure = { path = "cobble-data-structure", version = "0.0.1" }
+cobble-web-monitor = { path = "cobble-web-monitor", version = "0.0.1" }
+
 [profile.release]
 opt-level = 3
 lto = "fat"
