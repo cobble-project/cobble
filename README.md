@@ -25,6 +25,10 @@ We list some of Cobble's key features below, they are either implemented or are 
 
 Cobble usage can be viewed as **step 0 + five patterns**.
 
+For complete guides and more examples, see docs:
+- https://cobble-project.github.io/cobble/latest/
+- https://cobble-project.github.io/cobble/latest/getting-started/
+
 ### 0) Config first: understand volumes
 
 Before any API flow, define `Config` and volume layout.
@@ -80,49 +84,74 @@ Recover/read flow:
 
 ### 2) Distributed write/read with `N x Db` + `1 x DbCoordinator`
 
-Core components:
-- `N` shard writers (`Db`), each owning one or more bucket ranges.
-- `1` `DbCoordinator`, storing/materializing global snapshot manifests.
+```rust
+use cobble::{Config, CoordinatorConfig, Db, DbCoordinator};
 
-Snapshot flow:
-1. Each shard calls `Db::snapshot()` (or `snapshot_with_callback`) and produces `ShardSnapshotInput`.
-2. Coordinator calls `take_global_snapshot(total_buckets, shard_inputs)`.
-3. Coordinator persists it with `materialize_global_snapshot(&manifest)`.
+// shard writers
+let db1 = Db::open(config1, vec![0..=499])?;
+let db2 = Db::open(config2, vec![500..=999])?;
 
-Recover flow (historical read/write resume):
-1. Restore coordinator state first (load global snapshot manifest/current pointer).
-2. Then restore each shard DB with
-   `Db::open_from_snapshot(config, shard_snapshot_id, db_id)`.
-3. Continue write/read on restored shard DB instances.
+// coordinator
+let coord = DbCoordinator::open(CoordinatorConfig {
+    volumes: coordinator_volumes,
+    snapshot_retention: Some(5),
+})?;
 
-Remote compaction (optional in distributed mode):
-1. Start remote compaction worker process:
-   - create `RemoteCompactionServer::new(server_config)?`
-   - call `server.serve("0.0.0.0:PORT")?`
-2. On each writer `Db` config, set:
-   - `config.compaction_remote_addr = Some("HOST:PORT".to_string())`
-3. Open DB as usual; compaction tasks will be offloaded to remote worker.
+// write
+db1.put(100, b"user:1", 0, b"Alice")?;
+db2.put(700, b"order:9", 0, b"paid")?;
 
-For structured wrappers, use `StructuredRemoteCompactionServer` in
-`cobble-data-structure` when you need structured merge-operator resolution.
+// global snapshot
+let s1 = db1.snapshot()?;
+let s2 = db2.snapshot()?;
+let i1 = db1.shard_snapshot_input(s1)?;
+let i2 = db2.shard_snapshot_input(s2)?;
+let manifest = coord.take_global_snapshot(1000, vec![i1, i2])?;
+coord.materialize_global_snapshot(&manifest)?;
+```
+
+Remote compaction example:
+
+```rust
+let mut config = Config::default();
+config.compaction_remote_addr = Some("127.0.0.1:18888".to_string());
+```
+
+See full distributed setup and restore examples:
+https://cobble-project.github.io/cobble/latest/getting-started/distributed/
 
 ### 3) Real-time read while writing (`Reader`)
 
-Use `Reader` in services that should read continuously while writer shards keep
-writing and generating snapshots.
+```rust
+use cobble::{Reader, ReaderConfig, VolumeDescriptor};
 
-- Open: `Reader::open_current(reader_config)` (or `Reader::open(reader_config, snapshot_id)`).
-- Read: `reader.get(...)` / `reader.scan(...)`.
-- Refresh pointer: `reader.refresh()` to pick newer global snapshots.
+let read_config = ReaderConfig {
+    volumes: VolumeDescriptor::single_volume("file:///tmp/cobble".to_string()),
+    total_buckets: 1024,
+    ..ReaderConfig::default()
+};
+let mut reader = Reader::open_current(read_config)?;
+let v = reader.get(0, b"user:1")?;
+reader.refresh()?; // pull newer materialized snapshot
+```
+
+More `Reader` details:
+https://cobble-project.github.io/cobble/latest/getting-started/reader-and-scan/
 
 ### 4) Distributed scan on one snapshot
 
-Given a `GlobalSnapshotManifest`:
-1. Build `ScanPlan::new(manifest)` and set optional `with_start`/`with_end`.
-2. Generate splits via `plan.splits()`.
-3. Dispatch each `ScanSplit` to workers.
-4. Worker opens scanner: `split.create_scanner(config, &scan_options)`.
-5. Iterate `ScanSplitScanner` to consume key/column rows.
+```rust
+use cobble::{ScanOptions, ScanPlan};
+
+let plan = ScanPlan::new(global_manifest);
+for split in plan.splits() {
+    let scanner = split.create_scanner(config.clone(), &ScanOptions::default())?;
+    for row in scanner {
+        let (key, columns) = row?;
+        // process row...
+    }
+}
+```
 
 ### 5) Structured DB wrappers (typed columns)
 
@@ -135,6 +164,34 @@ Given a `GlobalSnapshotManifest`:
 
 All snapshot/read/scan patterns are the same as core `cobble`, but values are
 encoded/decoded as structured typed columns (`Bytes`/`List`).
+
+```rust
+use bytes::Bytes;
+use cobble::{Config, VolumeDescriptor};
+use cobble_data_structure::{ListConfig, ListRetainMode, StructuredColumnValue, StructuredSingleDb};
+
+let mut config = Config::default();
+config.num_columns = 2;
+config.total_buckets = 1;
+config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-structured".to_string());
+
+let mut db = StructuredSingleDb::open(config)?;
+db.update_schema()
+  .add_list_column(1, ListConfig {
+      max_elements: Some(100),
+      retain_mode: ListRetainMode::Last,
+      preserve_element_ttl: false,
+  })
+  .commit()?;
+
+db.put(0, b"k1", 0, StructuredColumnValue::Bytes(Bytes::from_static(b"v0")))?;
+```
+
+More scan examples:
+https://cobble-project.github.io/cobble/latest/getting-started/reader-and-scan/
+
+More structured examples:
+https://cobble-project.github.io/cobble/latest/getting-started/structured-db/
 
 ### Build / test
 
