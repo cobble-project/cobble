@@ -7,6 +7,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let ui_dir = manifest_dir.join("web-ui");
+    let ui_work_dir = out_dir.join("web-ui-build");
     let dist_dir = out_dir.join("web-ui-dist");
     let package_json = ui_dir.join("package.json");
     let package_lock = ui_dir.join("package-lock.json");
@@ -58,24 +59,25 @@ fn main() {
     }
 
     let npm = env::var("NPM").unwrap_or_else(|_| "npm".to_string());
+    prepare_ui_workspace(&ui_dir, &ui_work_dir);
     if package_lock.exists() {
         run_npm(
             &npm,
-            &ui_dir,
+            &ui_work_dir,
             &["ci", "--no-fund", "--no-audit", "--include=dev"],
             &[],
         );
     } else {
         run_npm(
             &npm,
-            &ui_dir,
+            &ui_work_dir,
             &["install", "--no-fund", "--no-audit", "--include=dev"],
             &[],
         );
     }
     run_npm_with_out_dir(
         &npm,
-        &ui_dir,
+        &ui_work_dir,
         &dist_dir,
         &[
             ("VITE_COBBLE_VERSION", &build_version),
@@ -141,6 +143,39 @@ fn run_npm_with_out_dir(npm: &str, cwd: &Path, dist_dir: &Path, extra_env: &[(&s
         &["run", "build", "--", "--outDir", dist_dir_str.as_str()],
         extra_env,
     );
+}
+
+fn prepare_ui_workspace(src_dir: &Path, dst_dir: &Path) {
+    if dst_dir.exists() {
+        fs::remove_dir_all(dst_dir).expect("remove old web-ui build workspace");
+    }
+    copy_ui_tree(src_dir, dst_dir);
+}
+
+fn copy_ui_tree(src_dir: &Path, dst_dir: &Path) {
+    fs::create_dir_all(dst_dir).expect("create web-ui build workspace");
+    for entry in fs::read_dir(src_dir).expect("read web-ui source directory") {
+        let entry = entry.expect("read web-ui source directory entry");
+        let file_type = entry.file_type().expect("read web-ui source file type");
+        let file_name = entry.file_name();
+        if file_name == "node_modules" || file_name == "dist" {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst_dir.join(&file_name);
+        if file_type.is_dir() {
+            copy_ui_tree(&src_path, &dst_path);
+        } else if file_type.is_file() {
+            fs::copy(&src_path, &dst_path).unwrap_or_else(|err| {
+                panic!(
+                    "copy web-ui file {} -> {} failed: {}",
+                    src_path.display(),
+                    dst_path.display(),
+                    err
+                )
+            });
+        }
+    }
 }
 
 fn emit_ui_dist_env(dist_dir: &Path) {

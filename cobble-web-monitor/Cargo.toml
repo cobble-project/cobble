@@ -15,13 +15,13 @@ axum = "0.8.4"
 base64 = "0.22.1"
 cobble = { workspace = true }
 include_dir = "0.7.4"
-log = "0.4.29"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.143"
-thiserror = "2.0.16"
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "net", "sync", "time"] }
+log = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-serial_test = "3.2.0"
-uuid = { version = "1.18.0", features = ["v4"] }
+serial_test = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }

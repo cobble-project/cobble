@@ -11,26 +11,26 @@ keywords = ["kv", "lsm", "storage"]
 categories = ["database-implementations"]
 
 [dependencies]
-bytes = "1.11.0"
+bytes = { workspace = true }
 arc-swap = "1.7.1"
 dashmap = "6.1.0"
 foyer = "0.22.3"
-log = { version = "0.4.28", features = ["serde"] }
+log = { workspace = true, features = ["serde"] }
 log4rs = "1.3.0"
 metrics = "0.22.3"
 opendal = { version = "0.54.0", features = ["services-fs", "services-oss", "services-s3"] }
 rand = "0.8.5"
-serial_test = "3.3.1"
-thiserror = "2.0.16"
-tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "macros"] }
+serial_test = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 url = "2.5.7"
-uuid = { version = "1.18.0", features = ["v4"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.143"
+uuid = { workspace = true, features = ["v4"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 config = { version = "0.15.19", features = ["yaml", "ini"] }
 serde_yaml = "0.9.34"
 tempfile = "3.20.0"
-lz4_flex = { version = "0.11.5", default-features = false }
+lz4_flex = { version = "0.13.0", default-features = false }
 parquet = "58.0.0"
 
 [target.'cfg(unix)'.dependencies]
