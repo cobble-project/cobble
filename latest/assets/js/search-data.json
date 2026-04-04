@@ -146,110 +146,110 @@
     
     "relUrl": "/architecture/compaction.html#compaction-and-value-separation"
   },"21": {
-    "doc": "All Configuration",
-    "title": "All Configuration",
-    "content": "Complete reference for all Cobble configuration parameters. ",
-    "url": "/cobble/latest/reference/configuration.html",
-    
-    "relUrl": "/reference/configuration.html"
-  },"22": {
-    "doc": "All Configuration",
-    "title": "Config",
-    "content": "The main Config struct. Can be created programmatically or loaded from a file (Config::from_path(\"config.yaml\")). Supported file formats: YAML (.yaml/.yml), JSON (.json), TOML (.toml), INI (.ini). Storage . | Parameter | Type | Default | Description | . | volumes | Vec&lt;VolumeDescriptor&gt; | Single local volume at /tmp/cobble | Storage volume descriptors | . | data_file_type | DataFileType | SSTable | Output format: SSTable or Parquet | . Memtable . | Parameter | Type | Default | Description | . | memtable_capacity | usize | 67,108,864 (64 MB) | Max memtable size in bytes before flush | . | memtable_buffer_count | usize | 2 | Number of memtable buffers (active + immutable) | . | memtable_type | MemtableType | Hash | Implementation: Hash, Skiplist, Vec | . LSM Tree . | Parameter | Type | Default | Description | . | l0_file_limit | usize | 4 | L0 file count that triggers compaction | . | write_stall_limit | Option&lt;usize&gt; | None | Max immutable+L0 files before stall. Auto: min(l0+4, l0×2) | . | l1_base_bytes | usize | 67,108,864 (64 MB) | Target size for level 1 | . | level_size_multiplier | usize | 10 | Size multiplier per level | . | max_level | u8 | 6 | Maximum number of LSM levels | . SST Options . | Parameter | Type | Default | Description | . | base_file_size | usize | 67,108,864 (64 MB) | Target output file size | . | sst_bloom_filter_enabled | bool | false | Enable bloom filter per SST file | . | sst_bloom_bits_per_key | u32 | 10 | Bits per key for bloom filter | . | sst_partitioned_index | bool | false | Enable two-level partitioned index | . | sst_compression_by_level | Vec&lt;SstCompressionAlgorithm&gt; | [None, None, Lz4] | Compression per level | . Parquet . | Parameter | Type | Default | Description | . | parquet_row_group_size_bytes | usize | 262,144 (256 KB) | Row group size in bytes | . Block Cache . | Parameter | Type | Default | Description | . | block_cache_size | usize | 67,108,864 (64 MB) | In-memory cache size (0 = disabled) | . | block_cache_hybrid_enabled | bool | false | Enable memory + disk hybrid cache | . | block_cache_hybrid_disk_size | Option&lt;usize&gt; | None | Disk tier capacity (defaults to memory size) | . Compaction . | Parameter | Type | Default | Description | . | compaction_policy | CompactionPolicyKind | RoundRobin | Policy: RoundRobin or MinOverlap | . | compaction_read_ahead_enabled | bool | true | Buffered reads during compaction | . | compaction_remote_addr | Option&lt;String&gt; | None | Remote compaction server address (host:port) | . | compaction_threads | usize | 4 | Compaction thread pool size | . | compaction_remote_timeout_ms | u64 | 300,000 | Remote compaction timeout (milliseconds) | . | compaction_server_max_concurrent | usize | 4 | Max concurrent tasks on remote server | . | compaction_server_max_queued | usize | 64 | Max queued tasks before rejecting | . Value Separation . | Parameter | Type | Default | Description | . | value_separation_threshold | usize | usize::MAX | Byte threshold for VLOG separation (MAX = disabled) | . TTL . | Parameter | Type | Default | Description | . | ttl_enabled | bool | false | Enable TTL metadata processing | . | default_ttl_seconds | Option&lt;u32&gt; | None | Default TTL for entries (None = no expiration) | . | time_provider | TimeProviderKind | System | Time source: System or Manual | . Snapshots . | Parameter | Type | Default | Description | . | snapshot_on_flush | bool | false | Auto-snapshot after each memtable flush | . | snapshot_retention | Option&lt;usize&gt; | None | Keep only N most recent snapshots | . | active_memtable_incremental_snapshot_ratio | f64 | 0.0 | Ratio for incremental memtable snapshots (0 = disabled) | . Schema . | Parameter | Type | Default | Description | . | num_columns | usize | 1 | Number of value columns per key | . | total_buckets | u32 | 1 | Total buckets for sharding (1–65536) | . Volume Offload . | Parameter | Type | Default | Description | . | primary_volume_write_stop_watermark | f64 | 0.95 | Usage ratio to stop writes | . | primary_volume_offload_trigger_watermark | f64 | 0.85 | Usage ratio to trigger offload | . | primary_volume_offload_policy | PrimaryVolumeOffloadPolicyKind | Priority | Policy: LargestFile or Priority | . LSM Splitting . | Parameter | Type | Default | Description | . | lsm_split_trigger_level | Option&lt;u8&gt; | None | Level that triggers LSM tree splitting | . Logging . | Parameter | Type | Default | Description | . | log_path | Option&lt;String&gt; | None | Log file path (must be local) | . | log_console | bool | false | Enable console logging | . | log_level | log::LevelFilter | Info | Trace, Debug, Info, Warn, Error, Off | . ",
-    "url": "/cobble/latest/reference/configuration.html#config",
-    
-    "relUrl": "/reference/configuration.html#config"
-  },"23": {
-    "doc": "All Configuration",
-    "title": "CoordinatorConfig",
-    "content": "Configuration for DbCoordinator. | Parameter | Type | Default | Description | . | volumes | Vec&lt;VolumeDescriptor&gt; | Single local volume | Storage volumes for global manifests | . | snapshot_retention | Option&lt;usize&gt; | None | Auto-expire old global snapshots | . ",
-    "url": "/cobble/latest/reference/configuration.html#coordinatorconfig",
-    
-    "relUrl": "/reference/configuration.html#coordinatorconfig"
-  },"24": {
-    "doc": "All Configuration",
-    "title": "VolumeDescriptor",
-    "content": "Describes a storage volume. | Field | Type | Default | Description | . | base_dir | String | (required) | Base directory URL (file://, s3://, etc.) | . | access_id | Option&lt;String&gt; | None | Access ID for remote storage | . | secret_key | Option&lt;String&gt; | None | Secret key for remote storage | . | size_limit | Option&lt;u64&gt; | None | Maximum volume size in bytes | . | kinds | u8 | 0 | Bitmask of VolumeUsageKind values | . VolumeUsageKind . | Kind | Value | Description | . | Meta | 0 | Metadata files (manifests, schemas) | . | PrimaryDataPriorityHigh | 1 | High-priority data (SST, Parquet, VLOG) | . | PrimaryDataPriorityMedium | 2 | Medium-priority data | . | PrimaryDataPriorityLow | 3 | Low-priority data | . | Snapshot | 4 | Snapshot materialization | . | Cache | 5 | Block cache disk tier | . | Readonly | 6 | Read-only data source | . Helper Methods . | Method | Description | . | VolumeDescriptor::single_volume(url) | Create single volume with PrimaryDataPriorityHigh + Meta | . | VolumeDescriptor::new(url, kinds) | Create volume with specified usage kinds list (Vec&lt;VolumeUsageKind&gt;) | . | set_usage(kind) | Add a usage kind to the volume | . | supports(kind) | Check if volume supports a usage kind | . ",
-    "url": "/cobble/latest/reference/configuration.html#volumedescriptor",
-    
-    "relUrl": "/reference/configuration.html#volumedescriptor"
-  },"25": {
-    "doc": "All Configuration",
-    "title": "ReadOptions",
-    "content": "Options for point lookups. | Field | Type | Default | Description | . | column_indices | Option&lt;Vec&lt;usize&gt;&gt; | None | Column projection (None = all columns) | . ",
-    "url": "/cobble/latest/reference/configuration.html#readoptions",
-    
-    "relUrl": "/reference/configuration.html#readoptions"
-  },"26": {
-    "doc": "All Configuration",
-    "title": "ScanOptions",
-    "content": "Options for scan operations. | Field | Type | Default | Description | . | read_ahead_bytes | usize | 0 | Read-ahead buffer size (0 = disabled) | . | column_indices | Option&lt;Vec&lt;usize&gt;&gt; | None | Column projection | . ",
-    "url": "/cobble/latest/reference/configuration.html#scanoptions",
-    
-    "relUrl": "/reference/configuration.html#scanoptions"
-  },"27": {
-    "doc": "All Configuration",
-    "title": "WriteOptions",
-    "content": "Options for write operations. | Field | Type | Default | Description | . | ttl_seconds | Option&lt;u32&gt; | None | TTL for this write (overrides default) | . ",
-    "url": "/cobble/latest/reference/configuration.html#writeoptions",
-    
-    "relUrl": "/reference/configuration.html#writeoptions"
-  },"28": {
-    "doc": "All Configuration",
-    "title": "ReaderConfigEntry",
-    "content": "Configuration for the read proxy. | Field | Type | Default | Description | . | pin_partition_in_memory_count | usize | 1 | Partition snapshots pinned in memory | . | block_cache_size | usize | 536,870,912 (512 MB) | Reader block cache size | . | reload_tolerance_seconds | u64 | 10 | Min interval between snapshot reload checks | . ",
-    "url": "/cobble/latest/reference/configuration.html#readerconfigentry",
-    
-    "relUrl": "/reference/configuration.html#readerconfigentry"
-  },"29": {
-    "doc": "All Configuration",
-    "title": "Enums",
-    "content": "DataFileType . | Variant | Description | . | SSTable | Row-based SST format (default) | . | Parquet | Apache Parquet columnar format | . MemtableType . | Variant | Description | . | Hash | Hash table (default) | . | Skiplist | Skip list | . | Vec | Vector-based | . CompactionPolicyKind . | Variant | Description | . | RoundRobin | Fair round-robin level selection (default) | . | MinOverlap | Minimize key range overlap | . SstCompressionAlgorithm . | Variant | Description | . | None | No compression (default) | . | Lz4 | LZ4 compression | . TimeProviderKind . | Variant | Description | . | System | System wall clock (default) | . | Manual | Manual time control (starts at 0) | . PrimaryVolumeOffloadPolicyKind . | Variant | Description | . | Priority | Offload by file priority (default) | . | LargestFile | Offload largest file first | . ",
-    "url": "/cobble/latest/reference/configuration.html#enums",
-    
-    "relUrl": "/reference/configuration.html#enums"
-  },"30": {
     "doc": "Configuration",
     "title": "Configuration",
     "content": "Before opening any database, you must create a Config and define at least one storage volume. ",
     "url": "/cobble/latest/getting-started/configuration.html",
     
     "relUrl": "/getting-started/configuration.html"
-  },"31": {
+  },"22": {
     "doc": "Configuration",
     "title": "Volume Categories",
     "content": "Cobble organizes storage into volumes, each tagged with one or more usage kinds: . | Kind | Purpose | . | PrimaryDataPriorityHigh | Main data files (SST, Parquet, VLOG) with highest priority | . | PrimaryDataPriorityMedium | Medium-priority data files | . | PrimaryDataPriorityLow | Low-priority data files (candidates for offload) | . | Meta | Metadata — snapshot manifests, schema files, pointers | . | Snapshot | Snapshot materialization target storage | . | Cache | Disk tier for hybrid block cache | . | Readonly | Read-only source for historical data loading | . A VolumeDescriptor specifies a base directory URL and a bitmask of supported usage kinds. The only difference between the priority levels is how the file manager selects volumes for new files and when to offload files as volumes fill up. For a deeper explanation of volume roles, tiered offload behavior, and snapshot volume strategies, see Multi-Volume Storage. ",
     "url": "/cobble/latest/getting-started/configuration.html#volume-categories",
     
     "relUrl": "/getting-started/configuration.html#volume-categories"
-  },"32": {
+  },"23": {
     "doc": "Configuration",
     "title": "Minimal Configuration",
     "content": "A single local volume with PrimaryDataPriorityHigh + Meta is sufficient to get started: . use cobble::Config; let config = Config::default(); // Default volume: file:///tmp/cobble with PrimaryDataPriorityHigh + Meta . Or configure a custom path: . use cobble::{Config, VolumeDescriptor}; let mut config = Config::default(); config.volumes = VolumeDescriptor::single_volume(\"file:///data/cobble\".to_string()); . Restore/resume requires access to ALL files referenced by the target snapshot. This includes manifests, schema files, SST/Parquet data files, and VLOG files. Ensure that all volumes used when the snapshot was taken are still accessible during recovery. ",
     "url": "/cobble/latest/getting-started/configuration.html#minimal-configuration",
     
     "relUrl": "/getting-started/configuration.html#minimal-configuration"
-  },"33": {
+  },"24": {
     "doc": "Configuration",
     "title": "Multi-Volume Setup",
     "content": "For production deployments, you can separate data and metadata across different storage backends: . use cobble::{Config, VolumeDescriptor, VolumeUsageKind}; let mut config = Config::default(); config.volumes = vec![ // Fast SSD for hot data and metadata VolumeDescriptor::new( \"file:///ssd/cobble\".to_string(), vec![ VolumeUsageKind::PrimaryDataPriorityHigh, VolumeUsageKind::Meta, ], ), // Larger HDD for cold data VolumeDescriptor::new( \"file:///hdd/cobble\".to_string(), vec![VolumeUsageKind::PrimaryDataPriorityLow], ), // Snapshot materialization VolumeDescriptor::new( \"file:///shared/snapshots\".to_string(), vec![VolumeUsageKind::Snapshot], ), ]; . ",
     "url": "/cobble/latest/getting-started/configuration.html#multi-volume-setup",
     
     "relUrl": "/getting-started/configuration.html#multi-volume-setup"
-  },"34": {
+  },"25": {
     "doc": "Configuration",
     "title": "Key Configuration Parameters",
     "content": "Memtable . | Parameter | Default | Description | . | memtable_capacity | 64 MB | Maximum bytes before flush to L0 | . | memtable_buffer_count | 2 | Number of memtable buffers (active + immutable) | . | memtable_type | Hash | Implementation: Hash, Skiplist, or Vec | . LSM Tree . | Parameter | Default | Description | . | l0_file_limit | 4 | L0 file count that triggers compaction | . | write_stall_limit | None | Max immutable + L0 files before write stall (auto-calculated if unset) | . | l1_base_bytes | 64 MB | Target size for level 1 | . | level_size_multiplier | 10 | Size multiplier per level (L2 = 640MB, L3 = 6.4GB, …) | . | max_level | 6 | Maximum number of levels | . SST / Parquet . | Parameter | Default | Description | . | data_file_type | SSTable | Output format: SSTable or Parquet | . | base_file_size | 64 MB | Target SST/Parquet file size | . | sst_bloom_filter_enabled | false | Enable bloom filters for point lookups | . | sst_bloom_bits_per_key | 10 | Bits per key for bloom filters | . | sst_partitioned_index | false | Enable two-level index for large files | . | sst_compression_by_level | [None, None, Lz4] | Compression algorithm per level | . | parquet_row_group_size_bytes | 256 KB | Parquet row group size | . Block Cache . | Parameter | Default | Description | . | block_cache_size | 64 MB | In-memory block cache size (0 = disabled) | . | block_cache_hybrid_enabled | false | Enable memory + disk hybrid cache | . | block_cache_hybrid_disk_size | None | Disk cache capacity (defaults to block_cache_size) | . Value Separation . | Parameter | Default | Description | . | value_separation_threshold | usize::MAX | Byte threshold to separate values into VLOG (disabled by default) | . TTL . | Parameter | Default | Description | . | ttl_enabled | false | Enable TTL metadata processing | . | default_ttl_seconds | None | Default TTL for entries without explicit TTL | . | time_provider | System | Time source: System (wall clock) or Manual | . Snapshots . | Parameter | Default | Description | . | snapshot_on_flush | false | Automatically take snapshot after every memtable flush | . | snapshot_retention | None | Keep only the N most recent snapshots | . | active_memtable_incremental_snapshot_ratio | 0.0 | Ratio for incremental memtable snapshots (0 = disabled) | . Schema . | Parameter | Default | Description | . | num_columns | 1 | Number of value columns | . | total_buckets | 1 | Total bucket count for sharding (1–65536) | . Volume Offload . | Parameter | Default | Description | . | primary_volume_write_stop_watermark | 0.95 | Volume usage ratio to stop writes | . | primary_volume_offload_trigger_watermark | 0.85 | Volume usage ratio to trigger file offload | . | primary_volume_offload_policy | Priority | Offload policy: LargestFile or Priority | . Logging . | Parameter | Default | Description | . | log_path | None | File path for logs (local only) | . | log_console | false | Enable console log output | . | log_level | Info | Log level: Trace, Debug, Info, Warn, Error, Off | . ",
     "url": "/cobble/latest/getting-started/configuration.html#key-configuration-parameters",
     
     "relUrl": "/getting-started/configuration.html#key-configuration-parameters"
-  },"35": {
+  },"26": {
     "doc": "Configuration",
     "title": "Loading Config from File",
     "content": "Cobble supports loading configuration from YAML, JSON, TOML, or INI files: . let config = Config::from_path(\"config.yaml\")?; . The file format is detected by extension (.yaml/.yml, .json, .toml, .ini). ",
     "url": "/cobble/latest/getting-started/configuration.html#loading-config-from-file",
     
     "relUrl": "/getting-started/configuration.html#loading-config-from-file"
+  },"27": {
+    "doc": "All Configuration",
+    "title": "All Configuration",
+    "content": "Complete reference for all Cobble configuration parameters. ",
+    "url": "/cobble/latest/reference/configuration.html",
+    
+    "relUrl": "/reference/configuration.html"
+  },"28": {
+    "doc": "All Configuration",
+    "title": "Config",
+    "content": "The main Config struct. Can be created programmatically or loaded from a file (Config::from_path(\"config.yaml\")). Supported file formats: YAML (.yaml/.yml), JSON (.json), TOML (.toml), INI (.ini). Storage . | Parameter | Type | Default | Description | . | volumes | Vec&lt;VolumeDescriptor&gt; | Single local volume at /tmp/cobble | Storage volume descriptors | . | data_file_type | DataFileType | SSTable | Output format: SSTable or Parquet | . Memtable . | Parameter | Type | Default | Description | . | memtable_capacity | usize | 67,108,864 (64 MB) | Max memtable size in bytes before flush | . | memtable_buffer_count | usize | 2 | Number of memtable buffers (active + immutable) | . | memtable_type | MemtableType | Hash | Implementation: Hash, Skiplist, Vec | . LSM Tree . | Parameter | Type | Default | Description | . | l0_file_limit | usize | 4 | L0 file count that triggers compaction | . | write_stall_limit | Option&lt;usize&gt; | None | Max immutable+L0 files before stall. Auto: min(l0+4, l0×2) | . | l1_base_bytes | usize | 67,108,864 (64 MB) | Target size for level 1 | . | level_size_multiplier | usize | 10 | Size multiplier per level | . | max_level | u8 | 6 | Maximum number of LSM levels | . SST Options . | Parameter | Type | Default | Description | . | base_file_size | usize | 67,108,864 (64 MB) | Target output file size | . | sst_bloom_filter_enabled | bool | false | Enable bloom filter per SST file | . | sst_bloom_bits_per_key | u32 | 10 | Bits per key for bloom filter | . | sst_partitioned_index | bool | false | Enable two-level partitioned index | . | sst_compression_by_level | Vec&lt;SstCompressionAlgorithm&gt; | [None, None, Lz4] | Compression per level | . Parquet . | Parameter | Type | Default | Description | . | parquet_row_group_size_bytes | usize | 262,144 (256 KB) | Row group size in bytes | . Block Cache . | Parameter | Type | Default | Description | . | block_cache_size | usize | 67,108,864 (64 MB) | In-memory cache size (0 = disabled) | . | block_cache_hybrid_enabled | bool | false | Enable memory + disk hybrid cache | . | block_cache_hybrid_disk_size | Option&lt;usize&gt; | None | Disk tier capacity (defaults to memory size) | . Compaction . | Parameter | Type | Default | Description | . | compaction_policy | CompactionPolicyKind | RoundRobin | Policy: RoundRobin or MinOverlap | . | compaction_read_ahead_enabled | bool | true | Buffered reads during compaction | . | compaction_remote_addr | Option&lt;String&gt; | None | Remote compaction server address (host:port) | . | compaction_threads | usize | 4 | Compaction thread pool size | . | compaction_remote_timeout_ms | u64 | 300,000 | Remote compaction timeout (milliseconds) | . | compaction_server_max_concurrent | usize | 4 | Max concurrent tasks on remote server | . | compaction_server_max_queued | usize | 64 | Max queued tasks before rejecting | . Value Separation . | Parameter | Type | Default | Description | . | value_separation_threshold | usize | usize::MAX | Byte threshold for VLOG separation (MAX = disabled) | . TTL . | Parameter | Type | Default | Description | . | ttl_enabled | bool | false | Enable TTL metadata processing | . | default_ttl_seconds | Option&lt;u32&gt; | None | Default TTL for entries (None = no expiration) | . | time_provider | TimeProviderKind | System | Time source: System or Manual | . Snapshots . | Parameter | Type | Default | Description | . | snapshot_on_flush | bool | false | Auto-snapshot after each memtable flush | . | snapshot_retention | Option&lt;usize&gt; | None | Keep only N most recent snapshots | . | active_memtable_incremental_snapshot_ratio | f64 | 0.0 | Ratio for incremental memtable snapshots (0 = disabled) | . Schema . | Parameter | Type | Default | Description | . | num_columns | usize | 1 | Number of value columns per key | . | total_buckets | u32 | 1 | Total buckets for sharding (1–65536) | . Volume Offload . | Parameter | Type | Default | Description | . | primary_volume_write_stop_watermark | f64 | 0.95 | Usage ratio to stop writes | . | primary_volume_offload_trigger_watermark | f64 | 0.85 | Usage ratio to trigger offload | . | primary_volume_offload_policy | PrimaryVolumeOffloadPolicyKind | Priority | Policy: LargestFile or Priority | . LSM Splitting . | Parameter | Type | Default | Description | . | lsm_split_trigger_level | Option&lt;u8&gt; | None | Level that triggers LSM tree splitting | . Logging . | Parameter | Type | Default | Description | . | log_path | Option&lt;String&gt; | None | Log file path (must be local) | . | log_console | bool | false | Enable console logging | . | log_level | log::LevelFilter | Info | Trace, Debug, Info, Warn, Error, Off | . ",
+    "url": "/cobble/latest/reference/configuration.html#config",
+    
+    "relUrl": "/reference/configuration.html#config"
+  },"29": {
+    "doc": "All Configuration",
+    "title": "CoordinatorConfig",
+    "content": "Configuration for DbCoordinator. | Parameter | Type | Default | Description | . | volumes | Vec&lt;VolumeDescriptor&gt; | Single local volume | Storage volumes for global manifests | . | snapshot_retention | Option&lt;usize&gt; | None | Auto-expire old global snapshots | . ",
+    "url": "/cobble/latest/reference/configuration.html#coordinatorconfig",
+    
+    "relUrl": "/reference/configuration.html#coordinatorconfig"
+  },"30": {
+    "doc": "All Configuration",
+    "title": "VolumeDescriptor",
+    "content": "Describes a storage volume. | Field | Type | Default | Description | . | base_dir | String | (required) | Base directory URL (file://, s3://, etc.) | . | access_id | Option&lt;String&gt; | None | Access ID for remote storage | . | secret_key | Option&lt;String&gt; | None | Secret key for remote storage | . | size_limit | Option&lt;u64&gt; | None | Maximum volume size in bytes | . | kinds | u8 | 0 | Bitmask of VolumeUsageKind values | . VolumeUsageKind . | Kind | Value | Description | . | Meta | 0 | Metadata files (manifests, schemas) | . | PrimaryDataPriorityHigh | 1 | High-priority data (SST, Parquet, VLOG) | . | PrimaryDataPriorityMedium | 2 | Medium-priority data | . | PrimaryDataPriorityLow | 3 | Low-priority data | . | Snapshot | 4 | Snapshot materialization | . | Cache | 5 | Block cache disk tier | . | Readonly | 6 | Read-only data source | . Helper Methods . | Method | Description | . | VolumeDescriptor::single_volume(url) | Create single volume with PrimaryDataPriorityHigh + Meta | . | VolumeDescriptor::new(url, kinds) | Create volume with specified usage kinds list (Vec&lt;VolumeUsageKind&gt;) | . | set_usage(kind) | Add a usage kind to the volume | . | supports(kind) | Check if volume supports a usage kind | . ",
+    "url": "/cobble/latest/reference/configuration.html#volumedescriptor",
+    
+    "relUrl": "/reference/configuration.html#volumedescriptor"
+  },"31": {
+    "doc": "All Configuration",
+    "title": "ReadOptions",
+    "content": "Options for point lookups. | Field | Type | Default | Description | . | column_indices | Option&lt;Vec&lt;usize&gt;&gt; | None | Column projection (None = all columns) | . ",
+    "url": "/cobble/latest/reference/configuration.html#readoptions",
+    
+    "relUrl": "/reference/configuration.html#readoptions"
+  },"32": {
+    "doc": "All Configuration",
+    "title": "ScanOptions",
+    "content": "Options for scan operations. | Field | Type | Default | Description | . | read_ahead_bytes | usize | 0 | Read-ahead buffer size (0 = disabled) | . | column_indices | Option&lt;Vec&lt;usize&gt;&gt; | None | Column projection | . ",
+    "url": "/cobble/latest/reference/configuration.html#scanoptions",
+    
+    "relUrl": "/reference/configuration.html#scanoptions"
+  },"33": {
+    "doc": "All Configuration",
+    "title": "WriteOptions",
+    "content": "Options for write operations. | Field | Type | Default | Description | . | ttl_seconds | Option&lt;u32&gt; | None | TTL for this write (overrides default) | . ",
+    "url": "/cobble/latest/reference/configuration.html#writeoptions",
+    
+    "relUrl": "/reference/configuration.html#writeoptions"
+  },"34": {
+    "doc": "All Configuration",
+    "title": "ReaderConfigEntry",
+    "content": "Configuration for the read proxy. | Field | Type | Default | Description | . | pin_partition_in_memory_count | usize | 1 | Partition snapshots pinned in memory | . | block_cache_size | usize | 536,870,912 (512 MB) | Reader block cache size | . | reload_tolerance_seconds | u64 | 10 | Min interval between snapshot reload checks | . ",
+    "url": "/cobble/latest/reference/configuration.html#readerconfigentry",
+    
+    "relUrl": "/reference/configuration.html#readerconfigentry"
+  },"35": {
+    "doc": "All Configuration",
+    "title": "Enums",
+    "content": "DataFileType . | Variant | Description | . | SSTable | Row-based SST format (default) | . | Parquet | Apache Parquet columnar format | . MemtableType . | Variant | Description | . | Hash | Hash table (default) | . | Skiplist | Skip list | . | Vec | Vector-based | . CompactionPolicyKind . | Variant | Description | . | RoundRobin | Fair round-robin level selection (default) | . | MinOverlap | Minimize key range overlap | . SstCompressionAlgorithm . | Variant | Description | . | None | No compression (default) | . | Lz4 | LZ4 compression | . TimeProviderKind . | Variant | Description | . | System | System wall clock (default) | . | Manual | Manual time control (starts at 0) | . PrimaryVolumeOffloadPolicyKind . | Variant | Description | . | Priority | Offload by file priority (default) | . | LargestFile | Offload largest file first | . ",
+    "url": "/cobble/latest/reference/configuration.html#enums",
+    
+    "relUrl": "/reference/configuration.html#enums"
   },"36": {
     "doc": "Distributed DB",
     "title": "Distributed DB",
@@ -342,75 +342,75 @@
     
     "relUrl": "/architecture/file-management.html#volume-selection"
   },"49": {
-    "doc": "Home",
-    "title": "Cobble Project",
-    "content": "Cobble is a high-performance LSM-based key-value storage engine designed for both embedded and distributed systems. It provides a flexible and efficient storage solution for various workloads, from small-scale applications to large distributed services. Compared with other embedded key-value stores like RocksDB, it offers multiple file formats (SSTable and Parquet), distributed storage support, distributed snapshots, remote compaction, and more. Thus, it really fits the needs of modern distributed systems that require a versatile and scalable storage engine. Note: Cobble is still in active development, and all the APIs might be changed without deprecation for early versions. We will try our best to keep the documentation up to date, but please check the code and tests for the latest usage patterns. ",
-    "url": "/cobble/latest/#cobble-project",
-    
-    "relUrl": "/#cobble-project"
-  },"50": {
-    "doc": "Home",
-    "title": "Key Features",
-    "content": ". | Multi-volume storage with local disk and remote object storage (S3, OSS, etc.) support (powered by Apache OpenDAL) | LSM Tree storage optimized for high write throughput and efficient merge reads | Key-value separation for large-value workloads | Multi-column schema with online schema evolution (add/delete columns) | Distributed snapshots with coordinator-based global consistency | Distributed scan for batch processing and analytics across multiple nodes | Remote compaction to offload CPU/IO from writer nodes | Pluggable merge operators for read-modify-write patterns (counters, lists, etc.) | Hybrid block cache with optional memory + disk tiers (powered by Foyer) | Multiple file formats: SSTable and Apache Parquet for different workload needs | Multiple readers: concurrent read access across processes and machines with snapshot isolation | Row-level TTL support with configurable time providers | Data structures support with typed row encoding/decoding and structured APIs | Java bindings for JVM-based applications | Web monitoring dashboard for operational visibility | . ",
-    "url": "/cobble/latest/#key-features",
-    
-    "relUrl": "/#key-features"
-  },"51": {
-    "doc": "Home",
-    "title": "Documentation Structure",
-    "content": "| Section | Description | . | Getting Started | Configuration, basic usage, and integration guides | . | Architecture | Internal design, data structures, and algorithms | . | Reference | Complete configuration reference and API documentation | . | FFI Bindings | Using Cobble from other languages (Java, …) | . ",
-    "url": "/cobble/latest/#documentation-structure",
-    
-    "relUrl": "/#documentation-structure"
-  },"52": {
-    "doc": "Home",
-    "title": "Home",
-    "content": " ",
-    "url": "/cobble/latest/",
-    
-    "relUrl": "/"
-  },"53": {
-    "doc": "Architecture",
-    "title": "Architecture",
-    "content": "This section explains the design principles behind Cobble and how its components work together. The goal is to help you understand why Cobble behaves the way it does, so you can make informed decisions about configuration and deployment. ",
-    "url": "/cobble/latest/architecture/",
-    
-    "relUrl": "/architecture/"
-  },"54": {
-    "doc": "Architecture",
-    "title": "Design Philosophy",
-    "content": "Cobble is built around a few core ideas: . | Focus on embedded key-value storage. Cobble is designed to be a high-performance embedded database that can be used as a building block for larger systems. It provides the primitives for key-value storage, snapshots, and distributed coordination, but leaves higher-level features (like SQL layers or distributed transactions) to be built on top. | Weak coordination among shards. In a distributed deployment, each Db shard operates mostly independently, with the Coordinator only involved in snapshot management. This minimizes cross-shard communication and allows for high write throughput without distributed locking. We leave it to the application to decide how to partition data and handle cross-shard consistency if needed. | Flexible with more options. Cobble provides multiple implementations for key components (memtable, file formats, compaction strategies) that can be configured based on workload needs. The architecture is designed to accommodate these options without sacrificing core performance. | Snapshots for consistency as well as read serving. The snapshot system is not just for backup and restore — it’s a fundamental part of how Cobble provides consistent read views in a distributed environment. This makes Cobble a good fit for analytical workloads that need to read from a consistent point-in-time view while writes are ongoing. | Single-threaded APIs for simplicity and performance. Each components’ APIs are designed to be called from a single thread, which simplifies the internal design and allows for high performance without locking. For concurrent access, you use multiple instance of Reader or Scanner against snapshots, which are safe to use concurrently. | . ",
-    "url": "/cobble/latest/architecture/#design-philosophy",
-    
-    "relUrl": "/architecture/#design-philosophy"
-  },"55": {
-    "doc": "Architecture",
-    "title": "Module Map",
-    "content": "| Module | What it provides | . | LSM Tree | The core storage structure — how data is organized on disk | . | Memtable | In-memory write buffers — why there are three implementations | . | Compaction | Background merging — how Cobble keeps reads fast over time | . | Key-Value Separation | VLOG — when and why to store values separately | . | Read &amp; Write Paths | How data flows from writes to reads | . | Snapshot System | Point-in-time consistency for restore, reads, and scans | . | File Management | File lifecycle, volume selection, and storage backends | . | Block Cache | Multi-tier caching for read performance | . | Schema Evolution | Adding and removing columns without rewriting data | . | Merge Operators | Efficient read-modify-write without extra round trips | . ",
-    "url": "/cobble/latest/architecture/#module-map",
-    
-    "relUrl": "/architecture/#module-map"
-  },"56": {
-    "doc": "Getting Started",
-    "title": "Getting Started",
-    "content": "This section guides you through setting up and using Cobble for different use cases — from a single-machine embedded store to a distributed cluster with snapshot-following reads and parallel scans. Start with Basic Concepts for an overview of the key components, then Configuration to understand how Cobble organizes storage, and finally choose the deployment model that fits your application: . | Guide | When to use | . | Basic Concepts | Core components — Db, Coordinator, Reader, Scanner, snapshots | . | Configuration | Every deployment starts here — volumes, tuning, and storage layout | . | Single-Machine Embedded DB | Simple embedded key-value store on a single machine | . | Distributed DB | Multiple writer shards coordinated by a global snapshot system | . | Reader &amp; Distributed Scan | Serve snapshot-following reads or run parallel analytical scans across shards | . | Remote Compaction | Offload background compaction to dedicated worker nodes | . | Structured DB | Type-safe row-oriented wrappers for all of the above | . ",
-    "url": "/cobble/latest/getting-started/",
-    
-    "relUrl": "/getting-started/"
-  },"57": {
     "doc": "FFI Bindings",
     "title": "FFI Bindings",
     "content": "Cobble’s core engine is written in Rust, but its functionality is accessible from other languages through foreign function interface (FFI) bindings. | Binding | Language | Crate | . | Java | JVM (Java, Kotlin, Scala, …) | cobble-java | . ",
     "url": "/cobble/latest/ffi-bindings/",
     
     "relUrl": "/ffi-bindings/"
-  },"58": {
+  },"50": {
+    "doc": "Getting Started",
+    "title": "Getting Started",
+    "content": "This section guides you through setting up and using Cobble for different use cases — from a single-machine embedded store to a distributed cluster with snapshot-following reads and parallel scans. Start with Basic Concepts for an overview of the key components, then Configuration to understand how Cobble organizes storage, and finally choose the deployment model that fits your application: . | Guide | When to use | . | Basic Concepts | Core components — Db, Coordinator, Reader, Scanner, snapshots | . | Configuration | Every deployment starts here — volumes, tuning, and storage layout | . | Single-Machine Embedded DB | Simple embedded key-value store on a single machine | . | Distributed DB | Multiple writer shards coordinated by a global snapshot system | . | Reader &amp; Distributed Scan | Serve snapshot-following reads or run parallel analytical scans across shards | . | Remote Compaction | Offload background compaction to dedicated worker nodes | . | Structured DB | Type-safe row-oriented wrappers for all of the above | . ",
+    "url": "/cobble/latest/getting-started/",
+    
+    "relUrl": "/getting-started/"
+  },"51": {
     "doc": "Reference",
     "title": "Reference",
     "content": "Complete reference documentation for Cobble configuration, APIs, and operational details. | Page | Description | . | Configuration Reference | All configuration parameters with types, defaults, and descriptions | . | API Overview | Public Rust API surface and module structure | . | Monitoring | Web monitor dashboard and metrics | . ",
     "url": "/cobble/latest/reference/",
     
     "relUrl": "/reference/"
+  },"52": {
+    "doc": "Architecture",
+    "title": "Architecture",
+    "content": "This section explains the design principles behind Cobble and how its components work together. The goal is to help you understand why Cobble behaves the way it does, so you can make informed decisions about configuration and deployment. ",
+    "url": "/cobble/latest/architecture/",
+    
+    "relUrl": "/architecture/"
+  },"53": {
+    "doc": "Architecture",
+    "title": "Design Philosophy",
+    "content": "Cobble is built around a few core ideas: . | Focus on embedded key-value storage. Cobble is designed to be a high-performance embedded database that can be used as a building block for larger systems. It provides the primitives for key-value storage, snapshots, and distributed coordination, but leaves higher-level features (like SQL layers or distributed transactions) to be built on top. | Weak coordination among shards. In a distributed deployment, each Db shard operates mostly independently, with the Coordinator only involved in snapshot management. This minimizes cross-shard communication and allows for high write throughput without distributed locking. We leave it to the application to decide how to partition data and handle cross-shard consistency if needed. | Flexible with more options. Cobble provides multiple implementations for key components (memtable, file formats, compaction strategies) that can be configured based on workload needs. The architecture is designed to accommodate these options without sacrificing core performance. | Snapshots for consistency as well as read serving. The snapshot system is not just for backup and restore — it’s a fundamental part of how Cobble provides consistent read views in a distributed environment. This makes Cobble a good fit for analytical workloads that need to read from a consistent point-in-time view while writes are ongoing. | Single-threaded APIs for simplicity and performance. Each components’ APIs are designed to be called from a single thread, which simplifies the internal design and allows for high performance without locking. For concurrent access, you use multiple instance of Reader or Scanner against snapshots, which are safe to use concurrently. | . ",
+    "url": "/cobble/latest/architecture/#design-philosophy",
+    
+    "relUrl": "/architecture/#design-philosophy"
+  },"54": {
+    "doc": "Architecture",
+    "title": "Module Map",
+    "content": "| Module | What it provides | . | LSM Tree | The core storage structure — how data is organized on disk | . | Memtable | In-memory write buffers — why there are three implementations | . | Compaction | Background merging — how Cobble keeps reads fast over time | . | Key-Value Separation | VLOG — when and why to store values separately | . | Read &amp; Write Paths | How data flows from writes to reads | . | Snapshot System | Point-in-time consistency for restore, reads, and scans | . | File Management | File lifecycle, volume selection, and storage backends | . | Block Cache | Multi-tier caching for read performance | . | Schema Evolution | Adding and removing columns without rewriting data | . | Merge Operators | Efficient read-modify-write without extra round trips | . ",
+    "url": "/cobble/latest/architecture/#module-map",
+    
+    "relUrl": "/architecture/#module-map"
+  },"55": {
+    "doc": "Home",
+    "title": "Cobble Project",
+    "content": "Cobble is a high-performance LSM-based key-value storage engine designed for both embedded and distributed systems. It provides a flexible and efficient storage solution for various workloads, from small-scale applications to large distributed services. Compared with other embedded key-value stores like RocksDB, it offers multiple file formats (SSTable and Parquet), distributed storage support, distributed snapshots, remote compaction, and more. Thus, it really fits the needs of modern distributed systems that require a versatile and scalable storage engine. Note: Cobble is still in active development, and all the APIs might be changed without deprecation for early versions. We will try our best to keep the documentation up to date, but please check the code and tests for the latest usage patterns. ",
+    "url": "/cobble/latest/#cobble-project",
+    
+    "relUrl": "/#cobble-project"
+  },"56": {
+    "doc": "Home",
+    "title": "Key Features",
+    "content": ". | Multi-volume storage with local disk and remote object storage (S3, OSS, etc.) support (powered by Apache OpenDAL) | LSM Tree storage optimized for high write throughput and efficient merge reads | Key-value separation for large-value workloads | Multi-column schema with online schema evolution (add/delete columns) | Distributed snapshots with coordinator-based global consistency | Distributed scan for batch processing and analytics across multiple nodes | Remote compaction to offload CPU/IO from writer nodes | Pluggable merge operators for read-modify-write patterns (counters, lists, etc.) | Hybrid block cache with optional memory + disk tiers (powered by Foyer) | Multiple file formats: SSTable and Apache Parquet for different workload needs | Multiple readers: concurrent read access across processes and machines with snapshot isolation | Row-level TTL support with configurable time providers | Data structures support with typed row encoding/decoding and structured APIs | Java bindings for JVM-based applications | Web monitoring dashboard for operational visibility | . ",
+    "url": "/cobble/latest/#key-features",
+    
+    "relUrl": "/#key-features"
+  },"57": {
+    "doc": "Home",
+    "title": "Documentation Structure",
+    "content": "| Section | Description | . | Getting Started | Configuration, basic usage, and integration guides | . | Architecture | Internal design, data structures, and algorithms | . | Reference | Complete configuration reference and API documentation | . | FFI Bindings | Using Cobble from other languages (Java, …) | . ",
+    "url": "/cobble/latest/#documentation-structure",
+    
+    "relUrl": "/#documentation-structure"
+  },"58": {
+    "doc": "Home",
+    "title": "Home",
+    "content": " ",
+    "url": "/cobble/latest/",
+    
+    "relUrl": "/"
   },"59": {
     "doc": "Java",
     "title": "Java Bindings",
