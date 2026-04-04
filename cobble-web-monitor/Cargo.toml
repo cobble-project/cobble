@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 build = "build.rs"
 license.workspace = true
-publish = false
+description = "Embeddable HTTP web monitor for Cobble databases"
+repository.workspace = true
+homepage.workspace = true
+keywords = ["monitoring", "kv", "storage"]
+categories = ["database-implementations"]
 
 [dependencies]
 axum = "0.8.4"

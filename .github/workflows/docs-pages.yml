@@ -50,11 +50,11 @@ jobs:
               exit 0
             fi
           elif [[ "${ref_type}" == "tag" ]]; then
-            if [[ "${ref_name}" =~ ^[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z._-]+)?$ ]]; then
-              root="${ref_name}"
+            if [[ "${ref_name}" =~ ^v([0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z._-]+)?)$ ]]; then
+              root="${BASH_REMATCH[1]}"
             else
               echo "deploy=false" >> "${GITHUB_OUTPUT}"
-              echo "reason=Skip docs publish: tag '${ref_name}' is not a version tag." >> "${GITHUB_OUTPUT}"
+              echo "reason=Skip docs publish: tag '${ref_name}' is not a v-prefixed version tag (e.g. v0.1.0)." >> "${GITHUB_OUTPUT}"
               exit 0
             fi
           fi

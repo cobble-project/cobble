@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 const DEFAULT_INSPECT_LIMIT: usize = 100;
 const DEFAULT_INSPECT_MAX_LIMIT: usize = 1000;
-static UI_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web-ui/dist");
+static UI_DIST: Dir<'_> = include_dir!("$COBBLE_WEB_MONITOR_UI_DIST");
 
 #[derive(Clone, Debug)]
 pub enum MonitorConfigSource {
