@@ -2,11 +2,9 @@ name: Deploy Docs
 
 on:
   push:
-    branches:
-      - "**"
-    paths:
-      - "docs/**"
-      - ".github/workflows/docs-pages.yml"
+    branches: [main, master]
+    tags:
+      - "*"
 
 permissions:
   contents: write
@@ -29,19 +27,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          branch="${GITHUB_REF_NAME}"
+          ref_type="${GITHUB_REF_TYPE}"
+          ref_name="${GITHUB_REF_NAME}"
           root=""
-          if [[ "${branch}" == "main" || "${branch}" == "master" ]]; then
-            root="latest"
-          elif [[ "${branch}" =~ ^[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z._-]+)?$ ]]; then
-            root="${branch}"
-          elif [[ "${branch}" =~ ^release/([0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z._-]+)?)$ ]]; then
-            root="${BASH_REMATCH[1]}"
+
+          if [[ "${ref_type}" == "branch" && ( "${ref_name}" == "main" || "${ref_name}" == "master" ) ]]; then
+            before="${{ github.event.before }}"
+            docs_changed="false"
+            if [[ -z "${before}" || "${before}" =~ ^0+$ ]]; then
+              if git ls-tree -r --name-only "${GITHUB_SHA}" | grep -q '^docs/'; then
+                docs_changed="true"
+              fi
+            elif git diff --name-only "${before}" "${GITHUB_SHA}" | grep -q '^docs/'; then
+              docs_changed="true"
+            fi
+
+            if [[ "${docs_changed}" == "true" ]]; then
+              root="latest"
+            else
+              echo "deploy=false" >> "${GITHUB_OUTPUT}"
+              echo "reason=Skip latest publish: no docs/ changes in this push." >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+          elif [[ "${ref_type}" == "tag" ]]; then
+            if [[ "${ref_name}" =~ ^[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z._-]+)?$ ]]; then
+              root="${ref_name}"
+            else
+              echo "deploy=false" >> "${GITHUB_OUTPUT}"
+              echo "reason=Skip docs publish: tag '${ref_name}' is not a version tag." >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
           fi
 
           if [[ -z "${root}" ]]; then
             echo "deploy=false" >> "${GITHUB_OUTPUT}"
-            echo "reason=Skip docs publish for branch '${branch}'." >> "${GITHUB_OUTPUT}"
+            echo "reason=Skip docs publish for ref '${ref_name}'." >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 

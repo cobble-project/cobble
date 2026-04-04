@@ -20,20 +20,20 @@ Then open `http://127.0.0.1:4000`.
 - `docs-pages.yml` is pure workflow deployment (no manual script).
 - In repository settings, enable **Pages -> Deploy from a branch** and point to `gh-pages` / `(root)`.
 
-### Branch-to-root mapping
+### Trigger and root mapping
 
-`docs-pages.yml` publishes by pushed branch name:
+`docs-pages.yml` only publishes in these two cases:
 
-- `main` or `master` -> `latest/`
-- numeric version branch -> same root
-  - examples: `0.3.0`, `1.2`, `release/1.4.0` -> `0.3.0/`, `1.2/`, `1.4.0/`
-- other branches are ignored by deploy job
+1. Push to `main` / `master` **and** this push contains changes under `docs/**` -> publish `latest/`
+2. Push a version tag (tag name is the version, e.g. `0.3.0`) -> publish `<tag>/`
+
+All other pushes/tags are ignored by deploy job.
 
 ### How to operate
 
-1. Update docs in your target branch.
-2. Push the branch to GitHub.
-3. Workflow auto-builds and publishes to the corresponding root on `gh-pages`.
+1. For `latest/`: update docs and push to `main` / `master`.
+2. For versioned docs: create and push a version tag (e.g. `0.3.0`).
+3. Workflow auto-builds and publishes to corresponding root on `gh-pages`.
 
 ### Versioned roots
 
