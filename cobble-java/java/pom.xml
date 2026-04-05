@@ -6,7 +6,7 @@
 
   <groupId>io.github.cobble-project</groupId>
   <artifactId>cobble</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1-SNAPSHOT</version>
   <name>cobble-java</name>
   <description>Java JNI bindings for Cobble, an LSM-based key-value storage engine.</description>
   <url>https://github.com/cobble-project/cobble</url>
