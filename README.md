@@ -1,4 +1,12 @@
 <p align="center"><img src="logo.png" width="60%" alt="Cobble logo" /></p>
+<p align="center">
+  <a href="https://crates.io/crates/cobble"><img alt="crates.io" src="https://img.shields.io/crates/v/cobble?logo=rust" /></a>
+  <a href="#"><img alt="GitHub License" src="https://img.shields.io/github/license/cobble-project/cobble" /></a>
+  <a href="https://cobble-project.github.io/cobble/latest/"><img alt="Docs" src="https://img.shields.io/badge/docs-GitHub%20Pages-222222?logo=githubpages" /></a>
+  <a href="https://central.sonatype.com/artifact/io.github.cobble-project/cobble"><img alt="Maven Central" src="https://img.shields.io/maven-central/v/io.github.cobble-project/cobble?logo=apachemaven" /></a>
+  <a href="https://github.com/cobble-project/cobble/actions/workflows/ci.yml"><img alt="GitHub CI" src="https://img.shields.io/github/actions/workflow/status/cobble-project/cobble/ci.yml?label=CI&logo=githubactions" /></a>
+  <a href="https://docs.rs/cobble/latest/cobble/"><img alt="docs.rs" src="https://img.shields.io/badge/docs-docs.rs-00A1FF" /></a>
+</p>
 
 Cobble is a high-performance, embedded key-value store designed for use in distributed systems as well as standalone applications.
 This project aims to provide a highly flexible storage engine for various services or applications.
