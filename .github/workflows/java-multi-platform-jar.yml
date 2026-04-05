@@ -83,13 +83,19 @@ jobs:
           cp "target/${{ matrix.target }}/debug/${{ matrix.lib_file }}" "native/${{ matrix.platform }}/debug/${{ matrix.lib_file }}"
           cp "target/${{ matrix.target }}/release/${{ matrix.lib_file }}" "native/${{ matrix.platform }}/release/${{ matrix.lib_file }}"
 
+      - name: Archive native artifact with prefix
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="native-archive-${{ matrix.platform }}.tar.gz"
+          tar -czf "${archive}" "native/${{ matrix.platform }}"
+          tar -tzf "${archive}" | grep -E "^native/${{ matrix.platform }}/(debug|release)/${{ matrix.lib_file }}$"
+
       - name: Upload native artifact
         uses: actions/upload-artifact@v5
         with:
-          name: native-${{ matrix.platform }}
-          path: |
-            native/${{ matrix.platform }}/debug/${{ matrix.lib_file }}
-            native/${{ matrix.platform }}/release/${{ matrix.lib_file }}
+          name: native-archive-${{ matrix.platform }}
+          path: native-archive-${{ matrix.platform }}.tar.gz
           if-no-files-found: error
 
   build-jar:
@@ -106,9 +112,44 @@ jobs:
       - name: Download all native artifacts
         uses: actions/download-artifact@v5
         with:
-          pattern: native-*
+          pattern: native-archive-*
           merge-multiple: true
-          path: cobble-java/java/src/main/resources
+          path: native-archives
+
+      - name: Extract and verify native artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cobble-java/java/src/main/resources
+          shopt -s nullglob
+          archives=(native-archives/*.tar.gz)
+          if [[ ${#archives[@]} -eq 0 ]]; then
+            echo "No native archives downloaded." >&2
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            tar -xzf "${archive}" -C cobble-java/java/src/main/resources
+          done
+
+          expected=(
+            "native/macos-aarch64/debug/libcobblejni.dylib"
+            "native/macos-aarch64/release/libcobblejni.dylib"
+            "native/macos-x86_64/debug/libcobblejni.dylib"
+            "native/macos-x86_64/release/libcobblejni.dylib"
+            "native/linux-x86_64/debug/libcobblejni.so"
+            "native/linux-x86_64/release/libcobblejni.so"
+            "native/linux-aarch64/debug/libcobblejni.so"
+            "native/linux-aarch64/release/libcobblejni.so"
+            "native/windows-x86_64/debug/cobblejni.dll"
+            "native/windows-x86_64/release/cobblejni.dll"
+          )
+          for file in "${expected[@]}"; do
+            full_path="cobble-java/java/src/main/resources/${file}"
+            if [[ ! -s "${full_path}" ]]; then
+              echo "Missing or empty native artifact: ${full_path}" >&2
+              exit 1
+            fi
+          done
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -147,9 +188,44 @@ jobs:
       - name: Download all native artifacts
         uses: actions/download-artifact@v5
         with:
-          pattern: native-*
+          pattern: native-archive-*
           merge-multiple: true
-          path: cobble-java/java/src/main/resources
+          path: native-archives
+
+      - name: Extract and verify native artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cobble-java/java/src/main/resources
+          shopt -s nullglob
+          archives=(native-archives/*.tar.gz)
+          if [[ ${#archives[@]} -eq 0 ]]; then
+            echo "No native archives downloaded." >&2
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            tar -xzf "${archive}" -C cobble-java/java/src/main/resources
+          done
+
+          expected=(
+            "native/macos-aarch64/debug/libcobblejni.dylib"
+            "native/macos-aarch64/release/libcobblejni.dylib"
+            "native/macos-x86_64/debug/libcobblejni.dylib"
+            "native/macos-x86_64/release/libcobblejni.dylib"
+            "native/linux-x86_64/debug/libcobblejni.so"
+            "native/linux-x86_64/release/libcobblejni.so"
+            "native/linux-aarch64/debug/libcobblejni.so"
+            "native/linux-aarch64/release/libcobblejni.so"
+            "native/windows-x86_64/debug/cobblejni.dll"
+            "native/windows-x86_64/release/cobblejni.dll"
+          )
+          for file in "${expected[@]}"; do
+            full_path="cobble-java/java/src/main/resources/${file}"
+            if [[ ! -s "${full_path}" ]]; then
+              echo "Missing or empty native artifact: ${full_path}" >&2
+              exit 1
+            fi
+          done
 
       - name: Setup Java
         uses: actions/setup-java@v5
