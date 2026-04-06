@@ -55,3 +55,8 @@ or:
 ```bash
 cargo run --bin cobble-cli -- web-monitor --config ./cobble-monitor-test-config.json --bind 127.0.0.1:8080
 ```
+
+## Docs
+
+- Project docs: https://cobble-project.github.io/cobble/latest/
+- Repository: https://github.com/cobble-project/cobble
