@@ -567,7 +567,6 @@ fn parse_lookup_items(params: &InspectParams, default_bucket: u16) -> Result<Vec
 #[derive(Debug, Deserialize)]
 struct LookupItemInput {
     key_b64: String,
-    #[serde(default)]
     bucket: Option<u16>,
 }
 

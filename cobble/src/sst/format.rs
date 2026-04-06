@@ -3,13 +3,14 @@ use crate::file::SequentialWriteFile;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Magic number at the end of SST file for validation
-pub const SST_FILE_MAGIC: u32 = 0x53535431; // "SST1"
+const SST_FILE_MAGIC: u32 = 0x53535431; // "SST1"
+const SST_FOOTER_VERSION_CURRENT: u32 = 1;
 
 /// Footer structure at the end of SST file
 /// Layout: [index_block_offset: u64][index_block_size: u64]
 ///         [filter_block_offset: u64][filter_block_size: u64]
-///         [flags: u32][magic: u32]
-pub const FOOTER_SIZE: usize = 40; // 8 + 8 + 8 + 8 + 4 + 4
+///         [flags: u32][version: u32][magic: u32]
+pub(crate) const FOOTER_SIZE: usize = 44; // 8 + 8 + 8 + 8 + 4 + 4 + 4
 
 const FOOTER_FLAG_FILTER_PRESENT: u32 = 0x1;
 const FOOTER_FLAG_PARTITIONED_INDEX: u32 = 0x2;
@@ -57,6 +58,7 @@ impl Footer {
             flags |= FOOTER_FLAG_PARTITIONED_INDEX;
         }
         buf.put_u32_le(flags);
+        buf.put_u32_le(SST_FOOTER_VERSION_CURRENT);
         buf.put_u32_le(SST_FILE_MAGIC);
         buf.freeze()
     }
@@ -76,7 +78,15 @@ impl Footer {
         let filter_block_offset = buf.get_u64_le();
         let filter_block_size = buf.get_u64_le();
         let flags = buf.get_u32_le();
+        let version = buf.get_u32_le();
         let magic = buf.get_u32_le();
+
+        if version != SST_FOOTER_VERSION_CURRENT {
+            return Err(Error::IoError(format!(
+                "Unsupported SST footer version: {} (expected {})",
+                version, SST_FOOTER_VERSION_CURRENT
+            )));
+        }
 
         if magic != SST_FILE_MAGIC {
             return Err(Error::IoError(format!(
@@ -422,6 +432,19 @@ mod tests {
         assert_eq!(decoded.filter_block_size, 400);
         assert!(decoded.filter_present);
         assert!(!decoded.partitioned_index);
+    }
+
+    #[test]
+    fn test_footer_contains_version() {
+        let footer = Footer::new(10, 20, 30, 40, true, true);
+        let encoded = footer.encode();
+        let decoded = Footer::decode(&encoded).unwrap();
+        assert_eq!(decoded.index_block_offset, 10);
+        assert_eq!(decoded.index_block_size, 20);
+        assert_eq!(decoded.filter_block_offset, 30);
+        assert_eq!(decoded.filter_block_size, 40);
+        assert!(decoded.filter_present);
+        assert!(decoded.partitioned_index);
     }
 
     #[test]

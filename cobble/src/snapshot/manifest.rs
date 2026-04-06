@@ -13,8 +13,11 @@ use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::Arc;
 
+pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 1;
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
+    pub(crate) version: u32,
     pub(crate) id: u64,
     pub(crate) seq_id: u64,
     pub(crate) latest_schema_id: u64,
@@ -27,6 +30,7 @@ pub(crate) struct ManifestSnapshot {
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestIncrementalSnapshot {
+    pub(crate) version: u32,
     pub(crate) id: u64,
     pub(crate) seq_id: u64,
     pub(crate) base_snapshot_id: u64,
@@ -57,6 +61,25 @@ pub(crate) struct LoadedManifest {
     pub(crate) snapshot_id: u64,
     pub(crate) base_snapshot_id: Option<u64>,
     pub(crate) manifest: ManifestSnapshot,
+}
+
+impl ManifestPayload {
+    fn version(&self) -> u32 {
+        match self {
+            ManifestPayload::Snapshot(manifest) => manifest.version,
+            ManifestPayload::IncrementalSnapshot(manifest) => manifest.version,
+        }
+    }
+}
+
+fn validate_manifest_version(version: u32) -> Result<()> {
+    if version != MANIFEST_VERSION_CURRENT {
+        return Err(Error::IoError(format!(
+            "Unsupported snapshot manifest version: {} (expected {})",
+            version, MANIFEST_VERSION_CURRENT
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -100,8 +123,10 @@ pub(crate) struct ManifestVlogFile {
 }
 
 pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<ManifestPayload> {
-    serde_json::from_slice(bytes)
-        .map_err(|err| Error::IoError(format!("Failed to decode manifest: {}", err)))
+    let payload: ManifestPayload = serde_json::from_slice(bytes)
+        .map_err(|err| Error::IoError(format!("Failed to decode manifest: {}", err)))?;
+    validate_manifest_version(payload.version())?;
+    Ok(payload)
 }
 
 pub(crate) fn parse_snapshot_manifest_id(name: &str) -> Option<u64> {
@@ -138,6 +163,7 @@ pub(crate) fn load_manifest_entry(
                     &mut resolved.tree_levels,
                     &incremental.tree_level_edits,
                 )?;
+                resolved.version = incremental.version;
                 resolved.vlog_files = incremental.vlog_files;
                 resolved.id = incremental.id;
                 resolved.seq_id = incremental.seq_id;
@@ -205,6 +231,7 @@ pub(crate) fn load_manifest_chain(
                     &mut resolved_base.tree_levels,
                     &manifest.tree_level_edits,
                 )?;
+                resolved_base.version = manifest.version;
                 resolved_base.vlog_files = manifest.vlog_files;
                 resolved_base.id = manifest.id;
                 resolved_base.seq_id = manifest.seq_id;
@@ -331,6 +358,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
 ) -> Result<Option<u64>> {
     let full_manifest = || {
         ManifestPayload::Snapshot(ManifestSnapshot {
+            version: MANIFEST_VERSION_CURRENT,
             id: snapshot.id,
             seq_id: snapshot.seq_id,
             latest_schema_id: snapshot.latest_schema_id,
@@ -348,6 +376,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
         {
             incremental_base_id = Some(base.id);
             ManifestPayload::IncrementalSnapshot(ManifestIncrementalSnapshot {
+                version: MANIFEST_VERSION_CURRENT,
                 id: snapshot.id,
                 seq_id: snapshot.seq_id,
                 base_snapshot_id: base.id,
@@ -681,4 +710,54 @@ pub(crate) fn build_vlog_version_from_manifest(
         files.push((vlog_file.file_seq, tracked_id, vlog_file.valid_entries));
     }
     Ok(VlogVersion::from_files_with_entries(files))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_manifest_requires_version() {
+        let without_version = br#"{
+            "id": 1,
+            "seq_id": 2,
+            "latest_schema_id": 3,
+            "bucket_ranges": [],
+            "lsm_tree_bucket_ranges": [],
+            "tree_levels": [],
+            "vlog_files": [],
+            "active_memtable_data": []
+        }"#;
+        let err = match decode_manifest(without_version) {
+            Ok(_) => panic!("expected missing version to be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("Failed to decode manifest"));
+    }
+
+    #[test]
+    fn decode_manifest_rejects_future_version() {
+        let future = format!(
+            r#"{{
+                "version": {},
+                "id": 1,
+                "seq_id": 2,
+                "latest_schema_id": 3,
+                "bucket_ranges": [],
+                "lsm_tree_bucket_ranges": [],
+                "tree_levels": [],
+                "vlog_files": [],
+                "active_memtable_data": []
+            }}"#,
+            MANIFEST_VERSION_CURRENT + 1
+        );
+        let err = match decode_manifest(future.as_bytes()) {
+            Ok(_) => panic!("expected future manifest version to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("Unsupported snapshot manifest version")
+        );
+    }
 }

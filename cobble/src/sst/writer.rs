@@ -252,13 +252,14 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
                 false,
             );
             let footer_encoded = footer.encode();
+            let meta_bytes = footer_encoded.clone();
             self.writer.write(&footer_encoded)?;
 
             let file_size = self.writer.offset();
             let mut writer = self.writer;
             writer.close()?;
 
-            return Ok((first_key, last_key, file_size, footer_encoded));
+            return Ok((first_key, last_key, file_size, meta_bytes));
         }
 
         // Write two-level index
@@ -365,6 +366,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             self.options.partitioned_index,
         );
         let footer_encoded = footer.encode();
+        let meta_bytes = footer_encoded.clone();
         self.writer.write(&footer_encoded)?;
 
         // Get final file size before closing
@@ -374,7 +376,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         let mut writer = self.writer;
         writer.close()?;
 
-        Ok((first_key, last_key, file_size, footer_encoded))
+        Ok((first_key, last_key, file_size, meta_bytes))
     }
 
     /// Finish writing the SST file

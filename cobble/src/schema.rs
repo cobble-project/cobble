@@ -548,15 +548,10 @@ fn collect_schema_ids_from_manifest(manifest: &ManifestSnapshot, schema_ids: &mu
 struct SchemaFile {
     id: u64,
     num_columns: usize,
-    #[serde(default)]
     merge_operator_ids: Vec<String>,
-    #[serde(default)]
     evolution_id: Option<String>,
-    #[serde(default)]
     evolution_indexes: Option<Vec<usize>>,
-    #[serde(default)]
     evolution_default_values: Option<Vec<Option<Vec<u8>>>>,
-    #[serde(default)]
     column_metadata: Vec<Option<JsonValue>>,
 }
 

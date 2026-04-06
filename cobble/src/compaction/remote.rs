@@ -266,13 +266,11 @@ struct RemoteDataFile {
     end_key: Vec<u8>,
     schema_id: u64,
     size: usize,
-    #[serde(default)]
     has_separated_values: bool,
     bucket_range_start: u16,
     bucket_range_end: u16,
     effective_bucket_range_start: u16,
     effective_bucket_range_end: u16,
-    #[serde(default)]
     vlog_file_seq_offset: u32,
     meta_bytes: Option<Vec<u8>>,
 }
@@ -366,7 +364,7 @@ impl RemoteSortedRun {
 /// A struct representing the request for a remote compaction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RemoteCompactionRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<u64>,
     db_id: String,
     lsm_tree_idx: usize,
@@ -375,9 +373,7 @@ struct RemoteCompactionRequest {
     ttl_config: RemoteTtlConfig,
     ttl_now_seconds: u32,
     runs: Vec<RemoteSortedRun>,
-    #[serde(default)]
     merge_operator_ids: Vec<String>,
-    #[serde(default)]
     merge_operator_metadata: Vec<Option<serde_json::Value>>,
 }
 
@@ -404,7 +400,6 @@ impl fmt::Display for RemoteCompactionRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RemoteCompactionResponse {
     output_files: Vec<RemoteDataFile>,
-    #[serde(default)]
     vlog_entry_deltas: Vec<(u32, i64)>,
     error: Option<String>,
 }
