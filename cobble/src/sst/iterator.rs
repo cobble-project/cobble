@@ -186,10 +186,10 @@ impl SSTIterator {
             .unwrap_or_else(|| Arc::new(SSTIteratorMetrics::new("unknown")));
         // Read footer
         let (footer, cached_footer) = if let Some(bytes) = footer_bytes {
-            (Self::decode_footer_bytes(bytes)?, None)
+            (Footer::decode(bytes.as_ref())?, None)
         } else {
             let bytes = Self::read_footer_bytes(&*file)?;
-            let footer = Self::decode_footer_bytes(bytes.clone())?;
+            let footer = Footer::decode(bytes.as_ref())?;
             (footer, Some(bytes))
         };
 
@@ -305,17 +305,6 @@ impl SSTIterator {
 
         let footer_offset = file_size - FOOTER_SIZE;
         file.read_at(footer_offset, FOOTER_SIZE)
-    }
-
-    fn decode_footer_bytes(data: Bytes) -> Result<Footer> {
-        if data.len() != FOOTER_SIZE {
-            return Err(Error::IoError(format!(
-                "Failed to read complete footer: expected {} bytes, got {}",
-                FOOTER_SIZE,
-                data.len()
-            )));
-        }
-        Footer::decode(&data)
     }
 
     /// Seek to the first key >= target

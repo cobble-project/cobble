@@ -16,6 +16,8 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub(crate) const GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT: u32 = 1;
+
 /// Bucket snapshot reference input.
 #[derive(Clone, Debug)]
 pub struct ShardSnapshotInput {
@@ -41,11 +43,24 @@ pub struct ShardSnapshotRef {
 /// Global snapshot manifest referencing bucket-level snapshots.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GlobalSnapshotManifest {
+    pub version: u32,
     pub id: u64,
     pub total_buckets: u32,
     pub shard_snapshots: Vec<ShardSnapshotRef>,
     /// Watermark: the minimum timestamp (seconds) across all shard snapshots.
     pub watermark_seconds: u32,
+}
+
+impl GlobalSnapshotManifest {
+    pub(crate) fn validate_version(&self) -> Result<()> {
+        if self.version != GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT {
+            return Err(Error::IoError(format!(
+                "Unsupported global snapshot manifest version: {} (expected {})",
+                self.version, GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Coordinator node that materializes global snapshots on shared storage.
@@ -146,6 +161,7 @@ impl DbCoordinator {
             });
         }
         Ok(GlobalSnapshotManifest {
+            version: GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT,
             id,
             total_buckets,
             shard_snapshots: bucket_refs,
@@ -290,8 +306,10 @@ fn encode_global_manifest<W: SequentialWriteFile>(
 }
 
 fn decode_global_manifest(bytes: &[u8]) -> Result<GlobalSnapshotManifest> {
-    serde_json::from_slice(bytes)
-        .map_err(|err| Error::IoError(format!("Failed to decode global manifest: {}", err)))
+    let manifest: GlobalSnapshotManifest = serde_json::from_slice(bytes)
+        .map_err(|err| Error::IoError(format!("Failed to decode global manifest: {}", err)))?;
+    manifest.validate_version()?;
+    Ok(manifest)
 }
 
 fn load_latest_snapshot_id(fs: &Arc<dyn FileSystem>) -> Result<Option<u64>> {
@@ -390,6 +408,18 @@ mod tests {
         assert_eq!(loaded.shard_snapshots[1].manifest_path, path_b);
 
         cleanup_root(root);
+    }
+
+    #[test]
+    fn test_global_snapshot_manifest_requires_version() {
+        let raw = br#"{
+            "id": 1,
+            "total_buckets": 4,
+            "shard_snapshots": [],
+            "watermark_seconds": 0
+        }"#;
+        let err = decode_global_manifest(raw).unwrap_err();
+        assert!(err.to_string().contains("Failed to decode global manifest"));
     }
 
     #[test]

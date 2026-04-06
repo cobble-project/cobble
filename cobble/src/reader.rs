@@ -398,9 +398,12 @@ impl Reader {
 }
 
 fn decode_global_snapshot(bytes: &[u8]) -> Result<GlobalSnapshotManifest> {
-    serde_json::from_slice(bytes).map_err(|err: SerdeError| {
-        Error::IoError(format!("Failed to decode global manifest: {}", err))
-    })
+    let manifest: GlobalSnapshotManifest =
+        serde_json::from_slice(bytes).map_err(|err: SerdeError| {
+            Error::IoError(format!("Failed to decode global manifest: {}", err))
+        })?;
+    manifest.validate_version()?;
+    Ok(manifest)
 }
 
 fn parse_snapshot_id(manifest_name: &str) -> Option<u64> {
@@ -549,12 +552,14 @@ mod tests {
         let _ = fs.create_dir(&schema_dir);
         let mut schema_writer = fs.open_write(&schema_path).unwrap();
         schema_writer
-            .write(br#"{"id":0,"num_columns":1,"merge_operator_ids":[]}"#)
+            .write(
+                br#"{"id":0,"num_columns":1,"merge_operator_ids":[],"evolution_id":null,"evolution_indexes":null,"evolution_default_values":null,"column_metadata":[null]}"#,
+            )
             .unwrap();
         schema_writer.close().unwrap();
         let mut writer = fs.open_write(&manifest_path).unwrap();
         let manifest = format!(
-            "{{\"id\":{},\"seq_id\":0,\"latest_schema_id\":0,\"bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"lsm_tree_bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"tree_levels\":[[]],\"vlog_files\":[],\"active_memtable_data\":[]}}",
+            "{{\"version\":1,\"id\":{},\"seq_id\":0,\"latest_schema_id\":0,\"bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"lsm_tree_bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"tree_levels\":[[]],\"vlog_files\":[],\"active_memtable_data\":[]}}",
             snapshot_id
         );
         writer.write(manifest.as_bytes()).unwrap();

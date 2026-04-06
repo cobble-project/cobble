@@ -135,7 +135,6 @@ impl VolumeUsageKind {
 
 /// Descriptor for a storage volume.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
 pub struct VolumeDescriptor {
     /// Base directory URL for the volume.
     pub base_dir: String,
@@ -192,7 +191,6 @@ fn supports_primary_data(volume: &VolumeDescriptor) -> bool {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
 pub struct ReaderConfigEntry {
     pub pin_partition_in_memory_count: usize,
     pub block_cache_size: usize,
@@ -353,7 +351,6 @@ impl ReadOptions {
 
 /// Config for opening the database.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
 pub struct Config {
     /// Storage volume descriptors for this database.
     pub volumes: Vec<VolumeDescriptor>,
@@ -852,10 +849,8 @@ mod tests {
         let mut path_buf = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path_buf.push("tests/testdata/config.ini");
 
-        let decoded_ini =
-            Config::from_path(path_buf.as_path()).expect("Cannot deserialize ini config");
-        assert_eq!(decoded_ini.reader.reload_tolerance_seconds, 5);
-        assert!(decoded_ini.volumes[0].supports(VolumeUsageKind::Meta));
+        let err = Config::from_path(path_buf.as_path()).unwrap_err();
+        assert!(matches!(err, crate::error::Error::ConfigError(_)));
     }
 
     #[test]
@@ -959,26 +954,23 @@ mod tests {
     }
 
     #[test]
-    fn test_data_file_type_defaults_to_sst_when_missing() {
+    fn test_data_file_type_missing_field_is_rejected() {
         let json = r#"{
             "volumes": [{"base_dir":"file:///tmp/cobble","kinds":["meta","primary_data_priority_high"]}],
             "num_columns": 1
         }"#;
-        let decoded: Config =
-            serde_json::from_str(json).expect("Cannot deserialize partial config");
-        assert_eq!(decoded.data_file_type, DataFileType::SSTable);
-        assert_eq!(decoded.parquet_row_group_size_bytes, 256 * 1024);
+        let err = serde_json::from_str::<Config>(json).unwrap_err();
+        assert!(err.to_string().contains("missing field"));
     }
 
     #[test]
     fn test_data_file_type_parquet_round_trip() {
-        let json = r#"{
-            "volumes": [{"base_dir":"file:///tmp/cobble","kinds":["meta","primary_data_priority_high"]}],
-            "data_file_type":"parquet",
-            "parquet_row_group_size_bytes": 8192
-        }"#;
+        let mut expected = Config::default();
+        expected.data_file_type = DataFileType::Parquet;
+        expected.parquet_row_group_size_bytes = 8192;
+        let json = serde_json::to_string(&expected).expect("Cannot serialize config");
         let decoded: Config =
-            serde_json::from_str(json).expect("Cannot deserialize parquet config");
+            serde_json::from_str(&json).expect("Cannot deserialize parquet config");
         assert_eq!(decoded.data_file_type, DataFileType::Parquet);
         assert_eq!(decoded.parquet_row_group_size_bytes, 8192);
     }
