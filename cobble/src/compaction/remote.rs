@@ -38,7 +38,25 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 const REMOTE_FILE_ID_START: u64 = u64::MAX / 2;
+const REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT: u32 = 1;
+const REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION: u32 = 1;
 type RemoteCompactionOutput = (Vec<RemoteDataFile>, Vec<(u32, i64)>);
+
+fn validate_protocol_compatibility(
+    role: &str,
+    peer_version: u32,
+    peer_min_compatible_version: u32,
+) -> Result<()> {
+    let local_version = REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT;
+    let local_min_compatible = REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION;
+    if peer_min_compatible_version > local_version || peer_version < local_min_compatible {
+        return Err(Error::IoError(format!(
+            "{} protocol incompatible: peer(version={}, compatible_version={}), local(version={}, compatible_version={})",
+            role, peer_version, peer_min_compatible_version, local_version, local_min_compatible
+        )));
+    }
+    Ok(())
+}
 
 /// Concurrency limiter for the remote compaction server.
 ///
@@ -364,6 +382,8 @@ impl RemoteSortedRun {
 /// A struct representing the request for a remote compaction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RemoteCompactionRequest {
+    version: u32,
+    compatible_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<u64>,
     db_id: String,
@@ -375,6 +395,12 @@ struct RemoteCompactionRequest {
     runs: Vec<RemoteSortedRun>,
     merge_operator_ids: Vec<String>,
     merge_operator_metadata: Vec<Option<serde_json::Value>>,
+}
+
+impl RemoteCompactionRequest {
+    fn validate_protocol_compatibility(&self) -> Result<()> {
+        validate_protocol_compatibility("request", self.version, self.compatible_version)
+    }
 }
 
 impl fmt::Display for RemoteCompactionRequest {
@@ -399,6 +425,8 @@ impl fmt::Display for RemoteCompactionRequest {
 /// A struct representing the response from a remote compaction request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RemoteCompactionResponse {
+    version: u32,
+    compatible_version: u32,
     output_files: Vec<RemoteDataFile>,
     vlog_entry_deltas: Vec<(u32, i64)>,
     error: Option<String>,
@@ -422,6 +450,8 @@ enum RemoteCompactionReply {
 impl RemoteCompactionResponse {
     fn ok(output_files: Vec<RemoteDataFile>, vlog_entry_deltas: Vec<(u32, i64)>) -> Self {
         Self {
+            version: REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT,
+            compatible_version: REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
             output_files,
             vlog_entry_deltas,
             error: None,
@@ -430,10 +460,16 @@ impl RemoteCompactionResponse {
 
     fn err(message: impl Into<String>) -> Self {
         Self {
+            version: REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT,
+            compatible_version: REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
             output_files: Vec::new(),
             vlog_entry_deltas: Vec::new(),
             error: Some(message.into()),
         }
+    }
+
+    fn validate_protocol_compatibility(&self) -> Result<()> {
+        validate_protocol_compatibility("response", self.version, self.compatible_version)
     }
 }
 
@@ -544,6 +580,8 @@ impl RemoteCompactionWorker {
             }
         }
         Ok(RemoteCompactionRequest {
+            version: REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT,
+            compatible_version: REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
             request_id: None,
             db_id: self.metrics_manager.db_id().to_string(),
             lsm_tree_idx,
@@ -831,6 +869,13 @@ impl RemoteCompactionServer {
                     RemoteCompactionReply::SupportedMergeOperators(sorted)
                 }
                 RemoteCompactionCommand::Execute(mut request) => {
+                    if let Err(err) = request.validate_protocol_compatibility() {
+                        warn!("Reject incompatible request: {}", err);
+                        let response = RemoteCompactionResponse::err(err.to_string());
+                        let _ =
+                            write_message(&mut stream, &RemoteCompactionReply::Execute(response));
+                        return;
+                    }
                     let request_id = request_id_counter.fetch_add(1, Ordering::SeqCst);
                     request.request_id = Some(request_id);
                     info!("Received request: {}", request);
@@ -1098,7 +1143,10 @@ fn send_compaction_request_to(
     timeout: Duration,
 ) -> Result<RemoteCompactionResponse> {
     match send_command_to(address, RemoteCompactionCommand::Execute(request), timeout)? {
-        RemoteCompactionReply::Execute(response) => Ok(response),
+        RemoteCompactionReply::Execute(response) => {
+            response.validate_protocol_compatibility()?;
+            Ok(response)
+        }
         RemoteCompactionReply::Error(error) => Err(Error::IoError(error)),
         RemoteCompactionReply::SupportedMergeOperators(ids) => Err(Error::IoError(format!(
             "unexpected capability response while executing compaction: {:?}",
