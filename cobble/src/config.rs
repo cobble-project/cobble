@@ -1,12 +1,15 @@
 use crate::SstCompressionAlgorithm;
 use crate::data_file::DataFileType;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::time::TimeProviderKind;
 use crate::util::normalize_storage_path_to_url;
+use config::{Config as ConfigLoader, File as ConfigFile, FileFormat as ConfigFileFormat};
 use log::warn;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::sync::{Arc, Mutex};
+use toml::Value as TomlValue;
 use url::Url;
 
 const DEFAULT_READ_PROXY_RELOAD_TOLERANCE_SECONDS: u64 = 10;
@@ -538,7 +541,7 @@ impl Config {
             return Ok(None);
         };
         if disk_capacity_bytes == 0 {
-            return Err(crate::error::Error::ConfigError(
+            return Err(Error::ConfigError(
                 "block_cache_hybrid_disk_size must be greater than 0 when hybrid cache is enabled"
                     .to_string(),
             ));
@@ -556,7 +559,7 @@ impl Config {
             has_cache_volume = true;
             let normalized_base_dir = normalize_storage_path_to_url(&volume.base_dir)?;
             let url = Url::parse(&normalized_base_dir).map_err(|err| {
-                crate::error::Error::ConfigError(format!(
+                Error::ConfigError(format!(
                     "Invalid cache volume URL {}: {}",
                     normalized_base_dir, err
                 ))
@@ -594,17 +597,17 @@ impl Config {
             return Ok(Some(plan.clone()));
         }
         if !has_cache_volume {
-            return Err(crate::error::Error::ConfigError(
+            return Err(Error::ConfigError(
                 "Hybrid block cache enabled but no volume is configured with cache usage"
                     .to_string(),
             ));
         }
         if !has_local_cache_volume {
-            return Err(crate::error::Error::ConfigError(
+            return Err(Error::ConfigError(
                 "Hybrid block cache requires a local file:// cache volume".to_string(),
             ));
         }
-        Err(crate::error::Error::ConfigError(format!(
+        Err(Error::ConfigError(format!(
             "No cache volume has enough capacity for hybrid block cache disk size {} bytes",
             disk_capacity_bytes
         )))
@@ -625,14 +628,14 @@ impl Config {
         let mut adjusted = self.clone();
         let disk_bytes = plan.disk_capacity_bytes as u64;
         let volume = adjusted.volumes.get_mut(plan.volume_idx).ok_or_else(|| {
-            crate::error::Error::ConfigError(format!(
+            Error::ConfigError(format!(
                 "Selected hybrid cache volume index {} out of range",
                 plan.volume_idx
             ))
         })?;
         if let Some(limit) = volume.size_limit {
             if limit <= disk_bytes {
-                return Err(crate::error::Error::ConfigError(format!(
+                return Err(Error::ConfigError(format!(
                     "Hybrid cache reservation {} bytes exceeds shared volume limit {} bytes for {}",
                     disk_bytes, limit, volume.base_dir
                 )));
@@ -642,36 +645,76 @@ impl Config {
         Ok(adjusted)
     }
 
-    pub fn from_path(path: impl AsRef<std::path::Path>) -> crate::error::Result<Self> {
-        let mut builder = ::config::Config::builder();
+    pub fn from_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = path.as_ref();
-        let format = match path
+        let extension = path
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_lowercase())
-        {
-            Some(ext) if ext == "yaml" || ext == "yml" => ::config::FileFormat::Yaml,
-            Some(ext) if ext == "ini" => ::config::FileFormat::Ini,
-            Some(ext) if ext == "json" => ::config::FileFormat::Json,
-            Some(ext) if ext == "toml" => ::config::FileFormat::Toml,
-            Some(ext) => {
-                return Err(crate::error::Error::ConfigError(format!(
+            .ok_or_else(|| Error::ConfigError("Config path missing extension".to_string()))?;
+        let format = match extension.as_str() {
+            "yaml" | "yml" => ConfigFileFormat::Yaml,
+            "ini" => ConfigFileFormat::Ini,
+            "json" => ConfigFileFormat::Json,
+            "toml" => ConfigFileFormat::Toml,
+            _ => {
+                return Err(Error::ConfigError(format!(
                     "Unsupported config format: {}",
-                    ext
+                    extension
                 )));
             }
-            None => {
-                return Err(crate::error::Error::ConfigError(
-                    "Config path missing extension".to_string(),
-                ));
-            }
         };
-        builder = builder.add_source(::config::File::from(path).format(format));
+
+        let provided = match extension.as_str() {
+            "json" => {
+                let contents = std::fs::read_to_string(path)
+                    .map_err(|err| Error::ConfigError(err.to_string()))?;
+                let parsed = serde_json::from_str::<JsonValue>(&contents)
+                    .map_err(|err| Error::ConfigError(err.to_string()))?;
+                Some(parsed)
+            }
+            "yaml" | "yml" => {
+                let contents = std::fs::read_to_string(path)
+                    .map_err(|err| Error::ConfigError(err.to_string()))?;
+                let parsed = serde_yaml::from_str::<serde_yaml::Value>(&contents)
+                    .map_err(|err| Error::ConfigError(err.to_string()))?;
+                Some(
+                    serde_json::to_value(parsed)
+                        .map_err(|err| Error::ConfigError(err.to_string()))?,
+                )
+            }
+            "toml" => {
+                let contents = std::fs::read_to_string(path)
+                    .map_err(|err| Error::ConfigError(err.to_string()))?;
+                let parsed = toml::from_str::<TomlValue>(&contents)
+                    .map_err(|err| Error::ConfigError(err.to_string()))?;
+                Some(
+                    serde_json::to_value(parsed)
+                        .map_err(|err| Error::ConfigError(err.to_string()))?,
+                )
+            }
+            _ => None,
+        };
+
+        let schema = serde_json::to_value(Config::default())
+            .map_err(|err| Error::ConfigError(err.to_string()))?;
+        if let Some(provided) = provided.as_ref() {
+            let unrecognized = collect_unrecognized_entry_paths(provided, &schema, "");
+            for entry in unrecognized {
+                warn!("unrecognized entry: {}", entry);
+            }
+        }
+
+        let default_json = serde_json::to_string(&Config::default())
+            .map_err(|err| Error::ConfigError(err.to_string()))?;
+        let mut builder = ConfigLoader::builder();
+        builder = builder.add_source(ConfigFile::from_str(&default_json, ConfigFileFormat::Json));
+        builder = builder.add_source(ConfigFile::from(path).format(format));
         builder
             .build()
-            .map_err(|err| crate::error::Error::ConfigError(err.to_string()))?
+            .map_err(|err| Error::ConfigError(err.to_string()))?
             .try_deserialize()
-            .map_err(|err| crate::error::Error::ConfigError(err.to_string()))
+            .map_err(|err| Error::ConfigError(err.to_string()))
     }
 
     pub(crate) fn resolved_write_stall_limit(&self) -> usize {
@@ -715,11 +758,55 @@ impl Config {
     }
 }
 
+fn collect_unrecognized_entry_paths(
+    provided: &JsonValue,
+    schema: &JsonValue,
+    path: &str,
+) -> Vec<String> {
+    match (provided, schema) {
+        (JsonValue::Object(provided_map), JsonValue::Object(schema_map)) => {
+            let mut unknown = Vec::new();
+            for (key, value) in provided_map {
+                let current_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", path, key)
+                };
+                if let Some(schema_value) = schema_map.get(key) {
+                    unknown.extend(collect_unrecognized_entry_paths(
+                        value,
+                        schema_value,
+                        &current_path,
+                    ));
+                } else {
+                    unknown.push(current_path);
+                }
+            }
+            unknown
+        }
+        (JsonValue::Array(provided_items), JsonValue::Array(schema_items)) => {
+            let mut unknown = Vec::new();
+            if let Some(schema_item) = schema_items.first() {
+                for (idx, provided_item) in provided_items.iter().enumerate() {
+                    let current_path = format!("{}[{}]", path, idx);
+                    unknown.extend(collect_unrecognized_entry_paths(
+                        provided_item,
+                        schema_item,
+                        &current_path,
+                    ));
+                }
+            }
+            unknown
+        }
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, MemtableType, PrimaryVolumeOffloadPolicyKind, ReaderConfigEntry, VolumeDescriptor,
-        VolumeUsageKind,
+        Config, Error, MemtableType, PrimaryVolumeOffloadPolicyKind, ReaderConfigEntry,
+        VolumeDescriptor, VolumeUsageKind,
     };
     use crate::SstCompressionAlgorithm;
     use crate::data_file::DataFileType;
@@ -849,8 +936,10 @@ mod tests {
         let mut path_buf = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path_buf.push("tests/testdata/config.ini");
 
-        let err = Config::from_path(path_buf.as_path()).unwrap_err();
-        assert!(matches!(err, crate::error::Error::ConfigError(_)));
+        let decoded_ini = Config::from_path(path_buf.as_path()).expect("Cannot deserialize ini");
+        assert_eq!(decoded_ini.memtable_capacity, 1024);
+        assert_eq!(decoded_ini.reader.block_cache_size, 2048);
+        assert_eq!(decoded_ini.data_file_type, DataFileType::SSTable);
     }
 
     #[test]
@@ -950,7 +1039,7 @@ mod tests {
             vec![VolumeUsageKind::Cache],
         )];
         let err = config.resolve_hybrid_cache_volume_plan(2048).unwrap_err();
-        assert!(matches!(err, crate::error::Error::ConfigError(_)));
+        assert!(matches!(err, Error::ConfigError(_)));
     }
 
     #[test]
@@ -973,5 +1062,48 @@ mod tests {
             serde_json::from_str(&json).expect("Cannot deserialize parquet config");
         assert_eq!(decoded.data_file_type, DataFileType::Parquet);
         assert_eq!(decoded.parquet_row_group_size_bytes, 8192);
+    }
+
+    #[test]
+    fn test_config_from_path_allows_partial_entries() {
+        let json = r#"{
+            "volumes": [{"base_dir":"file:///tmp/cobble","kinds":["meta","primary_data_priority_high"]}],
+            "memtable_capacity": 2048
+        }"#;
+        let mut json_file = Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("Should create temp json");
+        json_file
+            .write_all(json.as_bytes())
+            .expect("Should be able to write json");
+        json_file.flush().expect("Should be able to flush json");
+
+        let decoded = Config::from_path(json_file.path()).expect("Cannot deserialize partial json");
+        assert_eq!(decoded.memtable_capacity, 2048);
+        assert_eq!(decoded.num_columns, Config::default().num_columns);
+        assert_eq!(decoded.data_file_type, Config::default().data_file_type);
+    }
+
+    #[test]
+    fn test_collect_unrecognized_entry_paths() {
+        let provided = serde_json::json!({
+            "num_columns": 1,
+            "unknown_top": 1,
+            "reader": {
+                "block_cache_size": 1024,
+                "unknown_nested": true
+            },
+            "volumes": [{
+                "base_dir": "file:///tmp/cobble",
+                "kinds": ["meta", "primary_data_priority_high"],
+                "unknown_volume_key": "x"
+            }]
+        });
+        let schema = serde_json::to_value(Config::default()).expect("serialize default config");
+        let unknown = super::collect_unrecognized_entry_paths(&provided, &schema, "");
+        assert!(unknown.contains(&"unknown_top".to_string()));
+        assert!(unknown.contains(&"reader.unknown_nested".to_string()));
+        assert!(unknown.contains(&"volumes[0].unknown_volume_key".to_string()));
     }
 }
