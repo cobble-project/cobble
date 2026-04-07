@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config::default();
     config.num_columns = 2;
     config.total_buckets = 1;
-    config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-single".to_string());
+    config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-single");
 
     let db = SingleDb::open(config)?;
     db.put(0, b"user:1", 0, b"Alice")?;

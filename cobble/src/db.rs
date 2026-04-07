@@ -537,7 +537,11 @@ impl Db {
     }
 
     /// Open a read-only view from a snapshot manifest.
-    pub fn open_read_only(config: Config, snapshot_id: u64, db_id: String) -> Result<ReadOnlyDb> {
+    pub fn open_read_only(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+    ) -> Result<ReadOnlyDb> {
         let config = config.normalize_volume_paths()?;
         init_logging(&config);
         ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id)

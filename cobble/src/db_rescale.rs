@@ -31,10 +31,11 @@ impl Db {
     /// buckets during the process. Returns the snapshot ID of the source snapshot used for expansion.
     pub fn expand_bucket(
         &self,
-        source_db_id: String,
+        source_db_id: impl Into<String>,
         snapshot_id: Option<u64>,
         ranges: Option<Vec<RangeInclusive<u16>>>,
     ) -> Result<u64> {
+        let source_db_id = source_db_id.into();
         self.ensure_open()?;
         if source_db_id == self.id {
             return Err(Error::ConfigError(

@@ -21,7 +21,7 @@ This makes `Reader` ideal for low-latency serving on a stable view, but with fre
 use cobble::{Reader, ReaderConfig, VolumeDescriptor};
 
 let read_config = ReaderConfig {
-    volumes: VolumeDescriptor::single_volume("file:///tmp/my-db".to_string()),
+    volumes: VolumeDescriptor::single_volume("file:///tmp/my-db"),
     total_buckets: 1024,
     ..ReaderConfig::default()
 };

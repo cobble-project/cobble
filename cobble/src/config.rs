@@ -150,9 +150,9 @@ pub struct VolumeDescriptor {
 }
 
 impl VolumeDescriptor {
-    pub fn new(base_dir: String, kinds: Vec<VolumeUsageKind>) -> Self {
+    pub fn new(base_dir: impl Into<String>, kinds: Vec<VolumeUsageKind>) -> Self {
         let mut descriptor = Self {
-            base_dir,
+            base_dir: base_dir.into(),
             access_id: None,
             secret_key: None,
             size_limit: None,
@@ -165,7 +165,7 @@ impl VolumeDescriptor {
     }
 
     /// Helper to create a single volume config for both primary data and meta.
-    pub fn single_volume(base_dir: String) -> Vec<Self> {
+    pub fn single_volume(base_dir: impl Into<String>) -> Vec<Self> {
         vec![Self::new(
             base_dir,
             vec![
@@ -450,7 +450,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            volumes: VolumeDescriptor::single_volume("file:///tmp/cobble".to_string()),
+            volumes: VolumeDescriptor::single_volume("file:///tmp/cobble"),
             memtable_capacity: 64 * 1024 * 1024,
             memtable_buffer_count: 2,
             memtable_type: MemtableType::Hash,

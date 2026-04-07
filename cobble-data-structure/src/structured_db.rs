@@ -410,14 +410,18 @@ impl StructuredDb {
         })
     }
 
-    pub fn open_from_snapshot(config: Config, snapshot_id: u64, db_id: String) -> Result<Self> {
+    pub fn open_from_snapshot(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+    ) -> Result<Self> {
         Self::open_from_snapshot_with_resolver(config, snapshot_id, db_id, None)
     }
 
     pub fn open_from_snapshot_with_resolver(
         config: Config,
         snapshot_id: u64,
-        db_id: String,
+        db_id: impl Into<String>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
         let db = Db::open_from_snapshot_with_resolver(
@@ -433,13 +437,13 @@ impl StructuredDb {
         })
     }
 
-    pub fn resume(config: Config, db_id: String) -> Result<Self> {
+    pub fn resume(config: Config, db_id: impl Into<String>) -> Result<Self> {
         Self::resume_with_resolver(config, db_id, None)
     }
 
     pub fn resume_with_resolver(
         config: Config,
-        db_id: String,
+        db_id: impl Into<String>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
         let db = Db::resume_with_resolver(config, db_id, Some(combined_resolver(resolver)))?;

@@ -16,7 +16,7 @@
 //! - `Readonly`: read-only source volume for historical loading
 //!
 //! Minimum practical configuration:
-//! `VolumeDescriptor::single_volume("file:///path".to_string())`.
+//! `VolumeDescriptor::single_volume("file:///path")`.
 //!
 //! IMPORTANT: for any restore/resume flow, the runtime must be able to access all
 //! files referenced by the target snapshot manifests. Missing/inaccessible files
@@ -33,7 +33,7 @@
 //! let mut config = Config::default();
 //! config.num_columns = 2;
 //! config.total_buckets = 1;
-//! config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-single".to_string());
+//! config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-single");
 //!
 //! let db = SingleDb::open(config.clone())?;
 //! db.put(0, b"k1", 0, b"v1")?;

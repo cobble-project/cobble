@@ -55,7 +55,7 @@ This is the simplest single-path deployment and is enough for local development.
 use cobble::{Config, VolumeDescriptor};
 
 let mut config = Config::default();
-config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble".to_string());
+config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble");
 ```
 
 > [!IMPORTANT]
@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config::default();
     config.num_columns = 2;
     config.total_buckets = 1;
-    config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-single".to_string());
+    config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-single");
 
     let db = SingleDb::open(config)?;
     db.put(0, b"user:1", 0, b"Alice")?;
@@ -134,7 +134,7 @@ https://cobble-project.github.io/cobble/latest/getting-started/distributed/
 use cobble::{Reader, ReaderConfig, VolumeDescriptor};
 
 let read_config = ReaderConfig {
-    volumes: VolumeDescriptor::single_volume("file:///tmp/cobble".to_string()),
+    volumes: VolumeDescriptor::single_volume("file:///tmp/cobble"),
     total_buckets: 1024,
     ..ReaderConfig::default()
 };
@@ -181,7 +181,7 @@ use cobble_data_structure::{ListConfig, ListRetainMode, StructuredColumnValue, S
 let mut config = Config::default();
 config.num_columns = 2;
 config.total_buckets = 1;
-config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-structured".to_string());
+config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-structured");
 
 let mut db = StructuredSingleDb::open(config)?;
 db.update_schema()

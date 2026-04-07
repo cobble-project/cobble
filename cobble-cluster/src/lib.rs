@@ -13,7 +13,7 @@
 //!
 //! let mut config = Config::default();
 //! config.total_buckets = 1;
-//! config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-cluster".to_string());
+//! config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-cluster");
 //!
 //! let mut coordinator = StandaloneCoordinator::open(config.clone())?;
 //! coordinator.serve("127.0.0.1:9900")?;

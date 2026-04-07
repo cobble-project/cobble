@@ -907,17 +907,18 @@ impl StandaloneShardNode {
     /// This is useful in tests and rolling-restart flows where the previous `Db`
     /// was cleanly closed and needs to rejoin coordinator governance with the
     /// same `db_id`.
-    pub fn resume<S>(
+    pub fn resume<D, S>(
         config: Config,
-        db_id: String,
+        db_id: D,
         bucket_ranges: Vec<RangeInclusive<u16>>,
         coordinator_addr: S,
     ) -> Result<Self>
     where
+        D: Into<String>,
         S: Into<String>,
     {
         let coordinator_addr = coordinator_addr.into();
-        let db = Arc::new(Db::resume(config.clone(), db_id)?);
+        let db = Arc::new(Db::resume(config.clone(), db_id.into())?);
         Ok(Self {
             db,
             registration: Some(ShardRegistration {

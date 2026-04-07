@@ -39,7 +39,7 @@ impl ReadOnlyDb {
     pub fn open_with_db_id(
         config: Config,
         snapshot_id: u64,
-        snapshot_db_id: String,
+        snapshot_db_id: impl Into<String>,
     ) -> Result<Self> {
         Self::open_with_db_id_and_cache(config, snapshot_id, snapshot_db_id, None)
     }
@@ -48,9 +48,10 @@ impl ReadOnlyDb {
     pub fn open_with_db_id_and_resolver(
         config: Config,
         snapshot_id: u64,
-        snapshot_db_id: String,
+        snapshot_db_id: impl Into<String>,
         resolver: Arc<dyn MergeOperatorResolver>,
     ) -> Result<Self> {
+        let snapshot_db_id = snapshot_db_id.into();
         let metrics_manager = Arc::new(MetricsManager::new(&snapshot_db_id));
         Self::open_internal(
             config,
@@ -65,9 +66,10 @@ impl ReadOnlyDb {
     pub fn open_with_db_id_and_cache(
         config: Config,
         snapshot_id: u64,
-        snapshot_db_id: String,
+        snapshot_db_id: impl Into<String>,
         block_cache: Option<BlockCache>,
     ) -> Result<Self> {
+        let snapshot_db_id = snapshot_db_id.into();
         let metrics_manager = Arc::new(MetricsManager::new(&snapshot_db_id));
         Self::open_internal(
             config,
@@ -82,10 +84,11 @@ impl ReadOnlyDb {
     pub fn open_with_db_id_and_cache_with_metrics(
         config: Config,
         snapshot_id: u64,
-        snapshot_db_id: String,
+        snapshot_db_id: impl Into<String>,
         block_cache: Option<BlockCache>,
         metrics_manager: Arc<MetricsManager>,
     ) -> Result<Self> {
+        let snapshot_db_id = snapshot_db_id.into();
         Self::open_internal(
             config,
             snapshot_id,
@@ -99,11 +102,12 @@ impl ReadOnlyDb {
     pub fn open_with_db_id_and_cache_with_metrics_and_resolver(
         config: Config,
         snapshot_id: u64,
-        snapshot_db_id: String,
+        snapshot_db_id: impl Into<String>,
         block_cache: Option<BlockCache>,
         metrics_manager: Arc<MetricsManager>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
+        let snapshot_db_id = snapshot_db_id.into();
         Self::open_internal(
             config,
             snapshot_id,
