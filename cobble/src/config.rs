@@ -1126,4 +1126,20 @@ mod tests {
         assert!(unknown.contains(&"reader.unknown_nested".to_string()));
         assert!(unknown.contains(&"volumes[0].unknown_volume_key".to_string()));
     }
+
+    #[test]
+    fn test_template_config_yaml_is_valid() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../template/config.yaml");
+        let parsed = Config::from_path(path).expect("template/config.yaml should be valid");
+        assert_eq!(parsed.total_buckets, 1);
+        assert_eq!(parsed.memtable_type, MemtableType::Hash);
+        assert_eq!(parsed.data_file_type, DataFileType::SSTable);
+        assert_eq!(
+            parsed.primary_volume_offload_policy,
+            PrimaryVolumeOffloadPolicyKind::Priority
+        );
+        assert_eq!(parsed.volumes.len(), 1);
+        assert!(parsed.volumes[0].supports(VolumeUsageKind::PrimaryDataPriorityHigh));
+        assert!(parsed.volumes[0].supports(VolumeUsageKind::Meta));
+    }
 }

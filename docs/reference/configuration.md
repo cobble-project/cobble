@@ -14,6 +14,8 @@ The main `Config` struct. Can be created programmatically or loaded from a file 
 
 Supported file formats: YAML (`.yaml`/`.yml`), JSON (`.json`), TOML (`.toml`), INI (`.ini`).
 
+A useful template would be (take care of the code version): https://github.com/cobble-project/cobble/blob/main/template/config.yaml
+
 ### Storage Feature Flags (OpenDAL)
 
 Cobble exposes a focused set of optional OpenDAL backend features.

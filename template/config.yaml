@@ -1,0 +1,115 @@
+# Cobble Config template
+# Source of truth: cobble/src/config.rs (Config, VolumeDescriptor, ReaderConfigEntry).
+# This template keeps all current fields and default values, with detailed comments.
+
+# Storage volume list. Each item maps to `VolumeDescriptor`.
+volumes:
+  - # Base storage URL (supports file://, s3://, oss://, etc.).
+    # Local file:// is always available without extra Cargo features.
+    base_dir: "file:///tmp/cobble"
+
+    # Optional remote auth fields. `null` means unset.
+    access_id: null
+    secret_key: null
+
+    # Optional volume capacity limit in bytes.
+    # When set, Cobble uses it for write-stop/offload pressure control.
+    size_limit: null
+
+    # Optional backend-specific initialization options passed to OpenDAL.
+    # Example (S3-compatible endpoint):
+    # custom_options:
+    #   endpoint: "http://127.0.0.1:9000"
+    #   region: "us-east-1"
+    custom_options: null
+
+    # Volume usage kinds (string list or bitmask are both accepted by parser).
+    # Valid items:
+    # - meta
+    # - primary_data_priority_high
+    # - primary_data_priority_medium
+    # - primary_data_priority_low
+    # - snapshot
+    # - cache
+    # - readonly
+    kinds:
+      - primary_data_priority_high
+      - meta
+
+# Memtable settings.
+memtable_capacity: 67108864              # 64 MiB
+memtable_buffer_count: 2                 # active + immutable buffers
+memtable_type: hash                      # hash | skiplist | vec
+
+# Value schema / shard-bucket settings.
+num_columns: 1
+total_buckets: 1                         # valid range: 1..=65536
+
+# LSM shape and write-stall policy.
+l0_file_limit: 4
+write_stall_limit: null                  # null => auto: min(l0 + 4, l0 * 2)
+l1_base_bytes: 67108864                  # 64 MiB
+level_size_multiplier: 10
+max_level: 6
+
+# Compaction strategy and remote-compaction network settings.
+compaction_policy: round_robin           # round_robin | min_overlap
+compaction_read_ahead_enabled: true
+compaction_remote_addr: null             # "host:port" to enable remote compaction
+compaction_threads: 4
+compaction_remote_timeout_ms: 300000
+compaction_server_max_concurrent: 4
+compaction_server_max_queued: 64
+
+# Block cache.
+block_cache_size: 67108864               # 64 MiB (0 means disabled)
+block_cache_hybrid_enabled: false        # memory + local disk (foyer hybrid cache)
+block_cache_hybrid_disk_size: null       # null => fallback to block_cache_size
+
+# Reader-specific defaults (`ReaderConfigEntry`).
+reader:
+  pin_partition_in_memory_count: 1
+  block_cache_size: 536870912            # 512 MiB
+  reload_tolerance_seconds: 10
+
+# Flush/compaction output file format.
+base_file_size: 67108864                 # 64 MiB target output size
+sst_bloom_filter_enabled: false
+sst_bloom_bits_per_key: 10
+sst_partitioned_index: false
+data_file_type: sst                      # sst | parquet
+parquet_row_group_size_bytes: 262144     # 256 KiB
+
+# SST level compression.
+# Values: none | lz4
+sst_compression_by_level:
+  - none
+  - none
+  - lz4
+
+# TTL and clock source.
+ttl_enabled: false
+default_ttl_seconds: null
+time_provider: system                    # system | manual
+
+# Logging.
+log_path: null                           # local path only
+log_console: false
+log_level: INFO                          # OFF | ERROR | WARN | INFO | DEBUG | TRACE
+
+# Snapshot behavior.
+snapshot_on_flush: false
+active_memtable_incremental_snapshot_ratio: 0.0
+snapshot_retention: null                 # keep newest N snapshots; null disables auto-expire
+
+# Optional LSM split trigger (null disables split logic).
+lsm_split_trigger_level: null
+
+# Primary-volume pressure/offload behavior.
+primary_volume_write_stop_watermark: 0.95
+primary_volume_offload_trigger_watermark: 0.85
+primary_volume_offload_policy: priority  # priority | largest_file
+
+# Value-log separation threshold.
+# `18446744073709551615` == usize::MAX on 64-bit platforms (default = effectively disabled).
+value_separation_threshold: 18446744073709551615
