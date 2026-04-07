@@ -1,6 +1,8 @@
 # cobble-web-monitor
 
 `cobble-web-monitor` provides an embedded HTTP monitor server for Cobble DB instances.
+Cobble is a embedded versioned key-value store with multi-layer architecture, and the web monitor allows you to inspect snapshots and keys through a browser UI.
+This crate provides a lib for starting the monitor server from Rust code, and also a CLI entry point via [`cobble-cli`](https://crates.io/crates/cobble-cli).
 
 ## Frontend SPA
 
@@ -59,4 +61,5 @@ cargo run --bin cobble-cli -- web-monitor --config ./cobble-monitor-test-config.
 ## Docs
 
 - Project docs: https://cobble-project.github.io/cobble/latest/
+- Web monitor docs: https://cobble-project.github.io/cobble/latest/tools/web-monitor.html
 - Repository: https://github.com/cobble-project/cobble

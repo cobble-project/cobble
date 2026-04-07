@@ -1,6 +1,6 @@
 # cobble-cli
 
-`cobble-cli` contains command-line tools for operating Cobble services.
+`cobble-cli` contains command-line tools for operating Cobble, which is a embedded versioned key-value store with multi-layer architecture. The CLI provides commands for running remote compaction workers and the web monitor service.
 
 ## Install
 
@@ -21,4 +21,5 @@ cobble-cli web-monitor --config ./config.yaml --bind 127.0.0.1:8080
 ## Docs
 
 - Project docs: https://cobble-project.github.io/cobble/latest/
+- CLI docs: https://cobble-project.github.io/cobble/latest/tools/cli.html
 - Repository: https://github.com/cobble-project/cobble

@@ -39,3 +39,4 @@ Thus, it really fits the needs of modern distributed systems that require a vers
 | [**Architecture**](architecture/) | Internal design, data structures, and algorithms |
 | [**Reference**](reference/) | Complete configuration reference and API documentation |
 | [**FFI Bindings**](ffi-bindings/) | Using Cobble from other languages (Java, …) |
+| [**Tools**](tools/) | Operational tooling: CLI commands and Web Monitor |
