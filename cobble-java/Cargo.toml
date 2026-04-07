@@ -9,6 +9,10 @@ publish = false
 name = "cobblejni"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+storage-all = ["cobble/storage-all"]
+
 [dependencies]
 cobble = { workspace = true }
 cobble-data-structure = { workspace = true }

@@ -3,6 +3,7 @@ use crate::file::file_system::FileSystem;
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
 use bytes::Bytes;
 use positioned_io::ReadAt;
+use std::collections::HashMap;
 use std::fs::{File as StdFile, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,12 @@ impl PosixFileSystem {
 }
 
 impl FileSystem for PosixFileSystem {
-    fn init(_url: &Url, _access_id: Option<String>, _access_key: Option<String>) -> Result<Self> {
+    fn init(
+        _url: &Url,
+        _access_id: Option<String>,
+        _access_key: Option<String>,
+        _custom_options: Option<HashMap<String, String>>,
+    ) -> Result<Self> {
         Ok(Self {
             root: Path::new(_url.path()).to_path_buf(),
         })
@@ -275,7 +281,7 @@ mod tests {
     #[cfg(unix)]
     fn test_posix_fs_basic() {
         cleanup_test_root();
-        let fs = PosixFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None).unwrap();
+        let fs = PosixFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None).unwrap();
         assert!(!fs.exists("example").unwrap());
         fs.create_dir("example").unwrap();
         assert!(fs.exists("example").unwrap());
@@ -292,7 +298,7 @@ mod tests {
     #[cfg(unix)]
     fn test_posix_fs_read_write_and_mtime() {
         cleanup_test_root();
-        let fs = PosixFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None).unwrap();
+        let fs = PosixFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None).unwrap();
         assert_eq!(fs.last_modified("example").unwrap(), None);
         let data = b"Hello, Cobble!";
         {
@@ -316,7 +322,7 @@ mod tests {
     #[cfg(unix)]
     fn test_posix_fs_list() {
         cleanup_test_root();
-        let fs = PosixFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None).unwrap();
+        let fs = PosixFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None).unwrap();
         fs.create_dir("list/subdir").unwrap();
         {
             let mut writer = fs.open_write("list/a.txt").unwrap();

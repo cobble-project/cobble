@@ -123,6 +123,8 @@ If you want to customize your java APIs, you can compile by yourself. The Java b
 1. **Native library** (Rust → shared library via `cdylib`)
 2. **Java API** (Maven project with JNI wrappers)
 
+Java native build commands use `--features storage-all` on `cobble-java` (which forwards to `cobble/storage-all`), so Java artifacts include all Cobble optional OpenDAL backend features (`alluxio`, `cos`, `oss`, `s3`, `ftp`, `hdfs`, `sftp`).
+
 ```bash
 # Local debug build (current platform only, includes debug + release JNI libs)
 cd cobble-java/java

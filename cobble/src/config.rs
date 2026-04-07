@@ -8,6 +8,7 @@ use log::warn;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use toml::Value as TomlValue;
 use url::Url;
@@ -147,6 +148,8 @@ pub struct VolumeDescriptor {
     pub secret_key: Option<String>,
     /// Optional size limit for the volume in bytes.
     pub size_limit: Option<u64>,
+    /// Optional custom key-value options for backend-specific initialization.
+    pub custom_options: Option<HashMap<String, String>>,
     /// Usage kinds supported by the volume (bitmask of VolumeUsageKind).
     #[serde(deserialize_with = "deserialize_volume_kinds")]
     pub kinds: u8,
@@ -159,6 +162,7 @@ impl VolumeDescriptor {
             access_id: None,
             secret_key: None,
             size_limit: None,
+            custom_options: None,
             kinds: 0,
         };
         for kind in kinds {
@@ -816,14 +820,23 @@ mod tests {
 
     #[test]
     fn test_config_from_file_round_trip() {
+        let mut volume = VolumeDescriptor::new(
+            "file:///tmp/cobble".to_string(),
+            vec![
+                VolumeUsageKind::PrimaryDataPriorityHigh,
+                VolumeUsageKind::Meta,
+            ],
+        );
+        volume.custom_options = Some(
+            [
+                ("endpoint".to_string(), "http://127.0.0.1:9000".to_string()),
+                ("region".to_string(), "us-east-1".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
         let config = Config {
-            volumes: vec![VolumeDescriptor::new(
-                "file:///tmp/cobble".to_string(),
-                vec![
-                    VolumeUsageKind::PrimaryDataPriorityHigh,
-                    VolumeUsageKind::Meta,
-                ],
-            )],
+            volumes: vec![volume],
             memtable_capacity: 1024,
             memtable_buffer_count: 3,
             memtable_type: MemtableType::Vec,
@@ -890,6 +903,13 @@ mod tests {
         assert_eq!(decoded.volumes.len(), 1);
         assert!(decoded.volumes[0].supports(VolumeUsageKind::PrimaryDataPriorityHigh));
         assert!(decoded.volumes[0].supports(VolumeUsageKind::Meta));
+        assert_eq!(
+            decoded.volumes[0]
+                .custom_options
+                .as_ref()
+                .and_then(|v| v.get("endpoint")),
+            Some(&"http://127.0.0.1:9000".to_string())
+        );
         assert_eq!(decoded.memtable_capacity, 1024);
         assert_eq!(decoded.memtable_type, MemtableType::Vec);
         assert_eq!(decoded.total_buckets, 1024);

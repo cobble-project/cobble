@@ -29,6 +29,35 @@ We list some of Cobble's key features below, they are either implemented or are 
 - **Merge Operators**: Support for user-defined merge operations on values. Efficiently handle updates without reading existing values.
 - **Multi-language Bindings**: Now java-binding supported. Planned support for C, C++, Python and Go bindings.
 
+## Install
+
+Add `cobble` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+cobble = "0.1.0"
+```
+
+Cobble uses Apache OpenDAL for volume backends.
+
+The local `file://` backend is always enabled by default and does not require any Cargo feature.
+Optional remote/storage-service features exposed by Cobble are:
+
+- `storage-alluxio`
+- `storage-cos`
+- `storage-oss`
+- `storage-s3`
+- `storage-ftp`
+- `storage-hdfs`
+- `storage-sftp`
+
+```toml
+[dependencies]
+cobble = { version = "0.1.0", default-features = false, features = ["storage-s3"] }
+```
+
+- Enable all optional remote/storage-service backends: `storage-all`
+
 ## Getting Started
 
 Cobble usage can be viewed as **step 0 + five patterns**.

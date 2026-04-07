@@ -8,6 +8,7 @@ import com.google.gson.annotations.SerializedName;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Java-side config mapped to Rust {@code cobble::Config}.
@@ -205,6 +206,9 @@ public final class Config {
 
         /** Usage kinds supported by this volume. */
         public List<VolumeUsageKind> kinds;
+
+        /** Optional backend-specific initialization options. */
+        public Map<String, String> customOptions;
 
         public static VolumeDescriptor singleVolume(String baseDir) {
             VolumeDescriptor descriptor = new VolumeDescriptor();

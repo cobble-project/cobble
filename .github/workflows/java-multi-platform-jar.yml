@@ -67,11 +67,11 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
-            cargo zigbuild -p cobble-java --target "${{ matrix.target }}"
-            cargo zigbuild -p cobble-java --target "${{ matrix.target }}" --release
+            cargo zigbuild -p cobble-java --features storage-all --target "${{ matrix.target }}"
+            cargo zigbuild -p cobble-java --features storage-all --target "${{ matrix.target }}" --release
           else
-            cargo build -p cobble-java --target "${{ matrix.target }}"
-            cargo build -p cobble-java --target "${{ matrix.target }}" --release
+            cargo build -p cobble-java --features storage-all --target "${{ matrix.target }}"
+            cargo build -p cobble-java --features storage-all --target "${{ matrix.target }}" --release
           fi
 
       - name: Stage native artifact
