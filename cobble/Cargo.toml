@@ -10,6 +10,25 @@ homepage.workspace = true
 keywords = ["kv", "lsm", "storage"]
 categories = ["database-implementations"]
 
+[features]
+default = []
+storage-all = [
+    "storage-alluxio",
+    "storage-cos",
+    "storage-ftp",
+    "storage-hdfs",
+    "storage-oss",
+    "storage-s3",
+    "storage-sftp",
+]
+storage-alluxio = ["opendal/services-alluxio"]
+storage-cos = ["opendal/services-cos"]
+storage-ftp = ["opendal/services-ftp"]
+storage-hdfs = ["opendal/services-hdfs"]
+storage-oss = ["opendal/services-oss"]
+storage-s3 = ["opendal/services-s3"]
+storage-sftp = ["opendal/services-sftp"]
+
 [dependencies]
 bytes = { workspace = true }
 arc-swap = "1.7.1"
@@ -18,7 +37,7 @@ foyer = "0.22.3"
 log = { workspace = true, features = ["serde"] }
 log4rs = "1.3.0"
 metrics = "0.22.3"
-opendal = { version = "0.54.0", features = ["services-fs", "services-oss", "services-s3"] }
+opendal = { version = "0.54.0", default-features = false, features = ["services-fs"] }
 rand = "0.8.5"
 serial_test = { workspace = true }
 thiserror = { workspace = true }

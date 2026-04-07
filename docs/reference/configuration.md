@@ -14,6 +14,25 @@ The main `Config` struct. Can be created programmatically or loaded from a file 
 
 Supported file formats: YAML (`.yaml`/`.yml`), JSON (`.json`), TOML (`.toml`), INI (`.ini`).
 
+### Storage Feature Flags (OpenDAL)
+
+Cobble exposes a focused set of optional OpenDAL backend features.
+
+- Local `file://` is always enabled (no feature required)
+- Enable all optional backends: `storage-all`
+
+Optional feature mapping:
+
+| Cobble Feature | OpenDAL Service |
+|---|---|
+| `storage-alluxio` | `services-alluxio` |
+| `storage-cos` | `services-cos` |
+| `storage-ftp` | `services-ftp` |
+| `storage-hdfs` | `services-hdfs` |
+| `storage-oss` | `services-oss` |
+| `storage-s3` | `services-s3` |
+| `storage-sftp` | `services-sftp` |
+
 ### Storage
 
 | Parameter | Type | Default | Description |
@@ -149,6 +168,7 @@ Describes a storage volume.
 | `access_id` | `Option<String>` | `None` | Access ID for remote storage |
 | `secret_key` | `Option<String>` | `None` | Secret key for remote storage |
 | `size_limit` | `Option<u64>` | `None` | Maximum volume size in bytes |
+| `custom_options` | `Option<HashMap<String, String>>` | `None` | Backend-specific initialization options passed to OpenDAL |
 | `kinds` | `u8` | 0 | Bitmask of `VolumeUsageKind` values |
 
 ### VolumeUsageKind

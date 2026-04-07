@@ -29,6 +29,8 @@ Cobble abstracts file I/O behind a filesystem interface, supporting multiple bac
 
 This abstraction means the same `Db` instance can read files from local disk and cloud storage simultaneously — for example, hot data on a local SSD and cold data offloaded to S3.
 
+> Storage schemes are feature-gated. Local `file://` is always available. For non-default backends, enable the corresponding feature (for example, `storage-s3`, `storage-oss`, `storage-cos`, `storage-sftp`, etc.; or `storage-all`).
+
 For details on configuring multiple volumes with different backends, see [Multi-Volume Storage](multi-volume).
 
 ## Reader Cache

@@ -6,11 +6,17 @@ use crate::file::opendal_fs::OpendalFileSystem;
 use crate::file::posix_fs::PosixFileSystem;
 use crate::util::normalize_storage_path_to_url;
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
 pub trait FileSystem: Send + Sync {
-    fn init(url: &Url, access_id: Option<String>, access_key: Option<String>) -> Result<Self>
+    fn init(
+        url: &Url,
+        access_id: Option<String>,
+        access_key: Option<String>,
+        custom_options: Option<HashMap<String, String>>,
+    ) -> Result<Self>
     where
         Self: Sized;
 
@@ -54,12 +60,12 @@ impl FileSystemRegistry {
 
         #[cfg(unix)]
         if url.scheme().eq_ignore_ascii_case("file") {
-            let fs: Arc<dyn FileSystem> = Arc::new(PosixFileSystem::init(&url, None, None)?);
+            let fs: Arc<dyn FileSystem> = Arc::new(PosixFileSystem::init(&url, None, None, None)?);
             self.registered.insert(name.clone(), Arc::clone(&fs));
             return Ok(fs);
         }
 
-        let fs: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::init(&url, None, None)?);
+        let fs: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::init(&url, None, None, None)?);
         self.registered.insert(name.clone(), Arc::clone(&fs));
         Ok(fs)
     }
@@ -78,6 +84,7 @@ impl FileSystemRegistry {
                 &url,
                 volume.access_id.clone(),
                 volume.secret_key.clone(),
+                volume.custom_options.clone(),
             )?);
             self.registered.insert(name.clone(), Arc::clone(&fs));
             return Ok(fs);
@@ -87,6 +94,7 @@ impl FileSystemRegistry {
             &url,
             volume.access_id.clone(),
             volume.secret_key.clone(),
+            volume.custom_options.clone(),
         )?);
         self.registered.insert(name.clone(), Arc::clone(&fs));
         Ok(fs)

@@ -14,12 +14,23 @@ pub struct OpendalFileSystem {
 }
 
 impl FileSystem for OpendalFileSystem {
-    fn init(url: &Url, access_id: Option<String>, access_key: Option<String>) -> Result<Self> {
+    fn init(
+        url: &Url,
+        access_id: Option<String>,
+        access_key: Option<String>,
+        custom_options: Option<HashMap<String, String>>,
+    ) -> Result<Self> {
         let scheme = Scheme::from_str(match url.scheme().to_lowercase().as_str() {
             "file" => "fs",
             other => other,
         })
-        .map_err(|e| Error::FileSystemError(format!("Unsupported scheme: {}", e)))?;
+        .map_err(|e| {
+            Error::FileSystemError(format!(
+                "Unsupported scheme '{}': {}. Enable the matching cobble storage feature (for example: storage-s3, storage-oss, storage-cos, storage-alluxio).",
+                url.scheme(),
+                e
+            ))
+        })?;
         // other options from url
         let mut options: HashMap<String, String> = HashMap::new();
         match scheme {
@@ -40,6 +51,9 @@ impl FileSystem for OpendalFileSystem {
                 options.insert("bucket".to_string(), bucket.to_string());
                 options.insert("root".to_string(), url.path().to_string());
             }
+        }
+        if let Some(custom_options) = custom_options {
+            options.extend(custom_options);
         }
         let op = Operator::via_iter(scheme, options).map_err(|e| {
             Error::FileSystemError(format!("Failed to create opendal operator: {}", e))
@@ -177,7 +191,7 @@ mod test {
     #[serial_test::serial(file)]
     fn test_opendal_fs_basic() {
         cleanup_test_root();
-        let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None);
+        let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None);
         assert!(fs.is_ok());
         let fs = fs.unwrap();
         assert!(!fs.exists("example").unwrap());
@@ -192,7 +206,7 @@ mod test {
     #[serial_test::serial(file)]
     fn test_opendal_read_write() {
         cleanup_test_root();
-        let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None);
+        let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None);
         assert!(fs.is_ok());
         let fs = fs.unwrap();
         assert!(!fs.exists("example").unwrap());
@@ -215,7 +229,8 @@ mod test {
     #[serial_test::serial(file)]
     fn test_opendal_fs_list() {
         cleanup_test_root();
-        let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None).unwrap();
+        let fs =
+            OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None).unwrap();
         fs.create_dir("list/subdir").unwrap();
         {
             let mut writer = fs.open_write("list/a.txt").unwrap();

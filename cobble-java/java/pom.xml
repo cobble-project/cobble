@@ -76,6 +76,8 @@
                 <argument>build</argument>
                 <argument>-p</argument>
                 <argument>cobble-java</argument>
+                <argument>--features</argument>
+                <argument>storage-all</argument>
               </arguments>
             </configuration>
           </execution>
@@ -90,6 +92,8 @@
                 <argument>build</argument>
                 <argument>-p</argument>
                 <argument>cobble-java</argument>
+                <argument>--features</argument>
+                <argument>storage-all</argument>
                 <argument>--release</argument>
               </arguments>
             </configuration>

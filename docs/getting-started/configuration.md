@@ -8,6 +8,23 @@ nav_order: 2
 
 Before opening any database, you must create a `Config` and define at least one storage volume.
 
+## Storage Feature Flags
+
+Cobble storage backends are provided by Apache OpenDAL and are gated by Cargo features.
+
+- Local `file://` is always enabled (no feature required)
+- Optional feature set: `storage-alluxio`, `storage-cos`, `storage-oss`, `storage-s3`, `storage-ftp`, `storage-hdfs`, `storage-sftp`
+- Enable all optional backends: `storage-all`
+
+Example:
+
+```toml
+[dependencies]
+cobble = { version = "0.1.0", default-features = false, features = ["storage-s3"] }
+```
+
+If a volume URL uses a scheme whose feature is not enabled, Cobble will fail to initialize that volume.
+
 ## Volume Categories
 
 Cobble organizes storage into **volumes**, each tagged with one or more usage kinds:
