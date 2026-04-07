@@ -29,6 +29,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 config = { version = "0.15.19", features = ["yaml", "ini"] }
 serde_yaml = "0.9.34"
+toml = "0.9.8"
 tempfile = "3.20.0"
 lz4_flex = { version = "0.13.0", default-features = false }
 parquet = "58.0.0"
