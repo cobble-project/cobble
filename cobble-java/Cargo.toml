@@ -11,7 +11,22 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-storage-all = ["cobble/storage-all"]
+storage-all = [
+    "storage-alluxio",
+    "storage-cos",
+    "storage-ftp",
+    "storage-hdfs",
+    "storage-oss",
+    "storage-s3",
+    "storage-sftp",
+]
+storage-alluxio = ["cobble/storage-alluxio", "cobble-data-structure/storage-alluxio"]
+storage-cos = ["cobble/storage-cos", "cobble-data-structure/storage-cos"]
+storage-ftp = ["cobble/storage-ftp", "cobble-data-structure/storage-ftp"]
+storage-hdfs = ["cobble/storage-hdfs", "cobble-data-structure/storage-hdfs"]
+storage-oss = ["cobble/storage-oss", "cobble-data-structure/storage-oss"]
+storage-s3 = ["cobble/storage-s3", "cobble-data-structure/storage-s3"]
+storage-sftp = ["cobble/storage-sftp", "cobble-data-structure/storage-sftp"]
 
 [dependencies]
 cobble = { workspace = true }

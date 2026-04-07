@@ -15,6 +15,7 @@ Cobble storage backends are provided by Apache OpenDAL and are gated by Cargo fe
 - Local `file://` is always enabled (no feature required)
 - Optional feature set: `storage-alluxio`, `storage-cos`, `storage-oss`, `storage-s3`, `storage-ftp`, `storage-hdfs`, `storage-sftp`
 - Enable all optional backends: `storage-all`
+- Crates that depend on `cobble` in this workspace also expose the same `storage-*` features and forward them to `cobble`, so you can enable backend features from those crates as well.
 
 Example:
 

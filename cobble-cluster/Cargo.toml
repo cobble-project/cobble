@@ -5,6 +5,25 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+storage-all = [
+    "storage-alluxio",
+    "storage-cos",
+    "storage-ftp",
+    "storage-hdfs",
+    "storage-oss",
+    "storage-s3",
+    "storage-sftp",
+]
+storage-alluxio = ["cobble/storage-alluxio"]
+storage-cos = ["cobble/storage-cos"]
+storage-ftp = ["cobble/storage-ftp"]
+storage-hdfs = ["cobble/storage-hdfs"]
+storage-oss = ["cobble/storage-oss"]
+storage-s3 = ["cobble/storage-s3"]
+storage-sftp = ["cobble/storage-sftp"]
+
 [dependencies]
 cobble = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

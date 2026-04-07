@@ -57,6 +57,7 @@ cobble = { version = "0.1.0", default-features = false, features = ["storage-s3"
 ```
 
 - Enable all optional remote/storage-service backends: `storage-all`
+- Crates that depend on `cobble` in this workspace (for example `cobble-cli`, `cobble-web-monitor`, `cobble-cluster`, `cobble-bench`, `cobble-data-structure`, `cobble-java`) also re-expose the same `storage-*` feature names and forward them to `cobble`.
 
 ## Getting Started
 
