@@ -22,6 +22,7 @@ Cobble exposes a focused set of optional OpenDAL backend features.
 
 - Local `file://` is always enabled (no feature required)
 - Enable all optional backends: `storage-all`
+- Workspace crates that depend on `cobble` (`cobble-cli`, `cobble-web-monitor`, `cobble-cluster`, `cobble-bench`, `cobble-data-structure`, `cobble-java`) re-expose and forward the same `storage-*` features.
 
 Optional feature mapping:
 

@@ -2,6 +2,12 @@
 
 `cobble-cli` contains command-line tools for operating Cobble, which is a embedded versioned key-value store with multi-layer architecture. The CLI provides commands for running remote compaction workers and the web monitor service.
 
+## Storage backend features
+
+`cobble-cli` re-exposes `storage-*` features and forwards them to dependent Cobble crates.
+For the full feature list and usage examples, refer to `cobble`:
+https://crates.io/crates/cobble
+
 ## Install
 
 ```bash

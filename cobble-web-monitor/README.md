@@ -4,6 +4,12 @@
 Cobble is a embedded versioned key-value store with multi-layer architecture, and the web monitor allows you to inspect snapshots and keys through a browser UI.
 This crate provides a lib for starting the monitor server from Rust code, and also a CLI entry point via [`cobble-cli`](https://crates.io/crates/cobble-cli).
 
+## Storage backend features
+
+`cobble-web-monitor` re-exposes `storage-*` features and forwards them to `cobble`.
+For the full feature list and usage examples, refer to `cobble`:
+https://crates.io/crates/cobble
+
 ## Frontend SPA
 
 A Vue 3 + Vite + Tailwind single-page app is located at `cobble-web-monitor/web-ui`.
