@@ -7,6 +7,7 @@ use cobble::{Config, DbIterator, Result, ScanOptions, ScanSplit, ScanSplitScanne
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString, JValue};
 use jni::sys::{jint, jlong, jobject};
+use size::Size;
 use std::sync::OnceLock;
 
 const DEFAULT_SCAN_BATCH_SIZE: usize = 256;
@@ -265,7 +266,7 @@ pub extern "system" fn Java_io_cobble_ScanOptions_setReadAheadBytes(
         );
         return;
     }
-    scan_options.scan_options.read_ahead_bytes = read_ahead_bytes as usize;
+    scan_options.scan_options.read_ahead_bytes = Size::from_const(read_ahead_bytes as i64);
 }
 
 #[unsafe(no_mangle)]

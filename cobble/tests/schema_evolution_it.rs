@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::{CompactionPolicyKind, Config, Db, MetricValue, ReadOptions, VolumeDescriptor};
+use size::Size;
 use std::path::Path;
 
 const BASE_KEYS: usize = 6000;
@@ -71,17 +72,17 @@ fn new_col1(i: usize) -> Vec<u8> {
 fn open_configured_db(root: &str) -> Db {
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 8 * 1024,
+        memtable_capacity: Size::from_kib(8),
         memtable_buffer_count: 2,
         num_columns: 1,
         l0_file_limit: 2,
         write_stall_limit: None,
-        l1_base_bytes: 64 * 1024,
+        l1_base_bytes: Size::from_kib(64),
         level_size_multiplier: 2,
         max_level: 4,
         compaction_policy: CompactionPolicyKind::RoundRobin,
-        base_file_size: 32 * 1024,
-        block_cache_size: 0,
+        base_file_size: Size::from_kib(32),
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };

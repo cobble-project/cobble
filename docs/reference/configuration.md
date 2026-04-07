@@ -35,6 +35,15 @@ Optional feature mapping:
 | `storage-s3` | `services-s3` |
 | `storage-sftp` | `services-sftp` |
 
+### Size Value Format
+
+Size-related entries (cache size, memtable size, file size, thresholds, etc.) support:
+
+- raw bytes (`67108864`)
+- unit strings (`"64MB"`, `"64MiB"`)
+
+Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, `PiB`.
+
 ### Storage
 
 | Parameter | Type | Default | Description |
@@ -46,7 +55,7 @@ Optional feature mapping:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `memtable_capacity` | `usize` | 67,108,864 (64 MB) | Max memtable size in bytes before flush |
+| `memtable_capacity` | `Size` | `64MiB` | Max memtable size before flush |
 | `memtable_buffer_count` | `usize` | 2 | Number of memtable buffers (active + immutable) |
 | `memtable_type` | `MemtableType` | `Hash` | Implementation: `Hash`, `Skiplist`, `Vec` |
 
@@ -56,7 +65,7 @@ Optional feature mapping:
 |-----------|------|---------|-------------|
 | `l0_file_limit` | `usize` | 4 | L0 file count that triggers compaction |
 | `write_stall_limit` | `Option<usize>` | `None` | Max immutable+L0 files before stall. Auto: `min(l0+4, l0×2)` |
-| `l1_base_bytes` | `usize` | 67,108,864 (64 MB) | Target size for level 1 |
+| `l1_base_bytes` | `Size` | `64MiB` | Target size for level 1 |
 | `level_size_multiplier` | `usize` | 10 | Size multiplier per level |
 | `max_level` | `u8` | 6 | Maximum number of LSM levels |
 
@@ -64,7 +73,7 @@ Optional feature mapping:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `base_file_size` | `usize` | 67,108,864 (64 MB) | Target output file size |
+| `base_file_size` | `Size` | `64MiB` | Target output file size |
 | `sst_bloom_filter_enabled` | `bool` | `false` | Enable bloom filter per SST file |
 | `sst_bloom_bits_per_key` | `u32` | 10 | Bits per key for bloom filter |
 | `sst_partitioned_index` | `bool` | `false` | Enable two-level partitioned index |
@@ -74,15 +83,15 @@ Optional feature mapping:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `parquet_row_group_size_bytes` | `usize` | 262,144 (256 KB) | Row group size in bytes |
+| `parquet_row_group_size_bytes` | `Size` | `256KiB` | Row group size |
 
 ### Block Cache
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `block_cache_size` | `usize` | 67,108,864 (64 MB) | In-memory cache size (0 = disabled) |
+| `block_cache_size` | `Size` | `64MiB` | In-memory cache size (`0` also disables cache) |
 | `block_cache_hybrid_enabled` | `bool` | `false` | Enable memory + disk hybrid cache |
-| `block_cache_hybrid_disk_size` | `Option<usize>` | `None` | Disk tier capacity (defaults to memory size) |
+| `block_cache_hybrid_disk_size` | `Option<Size>` | `None` | Disk tier capacity (defaults to memory size) |
 
 ### Compaction
 
@@ -100,7 +109,7 @@ Optional feature mapping:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `value_separation_threshold` | `usize` | `usize::MAX` | Byte threshold for VLOG separation (MAX = disabled) |
+| `value_separation_threshold` | `Option<Size>` | `None` | Byte threshold for VLOG separation (`None` = disabled) |
 
 ### TTL
 
@@ -169,7 +178,7 @@ Describes a storage volume.
 | `base_dir` | `String` | (required) | Base directory URL (`file://`, `s3://`, etc.) |
 | `access_id` | `Option<String>` | `None` | Access ID for remote storage |
 | `secret_key` | `Option<String>` | `None` | Secret key for remote storage |
-| `size_limit` | `Option<u64>` | `None` | Maximum volume size in bytes |
+| `size_limit` | `Option<Size>` | `None` | Maximum volume size |
 | `custom_options` | `Option<HashMap<String, String>>` | `None` | Backend-specific initialization options passed to OpenDAL |
 | `kinds` | `u8` | 0 | Bitmask of `VolumeUsageKind` values |
 
@@ -212,7 +221,7 @@ Options for scan operations.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `read_ahead_bytes` | `usize` | 0 | Read-ahead buffer size (0 = disabled) |
+| `read_ahead_bytes` | `Size` | `0` | Read-ahead buffer size (`0` disables read-ahead) |
 | `column_indices` | `Option<Vec<usize>>` | `None` | Column projection |
 
 ---
@@ -234,7 +243,7 @@ Configuration for the read proxy.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `pin_partition_in_memory_count` | `usize` | 1 | Partition snapshots pinned in memory |
-| `block_cache_size` | `usize` | 536,870,912 (512 MB) | Reader block cache size |
+| `block_cache_size` | `Size` | `512MiB` | Reader block cache size |
 | `reload_tolerance_seconds` | `u64` | 10 | Min interval between snapshot reload checks |
 
 ---

@@ -18,6 +18,7 @@ use crate::{Config, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, VolumeDesc
 use bytes::Bytes;
 use log::info;
 use serde_json::Error as SerdeError;
+use size::Size;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,9 +29,9 @@ pub struct ReaderConfig {
     pub volumes: Vec<VolumeDescriptor>,
     pub total_buckets: u32,
     pub pin_partition_in_memory_count: usize,
-    pub block_cache_size: usize,
+    pub block_cache_size: Size,
     pub block_cache_hybrid_enabled: bool,
-    pub block_cache_hybrid_disk_size: Option<usize>,
+    pub block_cache_hybrid_disk_size: Option<Size>,
     pub reload_tolerance: Duration,
 }
 
@@ -41,7 +42,7 @@ impl Default for ReaderConfig {
             volumes: VolumeDescriptor::single_volume("file:///tmp/"),
             total_buckets: default_config.total_buckets,
             pin_partition_in_memory_count: 1,
-            block_cache_size: 512 * 1024 * 1024,
+            block_cache_size: Size::from_mib(512),
             block_cache_hybrid_enabled: default_config.block_cache_hybrid_enabled,
             block_cache_hybrid_disk_size: default_config.block_cache_hybrid_disk_size,
             reload_tolerance: Duration::from_secs(10),
@@ -106,6 +107,9 @@ impl Reader {
         global_snapshot_id: u64,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
+        let block_cache_size =
+            crate::util::size_to_usize("reader.block_cache_size", read_config.block_cache_size)
+                .map_err(Error::ConfigError)?;
         let config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
@@ -134,11 +138,11 @@ impl Reader {
         let global_snapshot = load_global_snapshot_by_name(&fs, &manifest_name)?;
         let bucket_map = build_bucket_map(&global_snapshot)?;
         let db_id = Uuid::new_v4().to_string();
-        let block_cache = if read_config.block_cache_size > 0 {
+        let block_cache = if block_cache_size > 0 {
             Some(new_block_cache_with_config(
                 &config,
                 &db_id,
-                read_config.block_cache_size,
+                block_cache_size,
                 None,
             )?)
         } else {
@@ -172,6 +176,9 @@ impl Reader {
         read_config: ReaderConfig,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
+        let block_cache_size =
+            crate::util::size_to_usize("reader.block_cache_size", read_config.block_cache_size)
+                .map_err(Error::ConfigError)?;
         let config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
@@ -201,11 +208,11 @@ impl Reader {
         let global_snapshot = load_global_snapshot_by_name(&fs, &pointer)?;
         let bucket_map = build_bucket_map(&global_snapshot)?;
         let db_id = Uuid::new_v4().to_string();
-        let block_cache = if read_config.block_cache_size > 0 {
+        let block_cache = if block_cache_size > 0 {
             Some(new_block_cache_with_config(
                 &config,
                 &db_id,
-                read_config.block_cache_size,
+                block_cache_size,
                 None,
             )?)
         } else {

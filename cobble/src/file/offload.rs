@@ -653,6 +653,7 @@ mod tests {
         File, FileSystemRegistry, RandomAccessFile, SequentialWriteFile, test_utils,
     };
     use crate::{Config, MetricsManager, VolumeUsageKind};
+    use size::Size;
 
     fn pressure(rank: u8) -> VolumePressure {
         VolumePressure {
@@ -1017,12 +1018,12 @@ mod tests {
         let low_fs = registry.get_or_register(low_url.clone()).unwrap();
         let mut high =
             crate::VolumeDescriptor::new(high_url, vec![VolumeUsageKind::PrimaryDataPriorityHigh]);
-        high.size_limit = Some(1024);
+        high.size_limit = Some(Size::from_kib(1));
         let low =
             crate::VolumeDescriptor::new(low_url, vec![VolumeUsageKind::PrimaryDataPriorityLow]);
         let config = Config {
             volumes: vec![high, low],
-            base_file_size: 64,
+            base_file_size: Size::from_const(64),
             primary_volume_write_stop_watermark: 0.95,
             primary_volume_offload_trigger_watermark: 0.5,
             ..Config::default()
@@ -1058,12 +1059,12 @@ mod tests {
         let low_fs = registry.get_or_register(low_url.clone()).unwrap();
         let mut high =
             crate::VolumeDescriptor::new(high_url, vec![VolumeUsageKind::PrimaryDataPriorityHigh]);
-        high.size_limit = Some(1200);
+        high.size_limit = Some(Size::from_const(1200));
         let low =
             crate::VolumeDescriptor::new(low_url, vec![VolumeUsageKind::PrimaryDataPriorityLow]);
         let config = Config {
             volumes: vec![high, low],
-            base_file_size: 64,
+            base_file_size: Size::from_const(64),
             primary_volume_write_stop_watermark: 0.95,
             primary_volume_offload_trigger_watermark: 0.4,
             ..Config::default()
@@ -1102,14 +1103,14 @@ mod tests {
             format!("file://{}/high", root),
             vec![VolumeUsageKind::PrimaryDataPriorityHigh],
         );
-        high.size_limit = Some(1024);
+        high.size_limit = Some(Size::from_kib(1));
         let low = crate::VolumeDescriptor::new(
             format!("file://{}/low", root),
             vec![VolumeUsageKind::PrimaryDataPriorityLow],
         );
         let config = Config {
             volumes: vec![high, low],
-            base_file_size: 64,
+            base_file_size: Size::from_const(64),
             primary_volume_write_stop_watermark: 0.95,
             primary_volume_offload_trigger_watermark: 0.8,
             ..Config::default()
@@ -1137,10 +1138,10 @@ mod tests {
         let high_url = format!("file://{}/high", root);
         let mut high =
             crate::VolumeDescriptor::new(high_url, vec![VolumeUsageKind::PrimaryDataPriorityHigh]);
-        high.size_limit = Some(1024);
+        high.size_limit = Some(Size::from_kib(1));
         let config = Config {
             volumes: vec![high],
-            base_file_size: 64,
+            base_file_size: Size::from_const(64),
             primary_volume_write_stop_watermark: 0.5,
             primary_volume_offload_trigger_watermark: 0.4,
             ..Config::default()

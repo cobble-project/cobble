@@ -2,12 +2,13 @@ use crate::SstCompressionAlgorithm;
 use crate::data_file::DataFileType;
 use crate::error::{Error, Result};
 use crate::time::TimeProviderKind;
-use crate::util::normalize_storage_path_to_url;
+use crate::util::{normalize_storage_path_to_url, size_to_u64, size_to_usize};
 use config::{Config as ConfigLoader, File as ConfigFile, FileFormat as ConfigFileFormat};
 use log::warn;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use size::Size;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use toml::Value as TomlValue;
@@ -147,7 +148,7 @@ pub struct VolumeDescriptor {
     /// Optional secret key used to connect.
     pub secret_key: Option<String>,
     /// Optional size limit for the volume in bytes.
-    pub size_limit: Option<u64>,
+    pub size_limit: Option<Size>,
     /// Optional custom key-value options for backend-specific initialization.
     pub custom_options: Option<HashMap<String, String>>,
     /// Usage kinds supported by the volume (bitmask of VolumeUsageKind).
@@ -189,6 +190,13 @@ impl VolumeDescriptor {
     pub fn supports(&self, kind: VolumeUsageKind) -> bool {
         (self.kinds & kind.mask()) != 0
     }
+
+    pub(crate) fn size_limit_bytes(&self) -> Result<Option<u64>> {
+        self.size_limit
+            .map(|size| size_to_u64("volumes[].size_limit", size))
+            .transpose()
+            .map_err(Error::ConfigError)
+    }
 }
 
 fn supports_primary_data(volume: &VolumeDescriptor) -> bool {
@@ -200,7 +208,7 @@ fn supports_primary_data(volume: &VolumeDescriptor) -> bool {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReaderConfigEntry {
     pub pin_partition_in_memory_count: usize,
-    pub block_cache_size: usize,
+    pub block_cache_size: Size,
     pub reload_tolerance_seconds: u64,
 }
 
@@ -208,9 +216,15 @@ impl Default for ReaderConfigEntry {
     fn default() -> Self {
         Self {
             pin_partition_in_memory_count: 1,
-            block_cache_size: 512 * 1024 * 1024,
+            block_cache_size: Size::from_mib(512),
             reload_tolerance_seconds: DEFAULT_READ_PROXY_RELOAD_TOLERANCE_SECONDS,
         }
+    }
+}
+
+impl ReaderConfigEntry {
+    pub(crate) fn block_cache_size_bytes(&self) -> Result<usize> {
+        size_to_usize("reader.block_cache_size", self.block_cache_size).map_err(Error::ConfigError)
     }
 }
 
@@ -223,7 +237,7 @@ pub struct ReadOptions {
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanOptions {
-    pub read_ahead_bytes: usize,
+    pub read_ahead_bytes: Size,
     pub column_indices: Option<Vec<usize>>,
     max_index: Option<usize>,
 }
@@ -272,7 +286,7 @@ impl ScanOptions {
             .as_ref()
             .and_then(|indices| indices.iter().max().cloned());
         Self {
-            read_ahead_bytes: 0,
+            read_ahead_bytes: Size::from_const(0),
             column_indices,
             max_index,
         }
@@ -284,6 +298,10 @@ impl ScanOptions {
 
     pub(crate) fn max_index(&self) -> Option<usize> {
         self.max_index
+    }
+
+    pub(crate) fn read_ahead_bytes(&self) -> Result<usize> {
+        size_to_usize("scan.read_ahead_bytes", self.read_ahead_bytes).map_err(Error::ConfigError)
     }
 }
 
@@ -362,7 +380,7 @@ pub struct Config {
     /// Storage volume descriptors for this database.
     pub volumes: Vec<VolumeDescriptor>,
     /// Memtable capacity in bytes.
-    pub memtable_capacity: usize,
+    pub memtable_capacity: Size,
     /// Number of memtable buffers to keep in memory.
     pub memtable_buffer_count: usize,
     /// Memtable implementation type.
@@ -377,7 +395,7 @@ pub struct Config {
     /// If None, uses min(l0_file_limit + 4, l0_file_limit * 2).
     pub write_stall_limit: Option<usize>,
     /// Base size for level 1.
-    pub l1_base_bytes: usize,
+    pub l1_base_bytes: Size,
     /// Size multiplier for deeper levels.
     pub level_size_multiplier: usize,
     /// Maximum level number (inclusive).
@@ -397,16 +415,16 @@ pub struct Config {
     /// Maximum number of queued requests before the server rejects new connections.
     pub compaction_server_max_queued: usize,
     /// Size of the block cache in bytes. If zero, cache is disabled.
-    pub block_cache_size: usize,
+    pub block_cache_size: Size,
     /// Enable foyer hybrid block cache (memory + local disk).
     pub block_cache_hybrid_enabled: bool,
     /// Optional disk capacity for hybrid block cache in bytes.
     /// If unset, defaults to the in-memory block cache size.
-    pub block_cache_hybrid_disk_size: Option<usize>,
+    pub block_cache_hybrid_disk_size: Option<Size>,
     /// Read proxy configuration overrides.
     pub reader: ReaderConfigEntry,
     /// Target base SST file size in bytes.
-    pub base_file_size: usize,
+    pub base_file_size: Size,
     /// Enable bloom filter in SST files.
     pub sst_bloom_filter_enabled: bool,
     /// Bits per key for SST bloom filter when enabled.
@@ -416,7 +434,7 @@ pub struct Config {
     /// Output data-file format used by flush/compaction writers.
     pub data_file_type: DataFileType,
     /// Target parquet row-group size in bytes when parquet output format is selected.
-    pub parquet_row_group_size_bytes: usize,
+    pub parquet_row_group_size_bytes: Size,
     /// Compression algorithm per level (index by level number).
     pub sst_compression_by_level: Vec<SstCompressionAlgorithm>,
     /// Whether TTL is enabled. If false, TTL metadata is ignored.
@@ -424,7 +442,8 @@ pub struct Config {
     /// Default TTL duration (in seconds). None means no expiration by default.
     pub default_ttl_seconds: Option<u32>,
     /// Values larger than this threshold are marked for value-log separation.
-    pub value_separation_threshold: usize,
+    /// None disables value-log separation.
+    pub value_separation_threshold: Option<Size>,
     /// Time provider to use for TTL.
     pub time_provider: TimeProviderKind,
     /// Optional log file path. If None, logs go to console only. Must be a local path.
@@ -458,14 +477,14 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             volumes: VolumeDescriptor::single_volume("file:///tmp/cobble"),
-            memtable_capacity: 64 * 1024 * 1024,
+            memtable_capacity: Size::from_mib(64),
             memtable_buffer_count: 2,
             memtable_type: MemtableType::Hash,
             num_columns: 1,
             total_buckets: 1,
             l0_file_limit: 4,
             write_stall_limit: None,
-            l1_base_bytes: 64 * 1024 * 1024,
+            l1_base_bytes: Size::from_mib(64),
             level_size_multiplier: 10,
             max_level: 6,
             compaction_policy: CompactionPolicyKind::RoundRobin,
@@ -475,16 +494,16 @@ impl Default for Config {
             compaction_remote_timeout_ms: 300_000,
             compaction_server_max_concurrent: 4,
             compaction_server_max_queued: 64,
-            block_cache_size: 64 * 1024 * 1024,
+            block_cache_size: Size::from_mib(64),
             block_cache_hybrid_enabled: false,
             block_cache_hybrid_disk_size: None,
             reader: ReaderConfigEntry::default(),
-            base_file_size: 64 * 1024 * 1024,
+            base_file_size: Size::from_mib(64),
             sst_bloom_filter_enabled: false,
             sst_bloom_bits_per_key: 10,
             sst_partitioned_index: false,
             data_file_type: DataFileType::SSTable,
-            parquet_row_group_size_bytes: 256 * 1024,
+            parquet_row_group_size_bytes: Size::from_kib(256),
             sst_compression_by_level: vec![
                 SstCompressionAlgorithm::None,
                 SstCompressionAlgorithm::None,
@@ -492,7 +511,7 @@ impl Default for Config {
             ],
             ttl_enabled: false,
             default_ttl_seconds: None,
-            value_separation_threshold: usize::MAX,
+            value_separation_threshold: None,
             time_provider: TimeProviderKind::default(),
             log_path: None,
             log_console: false,
@@ -528,12 +547,59 @@ impl Config {
 }
 
 impl Config {
-    pub(crate) fn hybrid_block_cache_disk_size(&self, memory_capacity: usize) -> Option<usize> {
+    pub(crate) fn memtable_capacity_bytes(&self) -> Result<usize> {
+        size_to_usize("memtable_capacity", self.memtable_capacity).map_err(Error::ConfigError)
+    }
+
+    pub(crate) fn l1_base_bytes_bytes(&self) -> Result<usize> {
+        size_to_usize("l1_base_bytes", self.l1_base_bytes).map_err(Error::ConfigError)
+    }
+
+    pub(crate) fn block_cache_size_bytes(&self) -> Result<usize> {
+        size_to_usize("block_cache_size", self.block_cache_size).map_err(Error::ConfigError)
+    }
+
+    pub(crate) fn block_cache_hybrid_disk_size_bytes(&self) -> Result<Option<usize>> {
+        self.block_cache_hybrid_disk_size
+            .map(|size| size_to_usize("block_cache_hybrid_disk_size", size))
+            .transpose()
+            .map_err(Error::ConfigError)
+    }
+
+    pub(crate) fn base_file_size_bytes(&self) -> Result<usize> {
+        size_to_usize("base_file_size", self.base_file_size).map_err(Error::ConfigError)
+    }
+
+    pub(crate) fn parquet_row_group_size_bytes(&self) -> Result<usize> {
+        size_to_usize(
+            "parquet_row_group_size_bytes",
+            self.parquet_row_group_size_bytes,
+        )
+        .map_err(Error::ConfigError)
+    }
+
+    pub(crate) fn value_separation_threshold_bytes(&self) -> Result<usize> {
+        self.value_separation_threshold
+            .map(|size| size_to_usize("value_separation_threshold", size))
+            .transpose()
+            .map_err(Error::ConfigError)
+            .map(|size| size.unwrap_or(0))
+    }
+
+    pub(crate) fn hybrid_block_cache_disk_size(
+        &self,
+        memory_capacity: usize,
+    ) -> Result<Option<usize>> {
         if !self.block_cache_hybrid_enabled || memory_capacity == 0 {
-            return None;
+            return Ok(None);
         }
-        let disk = self.block_cache_hybrid_disk_size.unwrap_or(memory_capacity);
-        Some(disk)
+        let disk = self
+            .block_cache_hybrid_disk_size
+            .map(|size| size_to_usize("block_cache_hybrid_disk_size", size))
+            .transpose()
+            .map_err(Error::ConfigError)?
+            .unwrap_or(memory_capacity);
+        Ok(Some(disk))
     }
 
     /// Select a suitable volume for hybrid block cache based on the config and the required disk capacity.
@@ -541,7 +607,7 @@ impl Config {
         &self,
         memory_capacity: usize,
     ) -> Result<Option<HybridCacheVolumePlan>> {
-        let Some(disk_capacity_bytes) = self.hybrid_block_cache_disk_size(memory_capacity) else {
+        let Some(disk_capacity_bytes) = self.hybrid_block_cache_disk_size(memory_capacity)? else {
             return Ok(None);
         };
         if disk_capacity_bytes == 0 {
@@ -572,7 +638,12 @@ impl Config {
                 continue;
             }
             has_local_cache_volume = true;
-            let fits = match volume.size_limit {
+            let volume_limit = volume
+                .size_limit
+                .map(|limit| size_to_u64(&format!("volumes[{idx}].size_limit"), limit))
+                .transpose()
+                .map_err(Error::ConfigError)?;
+            let fits = match volume_limit {
                 Some(limit) => limit >= required,
                 None => true,
             };
@@ -638,13 +709,15 @@ impl Config {
             ))
         })?;
         if let Some(limit) = volume.size_limit {
+            let limit = size_to_u64(&format!("volumes[{}].size_limit", plan.volume_idx), limit)
+                .map_err(Error::ConfigError)?;
             if limit <= disk_bytes {
                 return Err(Error::ConfigError(format!(
                     "Hybrid cache reservation {} bytes exceeds shared volume limit {} bytes for {}",
                     disk_bytes, limit, volume.base_dir
                 )));
             }
-            volume.size_limit = Some(limit - disk_bytes);
+            volume.size_limit = Some(Size::from_const((limit - disk_bytes) as i64));
         }
         Ok(adjusted)
     }
@@ -714,11 +787,13 @@ impl Config {
         let mut builder = ConfigLoader::builder();
         builder = builder.add_source(ConfigFile::from_str(&default_json, ConfigFileFormat::Json));
         builder = builder.add_source(ConfigFile::from(path).format(format));
-        builder
+        let config: Config = builder
             .build()
             .map_err(|err| Error::ConfigError(err.to_string()))?
             .try_deserialize()
-            .map_err(|err| Error::ConfigError(err.to_string()))
+            .map_err(|err| Error::ConfigError(err.to_string()))?;
+        config.validate_sizes()?;
+        Ok(config)
     }
 
     pub(crate) fn resolved_write_stall_limit(&self) -> usize {
@@ -759,6 +834,24 @@ impl Config {
                 .last()
                 .expect("compression config not empty")
         }
+    }
+
+    fn validate_sizes(&self) -> Result<()> {
+        self.memtable_capacity_bytes()?;
+        self.l1_base_bytes_bytes()?;
+        self.block_cache_size_bytes()?;
+        self.block_cache_hybrid_disk_size_bytes()?;
+        self.reader.block_cache_size_bytes()?;
+        self.base_file_size_bytes()?;
+        self.parquet_row_group_size_bytes()?;
+        self.value_separation_threshold_bytes()?;
+        for (idx, volume) in self.volumes.iter().enumerate() {
+            if let Some(limit) = volume.size_limit {
+                size_to_u64(&format!("volumes[{idx}].size_limit"), limit)
+                    .map_err(Error::ConfigError)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -814,6 +907,7 @@ mod tests {
     };
     use crate::SstCompressionAlgorithm;
     use crate::data_file::DataFileType;
+    use size::Size;
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::Builder;
@@ -837,31 +931,31 @@ mod tests {
         );
         let config = Config {
             volumes: vec![volume],
-            memtable_capacity: 1024,
+            memtable_capacity: Size::from_kib(1),
             memtable_buffer_count: 3,
             memtable_type: MemtableType::Vec,
             num_columns: 2,
             total_buckets: 1024,
             l0_file_limit: 5,
             write_stall_limit: Some(12),
-            l1_base_bytes: 8 * 1024,
+            l1_base_bytes: Size::from_kib(8),
             level_size_multiplier: 7,
             max_level: 4,
             compaction_policy: super::CompactionPolicyKind::MinOverlap,
-            block_cache_size: 256,
+            block_cache_size: Size::from_const(256),
             block_cache_hybrid_enabled: true,
-            block_cache_hybrid_disk_size: Some(1024),
+            block_cache_hybrid_disk_size: Some(Size::from_kib(1)),
             reader: ReaderConfigEntry {
                 pin_partition_in_memory_count: 2,
-                block_cache_size: 2048,
+                block_cache_size: Size::from_kib(2),
                 reload_tolerance_seconds: 5,
             },
-            base_file_size: 512,
+            base_file_size: Size::from_const(512),
             sst_bloom_filter_enabled: true,
             sst_bloom_bits_per_key: 11,
             sst_partitioned_index: true,
             data_file_type: DataFileType::Parquet,
-            parquet_row_group_size_bytes: 4096,
+            parquet_row_group_size_bytes: Size::from_kib(4),
             sst_compression_by_level: vec![
                 SstCompressionAlgorithm::None,
                 SstCompressionAlgorithm::None,
@@ -869,7 +963,7 @@ mod tests {
             ],
             ttl_enabled: true,
             default_ttl_seconds: Some(120),
-            value_separation_threshold: 4096,
+            value_separation_threshold: Some(Size::from_kib(4)),
             time_provider: crate::time::TimeProviderKind::Manual,
             log_path: Some("/tmp/cobble.log".to_string()),
             log_console: true,
@@ -910,7 +1004,7 @@ mod tests {
                 .and_then(|v| v.get("endpoint")),
             Some(&"http://127.0.0.1:9000".to_string())
         );
-        assert_eq!(decoded.memtable_capacity, 1024);
+        assert_eq!(decoded.memtable_capacity, Size::from_kib(1));
         assert_eq!(decoded.memtable_type, MemtableType::Vec);
         assert_eq!(decoded.total_buckets, 1024);
         assert_eq!(decoded.write_stall_limit, Some(12));
@@ -930,15 +1024,18 @@ mod tests {
             decoded.primary_volume_offload_policy,
             PrimaryVolumeOffloadPolicyKind::LargestFile
         );
-        assert_eq!(decoded.value_separation_threshold, 4096);
+        assert_eq!(decoded.value_separation_threshold, Some(Size::from_kib(4)));
         assert_eq!(decoded.compaction_server_max_concurrent, 8);
         assert_eq!(decoded.compaction_server_max_queued, 32);
         assert_eq!(decoded.data_file_type, DataFileType::Parquet);
-        assert_eq!(decoded.parquet_row_group_size_bytes, 4096);
-        assert_eq!(decoded.reader.block_cache_size, 2048);
+        assert_eq!(decoded.parquet_row_group_size_bytes, Size::from_kib(4));
+        assert_eq!(decoded.reader.block_cache_size, Size::from_kib(2));
         assert_eq!(decoded.reader.reload_tolerance_seconds, 5);
         assert!(decoded.block_cache_hybrid_enabled);
-        assert_eq!(decoded.block_cache_hybrid_disk_size, Some(1024));
+        assert_eq!(
+            decoded.block_cache_hybrid_disk_size,
+            Some(Size::from_kib(1))
+        );
 
         let yaml = serde_yaml::to_string(&config).expect("Cannot serialize yaml");
         let mut yaml_file = Builder::new()
@@ -951,14 +1048,14 @@ mod tests {
         yaml_file.flush().expect("Should able to flush yaml");
         let decoded_yaml: Config =
             Config::from_path(yaml_file.path()).expect("Cannot deserialize yaml");
-        assert_eq!(decoded_yaml.reader.block_cache_size, 2048);
+        assert_eq!(decoded_yaml.reader.block_cache_size, Size::from_kib(2));
 
         let mut path_buf = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path_buf.push("tests/testdata/config.ini");
 
         let decoded_ini = Config::from_path(path_buf.as_path()).expect("Cannot deserialize ini");
-        assert_eq!(decoded_ini.memtable_capacity, 1024);
-        assert_eq!(decoded_ini.reader.block_cache_size, 2048);
+        assert_eq!(decoded_ini.memtable_capacity, Size::from_kib(1));
+        assert_eq!(decoded_ini.reader.block_cache_size, Size::from_kib(2));
         assert_eq!(decoded_ini.data_file_type, DataFileType::SSTable);
     }
 
@@ -1003,7 +1100,7 @@ mod tests {
     fn test_hybrid_cache_prefers_cache_only_volume() {
         let mut config = Config::default();
         config.block_cache_hybrid_enabled = true;
-        config.block_cache_hybrid_disk_size = Some(1024);
+        config.block_cache_hybrid_disk_size = Some(Size::from_kib(1));
         config.volumes = vec![
             VolumeDescriptor::new(
                 "file:///tmp/primary-shared".to_string(),
@@ -1031,7 +1128,7 @@ mod tests {
     fn test_hybrid_cache_partitions_shared_volume_limit() {
         let mut config = Config::default();
         config.block_cache_hybrid_enabled = true;
-        config.block_cache_hybrid_disk_size = Some(1024);
+        config.block_cache_hybrid_disk_size = Some(Size::from_kib(1));
         let mut shared = VolumeDescriptor::new(
             "file:///tmp/shared".to_string(),
             vec![
@@ -1040,20 +1137,20 @@ mod tests {
                 VolumeUsageKind::Meta,
             ],
         );
-        shared.size_limit = Some(8192);
+        shared.size_limit = Some(Size::from_kib(8));
         config.volumes = vec![shared];
         let plan = config.resolve_hybrid_cache_volume_plan(4096).unwrap();
         let adjusted = config
             .apply_hybrid_cache_primary_partition_with_plan(plan.as_ref())
             .unwrap();
-        assert_eq!(adjusted.volumes[0].size_limit, Some(7168));
+        assert_eq!(adjusted.volumes[0].size_limit, Some(Size::from_kib(7)));
     }
 
     #[test]
     fn test_hybrid_cache_rejects_non_local_cache_volume() {
         let mut config = Config::default();
         config.block_cache_hybrid_enabled = true;
-        config.block_cache_hybrid_disk_size = Some(1024);
+        config.block_cache_hybrid_disk_size = Some(Size::from_kib(1));
         config.volumes = vec![VolumeDescriptor::new(
             "s3://bucket/cache".to_string(),
             vec![VolumeUsageKind::Cache],
@@ -1076,12 +1173,12 @@ mod tests {
     fn test_data_file_type_parquet_round_trip() {
         let mut expected = Config::default();
         expected.data_file_type = DataFileType::Parquet;
-        expected.parquet_row_group_size_bytes = 8192;
+        expected.parquet_row_group_size_bytes = Size::from_kib(8);
         let json = serde_json::to_string(&expected).expect("Cannot serialize config");
         let decoded: Config =
             serde_json::from_str(&json).expect("Cannot deserialize parquet config");
         assert_eq!(decoded.data_file_type, DataFileType::Parquet);
-        assert_eq!(decoded.parquet_row_group_size_bytes, 8192);
+        assert_eq!(decoded.parquet_row_group_size_bytes, Size::from_kib(8));
     }
 
     #[test]
@@ -1100,9 +1197,80 @@ mod tests {
         json_file.flush().expect("Should be able to flush json");
 
         let decoded = Config::from_path(json_file.path()).expect("Cannot deserialize partial json");
-        assert_eq!(decoded.memtable_capacity, 2048);
+        assert_eq!(decoded.memtable_capacity, Size::from_kib(2));
         assert_eq!(decoded.num_columns, Config::default().num_columns);
         assert_eq!(decoded.data_file_type, Config::default().data_file_type);
+    }
+
+    #[test]
+    fn test_config_from_path_parses_human_readable_sizes() {
+        let yaml = r#"
+        volumes:
+          - base_dir: "file:///tmp/cobble"
+            kinds: ["meta", "primary_data_priority_high"]
+            size_limit: "2GiB"
+        memtable_capacity: "64MB"
+        l1_base_bytes: "128MiB"
+        block_cache_size: "32MB"
+        block_cache_hybrid_disk_size: "1GiB"
+        reader:
+          pin_partition_in_memory_count: 1
+          block_cache_size: "512MB"
+          reload_tolerance_seconds: 10
+        base_file_size: "64MiB"
+        parquet_row_group_size_bytes: "256KB"
+        value_separation_threshold: "4MB"
+        "#;
+        let mut file = Builder::new()
+            .suffix(".yaml")
+            .tempfile()
+            .expect("should create temp yaml");
+        file.write_all(yaml.as_bytes())
+            .expect("should write temp yaml");
+        file.flush().expect("should flush temp yaml");
+
+        let decoded = Config::from_path(file.path()).expect("should parse human-readable sizes");
+        assert_eq!(decoded.memtable_capacity, Size::from_const(64_000_000));
+        assert_eq!(decoded.l1_base_bytes, Size::from_mib(128));
+        assert_eq!(decoded.block_cache_size, Size::from_const(32_000_000));
+        assert_eq!(
+            decoded.block_cache_hybrid_disk_size,
+            Some(Size::from_gib(1))
+        );
+        assert_eq!(
+            decoded.reader.block_cache_size,
+            Size::from_const(512_000_000)
+        );
+        assert_eq!(decoded.base_file_size, Size::from_mib(64));
+        assert_eq!(
+            decoded.parquet_row_group_size_bytes,
+            Size::from_const(256_000)
+        );
+        assert_eq!(
+            decoded.value_separation_threshold,
+            Some(Size::from_const(4_000_000))
+        );
+        assert_eq!(decoded.volumes[0].size_limit, Some(Size::from_gib(2)));
+    }
+
+    #[test]
+    fn test_config_from_path_rejects_invalid_size_unit() {
+        let yaml = r#"
+        volumes:
+          - base_dir: "file:///tmp/cobble"
+            kinds: ["meta", "primary_data_priority_high"]
+        memtable_capacity: "64MEGA"
+        "#;
+        let mut file = Builder::new()
+            .suffix(".yaml")
+            .tempfile()
+            .expect("should create temp yaml");
+        file.write_all(yaml.as_bytes())
+            .expect("should write temp yaml");
+        file.flush().expect("should flush temp yaml");
+
+        let err = Config::from_path(file.path()).expect_err("invalid unit should be rejected");
+        assert!(matches!(err, Error::ConfigError(_)));
     }
 
     #[test]

@@ -3,6 +3,7 @@ use cobble::{Config, SingleDb, VolumeDescriptor};
 use cobble_web_monitor::{MonitorConfig, MonitorConfigSource, MonitorServer};
 use serde_json::{Value as JsonValue, json};
 use serial_test::serial;
+use size::Size;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -17,7 +18,7 @@ fn write_config_file(root: &str) -> (PathBuf, Config) {
         total_buckets: 4,
         num_columns: 1,
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 256,
+        memtable_capacity: Size::from_const(256),
         ..Config::default()
     };
     let config_json = serde_json::to_string_pretty(&config).expect("serialize config");

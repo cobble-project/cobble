@@ -231,7 +231,8 @@ impl Db {
         metrics_registry::init_metrics();
         let id = db_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let metrics_manager = Arc::new(MetricsManager::new(&id));
-        let hybrid_cache_plan = config.resolve_hybrid_cache_volume_plan(config.block_cache_size)?;
+        let hybrid_cache_plan =
+            config.resolve_hybrid_cache_volume_plan(config.block_cache_size_bytes()?)?;
         let file_manager_config =
             config.apply_hybrid_cache_primary_partition_with_plan(hybrid_cache_plan.as_ref())?;
 
@@ -572,6 +573,9 @@ impl Db {
             default_ttl_seconds: config.default_ttl_seconds,
         };
         let ttl_provider = Arc::new(TTLProvider::new(&ttl_config, Arc::clone(&time_provider)));
+        let block_cache_size = config.block_cache_size_bytes()?;
+        let memtable_capacity = config.memtable_capacity_bytes()?;
+        let value_separation_threshold = config.value_separation_threshold_bytes()?;
         let runtime_num_columns = schema_manager.current_num_columns();
         let mut lsm_tree = LSMTree::with_state_and_ttl(
             Arc::clone(&db_state),
@@ -579,18 +583,18 @@ impl Db {
             Arc::clone(&db_lifecycle),
             Arc::clone(&metrics_manager),
         );
-        if config.block_cache_size > 0 {
+        if block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache_with_config(
                 &config,
                 &id,
-                config.block_cache_size,
+                block_cache_size,
                 hybrid_cache_plan.as_ref(),
             )?));
         }
         db_state.configure_multi_lsm(config.total_buckets, &bucket_ranges)?;
         let lsm_tree = Arc::new(lsm_tree);
         let mut memtable_writer_options =
-            crate::compaction::build_writer_options(&config, 0, config.data_file_type);
+            crate::compaction::build_writer_options(&config, 0, config.data_file_type)?;
         match &mut memtable_writer_options {
             WriterOptions::Sst(sst_options) => {
                 sst_options.num_columns = runtime_num_columns;
@@ -604,11 +608,11 @@ impl Db {
         let vlog_store = Arc::new(VlogStore::new(
             Arc::clone(&file_manager),
             memtable_writer_options.buffer_size(),
-            config.value_separation_threshold,
+            value_separation_threshold,
         ));
         vlog_store.ensure_next_file_seq_at_least(initial_vlog_file_seq);
         // Compaction setup
-        let mut compaction_options = crate::compaction::build_compaction_config(&config);
+        let mut compaction_options = crate::compaction::build_compaction_config(&config)?;
         compaction_options.num_columns = runtime_num_columns;
         let compaction_worker: Arc<dyn crate::compaction::CompactionWorker> =
             if let Some(addr) = config.compaction_remote_addr.clone() {
@@ -658,7 +662,7 @@ impl Db {
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
             MemtableManagerOptions {
-                memtable_capacity: config.memtable_capacity,
+                memtable_capacity,
                 buffer_count: config.memtable_buffer_count,
                 memtable_type: config.memtable_type,
                 writer_options: memtable_writer_options,
@@ -930,7 +934,7 @@ impl Db {
             Arc::clone(&snapshot),
             Arc::clone(&schema),
             Arc::clone(&self.schema_manager),
-            options.read_ahead_bytes,
+            options.read_ahead_bytes()?,
             options.columns(),
         );
         let (lsm_iters, effective_schema) = match lsm_iters {
@@ -993,6 +997,7 @@ mod tests {
         U64CounterMergeOperator, VolumeDescriptor,
     };
     use serial_test::serial;
+    use size::Size;
     use std::sync::{Arc, Mutex};
 
     fn cleanup_test_root(path: &str) {
@@ -1001,7 +1006,7 @@ mod tests {
 
     fn config_with_small_memtable(path: &str) -> Config {
         Config {
-            memtable_capacity: 128,
+            memtable_capacity: Size::from_const(128),
             memtable_buffer_count: 2,
             num_columns: 1,
             sst_bloom_filter_enabled: true,
@@ -1171,7 +1176,7 @@ mod tests {
         let root = "/tmp/db_custom_merge_operator";
         cleanup_test_root(root);
         let config = Config {
-            memtable_capacity: 128,
+            memtable_capacity: Size::from_const(128),
             memtable_buffer_count: 2,
             num_columns: 2,
             sst_bloom_filter_enabled: true,
@@ -1213,7 +1218,7 @@ mod tests {
         let root = "/tmp/db_counter_merge_operator";
         cleanup_test_root(root);
         let config = Config {
-            memtable_capacity: 128,
+            memtable_capacity: Size::from_const(128),
             memtable_buffer_count: 2,
             num_columns: 2,
             sst_bloom_filter_enabled: true,
@@ -1272,7 +1277,7 @@ mod tests {
         let root = "/tmp/db_schema_evolution_get";
         cleanup_test_root(root);
         let config = Config {
-            memtable_capacity: 128,
+            memtable_capacity: Size::from_const(128),
             memtable_buffer_count: 2,
             num_columns: 1,
             sst_bloom_filter_enabled: true,
@@ -1303,7 +1308,7 @@ mod tests {
         let root = "/tmp/db_schema_evolution_memtable_read";
         cleanup_test_root(root);
         let config = Config {
-            memtable_capacity: 128,
+            memtable_capacity: Size::from_const(128),
             memtable_buffer_count: 2,
             num_columns: 1,
             sst_bloom_filter_enabled: true,
@@ -1362,7 +1367,7 @@ mod tests {
         let root = "/tmp/db_value_separation_memtable";
         cleanup_test_root(root);
         let config = Config {
-            value_separation_threshold: 8,
+            value_separation_threshold: Some(Size::from_const(8)),
             ..config_with_small_memtable(root)
         };
         let db = open_db(config);
@@ -1384,7 +1389,7 @@ mod tests {
         let root = "/tmp/db_value_separation";
         cleanup_test_root(root);
         let config = Config {
-            value_separation_threshold: 8,
+            value_separation_threshold: Some(Size::from_const(8)),
             ..config_with_small_memtable(root)
         };
         let db = open_db(config);
@@ -1434,7 +1439,7 @@ mod tests {
         let root = "/tmp/db_get_merge_separated_array";
         cleanup_test_root(root);
         let config = Config {
-            value_separation_threshold: 4,
+            value_separation_threshold: Some(Size::from_const(4)),
             ..config_with_small_memtable(root)
         };
         let db = open_db(config);
@@ -1780,7 +1785,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let mut options = ScanOptions::default();
-            options.read_ahead_bytes = 128;
+            options.read_ahead_bytes = Size::from_const(128);
             let mut iter = db
                 .scan_with_options(0, b"".as_slice()..b"\xff".as_slice(), &options)
                 .unwrap();

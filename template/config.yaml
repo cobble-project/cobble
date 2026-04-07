@@ -37,7 +37,7 @@ volumes:
       - meta
 
 # Memtable settings.
-memtable_capacity: 67108864              # 64 MiB
+memtable_capacity: "64MiB"
 memtable_buffer_count: 2                 # active + immutable buffers
 memtable_type: hash                      # hash | skiplist | vec
 
@@ -48,7 +48,7 @@ total_buckets: 1                         # valid range: 1..=65536
 # LSM shape and write-stall policy.
 l0_file_limit: 4
 write_stall_limit: null                  # null => auto: min(l0 + 4, l0 * 2)
-l1_base_bytes: 67108864                  # 64 MiB
+l1_base_bytes: "64MiB"
 level_size_multiplier: 10
 max_level: 6
 
@@ -62,23 +62,23 @@ compaction_server_max_concurrent: 4
 compaction_server_max_queued: 64
 
 # Block cache.
-block_cache_size: 67108864               # 64 MiB (0 means disabled)
+block_cache_size: "64MiB"                # "0" also disables cache
 block_cache_hybrid_enabled: false        # memory + local disk (foyer hybrid cache)
-block_cache_hybrid_disk_size: null       # null => fallback to block_cache_size
+block_cache_hybrid_disk_size: null       # e.g. "1GiB"; null => fallback to block_cache_size
 
 # Reader-specific defaults (`ReaderConfigEntry`).
 reader:
   pin_partition_in_memory_count: 1
-  block_cache_size: 536870912            # 512 MiB
+  block_cache_size: "512MiB"
   reload_tolerance_seconds: 10
 
 # Flush/compaction output file format.
-base_file_size: 67108864                 # 64 MiB target output size
+base_file_size: "64MiB"
 sst_bloom_filter_enabled: false
 sst_bloom_bits_per_key: 10
 sst_partitioned_index: false
 data_file_type: sst                      # sst | parquet
-parquet_row_group_size_bytes: 262144     # 256 KiB
+parquet_row_group_size_bytes: "256KiB"
 
 # SST level compression.
 # Values: none | lz4
@@ -111,5 +111,6 @@ primary_volume_offload_trigger_watermark: 0.85
 primary_volume_offload_policy: priority  # priority | largest_file
 
 # Value-log separation threshold.
-# `18446744073709551615` == usize::MAX on 64-bit platforms (default = effectively disabled).
-value_separation_threshold: 18446744073709551615
+# Supports human-readable sizes like "4MB", "64MiB".
+# Use null to disable value-log separation (i.e. all values are inlined in LSM).
+value_separation_threshold: null

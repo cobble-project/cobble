@@ -541,7 +541,7 @@ impl VlogStore {
     }
 
     pub(crate) fn should_separate(&self, value_len: usize) -> bool {
-        value_len > self.value_separation_threshold
+        self.value_separation_threshold > 0 && value_len > self.value_separation_threshold
     }
 
     pub(crate) fn create_writer(
@@ -657,6 +657,17 @@ mod tests {
         let store = VlogStore::new(Arc::clone(&file_manager), 64, 8);
         assert!(!store.should_separate(8));
         assert!(store.should_separate(9));
+    }
+
+    #[test]
+    fn test_should_not_separate_when_threshold_disabled() {
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("vlog-test"));
+        let file_manager = Arc::new(FileManager::with_defaults(fs, metrics_manager).unwrap());
+        let store = VlogStore::new(Arc::clone(&file_manager), 64, 0);
+        assert!(!store.should_separate(1));
+        assert!(!store.should_separate(1024));
     }
 
     #[test]

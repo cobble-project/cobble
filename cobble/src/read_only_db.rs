@@ -136,6 +136,8 @@ impl ReadOnlyDb {
         let file_manager =
             FileManager::from_config(&config, &snapshot_db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
+        let block_cache_size = config.block_cache_size_bytes()?;
+        let value_separation_threshold = config.value_separation_threshold_bytes()?;
         let time_provider = config.time_provider.create();
         let ttl_provider = Arc::new(TTLProvider::new(
             &TtlConfig {
@@ -171,11 +173,11 @@ impl ReadOnlyDb {
             tree_versions.into_iter().map(Arc::new).collect(),
         )?;
         let writer_options =
-            crate::compaction::build_writer_options(&config, 0, config.data_file_type);
+            crate::compaction::build_writer_options(&config, 0, config.data_file_type)?;
         let vlog_store = Arc::new(VlogStore::new(
             Arc::clone(&file_manager),
             writer_options.buffer_size(),
-            config.value_separation_threshold,
+            value_separation_threshold,
         ));
 
         let db_state = Arc::new(DbStateHandle::new());
@@ -196,11 +198,11 @@ impl ReadOnlyDb {
         );
         if let Some(block_cache) = block_cache {
             lsm_tree.set_block_cache(Some(block_cache));
-        } else if config.block_cache_size > 0 {
+        } else if block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache_with_config(
                 &config,
                 &snapshot_db_id,
-                config.block_cache_size,
+                block_cache_size,
                 None,
             )?));
         }
@@ -327,7 +329,7 @@ impl ReadOnlyDb {
             Arc::clone(&snapshot),
             Arc::clone(&schema),
             Arc::clone(&self.schema_manager),
-            options.read_ahead_bytes,
+            options.read_ahead_bytes()?,
             options.columns(),
         )?;
         let encode_scan_key = |key: &[u8]| {

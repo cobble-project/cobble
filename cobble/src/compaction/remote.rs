@@ -557,7 +557,7 @@ impl RemoteCompactionWorker {
             .collect::<Result<Vec<_>>>()?;
         let schema = self.schema_manager.latest_schema();
         let mut writer_options =
-            super::build_writer_options(&self.config, output_level, data_file_type);
+            super::build_writer_options(&self.config, output_level, data_file_type)?;
         match &mut writer_options {
             WriterOptions::Sst(sst_options) => {
                 sst_options.num_columns = schema.num_columns();
@@ -715,7 +715,7 @@ pub struct RemoteCompactionServer {
 
 impl RemoteCompactionServer {
     pub fn new(config: Config) -> Result<Self> {
-        let compaction_config = super::build_compaction_config(&config);
+        let compaction_config = super::build_compaction_config(&config)?;
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .thread_name("cobble-compaction")
@@ -1036,7 +1036,7 @@ impl RemoteCompactionServer {
     ) -> Result<Arc<FileManager>> {
         let options = FileManagerOptions {
             base_dir: db_id.to_string(),
-            base_file_size: config.base_file_size,
+            base_file_size: config.base_file_size_bytes()?,
             ..FileManagerOptions::default()
         };
         let file_manager =
@@ -1167,6 +1167,7 @@ mod tests {
     use crate::r#type::{Column, KvValue, Value, ValueType};
     use crate::writer_options::WriterOptions;
     use serial_test::serial;
+    use size::Size;
     use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
 
@@ -1247,7 +1248,7 @@ mod tests {
         cleanup_test_root(root);
         let config = Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-            base_file_size: 128,
+            base_file_size: Size::from_const(128),
             sst_bloom_filter_enabled: true,
             compaction_threads: 2,
             ..Config::default()
@@ -1382,7 +1383,7 @@ mod tests {
         cleanup_test_root(root);
         let config = Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-            base_file_size: 128,
+            base_file_size: Size::from_const(128),
             sst_bloom_filter_enabled: true,
             compaction_threads: 2,
             num_columns: 1,
@@ -1542,7 +1543,7 @@ mod tests {
         cleanup_test_root(root);
         let config = Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-            base_file_size: 128,
+            base_file_size: Size::from_const(128),
             sst_bloom_filter_enabled: true,
             compaction_threads: 2,
             ..Config::default()

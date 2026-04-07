@@ -54,6 +54,7 @@ mod tests {
     use crate::StructuredColumnValue;
     use crate::list::{ListConfig, ListRetainMode};
     use cobble::VolumeDescriptor;
+    use size::Size;
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
@@ -84,7 +85,7 @@ mod tests {
         // Set up the remote compaction server
         let server_config = Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-            base_file_size: 128,
+            base_file_size: Size::from_const(128),
             compaction_threads: 1,
             num_columns: 2,
             ..Config::default()
@@ -108,7 +109,7 @@ mod tests {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             num_columns: 2,
             total_buckets: 1,
-            base_file_size: 128,
+            base_file_size: Size::from_const(128),
             compaction_threads: 1,
             l0_file_limit: 2,
             compaction_remote_addr: Some(addr.to_string()),
