@@ -74,7 +74,7 @@ For development or single-machine deployments, a single volume is sufficient:
 use cobble::{Config, VolumeDescriptor};
 
 let mut config = Config::default();
-config.volumes = VolumeDescriptor::single_volume("file:///data/cobble".to_string());
+config.volumes = VolumeDescriptor::single_volume("file:///data/cobble");
 ```
 
 This puts everything — data, metadata, and snapshots — in one directory. As your deployment grows, you can add more volumes without changing application code.
@@ -90,7 +90,7 @@ let mut config = Config::default();
 
 // Fast local SSD for active data + cache
 let mut high = VolumeDescriptor::new(
-    "file:///fast-ssd/cobble".to_string(),
+    "file:///fast-ssd/cobble",
     vec![
         VolumeUsageKind::PrimaryDataPriorityHigh,
         VolumeUsageKind::Cache,
@@ -100,13 +100,13 @@ high.size_limit = Some(100 * 1024 * 1024 * 1024); // 100 GB
 
 // Larger SSD for warm data
 let medium = VolumeDescriptor::new(
-    "file:///large-ssd/cobble".to_string(),
+    "file:///large-ssd/cobble",
     vec![VolumeUsageKind::PrimaryDataPriorityMedium],
 );
 
 // S3 for snapshot export
 let snapshot = VolumeDescriptor::new(
-    "s3://my-bucket/cobble-snapshots".to_string(),
+    "s3://my-bucket/cobble-snapshots",
     vec![
         VolumeUsageKind::Snapshot,
         VolumeUsageKind::Meta,
@@ -131,7 +131,7 @@ let mut config = Config::default();
 
 // Network-attached storage for primary data and snapshots
 let primary = VolumeDescriptor::new(
-    "file:///network-storage/cobble".to_string(),
+    "file:///network-storage/cobble",
     vec![
         VolumeUsageKind::PrimaryDataPriorityHigh,
         VolumeUsageKind::Snapshot,
@@ -141,7 +141,7 @@ let primary = VolumeDescriptor::new(
 
 // Local SSD for block cache
 let cache = VolumeDescriptor::new(
-    "file:///local-ssd/cobble-cache".to_string(),
+    "file:///local-ssd/cobble-cache",
     vec![VolumeUsageKind::Cache],
 );
 

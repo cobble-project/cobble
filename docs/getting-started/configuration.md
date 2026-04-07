@@ -43,7 +43,7 @@ Or configure a custom path:
 use cobble::{Config, VolumeDescriptor};
 
 let mut config = Config::default();
-config.volumes = VolumeDescriptor::single_volume("file:///data/cobble".to_string());
+config.volumes = VolumeDescriptor::single_volume("file:///data/cobble");
 ```
 
 {: .warning }
@@ -60,7 +60,7 @@ let mut config = Config::default();
 config.volumes = vec![
     // Fast SSD for hot data and metadata
     VolumeDescriptor::new(
-        "file:///ssd/cobble".to_string(),
+        "file:///ssd/cobble",
         vec![
             VolumeUsageKind::PrimaryDataPriorityHigh,
             VolumeUsageKind::Meta,
@@ -68,12 +68,12 @@ config.volumes = vec![
     ),
     // Larger HDD for cold data
     VolumeDescriptor::new(
-        "file:///hdd/cobble".to_string(),
+        "file:///hdd/cobble",
         vec![VolumeUsageKind::PrimaryDataPriorityLow],
     ),
     // Snapshot materialization
     VolumeDescriptor::new(
-        "file:///shared/snapshots".to_string(),
+        "file:///shared/snapshots",
         vec![VolumeUsageKind::Snapshot],
     ),
 ];

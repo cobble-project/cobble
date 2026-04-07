@@ -12,7 +12,7 @@
 //! let mut config = Config::default();
 //! config.num_columns = 2;
 //! config.total_buckets = 1;
-//! config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-ssingle".to_string());
+//! config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-ssingle");
 //!
 //! let mut db = StructuredSingleDb::open(config)?;
 //! db.update_schema().add_list_column(

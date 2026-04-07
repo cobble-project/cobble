@@ -897,7 +897,7 @@ fn test_db_snapshot_read_only_get_with_vec_memtable() {
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     db.close().unwrap();
 
-    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
     for (key, expected_value) in expected.iter() {
         let value = ro.get(0, key).unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -935,7 +935,7 @@ fn test_db_snapshot_read_only_get_with_vec_memtable_separated_values() {
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     db.close().unwrap();
 
-    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
     for (key, expected_value) in expected.iter() {
         let value = ro.get(0, key).unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -972,7 +972,7 @@ fn test_db_snapshot_read_only_get_with_skiplist_memtable() {
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     db.close().unwrap();
 
-    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
     for (key, expected_value) in expected.iter() {
         let value = ro.get(0, key).unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -1010,7 +1010,7 @@ fn test_db_snapshot_read_only_get_with_skiplist_memtable_separated_values() {
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     db.close().unwrap();
 
-    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
     for (key, expected_value) in expected.iter() {
         let value = ro.get(0, key).unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
@@ -1043,7 +1043,7 @@ fn test_db_snapshot_read_only_get() {
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     db.close().unwrap();
 
-    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
     let value = ro.get(0, b"k1").unwrap().expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
@@ -1077,7 +1077,7 @@ fn test_db_snapshot_read_only_get_with_separated_value() {
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     db.close().unwrap();
 
-    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
     let value = ro.get(0, b"k1").unwrap().expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), large);
@@ -1111,7 +1111,7 @@ fn test_db_snapshot_read_only_scan_with_separated_value() {
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     db.close().unwrap();
 
-    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
     let mut iter = ro.scan(0, b"k1".as_slice()..b"kz".as_slice()).unwrap();
     let mut rows = Vec::new();
     while let Some(row) = iter.next() {
@@ -1165,8 +1165,7 @@ fn test_db_incremental_snapshot_restore() {
     let value2 = ro.get(0, b"k2").unwrap().expect("k2 value present");
     assert_eq!(value2[0].as_ref().unwrap().as_ref(), b"v2");
 
-    let writable =
-        Db::open_from_snapshot(config, incremental_snapshot_id, db.id().to_string()).unwrap();
+    let writable = Db::open_from_snapshot(config, incremental_snapshot_id, db.id()).unwrap();
     let value1 = writable.get(0, b"k1").unwrap().expect("k1 value present");
     assert_eq!(value1[0].as_ref().unwrap().as_ref(), b"v1");
     let value2 = writable.get(0, b"k2").unwrap().expect("k2 value present");
@@ -1500,7 +1499,7 @@ fn test_db_open_from_snapshot_allows_writes() {
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     db.close().unwrap();
 
-    let writable = Db::open_from_snapshot(config, snapshot_id, db.id().to_string()).unwrap();
+    let writable = Db::open_from_snapshot(config, snapshot_id, db.id()).unwrap();
     let mut batch = WriteBatch::new();
     batch.put(0, b"k2", 0, b"v2".to_vec());
     writable.write_batch(batch).unwrap();
@@ -1538,13 +1537,12 @@ fn test_db_resume_takes_over_snapshot_lifecycle() {
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     db.close().unwrap();
 
-    let writable =
-        Db::open_from_snapshot(config.clone(), snapshot_id, db.id().to_string()).unwrap();
+    let writable = Db::open_from_snapshot(config.clone(), snapshot_id, db.id()).unwrap();
     assert!(!writable.expire_snapshot(snapshot_id).unwrap());
     writable.close().unwrap();
 
     let resume_config = config;
-    let writable = Db::resume(resume_config, db.id().to_string()).unwrap();
+    let writable = Db::resume(resume_config, db.id()).unwrap();
     let bucket_snapshot = writable.shard_snapshot_input(snapshot_id).unwrap();
     assert_eq!(bucket_snapshot.ranges, vec![0u16..=7u16]);
 
@@ -1604,15 +1602,14 @@ fn test_db_multi_lsm_snapshot_restore_and_resume() {
     );
     db.close().unwrap();
 
-    let restored =
-        Db::open_from_snapshot(config.clone(), snapshot_id, db.id().to_string()).unwrap();
+    let restored = Db::open_from_snapshot(config.clone(), snapshot_id, db.id()).unwrap();
     let left = restored.get(0, b"k-left").unwrap().expect("left value");
     assert_eq!(left[0].as_ref().unwrap().as_ref(), b"v-left");
     let right = restored.get(3, b"k-right").unwrap().expect("right value");
     assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
     restored.close().unwrap();
 
-    let resumed = Db::resume(config, db.id().to_string()).unwrap();
+    let resumed = Db::resume(config, db.id()).unwrap();
     let left = resumed
         .get(0, b"k-left")
         .unwrap()
@@ -1661,14 +1658,13 @@ fn test_db_parquet_snapshot_restore_and_read_only() {
     );
     db.close().unwrap();
 
-    let read_only = Db::open_read_only(config.clone(), snapshot_id, db.id().to_string()).unwrap();
+    let read_only = Db::open_read_only(config.clone(), snapshot_id, db.id()).unwrap();
     let left = read_only.get(0, b"k-left").unwrap().expect("left value");
     assert_eq!(left[0].as_ref().unwrap().as_ref(), b"v-left");
     let right = read_only.get(3, b"k-right").unwrap().expect("right value");
     assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
 
-    let restored =
-        Db::open_from_snapshot(config.clone(), snapshot_id, db.id().to_string()).unwrap();
+    let restored = Db::open_from_snapshot(config.clone(), snapshot_id, db.id()).unwrap();
     let left = restored
         .get(0, b"k-left")
         .unwrap()
@@ -2431,7 +2427,7 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
 
     db.close().unwrap();
 
-    let ro = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+    let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
     let mut ro_iter = ro
         .scan_with_options(
             0,

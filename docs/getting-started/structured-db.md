@@ -29,7 +29,7 @@ use cobble_data_structure::{
 let mut config = Config::default();
 config.num_columns = 2;
 config.total_buckets = 1;
-config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-structured-single".to_string());
+config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-structured-single");
 let mut db = StructuredSingleDb::open(config)?;
 db.update_schema()
   .add_list_column(1, ListConfig {
@@ -60,7 +60,7 @@ use cobble_data_structure::{ListConfig, ListRetainMode, StructuredDb};
 let mut config = Config::default();
 config.num_columns = 2;
 config.total_buckets = 1024;
-config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-structured-dist".to_string());
+config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-structured-dist");
 let mut db = StructuredDb::open(config, vec![0u16..=1023u16])?;
 db.update_schema()
   .add_list_column(1, ListConfig {
@@ -99,7 +99,7 @@ use cobble::{Config, ReaderConfig, VolumeDescriptor};
 use cobble_data_structure::{StructuredReader, StructuredReadOnlyDb};
 
 let read_config = ReaderConfig {
-    volumes: VolumeDescriptor::single_volume("file:///tmp/my-db".to_string()),
+    volumes: VolumeDescriptor::single_volume("file:///tmp/my-db"),
     total_buckets: 1024,
     ..ReaderConfig::default()
 };
@@ -111,7 +111,7 @@ reader.refresh()?;
 let mut config = Config::default();
 config.num_columns = 2;
 config.total_buckets = 1024;
-config.volumes = VolumeDescriptor::single_volume("file:///tmp/my-db".to_string());
+config.volumes = VolumeDescriptor::single_volume("file:///tmp/my-db");
 let ro = StructuredReadOnlyDb::open(config, snapshot_id, db_id)?;
 let row2 = ro.get(0, b"k1")?;
 ```

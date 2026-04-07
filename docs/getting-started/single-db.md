@@ -14,7 +14,7 @@ nav_order: 4
 use cobble::{Config, SingleDb, VolumeDescriptor};
 
 let mut config = Config::default();
-config.volumes = VolumeDescriptor::single_volume("file:///tmp/my-db".to_string());
+config.volumes = VolumeDescriptor::single_volume("file:///tmp/my-db");
 
 let db = SingleDb::open(config)?;
 ```
@@ -57,7 +57,7 @@ drop(db);
 
 // Resume from the snapshot
 let mut config = Config::default();
-config.volumes = VolumeDescriptor::single_volume("file:///tmp/my-db".to_string());
+config.volumes = VolumeDescriptor::single_volume("file:///tmp/my-db");
 let db = SingleDb::resume(config, snapshot_id)?;
 
 // Data is intact

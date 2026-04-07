@@ -13,7 +13,7 @@ pub struct CoordinatorConfig {
 impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
-            volumes: VolumeDescriptor::single_volume("file:///tmp/cobble".to_string()),
+            volumes: VolumeDescriptor::single_volume("file:///tmp/cobble"),
             snapshot_retention: None,
         }
     }

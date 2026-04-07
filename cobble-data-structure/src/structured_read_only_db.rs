@@ -13,14 +13,14 @@ pub struct StructuredReadOnlyDb {
 }
 
 impl StructuredReadOnlyDb {
-    pub fn open(config: Config, snapshot_id: u64, db_id: String) -> Result<Self> {
+    pub fn open(config: Config, snapshot_id: u64, db_id: impl Into<String>) -> Result<Self> {
         Self::open_with_resolver(config, snapshot_id, db_id, None)
     }
 
     pub fn open_with_resolver(
         config: Config,
         snapshot_id: u64,
-        db_id: String,
+        db_id: impl Into<String>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
         let db = ReadOnlyDb::open_with_db_id_and_resolver(

@@ -255,16 +255,21 @@ fn can_incremental_snapshot_from_tree_versions(
 
 impl Db {
     /// Open a writable database initialized from a snapshot manifest.
-    pub fn open_from_snapshot(config: Config, snapshot_id: u64, db_id: String) -> Result<Self> {
+    pub fn open_from_snapshot(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+    ) -> Result<Self> {
         Self::open_from_snapshot_with_resolver(config, snapshot_id, db_id, None)
     }
 
     pub fn open_from_snapshot_with_resolver(
         config: Config,
         snapshot_id: u64,
-        db_id: String,
+        db_id: impl Into<String>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
+        let db_id = db_id.into();
         let config = config.normalize_volume_paths()?;
         init_logging(&config);
         log::info!(
@@ -350,15 +355,16 @@ impl Db {
     }
 
     /// Resume a writable database from an existing folder by loading all snapshot manifests.
-    pub fn resume(config: Config, db_id: String) -> Result<Self> {
+    pub fn resume(config: Config, db_id: impl Into<String>) -> Result<Self> {
         Self::resume_with_resolver(config, db_id, None)
     }
 
     pub fn resume_with_resolver(
         config: Config,
-        db_id: String,
+        db_id: impl Into<String>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
+        let db_id = db_id.into();
         let config = config.normalize_volume_paths()?;
         init_logging(&config);
         log::info!(

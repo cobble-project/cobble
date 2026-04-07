@@ -38,7 +38,7 @@ impl Default for ReaderConfig {
     fn default() -> Self {
         let default_config = Config::default();
         Self {
-            volumes: VolumeDescriptor::single_volume("file:///tmp/".to_string()),
+            volumes: VolumeDescriptor::single_volume("file:///tmp/"),
             total_buckets: default_config.total_buckets,
             pin_partition_in_memory_count: 1,
             block_cache_size: 512 * 1024 * 1024,
