@@ -34,7 +34,7 @@ Two parameters control the memtable's memory behavior:
 
 ## Value Separation During Flush
 
-When [key-value separation](key-value-separation) is enabled, the flush process examines each value. Values larger than `value_separation_threshold` are written to a separate VLOG file instead of being inlined in the SST. The SST stores only a small pointer, which dramatically reduces the amount of data that flows through [compaction](compaction) in subsequent levels.
+When [key-value separation](key-value-separation) is enabled (`value_separation_threshold` is set), the flush process examines each value. Values larger than `value_separation_threshold` are written to a separate VLOG file instead of being inlined in the SST. The SST stores only a small pointer, which dramatically reduces the amount of data that flows through [compaction](compaction) in subsequent levels.
 
 ## Incremental Snapshots
 

@@ -7,6 +7,7 @@ use cobble::{
     VolumeUsageKind, WriteBatch,
 };
 use serde_json::Value as JsonValue;
+use size::Size;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -206,17 +207,17 @@ fn test_db_put_get_large_dataset() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 4 * 1024 * 1024,
+        memtable_capacity: Size::from_mib(4),
         memtable_buffer_count: 2,
         num_columns: 1,
         l0_file_limit: 2,
         write_stall_limit: None,
-        l1_base_bytes: 16 * 1024 * 1024,
+        l1_base_bytes: Size::from_mib(16),
         level_size_multiplier: 2,
         max_level: 4,
         compaction_policy: CompactionPolicyKind::RoundRobin,
-        block_cache_size: 0,
-        base_file_size: 4 * 1024 * 1024,
+        block_cache_size: Size::from_const(0),
+        base_file_size: Size::from_mib(4),
         log_path: None,
         log_console: true,
         log_level: log::LevelFilter::Debug,
@@ -257,17 +258,17 @@ fn test_db_writebatch_get_large_dataset() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 4 * 1024 * 1024,
+        memtable_capacity: Size::from_mib(4),
         memtable_buffer_count: 2,
         num_columns: 1,
         l0_file_limit: 2,
         write_stall_limit: None,
-        l1_base_bytes: 16 * 1024 * 1024,
+        l1_base_bytes: Size::from_mib(16),
         level_size_multiplier: 2,
         max_level: 4,
         compaction_policy: CompactionPolicyKind::RoundRobin,
-        block_cache_size: 0,
-        base_file_size: 4 * 1024 * 1024,
+        block_cache_size: Size::from_const(0),
+        base_file_size: Size::from_mib(4),
         log_path: None,
         log_console: true,
         log_level: log::LevelFilter::Debug,
@@ -309,18 +310,18 @@ fn test_db_put_get_large_dataset_with_separated_values() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 4 * 1024 * 1024,
+        memtable_capacity: Size::from_mib(4),
         memtable_buffer_count: 2,
         num_columns: 1,
         l0_file_limit: 2,
         write_stall_limit: None,
-        l1_base_bytes: 16 * 1024 * 1024,
+        l1_base_bytes: Size::from_mib(16),
         level_size_multiplier: 2,
         max_level: 4,
         compaction_policy: CompactionPolicyKind::RoundRobin,
-        block_cache_size: 0,
-        base_file_size: 4 * 1024 * 1024,
-        value_separation_threshold: 1024,
+        block_cache_size: Size::from_const(0),
+        base_file_size: Size::from_mib(4),
+        value_separation_threshold: Some(Size::from_kib(1)),
         log_path: None,
         log_console: true,
         log_level: log::LevelFilter::Debug,
@@ -361,18 +362,18 @@ fn test_db_writebatch_get_large_dataset_with_separated_values() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 4 * 1024 * 1024,
+        memtable_capacity: Size::from_mib(4),
         memtable_buffer_count: 2,
         num_columns: 1,
         l0_file_limit: 2,
         write_stall_limit: None,
-        l1_base_bytes: 16 * 1024 * 1024,
+        l1_base_bytes: Size::from_mib(16),
         level_size_multiplier: 2,
         max_level: 4,
         compaction_policy: CompactionPolicyKind::RoundRobin,
-        block_cache_size: 0,
-        base_file_size: 4 * 1024 * 1024,
-        value_separation_threshold: 1024,
+        block_cache_size: Size::from_const(0),
+        base_file_size: Size::from_mib(4),
+        value_separation_threshold: Some(Size::from_kib(1)),
         log_path: None,
         log_console: true,
         log_level: log::LevelFilter::Debug,
@@ -414,17 +415,17 @@ fn test_db_counter_merge_large_dataset_with_compaction_and_file_read() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 8 * 1024,
+        memtable_capacity: Size::from_kib(8),
         memtable_buffer_count: 2,
         num_columns: 1,
         l0_file_limit: 2,
         write_stall_limit: None,
-        l1_base_bytes: 64 * 1024,
+        l1_base_bytes: Size::from_kib(64),
         level_size_multiplier: 2,
         max_level: 4,
         compaction_policy: CompactionPolicyKind::RoundRobin,
-        block_cache_size: 0,
-        base_file_size: 32 * 1024,
+        block_cache_size: Size::from_const(0),
+        base_file_size: Size::from_kib(32),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -496,10 +497,10 @@ fn test_schema_persisted_and_restored_across_open_modes() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 8 * 1024,
+        memtable_capacity: Size::from_kib(8),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -558,10 +559,10 @@ fn test_db_get_filters_columns() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 4 * 1024,
+        memtable_capacity: Size::from_kib(4),
         memtable_buffer_count: 2,
         num_columns: 3,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -605,10 +606,10 @@ fn test_db_delete_with_large_values() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 4 * 1024,
+        memtable_capacity: Size::from_kib(4),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -637,10 +638,10 @@ fn test_db_merge_with_large_values() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 4 * 1024,
+        memtable_capacity: Size::from_kib(4),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -674,17 +675,17 @@ fn test_db_ttl_put_get_with_manual_time() {
 
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 4 * 1024 * 1024,
+        memtable_capacity: Size::from_mib(4),
         memtable_buffer_count: 2,
         num_columns: 1,
         l0_file_limit: 2,
         write_stall_limit: None,
-        l1_base_bytes: 16 * 1024 * 1024,
+        l1_base_bytes: Size::from_mib(16),
         level_size_multiplier: 2,
         max_level: 4,
         compaction_policy: CompactionPolicyKind::RoundRobin,
-        block_cache_size: 0,
-        base_file_size: 4 * 1024 * 1024,
+        block_cache_size: Size::from_const(0),
+        base_file_size: Size::from_mib(4),
         ttl_enabled: true,
         default_ttl_seconds: None,
         time_provider: TimeProviderKind::Manual,
@@ -725,17 +726,17 @@ fn test_db_ttl_default_ttl_with_manual_time() {
     cleanup_test_root(root);
 
     let config = Config {
-        memtable_capacity: 4 * 1024 * 1024,
+        memtable_capacity: Size::from_mib(4),
         memtable_buffer_count: 2,
         num_columns: 1,
         l0_file_limit: 2,
         write_stall_limit: None,
-        l1_base_bytes: 16 * 1024 * 1024,
+        l1_base_bytes: Size::from_mib(16),
         level_size_multiplier: 2,
         max_level: 4,
         compaction_policy: CompactionPolicyKind::RoundRobin,
-        block_cache_size: 0,
-        base_file_size: 4 * 1024 * 1024,
+        block_cache_size: Size::from_const(0),
+        base_file_size: Size::from_mib(4),
         ttl_enabled: true,
         default_ttl_seconds: Some(5),
         time_provider: cobble::TimeProviderKind::Manual,
@@ -770,11 +771,11 @@ fn test_db_snapshot_creates_manifest() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
         total_buckets: 8,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -801,11 +802,11 @@ fn test_single_db_snapshot_updates_global_manifest() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
         total_buckets: 8,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -850,11 +851,11 @@ fn test_single_db_close_waits_snapshot_global_materialization() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
         total_buckets: 8,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -876,11 +877,11 @@ fn test_db_snapshot_read_only_get_with_vec_memtable() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 256,
+        memtable_capacity: Size::from_const(256),
         memtable_buffer_count: 2,
         memtable_type: MemtableType::Vec,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -913,12 +914,12 @@ fn test_db_snapshot_read_only_get_with_vec_memtable_separated_values() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 256,
+        memtable_capacity: Size::from_const(256),
         memtable_buffer_count: 2,
         memtable_type: MemtableType::Vec,
         num_columns: 1,
-        value_separation_threshold: 8,
-        block_cache_size: 0,
+        value_separation_threshold: Some(Size::from_const(8)),
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -951,11 +952,11 @@ fn test_db_snapshot_read_only_get_with_skiplist_memtable() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 256,
+        memtable_capacity: Size::from_const(256),
         memtable_buffer_count: 2,
         memtable_type: MemtableType::Skiplist,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -988,12 +989,12 @@ fn test_db_snapshot_read_only_get_with_skiplist_memtable_separated_values() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 256,
+        memtable_capacity: Size::from_const(256),
         memtable_buffer_count: 2,
         memtable_type: MemtableType::Skiplist,
         num_columns: 1,
-        value_separation_threshold: 8,
-        block_cache_size: 0,
+        value_separation_threshold: Some(Size::from_const(8)),
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1026,10 +1027,10 @@ fn test_db_snapshot_read_only_get() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1058,11 +1059,11 @@ fn test_db_snapshot_read_only_get_with_separated_value() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        value_separation_threshold: 8,
-        block_cache_size: 0,
+        value_separation_threshold: Some(Size::from_const(8)),
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1092,11 +1093,11 @@ fn test_db_snapshot_read_only_scan_with_separated_value() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        value_separation_threshold: 8,
-        block_cache_size: 0,
+        value_separation_threshold: Some(Size::from_const(8)),
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1133,10 +1134,10 @@ fn test_db_incremental_snapshot_restore() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1193,11 +1194,11 @@ fn test_db_snapshot_volume_uploads_files_and_keeps_incremental_manifest() {
                 vec![VolumeUsageKind::Snapshot, VolumeUsageKind::Meta],
             ),
         ],
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
-        value_separation_threshold: 16,
+        block_cache_size: Size::from_const(0),
+        value_separation_threshold: Some(Size::from_const(16)),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1261,10 +1262,10 @@ fn test_db_restore_from_readonly_snapshot_volume_migrates_files_and_disables_fir
 
     let source_config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", old_root)),
-        memtable_capacity: 64,
+        memtable_capacity: Size::from_const(64),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1319,10 +1320,10 @@ fn test_db_restore_from_readonly_snapshot_volume_migrates_files_and_disables_fir
                 vec![VolumeUsageKind::Readonly],
             ),
         ],
-        memtable_capacity: 64,
+        memtable_capacity: Size::from_const(64),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1378,11 +1379,11 @@ fn test_db_snapshot_multi_volume_selection_reuse_and_expire_regression() {
                 vec![VolumeUsageKind::Snapshot],
             ),
         ],
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
-        value_separation_threshold: 16,
+        block_cache_size: Size::from_const(0),
+        value_separation_threshold: Some(Size::from_const(16)),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1445,10 +1446,10 @@ fn test_db_incremental_snapshot_keeps_base_manifest_live() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1482,10 +1483,10 @@ fn test_db_open_from_snapshot_allows_writes() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1522,11 +1523,11 @@ fn test_db_resume_takes_over_snapshot_lifecycle() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
         total_buckets: 8,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1564,11 +1565,11 @@ fn test_db_multi_lsm_snapshot_restore_and_resume() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 256,
+        memtable_capacity: Size::from_const(256),
         memtable_buffer_count: 2,
         num_columns: 1,
         total_buckets: 4,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1634,11 +1635,11 @@ fn test_db_parquet_snapshot_restore_and_read_only() {
     let config = config_with_data_file_type(
         Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-            memtable_capacity: 256,
+            memtable_capacity: Size::from_const(256),
             memtable_buffer_count: 2,
             num_columns: 1,
             total_buckets: 4,
-            block_cache_size: 0,
+            block_cache_size: Size::from_const(0),
             ..Config::default()
         },
         "parquet",
@@ -1686,10 +1687,10 @@ fn test_db_metrics_list() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1742,10 +1743,10 @@ fn test_db_expire_snapshot_releases_manifest() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         ..Config::default()
     };
     let db = open_db(config);
@@ -1775,10 +1776,10 @@ fn test_db_expire_snapshot_releases_schema_files() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1826,11 +1827,11 @@ fn test_db_snapshot_uses_active_memtable_incremental_data_when_under_threshold()
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 1024,
+        memtable_capacity: Size::from_kib(1),
         memtable_buffer_count: 2,
         num_columns: 1,
         active_memtable_incremental_snapshot_ratio: 0.9,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -1894,12 +1895,12 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 2048,
+        memtable_capacity: Size::from_kib(2),
         memtable_buffer_count: 2,
         num_columns: 1,
-        value_separation_threshold: 8,
+        value_separation_threshold: Some(Size::from_const(8)),
         active_memtable_incremental_snapshot_ratio: 0.9,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -2037,11 +2038,11 @@ fn test_db_resume_can_continue_writes_after_active_memtable_snapshot() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 1024,
+        memtable_capacity: Size::from_kib(1),
         memtable_buffer_count: 2,
         num_columns: 1,
         active_memtable_incremental_snapshot_ratio: 0.9,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -2085,11 +2086,11 @@ fn test_db_snapshot_falls_back_to_sst_when_active_memtable_above_threshold() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 1024,
+        memtable_capacity: Size::from_kib(1),
         memtable_buffer_count: 2,
         num_columns: 1,
         active_memtable_incremental_snapshot_ratio: 0.05,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -2139,10 +2140,10 @@ fn test_db_snapshot_auto_expire() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         snapshot_retention: Some(1),
         snapshot_on_flush: true,
         sst_bloom_filter_enabled: true,
@@ -2180,10 +2181,10 @@ fn test_db_snapshot_retain_skips_auto_expire() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 128,
+        memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         snapshot_retention: Some(1),
         snapshot_on_flush: true,
         sst_bloom_filter_enabled: true,
@@ -2222,11 +2223,11 @@ fn test_db_scan_put_reads_from_memtable_and_sst() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 1024,
+        memtable_capacity: Size::from_kib(1),
         memtable_buffer_count: 2,
         num_columns: 1,
-        value_separation_threshold: 64,
-        block_cache_size: 0,
+        value_separation_threshold: Some(Size::from_const(64)),
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -2289,10 +2290,10 @@ fn test_db_scan_put_range_keeps_latest_value() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 1024,
+        memtable_capacity: Size::from_kib(1),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -2351,10 +2352,10 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
     let config = config_with_data_file_type(
         Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-            memtable_capacity: 1024,
+            memtable_capacity: Size::from_kib(1),
             memtable_buffer_count: 2,
             num_columns: 3,
-            block_cache_size: 0,
+            block_cache_size: Size::from_const(0),
             sst_bloom_filter_enabled: true,
             ..Config::default()
         },
@@ -2385,7 +2386,7 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
     );
 
     let mut scan_options = ScanOptions::for_columns(vec![2, 0]);
-    scan_options.read_ahead_bytes = 256;
+    scan_options.read_ahead_bytes = Size::from_const(256);
     let mut iter = db
         .scan_with_options(
             0,
@@ -2479,16 +2480,16 @@ fn test_db_skiplist_large_write_flush_and_scan() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        memtable_capacity: 16 * 1024,
+        memtable_capacity: Size::from_kib(16),
         memtable_buffer_count: 2,
         memtable_type: MemtableType::Skiplist,
         num_columns: 1,
         l0_file_limit: 2,
         write_stall_limit: None,
-        l1_base_bytes: 64 * 1024,
+        l1_base_bytes: Size::from_kib(64),
         level_size_multiplier: 2,
         max_level: 4,
-        block_cache_size: 0,
+        block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };

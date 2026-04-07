@@ -279,7 +279,8 @@ impl Db {
         );
         metrics_registry::init_metrics();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
-        let hybrid_cache_plan = config.resolve_hybrid_cache_volume_plan(config.block_cache_size)?;
+        let hybrid_cache_plan =
+            config.resolve_hybrid_cache_volume_plan(config.block_cache_size_bytes()?)?;
         let file_manager_config =
             config.apply_hybrid_cache_primary_partition_with_plan(hybrid_cache_plan.as_ref())?;
         let file_manager =
@@ -374,7 +375,8 @@ impl Db {
         );
         metrics_registry::init_metrics();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
-        let hybrid_cache_plan = config.resolve_hybrid_cache_volume_plan(config.block_cache_size)?;
+        let hybrid_cache_plan =
+            config.resolve_hybrid_cache_volume_plan(config.block_cache_size_bytes()?)?;
         let file_manager_config =
             config.apply_hybrid_cache_primary_partition_with_plan(hybrid_cache_plan.as_ref())?;
         let file_manager =

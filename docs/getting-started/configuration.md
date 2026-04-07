@@ -98,6 +98,8 @@ config.volumes = vec![
 
 ## Key Configuration Parameters
 
+All capacity/size fields in `Config` (such as `memtable_capacity`, `l1_base_bytes`, `base_file_size`, `block_cache_size`, and `parquet_row_group_size_bytes`) use `Size`. In config files, you can write raw bytes (for example `67108864`) or unit strings (for example `"64MiB"`).
+
 ### Memtable
 
 | Parameter | Default | Description |
@@ -140,7 +142,7 @@ config.volumes = vec![
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `value_separation_threshold` | `usize::MAX` | Byte threshold to separate values into VLOG (disabled by default) |
+| `value_separation_threshold` | `None` | Byte threshold to separate values into VLOG (`None` disables separation) |
 
 ### TTL
 

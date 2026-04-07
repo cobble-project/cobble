@@ -3,6 +3,7 @@ use log::LevelFilter::Debug;
 use rand_core::Rng;
 use rand_core::SeedableRng;
 use rand_xorshift::XorShiftRng;
+use size::Size;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -209,9 +210,9 @@ fn run(args: Args) -> Result<(), String> {
         ));
     }
     let value_separation_threshold = if matches!(args.mode, BenchMode::BulkLoadSeparated) {
-        SEPARATED_BULKLOAD_THRESHOLD
+        Some(Size::from_const(SEPARATED_BULKLOAD_THRESHOLD as i64))
     } else {
-        usize::MAX
+        None
     };
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", args.db_path.display())),
@@ -233,7 +234,7 @@ fn run(args: Args) -> Result<(), String> {
                 args.key_count,
                 args.key_len,
                 args.value_len,
-                value_separation_threshold,
+                value_separation_threshold.map(|v| v.bytes()).unwrap_or(0),
                 args.db_path.display(),
                 args.seed,
                 args.remote_compactor.as_deref().unwrap_or("local")

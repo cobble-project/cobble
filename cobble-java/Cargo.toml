@@ -20,3 +20,4 @@ bytes = { workspace = true }
 jni = "0.21"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+size = { workspace = true }

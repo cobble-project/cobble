@@ -458,6 +458,7 @@ mod tests {
     use crate::metrics_manager::MetricsManager;
     use crate::{Config, VolumeDescriptor};
     use serial_test::serial;
+    use size::Size;
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -472,7 +473,7 @@ mod tests {
         let root = "/tmp/db_expand_bucket";
         cleanup_test_root(root);
         let mut config = Config {
-            memtable_capacity: 128,
+            memtable_capacity: Size::from_const(128),
             memtable_buffer_count: 2,
             num_columns: 1,
             sst_bloom_filter_enabled: true,
@@ -520,7 +521,7 @@ mod tests {
         let root = "/tmp/db_expand_bucket_outside_source";
         cleanup_test_root(root);
         let mut config = Config {
-            memtable_capacity: 128,
+            memtable_capacity: Size::from_const(128),
             memtable_buffer_count: 2,
             num_columns: 1,
             sst_bloom_filter_enabled: true,
@@ -605,10 +606,10 @@ mod tests {
         cleanup_test_root(root);
         let config = Config {
             total_buckets: 8,
-            memtable_capacity: 8 * 1024,
+            memtable_capacity: Size::from_kib(8),
             memtable_buffer_count: 2,
             num_columns: 1,
-            value_separation_threshold: 1,
+            value_separation_threshold: Some(Size::from_const(1)),
             active_memtable_incremental_snapshot_ratio: 1.0,
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             ..Config::default()
@@ -654,7 +655,7 @@ mod tests {
         cleanup_test_root(root);
         let config = Config {
             total_buckets: 8,
-            memtable_capacity: 128,
+            memtable_capacity: Size::from_const(128),
             memtable_buffer_count: 2,
             num_columns: 1,
             sst_bloom_filter_enabled: true,

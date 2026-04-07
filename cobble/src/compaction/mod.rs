@@ -33,7 +33,7 @@ use crate::parquet::{ParquetWriter, ParquetWriterOptions};
 use crate::schema::SchemaManager;
 use crate::sst::SSTWriterOptions;
 use crate::writer_options::WriterOptions;
-use log::info;
+use log::{error, info};
 use std::sync::{Arc, Mutex, Weak};
 
 pub(crate) trait CompactionWorker: Send + Sync {
@@ -112,7 +112,17 @@ impl LocalCompactionWorker {
         }
         let sst_metrics = tree.sst_metrics();
         let runtime_num_columns = self.schema_manager.current_num_columns();
-        let mut writer_options = build_writer_options(&self.config, output_level, data_file_type);
+        let mut writer_options =
+            match build_writer_options(&self.config, output_level, data_file_type) {
+                Ok(options) => options,
+                Err(err) => {
+                    error!(
+                        "skip compaction submit due to invalid writer size config: {}",
+                        err
+                    );
+                    return None;
+                }
+            };
         match &mut writer_options {
             WriterOptions::Sst(sst_options) => {
                 sst_options.num_columns = runtime_num_columns;
@@ -197,12 +207,12 @@ pub(crate) fn make_data_file_builder_factory(
     }
 }
 
-pub(crate) fn build_parquet_writer_options(config: &crate::Config) -> ParquetWriterOptions {
-    ParquetWriterOptions {
-        row_group_size_bytes: config.parquet_row_group_size_bytes.max(1),
+pub(crate) fn build_parquet_writer_options(config: &crate::Config) -> Result<ParquetWriterOptions> {
+    Ok(ParquetWriterOptions {
+        row_group_size_bytes: config.parquet_row_group_size_bytes()?.max(1),
         num_columns: config.num_columns,
         ..ParquetWriterOptions::default()
-    }
+    })
 }
 
 pub(crate) fn build_sst_writer_options(config: &crate::Config, level: u8) -> SSTWriterOptions {
@@ -220,22 +230,22 @@ pub(crate) fn build_writer_options(
     config: &crate::Config,
     level: u8,
     data_file_type: DataFileType,
-) -> WriterOptions {
-    match data_file_type {
+) -> Result<WriterOptions> {
+    Ok(match data_file_type {
         DataFileType::SSTable => WriterOptions::Sst(build_sst_writer_options(config, level)),
-        DataFileType::Parquet => WriterOptions::Parquet(build_parquet_writer_options(config)),
-    }
+        DataFileType::Parquet => WriterOptions::Parquet(build_parquet_writer_options(config)?),
+    })
 }
 
-pub(crate) fn build_compaction_config(config: &crate::Config) -> CompactionConfig {
-    CompactionConfig {
+pub(crate) fn build_compaction_config(config: &crate::Config) -> Result<CompactionConfig> {
+    Ok(CompactionConfig {
         policy: config.compaction_policy,
         l0_file_limit: config.l0_file_limit,
-        l1_base_bytes: config.l1_base_bytes,
+        l1_base_bytes: config.l1_base_bytes_bytes()?,
         level_size_multiplier: config.level_size_multiplier,
         max_level: config.max_level,
         num_columns: config.num_columns,
-        target_file_size: config.base_file_size,
+        target_file_size: config.base_file_size_bytes()?,
         bloom_filter_enabled: config.sst_bloom_filter_enabled,
         bloom_bits_per_key: config.sst_bloom_bits_per_key,
         partitioned_index: config.sst_partitioned_index,
@@ -244,5 +254,5 @@ pub(crate) fn build_compaction_config(config: &crate::Config) -> CompactionConfi
         split_trigger_level: config.lsm_split_trigger_level,
         output_file_type: config.data_file_type,
         ..CompactionConfig::default()
-    }
+    })
 }

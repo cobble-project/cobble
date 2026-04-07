@@ -563,6 +563,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serial_test",
+ "size",
  "tempfile",
  "thiserror 2.0.16",
  "tokio",
@@ -579,6 +580,7 @@ dependencies = [
  "log",
  "rand_core 0.10.0",
  "rand_xorshift",
+ "size",
 ]
 
 [[package]]
@@ -609,6 +611,7 @@ dependencies = [
  "cobble",
  "serde",
  "serde_json",
+ "size",
  "uuid",
 ]
 
@@ -622,6 +625,7 @@ dependencies = [
  "jni",
  "serde",
  "serde_json",
+ "size",
 ]
 
 [[package]]
@@ -637,6 +641,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "size",
  "thiserror 2.0.16",
  "tokio",
  "uuid",
@@ -3174,6 +3179,15 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "size"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b6709c7b6754dca1311b3c73e79fcce40dd414c782c66d88e8823030093b02b"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "slab"

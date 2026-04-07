@@ -1,6 +1,7 @@
 use crate::Config;
 use crate::error::{Error, Result};
 use bytes::Bytes;
+use size::Size;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use url::Url;
@@ -42,6 +43,25 @@ pub(crate) fn build_commit_short_id() -> &'static str {
 
 pub(crate) fn build_version_string() -> &'static str {
     concat!("v", env!("CARGO_PKG_VERSION"))
+}
+
+pub(crate) fn size_to_u64(field_name: &str, size: Size) -> std::result::Result<u64, String> {
+    let bytes = size.bytes();
+    if bytes < 0 {
+        return Err(format!("{field_name} must be non-negative, got {}", bytes));
+    }
+    Ok(bytes as u64)
+}
+
+pub(crate) fn size_to_usize(field_name: &str, size: Size) -> std::result::Result<usize, String> {
+    let bytes = size_to_u64(field_name, size)?;
+    usize::try_from(bytes).map_err(|_| {
+        format!(
+            "{field_name}={} exceeds platform usize max {}",
+            bytes,
+            usize::MAX
+        )
+    })
 }
 
 pub(crate) fn ranges_overlap(left: &RangeInclusive<u16>, right: &RangeInclusive<u16>) -> bool {

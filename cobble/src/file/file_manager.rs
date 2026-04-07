@@ -856,7 +856,7 @@ impl FileManager {
         let data_volumes = Self::data_volumes_from_config(config)?;
         let options = FileManagerOptions {
             base_dir: db_id.to_string(),
-            base_file_size: config.base_file_size,
+            base_file_size: config.base_file_size_bytes()?,
             primary_volume_write_stop_watermark: config.primary_volume_write_stop_watermark,
             primary_volume_offload_trigger_watermark: config
                 .primary_volume_offload_trigger_watermark,
@@ -916,7 +916,7 @@ impl FileManager {
                 data_volumes.push(DataVolume {
                     fs,
                     base_dir: Some(normalized_base_dir),
-                    size_limit: volume.size_limit,
+                    size_limit: volume.size_limit_bytes()?,
                     used_bytes: AtomicU64::new(0),
                     projected_offload_bytes: AtomicU64::new(0),
                     priority: priority.unwrap_or(VolumePriority::Low),

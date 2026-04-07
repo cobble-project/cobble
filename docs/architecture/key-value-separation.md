@@ -15,10 +15,12 @@ Key-value separation addresses this by storing large values in a dedicated **Val
 Value separation is controlled by `value_separation_threshold`. Any value larger than this threshold is stored in the VLOG; smaller values remain inline in the SST.
 
 ```rust
-config.value_separation_threshold = 1024; // separate values > 1 KB
+use size::Size;
+
+config.value_separation_threshold = Some(Size::from_const(1024)); // separate values > 1 KB
 ```
 
-By default, the threshold is `usize::MAX` (effectively disabled). Enable it when:
+Set `value_separation_threshold` to `None` to disable separation. Enable it when:
 
 - Your values are consistently **larger than 1–4 KB**.
 - **Write throughput** is more important than single-read latency.
