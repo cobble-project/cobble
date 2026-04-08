@@ -176,12 +176,14 @@ Describes a storage volume.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `base_dir` | `String` | (required) | Base directory URL (`file://`, `s3://`, etc.) |
+| `base_dir` | `String` | (required) | Base directory URL (`file://`, `s3://`, etc.); S3 supports URL-encoded endpoint/root hints (for example `s3://127.0.0.1:9000/bucket/prefix?endpoint_scheme=http&region=us-east-1`) |
 | `access_id` | `Option<String>` | `None` | Access ID for remote storage |
 | `secret_key` | `Option<String>` | `None` | Secret key for remote storage |
 | `size_limit` | `Option<Size>` | `None` | Maximum volume size |
 | `custom_options` | `Option<HashMap<String, String>>` | `None` | Backend-specific initialization options passed to OpenDAL |
 | `kinds` | `u8` | 0 | Bitmask of `VolumeUsageKind` values |
+
+If you want to inject some custom options to OpenDAL for specific backends, you can use the `custom_options` field. You can find the list of supported options for each backend in [the OpenDAL documentation](https://opendal.apache.org/docs/rust/opendal/services/struct.S3.html#configuration), take S3 for example, you can set `endpoint`, `region` and so on.
 
 ### VolumeUsageKind
 
