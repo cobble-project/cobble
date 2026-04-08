@@ -279,6 +279,17 @@
       </properties>
     </profile>
     <profile>
+      <id>linux-amd64</id>
+      <activation>
+        <os><name>Linux</name><arch>amd64</arch></os>
+      </activation>
+      <properties>
+        <native.os>linux</native.os>
+        <native.arch>x86_64</native.arch>
+        <native.lib.file>lib${native.lib.name}.so</native.lib.file>
+      </properties>
+    </profile>
+    <profile>
       <id>linux-aarch64</id>
       <activation>
         <os><name>Linux</name><arch>aarch64</arch></os>
@@ -293,6 +304,17 @@
       <id>windows-x86_64</id>
       <activation>
         <os><family>windows</family><arch>x86_64</arch></os>
+      </activation>
+      <properties>
+        <native.os>windows</native.os>
+        <native.arch>x86_64</native.arch>
+        <native.lib.file>${native.lib.name}.dll</native.lib.file>
+      </properties>
+    </profile>
+    <profile>
+      <id>windows-amd64</id>
+      <activation>
+        <os><family>windows</family><arch>amd64</arch></os>
       </activation>
       <properties>
         <native.os>windows</native.os>
