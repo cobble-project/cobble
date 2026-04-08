@@ -8,6 +8,10 @@ has_children: true
 
 This section explains the design principles behind Cobble and how its components work together. The goal is to help you understand *why* Cobble behaves the way it does, so you can make informed decisions about configuration and deployment.
 
+![Archecture diagram](../static/arch-1.png)
+
+The whole architecture is described in above diagram. Data is split in buckets and each shard may contain multiple buckets. Each shard is managed by a `Db` instance (the read-write node in the diagram), which handles writes, compactions, and local snapshots. The `Coordinator` manages global snapshots across shards. The `ReadonlyDb` instances (the read-only node in diagram) can read from the materialized snapshots for consistent reads and scans. All those components can be embedded in any service or application, providing a lot of flexibility in how you build on top of Cobble. These components share loose consistency through shared file-based snapshots and manifest files, leaving the application to decide how to handle cross-shard consistency if needed.
+
 ## Design Philosophy
 
 Cobble is built around a few core ideas:
