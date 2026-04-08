@@ -92,6 +92,7 @@ impl<R: ReadAllFile> MetadataReader<R> {
 pub(crate) struct MetadataWriter<W: SequentialWriteFile> {
     inner: Option<W>,
     checksum_hasher: Hasher,
+    closed: bool,
 }
 
 impl<W: SequentialWriteFile> MetadataWriter<W> {
@@ -99,12 +100,16 @@ impl<W: SequentialWriteFile> MetadataWriter<W> {
         Self {
             inner: Some(inner),
             checksum_hasher: Hasher::new(),
+            closed: false,
         }
     }
 }
 
 impl<W: SequentialWriteFile> SequentialWriteFile for MetadataWriter<W> {
     fn write(&mut self, data: &[u8]) -> Result<usize> {
+        if self.closed {
+            return Err(Error::IoError("Metadata writer already closed".to_string()));
+        }
         match self.inner.as_mut() {
             Some(inner) => {
                 let written = inner.write(data)?;
@@ -118,14 +123,17 @@ impl<W: SequentialWriteFile> SequentialWriteFile for MetadataWriter<W> {
 
 impl<W: SequentialWriteFile> File for MetadataWriter<W> {
     fn close(&mut self) -> Result<()> {
-        let Some(inner) = self.inner.take() else {
+        if self.closed {
+            return Ok(());
+        }
+        let Some(inner) = self.inner.as_mut() else {
             return Ok(());
         };
-        let mut inner = inner;
         let checksum = std::mem::replace(&mut self.checksum_hasher, Hasher::new()).finalize();
         let trailer = trailer_for_checksum(checksum);
         inner.write(&trailer)?;
         inner.close()?;
+        self.closed = true;
         Ok(())
     }
 

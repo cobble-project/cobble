@@ -1856,7 +1856,7 @@ fn test_db_snapshot_uses_active_memtable_incremental_data_when_under_threshold()
     assert_eq!(*first_start, 0);
     assert!(first_end > first_start);
     let first_file = format!("{}/{}/{}", root, db.id(), first_path);
-    let first_data = std::fs::read(&first_file).unwrap();
+    let first_data = read_metadata_payload_from_path_for_test(&first_file).unwrap();
     assert_eq!(first_data.len() as u64, *first_end - *first_start);
 
     db.put(0, b"k2", 0, b"v2").unwrap();
@@ -1888,7 +1888,7 @@ fn test_db_snapshot_uses_active_memtable_incremental_data_when_under_threshold()
     assert_eq!(*second_start, *first_end);
     assert!(second_end > second_start);
     let second_file = format!("{}/{}/{}", root, db.id(), second_path);
-    let second_data = std::fs::read(&second_file).unwrap();
+    let second_data = read_metadata_payload_from_path_for_test(&second_file).unwrap();
     assert_eq!(second_data.len() as u64, *second_end - *second_start);
 
     cleanup_test_root(root);
@@ -1945,7 +1945,7 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
     assert!(first_vlog_file_seq.is_some());
     assert_eq!(*first_vlog_file_offset, first_data_end - first_data_start);
     let first_file = format!("{}/{}/{}", root, db.id(), first_path);
-    let first_data = std::fs::read(first_file).unwrap();
+    let first_data = read_metadata_payload_from_path_for_test(first_file).unwrap();
     let expected_first_size =
         (first_data_end - first_data_start) + (first_vlog_end - first_vlog_start);
     assert_eq!(first_data.len() as u64, expected_first_size);
@@ -2009,7 +2009,7 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
         second_data_end - second_data_start
     );
     let second_file = format!("{}/{}/{}", root, db.id(), second_path);
-    let second_data = std::fs::read(second_file).unwrap();
+    let second_data = read_metadata_payload_from_path_for_test(second_file).unwrap();
     let expected_second_size =
         (second_data_end - second_data_start) + (second_vlog_end - second_vlog_start);
     assert_eq!(second_data.len() as u64, expected_second_size);
