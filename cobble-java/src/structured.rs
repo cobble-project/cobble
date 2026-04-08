@@ -7,7 +7,7 @@
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{decode_scan_open_args, scan_options_from_handle_or_throw};
 use crate::util::{
-    decode_java_bytes, decode_java_string, decode_u16, decode_u64_from_jlong,
+    decode_java_bytes, decode_java_string, decode_u16, decode_u64_from_jlong, parse_config_json,
     throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
@@ -71,12 +71,8 @@ pub extern "system" fn Java_io_cobble_structured_Db_openHandleFromJson(
             return 0;
         }
     };
-    let config: Config = match serde_json::from_str(&config_json) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
-            return 0;
-        }
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
     };
     open_structured_db(&mut env, config)
 }
@@ -185,12 +181,8 @@ pub extern "system" fn Java_io_cobble_structured_Db_openFromSnapshotHandleFromJs
             return 0;
         }
     };
-    let config: Config = match serde_json::from_str(&config_json) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
-            return 0;
-        }
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
     };
     restore_structured_db(&mut env, config, snapshot_id, db_id)
 }
@@ -268,12 +260,8 @@ pub extern "system" fn Java_io_cobble_structured_Db_resumeHandleFromJson(
             return 0;
         }
     };
-    let config: Config = match serde_json::from_str(&config_json) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
-            return 0;
-        }
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
     };
     resume_structured_db(&mut env, config, db_id)
 }
@@ -772,12 +760,8 @@ pub extern "system" fn Java_io_cobble_structured_StructuredScanSplit_openStructu
             return 0;
         }
     };
-    let config = match serde_json::from_str::<Config>(&config_json) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_argument(&mut env, format!("invalid config json: {}", err));
-            return 0;
-        }
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
     };
     open_structured_split_scan_cursor(&mut env, config, split_json, scan_options_handle)
 }

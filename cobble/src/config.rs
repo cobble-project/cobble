@@ -547,6 +547,33 @@ impl Config {
 }
 
 impl Config {
+    pub fn from_json_str(contents: &str) -> Result<Self> {
+        let provided = serde_json::from_str::<JsonValue>(contents)
+            .map_err(|err| Error::ConfigError(err.to_string()))?;
+        let schema = serde_json::to_value(Config::default())
+            .map_err(|err| Error::ConfigError(err.to_string()))?;
+        let unrecognized = collect_unrecognized_entry_paths(&provided, &schema, "");
+        for entry in unrecognized {
+            warn!("unrecognized entry: {}", entry);
+        }
+
+        let default_json = serde_json::to_string(&Config::default())
+            .map_err(|err| Error::ConfigError(err.to_string()))?;
+        let provided_json =
+            serde_json::to_string(&provided).map_err(|err| Error::ConfigError(err.to_string()))?;
+
+        let mut builder = ConfigLoader::builder();
+        builder = builder.add_source(ConfigFile::from_str(&default_json, ConfigFileFormat::Json));
+        builder = builder.add_source(ConfigFile::from_str(&provided_json, ConfigFileFormat::Json));
+        let config: Config = builder
+            .build()
+            .map_err(|err| Error::ConfigError(err.to_string()))?
+            .try_deserialize()
+            .map_err(|err| Error::ConfigError(err.to_string()))?;
+        config.validate_sizes()?;
+        Ok(config)
+    }
+
     pub(crate) fn memtable_capacity_bytes(&self) -> Result<usize> {
         size_to_usize("memtable_capacity", self.memtable_capacity).map_err(Error::ConfigError)
     }
@@ -1197,6 +1224,18 @@ mod tests {
         json_file.flush().expect("Should be able to flush json");
 
         let decoded = Config::from_path(json_file.path()).expect("Cannot deserialize partial json");
+        assert_eq!(decoded.memtable_capacity, Size::from_kib(2));
+        assert_eq!(decoded.num_columns, Config::default().num_columns);
+        assert_eq!(decoded.data_file_type, Config::default().data_file_type);
+    }
+
+    #[test]
+    fn test_config_from_json_str_allows_partial_entries() {
+        let json = r#"{
+            "volumes": [{"base_dir":"file:///tmp/cobble","kinds":["meta","primary_data_priority_high"]}],
+            "memtable_capacity": 2048
+        }"#;
+        let decoded = Config::from_json_str(json).expect("Cannot deserialize partial json");
         assert_eq!(decoded.memtable_capacity, Size::from_kib(2));
         assert_eq!(decoded.num_columns, Config::default().num_columns);
         assert_eq!(decoded.data_file_type, Config::default().data_file_type);

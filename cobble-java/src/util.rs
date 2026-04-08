@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use cobble::Config;
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jint, jlong, jobject, jstring};
@@ -71,6 +72,16 @@ pub(crate) fn throw_illegal_state(env: &mut JNIEnv, message: String) {
 
 pub(crate) fn throw_illegal_argument(env: &mut JNIEnv, message: String) {
     let _ = env.throw_new("java/lang/IllegalArgumentException", message);
+}
+
+pub(crate) fn parse_config_json(env: &mut JNIEnv, json: &str) -> Option<Config> {
+    match Config::from_json_str(json) {
+        Ok(config) => Some(config),
+        Err(err) => {
+            throw_illegal_argument(env, format!("invalid config json: {}", err));
+            None
+        }
+    }
 }
 
 pub(crate) fn to_java_string_or_throw(env: &mut JNIEnv, value: String) -> jstring {
