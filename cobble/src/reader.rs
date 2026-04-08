@@ -3,7 +3,7 @@ use crate::config::VolumeUsageKind;
 use crate::coordinator::GlobalSnapshotManifest;
 use crate::db_state::{bucket_range_fits_total, bucket_range_last, bucket_slots_for_total};
 use crate::error::{Error, Result};
-use crate::file::{File, FileSystem, FileSystemRegistry};
+use crate::file::{FileSystem, FileSystemRegistry, MetadataReader};
 use crate::lru::LruCache;
 use crate::merge_operator::MergeOperatorResolver;
 use crate::metrics_manager::MetricsManager;
@@ -13,6 +13,10 @@ use crate::paths::{
 };
 #[cfg(test)]
 use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
+#[cfg(test)]
+use crate::test_utils::{
+    encode_metadata_payload_for_test, read_metadata_payload_from_path_for_test,
+};
 use crate::util::{build_commit_short_id, build_version_string};
 use crate::{Config, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, VolumeDescriptor};
 use bytes::Bytes;
@@ -305,7 +309,11 @@ impl Reader {
             let Some(snapshot_id) = parse_snapshot_id(manifest_name) else {
                 continue;
             };
-            let manifest = load_global_snapshot_by_name(&self.fs, manifest_name)?;
+            let manifest = match load_global_snapshot_by_name(&self.fs, manifest_name) {
+                Ok(manifest) => manifest,
+                Err(Error::ChecksumMismatch(_)) => continue,
+                Err(err) => return Err(err),
+            };
             snapshots.push(GlobalSnapshotSummary {
                 id: manifest.id,
                 total_buckets: manifest.total_buckets,
@@ -324,7 +332,11 @@ impl Reader {
             if parse_snapshot_id(manifest_name).is_none() {
                 continue;
             }
-            manifests.push(load_global_snapshot_by_name(&self.fs, manifest_name)?);
+            match load_global_snapshot_by_name(&self.fs, manifest_name) {
+                Ok(manifest) => manifests.push(manifest),
+                Err(Error::ChecksumMismatch(_)) => {}
+                Err(err) => return Err(err),
+            }
         }
         manifests.sort_by_key(|snapshot| snapshot.id);
         Ok(manifests)
@@ -425,8 +437,8 @@ fn load_global_snapshot_by_name(
 ) -> Result<GlobalSnapshotManifest> {
     let manifest_path = global_snapshot_manifest_path_by_pointer(manifest_name);
     let reader = fs.open_read(&manifest_path)?;
-    let bytes = reader.read_at(0, reader.size())?;
-    decode_global_snapshot(bytes.as_ref())
+    let payload = MetadataReader::new(reader).read_all()?;
+    decode_global_snapshot(payload.as_ref())
 }
 
 fn read_manifest_pointer(
@@ -454,8 +466,12 @@ fn read_manifest_pointer(
                 continue;
             }
         };
-        let bytes = reader.read_at(0, reader.size())?;
-        let pointer = String::from_utf8(bytes.to_vec())
+        let payload = match MetadataReader::new(reader).read_all() {
+            Ok(payload) => payload,
+            Err(Error::ChecksumMismatch(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let pointer = String::from_utf8(payload.to_vec())
             .map_err(|err| Error::IoError(format!("Invalid manifest pointer: {}", err)))?;
         let pointer = pointer.trim().to_string();
         if pointer.is_empty() {
@@ -558,18 +574,18 @@ mod tests {
         let _ = fs.create_dir(&snapshot_dir);
         let _ = fs.create_dir(&schema_dir);
         let mut schema_writer = fs.open_write(&schema_path).unwrap();
-        schema_writer
-            .write(
-                br#"{"id":0,"num_columns":1,"merge_operator_ids":[],"evolution_id":null,"evolution_indexes":null,"evolution_default_values":null,"column_metadata":[null]}"#,
-            )
-            .unwrap();
+        let schema_payload =
+            br#"{"id":0,"num_columns":1,"merge_operator_ids":[],"evolution_id":null,"evolution_indexes":null,"evolution_default_values":null,"column_metadata":[null]}"#;
+        let schema_bytes = encode_metadata_payload_for_test(schema_payload);
+        schema_writer.write(&schema_bytes).unwrap();
         schema_writer.close().unwrap();
         let mut writer = fs.open_write(&manifest_path).unwrap();
         let manifest = format!(
             "{{\"version\":1,\"id\":{},\"seq_id\":0,\"latest_schema_id\":0,\"bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"lsm_tree_bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"tree_levels\":[[]],\"vlog_files\":[],\"active_memtable_data\":[]}}",
             snapshot_id
         );
-        writer.write(manifest.as_bytes()).unwrap();
+        let manifest_bytes = encode_metadata_payload_for_test(manifest.as_bytes());
+        writer.write(&manifest_bytes).unwrap();
         writer.close().unwrap();
         wait_for_manifest_in_db(root, db_id, snapshot_id)
     }
@@ -578,17 +594,18 @@ mod tests {
         let path = format!("{}/{}", root, global_snapshot_current_path());
         let manifest = snapshot_manifest_name(snapshot_id);
         for _ in 0..50 {
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                if contents.trim() == manifest {
-                    return;
-                }
+            if let Ok(payload) = read_metadata_payload_from_path_for_test(&path)
+                && let Ok(contents) = std::str::from_utf8(&payload)
+                && contents.trim() == manifest
+            {
+                return;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let contents = std::fs::read_to_string(&path).expect("read pointer");
+        let payload = read_metadata_payload_from_path_for_test(&path).expect("read pointer");
+        let contents = std::str::from_utf8(&payload).expect("pointer utf8");
         assert_eq!(contents.trim(), manifest);
     }
-
     #[test]
     #[serial_test::serial(file)]
     fn test_read_proxy_routes_and_evicts() {

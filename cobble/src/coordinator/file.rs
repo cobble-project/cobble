@@ -1,7 +1,9 @@
 //! File writer that ensures atomic writes by writing to a temporary file
 //! and renaming it to the final path upon successful completion.
 use crate::error::{Error, Result};
-use crate::file::{File, FileSystem, SequentialWriteFile};
+use crate::file::{
+    File, FileSystem, MetadataWriter as ChecksumMetadataWriter, SequentialWriteFile,
+};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -9,7 +11,7 @@ pub(crate) struct MetadataWriter {
     temp_path: String,
     final_path: String,
     fs: Arc<dyn FileSystem>,
-    writer: Option<Box<dyn SequentialWriteFile>>,
+    writer: Option<ChecksumMetadataWriter<Box<dyn SequentialWriteFile>>>,
 }
 
 impl MetadataWriter {
@@ -20,7 +22,7 @@ impl MetadataWriter {
             temp_path,
             final_path: path.to_string(),
             fs: fs.clone(),
-            writer: Some(writer),
+            writer: Some(ChecksumMetadataWriter::new(writer)),
         })
     }
 }

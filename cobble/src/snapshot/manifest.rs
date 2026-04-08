@@ -2,8 +2,8 @@ use super::{ActiveMemtableSnapshotData, DbSnapshot};
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::{Error, Result};
 use crate::file::{
-    BufferedWriter, File, FileManager, SequentialWriteFile, TrackedFileId, VLOG_FILE_PRIORITY,
-    lsm_file_priority_for_level,
+    BufferedWriter, FileManager, MetadataReader, SequentialWriteFile, TrackedFileId,
+    VLOG_FILE_PRIORITY, lsm_file_priority_for_level,
 };
 use crate::lsm::{LSMTreeVersion, Level};
 use crate::vlog::VlogVersion;
@@ -135,11 +135,19 @@ pub(crate) fn parse_snapshot_manifest_id(name: &str) -> Option<u64> {
 }
 
 pub(crate) fn list_snapshot_manifest_ids(file_manager: &Arc<FileManager>) -> Result<Vec<u64>> {
-    let mut snapshot_ids: Vec<u64> = file_manager
+    let mut snapshot_ids = Vec::new();
+    for snapshot_id in file_manager
         .list_snapshot_metadata_names()?
         .into_iter()
         .filter_map(|name| parse_snapshot_manifest_id(&name))
-        .collect();
+    {
+        let manifest_name = snapshot_manifest_name(snapshot_id);
+        match read_manifest_payload(file_manager, &manifest_name) {
+            Ok(_) => snapshot_ids.push(snapshot_id),
+            Err(Error::ChecksumMismatch(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
     snapshot_ids.sort_unstable();
     snapshot_ids.dedup();
     Ok(snapshot_ids)
@@ -151,9 +159,8 @@ pub(crate) fn load_manifest_entry(
     loaded_by_id: &HashMap<u64, LoadedManifest>,
 ) -> Result<LoadedManifest> {
     let manifest_name = snapshot_manifest_name(snapshot_id);
-    let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
-    let bytes = reader.read_at(0, reader.size())?;
-    let (base_snapshot_id, manifest) = match decode_manifest(bytes.as_ref())? {
+    let payload = read_manifest_payload(file_manager, &manifest_name)?;
+    let (base_snapshot_id, manifest) = match decode_manifest(payload.as_ref())? {
         ManifestPayload::Snapshot(manifest) => (None, manifest),
         ManifestPayload::IncrementalSnapshot(incremental) => {
             let base_snapshot_id = Some(incremental.base_snapshot_id);
@@ -202,8 +209,7 @@ pub(crate) fn load_manifest_chain(
             )));
         }
         let manifest_name = snapshot_manifest_name(current_id);
-        let reader = file_manager.open_metadata_file_reader_untracked(&manifest_name)?;
-        let bytes = reader.read_at(0, reader.size())?;
+        let bytes = read_manifest_payload(file_manager, &manifest_name)?;
         let payload = decode_manifest(bytes.as_ref())?;
         next_id = match &payload {
             ManifestPayload::Snapshot(_) => None,
@@ -250,6 +256,12 @@ pub(crate) fn load_manifest_chain(
         });
     }
     Ok(chain)
+}
+
+fn read_manifest_payload(file_manager: &Arc<FileManager>, manifest_name: &str) -> Result<Vec<u8>> {
+    let reader = file_manager.open_metadata_file_reader_untracked(manifest_name)?;
+    let bytes = MetadataReader::new(reader).read_all()?;
+    Ok(bytes.to_vec())
 }
 
 /// Load the resolved manifest for the given snapshot id.

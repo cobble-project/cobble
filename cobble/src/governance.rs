@@ -4,7 +4,9 @@ use crate::Config;
 use crate::config::VolumeDescriptor;
 use crate::db_state::{bucket_range_fits_total, bucket_range_last};
 use crate::error::{Error, Result};
-use crate::file::{File, FileSystem, FileSystemRegistry, SequentialWriteFile};
+use crate::file::{
+    File, FileSystem, FileSystemRegistry, MetadataReader, MetadataWriter, SequentialWriteFile,
+};
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -262,14 +264,15 @@ impl GovernanceManager {
 
     fn publish(&self, manifest: &GovernanceManifest) -> Result<String> {
         let manifest_name = format!("MANIFEST.{}", Uuid::new_v4());
-        let mut manifest_writer = self.fs.open_write(&manifest_name)?;
+        let mut manifest_writer = MetadataWriter::new(self.fs.open_write(&manifest_name)?);
         let manifest_bytes = serde_json::to_vec(manifest).map_err(|err| {
             Error::IoError(format!("Failed to encode governance manifest: {}", err))
         })?;
         manifest_writer.write(&manifest_bytes)?;
         manifest_writer.close()?;
 
-        let mut pointer_writer = self.fs.open_write(GOVERNANCE_MANIFEST_POINTER_NAME)?;
+        let mut pointer_writer =
+            MetadataWriter::new(self.fs.open_write(GOVERNANCE_MANIFEST_POINTER_NAME)?);
         pointer_writer.write(manifest_name.as_bytes())?;
         pointer_writer.close()?;
         Ok(manifest_name)
@@ -280,16 +283,24 @@ impl GovernanceManager {
             return Ok(None);
         }
         let reader = self.fs.open_read(GOVERNANCE_MANIFEST_POINTER_NAME)?;
-        let bytes = reader.read_at(0, reader.size())?;
-        let manifest_name = String::from_utf8(bytes.to_vec())
+        let pointer_payload = match MetadataReader::new(reader).read_all() {
+            Ok(payload) => payload,
+            Err(Error::ChecksumMismatch(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let manifest_name = String::from_utf8(pointer_payload.to_vec())
             .map_err(|err| Error::IoError(format!("Invalid manifest pointer: {}", err)))?;
         let manifest_name = manifest_name.trim();
         if manifest_name.is_empty() {
             return Ok(None);
         }
         let reader = self.fs.open_read(manifest_name)?;
-        let bytes = reader.read_at(0, reader.size())?;
-        let manifest = serde_json::from_slice(&bytes).map_err(|err| {
+        let manifest_payload = match MetadataReader::new(reader).read_all() {
+            Ok(payload) => payload,
+            Err(Error::ChecksumMismatch(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let manifest = serde_json::from_slice(manifest_payload.as_ref()).map_err(|err| {
             Error::IoError(format!("Failed to decode governance manifest: {}", err))
         })?;
         Ok(Some(manifest))

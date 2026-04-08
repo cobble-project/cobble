@@ -27,6 +27,16 @@ pub trait RandomAccessFile: File + Send + Sync + 'static {
     }
 }
 
+pub trait ReadAllFile {
+    fn read_all(&self) -> Result<Bytes, Error>;
+}
+
+impl<T: RandomAccessFile + ?Sized> ReadAllFile for T {
+    fn read_all(&self) -> Result<Bytes, Error> {
+        self.read_at(0, self.size())
+    }
+}
+
 pub trait SequentialWriteFile: File + Send {
     fn write(&mut self, data: &[u8]) -> Result<usize, Error>;
 }

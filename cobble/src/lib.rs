@@ -160,6 +160,13 @@ pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProvide
 pub use r#type::ValueType;
 pub use write_batch::WriteBatch;
 
+#[doc(hidden)]
+pub mod test_utils {
+    pub use crate::file::metadata_io::{
+        encode_metadata_payload_for_test, read_metadata_payload_from_path_for_test,
+    };
+}
+
 pub fn build_commit_short_id() -> &'static str {
     util::build_commit_short_id()
 }
