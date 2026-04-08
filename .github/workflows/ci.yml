@@ -49,6 +49,68 @@ jobs:
         timeout-minutes: 10
         run: cargo test --verbose
 
+      - name: Start local S3 service (RustFS)
+        id: s3
+        run: |
+          set -euo pipefail
+          docker rm -f cobble-s3 >/dev/null 2>&1 || true
+          mkdir -p "$GITHUB_WORKSPACE/.ci/rustfs-data" "$GITHUB_WORKSPACE/.ci/rustfs-logs"
+          sudo chown -R 10001:10001 "$GITHUB_WORKSPACE/.ci/rustfs-data" "$GITHUB_WORKSPACE/.ci/rustfs-logs"
+          docker pull rustfs/rustfs:latest
+          docker run -d --name cobble-s3 \
+            -p 9000:9000 \
+            -p 9001:9001 \
+            -v "$GITHUB_WORKSPACE/.ci/rustfs-data:/data" \
+            -v "$GITHUB_WORKSPACE/.ci/rustfs-logs:/logs" \
+            rustfs/rustfs:latest
+          echo "access_id=rustfsadmin" >> "$GITHUB_OUTPUT"
+          echo "secret_key=rustfsadmin" >> "$GITHUB_OUTPUT"
+          echo "endpoint=http://127.0.0.1:9000" >> "$GITHUB_OUTPUT"
+          echo "bucket=cobble-test" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for local S3 service
+        run: |
+          for i in {1..60}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "${{ steps.s3.outputs.endpoint }}/" || true)
+            if [ "$code" != "000" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs cobble-s3 || true
+          echo "S3 service did not become ready in time"
+          exit 1
+
+      - name: Ensure test bucket exists
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.s3.outputs.access_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.s3.outputs.secret_key }}
+          AWS_DEFAULT_REGION: us-east-1
+          COBBLE_S3_ENDPOINT: ${{ steps.s3.outputs.endpoint }}
+          COBBLE_S3_BUCKET: ${{ steps.s3.outputs.bucket }}
+        run: |
+          if ! command -v aws >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y awscli
+          fi
+          aws --endpoint-url "$COBBLE_S3_ENDPOINT" s3api head-bucket --bucket "$COBBLE_S3_BUCKET" || \
+          aws --endpoint-url "$COBBLE_S3_ENDPOINT" s3api create-bucket --bucket "$COBBLE_S3_BUCKET"
+
+      - name: Run S3 roundtrip integration test
+        timeout-minutes: 15
+        env:
+          COBBLE_S3_ENDPOINT: ${{ steps.s3.outputs.endpoint }}
+          COBBLE_S3_BUCKET: ${{ steps.s3.outputs.bucket }}
+          COBBLE_S3_ACCESS_ID: ${{ steps.s3.outputs.access_id }}
+          COBBLE_S3_SECRET_KEY: ${{ steps.s3.outputs.secret_key }}
+        run: cargo test -p cobble --features storage-s3 --test s3_roundtrip_it s3_roundtrip_write_snapshot_resume -- --nocapture
+
+      - name: Stop local S3 service
+        if: always()
+        run: |
+          docker rm -f cobble-s3 >/dev/null 2>&1 || true
+          sudo rm -rf "$GITHUB_WORKSPACE/.ci/rustfs-data" "$GITHUB_WORKSPACE/.ci/rustfs-logs"
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
