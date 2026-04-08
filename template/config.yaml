@@ -6,6 +6,10 @@
 volumes:
   - # Base storage URL (supports file://, s3://, oss://, etc.).
     # Local file:// is always available without extra Cargo features.
+    # S3 examples:
+    # - AWS style: s3://my-bucket/my-prefix
+    # - S3-compatible local endpoint:
+    #   s3://127.0.0.1:9000/my-bucket/my-prefix?endpoint_scheme=http&region=us-east-1
     base_dir: "file:///tmp/cobble"
 
     # Optional remote auth fields. `null` means unset.
