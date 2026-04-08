@@ -3,7 +3,7 @@ use super::Db;
 use crate::data_file::intersect_bucket_ranges;
 use crate::db_state::{DbState, MultiLSMTreeVersion, bucket_range_fits_total};
 use crate::error::{Error, Result};
-use crate::file::{File, FileManager, SequentialWriteFile};
+use crate::file::{File, FileManager, MetadataReader, SequentialWriteFile};
 use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::paths::schema_file_relative_path;
@@ -168,9 +168,9 @@ impl Db {
             }
             let schema_path = schema_file_relative_path(schema_id);
             let reader = source_file_manager.open_metadata_file_reader_untracked(&schema_path)?;
-            let bytes = reader.read_at(0, reader.size())?;
+            let payload = MetadataReader::new(reader).read_all()?;
             let mut writer = self.file_manager.create_metadata_file(&schema_path)?;
-            writer.write(bytes.as_ref())?;
+            writer.write(payload.as_ref())?;
             writer.close()?;
             self.schema_manager.register_schema_from_file(
                 &self.file_manager,

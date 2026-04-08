@@ -3,7 +3,9 @@ use crate::coordinator::CoordinatorConfig;
 use crate::coordinator::file::MetadataWriter;
 use crate::error::Error::IoError;
 use crate::error::{Error, Result};
-use crate::file::{BufferedWriter, File, FileSystem, FileSystemRegistry, SequentialWriteFile};
+use crate::file::{
+    BufferedWriter, File, FileSystem, FileSystemRegistry, MetadataReader, SequentialWriteFile,
+};
 use crate::paths::{
     SNAPSHOT_DIR, global_snapshot_current_path, global_snapshot_manifest_path,
     snapshot_manifest_name,
@@ -172,7 +174,7 @@ impl DbCoordinator {
     /// Materialize a global snapshot manifest and update the pointer.
     pub fn materialize_global_snapshot(&self, snapshot: &GlobalSnapshotManifest) -> Result<()> {
         let manifest_path = global_snapshot_manifest_path(snapshot.id);
-        let writer = self.fs.open_write(&manifest_path)?;
+        let writer = MetadataWriter::new(&manifest_path, &self.fs)?;
         let mut buffered = BufferedWriter::new(writer, 8192);
         encode_global_manifest(&mut buffered, snapshot)?;
         buffered.close()?;
@@ -185,8 +187,8 @@ impl DbCoordinator {
     pub fn load_global_snapshot(&self, snapshot_id: u64) -> Result<GlobalSnapshotManifest> {
         let manifest_path = global_snapshot_manifest_path(snapshot_id);
         let reader = self.fs.open_read(&manifest_path)?;
-        let bytes = reader.read_at(0, reader.size())?;
-        decode_global_manifest(bytes.as_ref())
+        let payload = MetadataReader::new(reader).read_all()?;
+        decode_global_manifest(payload.as_ref())
     }
 
     /// Load the latest global snapshot manifest referenced by the pointer.
@@ -206,7 +208,11 @@ impl DbCoordinator {
             let Ok(snapshot_id) = parse_snapshot_id(manifest_name) else {
                 continue;
             };
-            snapshots.push(self.load_global_snapshot(snapshot_id)?);
+            match self.load_global_snapshot(snapshot_id) {
+                Ok(snapshot) => snapshots.push(snapshot),
+                Err(Error::ChecksumMismatch(_)) => {}
+                Err(err) => return Err(err),
+            }
         }
         snapshots.sort_by_key(|snapshot| snapshot.id);
         Ok(snapshots)
@@ -318,8 +324,12 @@ fn load_latest_snapshot_id(fs: &Arc<dyn FileSystem>) -> Result<Option<u64>> {
         return Ok(None);
     }
     let reader = fs.open_read(&pointer_path)?;
-    let bytes = reader.read_at(0, reader.size())?;
-    let manifest_name = String::from_utf8(bytes.to_vec())
+    let payload = match MetadataReader::new(reader).read_all() {
+        Ok(payload) => payload,
+        Err(Error::ChecksumMismatch(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let manifest_name = String::from_utf8(payload.to_vec())
         .map(|s| s.trim().to_string())
         .map_err(|err| Error::IoError(format!("Invalid manifest pointer: {}", err)))?;
     if manifest_name.is_empty() {
@@ -604,6 +614,79 @@ mod tests {
         assert!(listed.iter().any(|s| s.id == 2));
 
         assert!(node.expire_snapshot(1).unwrap());
+        let listed = node.list_global_snapshots().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, 2);
+
+        cleanup_root(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_load_latest_snapshot_id_ignores_checksum_mismatch_pointer() {
+        let root = "/tmp/coordinator_pointer_checksum";
+        cleanup_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+
+        fs.create_dir(SNAPSHOT_DIR).unwrap();
+        let mut writer = fs.open_write(&global_snapshot_current_path()).unwrap();
+        writer.write(b"SNAPSHOT-123").unwrap();
+        writer.close().unwrap();
+
+        let latest = load_latest_snapshot_id(&fs).unwrap();
+        assert!(latest.is_none());
+
+        cleanup_root(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_list_global_snapshots_skips_checksum_mismatch_manifest() {
+        let root = "/tmp/coordinator_corrupt_manifest";
+        cleanup_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let path = write_bucket_snapshot(Arc::clone(&fs), root, "db-a", 1);
+
+        let node = DbCoordinator::open(CoordinatorConfig {
+            volumes: vec![crate::config::VolumeDescriptor::new(
+                format!("file://{}", root),
+                vec![
+                    crate::config::VolumeUsageKind::PrimaryDataPriorityHigh,
+                    crate::config::VolumeUsageKind::Meta,
+                ],
+            )],
+            snapshot_retention: None,
+        })
+        .unwrap();
+
+        for id in [1_u64, 2_u64] {
+            let snapshot = node
+                .take_global_snapshot_with_id(
+                    4,
+                    vec![ShardSnapshotInput {
+                        ranges: vec![0u16..=3u16],
+                        db_id: "db-a".to_string(),
+                        snapshot_id: 1,
+                        manifest_path: path.clone(),
+                        timestamp_seconds: 0,
+                    }],
+                    id,
+                )
+                .unwrap();
+            node.materialize_global_snapshot(&snapshot).unwrap();
+        }
+
+        let corrupt_manifest_path = global_snapshot_manifest_path(1);
+        let mut corrupt_writer = fs.open_write(&corrupt_manifest_path).unwrap();
+        corrupt_writer.write(br#"{"invalid":"manifest"}"#).unwrap();
+        corrupt_writer.close().unwrap();
+
         let listed = node.list_global_snapshots().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, 2);

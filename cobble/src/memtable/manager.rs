@@ -9,7 +9,7 @@ use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
 use crate::db_status::DbLifecycle;
 use crate::error::Error::InvalidState;
 use crate::error::{Error, Result};
-use crate::file::{File, FileManager, TrackedFileId};
+use crate::file::{File, FileManager, MetadataReader, TrackedFileId};
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{
     ColumnMaskingIterator, DeduplicatingIterator, KvIterator, SchemaEvolvingIterator,
@@ -1613,8 +1613,8 @@ fn decode_active_snapshot_segments_into_memtable(
 
     for segment in segments {
         let reader = file_manager.open_metadata_file_reader_untracked(&segment.path)?;
-        let bytes = reader.read_at(0, reader.size())?;
-        let segment_bytes = bytes.as_ref();
+        let segment_payload = MetadataReader::new(reader).read_all()?;
+        let segment_bytes = segment_payload.as_ref();
         let vlog_data_file_offset = usize::try_from(segment.vlog_data_file_offset)
             .map_err(|_| Error::InvalidState("invalid vlog_data_file_offset".to_string()))?;
         if vlog_data_file_offset > segment_bytes.len() {

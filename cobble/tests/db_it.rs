@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use cobble::paths::bucket_snapshot_manifest_path;
+use cobble::test_utils::read_metadata_payload_from_path_for_test;
 use cobble::{
     CompactionPolicyKind, Config, Db, MemtableType, MetricValue, ReadOptions, Reader, ReaderConfig,
     ScanOptions, SingleDb, TimeProviderKind, U64CounterMergeOperator, VolumeDescriptor,
@@ -22,12 +23,17 @@ fn wait_for_manifest_in_db(root: &str, db_id: &str, snapshot_id: u64) -> String 
         bucket_snapshot_manifest_path(db_id, snapshot_id)
     );
     for _ in 0..50 {
-        if let Ok(contents) = std::fs::read_to_string(&full_path) {
-            return contents;
+        if let Ok(payload) = read_metadata_payload_from_path_for_test(&full_path)
+            && let Ok(contents) = std::str::from_utf8(&payload)
+        {
+            return contents.to_string();
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    std::fs::read_to_string(full_path).expect("read manifest")
+    let payload = read_metadata_payload_from_path_for_test(full_path).expect("read manifest");
+    std::str::from_utf8(&payload)
+        .expect("manifest utf8")
+        .to_string()
 }
 
 fn wait_for_missing(path: &str) {

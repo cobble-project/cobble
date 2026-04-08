@@ -17,6 +17,8 @@ pub enum Error {
     InvalidState(String),
     #[error("File format error: {0}")]
     FileFormatError(String),
+    #[error("Metadata checksum error: {0}")]
+    ChecksumMismatch(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::file::{BufferedWriter, File, FileManager};
+use crate::file::{BufferedWriter, File, FileManager, MetadataReader};
 use crate::merge_operator::{
     MergeOperator, MergeOperatorResolver, default_merge_operator, default_merge_operator_ref,
     merge_operator_by_id,
@@ -589,8 +589,8 @@ pub(crate) fn load_schema(
 ) -> Result<Schema> {
     let reader =
         file_manager.open_metadata_file_reader_untracked(&schema_file_relative_path(schema_id))?;
-    let bytes = reader.read_at(0, reader.size())?;
-    let schema_file: SchemaFile = serde_json::from_slice(bytes.as_ref())
+    let payload = MetadataReader::new(reader).read_all()?;
+    let schema_file: SchemaFile = serde_json::from_slice(payload.as_ref())
         .map_err(|err| Error::FileFormatError(format!("Failed to decode schema file: {}", err)))?;
     if schema_file.id != schema_id {
         return Err(Error::InvalidState(format!(

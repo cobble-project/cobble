@@ -15,6 +15,7 @@ use crate::config::{PrimaryVolumeOffloadPolicyKind, VolumeUsageKind};
 use crate::error::{Error, Result};
 use crate::file::file_system::{FileSystem, FileSystemRegistry};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
+use crate::file::metadata_io::MetadataWriter;
 use crate::file::offload::OffloadRuntime;
 use crate::lru::LruCache;
 use crate::metrics_manager::MetricsManager;
@@ -509,7 +510,7 @@ pub struct AtomicMetadataWriter {
     temp_path: String,
     final_name: String,
     final_path: String,
-    writer: Option<TrackedWriter>,
+    writer: Option<MetadataWriter<TrackedWriter>>,
     fs: Arc<dyn FileSystem>,
     metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
     metadata_files_gauge: Gauge,
@@ -532,7 +533,7 @@ impl AtomicMetadataWriter {
             temp_path,
             final_name,
             final_path,
-            writer: Some(writer),
+            writer: Some(MetadataWriter::new(writer)),
             fs,
             metadata_files,
             metadata_files_gauge,

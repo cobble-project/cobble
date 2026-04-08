@@ -1,6 +1,7 @@
 mod file_manager;
 mod file_system;
 mod files;
+pub(crate) mod metadata_io;
 mod offload;
 mod opendal_file;
 mod opendal_fs;
@@ -23,4 +24,5 @@ pub use self::files::{
     BufferedReader, BufferedWriter, File, RandomAccessFile, ReadAheadBufferedReader,
     SequentialWriteFile,
 };
+pub(crate) use self::metadata_io::{MetadataReader, MetadataWriter};
 pub(crate) use self::offload::{PrimaryOffloadFileRef, compare_primary_offload_file_refs};
