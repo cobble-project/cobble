@@ -11,8 +11,8 @@ use crate::structured::{
     decode_write_list_args, to_java_typed_columns,
 };
 use crate::util::{
-    decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong, throw_illegal_argument,
-    throw_illegal_state, to_java_string_or_throw,
+    decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong, parse_config_json,
+    throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use bytes::Bytes;
@@ -61,12 +61,8 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_openHandleFromJson(
             return 0;
         }
     };
-    let config: Config = match serde_json::from_str(&config_json) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
-            return 0;
-        }
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
     };
     open_structured_single_db(&mut env, config)
 }

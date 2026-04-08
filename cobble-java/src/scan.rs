@@ -1,6 +1,6 @@
 use crate::util::{
-    decode_column_index, decode_java_bytes, decode_java_string, decode_u16, throw_illegal_argument,
-    throw_illegal_state,
+    decode_column_index, decode_java_bytes, decode_java_string, decode_u16, parse_config_json,
+    throw_illegal_argument, throw_illegal_state,
 };
 use bytes::Bytes;
 use cobble::{Config, DbIterator, Result, ScanOptions, ScanSplit, ScanSplitScanner};
@@ -408,12 +408,8 @@ pub extern "system" fn Java_io_cobble_ScanSplit_openSplitScanCursorFromJson(
             return 0;
         }
     };
-    let config = match serde_json::from_str::<Config>(&config_json) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_argument(&mut env, format!("invalid config json: {}", err));
-            return 0;
-        }
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
     };
     open_split_scan_cursor(&mut env, config, split_json, scan_options_handle)
 }

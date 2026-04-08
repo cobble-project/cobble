@@ -1,8 +1,9 @@
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{ScanCursorHandle, decode_scan_open_args};
 use crate::util::{
-    decode_java_bytes, decode_java_string, decode_u16, decode_u32, throw_illegal_argument,
-    throw_illegal_state, to_java_optional_bytes_2d, to_java_string_or_throw,
+    decode_java_bytes, decode_java_string, decode_u16, decode_u32, parse_config_json,
+    throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
+    to_java_string_or_throw,
 };
 use cobble::{Config, Reader, ReaderConfig};
 use jni::JNIEnv;
@@ -53,12 +54,8 @@ pub extern "system" fn Java_io_cobble_Reader_openCurrentHandleFromJson(
             return 0;
         }
     };
-    let config = match serde_json::from_str::<Config>(&json) {
-        Ok(config) => config,
-        Err(err) => {
-            throw_illegal_argument(&mut env, format!("invalid config json: {}", err));
-            return 0;
-        }
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
     };
     let reader_config = ReaderConfig::from_config(&config);
     let reader = match Reader::open_current(reader_config) {
@@ -131,12 +128,8 @@ pub extern "system" fn Java_io_cobble_Reader_openHandleFromJson(
             return 0;
         }
     };
-    let config = match serde_json::from_str::<Config>(&json) {
-        Ok(config) => config,
-        Err(err) => {
-            throw_illegal_argument(&mut env, format!("invalid config json: {}", err));
-            return 0;
-        }
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
     };
     let reader_config = ReaderConfig::from_config(&config);
     let reader = match Reader::open(reader_config, snapshot_id) {

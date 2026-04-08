@@ -2,7 +2,7 @@ use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{ScanCursorHandle, decode_scan_open_args};
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong,
-    throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
+    parse_config_json, throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
     to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
@@ -55,12 +55,8 @@ pub extern "system" fn Java_io_cobble_SingleDb_openHandleFromJson(
             return 0;
         }
     };
-    let config = match serde_json::from_str::<Config>(&json) {
-        Ok(config) => config,
-        Err(err) => {
-            throw_illegal_argument(&mut env, format!("invalid config json: {}", err));
-            return 0;
-        }
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
     };
     let db = match SingleDb::open(config) {
         Ok(db) => db,
@@ -124,12 +120,8 @@ pub extern "system" fn Java_io_cobble_SingleDb_openFromGlobalSnapshotHandleFromJ
             return 0;
         }
     };
-    let config = match serde_json::from_str::<Config>(&json) {
-        Ok(config) => config,
-        Err(err) => {
-            throw_illegal_argument(&mut env, format!("invalid config json: {}", err));
-            return 0;
-        }
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
     };
     let global_snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
         Ok(v) => v,
