@@ -8,19 +8,20 @@
   <a href="https://docs.rs/cobble/latest/cobble/"><img alt="docs.rs" src="https://img.shields.io/badge/docs-docs.rs-00A1FF" /></a>
 </p>
 
-Cobble is a high-performance, embedded key-value store designed for use in distributed systems as well as standalone applications.
-This project aims to provide a highly flexible storage engine for various services or applications.
-It is built-on Rust and implements an LSM (Log-Structured Merge) tree architecture using multiple file formats (SST, parquet, etc.).
-It fulfills all your expectations for embedded LSM storage and can be integrated into various distributed systems and standalone applications as the underlying storage.
+**Cobble** is a high-performance LSM-based key-value storage engine designed for both embedded and distributed systems.
+It provides a flexible and efficient storage solution for various workloads, from small-scale applications to large distributed services.
+Compared with other embedded key-value stores like [RocksDB](https://github.com/facebook/rocksdb), it offers multiple file formats (SSTable and Parquet), distributed storage support, distributed snapshots, online rescaling between nodes, remote compaction, and more.
+Thus, it really fits the needs of modern distributed systems that require a versatile and scalable storage engine.
 
 ## Features
 
 We list some of Cobble's key features below, they are either implemented or are planned for future releases:
 
-- **Hybrid Media**: Local disk and remote object storage (S3, OSS, etc.) can be used individually or together; supports multi-volume distributed I/O scheduling.
+- **Hybrid Storage**: Local disk and remote object storage (S3, OSS, etc.) can be used individually or together; supports multi-volume distributed I/O scheduling.
 - **Schema Support & Evolution**: User-defined column schemas with incremental evolution.
 - **Multiple File Formats**: SST and Parquet for both point lookup and analytical queries.
-- **One writer, multiple readers**: A single writer for consistency, with concurrent readers across processes or machines.
+- **Distributed Snapshots**: Global consistent snapshots across multiple shards and machines, with local shard snapshots as building blocks.
+- **One writer, multiple readers for one shard**: A single writer for consistency, with concurrent readers across processes or machines.
 - **Remote Compaction**: Compaction can run on remote object storage to reduce local resource usage.
 - **Multi-version Snapshots**: Read historical data states via versioned snapshots.
 - **Key-value Separation**: Separates keys and values to optimize large-value, low-access patterns.
