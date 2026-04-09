@@ -17,30 +17,33 @@ jobs:
       matrix:
         include:
           - platform: macos-aarch64
-            runner: macos-latest
+            runner: macos-26
             target: aarch64-apple-darwin
             lib_file: libcobblejni.dylib
-            use_zigbuild: "false"
+            build_features: storage-all
           - platform: macos-x86_64
-            runner: macos-latest
+            runner: macos-26-intel
             target: x86_64-apple-darwin
             lib_file: libcobblejni.dylib
-            use_zigbuild: "false"
+            build_features: storage-all
           - platform: linux-x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             lib_file: libcobblejni.so
-            use_zigbuild: "false"
+            build_features: storage-all
           - platform: linux-aarch64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             lib_file: libcobblejni.so
-            use_zigbuild: "true"
+            build_features: storage-all
           - platform: windows-x86_64
-            runner: windows-latest
+            runner: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
             lib_file: cobblejni.dll
-            use_zigbuild: "false"
+            # Windows currently doesn't support these OpenDAL backends in our build:
+            # - storage-sftp (openssh crate is unix-only)
+            # - storage-hdfs (depends on unix-only libc constants)
+            build_features: storage-alluxio,storage-cos,storage-ftp,storage-oss,storage-s3
 
     steps:
       - name: Checkout
@@ -51,28 +54,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Setup Zig (for Linux aarch64 cross-build)
-        if: matrix.use_zigbuild == 'true'
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Install cargo-zigbuild
-        if: matrix.use_zigbuild == 'true'
-        shell: bash
-        run: cargo install cargo-zigbuild --locked
-
       - name: Build debug + release JNI library
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
-            cargo zigbuild -p cobble-java --features storage-all --target "${{ matrix.target }}"
-            cargo zigbuild -p cobble-java --features storage-all --target "${{ matrix.target }}" --release
-          else
-            cargo build -p cobble-java --features storage-all --target "${{ matrix.target }}"
-            cargo build -p cobble-java --features storage-all --target "${{ matrix.target }}" --release
-          fi
+          cargo build -p cobble-java --features "${{ matrix.build_features }}" --target "${{ matrix.target }}"
+          cargo build -p cobble-java --features "${{ matrix.build_features }}" --target "${{ matrix.target }}" --release
 
       - name: Stage native artifact
         shell: bash
