@@ -14,7 +14,7 @@ Cobble stores data as **key → multi-column value** pairs, grouped into numbere
 
 Each column in a value is independent: you can put, merge, or delete individual columns without affecting the others. The number of columns is fixed per database configuration but can evolve over time with [schema evolution](../architecture/schema-evolution).
 
-For merge operations, you define a [merge operator](../architecture/merge-operator.md) that specifies how to combine new values with existing ones. This is useful for patterns like counters, lists, sets, or any case where you want to update a value based on its current state without reading it first.
+For merge operations, you define a [merge operator](../architecture/merge-operator) that specifies how to combine new values with existing ones. This is useful for patterns like counters, lists, sets, or any case where you want to update a value based on its current state without reading it first.
 
 ## Core Components
 

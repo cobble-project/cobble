@@ -80,3 +80,6 @@ let db2 = Db::open_from_snapshot(config2, s2.snapshot_id, s2.db_id.clone())?;
 {: .warning }
 > All files referenced by the snapshot (SST, Parquet, VLOG, manifests, schemas) must be accessible from the configured volumes during restore.
 
+## Advanced: Rescale Bucket Ownership
+
+For runtime shard rebalance details, see [Architecture / Online Rescale](../architecture/rescale).

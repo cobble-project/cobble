@@ -29,5 +29,7 @@ jobs:
           cache-version: 0
           working-directory: "${{ github.workspace }}/docs"
 
-      - name: Build docs
-        run: bundle exec jekyll build --strict_front_matter
+      - name: Clean and build docs
+        run: |
+          bundle exec jekyll clean
+          bundle exec jekyll build --strict_front_matter

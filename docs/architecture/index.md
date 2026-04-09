@@ -36,3 +36,4 @@ Cobble is built around a few core ideas:
 | [Block Cache](block-cache) | Multi-tier caching for read performance |
 | [Schema Evolution](schema-evolution) | Adding and removing columns without rewriting data |
 | [Merge Operators](merge-operator) | Efficient read-modify-write without extra round trips |
+| [Online Rescale](rescale) | Runtime shard rebalance using shrink-then-expand bucket migration |

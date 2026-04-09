@@ -81,7 +81,7 @@ jobs:
           cache-version: 0
           working-directory: "${{ github.workspace }}/docs"
 
-      - name: Build docs
+      - name: Clean and build docs
         if: steps.resolve.outputs.deploy == 'true'
         working-directory: docs
         shell: bash
@@ -99,6 +99,7 @@ jobs:
           docs_commit_label: ${commit_short}
           EOF
 
+          bundle exec jekyll clean
           bundle exec jekyll build \
             --strict_front_matter \
             --baseurl "${baseurl}" \
