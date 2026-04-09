@@ -84,7 +84,7 @@ jobs:
             local n=1
             while true; do
               set +e
-              output="$(cargo publish -p "${crate}" --locked --registry crates-io 2>&1)"
+              output="$(cargo publish -p "${crate}" --registry crates-io 2>&1)"
               code=$?
               set -e
 

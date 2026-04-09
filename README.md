@@ -55,6 +55,8 @@ Optional remote/storage-service features exposed by Cobble are:
 - `storage-hdfs`
 - `storage-sftp`
 
+> On Windows, `storage-hdfs` and `storage-sftp` are currently not supported.
+
 ```toml
 [dependencies]
 cobble = { version = "0.1.0", default-features = false, features = ["storage-s3"] }

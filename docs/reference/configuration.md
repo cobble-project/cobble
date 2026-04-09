@@ -36,6 +36,8 @@ Optional feature mapping:
 | `storage-s3` | `services-s3` |
 | `storage-sftp` | `services-sftp` |
 
+> Windows note: `storage-hdfs` and `storage-sftp` are currently unsupported.
+
 ### Size Value Format
 
 Size-related entries (cache size, memtable size, file size, thresholds, etc.) support:

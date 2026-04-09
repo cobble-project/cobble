@@ -17,6 +17,8 @@ Cobble storage backends are provided by Apache OpenDAL and are gated by Cargo fe
 - Enable all optional backends: `storage-all`
 - Crates that depend on `cobble` in this workspace also expose the same `storage-*` features and forward them to `cobble`, so you can enable backend features from those crates as well.
 
+> On Windows, `storage-hdfs` and `storage-sftp` are currently unsupported.
+
 Example:
 
 ```toml
