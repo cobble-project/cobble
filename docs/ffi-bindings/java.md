@@ -16,7 +16,7 @@ We have published the Java API to Maven Central. You can add it as a dependency 
 <dependency>
     <groupId>io.github.cobble-project</groupId>
     <artifactId>cobble</artifactId>
-    <version>0.1.0</version>
+    <version>0.1.1</version>
 </dependency>
 ```
 

@@ -11,16 +11,16 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/cobble-project/cobble"
 homepage = "https://cobble-project.github.io/cobble/latest/"
 
 [workspace.dependencies]
-cobble = { path = "cobble", version = "0.1.0" }
-cobble-data-structure = { path = "cobble-data-structure", version = "0.1.0" }
-cobble-web-monitor = { path = "cobble-web-monitor", version = "0.1.0" }
+cobble = { path = "cobble", version = "0.1.1" }
+cobble-data-structure = { path = "cobble-data-structure", version = "0.1.1" }
+cobble-web-monitor = { path = "cobble-web-monitor", version = "0.1.1" }
 bytes = "1.11.0"
 log = "0.4.29"
 serde = { version = "1.0.219", features = ["derive"] }

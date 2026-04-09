@@ -23,7 +23,7 @@ Example:
 
 ```toml
 [dependencies]
-cobble = { version = "0.1.0", default-features = false, features = ["storage-s3"] }
+cobble = { version = "0.1.1", default-features = false, features = ["storage-s3"] }
 ```
 
 If a volume URL uses a scheme whose feature is not enabled, Cobble will fail to initialize that volume.
