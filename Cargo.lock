@@ -544,7 +544,7 @@ checksum = "d7ee2cfacbd29706479902b06d75ad8f1362900836aa32799eabc7e004bfd854"
 
 [[package]]
 name = "cobble"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "cobble-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cobble",
  "log",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "cobble-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cobble",
  "cobble-web-monitor",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "cobble-cluster"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cobble",
  "serde",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "cobble-data-structure"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "cobble",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "cobble-java"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "cobble",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "cobble-web-monitor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
