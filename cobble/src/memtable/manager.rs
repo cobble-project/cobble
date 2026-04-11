@@ -24,7 +24,7 @@ use crate::paths::snapshot_active_data_relative_path;
 use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotManager};
 use crate::sst::{SSTWriter, SSTWriterOptions};
-use crate::r#type::{KvValue, RefKey, RefValue};
+use crate::r#type::{KvValue, RefKey, RefValue, key_bucket};
 use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
 use crate::writer_options::WriterOptions;
 use log::{debug, trace, warn};
@@ -1490,12 +1490,9 @@ fn flush_memtable(
             collector.borrow_mut().check_error()?;
         }
         if let Some((key, kv_value)) = dedup_iter.take_current()? {
-            if key.len() < 2 {
-                return Err(Error::InvalidState(
-                    "encoded key missing bucket prefix".to_string(),
-                ));
-            }
-            let bucket = u16::from_le_bytes([key[0], key[1]]);
+            let bucket = key_bucket(&key).ok_or_else(|| {
+                Error::InvalidState("encoded key missing bucket/cf prefix".to_string())
+            })?;
             let tree_idx = multi_lsm_version
                 .tree_index_for_bucket(bucket)
                 .ok_or_else(|| {

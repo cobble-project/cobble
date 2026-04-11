@@ -259,7 +259,7 @@ impl ReadOnlyDb {
                 max_index, num_columns
             )));
         }
-        let mut encoded_key = bytes::BytesMut::with_capacity(2 + key.len());
+        let mut encoded_key = bytes::BytesMut::with_capacity(3 + key.len());
         encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded_key);
         let encoded_key = encoded_key.freeze();
         let masks = options.masks(num_columns);
@@ -340,7 +340,7 @@ impl ReadOnlyDb {
             options.columns(),
         )?;
         let encode_scan_key = |key: &[u8]| {
-            let mut encoded = bytes::BytesMut::with_capacity(2 + key.len());
+            let mut encoded = bytes::BytesMut::with_capacity(3 + key.len());
             encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded);
             encoded.freeze()
         };

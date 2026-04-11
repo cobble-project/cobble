@@ -5,7 +5,7 @@
 //!
 //! ## Key Format
 //! ```text
-//! [group: u16][data: bytes]
+//! [group: u16][cf: u8][data: bytes]
 //! ```
 //! Note: The key's data length is stored by the SST block format, not in the key itself.
 //!
@@ -63,38 +63,43 @@ impl<'a> ColumnRef for RefColumn<'a> {
 
 /// Encodes a Key to bytes.
 ///
-/// Layout: `[group: u16][data: bytes]`
+/// Layout: `[group: u16][cf: u8][data: bytes]`
 /// Note: The key's data length is stored by the SST block format, not encoded here.
 pub(crate) fn encode_key(key: &Key) -> Bytes {
-    let size = 2 + key.data().len();
+    let size = 3 + key.data().len();
     let mut buf = BytesMut::with_capacity(size);
-    encode_key_ref_into(&RefKey::new(key.bucket(), key.data()), &mut buf);
+    encode_key_ref_into(
+        &RefKey::new_with_column_family(key.bucket(), key.column_family(), key.data()),
+        &mut buf,
+    );
     buf.freeze()
 }
 
 pub(crate) fn encode_key_ref_into(key: &RefKey<'_>, buf: &mut impl BufMut) {
     buf.put_u16_le(key.bucket());
+    buf.put_u8(key.column_family());
     buf.put_slice(key.data());
 }
 
 /// Decodes a Key from bytes.
 /// The full key data is provided (length is known from SST block format).
 pub(crate) fn decode_key(data: &mut Bytes) -> Result<Key> {
-    if data.len() < 2 {
+    if data.len() < 3 {
         return Err(Error::IoError(format!(
-            "Key data too small: expected at least 2 bytes, got {}",
+            "Key data too small: expected at least 3 bytes, got {}",
             data.len()
         )));
     }
 
     let group = data.get_u16_le();
+    let column_family = data.get_u8();
     let key_data = data.split_to(data.len());
-    Ok(Key::new(group, key_data))
+    Ok(Key::new_with_column_family(group, column_family, key_data))
 }
 
 /// Returns the encoded size of a Key in bytes.
 pub(crate) fn key_encoded_size(key: &Key) -> usize {
-    2 + key.data().len()
+    3 + key.data().len()
 }
 
 /// Returns the size of the presence bitmap for the given number of columns.
@@ -532,13 +537,14 @@ mod tests {
         let key = Key::new(42, b"hello world".to_vec());
         let encoded = encode_key(&key);
 
-        // Verify encoded size: 2 (group) + 11 (data) = 13
-        assert_eq!(encoded.len(), 13);
-        assert_eq!(key_encoded_size(&key), 13);
+        // Verify encoded size: 2 (group) + 1 (cf) + 11 (data) = 14
+        assert_eq!(encoded.len(), 14);
+        assert_eq!(key_encoded_size(&key), 14);
 
         let mut encoded_for_decode = encoded.clone();
         let decoded = decode_key(&mut encoded_for_decode).unwrap();
         assert_eq!(decoded.bucket(), 42);
+        assert_eq!(decoded.column_family(), 0);
         assert_eq!(decoded.data().as_ref(), b"hello world");
     }
 
@@ -547,11 +553,12 @@ mod tests {
         let key = Key::new(0, Vec::new());
         let encoded = encode_key(&key);
 
-        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded.len(), 3);
 
         let mut encoded_for_decode = encoded.clone();
         let decoded = decode_key(&mut encoded_for_decode).unwrap();
         assert_eq!(decoded.bucket(), 0);
+        assert_eq!(decoded.column_family(), 0);
         assert_eq!(decoded.data().as_ref(), b"");
     }
 
@@ -563,6 +570,7 @@ mod tests {
         let mut encoded_for_decode = encoded.clone();
         let decoded = decode_key(&mut encoded_for_decode).unwrap();
         assert_eq!(decoded.bucket(), u16::MAX);
+        assert_eq!(decoded.column_family(), 0);
         assert_eq!(decoded.data().as_ref(), b"test");
     }
 

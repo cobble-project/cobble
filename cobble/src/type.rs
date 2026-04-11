@@ -9,6 +9,9 @@ pub(crate) struct Key {
     /// Used to partition the keyspace (e.g., different logical groups or column families).
     bucket: u16,
 
+    /// Internal column family id.
+    column_family: u8,
+
     /// Raw key bytes.
     /// The caller decides the encoding (prefixes, big-endian integers, varints, etc.).
     data: Bytes,
@@ -18,6 +21,8 @@ pub(crate) struct Key {
 pub(crate) struct RefKey<'a> {
     /// Logical namespace / group identifier.
     bucket: u16,
+    /// Internal column family id.
+    column_family: u8,
     /// Raw key bytes.
     data: &'a [u8],
 }
@@ -171,8 +176,18 @@ impl Key {
     /// \- `bucket`: logical namespace / group id
     /// \- `data`: raw key bytes
     pub(crate) fn new(bucket: u16, data: impl Into<Bytes>) -> Self {
+        Self::new_with_column_family(bucket, 0, data)
+    }
+
+    /// Creates a new `Key` in a specific column family.
+    pub(crate) fn new_with_column_family(
+        bucket: u16,
+        column_family: u8,
+        data: impl Into<Bytes>,
+    ) -> Self {
         Self {
             bucket,
+            column_family,
             data: data.into(),
         }
     }
@@ -182,6 +197,11 @@ impl Key {
         self.bucket
     }
 
+    /// Returns the internal column family id.
+    pub(crate) fn column_family(&self) -> u8 {
+        self.column_family
+    }
+
     /// Returns the raw key bytes.
     pub(crate) fn data(&self) -> &Bytes {
         &self.data
@@ -189,7 +209,11 @@ impl Key {
 }
 
 pub(crate) fn key_bucket(key: &[u8]) -> Option<u16> {
-    (key.len() >= 2).then(|| u16::from_le_bytes([key[0], key[1]]))
+    (key.len() >= 3).then(|| u16::from_le_bytes([key[0], key[1]]))
+}
+
+pub(crate) fn key_column_family(key: &[u8]) -> Option<u8> {
+    (key.len() >= 3).then(|| key[2])
 }
 
 impl ValueType {
@@ -308,11 +332,23 @@ pub(crate) fn encode_merge_separated_array(columns: &[RefColumn<'_>]) -> Result<
 
 impl<'a> RefKey<'a> {
     pub(crate) fn new(bucket: u16, data: &'a [u8]) -> Self {
-        Self { bucket, data }
+        Self::new_with_column_family(bucket, 0, data)
+    }
+
+    pub(crate) fn new_with_column_family(bucket: u16, column_family: u8, data: &'a [u8]) -> Self {
+        Self {
+            bucket,
+            column_family,
+            data,
+        }
     }
 
     pub(crate) fn bucket(&self) -> u16 {
         self.bucket
+    }
+
+    pub(crate) fn column_family(&self) -> u8 {
+        self.column_family
     }
 
     pub(crate) fn data(&self) -> &[u8] {
@@ -320,7 +356,7 @@ impl<'a> RefKey<'a> {
     }
 
     pub(crate) fn encoded_len(&self) -> usize {
-        2 + self.data.len()
+        3 + self.data.len()
     }
 }
 
