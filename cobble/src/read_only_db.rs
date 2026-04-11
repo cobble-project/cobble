@@ -8,7 +8,7 @@ use crate::file::FileManager;
 use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
-use crate::schema::{Schema, SchemaManager};
+use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaManager};
 use crate::snapshot::{
     build_tree_versions_from_manifest, build_vlog_version_from_manifest, load_manifest_for_snapshot,
 };
@@ -243,7 +243,14 @@ impl ReadOnlyDb {
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<Bytes>>>> {
         let schema = self.schema_manager.latest_schema();
-        let num_columns = schema.num_columns();
+        let column_family_id = schema.resolve_column_family_id(options.column_family())?;
+        if column_family_id != DEFAULT_COLUMN_FAMILY_ID {
+            return Err(Error::IoError(format!(
+                "ReadOptions.column_family {:?} is not supported before CF key-codec wiring",
+                options.column_family()
+            )));
+        }
+        let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         if let Some(max_index) = options.max_index()
             && max_index >= num_columns
         {

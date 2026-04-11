@@ -352,8 +352,26 @@ impl Schema {
     }
 
     #[inline]
-    pub(crate) fn column_family_id_by_name(&self, name: &str) -> Option<u8> {
+    fn column_family_id_by_name(&self, name: &str) -> Option<u8> {
         self.column_family_name_index.get(name).copied()
+    }
+
+    pub(crate) fn resolve_column_family_id(&self, column_family: Option<&str>) -> Result<u8> {
+        match column_family {
+            Some(name) => {
+                let normalized = normalize_column_family_name(name.to_string())?;
+                self.column_family_id_by_name(normalized.as_str())
+                    .ok_or_else(|| {
+                        Error::IoError(format!("Unknown column family '{}'", normalized))
+                    })
+            }
+            None => Ok(DEFAULT_COLUMN_FAMILY_ID),
+        }
+    }
+
+    pub(crate) fn num_columns_in_family(&self, column_family_id: u8) -> Option<usize> {
+        self.column_family_by_id(column_family_id)
+            .map(ColumnFamily::num_columns)
     }
 
     fn column_family_by_id(&self, column_family_id: u8) -> Option<&ColumnFamily> {

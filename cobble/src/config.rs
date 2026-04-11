@@ -230,6 +230,7 @@ impl ReaderConfigEntry {
 
 #[derive(Clone, Debug)]
 pub struct ReadOptions {
+    pub column_family: Option<String>,
     pub column_indices: Option<Vec<usize>>,
     max_index: Option<usize>,
     cached_masks: Arc<Mutex<Option<ReadOptionsMasks>>>,
@@ -245,13 +246,26 @@ pub struct ScanOptions {
 #[derive(Clone, Debug, Default)]
 pub struct WriteOptions {
     pub ttl_seconds: Option<u32>,
+    pub column_family: Option<String>,
 }
 
 impl WriteOptions {
     pub fn with_ttl(ttl_seconds: u32) -> Self {
         Self {
             ttl_seconds: Some(ttl_seconds),
+            column_family: None,
         }
+    }
+
+    pub fn with_column_family(column_family: impl Into<String>) -> Self {
+        Self {
+            ttl_seconds: None,
+            column_family: Some(column_family.into()),
+        }
+    }
+
+    pub(crate) fn column_family(&self) -> Option<&str> {
+        self.column_family.as_deref()
     }
 }
 
@@ -265,6 +279,7 @@ pub(crate) struct ReadOptionsMasks {
 impl Default for ReadOptions {
     fn default() -> Self {
         Self {
+            column_family: None,
             column_indices: None,
             max_index: None,
             cached_masks: Arc::new(Mutex::new(None)),
@@ -307,26 +322,47 @@ impl ScanOptions {
 
 impl ReadOptions {
     pub fn for_column(column_index: usize) -> Self {
-        Self::new_with_indices(Some(vec![column_index]))
+        Self::new_with_indices(None, Some(vec![column_index]))
     }
 
     pub fn for_columns(column_indices: Vec<usize>) -> Self {
-        Self::new_with_indices(Some(column_indices))
+        Self::new_with_indices(None, Some(column_indices))
     }
 
-    fn new_with_indices(column_indices: Option<Vec<usize>>) -> Self {
+    pub fn for_column_in_family(column_family: impl Into<String>, column_index: usize) -> Self {
+        Self::new_with_indices(Some(column_family.into()), Some(vec![column_index]))
+    }
+
+    pub fn for_columns_in_family(
+        column_family: impl Into<String>,
+        column_indices: Vec<usize>,
+    ) -> Self {
+        Self::new_with_indices(Some(column_family.into()), Some(column_indices))
+    }
+
+    fn new_with_indices(column_family: Option<String>, column_indices: Option<Vec<usize>>) -> Self {
         let max_index = column_indices
             .as_ref()
             .and_then(|indices| indices.iter().max().cloned());
         Self {
+            column_family,
             column_indices,
             max_index,
             cached_masks: Arc::new(Mutex::new(None)),
         }
     }
 
+    pub fn with_column_family(mut self, column_family: impl Into<String>) -> Self {
+        self.column_family = Some(column_family.into());
+        self
+    }
+
     pub(crate) fn columns(&self) -> Option<&[usize]> {
         self.column_indices.as_deref()
+    }
+
+    pub(crate) fn column_family(&self) -> Option<&str> {
+        self.column_family.as_deref()
     }
 
     pub(crate) fn max_index(&self) -> Option<usize> {
@@ -929,8 +965,8 @@ fn collect_unrecognized_entry_paths(
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, Error, MemtableType, PrimaryVolumeOffloadPolicyKind, ReaderConfigEntry,
-        VolumeDescriptor, VolumeUsageKind,
+        Config, Error, MemtableType, PrimaryVolumeOffloadPolicyKind, ReadOptions,
+        ReaderConfigEntry, VolumeDescriptor, VolumeUsageKind, WriteOptions,
     };
     use crate::SstCompressionAlgorithm;
     use crate::data_file::DataFileType;
@@ -1112,6 +1148,24 @@ mod tests {
         assert!(volume.supports(VolumeUsageKind::Readonly));
         assert!(!volume.supports(VolumeUsageKind::Snapshot));
         assert!(!volume.supports(VolumeUsageKind::PrimaryDataPriorityHigh));
+    }
+
+    #[test]
+    fn test_read_options_column_family_constructors() {
+        let options = ReadOptions::for_columns_in_family("metrics", vec![2, 0]);
+        assert_eq!(options.column_family(), Some("metrics"));
+        assert_eq!(options.columns(), Some(&[2, 0][..]));
+
+        let options = ReadOptions::for_column(1).with_column_family("default");
+        assert_eq!(options.column_family(), Some("default"));
+        assert_eq!(options.columns(), Some(&[1][..]));
+    }
+
+    #[test]
+    fn test_write_options_column_family_constructor() {
+        let options = WriteOptions::with_column_family("metrics");
+        assert_eq!(options.column_family(), Some("metrics"));
+        assert_eq!(options.ttl_seconds, None);
     }
 
     #[test]

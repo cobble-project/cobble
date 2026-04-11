@@ -9,7 +9,7 @@ use crate::lsm::LSMTree;
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::merge_operator::MergeOperator;
 use crate::metrics_manager::MetricsManager;
-use crate::schema::{Schema, SchemaBuilder, SchemaManager};
+use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaBuilder, SchemaManager};
 use crate::snapshot::{
     ActiveMemtableSnapshotData, LoadedManifest, SnapshotCallback, SnapshotManager,
     SnapshotManifestInfo, snapshot_manifest_name,
@@ -300,7 +300,15 @@ impl Db {
         V: AsRef<[u8]>,
     {
         self.ensure_open()?;
-        let num_columns = self.schema_manager.current_num_columns();
+        let schema = self.schema_manager.latest_schema();
+        let column_family_id = schema.resolve_column_family_id(options.column_family())?;
+        if column_family_id != DEFAULT_COLUMN_FAMILY_ID {
+            return Err(Error::IoError(format!(
+                "WriteOptions.column_family {:?} is not supported before CF key-codec wiring",
+                options.column_family()
+            )));
+        }
+        let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         let column_idx = column as usize;
         if column_idx >= num_columns {
             return Err(Error::IoError(format!(
@@ -765,7 +773,14 @@ impl Db {
     ) -> Result<Option<Vec<Option<Bytes>>>> {
         self.ensure_open()?;
         let schema = self.schema_manager.latest_schema();
-        let num_columns = schema.num_columns();
+        let column_family_id = schema.resolve_column_family_id(options.column_family())?;
+        if column_family_id != DEFAULT_COLUMN_FAMILY_ID {
+            return Err(Error::IoError(format!(
+                "ReadOptions.column_family {:?} is not supported before CF key-codec wiring",
+                options.column_family()
+            )));
+        }
+        let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         if let Some(max_index) = options.max_index()
             && max_index >= num_columns
         {
