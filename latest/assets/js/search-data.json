@@ -897,7 +897,7 @@
   },"128": {
     "doc": "Schema Evolution",
     "title": "How to Evolve Schema",
-    "content": "Use Db::update_schema() (or SingleDb::update_schema()) and commit: . use std::sync::Arc; use cobble::{Db, U64CounterMergeOperator}; let mut builder = db.update_schema(); builder.set_column_operator(2, Arc::new(U64CounterMergeOperator))?; let _new_schema = builder.commit(); . For adding/removing columns with explicit position control: . let mut builder = db.update_schema(); builder.add_column(1, None, None)?; // insert new column at index 1 // or builder.delete_column(1)?; // delete column at index 1 let _new_schema = builder.commit(); . ",
+    "content": "Use Db::update_schema() (or SingleDb::update_schema()) and commit: . use std::sync::Arc; use cobble::{Db, U64CounterMergeOperator}; let mut builder = db.update_schema(); builder.set_column_operator(2, Arc::new(U64CounterMergeOperator))?; let _new_schema = builder.commit(); . For adding/removing columns with explicit position control: . let mut builder = db.update_schema(); builder.add_column(1, None, None, None)?; // insert new column at index 1 // or builder.delete_column(1)?; // delete column at index 1 let _new_schema = builder.commit(); . ",
     "url": "/cobble/latest/architecture/schema-evolution.html#how-to-evolve-schema",
     
     "relUrl": "/architecture/schema-evolution.html#how-to-evolve-schema"
