@@ -24,7 +24,7 @@ use crate::paths::snapshot_active_data_relative_path;
 use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotManager};
 use crate::sst::{SSTWriter, SSTWriterOptions};
-use crate::r#type::{KvValue, RefKey, RefValue, key_bucket};
+use crate::r#type::{KvValue, RefKey, RefValue, key_bucket, key_column_family};
 use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
 use crate::writer_options::WriterOptions;
 use log::{debug, trace, warn};
@@ -1490,13 +1490,17 @@ fn flush_memtable(
             collector.borrow_mut().check_error()?;
         }
         if let Some((key, kv_value)) = dedup_iter.take_current()? {
-            let bucket = key_bucket(&key).ok_or_else(|| {
-                Error::InvalidState("encoded key missing bucket/cf prefix".to_string())
-            })?;
+            let bucket = key_bucket(&key)
+                .ok_or_else(|| InvalidState("encoded key missing bucket/cf prefix".to_string()))?;
+            let column_family_id = key_column_family(&key)
+                .ok_or_else(|| InvalidState("encoded key missing bucket/cf prefix".to_string()))?;
             let tree_idx = multi_lsm_version
-                .tree_index_for_bucket(bucket)
+                .tree_index_for_bucket_and_column_family(bucket, column_family_id)
                 .ok_or_else(|| {
-                    Error::InvalidState(format!("bucket {} not mapped to an LSM tree", bucket))
+                    InvalidState(format!(
+                        "bucket {} and column_family {} not mapped to an LSM tree",
+                        bucket, column_family_id
+                    ))
                 })?;
             if let std::collections::btree_map::Entry::Vacant(entry) = builders.entry(tree_idx) {
                 let (file_id, writer) = file_manager.create_data_file_with_offload()?;
@@ -1921,8 +1925,8 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                (Bytes::from_static(b"\0\0a"), Bytes::from("new")),
-                (Bytes::from_static(b"\0\0b"), Bytes::from("v1"))
+                (Bytes::from_static(b"\0\0\0a"), Bytes::from("new")),
+                (Bytes::from_static(b"\0\0\0b"), Bytes::from("v1"))
             ]
         );
         cleanup_test_root();

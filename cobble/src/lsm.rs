@@ -13,17 +13,17 @@ use crate::iterator::{
 };
 use crate::metrics_manager::MetricsManager;
 use crate::parquet::ParquetIterator;
-use crate::schema::{Schema, SchemaManager};
+use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaManager};
 use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
-use crate::r#type::{Value, key_bucket};
+use crate::r#type::{Value, key_bucket, key_column_family};
 use log::{debug, warn};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-use crate::db_state::{DbState, DbStateHandle, bucket_range_len};
+use crate::db_state::{DbState, DbStateHandle, LSMTreeScope, bucket_range_len};
 use crate::ttl::TTLProvider;
 use crate::vlog::{VlogEdit, apply_vlog_offset_to_value};
 
@@ -58,7 +58,7 @@ struct LSMTreeState {
     level_options: Vec<LevelOptions>,
     compaction_config: CompactionConfig,
     compaction_policy: Box<dyn CompactionPolicy>,
-    pending_compaction: HashMap<usize, Option<RangeInclusive<u16>>>,
+    pending_compaction: HashMap<usize, Option<LSMTreeScope>>,
     compaction_worker: Option<Arc<dyn CompactionWorker>>,
 }
 
@@ -495,24 +495,29 @@ impl LSMTree {
     }
 
     fn remap_pending_compactions(
-        pending: &HashMap<usize, Option<RangeInclusive<u16>>>,
+        pending: &HashMap<usize, Option<LSMTreeScope>>,
         new_multi: &crate::db_state::MultiLSMTreeVersion,
         split_tree_idx: usize,
         added_tree_count: usize,
-    ) -> HashMap<usize, Option<RangeInclusive<u16>>> {
+    ) -> HashMap<usize, Option<LSMTreeScope>> {
         let mut remapped = HashMap::with_capacity(pending.len());
-        for (idx, expected_range) in pending {
-            let new_idx = if let Some(expected_range) = expected_range.as_ref() {
+        for (idx, expected_scope) in pending {
+            let new_idx = if let Some(expected_scope) = expected_scope.as_ref() {
                 new_multi
-                    .tree_index_for_exact_range(expected_range)
-                    .or_else(|| new_multi.tree_index_for_bucket(*expected_range.start()))
+                    .tree_index_for_exact_scope(expected_scope)
+                    .or_else(|| {
+                        new_multi.tree_index_for_bucket_and_column_family(
+                            *expected_scope.bucket_range.start(),
+                            expected_scope.column_family_id,
+                        )
+                    })
                     .unwrap_or(*idx)
             } else if *idx > split_tree_idx {
                 idx.saturating_add(added_tree_count)
             } else {
                 *idx
             };
-            remapped.insert(new_idx, expected_range.clone());
+            remapped.insert(new_idx, expected_scope.clone());
         }
         remapped
     }
@@ -527,7 +532,8 @@ impl LSMTree {
         if split_level == 0 {
             return None;
         }
-        let tree_range = snapshot.multi_lsm_version.bucket_range_of_tree(tree_idx)?;
+        let tree_scope = snapshot.multi_lsm_version.tree_scope_of_tree(tree_idx)?;
+        let tree_range = tree_scope.bucket_range.clone();
         let bucket_count = bucket_range_len(&tree_range);
         if bucket_count <= 1 {
             return None;
@@ -565,37 +571,39 @@ impl LSMTree {
         if split_ranges.len() <= 1 {
             return None;
         }
-        let old_ranges = snapshot.multi_lsm_version.bucket_ranges();
-        if old_ranges.len() != snapshot.multi_lsm_version.tree_count() {
+        let old_scopes = snapshot.multi_lsm_version.tree_scopes();
+        if old_scopes.len() != snapshot.multi_lsm_version.tree_count() {
             return None;
         }
         let old_versions = snapshot.multi_lsm_version.tree_versions_cloned();
-        let mut new_ranges = Vec::with_capacity(old_ranges.len() + split_ranges.len() - 1);
+        let mut new_scopes = Vec::with_capacity(old_scopes.len() + split_ranges.len() - 1);
         let mut new_versions = Vec::with_capacity(old_versions.len() + split_ranges.len() - 1);
-        for (idx, (range, version)) in old_ranges
+        for (idx, (scope, version)) in old_scopes
             .into_iter()
             .zip(old_versions.into_iter())
             .enumerate()
         {
             if idx != tree_idx {
-                new_ranges.push(range);
+                new_scopes.push(scope);
                 new_versions.push(version);
                 continue;
             }
             for split_range in &split_ranges {
-                new_ranges.push(split_range.clone());
+                new_scopes.push(LSMTreeScope::new(
+                    split_range.clone(),
+                    tree_scope.column_family_id,
+                ));
                 new_versions.push(Self::clone_version_for_range(version.as_ref(), split_range));
             }
         }
-        let new_multi =
-            match crate::db_state::MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
-                snapshot.multi_lsm_version.total_buckets(),
-                &new_ranges,
-                new_versions,
-            ) {
-                Ok(multi) => multi,
-                Err(_) => return None,
-            };
+        let new_multi = match crate::db_state::MultiLSMTreeVersion::from_scopes_with_tree_versions(
+            snapshot.multi_lsm_version.total_buckets(),
+            &new_scopes,
+            new_versions,
+        ) {
+            Ok(multi) => multi,
+            Err(_) => return None,
+        };
         if !self
             .db_state
             .cas_mutate(snapshot.seq_id, |db_state, current| {
@@ -636,41 +644,44 @@ impl LSMTree {
     /// Returns Some(tree_idx) if the compaction result for the tree index can be applied.
     pub(crate) fn on_compaction_complete(&self, tree_idx: usize) -> Option<usize> {
         let mut state = self.state.lock().unwrap();
-        let expected_range = state.pending_compaction.remove(&tree_idx).flatten();
+        let expected_scope = state.pending_compaction.remove(&tree_idx).flatten();
         if self.db_lifecycle.ensure_open().is_err() {
             return None;
         }
         let snapshot = self.db_state.load();
-        let Some(expected_range) = expected_range else {
+        let Some(expected_scope) = expected_scope else {
             return Some(tree_idx);
         };
         if snapshot
             .multi_lsm_version
-            .bucket_range_of_tree(tree_idx)
+            .tree_scope_of_tree(tree_idx)
             .as_ref()
-            == Some(&expected_range)
+            == Some(&expected_scope)
         {
             return Some(tree_idx);
         }
         snapshot
             .multi_lsm_version
-            .tree_index_for_exact_range(&expected_range)
+            .tree_index_for_exact_scope(&expected_scope)
             .or_else(|| {
                 snapshot
                     .multi_lsm_version
-                    .tree_index_for_bucket(*expected_range.start())
+                    .tree_index_for_bucket_and_column_family(
+                        *expected_scope.bucket_range.start(),
+                        expected_scope.column_family_id,
+                    )
             })
     }
 
     #[cfg(test)]
     pub(crate) fn on_compaction_started(&self, tree_idx: usize) {
         let mut state = self.state.lock().unwrap();
-        let expected_range = self
+        let expected_scope = self
             .db_state
             .load()
             .multi_lsm_version
-            .bucket_range_of_tree(tree_idx);
-        state.pending_compaction.insert(tree_idx, expected_range);
+            .tree_scope_of_tree(tree_idx);
+        state.pending_compaction.insert(tree_idx, expected_scope);
     }
 
     pub(crate) fn ttl_provider(&self) -> Arc<crate::ttl::TTLProvider> {
@@ -704,9 +715,9 @@ impl LSMTree {
             return;
         }
         let tree_version = levels_snapshot.multi_lsm_version.version_of_index(tree_idx);
-        let expected_range = levels_snapshot
+        let expected_scope = levels_snapshot
             .multi_lsm_version
-            .bucket_range_of_tree(tree_idx);
+            .tree_scope_of_tree(tree_idx);
         let plan = state
             .compaction_policy
             .pick(&tree_version.levels, state.compaction_config);
@@ -732,7 +743,7 @@ impl LSMTree {
             state.compaction_config.output_file_type,
             self.ttl_provider(),
         ) {
-            state.pending_compaction.insert(tree_idx, expected_range);
+            state.pending_compaction.insert(tree_idx, expected_scope);
             std::mem::drop(handle);
         }
     }
@@ -807,7 +818,11 @@ impl LSMTree {
         selected_mask: Option<&[u8]>,
         terminal_mask: Option<&mut [u8]>,
     ) -> Result<Vec<Value>> {
-        let Some(version) = snapshot.multi_lsm_version.version_for_bucket(bucket) else {
+        let column_family_id = key_column_family(encoded_key).unwrap_or(DEFAULT_COLUMN_FAMILY_ID);
+        let Some(version) = snapshot
+            .multi_lsm_version
+            .version_for_bucket_and_column_family(bucket, column_family_id)
+        else {
             return Ok(Vec::new());
         };
         self.get_with_levels(
@@ -1832,12 +1847,10 @@ mod tests {
                 },
             ],
         });
-        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
-            4,
-            &[0u16..=3u16],
-            vec![initial_version],
-        )
-        .unwrap();
+        let scopes = crate::db_state::default_column_family_scopes(&[0u16..=3u16]);
+        let multi_lsm_version =
+            MultiLSMTreeVersion::from_scopes_with_tree_versions(4, &scopes, vec![initial_version])
+                .unwrap();
         db_state.store(DbState {
             seq_id: 0,
             bucket_ranges: Vec::new(),
@@ -1870,7 +1883,7 @@ mod tests {
         for bucket in 0..4u16 {
             let tree_idx = snapshot
                 .multi_lsm_version
-                .tree_index_for_bucket(bucket)
+                .tree_index_for_bucket_and_column_family(bucket, DEFAULT_COLUMN_FAMILY_ID)
                 .expect("tree idx for bucket");
             let range = snapshot
                 .multi_lsm_version
@@ -1914,12 +1927,10 @@ mod tests {
                 },
             ],
         });
-        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
-            4,
-            &[0u16..=3u16],
-            vec![initial_version],
-        )
-        .unwrap();
+        let scopes = crate::db_state::default_column_family_scopes(&[0u16..=3u16]);
+        let multi_lsm_version =
+            MultiLSMTreeVersion::from_scopes_with_tree_versions(4, &scopes, vec![initial_version])
+                .unwrap();
         db_state.store(DbState {
             seq_id: 0,
             bucket_ranges: Vec::new(),
@@ -1956,9 +1967,11 @@ mod tests {
                 files: vec![create_data_file_with_bucket(2, 8)],
             }],
         });
-        let initial_multi = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+        let initial_scopes =
+            crate::db_state::default_column_family_scopes(&[0u16..=1u16, 2u16..=3u16]);
+        let initial_multi = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             4,
-            &[0u16..=1u16, 2u16..=3u16],
+            &initial_scopes,
             vec![Arc::clone(&base_version), Arc::clone(&base_version)],
         )
         .unwrap();
@@ -1975,9 +1988,11 @@ mod tests {
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         lsm_tree.on_compaction_started(1);
 
-        let shifted_multi = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+        let shifted_scopes =
+            crate::db_state::default_column_family_scopes(&[0u16..=0u16, 1u16..=1u16, 2u16..=3u16]);
+        let shifted_multi = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             4,
-            &[0u16..=0u16, 1u16..=1u16, 2u16..=3u16],
+            &shifted_scopes,
             vec![
                 Arc::clone(&base_version),
                 Arc::clone(&base_version),
@@ -2009,9 +2024,10 @@ mod tests {
                 files: vec![create_data_file_with_bucket(1, 8)],
             }],
         });
-        let initial_multi = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+        let scopes = crate::db_state::default_column_family_scopes(&[0u16..=1u16]);
+        let initial_multi = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             2,
-            &[0u16..=1u16],
+            &scopes,
             vec![Arc::clone(&base_version)],
         )
         .unwrap();

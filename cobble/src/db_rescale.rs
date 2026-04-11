@@ -1,7 +1,9 @@
 //! Functionality for expanding owned buckets by importing snapshot data from another db.
 use super::Db;
 use crate::data_file::intersect_bucket_ranges;
-use crate::db_state::{DbState, MultiLSMTreeVersion, bucket_range_fits_total};
+use crate::db_state::{
+    DbState, MultiLSMTreeVersion, bucket_range_fits_total, default_column_family_scopes,
+};
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager, MetadataReader, SequentialWriteFile};
 use crate::lsm::LSMTree;
@@ -281,9 +283,10 @@ impl Db {
         let mut merged_versions = current.multi_lsm_version.tree_versions_cloned();
         merged_ranges.extend(imported_ranges);
         merged_versions.extend(imported_versions);
-        let merged_multi_lsm = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+        let merged_scopes = default_column_family_scopes(&merged_ranges);
+        let merged_multi_lsm = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             current.multi_lsm_version.total_buckets(),
-            &merged_ranges,
+            &merged_scopes,
             merged_versions,
         )?;
         let mut merged_vlog_entries = current.vlog_version.files_with_entries();
@@ -430,9 +433,10 @@ impl Db {
                 "cannot shrink all LSM tree ranges".to_string(),
             ));
         }
-        let updated_multi_lsm = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+        let updated_scopes = default_column_family_scopes(&updated_tree_ranges);
+        let updated_multi_lsm = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             current.multi_lsm_version.total_buckets(),
-            &updated_tree_ranges,
+            &updated_scopes,
             updated_tree_versions,
         )?;
         self.db_state.store(DbState {

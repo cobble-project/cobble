@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::lsm::LSMTreeVersion;
 use crate::memtable::{ActiveMemtable, ImmutableMemtable};
+use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, MAX_COLUMN_FAMILY_COUNT};
 use crate::vlog::VlogVersion;
 use arc_swap::ArcSwap;
 use std::collections::VecDeque;
@@ -10,14 +11,39 @@ use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Clone)]
 struct TreeVersionEntry {
-    bucket_range: RangeInclusive<u16>,
+    scope: LSMTreeScope,
     lsm_version: Arc<LSMTreeVersion>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LSMTreeScope {
+    pub(crate) bucket_range: RangeInclusive<u16>,
+    pub(crate) column_family_id: u8,
+}
+
+impl LSMTreeScope {
+    pub(crate) fn new(bucket_range: RangeInclusive<u16>, column_family_id: u8) -> Self {
+        Self {
+            bucket_range,
+            column_family_id,
+        }
+    }
+}
+
+pub(crate) fn default_column_family_scopes(
+    bucket_ranges: &[RangeInclusive<u16>],
+) -> Vec<LSMTreeScope> {
+    bucket_ranges
+        .iter()
+        .cloned()
+        .map(|bucket_range| LSMTreeScope::new(bucket_range, DEFAULT_COLUMN_FAMILY_ID))
+        .collect()
 }
 
 #[derive(Clone)]
 pub(crate) struct MultiLSMTreeVersion {
     total_buckets: u32,
-    bucket_to_tree_idx: Vec<u32>,
+    bucket_to_tree_idx_by_cf: Vec<Vec<u32>>,
     tree_versions: Vec<TreeVersionEntry>,
 }
 
@@ -25,28 +51,17 @@ impl MultiLSMTreeVersion {
     pub(crate) fn new(lsm_version: LSMTreeVersion) -> Self {
         Self {
             total_buckets: 0,
-            bucket_to_tree_idx: Vec::new(),
+            bucket_to_tree_idx_by_cf: Vec::new(),
             tree_versions: vec![TreeVersionEntry {
-                bucket_range: 0u16..=0u16,
+                scope: LSMTreeScope::new(0u16..=0u16, DEFAULT_COLUMN_FAMILY_ID),
                 lsm_version: Arc::new(lsm_version),
             }],
         }
     }
 
-    pub(crate) fn from_bucket_ranges(
+    pub(crate) fn from_scopes_with_tree_versions(
         total_buckets: u32,
-        bucket_ranges: &[RangeInclusive<u16>],
-        lsm_version: Arc<LSMTreeVersion>,
-    ) -> Result<Self> {
-        let tree_versions = (0..bucket_ranges.len())
-            .map(|_| Arc::clone(&lsm_version))
-            .collect();
-        Self::from_bucket_ranges_with_tree_versions(total_buckets, bucket_ranges, tree_versions)
-    }
-
-    pub(crate) fn from_bucket_ranges_with_tree_versions(
-        total_buckets: u32,
-        bucket_ranges: &[RangeInclusive<u16>],
+        scopes: &[LSMTreeScope],
         lsm_versions: Vec<Arc<LSMTreeVersion>>,
     ) -> Result<Self> {
         if total_buckets == 0 || total_buckets > (u16::MAX as u32) + 1 {
@@ -54,44 +69,63 @@ impl MultiLSMTreeVersion {
                 "total_buckets must be in range 1..=65536".to_string(),
             ));
         }
-        if bucket_ranges.is_empty() {
+        if scopes.is_empty() {
             return Err(Error::ConfigError(
-                "bucket_ranges must not be empty".to_string(),
+                "tree scopes must not be empty".to_string(),
             ));
         }
-        if lsm_versions.len() != bucket_ranges.len() {
+        if lsm_versions.len() != scopes.len() {
             return Err(Error::InvalidState(format!(
-                "LSM tree version count {} does not match bucket range count {}",
+                "LSM tree version count {} does not match tree scope count {}",
                 lsm_versions.len(),
-                bucket_ranges.len()
+                scopes.len()
             )));
         }
-        let mut bucket_to_tree_idx = vec![u32::MAX; bucket_slots_for_total(total_buckets)];
-        let mut tree_versions = Vec::with_capacity(bucket_ranges.len());
-        for (tree_idx, range) in bucket_ranges.iter().enumerate() {
-            if !bucket_range_fits_total(range, total_buckets) {
+        let bucket_slots = bucket_slots_for_total(total_buckets);
+        let max_cf_id = scopes
+            .iter()
+            .map(|scope| usize::from(scope.column_family_id))
+            .max()
+            .unwrap_or(usize::from(DEFAULT_COLUMN_FAMILY_ID));
+        let mut bucket_to_tree_idx_by_cf = vec![Vec::<u32>::new(); max_cf_id + 1];
+        let mut tree_versions = Vec::with_capacity(scopes.len());
+        for (tree_idx, scope) in scopes.iter().enumerate() {
+            if usize::from(scope.column_family_id) >= MAX_COLUMN_FAMILY_COUNT {
                 return Err(Error::ConfigError(format!(
-                    "Invalid bucket range {}..={} for total_buckets {}",
-                    range.start(),
-                    range.end(),
-                    total_buckets
+                    "Invalid column family id {} in tree scope",
+                    scope.column_family_id
                 )));
             }
-            let Some(last_bucket) = bucket_range_last(range) else {
+            if !bucket_range_fits_total(&scope.bucket_range, total_buckets) {
                 return Err(Error::ConfigError(format!(
-                    "Invalid bucket range {}..={} for total_buckets {}",
-                    range.start(),
-                    range.end(),
-                    total_buckets
+                    "Invalid bucket range {}..={} for total_buckets {} in column_family {}",
+                    scope.bucket_range.start(),
+                    scope.bucket_range.end(),
+                    total_buckets,
+                    scope.column_family_id
+                )));
+            }
+            let Some(last_bucket) = bucket_range_last(&scope.bucket_range) else {
+                return Err(Error::ConfigError(format!(
+                    "Invalid bucket range {}..={} for total_buckets {} in column_family {}",
+                    scope.bucket_range.start(),
+                    scope.bucket_range.end(),
+                    total_buckets,
+                    scope.column_family_id
                 )));
             };
-            let mut bucket = *range.start();
+            let cf_slot = usize::from(scope.column_family_id);
+            let cf_bucket_to_tree_idx = &mut bucket_to_tree_idx_by_cf[cf_slot];
+            if cf_bucket_to_tree_idx.is_empty() {
+                *cf_bucket_to_tree_idx = vec![u32::MAX; bucket_slots];
+            }
+            let mut bucket = *scope.bucket_range.start();
             loop {
-                let slot = &mut bucket_to_tree_idx[bucket as usize];
+                let slot = &mut cf_bucket_to_tree_idx[bucket as usize];
                 if *slot != u32::MAX {
                     return Err(Error::ConfigError(format!(
-                        "Overlapping bucket range detected at bucket {}",
-                        bucket
+                        "Overlapping bucket range detected at bucket {} in column_family {}",
+                        bucket, scope.column_family_id
                     )));
                 }
                 *slot = tree_idx as u32;
@@ -101,13 +135,13 @@ impl MultiLSMTreeVersion {
                 bucket = bucket.saturating_add(1);
             }
             tree_versions.push(TreeVersionEntry {
-                bucket_range: range.clone(),
+                scope: scope.clone(),
                 lsm_version: Arc::clone(&lsm_versions[tree_idx]),
             });
         }
         Ok(Self {
             total_buckets,
-            bucket_to_tree_idx,
+            bucket_to_tree_idx_by_cf,
             tree_versions,
         })
     }
@@ -133,16 +167,19 @@ impl MultiLSMTreeVersion {
                 end = Some(bucket);
             }
             entries.push(TreeVersionEntry {
-                bucket_range: match (start, end) {
-                    (Some(start), Some(end)) => start..=end,
-                    _ => 0u16..=0u16,
-                },
+                scope: LSMTreeScope::new(
+                    match (start, end) {
+                        (Some(start), Some(end)) => start..=end,
+                        _ => 0u16..=0u16,
+                    },
+                    DEFAULT_COLUMN_FAMILY_ID,
+                ),
                 lsm_version,
             });
         }
         Self {
             total_buckets,
-            bucket_to_tree_idx,
+            bucket_to_tree_idx_by_cf: vec![bucket_to_tree_idx],
             tree_versions: entries,
         }
     }
@@ -170,39 +207,68 @@ impl MultiLSMTreeVersion {
         self.total_buckets
     }
 
-    pub(crate) fn tree_index_for_bucket(&self, bucket: u16) -> Option<usize> {
-        if self.bucket_to_tree_idx.is_empty() {
+    pub(crate) fn tree_index_for_bucket_and_column_family(
+        &self,
+        bucket: u16,
+        column_family_id: u8,
+    ) -> Option<usize> {
+        if self.bucket_to_tree_idx_by_cf.is_empty() {
             return Some(0);
         }
-        let tree_idx = *self.bucket_to_tree_idx.get(bucket as usize)?;
+        let bucket_to_tree_idx = self
+            .bucket_to_tree_idx_by_cf
+            .get(column_family_id as usize)
+            .filter(|mapping| !mapping.is_empty())?;
+        let tree_idx = *bucket_to_tree_idx.get(bucket as usize)?;
         if tree_idx == u32::MAX {
             return None;
         }
         Some(tree_idx as usize)
     }
 
-    pub(crate) fn version_for_bucket(&self, bucket: u16) -> Option<Arc<LSMTreeVersion>> {
-        self.tree_index_for_bucket(bucket)
+    pub(crate) fn version_for_bucket_and_column_family(
+        &self,
+        bucket: u16,
+        column_family_id: u8,
+    ) -> Option<Arc<LSMTreeVersion>> {
+        self.tree_index_for_bucket_and_column_family(bucket, column_family_id)
             .map(|tree_idx| self.version_of_index(tree_idx))
     }
 
     pub(crate) fn bucket_range_of_tree(&self, tree_idx: usize) -> Option<RangeInclusive<u16>> {
         self.tree_versions
             .get(tree_idx)
-            .map(|entry| entry.bucket_range.clone())
+            .map(|entry| entry.scope.bucket_range.clone())
+    }
+
+    pub(crate) fn tree_scope_of_tree(&self, tree_idx: usize) -> Option<LSMTreeScope> {
+        self.tree_versions
+            .get(tree_idx)
+            .map(|entry| entry.scope.clone())
     }
 
     pub(crate) fn bucket_ranges(&self) -> Vec<RangeInclusive<u16>> {
         self.tree_versions
             .iter()
-            .map(|entry| entry.bucket_range.clone())
+            .map(|entry| entry.scope.bucket_range.clone())
+            .collect()
+    }
+
+    pub(crate) fn tree_scopes(&self) -> Vec<LSMTreeScope> {
+        self.tree_versions
+            .iter()
+            .map(|entry| entry.scope.clone())
             .collect()
     }
 
     pub(crate) fn tree_index_for_exact_range(&self, range: &RangeInclusive<u16>) -> Option<usize> {
+        self.tree_index_for_exact_scope(&LSMTreeScope::new(range.clone(), DEFAULT_COLUMN_FAMILY_ID))
+    }
+
+    pub(crate) fn tree_index_for_exact_scope(&self, scope: &LSMTreeScope) -> Option<usize> {
         self.tree_versions
             .iter()
-            .position(|entry| &entry.bucket_range == range)
+            .position(|entry| &entry.scope == scope)
     }
 
     pub(crate) fn with_lsm_version_at(
@@ -213,7 +279,7 @@ impl MultiLSMTreeVersion {
         let mut tree_versions = self.tree_versions.clone();
         if tree_versions.is_empty() {
             tree_versions.push(TreeVersionEntry {
-                bucket_range: 0u16..=0u16,
+                scope: LSMTreeScope::new(0u16..=0u16, DEFAULT_COLUMN_FAMILY_ID),
                 lsm_version,
             });
         } else {
@@ -222,7 +288,7 @@ impl MultiLSMTreeVersion {
         }
         Self {
             total_buckets: self.total_buckets,
-            bucket_to_tree_idx: self.bucket_to_tree_idx.clone(),
+            bucket_to_tree_idx_by_cf: self.bucket_to_tree_idx_by_cf.clone(),
             tree_versions,
         }
     }
@@ -346,9 +412,10 @@ impl DbStateHandle {
                 existing_tree_count
             )));
         };
-        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+        let scopes = default_column_family_scopes(bucket_ranges);
+        let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             total_buckets,
-            bucket_ranges,
+            &scopes,
             tree_versions,
         )?;
         self.store(DbState {
@@ -417,3 +484,71 @@ pub(crate) fn bucket_range_fits_total(range: &RangeInclusive<u16>, total_buckets
 //----------------------------
 // end of bucket utilities
 //----------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_version() -> Arc<LSMTreeVersion> {
+        Arc::new(LSMTreeVersion { levels: Vec::new() })
+    }
+
+    #[test]
+    fn test_multi_lsm_routes_by_bucket_and_column_family() {
+        let version0 = empty_version();
+        let version1 = empty_version();
+        let version2 = empty_version();
+        let scopes = vec![
+            LSMTreeScope::new(0u16..=1u16, DEFAULT_COLUMN_FAMILY_ID),
+            LSMTreeScope::new(2u16..=3u16, DEFAULT_COLUMN_FAMILY_ID),
+            LSMTreeScope::new(0u16..=3u16, 1),
+        ];
+        let multi = MultiLSMTreeVersion::from_scopes_with_tree_versions(
+            4,
+            &scopes,
+            vec![version0, version1, version2],
+        )
+        .expect("build multi lsm with CF scopes");
+
+        assert_eq!(
+            multi.tree_index_for_bucket_and_column_family(0, DEFAULT_COLUMN_FAMILY_ID),
+            Some(0)
+        );
+        assert_eq!(
+            multi.tree_index_for_bucket_and_column_family(3, DEFAULT_COLUMN_FAMILY_ID),
+            Some(1)
+        );
+        assert_eq!(multi.tree_index_for_bucket_and_column_family(2, 1), Some(2));
+        assert_eq!(multi.tree_index_for_bucket_and_column_family(2, 2), None);
+        assert_eq!(
+            multi.tree_index_for_bucket_and_column_family(0, DEFAULT_COLUMN_FAMILY_ID),
+            Some(0)
+        );
+        assert_eq!(
+            multi.tree_index_for_exact_scope(&LSMTreeScope::new(0u16..=3u16, 1)),
+            Some(2)
+        );
+        assert_eq!(multi.tree_index_for_exact_range(&(0u16..=3u16)), None);
+        assert_eq!(
+            multi.bucket_range_of_tree(2),
+            Some(0u16..=3u16),
+            "scope range should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_multi_lsm_rejects_overlap_in_same_column_family() {
+        let result = MultiLSMTreeVersion::from_scopes_with_tree_versions(
+            4,
+            &[
+                LSMTreeScope::new(0u16..=2u16, DEFAULT_COLUMN_FAMILY_ID),
+                LSMTreeScope::new(2u16..=3u16, DEFAULT_COLUMN_FAMILY_ID),
+            ],
+            vec![empty_version(), empty_version()],
+        );
+        assert!(matches!(
+            result,
+            Err(Error::ConfigError(msg)) if msg.contains("Overlapping bucket range")
+        ));
+    }
+}

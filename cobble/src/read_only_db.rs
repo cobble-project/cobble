@@ -1,7 +1,7 @@
 use crate::block_cache::{BlockCache, new_block_cache_with_config};
 use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
-use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
+use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, default_column_family_scopes};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::FileManager;
@@ -167,9 +167,10 @@ impl ReadOnlyDb {
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let tree_versions = build_tree_versions_from_manifest(&file_manager, &manifest, true)?;
-        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+        let tree_scopes = default_column_family_scopes(&lsm_tree_bucket_ranges);
+        let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             config.total_buckets,
-            &lsm_tree_bucket_ranges,
+            &tree_scopes,
             tree_versions.into_iter().map(Arc::new).collect(),
         )?;
         let writer_options =

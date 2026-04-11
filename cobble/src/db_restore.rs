@@ -1,7 +1,7 @@
 use super::Db;
 use crate::Config;
 use crate::config::PrimaryVolumeOffloadPolicyKind;
-use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
+use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, default_column_family_scopes};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::{
@@ -320,9 +320,10 @@ impl Db {
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
         let can_incremental_base =
             can_incremental_snapshot_from_tree_versions(&tree_versions, &file_manager);
-        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+        let tree_scopes = default_column_family_scopes(&lsm_tree_bucket_ranges);
+        let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             config.total_buckets,
-            &lsm_tree_bucket_ranges,
+            &tree_scopes,
             tree_versions.into_iter().map(Arc::new).collect(),
         )?;
 
@@ -434,9 +435,10 @@ impl Db {
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
         let can_incremental_base =
             can_incremental_snapshot_from_tree_versions(&tree_versions, &file_manager);
-        let multi_lsm_version = MultiLSMTreeVersion::from_bucket_ranges_with_tree_versions(
+        let tree_scopes = default_column_family_scopes(&lsm_tree_bucket_ranges);
+        let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             config.total_buckets,
-            &lsm_tree_bucket_ranges,
+            &tree_scopes,
             tree_versions.into_iter().map(Arc::new).collect(),
         )?;
         let db_state = Arc::new(DbStateHandle::new());
