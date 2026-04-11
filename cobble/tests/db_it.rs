@@ -438,7 +438,7 @@ fn test_db_counter_merge_large_dataset_with_compaction_and_file_read() {
     let db = open_db(config);
     let mut schema = db.update_schema();
     schema
-        .set_column_operator(0, Arc::new(U64CounterMergeOperator))
+        .set_column_operator(None, 0, Arc::new(U64CounterMergeOperator))
         .unwrap();
     let _ = schema.commit();
 
@@ -513,7 +513,7 @@ fn test_schema_persisted_and_restored_across_open_modes() {
     let db = open_db(config.clone());
     let mut schema = db.update_schema();
     schema
-        .set_column_operator(0, Arc::new(U64CounterMergeOperator))
+        .set_column_operator(None, 0, Arc::new(U64CounterMergeOperator))
         .unwrap();
     let _ = schema.commit();
 
@@ -1791,7 +1791,7 @@ fn test_db_expire_snapshot_releases_schema_files() {
     };
     let db = open_db(config);
     let mut schema = db.update_schema();
-    schema.add_column(1, None, None).unwrap();
+    schema.add_column(1, None, None, None).unwrap();
     let _ = schema.commit();
 
     db.put(0, b"k1", 1, b"v1").unwrap();

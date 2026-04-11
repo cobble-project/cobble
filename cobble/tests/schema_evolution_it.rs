@@ -103,7 +103,7 @@ fn setup_large_schema_evolution_dataset(root: &str) -> Db {
 
     let mut schema = db.update_schema();
     schema
-        .add_column(1, None, Some(Bytes::from_static(DEFAULT_COL1)))
+        .add_column(1, None, Some(Bytes::from_static(DEFAULT_COL1)), None)
         .unwrap();
     let _ = schema.commit();
 

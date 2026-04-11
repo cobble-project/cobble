@@ -25,7 +25,7 @@ For adding/removing columns with explicit position control:
 
 ```rust
 let mut builder = db.update_schema();
-builder.add_column(1, None, None)?;     // insert new column at index 1
+builder.add_column(1, None, None, None)?;     // insert new column at index 1
 // or
 builder.delete_column(1)?;              // delete column at index 1
 let _new_schema = builder.commit();

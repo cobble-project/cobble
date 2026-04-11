@@ -1186,7 +1186,7 @@ mod tests {
         let db = open_db(config);
         let mut schema = db.update_schema();
         schema
-            .set_column_operator(0, Arc::new(PipeMergeOperator))
+            .set_column_operator(None, 0, Arc::new(PipeMergeOperator))
             .unwrap();
         let _ = schema.commit();
 
@@ -1228,10 +1228,10 @@ mod tests {
         let db = open_db(config);
         let mut schema = db.update_schema();
         schema
-            .set_column_operator(0, Arc::new(U32CounterMergeOperator))
+            .set_column_operator(None, 0, Arc::new(U32CounterMergeOperator))
             .unwrap();
         schema
-            .set_column_operator(1, Arc::new(U64CounterMergeOperator))
+            .set_column_operator(None, 1, Arc::new(U64CounterMergeOperator))
             .unwrap();
         let _ = schema.commit();
 
@@ -1291,7 +1291,7 @@ mod tests {
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut schema = db.update_schema();
-        schema.add_column(1, None, None).unwrap();
+        schema.add_column(1, None, None, None).unwrap();
         let _ = schema.commit();
 
         let value = db.get(0, b"k1").unwrap().expect("value present");
@@ -1320,7 +1320,7 @@ mod tests {
         db.put(0, b"k1", 0, b"v1").unwrap();
 
         let mut schema = db.update_schema();
-        schema.add_column(1, None, None).unwrap();
+        schema.add_column(1, None, None, None).unwrap();
         let _ = schema.commit();
 
         let value = db.get(0, b"k1").unwrap().expect("value present");

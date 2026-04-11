@@ -2085,7 +2085,7 @@ mod tests {
         manager.put(&key1, &value1).unwrap();
 
         let mut builder = schema_manager.builder();
-        builder.add_column(1, None, None).unwrap();
+        builder.add_column(1, None, None, None).unwrap();
         let _ = builder.commit();
 
         let key2 = RefKey::new(0, b"k2");

@@ -1135,7 +1135,7 @@ mod tests {
 
         let schema_manager = Arc::new(SchemaManager::new(old_num_columns));
         let mut schema_builder = schema_manager.builder();
-        schema_builder.add_column(1, None, None).unwrap();
+        schema_builder.add_column(1, None, None, None).unwrap();
         let target_schema = schema_builder.commit();
 
         let options = CompactionConfig {

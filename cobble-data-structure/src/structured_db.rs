@@ -327,8 +327,8 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
     pub fn add_bytes_column(&mut self, column: u16) -> &mut Self {
         self.schema.columns.remove(&column);
         self.apply_inner(|inner| {
-            inner.set_column_operator(column as usize, Arc::new(BytesMergeOperator))?;
-            inner.clear_column_metadata(column as usize)?;
+            inner.set_column_operator(None, column as usize, Arc::new(BytesMergeOperator))?;
+            inner.clear_column_metadata(None, column as usize)?;
             Ok(())
         });
         self
@@ -339,8 +339,9 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
             .columns
             .insert(column, StructuredColumnType::List(config.clone()));
         self.apply_inner(|inner| {
-            inner.set_column_operator(column as usize, list_operator(config.clone()))?;
+            inner.set_column_operator(None, column as usize, list_operator(config.clone()))?;
             inner.set_column_metadata(
+                None,
                 column as usize,
                 serde_json::to_value(config).map_err(|err| {
                     Error::FileFormatError(format!(
@@ -358,8 +359,8 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
         // Structured delete means dropping structured typing for this column (back to Bytes).
         self.schema.columns.remove(&column);
         self.apply_inner(|inner| {
-            inner.set_column_operator(column as usize, Arc::new(BytesMergeOperator))?;
-            inner.clear_column_metadata(column as usize)?;
+            inner.set_column_operator(None, column as usize, Arc::new(BytesMergeOperator))?;
+            inner.clear_column_metadata(None, column as usize)?;
             Ok(())
         });
         self
@@ -736,8 +737,13 @@ fn apply_structured_schema(
         match column_type {
             StructuredColumnType::Bytes => {}
             StructuredColumnType::List(config) => {
-                schema.set_column_operator(*column as usize, list_operator(config.clone()))?;
+                schema.set_column_operator(
+                    None,
+                    *column as usize,
+                    list_operator(config.clone()),
+                )?;
                 schema.set_column_metadata(
+                    None,
                     *column as usize,
                     serde_json::to_value(config).map_err(|err| {
                         Error::FileFormatError(format!(

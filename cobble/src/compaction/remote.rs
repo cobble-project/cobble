@@ -1472,7 +1472,7 @@ mod tests {
         let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
         let mut schema_builder = schema_manager.builder();
         schema_builder
-            .set_column_operator(0, Arc::new(U64CounterMergeOperator))
+            .set_column_operator(None, 0, Arc::new(U64CounterMergeOperator))
             .unwrap();
         let _ = schema_builder.commit();
 

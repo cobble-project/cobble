@@ -202,7 +202,7 @@ pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeSetColumnOperator(
             return;
         }
     };
-    if let Err(err) = builder.set_column_operator(col, operator) {
+    if let Err(err) = builder.set_column_operator(None, col, operator) {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -262,7 +262,7 @@ pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeAddColumn(
             }
         }
     };
-    if let Err(err) = builder.add_column(col, operator, default_bytes) {
+    if let Err(err) = builder.add_column(col, operator, default_bytes, None) {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -278,7 +278,7 @@ pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeDeleteColumn(
         throw_illegal_state(&mut env, "schema builder handle is disposed".to_string());
         return;
     };
-    if let Err(err) = builder.delete_column(column_idx as usize) {
+    if let Err(err) = builder.delete_column(None, column_idx as usize) {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
