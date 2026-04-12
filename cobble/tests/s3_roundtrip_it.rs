@@ -80,14 +80,14 @@ fn s3_roundtrip_write_snapshot_resume() {
         level_size_multiplier: 4,
         max_level: 6,
         base_file_size: Size::from_mib(4),
-        block_cache_size: Size::from_const(0),
+        block_cache_size: Size::from_mib(256),
         log_console: true,
         ..Config::default()
     };
 
     // 64 MiB total payload: 16_384 keys x 4 KiB values.
     let value_len = 4096usize;
-    let target_bytes = 64 * 1024 * 1024usize;
+    let target_bytes = 1024 * 1024 * 1024usize;
     let records = target_bytes / value_len;
 
     let db = SingleDb::open(config.clone()).expect("open single db on s3 should succeed");
