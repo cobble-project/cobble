@@ -6,6 +6,9 @@ use bytes::Bytes;
 use log::error;
 use std::ops::Deref;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct SingleNodeSnapshotState {
@@ -282,8 +285,26 @@ impl SingleDb {
     pub fn close(&self) -> Result<()> {
         let mut state = self.snapshot_state.lock().unwrap();
         state.closing = true;
-        while state.in_flight > 0 {
-            state = self.snapshot_done.wait(state).unwrap();
+        if let Some(err) = self.db.lifecycle_error() {
+            drop(state);
+            self.db.force_close();
+            return Err(err);
+        }
+        let (state, _) = self
+            .snapshot_done
+            .wait_timeout_while(state, CLOSE_WAIT_TIMEOUT, |state| state.in_flight > 0)
+            .unwrap();
+        if let Some(err) = self.db.lifecycle_error() {
+            drop(state);
+            self.db.force_close();
+            return Err(err);
+        }
+        if state.in_flight > 0 {
+            drop(state);
+            self.db.force_close();
+            return Err(Error::IoError(
+                "Timed out waiting for in-flight single-node snapshots during close".to_string(),
+            ));
         }
         drop(state);
         self.db.close()

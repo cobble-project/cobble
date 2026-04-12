@@ -150,6 +150,12 @@ impl DbLifecycle {
         self.state.store(STATE_ERROR, Ordering::Release);
     }
 
+    pub(crate) fn error(&self) -> Option<Error> {
+        (self.state() == DbLifecycleState::Error)
+            .then(|| self.error.load_full().map(|err| err.as_ref().clone()))
+            .flatten()
+    }
+
     #[inline]
     pub(crate) fn ensure_open(&self) -> Result<()> {
         if self.is_open_fast() {

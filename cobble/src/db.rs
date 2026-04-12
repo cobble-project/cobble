@@ -22,7 +22,7 @@ use crate::write_batch::{WriteBatch, WriteOp};
 use crate::writer_options::WriterOptions;
 use crate::{Config, ReadOptions, ScanOptions, TimeProvider, WriteOptions};
 use bytes::{Bytes, BytesMut};
-use log::info;
+use log::{error, info};
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -188,6 +188,10 @@ impl Db {
         message.contains("not found")
             || message.contains("no such file")
             || message.contains("does not exist")
+            || message.contains("filecorrupt")
+            || message.contains("file corrupt")
+            || message.contains("body write aborted")
+            || message.contains("decode response body")
     }
 
     fn maybe_mark_error_on_read(&self, err: &Error) {
@@ -606,18 +610,48 @@ impl Db {
         Ok(())
     }
 
+    pub(crate) fn lifecycle_error(&self) -> Option<Error> {
+        self.db_lifecycle.error()
+    }
+
+    pub(crate) fn force_close(&self) {
+        self.memtable_manager.force_close();
+        self.lsm_tree.shutdown_compaction();
+        self.snapshot_manager.force_close();
+        self.db_lifecycle.mark_closed();
+    }
+
     /// Close the database and flush pending state.
     pub fn close(&self) -> Result<()> {
-        match self.db_lifecycle.begin_close()? {
-            CloseTransition::AlreadyClosingOrClosed => return Ok(()),
-            CloseTransition::Transitioned => {}
+        match self.db_lifecycle.begin_close() {
+            Ok(CloseTransition::AlreadyClosingOrClosed) => return Ok(()),
+            Ok(CloseTransition::Transitioned) => {}
+            Err(err) => {
+                self.force_close();
+                return Err(err);
+            }
         }
-        self.memtable_manager.close()?;
-        let _ = self
-            .snapshot_manager
-            .wait_for_materialization(Duration::from_secs(30));
+        if let Some(err) = self.lifecycle_error() {
+            self.force_close();
+            return Err(err);
+        }
+        if let Err(err) = self.memtable_manager.close() {
+            self.force_close();
+            return Err(err);
+        }
+        if let Some(err) = self.lifecycle_error() {
+            self.force_close();
+            return Err(err);
+        }
         self.lsm_tree.shutdown_compaction();
-        self.snapshot_manager.close()?;
+        if let Err(err) = self.snapshot_manager.close() {
+            self.force_close();
+            return Err(err);
+        }
+        if let Some(err) = self.lifecycle_error() {
+            self.force_close();
+            return Err(err);
+        }
         self.db_lifecycle.mark_closed();
         Ok(())
     }
@@ -809,6 +843,7 @@ impl Db {
         let snapshot_manager = SnapshotManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&schema_manager),
+            Arc::clone(&db_lifecycle),
             config.snapshot_retention,
             bucket_ranges.clone(),
         );
@@ -1147,7 +1182,10 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        let _ = self.close();
+        if let Err(err) = self.close() {
+            error!("db drop forced close after error: {}", err);
+            self.force_close();
+        }
     }
 }
 

@@ -29,9 +29,11 @@ use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
 use crate::writer_options::WriterOptions;
 use log::{debug, trace, warn};
 use metrics::{Counter, counter};
+use std::time::Duration;
 use uuid::Uuid;
 
 type DynKvIterator = Box<dyn for<'a> KvIterator<'a>>;
+const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(crate) struct MemtableFlushResult {
@@ -329,6 +331,11 @@ impl ActiveMemtable {
 }
 
 impl MemtableManager {
+    pub(crate) fn force_close(&self) {
+        self.flush_tx.lock().unwrap().take();
+        let _ = self.worker.lock().unwrap().take();
+    }
+
     pub(crate) fn new(
         file_manager: Arc<FileManager>,
         lsm_tree: Arc<LSMTree>,
@@ -853,6 +860,7 @@ impl MemtableManager {
             if self.db_state.load().active.is_none() {
                 let mut state = self.state.lock().unwrap();
                 while self.db_state.load().active.is_none() {
+                    self.db_lifecycle.ensure_open()?;
                     state = self.buffer_ready.wait(state).unwrap();
                 }
                 drop(state);
@@ -996,6 +1004,7 @@ impl MemtableManager {
                     "failed to allocate special active vec memtable".to_string(),
                 ));
             }
+            self.db_lifecycle.ensure_open()?;
             state = self.buffer_ready.wait(state).unwrap();
         }
         // Allow reclaimer to make active buffer again for future flushes.
@@ -1382,13 +1391,47 @@ impl MemtableManager {
     }
 
     pub(crate) fn close(&self) -> Result<()> {
+        if let Some(err) = self.db_lifecycle.error() {
+            self.force_close();
+            return Err(err);
+        }
         {
             let mut tx = self.flush_tx.lock().unwrap();
             tx.take();
         }
+        let (state, _) = self
+            .flush_done
+            .wait_timeout_while(self.state.lock().unwrap(), CLOSE_WAIT_TIMEOUT, |state| {
+                state.in_flight > 0
+            })
+            .unwrap();
+        if let Some(err) = self.db_lifecycle.error() {
+            drop(state);
+            self.force_close();
+            return Err(err);
+        }
+        if state.in_flight > 0 {
+            drop(state);
+            self.force_close();
+            return Err(Error::IoError(
+                "Timed out waiting for memtable flush worker to finish during close".to_string(),
+            ));
+        }
+        let flush_err = state
+            .flush_results
+            .iter()
+            .find_map(|result| result.as_ref().err().cloned());
+        drop(state);
         let worker = self.worker.lock().unwrap().take();
         if let Some(worker) = worker {
-            let _ = worker.join();
+            worker.join().map_err(|_| {
+                Error::IoError("Memtable flush worker panicked during close".to_string())
+            })?;
+        }
+        if let Some(err) = flush_err {
+            self.db_lifecycle.mark_error(err.clone());
+            self.force_close();
+            return Err(err);
         }
         Ok(())
     }

@@ -9,6 +9,7 @@ use super::{
 use crate::config::MemtableType;
 use crate::data_file::DataFile;
 use crate::db_state::{DbState, DbStateHandle};
+use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::{
     BufferedWriter, File, FileManager, SnapshotCopyResourceRegistry, TrackedFile, TrackedFileId,
@@ -21,12 +22,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinSet;
+
+const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct SnapshotManager {
     file_manager: Arc<FileManager>,
     schema_manager: Arc<SchemaManager>,
+    db_lifecycle: Arc<DbLifecycle>,
     bucket_ranges: Arc<RwLock<Vec<RangeInclusive<u16>>>>,
     state: Arc<Mutex<SnapshotManagerState>>,
     retention: Option<usize>,
@@ -42,6 +47,7 @@ impl Clone for SnapshotManager {
         Self {
             file_manager: Arc::clone(&self.file_manager),
             schema_manager: Arc::clone(&self.schema_manager),
+            db_lifecycle: Arc::clone(&self.db_lifecycle),
             bucket_ranges: Arc::clone(&self.bucket_ranges),
             state: Arc::clone(&self.state),
             retention: self.retention,
@@ -143,6 +149,7 @@ impl SnapshotManager {
     pub(crate) fn new(
         file_manager: Arc<FileManager>,
         schema_manager: Arc<SchemaManager>,
+        db_lifecycle: Arc<DbLifecycle>,
         retention: Option<usize>,
         bucket_ranges: Vec<RangeInclusive<u16>>,
     ) -> Self {
@@ -153,6 +160,7 @@ impl SnapshotManager {
         Self {
             file_manager,
             schema_manager,
+            db_lifecycle,
             bucket_ranges: Arc::new(RwLock::new(bucket_ranges)),
             state: Arc::new(Mutex::new(SnapshotManagerState {
                 next_id: 0,
@@ -816,13 +824,39 @@ impl SnapshotManager {
         guard.in_flight == 0
     }
 
+    pub(crate) fn force_close(&self) {
+        self.materialize_tx.lock().unwrap().take();
+        let _ = self.materialize_worker.lock().unwrap().take();
+    }
+
     /// Stop the background materializer worker.
     pub(crate) fn close(&self) -> Result<()> {
+        if let Some(err) = self.db_lifecycle.error() {
+            self.force_close();
+            return Err(err);
+        }
         let mut tx_guard = self.materialize_tx.lock().unwrap();
         tx_guard.take();
+        drop(tx_guard);
+        if let Some(err) = self.db_lifecycle.error() {
+            self.force_close();
+            return Err(err);
+        }
+        if !self.wait_for_materialization(CLOSE_WAIT_TIMEOUT) {
+            self.force_close();
+            return Err(Error::IoError(
+                "Timed out waiting for snapshot materialization during close".to_string(),
+            ));
+        }
+        if let Some(err) = self.db_lifecycle.error() {
+            self.force_close();
+            return Err(err);
+        }
         let worker = self.materialize_worker.lock().unwrap().take();
         if let Some(worker) = worker {
-            let _ = worker.join();
+            worker.join().map_err(|_| {
+                Error::IoError("Snapshot materializer worker panicked during close".to_string())
+            })?;
         }
         Ok(())
     }
