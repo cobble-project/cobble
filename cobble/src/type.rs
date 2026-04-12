@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::merge_operator::MergeOperator;
-use crate::schema::Schema;
+use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema};
 use crate::time::TimeProvider;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -569,13 +569,30 @@ impl Value {
         schema: &Schema,
         time_provider: Option<&dyn TimeProvider>,
     ) -> Result<Value> {
-        self.merge_with_callback(newer, schema, time_provider, &mut |_, _| {})
+        self.merge_in_column_family(newer, schema, DEFAULT_COLUMN_FAMILY_ID, time_provider)
+    }
+
+    pub(crate) fn merge_in_column_family(
+        self,
+        newer: Value,
+        schema: &Schema,
+        column_family_id: u8,
+        time_provider: Option<&dyn TimeProvider>,
+    ) -> Result<Value> {
+        self.merge_with_callback(
+            newer,
+            schema,
+            column_family_id,
+            time_provider,
+            &mut |_, _| {},
+        )
     }
 
     pub(crate) fn merge_with_callback<F>(
         self,
         newer: Value,
         schema: &Schema,
+        column_family_id: u8,
         time_provider: Option<&dyn TimeProvider>,
         on_merge: &mut F,
     ) -> Result<Value>
@@ -598,7 +615,11 @@ impl Value {
                     if old.data().is_empty() {
                         Some(new)
                     } else {
-                        Some(old.merge(new, schema.operator(column_idx), time_provider)?)
+                        Some(old.merge(
+                            new,
+                            schema.operator_in_family(column_family_id, column_idx),
+                            time_provider,
+                        )?)
                     }
                 }
                 (Some(old), None) => {
@@ -923,9 +944,15 @@ mod tests {
         ]);
         let mut seen = Vec::new();
         let _ = old
-            .merge_with_callback(new, &Schema::empty(), None, &mut |old_col, new_col| {
-                seen.push((old_col.map(|c| c.value_type), new_col.map(|c| c.value_type)));
-            })
+            .merge_with_callback(
+                new,
+                &Schema::empty(),
+                DEFAULT_COLUMN_FAMILY_ID,
+                None,
+                &mut |old_col, new_col| {
+                    seen.push((old_col.map(|c| c.value_type), new_col.map(|c| c.value_type)));
+                },
+            )
             .unwrap();
         assert_eq!(
             seen,

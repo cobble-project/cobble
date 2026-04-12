@@ -1163,8 +1163,8 @@ mod tests {
     use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
     use crate::lsm::{LSMTree, LSMTreeVersion, Level};
     use crate::parquet::ParquetIterator;
-    use crate::sst::row_codec::{decode_value, encode_value};
-    use crate::r#type::{Column, KvValue, Value, ValueType};
+    use crate::sst::row_codec::{decode_value, encode_key, encode_value};
+    use crate::r#type::{Column, Key, KvValue, Value, ValueType};
     use crate::writer_options::WriterOptions;
     use serial_test::serial;
     use size::Size;
@@ -1178,6 +1178,10 @@ mod tests {
     fn make_typed_value_bytes(value_type: ValueType, data: &[u8], num_columns: usize) -> Vec<u8> {
         let value = Value::new(vec![Some(Column::new(value_type, data.to_vec()))]);
         encode_value(&value, num_columns).to_vec()
+    }
+
+    fn make_test_key(raw_key: &[u8]) -> Vec<u8> {
+        encode_key(&Key::new(0, raw_key.to_vec())).to_vec()
     }
 
     fn create_test_sst(
@@ -1401,7 +1405,7 @@ mod tests {
         let mut expected = HashMap::new();
         let entries_old = (0..20u64)
             .map(|idx| {
-                let key = format!("k{:03}", idx).into_bytes();
+                let key = make_test_key(format!("k{:03}", idx).as_bytes());
                 let base = idx + 1;
                 let delta = 10u64;
                 expected.insert(key.clone(), base + delta);
@@ -1413,7 +1417,7 @@ mod tests {
             .collect::<Vec<_>>();
         let entries_new = (0..20u64)
             .map(|idx| {
-                let key = format!("k{:03}", idx).into_bytes();
+                let key = make_test_key(format!("k{:03}", idx).as_bytes());
                 let delta = 10u64;
                 (
                     key,

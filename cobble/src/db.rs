@@ -1,11 +1,11 @@
 use crate::block_cache::new_block_cache_with_config;
 use crate::db_builder::DbBuilder;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
-use crate::db_state::{DbStateHandle, bucket_range_fits_total};
+use crate::db_state::{DbStateHandle, LSMTreeScope, bucket_range_fits_total};
 use crate::db_status::{CloseTransition, DbLifecycle};
 use crate::error::{Error, Result};
 use crate::file::FileManager;
-use crate::lsm::LSMTree;
+use crate::lsm::{LSMTree, LSMTreeVersion};
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::merge_operator::MergeOperator;
 use crate::metrics_manager::MetricsManager;
@@ -25,6 +25,7 @@ use bytes::{Bytes, BytesMut};
 use log::info;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -50,6 +51,7 @@ pub struct Db {
     vlog_store: Arc<VlogStore>,
     snapshot_manager: SnapshotManager,
     schema_manager: Arc<SchemaManager>,
+    last_scope_synced_schema_version: AtomicU64,
     time_provider: Arc<dyn TimeProvider>,
     ttl_provider: Arc<TTLProvider>,
 }
@@ -285,6 +287,141 @@ impl Db {
         metrics_registry::snapshot_metrics(Some(&self.id))
     }
 
+    fn scopes_for_bucket_ranges_and_column_families(
+        bucket_ranges: &[RangeInclusive<u16>],
+        column_family_ids: &[u8],
+    ) -> Vec<LSMTreeScope> {
+        let mut unique_ids = column_family_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        if unique_ids.is_empty() {
+            unique_ids.push(DEFAULT_COLUMN_FAMILY_ID);
+        }
+        let mut scopes = Vec::with_capacity(unique_ids.len() * bucket_ranges.len());
+        for column_family_id in unique_ids {
+            for bucket_range in bucket_ranges {
+                scopes.push(LSMTreeScope::new(bucket_range.clone(), column_family_id));
+            }
+        }
+        scopes
+    }
+
+    fn ensure_multi_lsm_scopes_for_schema(
+        db_state: &Arc<DbStateHandle>,
+        schema: &Schema,
+    ) -> Result<()> {
+        let _guard = db_state.lock();
+        let snapshot = db_state.load();
+        let mut desired_cf_ids = schema.column_family_ids();
+        desired_cf_ids.sort_unstable();
+        desired_cf_ids.dedup();
+        if desired_cf_ids.is_empty() {
+            desired_cf_ids.push(DEFAULT_COLUMN_FAMILY_ID);
+        }
+
+        let existing_scopes = snapshot.multi_lsm_version.tree_scopes();
+        let existing_versions = snapshot.multi_lsm_version.tree_versions_cloned();
+        if existing_scopes.len() != existing_versions.len() {
+            return Err(Error::InvalidState(format!(
+                "LSM tree scope count {} does not match version count {}",
+                existing_scopes.len(),
+                existing_versions.len()
+            )));
+        }
+        let mut expanded_scopes = existing_scopes.clone();
+        let mut expanded_versions = existing_versions;
+
+        let base_ranges: Vec<RangeInclusive<u16>> = {
+            let default_ranges: Vec<RangeInclusive<u16>> = existing_scopes
+                .iter()
+                .filter(|scope| scope.column_family_id == DEFAULT_COLUMN_FAMILY_ID)
+                .map(|scope| scope.bucket_range.clone())
+                .collect();
+            if default_ranges.is_empty() {
+                snapshot.bucket_ranges.clone()
+            } else {
+                default_ranges
+            }
+        };
+        if expanded_scopes.is_empty() {
+            expanded_scopes =
+                Self::scopes_for_bucket_ranges_and_column_families(&base_ranges, &desired_cf_ids);
+            if expanded_scopes.is_empty() {
+                return Ok(());
+            }
+            expanded_versions =
+                vec![Arc::new(LSMTreeVersion { levels: vec![] }); expanded_scopes.len()];
+            let multi_lsm_version =
+                crate::db_state::MultiLSMTreeVersion::from_scopes_with_tree_versions(
+                    snapshot.multi_lsm_version.total_buckets(),
+                    &expanded_scopes,
+                    expanded_versions,
+                )?;
+            db_state.store(crate::db_state::DbState {
+                seq_id: snapshot.seq_id,
+                bucket_ranges: snapshot.bucket_ranges.clone(),
+                multi_lsm_version,
+                vlog_version: snapshot.vlog_version.clone(),
+                active: snapshot.active.clone(),
+                immutables: snapshot.immutables.clone(),
+                suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+            });
+            return Ok(());
+        }
+
+        let mut added_any = false;
+        for &column_family_id in &desired_cf_ids {
+            for bucket_range in &base_ranges {
+                let scope = LSMTreeScope::new(bucket_range.clone(), column_family_id);
+                if snapshot
+                    .multi_lsm_version
+                    .tree_index_for_exact_scope(&scope)
+                    .is_some()
+                {
+                    continue;
+                }
+                expanded_scopes.push(scope);
+                expanded_versions.push(Arc::new(LSMTreeVersion { levels: vec![] }));
+                added_any = true;
+            }
+        }
+        if !added_any {
+            return Ok(());
+        }
+
+        let multi_lsm_version =
+            crate::db_state::MultiLSMTreeVersion::from_scopes_with_tree_versions(
+                snapshot.multi_lsm_version.total_buckets(),
+                &expanded_scopes,
+                expanded_versions,
+            )?;
+        db_state.store(crate::db_state::DbState {
+            seq_id: snapshot.seq_id,
+            bucket_ranges: snapshot.bucket_ranges.clone(),
+            multi_lsm_version,
+            vlog_version: snapshot.vlog_version.clone(),
+            active: snapshot.active.clone(),
+            immutables: snapshot.immutables.clone(),
+            suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+        });
+        Ok(())
+    }
+
+    fn ensure_multi_lsm_scopes_for_schema_if_dirty(&self, schema: &Schema) -> Result<()> {
+        let schema_version = schema.version();
+        if self
+            .last_scope_synced_schema_version
+            .load(Ordering::Acquire)
+            == schema_version
+        {
+            return Ok(());
+        }
+        Self::ensure_multi_lsm_scopes_for_schema(&self.db_state, schema)?;
+        self.last_scope_synced_schema_version
+            .store(schema_version, Ordering::Release);
+        Ok(())
+    }
+
     /// Internal helper to write a single column value with the given ValueType.
     fn write_ref<K, V>(
         &self,
@@ -301,13 +438,8 @@ impl Db {
     {
         self.ensure_open()?;
         let schema = self.schema_manager.latest_schema();
+        self.ensure_multi_lsm_scopes_for_schema_if_dirty(schema.as_ref())?;
         let column_family_id = schema.resolve_column_family_id(options.column_family())?;
-        if column_family_id != DEFAULT_COLUMN_FAMILY_ID {
-            return Err(Error::IoError(format!(
-                "WriteOptions.column_family {:?} is not supported before CF key-codec wiring",
-                options.column_family()
-            )));
-        }
         let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         let column_idx = column as usize;
         if column_idx >= num_columns {
@@ -323,7 +455,7 @@ impl Db {
         let mut columns: Vec<Option<RefColumn<'_>>> = vec![None; num_columns];
         columns[column_idx] = Some(column);
         let record = RefValue::new_with_expired_at(columns, expired_at);
-        let key = RefKey::new(bucket, key.as_ref());
+        let key = RefKey::new_with_column_family(bucket, column_family_id, key.as_ref());
         self.memtable_manager.put(&key, &record)
     }
 
@@ -357,14 +489,21 @@ impl Db {
     where
         K: AsRef<[u8]>,
     {
-        self.write_ref(
-            bucket,
-            key,
-            column,
-            ValueType::Delete,
-            [],
-            &WriteOptions::default(),
-        )
+        self.delete_with_options(bucket, key, column, &WriteOptions::default())
+    }
+
+    /// Delete a single column value in the given bucket with write options.
+    pub fn delete_with_options<K>(
+        &self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        options: &WriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.write_ref(bucket, key, column, ValueType::Delete, [], options)
     }
 
     /// Merge a value into the given bucket and column.
@@ -394,18 +533,21 @@ impl Db {
 
     /// Write a batch of operations to the database.
     ///
-    /// Write path: merges batch entries by (bucket, key) into consolidated
+    /// Write path: merges batch entries by (bucket, column_family, key) into consolidated
     /// Values, then writes each merged entry to the active memtable via
     /// put_ref. The memtable manager handles flush-to-L0 when the memtable
     /// is full, separated value extraction to VLOG, and schema validation.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.ensure_open()?;
-        let mut pending: std::collections::BTreeMap<(u16, Bytes), Value> =
+        let mut pending: std::collections::BTreeMap<(u16, u8, Bytes), Value> =
             std::collections::BTreeMap::new();
         let schema = self.schema_manager.latest_schema();
-        let num_columns = schema.num_columns();
+        self.ensure_multi_lsm_scopes_for_schema_if_dirty(schema.as_ref())?;
         for (key_and_seq, op) in batch.ops {
             let bucket = key_and_seq.bucket;
+            let column_family_id =
+                schema.resolve_column_family_id(key_and_seq.column_family.as_deref())?;
+            let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
             let column_idx = key_and_seq.column as usize;
             if column_idx >= num_columns {
                 return Err(Error::IoError(format!(
@@ -430,22 +572,24 @@ impl Db {
             let mut columns = vec![None; num_columns];
             columns[column_idx] = Some(column);
             let next_value = Value::new_with_expired_at(columns, expired_at);
-            match pending.entry((bucket, key_and_seq.key)) {
+            match pending.entry((bucket, column_family_id, key_and_seq.key)) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(next_value);
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    let merged = std::mem::replace(entry.get_mut(), Value::new(Vec::new())).merge(
-                        next_value,
-                        &schema,
-                        Some(self.time_provider.as_ref()),
-                    )?;
+                    let merged = std::mem::replace(entry.get_mut(), Value::new(Vec::new()))
+                        .merge_in_column_family(
+                            next_value,
+                            &schema,
+                            column_family_id,
+                            Some(self.time_provider.as_ref()),
+                        )?;
                     *entry.get_mut() = merged;
                 }
             }
         }
-        for ((bucket, raw_key), value) in pending {
-            let key = RefKey::new(bucket, raw_key.as_ref());
+        for ((bucket, column_family_id, raw_key), value) in pending {
+            let key = RefKey::new_with_column_family(bucket, column_family_id, raw_key.as_ref());
             let columns: Vec<Option<RefColumn<'_>>> = value
                 .columns()
                 .iter()
@@ -599,7 +743,10 @@ impl Db {
                 hybrid_cache_plan.as_ref(),
             )?));
         }
+        let latest_schema = schema_manager.latest_schema();
         db_state.configure_multi_lsm(config.total_buckets, &bucket_ranges)?;
+        Self::ensure_multi_lsm_scopes_for_schema(&db_state, latest_schema.as_ref())?;
+        let last_scope_synced_schema_version = AtomicU64::new(latest_schema.version());
         let lsm_tree = Arc::new(lsm_tree);
         let mut memtable_writer_options =
             crate::compaction::build_writer_options(&config, 0, config.data_file_type)?;
@@ -702,6 +849,7 @@ impl Db {
             vlog_store,
             snapshot_manager,
             schema_manager,
+            last_scope_synced_schema_version,
             time_provider,
             ttl_provider,
         })
@@ -1009,7 +1157,7 @@ mod tests {
     use crate::db_state::full_bucket_range;
     use crate::{
         DbBuilder, DbGovernance, ReadOptions, ScanOptions, U32CounterMergeOperator,
-        U64CounterMergeOperator, VolumeDescriptor,
+        U64CounterMergeOperator, VolumeDescriptor, WriteOptions,
     };
     use serial_test::serial;
     use size::Size;
@@ -1181,6 +1329,70 @@ mod tests {
         let value = db.get(0, b"k1").unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"new");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_write_routes_non_default_column_family_to_separate_tree() {
+        let root = "/tmp/db_write_cf_routing";
+        cleanup_test_root(root);
+        let config = config_with_small_memtable(root);
+        let db = open_db(config);
+        let mut schema = db.update_schema();
+        schema
+            .add_column(0, None, None, Some("metrics".to_string()))
+            .unwrap();
+        let latest_schema = schema.commit();
+        let metrics_cf = latest_schema
+            .resolve_column_family_id(Some("metrics"))
+            .unwrap();
+
+        db.put_with_options(
+            0,
+            b"k_cf",
+            0,
+            b"v_cf",
+            &WriteOptions::with_column_family("metrics"),
+        )
+        .unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(0, b"k_default", 0, b"v_default");
+        batch.put_with_options(
+            0,
+            b"k_metrics",
+            0,
+            b"v_metrics",
+            &WriteOptions::with_column_family("metrics"),
+        );
+        batch.delete_with_options(0, b"k_cf", 0, &WriteOptions::with_column_family("metrics"));
+        db.write_batch(batch).unwrap();
+
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let snapshot = db.db_state.load();
+        let default_tree_idx = snapshot
+            .multi_lsm_version
+            .tree_index_for_bucket_and_column_family(0, DEFAULT_COLUMN_FAMILY_ID)
+            .unwrap();
+        let metrics_tree_idx = snapshot
+            .multi_lsm_version
+            .tree_index_for_bucket_and_column_family(0, metrics_cf)
+            .unwrap();
+        assert_ne!(default_tree_idx, metrics_tree_idx);
+        assert!(
+            !db.lsm_tree
+                .level_files_in_tree(default_tree_idx, 0)
+                .is_empty()
+        );
+        assert!(
+            !db.lsm_tree
+                .level_files_in_tree(metrics_tree_idx, 0)
+                .is_empty()
+        );
 
         cleanup_test_root(root);
     }

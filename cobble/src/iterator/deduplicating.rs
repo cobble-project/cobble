@@ -6,9 +6,9 @@
 
 use crate::error::Result;
 use crate::iterator::KvIterator;
-use crate::schema::Schema;
+use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema};
 use crate::ttl::TTLProvider;
-use crate::r#type::{Column, KvValue};
+use crate::r#type::{Column, KvValue, key_column_family};
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -187,6 +187,8 @@ impl<I> DeduplicatingIterator<I> {
             let mut values_iter = values.into_iter().rev();
             let first = values_iter.next().expect("values is non-empty");
             let mut merged_value = first.into_decoded(self.num_columns)?;
+            let column_family_id =
+                key_column_family(current_key.as_ref()).unwrap_or(DEFAULT_COLUMN_FAMILY_ID);
 
             if let Some(callback) = self.on_merge.as_deref_mut() {
                 // The first column is invoked with callback(None, first_column) to indicate it's the oldest column being merged.
@@ -201,6 +203,7 @@ impl<I> DeduplicatingIterator<I> {
                     merged_value = merged_value.merge_with_callback(
                         newer_value,
                         &self.schema,
+                        column_family_id,
                         Some(self.ttl_provider.time_provider()),
                         callback,
                     )?;
@@ -208,9 +211,10 @@ impl<I> DeduplicatingIterator<I> {
             } else {
                 for newer_value in values_iter {
                     let newer_value = newer_value.into_decoded(self.num_columns)?;
-                    merged_value = merged_value.merge(
+                    merged_value = merged_value.merge_in_column_family(
                         newer_value,
                         &self.schema,
+                        column_family_id,
                         Some(self.ttl_provider.time_provider()),
                     )?;
                 }

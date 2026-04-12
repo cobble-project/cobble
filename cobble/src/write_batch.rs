@@ -14,6 +14,7 @@ pub(crate) enum WriteOp {
 pub(crate) struct KeyAndSeq {
     pub bucket: u16,
     pub key: Bytes,
+    pub column_family: Option<String>,
     pub column: u16,
     pub seq: u64,
 }
@@ -34,10 +35,18 @@ impl WriteBatch {
         }
     }
 
-    fn insert_op(&mut self, bucket: u16, key: Bytes, column: u16, op: WriteOp) {
+    fn insert_op(
+        &mut self,
+        bucket: u16,
+        key: Bytes,
+        column_family: Option<String>,
+        column: u16,
+        op: WriteOp,
+    ) {
         let key_and_seq = KeyAndSeq {
             bucket,
             key: key.clone(),
+            column_family,
             column,
             seq: self.current_seq,
         };
@@ -69,6 +78,7 @@ impl WriteBatch {
         self.insert_op(
             bucket,
             key_bytes.clone(),
+            options.column_family().map(str::to_string),
             column,
             WriteOp::Put(key_bytes, value, options.ttl_seconds),
         );
@@ -78,10 +88,23 @@ impl WriteBatch {
     where
         K: AsRef<[u8]>,
     {
+        self.delete_with_options(bucket, key, column, &WriteOptions::default());
+    }
+
+    pub fn delete_with_options<K>(
+        &mut self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        options: &WriteOptions,
+    ) where
+        K: AsRef<[u8]>,
+    {
         let key_bytes = Bytes::copy_from_slice(key.as_ref());
         self.insert_op(
             bucket,
             key_bytes.clone(),
+            options.column_family().map(str::to_string),
             column,
             WriteOp::Delete(key_bytes),
         );
@@ -111,6 +134,7 @@ impl WriteBatch {
         self.insert_op(
             bucket,
             key_bytes.clone(),
+            options.column_family().map(str::to_string),
             column,
             WriteOp::Merge(key_bytes, value, options.ttl_seconds),
         );

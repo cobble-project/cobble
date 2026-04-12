@@ -374,6 +374,13 @@ impl Schema {
             .map(ColumnFamily::num_columns)
     }
 
+    pub(crate) fn column_family_ids(&self) -> Vec<u8> {
+        self.column_families
+            .iter()
+            .map(|family| family.id)
+            .collect()
+    }
+
     fn column_family_by_id(&self, column_family_id: u8) -> Option<&ColumnFamily> {
         match self.column_families.get(column_family_id as usize)? {
             family if family.id == column_family_id => Some(family),
@@ -416,7 +423,15 @@ impl Schema {
     }
 
     pub(crate) fn operator(&self, column_idx: usize) -> &dyn MergeOperator {
-        let family = match self.default_family() {
+        self.operator_in_family(DEFAULT_COLUMN_FAMILY_ID, column_idx)
+    }
+
+    pub(crate) fn operator_in_family(
+        &self,
+        column_family_id: u8,
+        column_idx: usize,
+    ) -> &dyn MergeOperator {
+        let family = match self.column_family_by_id(column_family_id) {
             Some(family) => family,
             None => return default_merge_operator_ref().as_ref(),
         };
