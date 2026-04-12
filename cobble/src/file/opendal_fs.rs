@@ -2,11 +2,13 @@ use crate::error::{Error, Result};
 use crate::file::file_system::FileSystem;
 use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::file::opendal_file::{OpendalRandomAccessFile, OpendalSequentialWriteFile};
+use opendal::layers::RetryLayer;
 use opendal::{ErrorKind, Operator, Scheme};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use url::Url;
 
 pub struct OpendalFileSystem {
@@ -179,9 +181,17 @@ impl FileSystem for OpendalFileSystem {
         if let Some(custom_options) = custom_options {
             options.extend(custom_options);
         }
-        let op = Operator::via_iter(scheme, options).map_err(|e| {
-            Error::FileSystemError(format!("Failed to create opendal operator: {}", e))
-        })?;
+        let op = Operator::via_iter(scheme, options)
+            .map_err(|e| {
+                Error::FileSystemError(format!("Failed to create opendal operator: {}", e))
+            })?
+            .layer(
+                RetryLayer::new()
+                    .with_jitter()
+                    .with_min_delay(Duration::from_millis(50))
+                    .with_max_delay(Duration::from_secs(2))
+                    .with_max_times(6),
+            );
         // Here we would create a concrete implementation of FileSystem using `op`
         Ok(OpendalFileSystem {
             op,
