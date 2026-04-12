@@ -1713,8 +1713,10 @@ mod tests {
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let worker = Arc::new(RecordingCompactionWorker::default());
         let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
-        let mut config = crate::compaction::CompactionConfig::default();
-        config.l0_file_limit = 0;
+        let config = crate::compaction::CompactionConfig {
+            l0_file_limit: 0,
+            ..crate::compaction::CompactionConfig::default()
+        };
         lsm_tree.configure_compaction(config, Some(worker_dyn));
         lsm_tree.apply_edit(
             0,
@@ -1762,9 +1764,11 @@ mod tests {
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let worker = Arc::new(RecordingCompactionWorker::default());
         let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
-        let mut config = crate::compaction::CompactionConfig::default();
-        config.l0_file_limit = 0;
-        config.output_file_type = DataFileType::Parquet;
+        let config = crate::compaction::CompactionConfig {
+            l0_file_limit: 0,
+            output_file_type: DataFileType::Parquet,
+            ..crate::compaction::CompactionConfig::default()
+        };
         lsm_tree.configure_compaction(config, Some(worker_dyn));
         lsm_tree.apply_edit(
             0,
@@ -1811,8 +1815,10 @@ mod tests {
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let worker = Arc::new(RecordingCompactionWorker::default());
         let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
-        let mut config = crate::compaction::CompactionConfig::default();
-        config.l0_file_limit = 0;
+        let config = crate::compaction::CompactionConfig {
+            l0_file_limit: 0,
+            ..crate::compaction::CompactionConfig::default()
+        };
         lsm_tree.configure_compaction(config, Some(worker_dyn));
         lsm_tree.apply_edit(
             0,
@@ -1864,10 +1870,12 @@ mod tests {
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let worker = Arc::new(RecordingCompactionWorker::default());
         let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
-        let mut config = crate::compaction::CompactionConfig::default();
-        config.l1_base_bytes = 10;
-        config.level_size_multiplier = 1;
-        config.split_trigger_level = Some(1);
+        let config = crate::compaction::CompactionConfig {
+            l1_base_bytes: 10,
+            level_size_multiplier: 1,
+            split_trigger_level: Some(1),
+            ..crate::compaction::CompactionConfig::default()
+        };
         lsm_tree.configure_compaction(config, Some(worker_dyn));
 
         lsm_tree.apply_edit(
@@ -1944,8 +1952,10 @@ mod tests {
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
         let worker = Arc::new(RecordingCompactionWorker::default());
         let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
-        let mut config = crate::compaction::CompactionConfig::default();
-        config.split_trigger_level = Some(0);
+        let config = crate::compaction::CompactionConfig {
+            split_trigger_level: Some(0),
+            ..crate::compaction::CompactionConfig::default()
+        };
         lsm_tree.configure_compaction(config, Some(worker_dyn));
         lsm_tree.apply_edit(
             0,

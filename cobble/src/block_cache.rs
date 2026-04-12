@@ -267,7 +267,7 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/cache_it_test");
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/cache_it_test".to_string())
+            .get_or_register("file:///tmp/cache_it_test")
             .unwrap();
 
         {

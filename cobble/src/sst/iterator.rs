@@ -887,9 +887,7 @@ mod tests {
     fn test_sst_iterator_basic() {
         let _ = std::fs::remove_dir_all("/tmp/sst_test");
         let registry = FileSystemRegistry::new();
-        let fs = registry
-            .get_or_register("file:///tmp/sst_test".to_string())
-            .unwrap();
+        let fs = registry.get_or_register("file:///tmp/sst_test").unwrap();
 
         // Write SST file
         {
@@ -960,7 +958,7 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/sst_compressed_test");
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/sst_compressed_test".to_string())
+            .get_or_register("file:///tmp/sst_compressed_test")
             .unwrap();
 
         {
@@ -1008,7 +1006,7 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/sst_filter_single_test");
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/sst_filter_single_test".to_string())
+            .get_or_register("file:///tmp/sst_filter_single_test")
             .unwrap();
 
         let keys: [&[u8]; 3] = [b"key1", b"key2", b"key3"];
@@ -1062,7 +1060,7 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/sst_filter_partitioned_test");
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/sst_filter_partitioned_test".to_string())
+            .get_or_register("file:///tmp/sst_filter_partitioned_test")
             .unwrap();
 
         let keys: [&[u8]; 4] = [b"key000", b"key001", b"key002", b"key003"];
@@ -1122,9 +1120,7 @@ mod tests {
     fn test_sst_iterator_seek() {
         let _ = std::fs::remove_dir_all("/tmp/sst_test");
         let registry = FileSystemRegistry::new();
-        let fs = registry
-            .get_or_register("file:///tmp/sst_test".to_string())
-            .unwrap();
+        let fs = registry.get_or_register("file:///tmp/sst_test").unwrap();
 
         // Write SST file
         {
@@ -1199,7 +1195,7 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/sst_typed_kv_test");
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/sst_typed_kv_test".to_string())
+            .get_or_register("file:///tmp/sst_typed_kv_test")
             .unwrap();
 
         let num_columns = 2;

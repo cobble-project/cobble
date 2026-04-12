@@ -1179,23 +1179,25 @@ mod tests {
 
     #[test]
     fn test_hybrid_cache_prefers_cache_only_volume() {
-        let mut config = Config::default();
-        config.block_cache_hybrid_enabled = true;
-        config.block_cache_hybrid_disk_size = Some(Size::from_kib(1));
-        config.volumes = vec![
-            VolumeDescriptor::new(
-                "file:///tmp/primary-shared".to_string(),
-                vec![
-                    VolumeUsageKind::PrimaryDataPriorityHigh,
-                    VolumeUsageKind::Cache,
-                    VolumeUsageKind::Meta,
-                ],
-            ),
-            VolumeDescriptor::new(
-                "file:///tmp/cache-only".to_string(),
-                vec![VolumeUsageKind::Cache],
-            ),
-        ];
+        let config = Config {
+            block_cache_hybrid_enabled: true,
+            block_cache_hybrid_disk_size: Some(Size::from_kib(1)),
+            volumes: vec![
+                VolumeDescriptor::new(
+                    "file:///tmp/primary-shared".to_string(),
+                    vec![
+                        VolumeUsageKind::PrimaryDataPriorityHigh,
+                        VolumeUsageKind::Cache,
+                        VolumeUsageKind::Meta,
+                    ],
+                ),
+                VolumeDescriptor::new(
+                    "file:///tmp/cache-only".to_string(),
+                    vec![VolumeUsageKind::Cache],
+                ),
+            ],
+            ..Config::default()
+        };
         let plan = config
             .resolve_hybrid_cache_volume_plan(2048)
             .unwrap()
@@ -1207,9 +1209,6 @@ mod tests {
 
     #[test]
     fn test_hybrid_cache_partitions_shared_volume_limit() {
-        let mut config = Config::default();
-        config.block_cache_hybrid_enabled = true;
-        config.block_cache_hybrid_disk_size = Some(Size::from_kib(1));
         let mut shared = VolumeDescriptor::new(
             "file:///tmp/shared".to_string(),
             vec![
@@ -1219,7 +1218,12 @@ mod tests {
             ],
         );
         shared.size_limit = Some(Size::from_kib(8));
-        config.volumes = vec![shared];
+        let config = Config {
+            block_cache_hybrid_enabled: true,
+            block_cache_hybrid_disk_size: Some(Size::from_kib(1)),
+            volumes: vec![shared],
+            ..Config::default()
+        };
         let plan = config.resolve_hybrid_cache_volume_plan(4096).unwrap();
         let adjusted = config
             .apply_hybrid_cache_primary_partition_with_plan(plan.as_ref())
@@ -1229,13 +1233,15 @@ mod tests {
 
     #[test]
     fn test_hybrid_cache_rejects_non_local_cache_volume() {
-        let mut config = Config::default();
-        config.block_cache_hybrid_enabled = true;
-        config.block_cache_hybrid_disk_size = Some(Size::from_kib(1));
-        config.volumes = vec![VolumeDescriptor::new(
-            "s3://bucket/cache".to_string(),
-            vec![VolumeUsageKind::Cache],
-        )];
+        let config = Config {
+            block_cache_hybrid_enabled: true,
+            block_cache_hybrid_disk_size: Some(Size::from_kib(1)),
+            volumes: vec![VolumeDescriptor::new(
+                "s3://bucket/cache".to_string(),
+                vec![VolumeUsageKind::Cache],
+            )],
+            ..Config::default()
+        };
         let err = config.resolve_hybrid_cache_volume_plan(2048).unwrap_err();
         assert!(matches!(err, Error::ConfigError(_)));
     }
@@ -1252,9 +1258,11 @@ mod tests {
 
     #[test]
     fn test_data_file_type_parquet_round_trip() {
-        let mut expected = Config::default();
-        expected.data_file_type = DataFileType::Parquet;
-        expected.parquet_row_group_size_bytes = Size::from_kib(8);
+        let expected = Config {
+            data_file_type: DataFileType::Parquet,
+            parquet_row_group_size_bytes: Size::from_kib(8),
+            ..Config::default()
+        };
         let json = serde_json::to_string(&expected).expect("Cannot serialize config");
         let decoded: Config =
             serde_json::from_str(&json).expect("Cannot deserialize parquet config");

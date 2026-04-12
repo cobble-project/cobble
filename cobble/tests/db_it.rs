@@ -50,9 +50,11 @@ fn schema_file_path(root: &str, db_id: &str, schema_id: u64) -> String {
     format!("{}/{}/schema/schema-{}", root, db_id, schema_id)
 }
 
+type ActiveSnapshotSegment = (String, String, String, u64, u64, Option<u64>, u64, u64, u64);
+
 fn active_snapshot_segments_from_manifest(
     manifest_json: &JsonValue,
-) -> Option<Vec<(String, String, String, u64, u64, Option<u64>, u64, u64, u64)>> {
+) -> Option<Vec<ActiveSnapshotSegment>> {
     let segments = manifest_json.get("active_memtable_data")?.as_array()?;
     let mut out = Vec::with_capacity(segments.len());
     for segment in segments {
@@ -705,13 +707,7 @@ fn test_db_ttl_put_get_with_manual_time() {
 
     // Put with explicit TTL of 10 seconds
     let mut batch = WriteBatch::new();
-    batch.put_with_options(
-        0,
-        b"key",
-        0,
-        b"value".to_vec(),
-        &cobble::WriteOptions::with_ttl(10),
-    );
+    batch.put_with_options(0, b"key", 0, b"value", &cobble::WriteOptions::with_ttl(10));
     db.write_batch(batch).unwrap();
 
     // At t=1000, value should be visible
@@ -757,7 +753,7 @@ fn test_db_ttl_default_ttl_with_manual_time() {
 
     // Put without explicit TTL uses default (5s)
     let mut batch = WriteBatch::new();
-    batch.put(0, b"foo", 0, b"bar".to_vec());
+    batch.put(0, b"foo", 0, b"bar");
     db.write_batch(batch).unwrap();
 
     // Before expiry
@@ -788,7 +784,7 @@ fn test_db_snapshot_creates_manifest() {
     let db = open_db(config);
 
     let mut batch = WriteBatch::new();
-    batch.put(0, b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1");
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -818,9 +814,9 @@ fn test_single_db_snapshot_updates_global_manifest() {
     };
     let db = SingleDb::open(config.clone()).unwrap();
 
-    db.put(0, b"k1", 0, b"v1".to_vec()).unwrap();
-    db.put(0, b"k2", 0, b"v2".to_vec()).unwrap();
-    db.put(0, b"x1", 0, b"vx".to_vec()).unwrap();
+    db.put(0, b"k1", 0, b"v1").unwrap();
+    db.put(0, b"k2", 0, b"v2").unwrap();
+    db.put(0, b"x1", 0, b"vx").unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let global_id = db
         .snapshot_with_callback(move |result| {
@@ -837,9 +833,9 @@ fn test_single_db_snapshot_updates_global_manifest() {
     let value = proxy.get(0, b"k1").unwrap().expect("value present");
     let col = value[0].as_ref().unwrap();
     assert_eq!(col.as_ref(), b"v1");
-    let mut iter = proxy.scan(0, b"k1".as_slice()..b"kz".as_slice()).unwrap();
+    let iter = proxy.scan(0, b"k1".as_slice()..b"kz".as_slice()).unwrap();
     let mut rows = Vec::new();
-    while let Some(row) = iter.next() {
+    for row in iter {
         rows.push(row.unwrap());
     }
     assert_eq!(rows.len(), 2);
@@ -866,7 +862,7 @@ fn test_single_db_close_waits_snapshot_global_materialization() {
         ..Config::default()
     };
     let db = SingleDb::open(config.clone()).unwrap();
-    db.put(0, b"k1", 0, b"v1".to_vec()).unwrap();
+    db.put(0, b"k1", 0, b"v1").unwrap();
     let _global_snapshot_id = db.snapshot().unwrap();
     db.close().unwrap();
 
@@ -1043,7 +1039,7 @@ fn test_db_snapshot_read_only_get() {
     let db = open_db(config.clone());
 
     let mut batch = WriteBatch::new();
-    batch.put(0, b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1");
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -1077,7 +1073,7 @@ fn test_db_snapshot_read_only_get_with_separated_value() {
     let large = b"value-larger-than-threshold";
 
     let mut batch = WriteBatch::new();
-    batch.put(0, b"k1", 0, large.to_vec());
+    batch.put(0, b"k1", 0, large);
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -1119,9 +1115,9 @@ fn test_db_snapshot_read_only_scan_with_separated_value() {
     db.close().unwrap();
 
     let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
-    let mut iter = ro.scan(0, b"k1".as_slice()..b"kz".as_slice()).unwrap();
+    let iter = ro.scan(0, b"k1".as_slice()..b"kz".as_slice()).unwrap();
     let mut rows = Vec::new();
-    while let Some(row) = iter.next() {
+    for row in iter {
         rows.push(row.unwrap());
     }
     assert_eq!(rows.len(), 2);
@@ -1499,7 +1495,7 @@ fn test_db_open_from_snapshot_allows_writes() {
     let db = open_db(config.clone());
 
     let mut batch = WriteBatch::new();
-    batch.put(0, b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1");
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -1508,7 +1504,7 @@ fn test_db_open_from_snapshot_allows_writes() {
 
     let writable = Db::open_from_snapshot(config, snapshot_id, db.id()).unwrap();
     let mut batch = WriteBatch::new();
-    batch.put(0, b"k2", 0, b"v2".to_vec());
+    batch.put(0, b"k2", 0, b"v2");
     writable.write_batch(batch).unwrap();
 
     let value = writable.get(0, b"k1").unwrap().expect("value present");
@@ -1703,7 +1699,7 @@ fn test_db_metrics_list() {
     let db = open_db(config);
 
     let mut batch = WriteBatch::new();
-    batch.put(0, b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1");
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -1758,7 +1754,7 @@ fn test_db_expire_snapshot_releases_manifest() {
     let db = open_db(config);
 
     let mut batch = WriteBatch::new();
-    batch.put(0, b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1");
     db.write_batch(batch).unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
@@ -2158,14 +2154,14 @@ fn test_db_snapshot_auto_expire() {
     let db = open_db(config);
 
     let mut batch = WriteBatch::new();
-    batch.put(0, b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1");
     db.write_batch(batch).unwrap();
 
     let first_id = db.snapshot().unwrap();
     let _ = wait_for_manifest_in_db(root, db.id(), first_id);
 
     let mut batch = WriteBatch::new();
-    batch.put(0, b"k2", 0, b"v2".to_vec());
+    batch.put(0, b"k2", 0, b"v2");
     db.write_batch(batch).unwrap();
 
     let second_id = db.snapshot().unwrap();
@@ -2199,7 +2195,7 @@ fn test_db_snapshot_retain_skips_auto_expire() {
     let db = open_db(config);
 
     let mut batch = WriteBatch::new();
-    batch.put(0, b"k1", 0, b"v1".to_vec());
+    batch.put(0, b"k1", 0, b"v1");
     db.write_batch(batch).unwrap();
 
     let first_id = db.snapshot().unwrap();
@@ -2207,7 +2203,7 @@ fn test_db_snapshot_retain_skips_auto_expire() {
     assert!(db.retain_snapshot(first_id));
 
     let mut batch = WriteBatch::new();
-    batch.put(0, b"k2", 0, b"v2".to_vec());
+    batch.put(0, b"k2", 0, b"v2");
     db.write_batch(batch).unwrap();
 
     let second_id = db.snapshot().unwrap();
@@ -2254,11 +2250,11 @@ fn test_db_scan_put_reads_from_memtable_and_sst() {
     db.put(0, b"mix:tail", 0, b"tail").unwrap();
     db.put(0, b"zzz:outside", 0, b"ignore-right").unwrap();
 
-    let mut iter = db
+    let iter = db
         .scan(0, b"fill:0000".as_slice()..b"mix;".as_slice())
         .unwrap();
     let mut seen: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    while let Some(row) = iter.next() {
+    for row in iter {
         let (key, columns) = row.unwrap();
         if let Some(value) = columns[0].as_ref() {
             seen.insert(key.to_vec(), value.to_vec());
@@ -2273,18 +2269,21 @@ fn test_db_scan_put_reads_from_memtable_and_sst() {
             vec![b'f'; 96].as_slice()
         );
     }
-    assert_eq!(seen.get(&b"mix:key".to_vec()).unwrap().as_slice(), b"new");
+    assert_eq!(seen.get(b"mix:key".as_slice()).unwrap().as_slice(), b"new");
     assert_eq!(
-        seen.get(&b"mix:huge-sst".to_vec()).unwrap().as_slice(),
+        seen.get(b"mix:huge-sst".as_slice()).unwrap().as_slice(),
         huge_sst.as_slice()
     );
     assert_eq!(
-        seen.get(&b"mix:huge-mem".to_vec()).unwrap().as_slice(),
+        seen.get(b"mix:huge-mem".as_slice()).unwrap().as_slice(),
         huge_mem.as_slice()
     );
-    assert_eq!(seen.get(&b"mix:tail".to_vec()).unwrap().as_slice(), b"tail");
-    assert!(!seen.contains_key(&b"aaa:outside".to_vec()));
-    assert!(!seen.contains_key(&b"zzz:outside".to_vec()));
+    assert_eq!(
+        seen.get(b"mix:tail".as_slice()).unwrap().as_slice(),
+        b"tail"
+    );
+    assert!(!seen.contains_key(b"aaa:outside".as_slice()));
+    assert!(!seen.contains_key(b"zzz:outside".as_slice()));
 
     cleanup_test_root(root);
 }
@@ -2314,11 +2313,11 @@ fn test_db_scan_put_range_keeps_latest_value() {
     db.put(0, b"r:0050", 0, b"latest").unwrap();
     db.put(0, b"s:outside", 0, b"right").unwrap();
 
-    let mut iter = db
+    let iter = db
         .scan(0, b"r:0000".as_slice()..b"r:0100".as_slice())
         .unwrap();
     let mut seen: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    while let Some(row) = iter.next() {
+    for row in iter {
         let (key, columns) = row.unwrap();
         if let Some(value) = columns[0].as_ref() {
             seen.insert(key.to_vec(), value.to_vec());
@@ -2326,11 +2325,20 @@ fn test_db_scan_put_range_keeps_latest_value() {
     }
 
     assert_eq!(seen.len(), 100);
-    assert_eq!(seen.get(&b"r:0050".to_vec()).unwrap().as_slice(), b"latest");
-    assert_eq!(seen.get(&b"r:0000".to_vec()).unwrap().as_slice(), b"v:0000");
-    assert_eq!(seen.get(&b"r:0099".to_vec()).unwrap().as_slice(), b"v:0099");
-    assert!(!seen.contains_key(&b"q:outside".to_vec()));
-    assert!(!seen.contains_key(&b"s:outside".to_vec()));
+    assert_eq!(
+        seen.get(b"r:0050".as_slice()).unwrap().as_slice(),
+        b"latest"
+    );
+    assert_eq!(
+        seen.get(b"r:0000".as_slice()).unwrap().as_slice(),
+        b"v:0000"
+    );
+    assert_eq!(
+        seen.get(b"r:0099".as_slice()).unwrap().as_slice(),
+        b"v:0099"
+    );
+    assert!(!seen.contains_key(b"q:outside".as_slice()));
+    assert!(!seen.contains_key(b"s:outside".as_slice()));
 
     cleanup_test_root(root);
 }
@@ -2378,8 +2386,8 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
         db.put(0, &key, 2, format!("c2-{i:04}").into_bytes())
             .unwrap();
     }
-    db.put(0, b"proj:0042", 0, b"c0-updated".to_vec()).unwrap();
-    db.put(0, b"proj:0042", 2, b"c2-updated".to_vec()).unwrap();
+    db.put(0, b"proj:0042", 0, b"c0-updated").unwrap();
+    db.put(0, b"proj:0042", 2, b"c2-updated").unwrap();
 
     let snapshot_id = db.snapshot().unwrap();
     let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
@@ -2393,7 +2401,7 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
 
     let mut scan_options = ScanOptions::for_columns(vec![2, 0]);
     scan_options.read_ahead_bytes = Size::from_const(256);
-    let mut iter = db
+    let iter = db
         .scan_with_options(
             0,
             b"proj:0000".as_slice()..b"proj:9999".as_slice(),
@@ -2401,7 +2409,7 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
         )
         .unwrap();
     let mut seen: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = HashMap::new();
-    while let Some(row) = iter.next() {
+    for row in iter {
         let (key, columns) = row.unwrap();
         assert_eq!(columns.len(), 2);
         let col2 = columns[0]
@@ -2435,7 +2443,7 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
     db.close().unwrap();
 
     let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
-    let mut ro_iter = ro
+    let ro_iter = ro
         .scan_with_options(
             0,
             b"proj:0000".as_slice()..b"proj:9999".as_slice(),
@@ -2443,7 +2451,7 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
         )
         .unwrap();
     let mut ro_seen = 0usize;
-    while let Some(row) = ro_iter.next() {
+    for row in ro_iter {
         let (key, columns) = row.unwrap();
         assert_eq!(columns.len(), 2);
         let key_str = std::str::from_utf8(key.as_ref()).unwrap();
@@ -2508,11 +2516,9 @@ fn test_db_skiplist_large_write_flush_and_scan() {
         db.put(0, &key, 0, value.clone()).unwrap();
         expected.insert(key, value);
     }
-    db.put(0, b"scan:01000", 0, b"updated-1000".to_vec())
-        .unwrap();
+    db.put(0, b"scan:01000", 0, b"updated-1000").unwrap();
     expected.insert(b"scan:01000".to_vec(), b"updated-1000".to_vec());
-    db.put(0, b"scan:01500", 0, b"updated-1500".to_vec())
-        .unwrap();
+    db.put(0, b"scan:01500", 0, b"updated-1500").unwrap();
     expected.insert(b"scan:01500".to_vec(), b"updated-1500".to_vec());
 
     let snapshot_id = db.snapshot().unwrap();
@@ -2535,11 +2541,11 @@ fn test_db_skiplist_large_write_flush_and_scan() {
         "expected snapshot to include flushed files"
     );
 
-    let mut iter = db
+    let iter = db
         .scan(0, b"scan:00000".as_slice()..b"scan:02000".as_slice())
         .unwrap();
     let mut seen: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    while let Some(row) = iter.next() {
+    for row in iter {
         let (key, columns) = row.unwrap();
         if let Some(value) = columns[0].as_ref() {
             seen.insert(key.to_vec(), value.to_vec());

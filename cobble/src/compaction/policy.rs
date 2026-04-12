@@ -579,7 +579,7 @@ mod tests {
         };
         let mut policy = RoundRobinPolicy::new();
         let plan = policy
-            .pick(&vec![level0, level1, level2], config)
+            .pick(&[level0, level1, level2], config)
             .expect("plan");
         assert_eq!(plan.input_level, 1);
         assert!(plan.trivial_move);
@@ -619,7 +619,7 @@ mod tests {
         };
         let mut policy = MinOverlapPolicy::new();
         let plan = policy
-            .pick(&vec![level0, level1, level2, level3], config)
+            .pick(&[level0, level1, level2, level3], config)
             .expect("plan");
         assert_eq!(plan.input_level, 2);
         assert_eq!(plan.base_file_id, 3);
@@ -728,7 +728,7 @@ mod tests {
         };
         let mut policy = RoundRobinPolicy::new();
         let plan = policy
-            .pick(&vec![level0, level1, level2, level3], config)
+            .pick(&[level0, level1, level2, level3], config)
             .expect("plan");
         assert_eq!(plan.input_level, 2);
     }
@@ -764,7 +764,7 @@ mod tests {
         };
         let mut policy = MinOverlapPolicy::new();
         let plan = policy
-            .pick(&vec![level0, level1, level2, level3], config)
+            .pick(&[level0, level1, level2, level3], config)
             .expect("plan");
         assert_eq!(plan.input_level, 2);
     }
@@ -795,7 +795,7 @@ mod tests {
         };
         let mut policy = MinOverlapPolicy::new();
         let plan = policy
-            .pick(&vec![level0, level1, level2], config)
+            .pick(&[level0, level1, level2], config)
             .expect("plan");
         assert_eq!(plan.input_level, 2);
     }

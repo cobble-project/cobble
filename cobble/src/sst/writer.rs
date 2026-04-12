@@ -449,7 +449,7 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/sst_writer_test");
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/sst_writer_test".to_string())
+            .get_or_register("file:///tmp/sst_writer_test")
             .unwrap();
 
         let writer_file = fs.open_write("test.sst").unwrap();
@@ -478,7 +478,7 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/sst_writer_test");
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/sst_writer_test".to_string())
+            .get_or_register("file:///tmp/sst_writer_test")
             .unwrap();
 
         let writer_file = fs.open_write("test_order.sst").unwrap();
@@ -505,7 +505,7 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/sst_writer_test");
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/sst_writer_test".to_string())
+            .get_or_register("file:///tmp/sst_writer_test")
             .unwrap();
 
         let writer_file = fs.open_write("test_blocks.sst").unwrap();

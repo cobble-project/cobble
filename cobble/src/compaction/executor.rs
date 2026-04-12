@@ -1090,9 +1090,9 @@ mod tests {
         let merged_items = decode_merge_separated_array(column.data()).unwrap();
         assert_eq!(merged_items.len(), 2);
         assert_eq!(merged_items[0].value_type, ValueType::PutSeparated);
-        assert_eq!(merged_items[0].data().as_ref(), old_put_separated);
+        assert_eq!(merged_items[0].data(), old_put_separated);
         assert_eq!(merged_items[1].value_type, ValueType::MergeSeparated);
-        assert_eq!(merged_items[1].data().as_ref(), new_merge_separated_a);
+        assert_eq!(merged_items[1].data(), new_merge_separated_a);
 
         iter.next().unwrap();
         assert!(iter.valid());
@@ -1106,7 +1106,7 @@ mod tests {
         assert_eq!(merged_items[0].value_type, ValueType::Put);
         assert_eq!(merged_items[0].data(), b"base_b");
         assert_eq!(merged_items[1].value_type, ValueType::MergeSeparated);
-        assert_eq!(merged_items[1].data().as_ref(), new_merge_separated_b);
+        assert_eq!(merged_items[1].data(), new_merge_separated_b);
 
         cleanup_test_dir(test_dir);
     }

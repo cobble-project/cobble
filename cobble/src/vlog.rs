@@ -606,7 +606,7 @@ mod tests {
     fn test_vlog_writer_reader() {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
+        let fs = registry.get_or_register(TEST_ROOT).unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("vlog-test"));
         let file_manager = Arc::new(FileManager::with_defaults(fs, metrics_manager).unwrap());
         let store = VlogStore::new(Arc::clone(&file_manager), 64, usize::MAX);
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn test_vlog_file_seq_wraps() {
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
+        let fs = registry.get_or_register(TEST_ROOT).unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("vlog-test"));
         let file_manager = Arc::new(FileManager::with_defaults(fs, metrics_manager).unwrap());
         let store = VlogStore::with_start_seq(Arc::clone(&file_manager), 64, usize::MAX, u32::MAX);
@@ -651,7 +651,7 @@ mod tests {
     #[test]
     fn test_should_separate() {
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
+        let fs = registry.get_or_register(TEST_ROOT).unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("vlog-test"));
         let file_manager = Arc::new(FileManager::with_defaults(fs, metrics_manager).unwrap());
         let store = VlogStore::new(Arc::clone(&file_manager), 64, 8);
@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn test_should_not_separate_when_threshold_disabled() {
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
+        let fs = registry.get_or_register(TEST_ROOT).unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("vlog-test"));
         let file_manager = Arc::new(FileManager::with_defaults(fs, metrics_manager).unwrap());
         let store = VlogStore::new(Arc::clone(&file_manager), 64, 0);

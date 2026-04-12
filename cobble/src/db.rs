@@ -349,8 +349,9 @@ impl Db {
             if expanded_scopes.is_empty() {
                 return Ok(());
             }
-            expanded_versions =
-                vec![Arc::new(LSMTreeVersion { levels: vec![] }); expanded_scopes.len()];
+            expanded_versions = (0..expanded_scopes.len())
+                .map(|_| Arc::new(LSMTreeVersion { levels: vec![] }))
+                .collect();
             let multi_lsm_version =
                 crate::db_state::MultiLSMTreeVersion::from_scopes_with_tree_versions(
                     snapshot.multi_lsm_version.total_buckets(),
@@ -1187,9 +1188,11 @@ mod tests {
         .unwrap()
     }
 
+    type GovernanceCall = (String, Vec<RangeInclusive<u16>>, u32);
+
     #[derive(Default)]
     struct RecordingGovernance {
-        calls: Mutex<Vec<(String, Vec<RangeInclusive<u16>>, u32)>>,
+        calls: Mutex<Vec<GovernanceCall>>,
     }
 
     impl DbGovernance for RecordingGovernance {
@@ -1317,8 +1320,8 @@ mod tests {
         let config = config_with_small_memtable(root);
         let db = open_db(config);
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"old".to_vec());
-        batch.put(0, b"k1", 0, b"new".to_vec());
+        batch.put(0, b"k1", 0, b"old");
+        batch.put(0, b"k1", 0, b"new");
         batch.put(0, b"k2", 0, vec![b'x'; 64]);
         db.write_batch(batch).unwrap();
 
@@ -1692,7 +1695,7 @@ mod tests {
         let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"old".to_vec());
+        batch.put(0, b"k1", 0, b"old");
         batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
@@ -1700,7 +1703,7 @@ mod tests {
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"new".to_vec());
+        batch.put(0, b"k1", 0, b"new");
         batch.put(0, b"k3", 0, vec![b'b'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
@@ -1723,7 +1726,7 @@ mod tests {
         let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"base".to_vec());
+        batch.put(0, b"k1", 0, b"base");
         batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
@@ -1731,7 +1734,7 @@ mod tests {
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.merge(0, b"k1", 0, b"_x".to_vec());
+        batch.merge(0, b"k1", 0, b"_x");
         batch.put(0, b"k3", 0, vec![b'b'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
@@ -1754,7 +1757,7 @@ mod tests {
         let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"old".to_vec());
+        batch.put(0, b"k1", 0, b"old");
         batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
@@ -1762,7 +1765,7 @@ mod tests {
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"new".to_vec());
+        batch.put(0, b"k1", 0, b"new");
         db.write_batch(batch).unwrap();
 
         let value = db.get(0, b"k1").unwrap().expect("value present");
@@ -1781,7 +1784,7 @@ mod tests {
         let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"base".to_vec());
+        batch.put(0, b"k1", 0, b"base");
         batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
@@ -1789,7 +1792,7 @@ mod tests {
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.merge(0, b"k1", 0, b"_x".to_vec());
+        batch.merge(0, b"k1", 0, b"_x");
         db.write_batch(batch).unwrap();
 
         let value = db.get(0, b"k1").unwrap().expect("value present");
@@ -1811,8 +1814,8 @@ mod tests {
         let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"c0-old".to_vec());
-        batch.put(0, b"k1", 1, b"c1-old".to_vec());
+        batch.put(0, b"k1", 0, b"c0-old");
+        batch.put(0, b"k1", 1, b"c1-old");
         batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
@@ -1820,7 +1823,7 @@ mod tests {
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 1, b"c1-new".to_vec());
+        batch.put(0, b"k1", 1, b"c1-new");
         db.write_batch(batch).unwrap();
 
         let value = db.get(0, b"k1").unwrap().expect("value present");
@@ -1844,8 +1847,8 @@ mod tests {
         let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"c0".to_vec());
-        batch.put(0, b"k1", 1, b"c1".to_vec());
+        batch.put(0, b"k1", 0, b"c0");
+        batch.put(0, b"k1", 1, b"c1");
         batch.put(0, b"k2", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
@@ -1853,7 +1856,7 @@ mod tests {
         let _ = db.memtable_manager.wait_for_flushes();
 
         let mut batch = WriteBatch::new();
-        batch.merge(0, b"k1", 1, b"_x".to_vec());
+        batch.merge(0, b"k1", 1, b"_x");
         batch.put(0, b"k3", 0, vec![b'b'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
@@ -1881,8 +1884,8 @@ mod tests {
         let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"c0".to_vec());
-        batch.put(0, b"k1", 1, b"c1".to_vec());
+        batch.put(0, b"k1", 0, b"c0");
+        batch.put(0, b"k1", 1, b"c1");
         db.write_batch(batch).unwrap();
 
         let value = db
@@ -1905,7 +1908,7 @@ mod tests {
         let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"old".to_vec());
+        batch.put(0, b"k1", 0, b"old");
         batch.put(0, b"z1", 0, vec![b'a'; 64]);
         db.write_batch(batch).unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
@@ -1915,9 +1918,9 @@ mod tests {
         db.put(0, b"k1", 0, b"new").unwrap();
         db.put(0, b"k2", 0, b"v2").unwrap();
 
-        let mut iter = db.scan(0, b"k1".as_slice()..b"k3".as_slice()).unwrap();
+        let iter = db.scan(0, b"k1".as_slice()..b"k3".as_slice()).unwrap();
         let mut rows = Vec::new();
-        while let Some(row) = iter.next() {
+        for row in iter {
             let (key, columns) = row.unwrap();
             rows.push((key, columns[0].clone()));
         }
@@ -1962,10 +1965,10 @@ mod tests {
         let db = open_db(config);
 
         let mut batch = WriteBatch::new();
-        batch.put(0, b"k1", 0, b"c0-1".to_vec());
-        batch.put(0, b"k1", 1, b"c1-1".to_vec());
-        batch.put(0, b"k2", 0, b"c0-2".to_vec());
-        batch.put(0, b"k2", 1, b"c1-2".to_vec());
+        batch.put(0, b"k1", 0, b"c0-1");
+        batch.put(0, b"k1", 1, b"c1-1");
+        batch.put(0, b"k2", 0, b"c0-2");
+        batch.put(0, b"k2", 1, b"c1-2");
         db.write_batch(batch).unwrap();
 
         let mut iter = db
@@ -2013,11 +2016,11 @@ mod tests {
         runtime.block_on(async {
             let mut options = ScanOptions::default();
             options.read_ahead_bytes = Size::from_const(128);
-            let mut iter = db
+            let iter = db
                 .scan_with_options(0, b"".as_slice()..b"\xff".as_slice(), &options)
                 .unwrap();
             let mut keys = Vec::new();
-            while let Some(row) = iter.next() {
+            for row in iter {
                 let (key, _) = row.unwrap();
                 keys.push(key);
             }

@@ -1848,7 +1848,7 @@ mod tests {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .get_or_register("file:///tmp/memtable_manager_test")
             .unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
@@ -1915,10 +1915,10 @@ mod tests {
             let decoded = decode_value(&mut value, num_columns).unwrap();
             let raw = decoded
                 .columns()
-                .get(0)
+                .first()
                 .and_then(|col| col.as_ref())
                 .map(|col| Bytes::copy_from_slice(col.data()))
-                .unwrap_or_else(Bytes::new);
+                .unwrap_or_default();
             entries.push((key, raw));
             iter.next().unwrap();
         }
@@ -1938,7 +1938,7 @@ mod tests {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .get_or_register("file:///tmp/memtable_manager_test")
             .unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
@@ -2004,7 +2004,7 @@ mod tests {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .get_or_register("file:///tmp/memtable_manager_test")
             .unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
@@ -2055,7 +2055,7 @@ mod tests {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .get_or_register("file:///tmp/memtable_manager_test")
             .unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
@@ -2124,7 +2124,7 @@ mod tests {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .get_or_register("file:///tmp/memtable_manager_test")
             .unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
@@ -2176,7 +2176,7 @@ mod tests {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .get_or_register("file:///tmp/memtable_manager_test")
             .unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
@@ -2224,7 +2224,7 @@ mod tests {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .get_or_register("file:///tmp/memtable_manager_test")
             .unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =
@@ -2271,7 +2271,7 @@ mod tests {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/memtable_manager_test".to_string())
+            .get_or_register("file:///tmp/memtable_manager_test")
             .unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
         let file_manager =

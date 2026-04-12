@@ -1675,7 +1675,7 @@ pub(crate) mod tests {
     fn create_test_file_manager() -> (Arc<dyn FileSystem>, FileManager) {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
+        let fs = registry.get_or_register(TEST_ROOT).unwrap();
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-test"));
         let fm = FileManager::with_defaults(Arc::clone(&fs), metrics_manager).unwrap();
         (fs, fm)
@@ -1946,20 +1946,22 @@ pub(crate) mod tests {
             snapshot_persistable: false,
             readonly_source: false,
         };
-        let mut options = FileManagerOptions::default();
-        options.base_dir = "db".to_string();
-        options.base_file_size = 64;
+        let options = FileManagerOptions {
+            base_dir: "db".to_string(),
+            base_file_size: 64,
+            ..FileManagerOptions::default()
+        };
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-test"));
         let fm = FileManager::new(vec![high_volume, low_volume], options, metrics_manager).unwrap();
 
         let (file_id1, mut writer1) = fm.create_data_file().unwrap();
-        writer1.write(&vec![b'a'; 80]).unwrap();
+        writer1.write(&[b'a'; 80]).unwrap();
         writer1.close().unwrap();
         let path1 = fm.get_data_file_path(file_id1).unwrap();
         assert!(high_fs.exists(&path1).unwrap());
 
         let (file_id2, mut writer2) = fm.create_data_file().unwrap();
-        writer2.write(&vec![b'b'; 8]).unwrap();
+        writer2.write(&[b'b'; 8]).unwrap();
         writer2.close().unwrap();
         let path2 = fm.get_data_file_path(file_id2).unwrap();
         assert!(low_fs.exists(&path2).unwrap());

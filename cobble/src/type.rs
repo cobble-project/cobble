@@ -854,13 +854,13 @@ mod tests {
 
     #[test]
     fn test_encode_decode_merge_separated_array_flatten_nested() {
-        let nested_columns = vec![
+        let nested_columns = [
             Column::new(ValueType::PutSeparated, b"p1".to_vec()),
             Column::new(ValueType::MergeSeparated, b"m1".to_vec()),
         ];
         let nested_refs: Vec<_> = nested_columns.iter().map(Column::as_ref_column).collect();
         let nested = encode_merge_separated_array(&nested_refs).unwrap();
-        let encoded_columns = vec![
+        let encoded_columns = [
             Column::new(ValueType::Put, b"inline".to_vec()),
             Column::new(ValueType::MergeSeparatedArray, nested),
             Column::new(ValueType::Merge, b"suffix".to_vec()),

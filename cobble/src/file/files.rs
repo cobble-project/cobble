@@ -359,7 +359,7 @@ mod tests {
     fn test_buffered_writer() {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
+        let fs = registry.get_or_register(TEST_ROOT).unwrap();
 
         // Test writing with buffer
         {
@@ -396,7 +396,7 @@ mod tests {
     fn test_buffered_reader() {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
+        let fs = registry.get_or_register(TEST_ROOT).unwrap();
 
         // Write test data
         {
@@ -437,7 +437,7 @@ mod tests {
     fn test_buffered_writer_flush() {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
+        let fs = registry.get_or_register(TEST_ROOT).unwrap();
 
         {
             let writer = fs.open_write("test_flush.txt").unwrap();
@@ -467,7 +467,7 @@ mod tests {
     fn test_buffered_reader_large_read() {
         cleanup_test_root();
         let registry = FileSystemRegistry::new();
-        let fs = registry.get_or_register(TEST_ROOT.to_string()).unwrap();
+        let fs = registry.get_or_register(TEST_ROOT).unwrap();
 
         // Write test data
         {

@@ -170,7 +170,7 @@ fn test_schema_evolution_scan_large_mixed_sst_memtable() {
     let root = "/tmp/schema_evolution_it_scan";
     let db = setup_large_schema_evolution_dataset(root);
 
-    let mut iter = db
+    let iter = db
         .scan(0, b"k000000".as_slice()..b"k999999".as_slice())
         .unwrap();
     let mut seen = 0usize;
@@ -184,7 +184,7 @@ fn test_schema_evolution_scan_large_mixed_sst_memtable() {
         MEMTABLE_ONLY_START,
         MEMTABLE_ONLY_END - 1,
     ];
-    while let Some(row) = iter.next() {
+    for row in iter {
         let (k, cols) = row.unwrap();
         if let Ok(s) = std::str::from_utf8(k.as_ref()) {
             let idx: usize = s[1..].parse().unwrap();

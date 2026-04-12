@@ -826,7 +826,7 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/sst_row_codec_test");
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/sst_row_codec_test".to_string())
+            .get_or_register("file:///tmp/sst_row_codec_test")
             .unwrap();
 
         // Define schema: 2 columns (name, email)
@@ -954,7 +954,7 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/sst_row_codec_seek_test");
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/sst_row_codec_seek_test".to_string())
+            .get_or_register("file:///tmp/sst_row_codec_seek_test")
             .unwrap();
 
         let num_columns = 1;
@@ -1028,7 +1028,7 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/sst_row_codec_blocks_test");
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/sst_row_codec_blocks_test".to_string())
+            .get_or_register("file:///tmp/sst_row_codec_blocks_test")
             .unwrap();
 
         let num_columns = 2;

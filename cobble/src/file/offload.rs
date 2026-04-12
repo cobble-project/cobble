@@ -668,7 +668,7 @@ mod tests {
         let policy = LargestFileOffloadPolicy;
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/offload-policy-largest".to_string())
+            .get_or_register("file:///tmp/offload-policy-largest")
             .unwrap();
         let candidates = vec![
             (
@@ -703,7 +703,7 @@ mod tests {
         let policy = LargestFileOffloadPolicy;
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/offload-policy-tie".to_string())
+            .get_or_register("file:///tmp/offload-policy-tie")
             .unwrap();
         let candidates = vec![
             (
@@ -728,7 +728,7 @@ mod tests {
         let policy = PriorityOffloadPolicy;
         let registry = FileSystemRegistry::new();
         let fs = registry
-            .get_or_register("file:///tmp/offload-policy-priority".to_string())
+            .get_or_register("file:///tmp/offload-policy-priority")
             .unwrap();
         let candidates = vec![
             (
@@ -771,10 +771,10 @@ mod tests {
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-offload-policy"));
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let (small_id, mut small_writer) = fm.create_data_file().unwrap();
-        small_writer.write(&vec![b'a'; 32]).unwrap();
+        small_writer.write(&[b'a'; 32]).unwrap();
         small_writer.close().unwrap();
         let (large_id, mut large_writer) = fm.create_data_file().unwrap();
-        large_writer.write(&vec![b'b'; 128]).unwrap();
+        large_writer.write(&[b'b'; 128]).unwrap();
         large_writer.close().unwrap();
         let source_volume = fm.primary_volume_by_rank(3).unwrap();
         let target_volume = fm.primary_volume_by_rank(1).unwrap();
@@ -808,7 +808,7 @@ mod tests {
         large_writer.write(&vec![b'a'; 512]).unwrap();
         large_writer.close().unwrap();
         let (small_low_pri_id, mut small_writer) = fm.create_data_file().unwrap();
-        small_writer.write(&vec![b'b'; 32]).unwrap();
+        small_writer.write(&[b'b'; 32]).unwrap();
         small_writer.close().unwrap();
         fm.set_data_file_priority(large_high_pri_id, 200).unwrap();
         fm.set_data_file_priority(small_low_pri_id, 3).unwrap();
@@ -844,7 +844,7 @@ mod tests {
         large_writer.write(&vec![b'a'; 512]).unwrap();
         large_writer.close().unwrap();
         let (small_low_pri_id, mut small_writer) = fm.create_data_file().unwrap();
-        small_writer.write(&vec![b'b'; 32]).unwrap();
+        small_writer.write(&[b'b'; 32]).unwrap();
         small_writer.close().unwrap();
         fm.set_data_file_priority(large_high_pri_id, 200).unwrap();
         fm.set_data_file_priority(small_low_pri_id, 3).unwrap();
@@ -878,7 +878,7 @@ mod tests {
         ));
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
-        source_writer.write(&vec![b's'; 64]).unwrap();
+        source_writer.write(&[b's'; 64]).unwrap();
         source_writer.close().unwrap();
         let (snapshot_replica_id, mut snapshot_writer) = fm.create_data_file().unwrap();
         snapshot_writer.write(&vec![b'r'; 1024]).unwrap();
