@@ -56,13 +56,13 @@ jobs:
           docker rm -f cobble-s3 >/dev/null 2>&1 || true
           mkdir -p "$GITHUB_WORKSPACE/.ci/rustfs-data" "$GITHUB_WORKSPACE/.ci/rustfs-logs"
           sudo chown -R 10001:10001 "$GITHUB_WORKSPACE/.ci/rustfs-data" "$GITHUB_WORKSPACE/.ci/rustfs-logs"
-          docker pull rustfs/rustfs:latest
+          docker pull rustfs/rustfs:1.0.0-alpha.91
           docker run -d --name cobble-s3 \
             -p 9000:9000 \
             -p 9001:9001 \
             -v "$GITHUB_WORKSPACE/.ci/rustfs-data:/data" \
             -v "$GITHUB_WORKSPACE/.ci/rustfs-logs:/logs" \
-            rustfs/rustfs:latest
+            rustfs/rustfs:1.0.0-alpha.91
           echo "access_id=rustfsadmin" >> "$GITHUB_OUTPUT"
           echo "secret_key=rustfsadmin" >> "$GITHUB_OUTPUT"
           echo "endpoint=http://127.0.0.1:9000" >> "$GITHUB_OUTPUT"
