@@ -96,6 +96,15 @@ jobs:
           aws --endpoint-url "$COBBLE_S3_ENDPOINT" s3api head-bucket --bucket "$COBBLE_S3_BUCKET" || \
           aws --endpoint-url "$COBBLE_S3_ENDPOINT" s3api create-bucket --bucket "$COBBLE_S3_BUCKET"
 
+      - name: Print local S3 logs before roundtrip test
+        run: |
+          sleep 10
+          echo "::group::RustFS logs before S3 roundtrip"
+          ls -lah "$GITHUB_WORKSPACE/.ci/rustfs-logs" || true
+          find "$GITHUB_WORKSPACE/.ci/rustfs-logs" -maxdepth 1 -type f -print -exec tail -n 200 {} \; || true
+          docker logs cobble-s3 || true
+          echo "::endgroup::"
+
       - name: Run S3 roundtrip integration test
         timeout-minutes: 15
         env:
@@ -104,6 +113,31 @@ jobs:
           COBBLE_S3_ACCESS_ID: ${{ steps.s3.outputs.access_id }}
           COBBLE_S3_SECRET_KEY: ${{ steps.s3.outputs.secret_key }}
         run: cargo test -p cobble --features storage-s3 --test s3_roundtrip_it s3_roundtrip_write_snapshot_resume -- --nocapture
+
+      - name: Capture local S3 logs
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.ci/rustfs-logs"
+          docker logs cobble-s3 > "$GITHUB_WORKSPACE/.ci/rustfs-logs/docker.log" 2>&1 || true
+          tar -czf "$GITHUB_WORKSPACE/.ci/rustfs-logs.tar.gz" -C "$GITHUB_WORKSPACE/.ci" rustfs-logs || true
+
+      - name: Print local S3 logs on failure
+        if: failure()
+        run: |
+          echo "::group::RustFS logs after S3 roundtrip failure"
+          ls -lah "$GITHUB_WORKSPACE/.ci/rustfs-logs" || true
+          find "$GITHUB_WORKSPACE/.ci/rustfs-logs" -maxdepth 1 -type f -print -exec tail -n 200 {} \; || true
+          echo "::endgroup::"
+
+      - name: Upload local S3 logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: rustfs-logs-${{ github.run_id }}-${{ github.job }}
+          path: |
+            .ci/rustfs-logs
+            .ci/rustfs-logs.tar.gz
+          if-no-files-found: warn
 
       - name: Stop local S3 service
         if: always()

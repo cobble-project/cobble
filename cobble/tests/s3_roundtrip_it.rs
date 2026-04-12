@@ -3,8 +3,10 @@
 use cobble::{Config, SingleDb, VolumeDescriptor, VolumeUsageKind};
 use size::Size;
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
+
+const PROGRESS_LOG_INTERVAL: usize = 16 * 1024;
 
 fn must_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("missing required env var: {}", name))
@@ -29,12 +31,39 @@ fn make_value(idx: usize, value_len: usize) -> Vec<u8> {
     value
 }
 
+fn log_stage(stage: &str, stage_start: Instant, total_start: Instant) {
+    eprintln!(
+        "[s3-roundtrip] stage={stage} stage_elapsed={:.3}s total_elapsed={:.3}s",
+        stage_start.elapsed().as_secs_f64(),
+        total_start.elapsed().as_secs_f64()
+    );
+}
+
+fn log_progress(
+    stage: &str,
+    completed: usize,
+    total: usize,
+    stage_start: Instant,
+    total_start: Instant,
+) {
+    if completed % PROGRESS_LOG_INTERVAL != 0 && completed != total {
+        return;
+    }
+    eprintln!(
+        "[s3-roundtrip] stage={stage} progress={completed}/{total} ({:.1}%) stage_elapsed={:.3}s total_elapsed={:.3}s",
+        (completed as f64 / total as f64) * 100.0,
+        stage_start.elapsed().as_secs_f64(),
+        total_start.elapsed().as_secs_f64()
+    );
+}
+
 #[test]
 fn s3_roundtrip_write_snapshot_resume() {
     if !has_required_env() {
         eprintln!("skipping s3 roundtrip test: COBBLE_S3_* env vars are not fully set");
         return;
     }
+    let total_start = Instant::now();
     let endpoint = must_env("COBBLE_S3_ENDPOINT");
     let bucket = must_env("COBBLE_S3_BUCKET");
     let access_id = must_env("COBBLE_S3_ACCESS_ID");
@@ -85,19 +114,36 @@ fn s3_roundtrip_write_snapshot_resume() {
         ..Config::default()
     };
 
-    // 64 MiB total payload: 16_384 keys x 4 KiB values.
+    // 1 GiB total payload: 262_144 keys x 4 KiB values.
     let value_len = 4096usize;
     let target_bytes = 1024 * 1024 * 1024usize;
     let records = target_bytes / value_len;
+    eprintln!(
+        "[s3-roundtrip] starting endpoint={} bucket={} root_prefix={} records={} value_len={} target_bytes={} block_cache_size={}",
+        endpoint,
+        bucket,
+        root_prefix,
+        records,
+        value_len,
+        target_bytes,
+        config.block_cache_size.bytes()
+    );
 
+    let open_start = Instant::now();
     let db = SingleDb::open(config.clone()).expect("open single db on s3 should succeed");
+    log_stage("open", open_start, total_start);
+
+    let write_start = Instant::now();
     for idx in 0..records {
         let key = format!("bulk-key-{idx:08}");
         let value = make_value(idx, value_len);
         db.put(0, key.as_bytes(), 0, value)
             .expect("write should succeed");
+        log_progress("write", idx + 1, records, write_start, total_start);
     }
+    log_stage("write", write_start, total_start);
 
+    let verify_before_snapshot_start = Instant::now();
     for idx in 0..records {
         let key = format!("bulk-key-{idx:08}");
         let expected = make_value(idx, value_len);
@@ -107,9 +153,22 @@ fn s3_roundtrip_write_snapshot_resume() {
             .expect("value should exist");
         let col = got[0].as_ref().expect("column 0 should exist");
         assert_eq!(col.as_ref(), expected.as_slice(), "mismatch at idx={idx}");
+        log_progress(
+            "verify-before-snapshot",
+            idx + 1,
+            records,
+            verify_before_snapshot_start,
+            total_start,
+        );
     }
+    log_stage(
+        "verify-before-snapshot",
+        verify_before_snapshot_start,
+        total_start,
+    );
 
     let (tx, rx) = mpsc::channel();
+    let snapshot_start = Instant::now();
     let snapshot_id = db
         .snapshot_with_callback(move |result| {
             let _ = tx.send(result.map(|_| ()));
@@ -119,9 +178,21 @@ fn s3_roundtrip_write_snapshot_resume() {
         .recv_timeout(Duration::from_secs(180))
         .expect("snapshot callback should complete");
     callback_result.expect("snapshot materialization should succeed");
-    db.close().expect("close db should succeed");
+    log_stage("snapshot", snapshot_start, total_start);
 
+    let close_before_resume_start = Instant::now();
+    db.close().expect("close db should succeed");
+    log_stage(
+        "close-before-resume",
+        close_before_resume_start,
+        total_start,
+    );
+
+    let resume_start = Instant::now();
     let resumed = SingleDb::resume(config, snapshot_id).expect("resume should succeed");
+    log_stage("resume", resume_start, total_start);
+
+    let verify_after_resume_start = Instant::now();
     for idx in 0..records {
         let key = format!("bulk-key-{idx:08}");
         let expected = make_value(idx, value_len);
@@ -135,6 +206,22 @@ fn s3_roundtrip_write_snapshot_resume() {
             expected.as_slice(),
             "mismatch after resume at idx={idx}"
         );
+        log_progress(
+            "verify-after-resume",
+            idx + 1,
+            records,
+            verify_after_resume_start,
+            total_start,
+        );
     }
+    log_stage(
+        "verify-after-resume",
+        verify_after_resume_start,
+        total_start,
+    );
+
+    let close_after_resume_start = Instant::now();
     resumed.close().expect("close resumed db should succeed");
+    log_stage("close-after-resume", close_after_resume_start, total_start);
+    log_stage("complete", total_start, total_start);
 }
