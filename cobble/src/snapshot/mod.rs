@@ -3,6 +3,7 @@ mod manager;
 mod manifest;
 mod memtable;
 
+use crate::db_state::LSMTreeScope;
 use crate::error::Result;
 use crate::file::TrackedFile;
 use crate::lsm::LSMTreeVersion;
@@ -13,9 +14,10 @@ use std::sync::Arc;
 
 pub(crate) use manager::SnapshotManager;
 pub(crate) use manifest::{
-    LoadedManifest, ManifestSnapshot, build_tree_versions_from_manifest,
-    build_vlog_version_from_manifest, list_snapshot_manifest_ids, load_manifest_entry,
-    load_manifest_for_snapshot, snapshot_manifest_name,
+    LoadedManifest, ManifestSnapshot, build_tree_scopes_from_manifest,
+    build_tree_versions_from_manifest, build_vlog_version_from_manifest,
+    list_snapshot_manifest_ids, load_manifest_entry, load_manifest_for_snapshot,
+    snapshot_manifest_name,
 };
 pub(crate) use memtable::ActiveMemtableSnapshotData;
 
@@ -36,6 +38,7 @@ pub(crate) struct DbSnapshot {
     pub referenced_schema_ids: BTreeSet<u64>,
     pub active_memtable_data: Vec<ActiveMemtableSnapshotData>,
     pub lsm_tree_bucket_ranges: Vec<RangeInclusive<u16>>,
+    pub tree_scopes: Vec<LSMTreeScope>,
     pub bucket_ranges: Vec<RangeInclusive<u16>>,
     pub finished: bool,
     pub callback: Option<SnapshotCallback>,
@@ -66,6 +69,7 @@ impl DbSnapshot {
             referenced_schema_ids: BTreeSet::new(),
             active_memtable_data: Vec::new(),
             lsm_tree_bucket_ranges: Vec::new(),
+            tree_scopes: Vec::new(),
             bucket_ranges: Vec::new(),
             finished: false,
             callback,

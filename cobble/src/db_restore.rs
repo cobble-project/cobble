@@ -1,7 +1,7 @@
 use super::Db;
 use crate::Config;
 use crate::config::PrimaryVolumeOffloadPolicyKind;
-use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, default_column_family_scopes};
+use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::{
@@ -13,8 +13,9 @@ use crate::merge_operator::MergeOperatorResolver;
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
 use crate::snapshot::{
-    ManifestSnapshot, build_tree_versions_from_manifest, build_vlog_version_from_manifest,
-    list_snapshot_manifest_ids, load_manifest_entry, load_manifest_for_snapshot,
+    ManifestSnapshot, build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
+    build_vlog_version_from_manifest, list_snapshot_manifest_ids, load_manifest_entry,
+    load_manifest_for_snapshot,
 };
 use crate::util::{build_commit_short_id, build_version_string, init_logging};
 use std::collections::{HashMap, VecDeque};
@@ -309,7 +310,7 @@ impl Db {
             )));
         }
         let bucket_ranges = manifest.bucket_ranges.clone();
-        let lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
+        let _lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
             manifest.bucket_ranges.clone()
         } else {
             manifest.lsm_tree_bucket_ranges.clone()
@@ -320,7 +321,7 @@ impl Db {
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
         let can_incremental_base =
             can_incremental_snapshot_from_tree_versions(&tree_versions, &file_manager);
-        let tree_scopes = default_column_family_scopes(&lsm_tree_bucket_ranges);
+        let tree_scopes = build_tree_scopes_from_manifest(&manifest);
         let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             config.total_buckets,
             &tree_scopes,
@@ -411,7 +412,7 @@ impl Db {
         let restored_snapshot_links =
             prepare_manifest_data_files_for_restore(&file_manager, &manifest)?;
         let bucket_ranges = manifest.bucket_ranges.clone();
-        let lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
+        let _lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
             manifest.bucket_ranges.clone()
         } else {
             manifest.lsm_tree_bucket_ranges.clone()
@@ -435,7 +436,7 @@ impl Db {
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
         let can_incremental_base =
             can_incremental_snapshot_from_tree_versions(&tree_versions, &file_manager);
-        let tree_scopes = default_column_family_scopes(&lsm_tree_bucket_ranges);
+        let tree_scopes = build_tree_scopes_from_manifest(&manifest);
         let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             config.total_buckets,
             &tree_scopes,

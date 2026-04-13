@@ -247,6 +247,7 @@ impl SnapshotManager {
         };
         let mut snapshot = (*snapshot).clone();
         snapshot.lsm_tree_bucket_ranges = db_state.multi_lsm_version.bucket_ranges();
+        snapshot.tree_scopes = db_state.multi_lsm_version.tree_scopes();
         if snapshot.lsm_tree_bucket_ranges.is_empty() {
             snapshot.lsm_tree_bucket_ranges = snapshot.bucket_ranges.clone();
         }
@@ -363,6 +364,7 @@ impl SnapshotManager {
             referenced_schema_ids,
             active_memtable_data: manifest.active_memtable_data.clone(),
             lsm_tree_bucket_ranges: manifest.lsm_tree_bucket_ranges.clone(),
+            tree_scopes: manifest.tree_scopes.clone(),
             bucket_ranges: manifest.bucket_ranges.clone(),
             finished: true,
             callback: None,

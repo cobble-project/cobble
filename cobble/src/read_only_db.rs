@@ -1,7 +1,7 @@
 use crate::block_cache::{BlockCache, new_block_cache_with_config};
 use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
-use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, default_column_family_scopes};
+use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::FileManager;
@@ -10,7 +10,8 @@ use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaManager};
 use crate::snapshot::{
-    build_tree_versions_from_manifest, build_vlog_version_from_manifest, load_manifest_for_snapshot,
+    build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
+    build_vlog_version_from_manifest, load_manifest_for_snapshot,
 };
 use crate::sst::row_codec::encode_key_ref_into;
 use crate::ttl::{TTLProvider, TtlConfig};
@@ -154,7 +155,7 @@ impl ReadOnlyDb {
             )));
         }
         let bucket_ranges = manifest.bucket_ranges.clone();
-        let lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
+        let _lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
             manifest.bucket_ranges.clone()
         } else {
             manifest.lsm_tree_bucket_ranges.clone()
@@ -167,7 +168,7 @@ impl ReadOnlyDb {
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let tree_versions = build_tree_versions_from_manifest(&file_manager, &manifest, true)?;
-        let tree_scopes = default_column_family_scopes(&lsm_tree_bucket_ranges);
+        let tree_scopes = build_tree_scopes_from_manifest(&manifest);
         let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             config.total_buckets,
             &tree_scopes,

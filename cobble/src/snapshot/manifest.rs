@@ -1,5 +1,6 @@
 use super::{ActiveMemtableSnapshotData, DbSnapshot};
 use crate::data_file::{DataFile, DataFileType};
+use crate::db_state::LSMTreeScope;
 use crate::error::{Error, Result};
 use crate::file::{
     BufferedWriter, FileManager, MetadataReader, SequentialWriteFile, TrackedFileId,
@@ -23,6 +24,7 @@ pub(crate) struct ManifestSnapshot {
     pub(crate) latest_schema_id: u64,
     pub(crate) bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) lsm_tree_bucket_ranges: Vec<RangeInclusive<u16>>,
+    pub(crate) tree_scopes: Vec<LSMTreeScope>,
     pub(crate) tree_levels: Vec<Vec<ManifestLevel>>,
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
     pub(crate) active_memtable_data: Vec<ActiveMemtableSnapshotData>,
@@ -37,6 +39,7 @@ pub(crate) struct ManifestIncrementalSnapshot {
     pub(crate) latest_schema_id: u64,
     pub(crate) bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) lsm_tree_bucket_ranges: Vec<RangeInclusive<u16>>,
+    pub(crate) tree_scopes: Vec<LSMTreeScope>,
     pub(crate) tree_level_edits: Vec<ManifestTreeLevelEdit>,
     // always include vlog file info in incremental manifests since vlog files are more likely to have changes
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
@@ -178,6 +181,7 @@ pub(crate) fn load_manifest_entry(
                 resolved.active_memtable_data = incremental.active_memtable_data;
                 resolved.bucket_ranges = incremental.bucket_ranges;
                 resolved.lsm_tree_bucket_ranges = incremental.lsm_tree_bucket_ranges;
+                resolved.tree_scopes = incremental.tree_scopes;
                 resolved
             } else {
                 load_manifest_for_snapshot(file_manager, snapshot_id)?
@@ -245,6 +249,7 @@ pub(crate) fn load_manifest_chain(
                 resolved_base.active_memtable_data = manifest.active_memtable_data;
                 resolved_base.bucket_ranges = manifest.bucket_ranges;
                 resolved_base.lsm_tree_bucket_ranges = manifest.lsm_tree_bucket_ranges;
+                resolved_base.tree_scopes = manifest.tree_scopes;
                 (Some(manifest.base_snapshot_id), resolved_base)
             }
         };
@@ -376,6 +381,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             latest_schema_id: snapshot.latest_schema_id,
             bucket_ranges: snapshot.bucket_ranges.clone(),
             lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
+            tree_scopes: snapshot.tree_scopes.clone(),
             tree_levels: manifest_tree_levels_from_snapshot(&snapshot.lsm_versions, file_manager),
             vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
             active_memtable_data: snapshot.active_memtable_data.clone(),
@@ -395,6 +401,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 latest_schema_id: snapshot.latest_schema_id,
                 bucket_ranges: snapshot.bucket_ranges.clone(),
                 lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
+                tree_scopes: snapshot.tree_scopes.clone(),
                 tree_level_edits,
                 vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
                 active_memtable_data: snapshot.active_memtable_data.clone(),
@@ -673,6 +680,11 @@ pub(crate) fn build_tree_versions_from_manifest(
     })
 }
 
+/// Build tree scopes from a manifest.
+pub(crate) fn build_tree_scopes_from_manifest(manifest: &ManifestSnapshot) -> Vec<LSMTreeScope> {
+    manifest.tree_scopes.clone()
+}
+
 /// Shared tree-version builder: iterates manifest levels and delegates
 /// per-file DataFile construction to the provided closure.
 fn build_tree_versions_internal(
@@ -757,6 +769,7 @@ mod tests {
                 "latest_schema_id": 3,
                 "bucket_ranges": [],
                 "lsm_tree_bucket_ranges": [],
+                "tree_scopes": [],
                 "tree_levels": [],
                 "vlog_files": [],
                 "active_memtable_data": []

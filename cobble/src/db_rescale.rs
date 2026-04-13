@@ -1,17 +1,15 @@
 //! Functionality for expanding owned buckets by importing snapshot data from another db.
 use super::Db;
 use crate::data_file::intersect_bucket_ranges;
-use crate::db_state::{
-    DbState, MultiLSMTreeVersion, bucket_range_fits_total, default_column_family_scopes,
-};
+use crate::db_state::{DbState, LSMTreeScope, MultiLSMTreeVersion, bucket_range_fits_total};
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager, MetadataReader, SequentialWriteFile};
 use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::paths::schema_file_relative_path;
 use crate::snapshot::{
-    build_tree_versions_from_manifest, build_vlog_version_from_manifest,
-    list_snapshot_manifest_ids, load_manifest_entry,
+    build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
+    build_vlog_version_from_manifest, list_snapshot_manifest_ids, load_manifest_entry,
 };
 use crate::util::{
     normalize_bucket_ranges, range_is_covered_by_ranges, ranges_overlap, subtract_range_by_cuts,
@@ -247,30 +245,39 @@ impl Db {
         // Step 6: Build imported tree/vlog versions as read-only source files.
         let source_tree_versions =
             build_tree_versions_from_manifest(&self.file_manager, &source_manifest, true)?;
-        if source_tree_versions.len() != source_tree_ranges.len() {
+        let source_scopes = build_tree_scopes_from_manifest(&source_manifest);
+        if source_tree_versions.len() != source_tree_ranges.len()
+            || source_tree_versions.len() != source_scopes.len()
+        {
             return Err(Error::InvalidState(format!(
-                "Source tree version count {} does not match range count {}",
+                "Source tree version count {}, range count {}, and scope count {} do not match",
                 source_tree_versions.len(),
-                source_tree_ranges.len()
+                source_tree_ranges.len(),
+                source_scopes.len()
             )));
         }
-        let mut imported_ranges = Vec::new();
+        let mut imported_scopes = Vec::new();
         let mut imported_versions = Vec::new();
         for expand_range in &expand_ranges {
-            for (source_version, source_range) in
-                source_tree_versions.iter().zip(source_tree_ranges.iter())
+            for ((source_version, source_range), source_scope) in source_tree_versions
+                .iter()
+                .zip(source_tree_ranges.iter())
+                .zip(source_scopes.iter())
             {
                 let Some(intersection) = intersect_bucket_ranges(expand_range, source_range) else {
                     continue;
                 };
-                imported_ranges.push(intersection.clone());
+                imported_scopes.push(LSMTreeScope::new(
+                    intersection.clone(),
+                    source_scope.column_family_id,
+                ));
                 imported_versions.push(LSMTree::clone_version_for_range(
                     source_version,
                     &intersection,
                 ));
             }
         }
-        if imported_ranges.is_empty() {
+        if imported_versions.is_empty() {
             return Err(Error::InvalidState(
                 "No source LSM trees matched requested expand ranges".to_string(),
             ));
@@ -279,11 +286,10 @@ impl Db {
             build_vlog_version_from_manifest(&self.file_manager, &source_manifest, true)?;
 
         // Step 7: Merge source tree/vlog versions into target state.
-        let mut merged_ranges = current.multi_lsm_version.bucket_ranges();
+        let mut merged_scopes = current.multi_lsm_version.tree_scopes();
         let mut merged_versions = current.multi_lsm_version.tree_versions_cloned();
-        merged_ranges.extend(imported_ranges);
+        merged_scopes.extend(imported_scopes);
         merged_versions.extend(imported_versions);
-        let merged_scopes = default_column_family_scopes(&merged_ranges);
         let merged_multi_lsm = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             current.multi_lsm_version.total_buckets(),
             &merged_scopes,
@@ -404,21 +410,23 @@ impl Db {
                 "cannot shrink all owned bucket ranges".to_string(),
             ));
         }
-        let tree_ranges = current.multi_lsm_version.bucket_ranges();
+        let existing_scopes = current.multi_lsm_version.tree_scopes();
         let tree_versions = current.multi_lsm_version.tree_versions_cloned();
-        if tree_ranges.len() != tree_versions.len() {
+        if existing_scopes.len() != tree_versions.len() {
             return Err(Error::InvalidState(format!(
-                "LSM tree version count {} does not match range count {}",
+                "LSM tree version count {} does not match scope count {}",
                 tree_versions.len(),
-                tree_ranges.len()
+                existing_scopes.len()
             )));
         }
-        let mut updated_tree_ranges = Vec::new();
+        let mut updated_scopes = Vec::new();
         let mut updated_tree_versions = Vec::new();
-        for (tree_range, tree_version) in tree_ranges.into_iter().zip(tree_versions.into_iter()) {
-            for kept_range in subtract_range_by_cuts(&tree_range, &shrink_ranges) {
-                updated_tree_ranges.push(kept_range.clone());
-                if kept_range == tree_range {
+        for (scope, tree_version) in existing_scopes.into_iter().zip(tree_versions.into_iter()) {
+            for kept_range in subtract_range_by_cuts(&scope.bucket_range, &shrink_ranges) {
+                let kept_scope =
+                    crate::db_state::LSMTreeScope::new(kept_range.clone(), scope.column_family_id);
+                updated_scopes.push(kept_scope);
+                if kept_range == scope.bucket_range {
                     updated_tree_versions.push(tree_version.clone());
                 } else {
                     updated_tree_versions.push(LSMTree::clone_version_for_range(
@@ -428,12 +436,11 @@ impl Db {
                 }
             }
         }
-        if updated_tree_ranges.is_empty() {
+        if updated_scopes.is_empty() {
             return Err(Error::ConfigError(
                 "cannot shrink all LSM tree ranges".to_string(),
             ));
         }
-        let updated_scopes = default_column_family_scopes(&updated_tree_ranges);
         let updated_multi_lsm = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             current.multi_lsm_version.total_buckets(),
             &updated_scopes,

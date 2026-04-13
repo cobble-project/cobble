@@ -4,6 +4,7 @@ use crate::memtable::{ActiveMemtable, ImmutableMemtable};
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, MAX_COLUMN_FAMILY_COUNT};
 use crate::vlog::VlogVersion;
 use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
 use std::sync::atomic::AtomicU64;
@@ -16,7 +17,7 @@ struct TreeVersionEntry {
     lsm_version: Arc<LSMTreeVersion>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LSMTreeScope {
     pub(crate) bucket_range: RangeInclusive<u16>,
     pub(crate) column_family_id: u8,

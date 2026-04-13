@@ -580,7 +580,7 @@ mod tests {
         schema_writer.close().unwrap();
         let mut writer = fs.open_write(&manifest_path).unwrap();
         let manifest = format!(
-            "{{\"version\":1,\"id\":{},\"seq_id\":0,\"latest_schema_id\":0,\"bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"lsm_tree_bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"tree_levels\":[[]],\"vlog_files\":[],\"active_memtable_data\":[]}}",
+            "{{\"version\":1,\"id\":{},\"seq_id\":0,\"latest_schema_id\":0,\"bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"lsm_tree_bucket_ranges\":[{{\"start\":0,\"end\":1}}],\"tree_scopes\":[{{\"bucket_range\":{{\"start\":0,\"end\":1}},\"column_family_id\":0}}],\"tree_levels\":[[]],\"vlog_files\":[],\"active_memtable_data\":[]}}",
             snapshot_id
         );
         let manifest_bytes = encode_metadata_payload_for_test(manifest.as_bytes());
