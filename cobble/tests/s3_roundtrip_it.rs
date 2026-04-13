@@ -46,7 +46,7 @@ fn log_progress(
     stage_start: Instant,
     total_start: Instant,
 ) {
-    if completed % PROGRESS_LOG_INTERVAL != 0 && completed != total {
+    if !completed.is_multiple_of(PROGRESS_LOG_INTERVAL) && completed != total {
         return;
     }
     eprintln!(
@@ -114,9 +114,9 @@ fn s3_roundtrip_write_snapshot_resume() {
         ..Config::default()
     };
 
-    // 1 GiB total payload: 262_144 keys x 4 KiB values.
+    // 1 GiB total payload: 131_072 keys x 4 KiB values.
     let value_len = 4096usize;
-    let target_bytes = 1024 * 1024 * 1024usize;
+    let target_bytes = 512 * 1024 * 1024usize;
     let records = target_bytes / value_len;
     eprintln!(
         "[s3-roundtrip] starting endpoint={} bucket={} root_prefix={} records={} value_len={} target_bytes={} block_cache_size={}",

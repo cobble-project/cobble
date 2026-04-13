@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::ops::RangeInclusive;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex};
+use uuid::Uuid;
 
 #[derive(Clone)]
 struct TreeVersionEntry {
@@ -433,6 +434,29 @@ impl DbStateHandle {
     pub(crate) fn store(&self, new_version: DbState) {
         self.current.store(Arc::new(new_version));
         self.changed.notify_all();
+    }
+
+    /// Removes an immutable memtable by id from the current state.
+    /// Used in flush error paths so the memtable can be fully dropped,
+    /// triggering the reclaimer which notifies `buffer_ready`.
+    pub(crate) fn remove_immutable(&self, memtable_id: Uuid) {
+        let _guard = self.lock();
+        let snapshot = self.load();
+        let mut immutables = snapshot.immutables.clone();
+        let before = immutables.len();
+        immutables.retain(|imm| imm.id != memtable_id);
+        if immutables.len() == before {
+            return;
+        }
+        self.store(DbState {
+            seq_id: self.allocate_seq_id(),
+            bucket_ranges: snapshot.bucket_ranges.clone(),
+            multi_lsm_version: snapshot.multi_lsm_version.clone(),
+            vlog_version: snapshot.vlog_version.clone(),
+            active: snapshot.active.clone(),
+            immutables,
+            suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+        });
     }
 }
 
