@@ -317,7 +317,7 @@ pub(crate) struct DbStateHandle {
     current: ArcSwap<DbState>,
     lock: Mutex<()>,
     next_seq_id: AtomicU64,
-    changed: Condvar,
+    changed: Arc<Condvar>,
 }
 
 impl DbStateHandle {
@@ -334,7 +334,7 @@ impl DbStateHandle {
             }),
             lock: Mutex::new(()),
             next_seq_id: AtomicU64::new(1),
-            changed: Condvar::new(),
+            changed: Arc::new(Condvar::new()),
         }
     }
 
@@ -356,6 +356,16 @@ impl DbStateHandle {
         guard: std::sync::MutexGuard<'a, ()>,
     ) -> std::sync::MutexGuard<'a, ()> {
         self.changed.wait(guard).unwrap()
+    }
+
+    /// Notifies all waiters on the changed condvar without actually changing state.
+    /// Used to wake up write-stall waiters when the DB enters an error state.
+    pub(crate) fn notify_changed(&self) {
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn changed_condvar(&self) -> &Arc<Condvar> {
+        &self.changed
     }
 
     pub(crate) fn cas_mutate<F>(&self, expected: u64, f: F) -> bool
