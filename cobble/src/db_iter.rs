@@ -23,6 +23,7 @@ pub(crate) struct DbIteratorOptions<'a> {
     /// When column projection is active, this is a projected schema
     /// with remapped operators matching the selected column indices.
     pub(crate) schema: Arc<Schema>,
+    pub(crate) column_family_id: u8,
 }
 
 pub struct DbIterator<'a> {
@@ -34,6 +35,7 @@ pub struct DbIterator<'a> {
     ttl_provider: Arc<TTLProvider>,
     schema: Arc<Schema>,
     num_columns: usize,
+    column_family_id: u8,
 }
 
 impl<'a> DbIterator<'a> {
@@ -61,6 +63,7 @@ impl<'a> DbIterator<'a> {
             ttl_provider: options.ttl_provider,
             schema,
             num_columns,
+            column_family_id: options.column_family_id,
         }
     }
 
@@ -109,6 +112,7 @@ impl<'a> DbIterator<'a> {
                     }
                 },
                 &self.schema,
+                self.column_family_id,
                 Some(self.ttl_provider.time_provider()),
             )?;
             if let Some(columns) = columns {

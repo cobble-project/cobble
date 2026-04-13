@@ -831,6 +831,7 @@ impl LSMTree {
             encoded_key,
             target_schema,
             schema_manager,
+            column_family_id,
             selected_columns,
             selected_mask,
             terminal_mask,
@@ -845,11 +846,14 @@ impl LSMTree {
         encoded_key: &[u8],
         target_schema: &Schema,
         schema_manager: &SchemaManager,
+        column_family_id: u8,
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
         mut terminal_mask: Option<&mut [u8]>,
     ) -> Result<Vec<Value>> {
-        let num_columns = target_schema.num_columns();
+        let num_columns = target_schema
+            .num_columns_in_family(column_family_id)
+            .unwrap_or(0);
         let mut values = Vec::new();
         let mask_size = num_columns.div_ceil(8).max(1);
         let last_bits = (num_columns - 1) % 8 + 1;
@@ -881,6 +885,7 @@ impl LSMTree {
                         encoded_key,
                         target_schema,
                         schema_manager,
+                        column_family_id,
                         selected_columns,
                         selected_mask,
                         terminal_mask.as_deref_mut(),
@@ -904,6 +909,7 @@ impl LSMTree {
                         encoded_key,
                         target_schema,
                         schema_manager,
+                        column_family_id,
                         selected_columns,
                         selected_mask,
                         terminal_mask.as_deref_mut(),
@@ -1050,16 +1056,21 @@ impl LSMTree {
         encoded_key: &[u8],
         target_schema: &Schema,
         schema_manager: &SchemaManager,
+        column_family_id: u8,
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
         mut terminal_mask: Option<&mut [u8]>,
         decode_mask: &mut [u8],
         out_values: &mut Vec<Value>,
     ) -> Result<bool> {
-        let num_columns = target_schema.num_columns();
+        let num_columns = target_schema
+            .num_columns_in_family(column_family_id)
+            .unwrap_or(0);
         let target_schema_id = target_schema.version();
         let source_schema = schema_manager.schema(file.schema_id)?;
-        let source_num_columns = source_schema.num_columns();
+        let source_num_columns = source_schema
+            .num_columns_in_family(column_family_id)
+            .unwrap_or(0);
         let mask_size = decode_mask.len();
         if let Some(bucket) = key_bucket(encoded_key)
             && !file.effective_bucket_range.contains(&bucket)

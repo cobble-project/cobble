@@ -150,6 +150,7 @@ pub(crate) fn value_to_vec_of_columns_with_vlog<F>(
     value: Value,
     mut resolve_pointer: F,
     schema: &Schema,
+    column_family_id: u8,
     time_provider: Option<&dyn TimeProvider>,
 ) -> Result<Option<Vec<Option<Bytes>>>>
 where
@@ -158,7 +159,7 @@ where
     let resolve_pointer = &mut resolve_pointer;
     let mut columns = Vec::with_capacity(value.columns.len());
     for (column_idx, column) in value.columns.into_iter().enumerate() {
-        let merge_operator = schema.operator(column_idx);
+        let merge_operator = schema.operator_in_family(column_family_id, column_idx);
         let resolved = match column {
             Some(column) => {
                 resolve_column_with_vlog(column, resolve_pointer, merge_operator, time_provider)?
@@ -958,12 +959,6 @@ impl Db {
         self.ensure_open()?;
         let schema = self.schema_manager.latest_schema();
         let column_family_id = schema.resolve_column_family_id(options.column_family())?;
-        if column_family_id != DEFAULT_COLUMN_FAMILY_ID {
-            return Err(Error::IoError(format!(
-                "ReadOptions.column_family {:?} is not supported before CF key-codec wiring",
-                options.column_family()
-            )));
-        }
         let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         if let Some(max_index) = options.max_index()
             && max_index >= num_columns
@@ -974,7 +969,10 @@ impl Db {
             )));
         }
         let mut encoded_key = BytesMut::with_capacity(3 + key.len());
-        encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded_key);
+        encode_key_ref_into(
+            &RefKey::new_with_column_family(bucket, column_family_id, key),
+            &mut encoded_key,
+        );
         let encoded_key = encoded_key.freeze();
         let selected_columns = options.columns();
         let masks = options.masks(num_columns);
@@ -997,12 +995,19 @@ impl Db {
                 let mut value = if source_schema.version() == schema.version() {
                     decode_value_masked(
                         &mut raw_value,
-                        source_schema.num_columns(),
+                        source_schema
+                            .num_columns_in_family(column_family_id)
+                            .unwrap_or(0),
                         decode_mask,
                         None,
                     )?
                 } else {
-                    let decoded = decode_value(&mut raw_value, source_schema.num_columns())?;
+                    let decoded = decode_value(
+                        &mut raw_value,
+                        source_schema
+                            .num_columns_in_family(column_family_id)
+                            .unwrap_or(0),
+                    )?;
                     self.schema_manager.evolve_value(
                         decoded,
                         source_schema.version(),
@@ -1073,7 +1078,12 @@ impl Db {
         let mut iter = values.into_iter();
         let mut merged = iter.next().expect("values not empty");
         for newer in iter {
-            merged = merged.merge(newer, &schema, Some(self.time_provider.as_ref()))?;
+            merged = merged.merge_in_column_family(
+                newer,
+                &schema,
+                column_family_id,
+                Some(self.time_provider.as_ref()),
+            )?;
         }
         let result = value_to_vec_of_columns_with_vlog(
             merged,
@@ -1088,6 +1098,7 @@ impl Db {
                     .ok_or(vlog_err),
             },
             &schema,
+            column_family_id,
             Some(self.time_provider.as_ref()),
         );
         match result {
@@ -1160,6 +1171,7 @@ impl Db {
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 schema: effective_schema,
+                column_family_id: DEFAULT_COLUMN_FAMILY_ID,
             },
         );
         if let Err(err) = iter.seek(start_key.as_ref()) {

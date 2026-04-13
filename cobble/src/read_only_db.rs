@@ -245,12 +245,6 @@ impl ReadOnlyDb {
     ) -> Result<Option<Vec<Option<Bytes>>>> {
         let schema = self.schema_manager.latest_schema();
         let column_family_id = schema.resolve_column_family_id(options.column_family())?;
-        if column_family_id != DEFAULT_COLUMN_FAMILY_ID {
-            return Err(Error::IoError(format!(
-                "ReadOptions.column_family {:?} is not supported before CF key-codec wiring",
-                options.column_family()
-            )));
-        }
         let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         if let Some(max_index) = options.max_index()
             && max_index >= num_columns
@@ -261,7 +255,10 @@ impl ReadOnlyDb {
             )));
         }
         let mut encoded_key = bytes::BytesMut::with_capacity(3 + key.len());
-        encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded_key);
+        encode_key_ref_into(
+            &RefKey::new_with_column_family(bucket, column_family_id, key),
+            &mut encoded_key,
+        );
         let encoded_key = encoded_key.freeze();
         let masks = options.masks(num_columns);
         let selected_mask = masks.selected_mask.as_deref();
@@ -287,7 +284,12 @@ impl ReadOnlyDb {
         let mut iter = values.into_iter();
         let mut merged = iter.next().expect("values not empty");
         for newer in iter {
-            merged = merged.merge(newer, &schema, Some(self.ttl_provider.time_provider()))?;
+            merged = merged.merge_in_column_family(
+                newer,
+                &schema,
+                column_family_id,
+                Some(self.ttl_provider.time_provider()),
+            )?;
         }
         let snapshot = self.lsm_tree.db_state().load();
         value_to_vec_of_columns_with_vlog(
@@ -297,6 +299,7 @@ impl ReadOnlyDb {
                     .read_pointer(&snapshot.vlog_version, pointer)
             },
             &schema,
+            DEFAULT_COLUMN_FAMILY_ID,
             Some(self.ttl_provider.time_provider()),
         )
     }
@@ -357,6 +360,7 @@ impl ReadOnlyDb {
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 schema: effective_schema,
+                column_family_id: DEFAULT_COLUMN_FAMILY_ID,
             },
         );
         iter.seek(start_key.as_ref())?;
