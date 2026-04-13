@@ -927,6 +927,7 @@ impl LSMTree {
         Ok(values)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan_with_snapshot(
         &self,
         file_manager: &Arc<FileManager>,
@@ -935,22 +936,31 @@ impl LSMTree {
         schema_manager: Arc<SchemaManager>,
         read_ahead_bytes: usize,
         selected_columns: Option<&[usize]>,
+        bucket: u16,
+        column_family_id: u8,
     ) -> Result<(Vec<DynKvIterator>, Arc<Schema>)> {
         let selected_columns = selected_columns.map(|columns| columns.to_vec());
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let use_read_ahead = read_ahead_bytes > 0 && tokio::runtime::Handle::try_current().is_ok();
         let mut runs: Vec<SortedRun> = Vec::new();
-        let primary_version = snapshot.multi_lsm_version.version_of_index(0);
-        for level in &primary_version.levels {
-            if level.files.is_empty() {
-                continue;
-            }
-            if level.tiered {
-                for file in level.files.iter().rev() {
-                    runs.push(SortedRun::new(level.ordinal, vec![Arc::clone(file)]));
+        let target_num_columns = target_schema
+            .num_columns_in_family(column_family_id)
+            .unwrap_or(0);
+        let version = snapshot
+            .multi_lsm_version
+            .version_for_bucket_and_column_family(bucket, column_family_id);
+        if let Some(version) = version {
+            for level in &version.levels {
+                if level.files.is_empty() {
+                    continue;
                 }
-            } else {
-                runs.push(SortedRun::new(level.ordinal, level.files.clone()));
+                if level.tiered {
+                    for file in level.files.iter().rev() {
+                        runs.push(SortedRun::new(level.ordinal, vec![Arc::clone(file)]));
+                    }
+                } else {
+                    runs.push(SortedRun::new(level.ordinal, level.files.clone()));
+                }
             }
         }
         for run in runs {
@@ -962,6 +972,9 @@ impl LSMTree {
             let selected_columns = selected_columns.clone();
             let run_iter = run.iter(move |file| {
                 let source_schema = schema_manager.schema(file.schema_id)?;
+                let source_num_columns = source_schema
+                    .num_columns_in_family(column_family_id)
+                    .unwrap_or(0);
                 let reader = file_manager.open_data_file_reader(file.file_id)?;
                 let reader: Box<dyn crate::file::RandomAccessFile> = if use_read_ahead {
                     Box::new(ReadAheadBufferedReader::new(reader, read_ahead_bytes))
@@ -972,7 +985,7 @@ impl LSMTree {
                     DataFileType::SSTable => {
                         let sst_options = SSTIteratorOptions {
                             metrics: Some(Arc::clone(&sst_metrics)),
-                            num_columns: source_schema.num_columns(),
+                            num_columns: source_num_columns,
                             bloom_filter_enabled: true,
                             ..SSTIteratorOptions::default()
                         };
@@ -1020,14 +1033,14 @@ impl LSMTree {
                 } else {
                     Box::new(VlogSeqOffsetIterator::new(
                         iter,
-                        target_schema.num_columns(),
+                        target_num_columns,
                         file.vlog_file_seq_offset,
                     ))
                 };
                 let iter: DynKvIterator = if let Some(columns) = selected_columns.as_deref() {
                     Box::new(ColumnMaskingIterator::new(
                         iter,
-                        target_schema.num_columns(),
+                        target_num_columns,
                         columns,
                     ))
                 } else {

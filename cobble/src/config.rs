@@ -240,6 +240,7 @@ pub struct ReadOptions {
 pub struct ScanOptions {
     pub read_ahead_bytes: Size,
     pub column_indices: Option<Vec<usize>>,
+    pub column_family: Option<String>,
     max_index: Option<usize>,
 }
 
@@ -303,8 +304,18 @@ impl ScanOptions {
         Self {
             read_ahead_bytes: Size::from_const(0),
             column_indices,
+            column_family: None,
             max_index,
         }
+    }
+
+    pub fn with_column_family(mut self, column_family: impl Into<String>) -> Self {
+        self.column_family = Some(column_family.into());
+        self
+    }
+
+    pub(crate) fn column_family(&self) -> Option<&str> {
+        self.column_family.as_deref()
     }
 
     pub(crate) fn columns(&self) -> Option<&[usize]> {

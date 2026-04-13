@@ -326,7 +326,8 @@ impl ReadOnlyDb {
     ) -> Result<DbIterator<'static>> {
         let snapshot = self.lsm_tree.db_state().load();
         let schema = self.schema_manager.latest_schema();
-        let num_columns = schema.num_columns();
+        let column_family_id = schema.resolve_column_family_id(options.column_family())?;
+        let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         if let Some(max_index) = options.max_index()
             && max_index >= num_columns
         {
@@ -342,10 +343,15 @@ impl ReadOnlyDb {
             Arc::clone(&self.schema_manager),
             options.read_ahead_bytes()?,
             options.columns(),
+            bucket,
+            column_family_id,
         )?;
         let encode_scan_key = |key: &[u8]| {
-            let mut encoded = bytes::BytesMut::with_capacity(3 + key.len());
-            encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded);
+            let mut encoded = bytes::BytesMut::with_capacity(4 + key.len());
+            encode_key_ref_into(
+                &RefKey::new_with_column_family(bucket, column_family_id, key),
+                &mut encoded,
+            );
             encoded.freeze()
         };
         let start_key = encode_scan_key(start.unwrap_or(&[]));
@@ -360,7 +366,7 @@ impl ReadOnlyDb {
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 schema: effective_schema,
-                column_family_id: DEFAULT_COLUMN_FAMILY_ID,
+                column_family_id,
             },
         );
         iter.seek(start_key.as_ref())?;

@@ -1123,7 +1123,8 @@ impl Db {
         self.ensure_open()?;
         let snapshot = self.db_state.load();
         let schema = self.schema_manager.latest_schema();
-        let num_columns = schema.num_columns();
+        let column_family_id = schema.resolve_column_family_id(options.column_family())?;
+        let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         if let Some(max_index) = options.max_index()
             && max_index >= num_columns
         {
@@ -1146,6 +1147,8 @@ impl Db {
             Arc::clone(&self.schema_manager),
             options.read_ahead_bytes()?,
             options.columns(),
+            bucket,
+            column_family_id,
         );
         let (lsm_iters, effective_schema) = match lsm_iters {
             Ok(result) => result,
@@ -1155,8 +1158,11 @@ impl Db {
             }
         };
         let encode_scan_key = |key: &[u8]| {
-            let mut encoded = BytesMut::with_capacity(3 + key.len());
-            encode_key_ref_into(&RefKey::new(bucket, key), &mut encoded);
+            let mut encoded = BytesMut::with_capacity(4 + key.len());
+            encode_key_ref_into(
+                &RefKey::new_with_column_family(bucket, column_family_id, key),
+                &mut encoded,
+            );
             encoded.freeze()
         };
         let start_key = encode_scan_key(range.start);
@@ -1171,7 +1177,7 @@ impl Db {
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 schema: effective_schema,
-                column_family_id: DEFAULT_COLUMN_FAMILY_ID,
+                column_family_id,
             },
         );
         if let Err(err) = iter.seek(start_key.as_ref()) {
