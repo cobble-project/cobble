@@ -492,6 +492,11 @@ impl MemtableManager {
             .spawn(move || {
                 while let Ok(job) = flush_rx.recv() {
                     if db_lifecycle.ensure_open().is_err() {
+                        // Remove immutable from state so the memtable can be
+                        // fully dropped, triggering the reclaimer → buffer_ready.
+                        if let Some(id) = job.memtable_id {
+                            db_state_clone.remove_immutable(id);
+                        }
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
                         flush_done_clone.notify_all();
@@ -549,6 +554,9 @@ impl MemtableManager {
                                         state.flush_results.push(Err(err));
                                         flush_done_clone.notify_all();
                                         drop(state);
+                                        // Remove immutable from state so the
+                                        // memtable drop triggers the reclaimer.
+                                        db_state_clone.remove_immutable(memtable_id);
                                         drop(keep_memtable_alive);
                                         continue;
                                     }
@@ -567,6 +575,12 @@ impl MemtableManager {
                                 db_lifecycle.mark_error(err.clone());
                                 state.flush_results.push(Err(err));
                                 flush_done_clone.notify_all();
+                                drop(state);
+                                // Remove immutable from state so the
+                                // memtable drop triggers the reclaimer.
+                                if let Some(id) = job.memtable_id {
+                                    db_state_clone.remove_immutable(id);
+                                }
                             }
                         }
                         drop(keep_memtable_alive);
