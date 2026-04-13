@@ -411,6 +411,9 @@ impl MemtableManager {
             Arc::clone(&vlog_store),
             metrics.clone(),
         )?;
+        // Wake up writer wait loops when the DB enters error/closing state.
+        db_lifecycle.register_error_notifier(&buffer_ready);
+        db_lifecycle.register_error_notifier(db_state.changed_condvar());
         Ok(Self {
             state,
             buffer_ready,
@@ -1212,7 +1215,7 @@ impl MemtableManager {
             state = self.flush_done.wait(state).unwrap();
         }
         let mut guard = self.db_state.lock();
-        guard = self.wait_for_write_stall_under_guard(guard);
+        guard = self.wait_for_write_stall_under_guard(guard)?;
         let snapshot_state = self.db_state.load();
         let mut to_flush = None;
         let mut active_memtable_snapshot = None;
@@ -1453,13 +1456,14 @@ impl MemtableManager {
     fn wait_for_write_stall_under_guard<'a>(
         &self,
         mut guard: std::sync::MutexGuard<'a, ()>,
-    ) -> std::sync::MutexGuard<'a, ()> {
+    ) -> Result<std::sync::MutexGuard<'a, ()>> {
         while Self::should_write_stall_with_snapshot(&self.db_state.load(), self.write_stall_limit)
         {
+            self.db_lifecycle.ensure_open()?;
             self.metrics.write_stall_waits_total.increment(1);
             guard = self.db_state.wait_for_change(guard);
         }
-        guard
+        Ok(guard)
     }
 
     fn should_write_stall_with_snapshot(snapshot: &DbState, write_stall_limit: usize) -> bool {

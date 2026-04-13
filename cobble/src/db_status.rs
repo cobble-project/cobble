@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use arc_swap::ArcSwapOption;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 const STATE_INITIALIZING: u8 = 0;
 const STATE_OPEN: u8 = 1;
@@ -60,6 +60,8 @@ pub(crate) enum CloseTransition {
 pub(crate) struct DbLifecycle {
     state: AtomicU8,
     error: ArcSwapOption<Error>,
+    /// Condvars to notify when the lifecycle enters an error/closing state.
+    error_notifiers: Mutex<Vec<Weak<Condvar>>>,
 }
 
 impl DbLifecycle {
@@ -67,6 +69,7 @@ impl DbLifecycle {
         Self {
             state: AtomicU8::new(STATE_INITIALIZING),
             error: ArcSwapOption::empty(),
+            error_notifiers: Mutex::new(Vec::new()),
         }
     }
 
@@ -74,6 +77,7 @@ impl DbLifecycle {
         Self {
             state: AtomicU8::new(STATE_OPEN),
             error: ArcSwapOption::empty(),
+            error_notifiers: Mutex::new(Vec::new()),
         }
     }
 
@@ -127,6 +131,7 @@ impl DbLifecycle {
                         )
                         .is_ok()
                     {
+                        self.notify_error_watchers();
                         return Ok(CloseTransition::Transitioned);
                     }
                 }
@@ -148,6 +153,22 @@ impl DbLifecycle {
     pub(crate) fn mark_error(&self, err: Error) {
         self.error.store(Some(Arc::new(err)));
         self.state.store(STATE_ERROR, Ordering::Release);
+        self.notify_error_watchers();
+    }
+
+    /// Registers a condvar to be notified when the lifecycle enters error or closing state.
+    pub(crate) fn register_error_notifier(&self, condvar: &Arc<Condvar>) {
+        let mut notifiers = self.error_notifiers.lock().unwrap();
+        notifiers.push(Arc::downgrade(condvar));
+    }
+
+    fn notify_error_watchers(&self) {
+        let notifiers = self.error_notifiers.lock().unwrap();
+        for notifier in notifiers.iter() {
+            if let Some(cv) = notifier.upgrade() {
+                cv.notify_all();
+            }
+        }
     }
 
     pub(crate) fn error(&self) -> Option<Error> {
