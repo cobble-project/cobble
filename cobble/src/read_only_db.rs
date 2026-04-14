@@ -8,7 +8,7 @@ use crate::file::FileManager;
 use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
-use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaManager};
+use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::{
     build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
     build_vlog_version_from_manifest, load_manifest_for_snapshot,
@@ -300,7 +300,7 @@ impl ReadOnlyDb {
                     .read_pointer(&snapshot.vlog_version, pointer)
             },
             &schema,
-            DEFAULT_COLUMN_FAMILY_ID,
+            column_family_id,
             Some(self.ttl_provider.time_provider()),
         )
     }
