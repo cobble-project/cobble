@@ -15,20 +15,20 @@ This repository is a Rust + Cargo project implementing an LSM-style KV storage e
   - `cobble-cli`: Command-line interface for interacting with the database.
 
 ## How to Test
-- Run all tests: `cargo test`
-- Run a subset: `cargo test <pattern>` (e.g., `cargo test row_codec`)
+- Run all workspace tests: `cargo test --workspace`
+- Run a fast subset on the main crate: `cargo test <pattern>` (e.g., `cargo test row_codec`)
   Notes:
 - Some tests write temporary files under `/tmp` and may use serial execution attributes. Remove stale `/tmp` test artifacts if tests intermittently fail.
 
 ## How to Lint & Format
 - Format: `cargo fmt`
-- Lint (treat warnings as errors): `cargo clippy -- -D warnings`
+- Lint the workspace (treat warnings as errors): `cargo clippy --workspace -- -D warnings`
 - Optional auto-fix for some lints: `cargo clippy --fix --allow-dirty --allow-staged`
 
 Before opening a PR, ensure:
 - `cargo fmt` produces no diffs
-- `cargo clippy -- -D warnings` passes
-- `cargo test` passes locally
+- `cargo clippy --workspace -- -D warnings` passes
+- `cargo test --workspace` passes locally
 
 ## PR Title Format
 Use this exact format for PR titles:

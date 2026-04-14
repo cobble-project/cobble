@@ -240,8 +240,9 @@ https://cobble-project.github.io/cobble/latest/getting-started/structured-db/
 ### Build / test
 
 - Format: `cargo fmt --all`
-- Lint: `cargo clippy -- -D warnings`
-- Test: `cargo test`
+- Lint (workspace): `cargo clippy --workspace -- -D warnings`
+- Test (workspace): `cargo test --workspace`
+- Fast inner-loop test on the main crate: `cargo test <pattern>`
 
 ## Contributing
 

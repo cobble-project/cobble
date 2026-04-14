@@ -33,7 +33,7 @@ Format:
 - `cargo fmt`
 
 Lint (treat warnings as errors):
-- `cargo clippy -- -D warnings`
+- `cargo clippy --workspace -- -D warnings`
 
 Fix lint issues automatically (where possible):
 - `cargo clippy --fix --allow-dirty --allow-staged`
@@ -42,7 +42,7 @@ Fix lint issues automatically (where possible):
 
 ### 2\.1 Run all tests
 
-- `cargo test`
+- `cargo test --workspace`
 
 ### 2\.2 Run a subset of tests
 

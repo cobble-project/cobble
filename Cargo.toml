@@ -9,6 +9,7 @@ members = [
     "cobble-data-structure",
     "cobble-web-monitor",
 ]
+default-members = ["cobble"]
 
 [workspace.package]
 version = "0.2.0"
