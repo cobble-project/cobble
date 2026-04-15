@@ -1058,7 +1058,7 @@ impl LSMTree {
             iterators.push(Box::new(run_iter));
         }
         let effective_schema = if let Some(columns) = selected_columns.as_deref() {
-            target_schema.project(columns)
+            target_schema.project_in_family(column_family_id, columns)
         } else {
             target_schema
         };

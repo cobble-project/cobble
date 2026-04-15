@@ -1180,9 +1180,6 @@ impl Db {
         };
         let start_key = encode_scan_key(range.start);
         let end_bound = Some((encode_scan_key(range.end), false));
-        let iter_num_columns = options
-            .columns()
-            .map_or(num_columns, |columns| columns.len());
         let mut iter = DbIterator::new(
             memtable_iters,
             lsm_iters,
@@ -1193,7 +1190,6 @@ impl Db {
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 schema: effective_schema,
-                num_columns: iter_num_columns,
                 column_family_id,
             },
         );

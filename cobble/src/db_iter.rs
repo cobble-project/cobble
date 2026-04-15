@@ -23,7 +23,6 @@ pub(crate) struct DbIteratorOptions<'a> {
     /// When column projection is active, this is a projected schema
     /// with remapped operators matching the selected column indices.
     pub(crate) schema: Arc<Schema>,
-    pub(crate) num_columns: usize,
     pub(crate) column_family_id: u8,
 }
 
@@ -46,7 +45,9 @@ impl<'a> DbIterator<'a> {
         options: DbIteratorOptions<'a>,
     ) -> Self {
         let schema = options.schema;
-        let num_columns = options.num_columns;
+        let num_columns = schema
+            .num_columns_in_family(options.column_family_id)
+            .unwrap_or_else(|| schema.num_columns());
         memtable_iters.append(&mut lsm_iters);
         let inner = DeduplicatingIterator::new(
             MergingIterator::new(memtable_iters),
@@ -129,5 +130,72 @@ impl Iterator for DbIterator<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_row().transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db_state::MultiLSMTreeVersion;
+    use crate::file::{FileManager, FileSystemRegistry};
+    use crate::lsm::LSMTreeVersion;
+    use crate::metrics_manager::MetricsManager;
+    use crate::schema::SchemaManager;
+    use serial_test::serial;
+    use std::collections::VecDeque;
+
+    #[test]
+    #[serial(file)]
+    fn test_db_iterator_uses_projected_family_schema_width() {
+        let root = "/tmp/db_iterator_projected_family_schema_width";
+        let _ = std::fs::remove_dir_all(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .expect("register file fs");
+        let metrics_manager = Arc::new(MetricsManager::new("db-iterator-test"));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager))
+                .expect("file manager"),
+        );
+        let vlog_store = Arc::new(VlogStore::new(file_manager, 4096, usize::MAX));
+
+        let schema_manager = Arc::new(SchemaManager::new(2));
+        let mut builder = schema_manager.builder();
+        builder
+            .add_column(0, None, None, Some("metrics".to_string()))
+            .unwrap();
+        builder
+            .add_column(1, None, None, Some("metrics".to_string()))
+            .unwrap();
+        let schema = builder.commit();
+        let projected_schema = schema.project_in_family(1, &[1]);
+
+        let snapshot = Arc::new(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: Vec::new() }),
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+
+        let iter = DbIterator::new(
+            Vec::new(),
+            Vec::new(),
+            DbIteratorOptions {
+                end_bound: None,
+                snapshot,
+                memtable_manager: None,
+                vlog_store,
+                ttl_provider: Arc::new(TTLProvider::disabled()),
+                schema: projected_schema,
+                column_family_id: 1,
+            },
+        );
+
+        assert_eq!(iter.num_columns, 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

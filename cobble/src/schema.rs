@@ -393,7 +393,7 @@ impl Schema {
 
     pub(crate) fn num_columns_in_family(&self, column_family_id: u8) -> Option<usize> {
         self.column_family_by_id(column_family_id)
-            .map(ColumnFamily::num_columns)
+            .map(ColumnFamily::visible_num_columns)
     }
 
     pub(crate) fn column_family_id_list(&self) -> Vec<u8> {
@@ -424,16 +424,24 @@ impl Schema {
     /// to the original schema, so merge semantics remain correct after
     /// `ColumnMaskingIterator` re-indexes columns.
     pub(crate) fn project(&self, selected_columns: &[usize]) -> Arc<Schema> {
+        self.project_in_family(DEFAULT_COLUMN_FAMILY_ID, selected_columns)
+    }
+
+    pub(crate) fn project_in_family(
+        &self,
+        column_family_id: u8,
+        selected_columns: &[usize],
+    ) -> Arc<Schema> {
         let mut column_families = self.column_families.as_ref().clone();
         for family in &mut column_families {
             family.evolution = BuiltinSchemaEvolution::Noop;
             family.projection = None;
         }
-        if let Some(default_family) = column_families
+        if let Some(projected_family) = column_families
             .iter_mut()
-            .find(|family| family.id == DEFAULT_COLUMN_FAMILY_ID)
+            .find(|family| family.id == column_family_id)
         {
-            default_family.projection = Some(selected_columns.to_vec());
+            projected_family.projection = Some(selected_columns.to_vec());
         }
         Arc::new(Schema {
             version: self.version,
