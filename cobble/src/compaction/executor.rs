@@ -16,7 +16,7 @@ use crate::iterator::{
     SchemaEvolvingIterator, SortedRun, VlogSeqOffsetIterator,
 };
 use crate::lsm::{LevelEdit, VersionEdit};
-use crate::schema::SchemaManager;
+use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, SchemaManager};
 use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions};
 use crate::vlog::{VlogEdit, VlogMergeCollector};
 use log::trace;
@@ -46,6 +46,8 @@ pub struct CompactionTask {
     /// This is used for remote compaction workers where we want to write files.
     output_files_readonly: bool,
     schema_manager: Arc<SchemaManager>,
+    column_family_id: u8,
+    num_columns: usize,
 }
 
 #[derive(Clone)]
@@ -85,6 +87,7 @@ impl CompactionTask {
         ttl_provider: Arc<crate::ttl::TTLProvider>,
         schema_manager: Arc<SchemaManager>,
     ) -> Self {
+        let default_num_columns = schema_manager.current_num_columns();
         Self {
             lsm_tree_idx,
             metrics,
@@ -97,11 +100,19 @@ impl CompactionTask {
             ttl_provider,
             output_files_readonly: false,
             schema_manager,
+            column_family_id: DEFAULT_COLUMN_FAMILY_ID,
+            num_columns: default_num_columns,
         }
     }
 
     pub fn with_readonly_outputs(mut self) -> Self {
         self.output_files_readonly = true;
+        self
+    }
+
+    pub(crate) fn with_column_family(mut self, column_family_id: u8, num_columns: usize) -> Self {
+        self.column_family_id = column_family_id;
+        self.num_columns = num_columns;
         self
     }
 
@@ -306,7 +317,8 @@ impl CompactionExecutor {
         let use_read_ahead =
             options.read_ahead_enabled && tokio::runtime::Handle::try_current().is_ok();
         let target_schema = task.schema_manager.latest_schema();
-        let num_columns = target_schema.num_columns();
+        let num_columns = task.num_columns;
+        let column_family_id = task.column_family_id;
         for run in &task.sorted_runs {
             for file in run.files() {
                 read_bytes = read_bytes.saturating_add(file.size as u64);
@@ -317,6 +329,9 @@ impl CompactionExecutor {
             let target_schema = Arc::clone(&target_schema);
             let run_iter = run.iter(move |file| {
                 let source_schema = schema_manager.schema(file.schema_id)?;
+                let source_num_columns = source_schema
+                    .num_columns_in_family(column_family_id)
+                    .unwrap_or(num_columns);
                 let reader = file_manager.open_data_file_reader(file.file_id)?;
                 let reader: Box<dyn crate::file::RandomAccessFile> = if use_read_ahead {
                     Box::new(ReadAheadBufferedReader::new(
@@ -330,7 +345,7 @@ impl CompactionExecutor {
                     DataFileType::SSTable => {
                         let sst_options = SSTIteratorOptions {
                             metrics: Some(Arc::clone(&sst_metrics)),
-                            num_columns: source_schema.num_columns(),
+                            num_columns: source_num_columns,
                             bloom_filter_enabled: options.bloom_filter_enabled,
                             ..SSTIteratorOptions::default()
                         };
@@ -378,7 +393,7 @@ impl CompactionExecutor {
                 } else {
                     Ok(Box::new(VlogSeqOffsetIterator::new(
                         iter,
-                        target_schema.num_columns(),
+                        num_columns,
                         file.vlog_file_seq_offset,
                     )))
                 }

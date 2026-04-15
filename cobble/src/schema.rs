@@ -310,6 +310,28 @@ impl Schema {
         )
     }
 
+    pub(crate) fn new_for_column_family(
+        version: u64,
+        column_family_id: u8,
+        operators: Vec<Arc<dyn MergeOperator>>,
+        column_metadata: Vec<Option<JsonValue>>,
+    ) -> Self {
+        let family_name = if column_family_id == DEFAULT_COLUMN_FAMILY_ID {
+            DEFAULT_COLUMN_FAMILY_NAME.to_string()
+        } else {
+            format!("remote-cf-{}", column_family_id)
+        };
+        Self::new_with_column_families(
+            version,
+            vec![ColumnFamily::new(
+                column_family_id,
+                family_name,
+                operators,
+                column_metadata,
+            )],
+        )
+    }
+
     fn new_with_column_families(version: u64, mut column_families: Vec<ColumnFamily>) -> Self {
         if column_families.is_empty() {
             column_families = default_column_families(0);
@@ -456,6 +478,13 @@ impl Schema {
             .collect()
     }
 
+    pub(crate) fn operator_ids_for_column_family_id(&self, column_family_id: u8) -> Vec<String> {
+        let num_columns = self.num_columns_in_family(column_family_id).unwrap_or(0);
+        (0..num_columns)
+            .map(|column_idx| self.operator_in_family(column_family_id, column_idx).id())
+            .collect()
+    }
+
     /// Return the merge operator id strings for all columns.
     pub fn all_operator_ids(&self) -> Vec<String> {
         self.operator_ids(self.num_columns())
@@ -464,10 +493,7 @@ impl Schema {
     /// Return the merge operator id strings for all columns in one column family.
     pub fn operator_ids_in_family(&self, column_family: &str) -> Result<Vec<String>> {
         let column_family_id = self.resolve_column_family_id(Some(column_family))?;
-        let num_columns = self.num_columns_in_family(column_family_id).unwrap_or(0);
-        Ok((0..num_columns)
-            .map(|column_idx| self.operator_in_family(column_family_id, column_idx).id())
-            .collect())
+        Ok(self.operator_ids_for_column_family_id(column_family_id))
     }
 
     pub(crate) fn empty() -> Arc<Self> {
@@ -485,6 +511,24 @@ impl Schema {
             Some(family) => family,
             None => return Cow::Owned(Vec::new()),
         };
+        self.column_metadata_for_family(family)
+    }
+
+    pub(crate) fn column_metadata_for_column_family_id(
+        &self,
+        column_family_id: u8,
+    ) -> Cow<'_, [Option<JsonValue>]> {
+        let family = match self.column_family_by_id(column_family_id) {
+            Some(family) => family,
+            None => return Cow::Owned(Vec::new()),
+        };
+        self.column_metadata_for_family(family)
+    }
+
+    fn column_metadata_for_family<'a>(
+        &self,
+        family: &'a ColumnFamily,
+    ) -> Cow<'a, [Option<JsonValue>]> {
         match &family.projection {
             None => Cow::Borrowed(family.column_metadata.as_slice()),
             Some(projection) => Cow::Owned(

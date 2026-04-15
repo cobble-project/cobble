@@ -688,6 +688,13 @@ impl LSMTree {
         Arc::clone(&self.ttl_provider)
     }
 
+    pub(crate) fn tree_scope_of_tree(&self, tree_idx: usize) -> Option<LSMTreeScope> {
+        self.db_state
+            .load()
+            .multi_lsm_version
+            .tree_scope_of_tree(tree_idx)
+    }
+
     /// Evaluate whether a compaction task should be scheduled for a tree.
     ///
     /// Compaction trigger: checks the target tree's version for L0 overflow

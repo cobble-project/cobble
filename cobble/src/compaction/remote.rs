@@ -388,6 +388,7 @@ struct RemoteCompactionRequest {
     request_id: Option<u64>,
     db_id: String,
     lsm_tree_idx: usize,
+    column_family_id: u8,
     output_level: u8,
     writer_options: RemoteWriterOptions,
     ttl_config: RemoteTtlConfig,
@@ -408,12 +409,13 @@ impl fmt::Display for RemoteCompactionRequest {
         let file_count: usize = self.runs.iter().map(|run| run.files.len()).sum();
         write!(
             f,
-            "id={} db_id={} tree_idx={} output_level={} data_file_type={} runs={} files={}",
+            "id={} db_id={} tree_idx={} cf_id={} output_level={} data_file_type={} runs={} files={}",
             self.request_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "unassigned".to_string()),
             self.db_id,
             self.lsm_tree_idx,
+            self.column_family_id,
             self.output_level,
             self.writer_options.data_file_type(),
             self.runs.len(),
@@ -551,23 +553,38 @@ impl RemoteCompactionWorker {
         data_file_type: DataFileType,
         ttl_provider: Arc<TTLProvider>,
     ) -> Result<RemoteCompactionRequest> {
+        let lsm_tree = self.lsm_tree.upgrade().ok_or_else(|| {
+            Error::IoError("lsm tree dropped during remote compaction".to_string())
+        })?;
+        let tree_scope = lsm_tree.tree_scope_of_tree(lsm_tree_idx).ok_or_else(|| {
+            Error::InvalidState(format!(
+                "missing tree scope for remote compaction tree {}",
+                lsm_tree_idx
+            ))
+        })?;
         let runs = sorted_runs
             .iter()
             .map(|run| RemoteSortedRun::from_sorted_run(run, &self.file_manager))
             .collect::<Result<Vec<_>>>()?;
         let schema = self.schema_manager.latest_schema();
+        let num_columns = schema
+            .num_columns_in_family(tree_scope.column_family_id)
+            .unwrap_or_else(|| schema.num_columns());
         let mut writer_options =
             super::build_writer_options(&self.config, output_level, data_file_type)?;
         match &mut writer_options {
             WriterOptions::Sst(sst_options) => {
-                sst_options.num_columns = schema.num_columns();
+                sst_options.num_columns = num_columns;
             }
             WriterOptions::Parquet(parquet_options) => {
-                parquet_options.num_columns = schema.num_columns();
+                parquet_options.num_columns = num_columns;
             }
         }
-        let merge_operator_ids = schema.operator_ids(schema.num_columns());
-        let merge_operator_metadata = schema.column_metadata().to_vec();
+        let merge_operator_ids =
+            schema.operator_ids_for_column_family_id(tree_scope.column_family_id);
+        let merge_operator_metadata = schema
+            .column_metadata_for_column_family_id(tree_scope.column_family_id)
+            .to_vec();
         for merge_operator_id in &merge_operator_ids {
             if !self
                 .supported_merge_operator_ids
@@ -585,11 +602,9 @@ impl RemoteCompactionWorker {
             request_id: None,
             db_id: self.metrics_manager.db_id().to_string(),
             lsm_tree_idx,
+            column_family_id: tree_scope.column_family_id,
             output_level,
-            writer_options: RemoteWriterOptions::from_writer_options(
-                &writer_options,
-                schema.num_columns(),
-            ),
+            writer_options: RemoteWriterOptions::from_writer_options(&writer_options, num_columns),
             ttl_config: RemoteTtlConfig {
                 enabled: self.ttl_config.enabled,
                 default_ttl_seconds: self.ttl_config.default_ttl_seconds,
@@ -958,7 +973,12 @@ impl RemoteCompactionServer {
             num_columns,
         )?;
         let schema_manager = Arc::new(SchemaManager::from_schemas(
-            vec![merge_operators.as_ref().clone()],
+            vec![Schema::new_for_column_family(
+                0,
+                request.column_family_id,
+                merge_operators,
+                request.merge_operator_metadata.clone(),
+            )],
             num_columns,
         ));
         let task = CompactionTask::new(
@@ -973,6 +993,7 @@ impl RemoteCompactionServer {
             ttl_provider,
             schema_manager,
         )
+        .with_column_family(request.column_family_id, num_columns)
         .with_readonly_outputs();
         let result = executor.execute_blocking(task, None);
         if let Err(e) = &result {
@@ -997,7 +1018,7 @@ impl RemoteCompactionServer {
         request_ids: &[String],
         request_metadata: &[Option<serde_json::Value>],
         num_columns: usize,
-    ) -> Result<Arc<Schema>> {
+    ) -> Result<Vec<Arc<dyn MergeOperator>>> {
         let ids: Vec<String> = if request_ids.is_empty() {
             vec![default_merge_operator().id(); num_columns]
         } else if request_ids.len() >= num_columns {
@@ -1025,7 +1046,7 @@ impl RemoteCompactionServer {
             // Final fallback: merge_operator_by_id (built-in operators)
             operators.push(merge_operator_by_id(id, metadata, None)?);
         }
-        Ok(Arc::new(Schema::new(0, num_columns, operators)))
+        Ok(operators)
     }
 
     fn file_manager_for_with(
@@ -1160,7 +1181,7 @@ mod tests {
     use super::*;
     use crate::VolumeDescriptor;
     use crate::compaction::{build_sst_writer_options, make_data_file_builder_factory};
-    use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
+    use crate::db_state::{DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion};
     use crate::lsm::{LSMTree, LSMTreeVersion, Level};
     use crate::parquet::ParquetIterator;
     use crate::sst::row_codec::{decode_value, encode_key, encode_value};
@@ -1182,6 +1203,15 @@ mod tests {
 
     fn make_test_key(raw_key: &[u8]) -> Vec<u8> {
         encode_key(&Key::new(0, raw_key.to_vec())).to_vec()
+    }
+
+    fn make_test_key_in_family(column_family_id: u8, raw_key: &[u8]) -> Vec<u8> {
+        encode_key(&Key::new_with_column_family(
+            0,
+            column_family_id,
+            raw_key.to_vec(),
+        ))
+        .to_vec()
     }
 
     fn create_test_sst(
@@ -1382,15 +1412,17 @@ mod tests {
 
     #[test]
     #[serial(file)]
-    fn test_remote_compaction_with_u64_counter_merge_operator() {
+    fn test_remote_compaction_with_u64_counter_merge_operator_in_non_default_family() {
         let root = "/tmp/remote_compaction_u64_counter";
         cleanup_test_root(root);
+        let column_family_id = 1;
+        let num_columns = 1;
         let config = Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             base_file_size: Size::from_const(128),
             sst_bloom_filter_enabled: true,
             compaction_threads: 2,
-            num_columns: 1,
+            num_columns: 2,
             ..Config::default()
         };
         let db_id = "remote-compaction-u64-counter".to_string();
@@ -1400,12 +1432,27 @@ mod tests {
         );
         let mut sst_options = build_sst_writer_options(&config, 0);
         sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
-        let num_columns = sst_options.num_columns;
+        sst_options.num_columns = num_columns;
+
+        let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
+        let mut schema_builder = schema_manager.builder();
+        schema_builder
+            .add_column(0, None, None, Some("metrics".to_string()))
+            .unwrap();
+        schema_builder
+            .set_column_operator(
+                Some("metrics".to_string()),
+                0,
+                Arc::new(U64CounterMergeOperator),
+            )
+            .unwrap();
+        let _ = schema_builder.commit();
 
         let mut expected = HashMap::new();
         let entries_old = (0..20u64)
             .map(|idx| {
-                let key = make_test_key(format!("k{:03}", idx).as_bytes());
+                let key =
+                    make_test_key_in_family(column_family_id, format!("k{:03}", idx).as_bytes());
                 let base = idx + 1;
                 let delta = 10u64;
                 expected.insert(key.clone(), base + delta);
@@ -1417,7 +1464,8 @@ mod tests {
             .collect::<Vec<_>>();
         let entries_new = (0..20u64)
             .map(|idx| {
-                let key = make_test_key(format!("k{:03}", idx).as_bytes());
+                let key =
+                    make_test_key_in_family(column_family_id, format!("k{:03}", idx).as_bytes());
                 let delta = 10u64;
                 (
                     key,
@@ -1447,7 +1495,12 @@ mod tests {
         db_state.store(DbState {
             seq_id: 0,
             bucket_ranges: Vec::new(),
-            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
+            multi_lsm_version: MultiLSMTreeVersion::from_scopes_with_tree_versions(
+                1,
+                &[LSMTreeScope::new(0u16..=0u16, column_family_id)],
+                vec![Arc::new(lsm_version)],
+            )
+            .unwrap(),
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
@@ -1472,13 +1525,6 @@ mod tests {
                 }
             })
         };
-
-        let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
-        let mut schema_builder = schema_manager.builder();
-        schema_builder
-            .set_column_operator(None, 0, Arc::new(U64CounterMergeOperator))
-            .unwrap();
-        let _ = schema_builder.commit();
 
         let worker = RemoteCompactionWorker::new(
             addr.to_string(),
