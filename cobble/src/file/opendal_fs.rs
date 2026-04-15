@@ -2,14 +2,13 @@ use crate::error::{Error, Result};
 use crate::file::file_system::FileSystem;
 use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::file::opendal_file::{OpendalRandomAccessFile, OpendalSequentialWriteFile};
-use opendal::layers::RetryLayer;
-use opendal::{ErrorKind, Operator, Scheme};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
+use ::opendal::layers::RetryLayer;
+use ::opendal::{Entry, ErrorKind, Metadata, Operator, Scheme};
 
 pub struct OpendalFileSystem {
     pub(crate) op: Operator,
@@ -109,10 +108,11 @@ impl FileSystem for OpendalFileSystem {
         access_key: Option<String>,
         custom_options: Option<HashMap<String, String>>,
     ) -> Result<Self> {
-        let scheme = Scheme::from_str(match url.scheme().to_lowercase().as_str() {
+        let scheme = match url.scheme().to_lowercase().as_str() {
             "file" => "fs",
             other => other,
-        })
+        }
+        .parse::<Scheme>()
         .map_err(|e| {
             Error::FileSystemError(format!(
                 "Unsupported scheme '{}': {}. Enable the matching cobble storage feature (for example: storage-s3, storage-oss, storage-cos, storage-alluxio).",
@@ -212,19 +212,28 @@ impl FileSystem for OpendalFileSystem {
             &format!("{}/", path)
         };
         self.runtime
-            .block_on(async { self.op.create_dir(path).await })
+            .block_on(async {
+                let result: opendal::Result<()> = self.op.create_dir(path).await;
+                result
+            })
             .map_err(|e| Error::IoError(format!("Failed to create directory {}: {}", path, e)))
     }
 
     fn exists(&self, path: &str) -> Result<bool> {
         self.runtime
-            .block_on(async { self.op.exists(path).await })
+            .block_on(async {
+                let result: opendal::Result<bool> = self.op.exists(path).await;
+                result
+            })
             .map_err(|e| Error::IoError(format!("Failed to create directory {}: {}", path, e)))
     }
 
     fn delete(&self, path: &str) -> Result<()> {
         self.runtime
-            .block_on(async { self.op.delete(path).await })
+            .block_on(async {
+                let result: opendal::Result<()> = self.op.delete(path).await;
+                result
+            })
             .map_err(|e| Error::IoError(format!("Failed to create directory {}: {}", path, e)))
     }
 
@@ -239,27 +248,33 @@ impl FileSystem for OpendalFileSystem {
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.runtime.block_on(async {
-            match self.op.rename(from, to).await {
+            let rename_result: opendal::Result<()> = self.op.rename(from, to).await;
+            match rename_result {
                 Ok(()) => Ok(()),
-                Err(rename_err) if rename_err.kind() == ErrorKind::Unsupported => {
-                    self.op.copy(from, to).await.map_err(|copy_err| {
-                        Error::IoError(format!(
-                            "Failed to copy {} to {} during rename fallback: {}",
-                            from, to, copy_err
-                        ))
-                    })?;
-                    self.op.delete(from).await.map_err(|delete_err| {
-                        Error::IoError(format!(
-                            "Failed to delete {} after rename fallback copy to {}: {}",
-                            from, to, delete_err
-                        ))
-                    })?;
-                    Ok(())
+                Err(rename_err) => {
+                    if rename_err.kind() == ErrorKind::Unsupported {
+                        let copy_result: opendal::Result<()> = self.op.copy(from, to).await;
+                        copy_result.map_err(|copy_err| {
+                            Error::IoError(format!(
+                                "Failed to copy {} to {} during rename fallback: {}",
+                                from, to, copy_err
+                            ))
+                        })?;
+                        let delete_result: opendal::Result<()> = self.op.delete(from).await;
+                        delete_result.map_err(|delete_err| {
+                            Error::IoError(format!(
+                                "Failed to delete {} after rename fallback copy to {}: {}",
+                                from, to, delete_err
+                            ))
+                        })?;
+                        Ok(())
+                    } else {
+                        Err(Error::IoError(format!(
+                            "Failed to rename {} to {}: {}",
+                            from, to, rename_err
+                        )))
+                    }
                 }
-                Err(rename_err) => Err(Error::IoError(format!(
-                    "Failed to rename {} to {}: {}",
-                    from, to, rename_err
-                ))),
             }
         })
     }
@@ -272,11 +287,14 @@ impl FileSystem for OpendalFileSystem {
         };
         let entries = self
             .runtime
-            .block_on(async { self.op.list(&path).await })
+            .block_on(async {
+                let result: opendal::Result<Vec<Entry>> = self.op.list(&path).await;
+                result
+            })
             .map_err(|e| Error::IoError(format!("Failed to list {}: {}", path, e)))?;
         Ok(entries
             .into_iter()
-            .filter_map(|entry| {
+            .filter_map(|entry: Entry| {
                 let name = entry.name().trim_end_matches('/');
                 (!name.is_empty()).then(|| name.to_string())
             })
@@ -286,7 +304,8 @@ impl FileSystem for OpendalFileSystem {
     fn open_read(&self, path: &str) -> Result<Box<dyn RandomAccessFile>> {
         self.runtime.block_on(async {
             // Get file metadata to retrieve size
-            let metadata = self.op.stat(path).await.map_err(|e| {
+            let metadata_result: opendal::Result<Metadata> = self.op.stat(path).await;
+            let metadata = metadata_result.map_err(|e| {
                 Error::IoError(format!("Failed to get metadata for {}: {}", path, e))
             })?;
 
@@ -326,8 +345,11 @@ impl FileSystem for OpendalFileSystem {
 
     fn last_modified(&self, path: &str) -> Result<Option<u64>> {
         self.runtime
-            .block_on(async { self.op.stat(path).await })
-            .map(|meta| meta.last_modified().map(|ts| ts.timestamp() as u64))
+            .block_on(async {
+                let result: opendal::Result<Metadata> = self.op.stat(path).await;
+                result
+            })
+            .map(|meta: Metadata| meta.last_modified().map(|ts| ts.into_inner().as_second() as u64))
             .map_err(|e| Error::IoError(format!("Failed to stat {}: {}", path, e)))
     }
 }

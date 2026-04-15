@@ -39,7 +39,7 @@ foyer = "0.22.3"
 log = { workspace = true, features = ["serde"] }
 log4rs = "1.3.0"
 metrics = "0.22.3"
-opendal = { version = "0.54.0", default-features = false, features = ["services-fs"] }
+opendal = { version = "0.55.0", default-features = false, features = ["services-fs"] }
 rand = "0.8.5"
 serial_test = { workspace = true }
 thiserror = { workspace = true }

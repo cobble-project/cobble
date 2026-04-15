@@ -58,12 +58,11 @@ fn take_global_checkpoint_with_retry(
     while Instant::now() <= deadline {
         match coordinator.take_global_checkpoint(total_buckets, request_timeout) {
             Ok(snapshot_id) => {
-                if let Ok(Some(manifest)) = coordinator.load_current_global_snapshot() {
-                    if manifest.id == snapshot_id
-                        && manifest.shard_snapshots.len() == expected_shards
-                    {
-                        return snapshot_id;
-                    }
+                if let Ok(Some(manifest)) = coordinator.load_current_global_snapshot()
+                    && manifest.id == snapshot_id
+                    && manifest.shard_snapshots.len() == expected_shards
+                {
+                    return snapshot_id;
                 }
                 thread::sleep(Duration::from_millis(25));
             }
