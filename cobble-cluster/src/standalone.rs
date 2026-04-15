@@ -19,7 +19,6 @@ use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -432,7 +431,7 @@ impl StandaloneCoordinator {
             if self.connected_shard_count() >= expected {
                 return Ok(());
             }
-            thread::sleep(ACCEPT_POLL_DELAY);
+            std::thread::sleep(ACCEPT_POLL_DELAY);
         }
         Err(Error::IoError(format!(
             "timeout waiting for {} connected shards, got {}",
@@ -1066,26 +1065,14 @@ async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
 }
 
 fn take_shard_checkpoint_for_db(db: &Db) -> Result<StandaloneShardSnapshot> {
-    let snapshot_id = db.snapshot()?;
-    let mut last_error = None;
-    for attempt in 0..=50 {
-        match db.shard_snapshot_input(snapshot_id) {
-            Ok(input) => return Ok(input.into()),
-            Err(err) => {
-                if attempt == 50 {
-                    return Err(err);
-                }
-                if !matches!(err, Error::IoError(ref msg) if msg.contains("Snapshot manifest not tracked"))
-                {
-                    return Err(err);
-                }
-                last_error = Some(err);
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-    Err(last_error
-        .unwrap_or_else(|| Error::IoError("failed to materialize shard checkpoint".to_string())))
+    let (tx, rx) = std::sync::mpsc::channel();
+    db.snapshot_with_callback(move |result| {
+        let _ = tx.send(result);
+    })?;
+    let shard_input = rx
+        .recv_timeout(Duration::from_secs(180))
+        .map_err(|_| Error::IoError("shard checkpoint snapshot callback timed out".to_string()))??;
+    Ok(shard_input.into())
 }
 
 async fn connect_with_retry_async(addr: &str, retries: usize) -> Result<TcpStream> {
