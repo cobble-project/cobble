@@ -32,8 +32,9 @@ type MergeCallback = Box<dyn FnMut(Option<&Column>, Option<&Column>)>;
 pub struct DeduplicatingIterator<I> {
     /// The underlying iterator (typically a MergingIterator).
     inner: I,
-    /// Number of columns in the value schema.
-    num_columns: usize,
+    /// When present, callers already know the exact column width (for example projected read
+    /// chains and compaction). When absent, we derive it from the key's column family.
+    num_columns: Option<usize>,
     /// Current merged key (if valid).
     current_key: Option<Bytes>,
     /// Current merged value (if valid).
@@ -82,10 +83,10 @@ impl<I> DeduplicatingIterator<I> {
     ///
     /// # Arguments
     /// * `inner` - The underlying iterator to wrap.
-    /// * `num_columns` - Number of columns in the value schema.
+    /// * `num_columns` - Known number of columns in the value schema, if the caller already has it.
     pub fn new(
         inner: I,
-        num_columns: usize,
+        num_columns: Option<usize>,
         ttl_provider: Arc<TTLProvider>,
         on_merge: Option<MergeCallback>,
         schema: Arc<Schema>,
@@ -101,6 +102,17 @@ impl<I> DeduplicatingIterator<I> {
             allow_terminal_shortcut,
             schema,
         }
+    }
+
+    fn num_columns_for_key(&self, key: &[u8]) -> usize {
+        if let Some(num_columns) = self.num_columns {
+            return num_columns;
+        }
+        let column_family_id = key_column_family(key).unwrap_or(DEFAULT_COLUMN_FAMILY_ID);
+        self.schema
+            .num_columns_in_family(column_family_id)
+            .filter(|num_columns| *num_columns > 0)
+            .unwrap_or_else(|| self.schema.num_columns())
     }
 
     /// Collects all values with the same key and merges them.
@@ -133,10 +145,11 @@ impl<I> DeduplicatingIterator<I> {
             let mut values: Vec<KvValue> = Vec::new();
             let mut selected_value: Option<KvValue> = None;
             let mut stop_collecting = false;
+            let num_columns = self.num_columns_for_key(current_key.as_ref());
 
             collect_value(
                 first_value,
-                self.num_columns,
+                num_columns,
                 &self.ttl_provider,
                 allow_terminal_shortcut,
                 &mut values,
@@ -161,7 +174,7 @@ impl<I> DeduplicatingIterator<I> {
                 if let Some(next_kv_value) = self.inner.take_value()? {
                     collect_value(
                         next_kv_value,
-                        self.num_columns,
+                        num_columns,
                         &self.ttl_provider,
                         allow_terminal_shortcut,
                         &mut values,
@@ -186,7 +199,7 @@ impl<I> DeduplicatingIterator<I> {
             // The last value in the list is the oldest, the first is the newest
             let mut values_iter = values.into_iter().rev();
             let first = values_iter.next().expect("values is non-empty");
-            let mut merged_value = first.into_decoded(self.num_columns)?;
+            let mut merged_value = first.into_decoded(num_columns)?;
             let column_family_id =
                 key_column_family(current_key.as_ref()).unwrap_or(DEFAULT_COLUMN_FAMILY_ID);
 
@@ -199,7 +212,7 @@ impl<I> DeduplicatingIterator<I> {
                 }
                 // Then for each newer value, we invoke the callback for each column pair (older, newer) before merging.
                 for newer_value in values_iter {
-                    let newer_value = newer_value.into_decoded(self.num_columns)?;
+                    let newer_value = newer_value.into_decoded(num_columns)?;
                     merged_value = merged_value.merge_with_callback(
                         newer_value,
                         &self.schema,
@@ -210,7 +223,7 @@ impl<I> DeduplicatingIterator<I> {
                 }
             } else {
                 for newer_value in values_iter {
-                    let newer_value = newer_value.into_decoded(self.num_columns)?;
+                    let newer_value = newer_value.into_decoded(num_columns)?;
                     merged_value = merged_value.merge_in_column_family(
                         newer_value,
                         &self.schema,
@@ -325,7 +338,7 @@ mod tests {
         let iter = MockIterator::new(entries);
         let mut dedup = DeduplicatingIterator::new(
             iter,
-            num_columns,
+            Some(num_columns),
             Arc::new(TTLProvider::disabled()),
             None,
             Schema::empty(),
@@ -378,7 +391,7 @@ mod tests {
         let iter = MockIterator::new(entries);
         let mut dedup = DeduplicatingIterator::new(
             iter,
-            num_columns,
+            Some(num_columns),
             Arc::new(TTLProvider::disabled()),
             None,
             Schema::empty(),
@@ -427,7 +440,7 @@ mod tests {
         let overlapped_for_callback = std::rc::Rc::clone(&overlapped);
         let mut dedup = DeduplicatingIterator::new(
             iter,
-            num_columns,
+            Some(num_columns),
             Arc::new(TTLProvider::disabled()),
             Some(Box::new(move |old_column, _new_column| {
                 if let Some(old_column) = old_column {
@@ -468,7 +481,7 @@ mod tests {
         let iter = MockIterator::new(entries);
         let mut dedup = DeduplicatingIterator::new(
             iter,
-            num_columns,
+            Some(num_columns),
             Arc::new(TTLProvider::disabled()),
             None,
             Schema::empty(),
@@ -526,7 +539,7 @@ mod tests {
         let iter = MockIterator::new(entries);
         let mut dedup = DeduplicatingIterator::new(
             iter,
-            num_columns,
+            Some(num_columns),
             Arc::new(TTLProvider::disabled()),
             None,
             Schema::empty(),
@@ -571,7 +584,7 @@ mod tests {
         let iter = MockIterator::new(entries);
         let mut dedup = DeduplicatingIterator::new(
             iter,
-            num_columns,
+            Some(num_columns),
             Arc::new(TTLProvider::disabled()),
             None,
             Schema::empty(),
@@ -594,7 +607,7 @@ mod tests {
         let iter = MockIterator::new(Vec::<(&[u8], &[u8])>::new());
         let mut dedup = DeduplicatingIterator::new(
             iter,
-            1,
+            Some(1),
             Arc::new(TTLProvider::disabled()),
             None,
             Schema::empty(),
@@ -635,7 +648,7 @@ mod tests {
         let iter = MockIterator::new(entries);
         let mut dedup = DeduplicatingIterator::new(
             iter,
-            num_columns,
+            Some(num_columns),
             Arc::new(TTLProvider::disabled()),
             None,
             Schema::empty(),
@@ -673,7 +686,7 @@ mod tests {
         let iter = MockIterator::new(entries);
         let mut dedup = DeduplicatingIterator::new(
             iter,
-            num_columns,
+            Some(num_columns),
             Arc::new(TTLProvider::disabled()),
             None,
             Schema::empty(),
@@ -755,7 +768,7 @@ mod tests {
         let iter = MockIterator::new(entries);
         let mut dedup = DeduplicatingIterator::new(
             iter,
-            num_columns,
+            Some(num_columns),
             ttl_provider.clone(),
             None,
             Schema::empty(),
@@ -832,7 +845,7 @@ mod tests {
         // Wrap with DeduplicatingIterator
         let mut dedup = DeduplicatingIterator::new(
             merging_iter,
-            num_columns,
+            Some(num_columns),
             Arc::new(TTLProvider::disabled()),
             None,
             Schema::empty(),

@@ -23,6 +23,7 @@ pub(crate) struct DbIteratorOptions<'a> {
     /// When column projection is active, this is a projected schema
     /// with remapped operators matching the selected column indices.
     pub(crate) schema: Arc<Schema>,
+    pub(crate) num_columns: usize,
     pub(crate) column_family_id: u8,
 }
 
@@ -45,11 +46,11 @@ impl<'a> DbIterator<'a> {
         options: DbIteratorOptions<'a>,
     ) -> Self {
         let schema = options.schema;
-        let num_columns = schema.num_columns();
+        let num_columns = options.num_columns;
         memtable_iters.append(&mut lsm_iters);
         let inner = DeduplicatingIterator::new(
             MergingIterator::new(memtable_iters),
-            num_columns,
+            Some(num_columns),
             Arc::clone(&options.ttl_provider),
             None,
             schema.clone(),

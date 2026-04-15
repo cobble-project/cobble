@@ -1537,10 +1537,9 @@ fn flush_memtable(
     // Try to handle merges during flush if vlog edits are present
     let merge_collector = vlog_edit.as_ref().map(|_| VlogMergeCollector::shared(true));
     let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
-    let num_columns = schema.num_columns();
     let mut dedup_iter = DeduplicatingIterator::new(
         PrimedIterator::new(memtable.iter()),
-        num_columns,
+        None,
         ttl_provider,
         merge_callback,
         Arc::clone(&schema),

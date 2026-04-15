@@ -400,7 +400,7 @@ impl CompactionExecutor {
         // Create deduplicating iterator
         let mut dedup_iter = DeduplicatingIterator::new(
             merging_iter,
-            num_columns,
+            Some(num_columns),
             task.ttl_provider(),
             merge_callback,
             Arc::clone(&target_schema),

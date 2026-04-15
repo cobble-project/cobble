@@ -357,6 +357,9 @@ impl ReadOnlyDb {
         };
         let start_key = encode_scan_key(start.unwrap_or(&[]));
         let end_bound = end.map(|key| (encode_scan_key(key), false));
+        let iter_num_columns = options
+            .columns()
+            .map_or(num_columns, |columns| columns.len());
         let mut iter: DbIterator<'static> = DbIterator::new(
             Vec::new(),
             lsm_iters,
@@ -367,6 +370,7 @@ impl ReadOnlyDb {
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 schema: effective_schema,
+                num_columns: iter_num_columns,
                 column_family_id,
             },
         );
