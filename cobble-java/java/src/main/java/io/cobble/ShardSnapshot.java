@@ -6,7 +6,9 @@ import com.google.gson.annotations.SerializedName;
 
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Pure Java shard snapshot payload.
@@ -22,6 +24,10 @@ public final class ShardSnapshot implements Serializable {
     /** Covered bucket ranges for this shard snapshot. */
     @SerializedName("ranges")
     public List<Range> ranges = new ArrayList<Range>();
+
+    /** Normalized column family name -> id mapping for this shard snapshot. */
+    @SerializedName("column_family_ids")
+    public Map<String, Integer> columnFamilyIds = new LinkedHashMap<String, Integer>();
 
     /** Source DB id. */
     @SerializedName("db_id")

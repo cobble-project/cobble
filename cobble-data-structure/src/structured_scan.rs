@@ -251,6 +251,7 @@ mod tests {
         let split = StructuredScanSplit {
             shard: ShardSnapshotRef {
                 ranges: vec![0u16..=3u16],
+                column_family_ids: BTreeMap::from([("default".to_string(), 0)]),
                 db_id: "test-db".to_string(),
                 snapshot_id: 7,
                 manifest_path: "test-db/snapshot/SNAPSHOT-7".to_string(),

@@ -6,7 +6,9 @@ import com.google.gson.annotations.SerializedName;
 
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /** Java object for a global snapshot manifest in coordinator storage. */
 public final class GlobalSnapshot implements Serializable {
@@ -24,6 +26,10 @@ public final class GlobalSnapshot implements Serializable {
     /** All shard snapshots included in this global snapshot. */
     @SerializedName("shard_snapshots")
     public List<ShardSnapshot> shardSnapshots = new ArrayList<ShardSnapshot>();
+
+    /** Global normalized column family name -> id mapping. */
+    @SerializedName("column_family_ids")
+    public Map<String, Integer> columnFamilyIds = new LinkedHashMap<String, Integer>();
 
     /** Watermark: the minimum timestamp (seconds) across all shard snapshots. */
     @SerializedName("watermark_seconds")

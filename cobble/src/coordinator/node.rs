@@ -14,16 +14,18 @@ use crate::util::{build_commit_short_id, build_version_string};
 use dashmap::DashSet;
 use log::info;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) const GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT: u32 = 1;
+pub(crate) const GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT: u32 = 2;
 
 /// Bucket snapshot reference input.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardSnapshotInput {
     pub ranges: Vec<RangeInclusive<u16>>,
+    pub column_family_ids: BTreeMap<String, u8>,
     pub db_id: String,
     pub snapshot_id: u64,
     pub manifest_path: String,
@@ -35,6 +37,7 @@ pub struct ShardSnapshotInput {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShardSnapshotRef {
     pub ranges: Vec<RangeInclusive<u16>>,
+    pub column_family_ids: BTreeMap<String, u8>,
     pub db_id: String,
     pub snapshot_id: u64,
     pub manifest_path: String,
@@ -48,6 +51,7 @@ pub struct GlobalSnapshotManifest {
     pub version: u32,
     pub id: u64,
     pub total_buckets: u32,
+    pub column_family_ids: BTreeMap<String, u8>,
     pub shard_snapshots: Vec<ShardSnapshotRef>,
     /// Watermark: the minimum timestamp (seconds) across all shard snapshots.
     pub watermark_seconds: u32,
@@ -144,6 +148,7 @@ impl DbCoordinator {
                 "bucket snapshots required to build global snapshot".to_string(),
             ));
         }
+        let column_family_ids = merge_column_family_ids(&shard_snapshots)?;
         let mut watermark_seconds = u32::MAX;
         let mut bucket_refs = Vec::with_capacity(shard_snapshots.len());
         for bucket in shard_snapshots {
@@ -156,6 +161,7 @@ impl DbCoordinator {
             watermark_seconds = watermark_seconds.min(bucket.timestamp_seconds);
             bucket_refs.push(ShardSnapshotRef {
                 ranges: bucket.ranges,
+                column_family_ids: bucket.column_family_ids,
                 db_id: bucket.db_id,
                 snapshot_id: bucket.snapshot_id,
                 manifest_path: bucket.manifest_path,
@@ -166,6 +172,7 @@ impl DbCoordinator {
             version: GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT,
             id,
             total_buckets,
+            column_family_ids,
             shard_snapshots: bucket_refs,
             watermark_seconds,
         })
@@ -290,6 +297,42 @@ impl DbCoordinator {
     }
 }
 
+fn merge_column_family_ids(shard_snapshots: &[ShardSnapshotInput]) -> Result<BTreeMap<String, u8>> {
+    let mut by_name = BTreeMap::new();
+    let mut by_id = BTreeMap::new();
+    for shard in shard_snapshots {
+        if shard.column_family_ids.is_empty() {
+            return Err(Error::CoordinationError(format!(
+                "Column family ids missing for {}:{}",
+                shard.db_id, shard.snapshot_id
+            )));
+        }
+        for (name, id) in &shard.column_family_ids {
+            if let Some(existing_id) = by_name.get(name) {
+                if *existing_id != *id {
+                    return Err(Error::CoordinationError(format!(
+                        "column family '{}' has conflicting ids {} and {} across shards",
+                        name, existing_id, id
+                    )));
+                }
+            } else {
+                by_name.insert(name.clone(), *id);
+            }
+            if let Some(existing_name) = by_id.get(id) {
+                if existing_name != name {
+                    return Err(Error::CoordinationError(format!(
+                        "column family id {} is assigned to both '{}' and '{}' across shards",
+                        id, existing_name, name
+                    )));
+                }
+            } else {
+                by_id.insert(*id, name.clone());
+            }
+        }
+    }
+    Ok(by_name)
+}
+
 fn parse_snapshot_id(name: &str) -> Result<u64> {
     let Some(id) = name.trim().strip_prefix("SNAPSHOT-") else {
         return Err(Error::IoError(format!(
@@ -364,6 +407,10 @@ mod tests {
         format!("file://{}/{}", root, path)
     }
 
+    fn default_column_family_ids() -> BTreeMap<String, u8> {
+        BTreeMap::from([("default".to_string(), 0)])
+    }
+
     #[test]
     #[serial_test::serial(file)]
     fn test_global_snapshot_round_trip() {
@@ -394,6 +441,7 @@ mod tests {
                 vec![
                     ShardSnapshotInput {
                         ranges: vec![0u16..=1u16],
+                        column_family_ids: default_column_family_ids(),
                         db_id: "db-a".to_string(),
                         snapshot_id: 1,
                         manifest_path: path_a.clone(),
@@ -401,6 +449,7 @@ mod tests {
                     },
                     ShardSnapshotInput {
                         ranges: vec![2u16..=3u16],
+                        column_family_ids: default_column_family_ids(),
                         db_id: "db-b".to_string(),
                         snapshot_id: 2,
                         manifest_path: path_b.clone(),
@@ -413,6 +462,7 @@ mod tests {
 
         let loaded = node.load_current_global_snapshot().unwrap().unwrap();
         assert_eq!(loaded.id, snapshot.id);
+        assert_eq!(loaded.column_family_ids, default_column_family_ids());
         assert_eq!(loaded.shard_snapshots, snapshot.shard_snapshots);
         assert_eq!(loaded.shard_snapshots[0].manifest_path, path_a);
         assert_eq!(loaded.shard_snapshots[1].manifest_path, path_b);
@@ -461,6 +511,7 @@ mod tests {
                 4,
                 vec![ShardSnapshotInput {
                     ranges: vec![0u16..=3u16],
+                    column_family_ids: default_column_family_ids(),
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path_a.clone(),
@@ -476,6 +527,7 @@ mod tests {
                 4,
                 vec![ShardSnapshotInput {
                     ranges: vec![0u16..=3u16],
+                    column_family_ids: default_column_family_ids(),
                     db_id: "db-b".to_string(),
                     snapshot_id: 2,
                     manifest_path: path_b.clone(),
@@ -522,6 +574,7 @@ mod tests {
                 4,
                 vec![ShardSnapshotInput {
                     ranges: vec![0u16..=3u16],
+                    column_family_ids: default_column_family_ids(),
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path.clone(),
@@ -537,6 +590,7 @@ mod tests {
                 4,
                 vec![ShardSnapshotInput {
                     ranges: vec![0u16..=3u16],
+                    column_family_ids: default_column_family_ids(),
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path,
@@ -582,6 +636,7 @@ mod tests {
                 4,
                 vec![ShardSnapshotInput {
                     ranges: vec![0u16..=3u16],
+                    column_family_ids: default_column_family_ids(),
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path.clone(),
@@ -598,6 +653,7 @@ mod tests {
                 4,
                 vec![ShardSnapshotInput {
                     ranges: vec![0u16..=3u16],
+                    column_family_ids: default_column_family_ids(),
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path,
@@ -643,6 +699,76 @@ mod tests {
     }
 
     #[test]
+    fn test_global_snapshot_rejects_conflicting_column_family_ids_by_name() {
+        let err = DbCoordinator::build_global_snapshot(
+            4,
+            vec![
+                ShardSnapshotInput {
+                    ranges: vec![0u16..=1u16],
+                    column_family_ids: BTreeMap::from([
+                        ("default".to_string(), 0),
+                        ("metrics".to_string(), 1),
+                    ]),
+                    db_id: "db-a".to_string(),
+                    snapshot_id: 1,
+                    manifest_path: "file:///tmp/db-a".to_string(),
+                    timestamp_seconds: 0,
+                },
+                ShardSnapshotInput {
+                    ranges: vec![2u16..=3u16],
+                    column_family_ids: BTreeMap::from([
+                        ("default".to_string(), 0),
+                        ("metrics".to_string(), 2),
+                    ]),
+                    db_id: "db-b".to_string(),
+                    snapshot_id: 2,
+                    manifest_path: "file:///tmp/db-b".to_string(),
+                    timestamp_seconds: 0,
+                },
+            ],
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::CoordinationError(_)));
+        assert!(err.to_string().contains("conflicting ids"));
+    }
+
+    #[test]
+    fn test_global_snapshot_rejects_conflicting_column_family_ids_by_id() {
+        let err = DbCoordinator::build_global_snapshot(
+            4,
+            vec![
+                ShardSnapshotInput {
+                    ranges: vec![0u16..=1u16],
+                    column_family_ids: BTreeMap::from([
+                        ("default".to_string(), 0),
+                        ("metrics".to_string(), 1),
+                    ]),
+                    db_id: "db-a".to_string(),
+                    snapshot_id: 1,
+                    manifest_path: "file:///tmp/db-a".to_string(),
+                    timestamp_seconds: 0,
+                },
+                ShardSnapshotInput {
+                    ranges: vec![2u16..=3u16],
+                    column_family_ids: BTreeMap::from([
+                        ("default".to_string(), 0),
+                        ("events".to_string(), 1),
+                    ]),
+                    db_id: "db-b".to_string(),
+                    snapshot_id: 2,
+                    manifest_path: "file:///tmp/db-b".to_string(),
+                    timestamp_seconds: 0,
+                },
+            ],
+            8,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::CoordinationError(_)));
+        assert!(err.to_string().contains("assigned to both"));
+    }
+
+    #[test]
     #[serial_test::serial(file)]
     fn test_list_global_snapshots_skips_checksum_mismatch_manifest() {
         let root = "/tmp/coordinator_corrupt_manifest";
@@ -671,6 +797,7 @@ mod tests {
                     4,
                     vec![ShardSnapshotInput {
                         ranges: vec![0u16..=3u16],
+                        column_family_ids: default_column_family_ids(),
                         db_id: "db-a".to_string(),
                         snapshot_id: 1,
                         manifest_path: path.clone(),

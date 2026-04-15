@@ -447,6 +447,7 @@ impl SnapshotManager {
             id: s.id,
             manifest_path: s.manifest_path.clone(),
             bucket_ranges: s.bucket_ranges.clone(),
+            latest_schema_id: s.latest_schema_id,
         });
         let mut incremental_base_id = None;
         let result = match snapshot {

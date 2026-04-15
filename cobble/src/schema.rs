@@ -381,6 +381,13 @@ impl Schema {
             .collect()
     }
 
+    pub(crate) fn column_family_ids_by_name(&self) -> BTreeMap<String, u8> {
+        self.column_families
+            .iter()
+            .map(|family| (family.name.clone(), family.id))
+            .collect()
+    }
+
     fn column_family_by_id(&self, column_family_id: u8) -> Option<&ColumnFamily> {
         match self.column_families.get(column_family_id as usize)? {
             family if family.id == column_family_id => Some(family),

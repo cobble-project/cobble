@@ -13,6 +13,8 @@ pub enum Error {
     ConfigError(String),
     #[error("Input error: {0}")]
     InputError(String),
+    #[error("Coordination error: {0}")]
+    CoordinationError(String),
     #[error("Internal state error: {0}")]
     InvalidState(String),
     #[error("File format error: {0}")]

@@ -50,6 +50,7 @@ pub(crate) struct SnapshotManifestInfo {
     pub id: u64,
     pub manifest_path: String,
     pub bucket_ranges: Vec<RangeInclusive<u16>>,
+    pub latest_schema_id: u64,
 }
 
 pub(crate) type SnapshotCallback =

@@ -676,16 +676,7 @@ pub extern "system" fn Java_io_cobble_Db_asyncSnapshot(
         complete_snapshot_json_future(
             &vm,
             &future,
-            result.map(|input| {
-                serde_json::to_string(&cobble::ShardSnapshotRef {
-                    ranges: input.ranges,
-                    db_id: input.db_id,
-                    snapshot_id: input.snapshot_id,
-                    manifest_path: input.manifest_path,
-                    timestamp_seconds: input.timestamp_seconds,
-                })
-                .unwrap_or_default()
-            }),
+            result.map(|input| shard_snapshot_json(&input)),
         );
     }) {
         throw_illegal_state(&mut env, err.to_string());
@@ -788,6 +779,10 @@ fn build_shard_snapshot_payload(db: &Db, snapshot_id: u64) -> std::result::Resul
     let input = db
         .shard_snapshot_input(snapshot_id)
         .map_err(|err| err.to_string())?;
+    Ok(shard_snapshot_json(&input))
+}
+
+fn shard_snapshot_json(input: &cobble::ShardSnapshotInput) -> String {
     let ranges: Vec<serde_json::Value> = input
         .ranges
         .iter()
@@ -798,13 +793,15 @@ fn build_shard_snapshot_payload(db: &Db, snapshot_id: u64) -> std::result::Resul
             })
         })
         .collect();
-    Ok(json!({
+    json!({
         "ranges": ranges,
-        "db_id": input.db_id,
+        "column_family_ids": &input.column_family_ids,
+        "db_id": &input.db_id,
         "snapshot_id": input.snapshot_id,
-        "manifest_path": input.manifest_path,
+        "manifest_path": &input.manifest_path,
+        "timestamp_seconds": input.timestamp_seconds,
     })
-    .to_string())
+    .to_string()
 }
 
 fn complete_snapshot_json_future(vm: &JavaVM, future: &GlobalRef, result: cobble::Result<String>) {

@@ -7,6 +7,7 @@ use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jstring};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 
 #[unsafe(no_mangle)]
@@ -92,6 +93,7 @@ struct JavaRange {
 #[derive(Deserialize)]
 struct JavaShardSnapshot {
     ranges: Vec<JavaRange>,
+    column_family_ids: BTreeMap<String, u8>,
     db_id: String,
     snapshot_id: u64,
     manifest_path: String,
@@ -162,6 +164,7 @@ pub extern "system" fn Java_io_cobble_DbCoordinator_materializeGlobalSnapshot(
         }
         shard_snapshots.push(ShardSnapshotInput {
             ranges,
+            column_family_ids: input.column_family_ids,
             db_id: input.db_id,
             snapshot_id: input.snapshot_id,
             manifest_path: input.manifest_path,

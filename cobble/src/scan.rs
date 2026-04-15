@@ -211,6 +211,7 @@ mod tests {
     use crate::config::VolumeDescriptor;
     use crate::coordinator::{CoordinatorConfig, DbCoordinator};
     use crate::{Db, ScanOptions, WriteBatch};
+    use std::collections::BTreeMap;
 
     fn cleanup_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
@@ -451,6 +452,7 @@ mod tests {
         let split = ScanSplit {
             shard: ShardSnapshotRef {
                 ranges: vec![0u16..=3u16],
+                column_family_ids: BTreeMap::from([("default".to_string(), 0)]),
                 db_id: "test-db".to_string(),
                 snapshot_id: 42,
                 manifest_path: "file:///tmp/manifest".to_string(),

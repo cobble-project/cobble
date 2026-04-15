@@ -351,6 +351,8 @@ class StructuredDbTest {
 
             ShardSnapshot shardSnapshot = db.snapshot();
             assertNotNull(shardSnapshot);
+            assertNotNull(shardSnapshot.columnFamilyIds);
+            assertEquals(Integer.valueOf(0), shardSnapshot.columnFamilyIds.get("default"));
             assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
 
             GlobalSnapshot globalSnapshot;
@@ -362,6 +364,8 @@ class StructuredDbTest {
                                 java.util.Collections.singletonList(shardSnapshot));
             }
             assertNotNull(globalSnapshot);
+            assertNotNull(globalSnapshot.columnFamilyIds);
+            assertEquals(Integer.valueOf(0), globalSnapshot.columnFamilyIds.get("default"));
 
             StructuredScanPlan plan =
                     StructuredScanPlan.fromGlobalSnapshot(globalSnapshot)

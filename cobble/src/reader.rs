@@ -534,6 +534,7 @@ mod tests {
     use super::*;
     use crate::VolumeDescriptor;
     use crate::coordinator::{CoordinatorConfig, DbCoordinator, ShardSnapshotInput};
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     fn cleanup_root(path: &str) {
@@ -605,6 +606,11 @@ mod tests {
         let contents = std::str::from_utf8(&payload).expect("pointer utf8");
         assert_eq!(contents.trim(), manifest);
     }
+
+    fn default_column_family_ids() -> BTreeMap<String, u8> {
+        BTreeMap::from([("default".to_string(), 0)])
+    }
+
     #[test]
     #[serial_test::serial(file)]
     fn test_read_proxy_routes_and_evicts() {
@@ -632,6 +638,7 @@ mod tests {
                 vec![
                     ShardSnapshotInput {
                         ranges: vec![0u16..=1u16],
+                        column_family_ids: default_column_family_ids(),
                         db_id: db_a.clone(),
                         snapshot_id: snap_a,
                         manifest_path: path_a,
@@ -639,6 +646,7 @@ mod tests {
                     },
                     ShardSnapshotInput {
                         ranges: vec![2u16..=3u16],
+                        column_family_ids: default_column_family_ids(),
                         db_id: db_b.clone(),
                         snapshot_id: snap_b,
                         manifest_path: path_b,
@@ -706,6 +714,7 @@ mod tests {
                 4,
                 vec![ShardSnapshotInput {
                     ranges: vec![0u16..=3u16],
+                    column_family_ids: default_column_family_ids(),
                     db_id: db_a.clone(),
                     snapshot_id: snap_a,
                     manifest_path: path_a,
@@ -734,6 +743,7 @@ mod tests {
                 4,
                 vec![ShardSnapshotInput {
                     ranges: vec![0u16..=3u16],
+                    column_family_ids: default_column_family_ids(),
                     db_id: db_b.clone(),
                     snapshot_id: snap_b,
                     manifest_path: path_b,

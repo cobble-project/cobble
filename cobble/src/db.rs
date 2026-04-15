@@ -12,7 +12,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaBuilder, SchemaManager};
 use crate::snapshot::{
     ActiveMemtableSnapshotData, LoadedManifest, SnapshotCallback, SnapshotManager,
-    SnapshotManifestInfo, snapshot_manifest_name,
+    SnapshotManifestInfo, load_manifest_for_snapshot, snapshot_manifest_name,
 };
 use crate::sst::row_codec::{decode_value, decode_value_masked, encode_key_ref_into};
 use crate::r#type::decode_merge_separated_array;
@@ -674,13 +674,20 @@ impl Db {
         self.ensure_open()?;
         let db_id = self.id.clone();
         let timestamp_seconds = self.now_seconds();
+        let schema_manager = Arc::clone(&self.schema_manager);
         let wrapper: SnapshotCallback = Arc::new(move |result: Result<SnapshotManifestInfo>| {
-            callback(result.map(|info| crate::coordinator::ShardSnapshotInput {
-                ranges: info.bucket_ranges,
-                db_id: db_id.clone(),
-                snapshot_id: info.id,
-                manifest_path: info.manifest_path,
-                timestamp_seconds,
+            callback(result.and_then(|info| {
+                let column_family_ids = schema_manager
+                    .schema(info.latest_schema_id)?
+                    .column_family_ids_by_name();
+                Ok(crate::coordinator::ShardSnapshotInput {
+                    ranges: info.bucket_ranges,
+                    column_family_ids,
+                    db_id: db_id.clone(),
+                    snapshot_id: info.id,
+                    manifest_path: info.manifest_path,
+                    timestamp_seconds,
+                })
             }));
         });
         let snapshot = self.snapshot_manager.create_snapshot(Some(wrapper));
@@ -709,6 +716,11 @@ impl Db {
         snapshot_id: u64,
     ) -> Result<crate::coordinator::ShardSnapshotInput> {
         self.ensure_open()?;
+        let manifest = load_manifest_for_snapshot(&self.file_manager, snapshot_id)?;
+        let column_family_ids = self
+            .schema_manager
+            .schema(manifest.latest_schema_id)?
+            .column_family_ids_by_name();
         let manifest_name = snapshot_manifest_name(snapshot_id);
         let manifest_path = self
             .file_manager
@@ -718,6 +730,7 @@ impl Db {
             })?;
         Ok(crate::coordinator::ShardSnapshotInput {
             ranges: self.db_state.load().bucket_ranges.clone(),
+            column_family_ids,
             db_id: self.id.clone(),
             snapshot_id,
             manifest_path,
