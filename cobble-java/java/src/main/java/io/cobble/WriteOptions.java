@@ -21,9 +21,29 @@ public final class WriteOptions extends NativeObject {
         return this;
     }
 
+    /** Target one column family for subsequent writes. */
+    public WriteOptions columnFamily(String columnFamily) {
+        if (columnFamily == null || columnFamily.trim().isEmpty()) {
+            throw new IllegalArgumentException("columnFamily must not be blank");
+        }
+        setColumnFamily(nativeHandle, columnFamily);
+        return this;
+    }
+
+    /** Clear any previously selected column family and fall back to default family. */
+    public WriteOptions clearColumnFamily() {
+        clearColumnFamily(nativeHandle);
+        return this;
+    }
+
     /** Create options with ttl set. */
     public static WriteOptions withTtl(int ttlSeconds) {
         return new WriteOptions().ttlSeconds(ttlSeconds);
+    }
+
+    /** Create options with the target column family set. */
+    public static WriteOptions withColumnFamily(String columnFamily) {
+        return new WriteOptions().columnFamily(columnFamily);
     }
 
     @Override
@@ -34,6 +54,10 @@ public final class WriteOptions extends NativeObject {
     private static native void setTtlSeconds(long nativeHandle, int ttlSeconds);
 
     private static native void clearTtlSeconds(long nativeHandle);
+
+    private static native void setColumnFamily(long nativeHandle, String columnFamily);
+
+    private static native void clearColumnFamily(long nativeHandle);
 
     private static long loadAndCreateHandle() {
         NativeLoader.load();

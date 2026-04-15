@@ -1,7 +1,7 @@
-use crate::util::{decode_u32, throw_illegal_argument, throw_illegal_state};
+use crate::util::{decode_java_string, decode_u32, throw_illegal_argument, throw_illegal_state};
 use cobble::WriteOptions;
 use jni::JNIEnv;
-use jni::objects::{JClass, JObject};
+use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jint, jlong};
 use std::sync::OnceLock;
 
@@ -89,6 +89,40 @@ pub extern "system" fn Java_io_cobble_WriteOptions_clearTtlSeconds(
         return;
     };
     write_options.write_options.ttl_seconds = None;
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_WriteOptions_setColumnFamily(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    column_family: JString,
+) {
+    let Some(write_options) = write_options_from_handle_mut_or_throw(&mut env, native_handle)
+    else {
+        return;
+    };
+    let column_family = match decode_java_string(&mut env, column_family) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    write_options.write_options.column_family = Some(column_family);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_WriteOptions_clearColumnFamily(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) {
+    let Some(write_options) = write_options_from_handle_mut_or_throw(&mut env, native_handle)
+    else {
+        return;
+    };
+    write_options.write_options.column_family = None;
 }
 
 fn write_options_from_handle_or_throw_impl(

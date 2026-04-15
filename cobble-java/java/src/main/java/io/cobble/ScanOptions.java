@@ -42,6 +42,29 @@ public final class ScanOptions extends NativeObject {
         return this;
     }
 
+    /** Target one column family for subsequent scans. */
+    public ScanOptions columnFamily(String columnFamily) {
+        if (columnFamily == null || columnFamily.trim().isEmpty()) {
+            throw new IllegalArgumentException("columnFamily must not be blank");
+        }
+        setColumnFamily(nativeHandle, columnFamily);
+        return this;
+    }
+
+    /** Clear any previously selected column family and fall back to default family. */
+    public ScanOptions clearColumnFamily() {
+        clearColumnFamily(nativeHandle);
+        return this;
+    }
+
+    public static ScanOptions forColumn(int columnIndex) {
+        return new ScanOptions().columns(columnIndex);
+    }
+
+    public static ScanOptions forColumns(int... columnIndices) {
+        return new ScanOptions().columns(columnIndices);
+    }
+
     public static ScanOptions defaults() {
         return new ScanOptions().columns(DEFAULT_COLUMNS);
     }
@@ -61,4 +84,8 @@ public final class ScanOptions extends NativeObject {
     private static native void setBatchSize(long nativeHandle, int batchSize);
 
     private static native void setColumns(long nativeHandle, int[] columns);
+
+    private static native void setColumnFamily(long nativeHandle, String columnFamily);
+
+    private static native void clearColumnFamily(long nativeHandle);
 }

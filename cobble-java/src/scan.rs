@@ -34,6 +34,27 @@ impl ScanOptionsHandle {
     }
 }
 
+fn rebuild_scan_options(
+    column_family: Option<String>,
+    column_indices: Option<Vec<usize>>,
+    read_ahead_bytes: Size,
+) -> ScanOptions {
+    let mut scan_options = match column_indices {
+        Some(column_indices) => match column_family {
+            Some(column_family) => {
+                ScanOptions::for_columns(column_indices).with_column_family(column_family)
+            }
+            None => ScanOptions::for_columns(column_indices),
+        },
+        None => match column_family {
+            Some(column_family) => ScanOptions::default().with_column_family(column_family),
+            None => ScanOptions::default(),
+        },
+    };
+    scan_options.read_ahead_bytes = read_ahead_bytes;
+    scan_options
+}
+
 pub(crate) struct ScanOpenArgs {
     pub(crate) bucket: u16,
     pub(crate) start_key_inclusive: Vec<u8>,
@@ -322,7 +343,51 @@ pub extern "system" fn Java_io_cobble_ScanOptions_setColumns(
             }
         }
     }
-    scan_options.scan_options.column_indices = Some(decoded);
+    scan_options.scan_options = rebuild_scan_options(
+        scan_options.scan_options.column_family.clone(),
+        Some(decoded),
+        scan_options.scan_options.read_ahead_bytes,
+    );
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ScanOptions_setColumnFamily(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    column_family: JString,
+) {
+    let Some(scan_options) = scan_options_from_handle_mut_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let column_family = match decode_java_string(&mut env, column_family) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    scan_options.scan_options = rebuild_scan_options(
+        Some(column_family),
+        scan_options.scan_options.column_indices.clone(),
+        scan_options.scan_options.read_ahead_bytes,
+    );
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ScanOptions_clearColumnFamily(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) {
+    let Some(scan_options) = scan_options_from_handle_mut_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    scan_options.scan_options = rebuild_scan_options(
+        None,
+        scan_options.scan_options.column_indices.clone(),
+        scan_options.scan_options.read_ahead_bytes,
+    );
 }
 
 #[unsafe(no_mangle)]

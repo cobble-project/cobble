@@ -92,6 +92,13 @@ public final class Reader extends NativeObject {
         }
     }
 
+    /** Get one column by index from a specific column family. */
+    public byte[] get(int bucket, byte[] key, String columnFamily, int column) {
+        try (ReadOptions options = ReadOptions.forColumnInFamily(columnFamily, column)) {
+            return singleColumnOrNull(get(nativeHandle, bucket, key, options.nativeHandle));
+        }
+    }
+
     /** Get selected columns by key using reusable native-backed read options. */
     public byte[][] get(int bucket, byte[] key) {
         return get(nativeHandle, bucket, key, 0L);
@@ -106,6 +113,13 @@ public final class Reader extends NativeObject {
     /** Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive). */
     public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
         return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
+    }
+
+    public ScanCursor scan(
+            int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, String columnFamily) {
+        try (ScanOptions options = new ScanOptions().columnFamily(columnFamily)) {
+            return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, options);
+        }
     }
 
     public ScanCursor scanWithOptions(

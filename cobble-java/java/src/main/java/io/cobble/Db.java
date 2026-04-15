@@ -132,6 +132,13 @@ public final class Db extends NativeObject {
         put(nativeHandle, bucket, key, column, value);
     }
 
+    /** Put one column value for a key in a specific column family. */
+    public void put(int bucket, byte[] key, String columnFamily, int column, byte[] value) {
+        try (WriteOptions options = WriteOptions.withColumnFamily(columnFamily)) {
+            putWithOptions(bucket, key, column, value, options);
+        }
+    }
+
     /** Put one column value for a key with explicit write options (native handle mode). */
     public void putWithOptions(
             int bucket, byte[] key, int column, byte[] value, WriteOptions options) {
@@ -144,6 +151,13 @@ public final class Db extends NativeObject {
         merge(nativeHandle, bucket, key, column, value);
     }
 
+    /** Merge one column value for a key in a specific column family. */
+    public void merge(int bucket, byte[] key, String columnFamily, int column, byte[] value) {
+        try (WriteOptions options = WriteOptions.withColumnFamily(columnFamily)) {
+            mergeWithOptions(bucket, key, column, value, options);
+        }
+    }
+
     /** Merge one column value for a key with explicit write options (native handle mode). */
     public void mergeWithOptions(
             int bucket, byte[] key, int column, byte[] value, WriteOptions options) {
@@ -154,6 +168,13 @@ public final class Db extends NativeObject {
     /** Get one column by index. */
     public byte[] get(int bucket, byte[] key, int column) {
         try (ReadOptions options = ReadOptions.forColumn(column)) {
+            return singleColumnOrNull(get(nativeHandle, bucket, key, options.nativeHandle));
+        }
+    }
+
+    /** Get one column by index from a specific column family. */
+    public byte[] get(int bucket, byte[] key, String columnFamily, int column) {
+        try (ReadOptions options = ReadOptions.forColumnInFamily(columnFamily, column)) {
             return singleColumnOrNull(get(nativeHandle, bucket, key, options.nativeHandle));
         }
     }
@@ -172,6 +193,14 @@ public final class Db extends NativeObject {
     /** Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive). */
     public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
         return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
+    }
+
+    /** Open a high-throughput native scan cursor in a specific column family. */
+    public ScanCursor scan(
+            int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, String columnFamily) {
+        try (ScanOptions options = new ScanOptions().columnFamily(columnFamily)) {
+            return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, options);
+        }
     }
 
     /** Open a high-throughput native scan cursor with explicit options handle mode. */
@@ -200,6 +229,19 @@ public final class Db extends NativeObject {
      */
     public void delete(int bucket, byte[] key, int column) {
         delete(nativeHandle, bucket, key, column);
+    }
+
+    /** Delete one column value for a key with explicit write options (native handle mode). */
+    public void deleteWithOptions(int bucket, byte[] key, int column, WriteOptions options) {
+        long writeOptionsHandle = options == null ? 0L : options.nativeHandle;
+        deleteWithOptions(nativeHandle, bucket, key, column, writeOptionsHandle);
+    }
+
+    /** Delete one column value for a key in a specific column family. */
+    public void delete(int bucket, byte[] key, String columnFamily, int column) {
+        try (WriteOptions options = WriteOptions.withColumnFamily(columnFamily)) {
+            deleteWithOptions(bucket, key, column, options);
+        }
     }
 
     /** Set manual time provider seconds (only effective when config uses manual time provider). */
@@ -360,6 +402,9 @@ public final class Db extends NativeObject {
             long scanOptionsHandle);
 
     private static native void delete(long nativeHandle, int bucket, byte[] key, int column);
+
+    private static native void deleteWithOptions(
+            long nativeHandle, int bucket, byte[] key, int column, long writeOptionsHandle);
 
     private static native void setTime(long nativeHandle, int nextSeconds);
 

@@ -977,7 +977,7 @@ fn collect_unrecognized_entry_paths(
 mod tests {
     use super::{
         Config, Error, MemtableType, PrimaryVolumeOffloadPolicyKind, ReadOptions,
-        ReaderConfigEntry, VolumeDescriptor, VolumeUsageKind, WriteOptions,
+        ReaderConfigEntry, ScanOptions, VolumeDescriptor, VolumeUsageKind, WriteOptions,
     };
     use crate::SstCompressionAlgorithm;
     use crate::data_file::DataFileType;
@@ -1168,6 +1168,17 @@ mod tests {
         assert_eq!(options.columns(), Some(&[2, 0][..]));
 
         let options = ReadOptions::for_column(1).with_column_family("default");
+        assert_eq!(options.column_family(), Some("default"));
+        assert_eq!(options.columns(), Some(&[1][..]));
+    }
+
+    #[test]
+    fn test_scan_options_column_family_builder() {
+        let options = ScanOptions::for_columns(vec![2, 0]).with_column_family("metrics");
+        assert_eq!(options.column_family(), Some("metrics"));
+        assert_eq!(options.columns(), Some(&[2, 0][..]));
+
+        let options = ScanOptions::for_column(1).with_column_family("default");
         assert_eq!(options.column_family(), Some("default"));
         assert_eq!(options.columns(), Some(&[1][..]));
     }

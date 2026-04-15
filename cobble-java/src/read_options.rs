@@ -1,7 +1,9 @@
-use crate::util::{decode_column_index, throw_illegal_argument, throw_illegal_state};
+use crate::util::{
+    decode_column_index, decode_java_string, throw_illegal_argument, throw_illegal_state,
+};
 use cobble::ReadOptions;
 use jni::JNIEnv;
-use jni::objects::{JClass, JIntArray, JObject};
+use jni::objects::{JClass, JIntArray, JObject, JString};
 use jni::sys::{jint, jlong};
 use std::sync::OnceLock;
 
@@ -18,6 +20,24 @@ impl ReadOptionsHandle {
 
     pub(crate) fn read_options(&self) -> &ReadOptions {
         &self.read_options
+    }
+}
+
+fn rebuild_read_options(
+    column_family: Option<String>,
+    column_indices: Option<Vec<usize>>,
+) -> ReadOptions {
+    match column_indices {
+        Some(column_indices) => match column_family {
+            Some(column_family) => {
+                ReadOptions::for_columns_in_family(column_family, column_indices)
+            }
+            None => ReadOptions::for_columns(column_indices),
+        },
+        None => match column_family {
+            Some(column_family) => ReadOptions::default().with_column_family(column_family),
+            None => ReadOptions::default(),
+        },
     }
 }
 
@@ -74,7 +94,10 @@ pub extern "system" fn Java_io_cobble_ReadOptions_setColumn(
             return;
         }
     };
-    read_options.read_options = ReadOptions::for_column(column_index);
+    read_options.read_options = match read_options.read_options.column_family.clone() {
+        Some(column_family) => ReadOptions::for_column_in_family(column_family, column_index),
+        None => ReadOptions::for_column(column_index),
+    };
 }
 
 #[unsafe(no_mangle)]
@@ -113,7 +136,46 @@ pub extern "system" fn Java_io_cobble_ReadOptions_setColumns(
             }
         }
     }
-    read_options.read_options = ReadOptions::for_columns(decoded);
+    read_options.read_options = match read_options.read_options.column_family.clone() {
+        Some(column_family) => ReadOptions::for_columns_in_family(column_family, decoded),
+        None => ReadOptions::for_columns(decoded),
+    };
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ReadOptions_setColumnFamily(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    column_family: JString,
+) {
+    let Some(read_options) = read_options_from_handle_mut_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let column_family = match decode_java_string(&mut env, column_family) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    read_options.read_options = rebuild_read_options(
+        Some(column_family),
+        read_options.read_options.column_indices.clone(),
+    );
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ReadOptions_clearColumnFamily(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) {
+    let Some(read_options) = read_options_from_handle_mut_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    read_options.read_options =
+        rebuild_read_options(None, read_options.read_options.column_indices.clone());
 }
 
 fn read_options_from_handle_or_throw_impl(

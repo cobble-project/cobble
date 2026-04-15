@@ -455,6 +455,52 @@ pub extern "system" fn Java_io_cobble_SingleDb_delete(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_deleteWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    write_options_handle: jlong,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let Some(write_options_handle) =
+        write_options_from_handle_or_throw(&mut env, write_options_handle)
+    else {
+        return;
+    };
+    if let Err(err) =
+        db.delete_with_options(bucket, key, column, write_options_handle.write_options())
+    {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_SingleDb_setTime(
     mut env: JNIEnv,
     _class: JClass,

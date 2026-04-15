@@ -919,6 +919,124 @@ class DbBindingTest {
         }
     }
 
+    @Test
+    void rawColumnFamilyApisAcrossDbReadOnlyAndReader() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-raw-cf-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        Path configPath = writeConfigFile(dataDir, config);
+
+        try (Db db = Db.open(config)) {
+            Schema schema = db.updateSchema().addColumn("metrics", 0, null, null).commit();
+            assertEquals(Integer.valueOf(0), schema.columnFamilyIds.get("default"));
+            assertEquals(Integer.valueOf(1), schema.columnFamilyIds.get("metrics"));
+            assertEquals(
+                    MergeOperatorType.BYTES.operatorId(), schema.mergeOperatorId("metrics", 0));
+            assertNotNull(schema.columnFamily("metrics"));
+            assertEquals(1, schema.columnFamily("metrics").numColumns);
+
+            for (int i = 0; i < 7; i++) {
+                byte[] key = scanKeyBytes("raw-cf", i);
+                byte[] value = valueBytes("raw-cf-v", i);
+                if (i % 2 == 0) {
+                    db.put(0, key, "metrics", 0, value);
+                } else {
+                    try (WriteOptions options = WriteOptions.withColumnFamily("metrics")) {
+                        db.putWithOptions(0, key, 0, value, options);
+                    }
+                }
+            }
+
+            assertArrayEquals(
+                    valueBytes("raw-cf-v", 3), db.get(0, scanKeyBytes("raw-cf", 3), "metrics", 0));
+            try (ReadOptions options = ReadOptions.forColumnInFamily("metrics", 0)) {
+                assertArrayEquals(
+                        valueBytes("raw-cf-v", 4),
+                        requiredSingleColumn(
+                                db.getWithOptions(0, scanKeyBytes("raw-cf", 4), options)));
+            }
+            try (ScanOptions options =
+                            ScanOptions.forColumns(0).columnFamily("metrics").batchSize(3);
+                    ScanCursor cursor =
+                            db.scanWithOptions(
+                                    0,
+                                    scanKeyBytes("raw-cf", 0),
+                                    scanKeyBytes("raw-cf", 7),
+                                    options)) {
+                int rows = 0;
+                while (true) {
+                    ScanBatch batch = cursor.nextBatch();
+                    for (int i = 0; i < batch.keys.length; i++) {
+                        assertEquals(1, batch.values[i].length);
+                        assertArrayEquals(valueBytes("raw-cf-v", rows), batch.values[i][0]);
+                        rows++;
+                    }
+                    if (!batch.hasMore) {
+                        break;
+                    }
+                }
+                assertEquals(7, rows);
+            }
+
+            try (WriteOptions options = WriteOptions.withColumnFamily("metrics")) {
+                db.deleteWithOptions(0, scanKeyBytes("raw-cf", 0), 0, options);
+            }
+            db.delete(0, scanKeyBytes("raw-cf", 1), "metrics", 0);
+            assertNull(db.get(0, scanKeyBytes("raw-cf", 0), "metrics", 0));
+            assertNull(db.get(0, scanKeyBytes("raw-cf", 1), "metrics", 0));
+
+            ShardSnapshot shardSnapshot = db.snapshot();
+            assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
+            try (ReadOnlyDb readOnlyDb =
+                            ReadOnlyDb.open(
+                                    configPath.toString(), shardSnapshot.snapshotId, db.id());
+                    ScanCursor cursor =
+                            readOnlyDb.scan(
+                                    0,
+                                    scanKeyBytes("raw-cf", 0),
+                                    scanKeyBytes("raw-cf", 7),
+                                    "metrics")) {
+                assertArrayEquals(
+                        valueBytes("raw-cf-v", 2),
+                        readOnlyDb.get(0, scanKeyBytes("raw-cf", 2), "metrics", 0));
+                int rows = 0;
+                while (true) {
+                    ScanBatch batch = cursor.nextBatch();
+                    rows += batch.keys.length;
+                    if (!batch.hasMore) {
+                        break;
+                    }
+                }
+                assertEquals(5, rows);
+            }
+
+            try (DbCoordinator coordinator = DbCoordinator.open(configPath.toString())) {
+                coordinator.materializeGlobalSnapshot(
+                        1, shardSnapshot.snapshotId, Collections.singletonList(shardSnapshot));
+            }
+
+            try (Reader reader = Reader.openCurrent(configPath.toString());
+                    ScanCursor cursor =
+                            reader.scan(
+                                    0,
+                                    scanKeyBytes("raw-cf", 0),
+                                    scanKeyBytes("raw-cf", 7),
+                                    "metrics")) {
+                assertArrayEquals(
+                        valueBytes("raw-cf-v", 6),
+                        reader.get(0, scanKeyBytes("raw-cf", 6), "metrics", 0));
+                int rows = 0;
+                while (true) {
+                    ScanBatch batch = cursor.nextBatch();
+                    rows += batch.keys.length;
+                    if (!batch.hasMore) {
+                        break;
+                    }
+                }
+                assertEquals(5, rows);
+            }
+        }
+    }
+
     private static ShardSnapshot awaitSnapshot(Future<ShardSnapshot> future) {
         try {
             return future.get();
