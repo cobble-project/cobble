@@ -1002,6 +1002,20 @@ class DbBindingTest {
             assertEquals(updated.version, current.version);
             assertEquals(MergeOperatorType.U32_COUNTER.operatorId(), current.mergeOperatorId(0));
 
+            Schema withMetrics = db.updateSchema().addColumn("metrics", 0, null, null).commit();
+            assertEquals(Integer.valueOf(0), withMetrics.columnFamilyIds.get("default"));
+            assertEquals(Integer.valueOf(1), withMetrics.columnFamilyIds.get("metrics"));
+            assertNotNull(withMetrics.columnFamily("metrics"));
+            assertEquals(1, withMetrics.columnFamily("metrics").numColumns);
+
+            Schema metricsUpdated =
+                    db.updateSchema()
+                            .setColumnOperator("metrics", 0, MergeOperatorType.BYTES)
+                            .commit();
+            assertEquals(
+                    MergeOperatorType.BYTES.operatorId(),
+                    metricsUpdated.mergeOperatorId("metrics", 0));
+
             // Test merge with u32 counter operator
             byte[] key = "counter-key".getBytes(StandardCharsets.UTF_8);
             byte[] val5 = new byte[] {5, 0, 0, 0};

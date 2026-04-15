@@ -14,11 +14,21 @@ public final class SchemaBuilder extends NativeObject {
 
     /** Set the merge operator for an existing column. */
     public SchemaBuilder setColumnOperator(int columnIdx, MergeOperatorType operator) {
+        return setColumnOperator(null, columnIdx, operator);
+    }
+
+    /** Set the merge operator for an existing column in one column family. */
+    public SchemaBuilder setColumnOperator(
+            String columnFamily, int columnIdx, MergeOperatorType operator) {
         if (operator == null) {
             throw new IllegalArgumentException("operator must not be null");
         }
         nativeSetColumnOperator(
-                nativeHandle, columnIdx, operator.operatorId(), operator.metadataJson());
+                nativeHandle,
+                columnFamily,
+                columnIdx,
+                operator.operatorId(),
+                operator.metadataJson());
         return this;
     }
 
@@ -30,15 +40,25 @@ public final class SchemaBuilder extends NativeObject {
      * @param defaultValue default value for existing rows, or null
      */
     public SchemaBuilder addColumn(int columnIdx, MergeOperatorType operator, byte[] defaultValue) {
+        return addColumn(null, columnIdx, operator, defaultValue);
+    }
+
+    public SchemaBuilder addColumn(
+            String columnFamily, int columnIdx, MergeOperatorType operator, byte[] defaultValue) {
         String opId = operator == null ? null : operator.operatorId();
         String meta = operator == null ? null : operator.metadataJson();
-        nativeAddColumn(nativeHandle, columnIdx, opId, meta, defaultValue);
+        nativeAddColumn(nativeHandle, columnFamily, columnIdx, opId, meta, defaultValue);
         return this;
     }
 
     /** Delete the column at the specified index, shifting remaining columns left. */
     public SchemaBuilder deleteColumn(int columnIdx) {
-        nativeDeleteColumn(nativeHandle, columnIdx);
+        return deleteColumn(null, columnIdx);
+    }
+
+    /** Delete the column at the specified index inside one column family. */
+    public SchemaBuilder deleteColumn(String columnFamily, int columnIdx) {
+        nativeDeleteColumn(nativeHandle, columnFamily, columnIdx);
         return this;
     }
 
@@ -54,16 +74,22 @@ public final class SchemaBuilder extends NativeObject {
     protected native void disposeInternal(long nativeHandle);
 
     private static native void nativeSetColumnOperator(
-            long nativeHandle, int columnIdx, String operatorId, String metadataJson);
+            long nativeHandle,
+            String columnFamily,
+            int columnIdx,
+            String operatorId,
+            String metadataJson);
 
     private static native void nativeAddColumn(
             long nativeHandle,
+            String columnFamily,
             int columnIdx,
             String operatorId,
             String metadataJson,
             byte[] defaultValue);
 
-    private static native void nativeDeleteColumn(long nativeHandle, int columnIdx);
+    private static native void nativeDeleteColumn(
+            long nativeHandle, String columnFamily, int columnIdx);
 
     private static native String nativeCommit(long nativeHandle);
 }

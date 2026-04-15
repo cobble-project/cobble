@@ -374,14 +374,14 @@ impl Schema {
             .map(ColumnFamily::num_columns)
     }
 
-    pub(crate) fn column_family_ids(&self) -> Vec<u8> {
+    pub(crate) fn column_family_id_list(&self) -> Vec<u8> {
         self.column_families
             .iter()
             .map(|family| family.id)
             .collect()
     }
 
-    pub(crate) fn column_family_ids_by_name(&self) -> BTreeMap<String, u8> {
+    pub fn column_family_ids(&self) -> BTreeMap<String, u8> {
         self.column_families
             .iter()
             .map(|family| (family.name.clone(), family.id))
@@ -459,6 +459,15 @@ impl Schema {
     /// Return the merge operator id strings for all columns.
     pub fn all_operator_ids(&self) -> Vec<String> {
         self.operator_ids(self.num_columns())
+    }
+
+    /// Return the merge operator id strings for all columns in one column family.
+    pub fn operator_ids_in_family(&self, column_family: &str) -> Result<Vec<String>> {
+        let column_family_id = self.resolve_column_family_id(Some(column_family))?;
+        let num_columns = self.num_columns_in_family(column_family_id).unwrap_or(0);
+        Ok((0..num_columns)
+            .map(|column_idx| self.operator_in_family(column_family_id, column_idx).id())
+            .collect())
     }
 
     pub(crate) fn empty() -> Arc<Self> {
@@ -987,6 +996,15 @@ impl SchemaBuilder {
         Ok(())
     }
 
+    pub fn set_column_operator_in_family(
+        &mut self,
+        column_family: impl Into<String>,
+        column_idx: usize,
+        operator: Arc<dyn MergeOperator>,
+    ) -> Result<()> {
+        self.set_column_operator(Some(column_family.into()), column_idx, operator)
+    }
+
     /// Add a new column at the specified index, shifting existing columns at and after that index to the right.
     /// `column_family` sets the target family for the new column; when `None`, it uses `default`.
     /// Cannot be used in the same commit as `delete_column`.
@@ -1028,6 +1046,21 @@ impl SchemaBuilder {
         Ok(())
     }
 
+    pub fn add_column_in_family(
+        &mut self,
+        column_family: impl Into<String>,
+        column_idx: usize,
+        operator: Option<Arc<dyn MergeOperator>>,
+        default_value: Option<Bytes>,
+    ) -> Result<()> {
+        self.add_column(
+            column_idx,
+            operator,
+            default_value,
+            Some(column_family.into()),
+        )
+    }
+
     /// Delete the column at the specified index, shifting existing columns after that index to the left.
     /// Cannot be used in the same commit as `add_column`.
     pub fn delete_column(
@@ -1049,6 +1082,14 @@ impl SchemaBuilder {
         family.operators.remove(column_idx);
         family.column_metadata.remove(column_idx);
         Ok(())
+    }
+
+    pub fn delete_column_in_family(
+        &mut self,
+        column_family: impl Into<String>,
+        column_idx: usize,
+    ) -> Result<()> {
+        self.delete_column(Some(column_family.into()), column_idx)
     }
 
     /// Commit the schema changes and return the new schema.
@@ -1378,7 +1419,7 @@ mod tests {
         let manager = Arc::new(SchemaManager::new(1));
         let mut builder = manager.builder();
         builder
-            .add_column(0, None, None, Some("metrics".to_string()))
+            .add_column_in_family("metrics", 0, None, None)
             .expect("add column with column family");
         let schema = builder.commit();
         let families = schema.column_families();
@@ -1395,13 +1436,11 @@ mod tests {
         let manager = Arc::new(SchemaManager::new(1));
         let mut builder = manager.builder();
         builder
-            .add_column(0, None, None, Some("metrics".to_string()))
+            .add_column_in_family("metrics", 0, None, None)
             .unwrap();
+        builder.add_column_in_family("tags", 0, None, None).unwrap();
         builder
-            .add_column(0, None, None, Some("tags".to_string()))
-            .unwrap();
-        builder
-            .add_column(1, None, None, Some("metrics".to_string()))
+            .add_column_in_family("metrics", 1, None, None)
             .unwrap();
         let schema = builder.commit();
         assert_eq!(schema.num_columns(), 1);
@@ -1422,12 +1461,34 @@ mod tests {
         let mut builder = manager.builder();
         for i in 1..MAX_COLUMN_FAMILY_COUNT {
             builder
-                .add_column(0, None, None, Some(format!("cf{}", i)))
+                .add_column_in_family(format!("cf{}", i), 0, None, None)
                 .expect("define column family within limit");
         }
         let err = builder
-            .add_column(0, None, None, Some("overflow".to_string()))
+            .add_column_in_family("overflow", 0, None, None)
             .expect_err("overflow should fail");
         assert!(err.to_string().contains("exceeds max"));
+    }
+
+    #[test]
+    fn test_schema_public_column_family_metadata() {
+        let manager = Arc::new(SchemaManager::new(1));
+        let mut builder = manager.builder();
+        builder
+            .add_column_in_family("metrics", 0, None, None)
+            .unwrap();
+        builder
+            .set_column_operator_in_family("metrics", 0, Arc::new(BracketMergeOperator))
+            .unwrap();
+        let schema = builder.commit();
+
+        assert_eq!(
+            schema.column_family_ids(),
+            BTreeMap::from([("default".to_string(), 0), ("metrics".to_string(), 1),])
+        );
+        assert_eq!(
+            schema.operator_ids_in_family("metrics").unwrap(),
+            vec![BracketMergeOperator.id().to_string()]
+        );
     }
 }

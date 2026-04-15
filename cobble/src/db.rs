@@ -317,7 +317,7 @@ impl Db {
     ) -> Result<()> {
         let _guard = db_state.lock();
         let snapshot = db_state.load();
-        let mut desired_cf_ids = schema.column_family_ids();
+        let mut desired_cf_ids = schema.column_family_id_list();
         desired_cf_ids.sort_unstable();
         desired_cf_ids.dedup();
         if desired_cf_ids.is_empty() {
@@ -679,7 +679,7 @@ impl Db {
             callback(result.and_then(|info| {
                 let column_family_ids = schema_manager
                     .schema(info.latest_schema_id)?
-                    .column_family_ids_by_name();
+                    .column_family_ids();
                 Ok(crate::coordinator::ShardSnapshotInput {
                     ranges: info.bucket_ranges,
                     column_family_ids,
@@ -720,7 +720,7 @@ impl Db {
         let column_family_ids = self
             .schema_manager
             .schema(manifest.latest_schema_id)?
-            .column_family_ids_by_name();
+            .column_family_ids();
         let manifest_name = snapshot_manifest_name(snapshot_id);
         let manifest_path = self
             .file_manager

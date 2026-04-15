@@ -1,6 +1,6 @@
 use crate::util::{
-    decode_java_bytes, decode_java_string, throw_illegal_argument, throw_illegal_state,
-    to_java_string_or_throw,
+    decode_java_bytes, decode_java_string, decode_optional_java_string, throw_illegal_argument,
+    throw_illegal_state, to_java_string_or_throw,
 };
 use bytes::Bytes;
 use cobble::{Db, Schema, SchemaBuilder, SingleDb, merge_operator_by_id};
@@ -189,6 +189,7 @@ pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeSetColumnOperator(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
+    column_family: JString,
     column_idx: jint,
     operator_id: JString,
     metadata_json: JString,
@@ -200,6 +201,13 @@ pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeSetColumnOperator(
     let col = column_idx as usize;
     let op_id = match decode_java_string(&mut env, operator_id) {
         Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column_family = match decode_optional_java_string(&mut env, column_family) {
+        Ok(value) => value,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return;
@@ -227,7 +235,7 @@ pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeSetColumnOperator(
             return;
         }
     };
-    if let Err(err) = builder.set_column_operator(None, col, operator) {
+    if let Err(err) = builder.set_column_operator(column_family, col, operator) {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -237,6 +245,7 @@ pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeAddColumn(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
+    column_family: JString,
     column_idx: jint,
     operator_id: JString,
     metadata_json: JString,
@@ -247,6 +256,13 @@ pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeAddColumn(
         return;
     };
     let col = column_idx as usize;
+    let column_family = match decode_optional_java_string(&mut env, column_family) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
     let op_id = if operator_id.is_null() {
         None
     } else {
@@ -287,7 +303,7 @@ pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeAddColumn(
             }
         }
     };
-    if let Err(err) = builder.add_column(col, operator, default_bytes, None) {
+    if let Err(err) = builder.add_column(col, operator, default_bytes, column_family) {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -297,13 +313,21 @@ pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeDeleteColumn(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
+    column_family: JString,
     column_idx: jint,
 ) {
     let Some(builder) = builder_from_handle(native_handle) else {
         throw_illegal_state(&mut env, "schema builder handle is disposed".to_string());
         return;
     };
-    if let Err(err) = builder.delete_column(None, column_idx as usize) {
+    let column_family = match decode_optional_java_string(&mut env, column_family) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    if let Err(err) = builder.delete_column(column_family, column_idx as usize) {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
