@@ -8,22 +8,47 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jint, jlong, jstring};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 // ── Schema JSON ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct SchemaJson {
-    version: u64,
+struct SchemaColumnFamilyJson {
+    id: u8,
+    name: String,
     num_columns: usize,
     operator_ids: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct SchemaJson {
+    version: u64,
+    column_family_ids: BTreeMap<String, u8>,
+    column_families: Vec<SchemaColumnFamilyJson>,
+}
+
 fn schema_to_json_string(schema: &Schema) -> Result<String, String> {
+    let column_family_ids = schema.column_family_ids();
+    let mut column_families = Vec::with_capacity(column_family_ids.len());
+    for (name, num_columns) in schema.column_families() {
+        let id = *column_family_ids
+            .get(&name)
+            .ok_or_else(|| format!("missing column family id for '{}'", name))?;
+        let operator_ids = schema
+            .operator_ids_in_family(name.as_str())
+            .map_err(|err| err.to_string())?;
+        column_families.push(SchemaColumnFamilyJson {
+            id,
+            name,
+            num_columns,
+            operator_ids,
+        });
+    }
     let payload = SchemaJson {
         version: schema.version(),
-        num_columns: schema.num_columns(),
-        operator_ids: schema.all_operator_ids(),
+        column_family_ids,
+        column_families,
     };
     serde_json::to_string(&payload).map_err(|e| e.to_string())
 }

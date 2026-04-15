@@ -986,15 +986,14 @@ class DbBindingTest {
         try (SingleDb db = SingleDb.open(config)) {
             // Read initial schema
             Schema initial = db.currentSchema();
-            assertEquals(2, initial.numColumns);
             assertEquals(0, initial.version);
-            assertNotNull(initial.operatorIds);
-            assertEquals(2, initial.operatorIds.size());
+            assertNotNull(initial.defaultColumnFamily());
+            assertEquals(2, initial.defaultColumnFamily().numColumns);
 
             // Set column 0 to U32CounterMergeOperator via MergeOperatorType enum
             Schema updated =
                     db.updateSchema().setColumnOperator(0, MergeOperatorType.U32_COUNTER).commit();
-            assertEquals(2, updated.numColumns);
+            assertEquals(2, updated.defaultColumnFamily().numColumns);
             assertTrue(updated.version > initial.version);
             assertEquals(MergeOperatorType.U32_COUNTER.operatorId(), updated.mergeOperatorId(0));
 
@@ -1021,12 +1020,12 @@ class DbBindingTest {
 
             // Add a column
             Schema added = db.updateSchema().addColumn(2, null, null).commit();
-            assertEquals(3, added.numColumns);
+            assertEquals(3, added.defaultColumnFamily().numColumns);
             assertTrue(added.version > updated.version);
 
             // Delete a column
             Schema deleted = db.updateSchema().deleteColumn(2).commit();
-            assertEquals(2, deleted.numColumns);
+            assertEquals(2, deleted.defaultColumnFamily().numColumns);
             assertTrue(deleted.version > added.version);
         }
     }
@@ -1038,7 +1037,8 @@ class DbBindingTest {
 
         try (Db db = Db.open(config)) {
             Schema initial = db.currentSchema();
-            assertEquals(1, initial.numColumns);
+            assertNotNull(initial.defaultColumnFamily());
+            assertEquals(1, initial.defaultColumnFamily().numColumns);
 
             Schema updated =
                     db.updateSchema().setColumnOperator(0, MergeOperatorType.U64_COUNTER).commit();
