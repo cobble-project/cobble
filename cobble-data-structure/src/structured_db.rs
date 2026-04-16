@@ -82,6 +82,32 @@ impl StructuredColumnFamilySchema {
 }
 
 impl StructuredSchema {
+    /// Returns structured column families keyed by public column-family name.
+    ///
+    /// The returned view always includes the default family, even when that family
+    /// only relies on implicit `Bytes` columns and therefore has no explicit
+    /// structured-column entries recorded internally.
+    pub fn column_families(&self) -> BTreeMap<String, StructuredColumnFamilySchema> {
+        let mut families = BTreeMap::new();
+        families.insert(
+            DEFAULT_COLUMN_FAMILY_NAME.to_string(),
+            self.column_families
+                .get(&DEFAULT_COLUMN_FAMILY_ID)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        for (name, &id) in &self.column_family_ids {
+            if name == DEFAULT_COLUMN_FAMILY_NAME {
+                continue;
+            }
+            families.insert(
+                name.clone(),
+                self.column_families.get(&id).cloned().unwrap_or_default(),
+            );
+        }
+        families
+    }
+
     pub(crate) fn resolve_column_family_id(&self, column_family: Option<&str>) -> Result<u8> {
         match column_family {
             None => Ok(DEFAULT_COLUMN_FAMILY_ID),
@@ -1520,6 +1546,14 @@ mod tests {
 
         let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
         let baseline = db.current_schema();
+        assert_eq!(
+            baseline
+                .column_families()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["default".to_string()]
+        );
 
         let mut invalid_builder = db.update_schema();
         invalid_builder.add_list_column(Some("   ".to_string()), 0, metrics_config.clone());
@@ -1542,6 +1576,18 @@ mod tests {
                 .get(&1)
                 .and_then(|family| family.columns.get(&0)),
             Some(&StructuredColumnType::List(metrics_config))
+        );
+        let named_families = schema.column_families();
+        assert!(named_families.contains_key("default"));
+        assert_eq!(
+            named_families
+                .get("metrics")
+                .and_then(|family| family.columns.get(&0)),
+            Some(&StructuredColumnType::List(ListConfig {
+                max_elements: Some(5),
+                retain_mode: ListRetainMode::Last,
+                preserve_element_ttl: false,
+            }))
         );
 
         db.close().unwrap();

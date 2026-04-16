@@ -131,7 +131,7 @@ for row in scanner { let (key, columns) = row?; }
 
 Structured values are represented with `StructuredColumnValue` and configured by `StructuredSchema` (`Bytes` / `List` column types).
 
-`StructuredSchema` is also family-aware: it keeps per-family typed columns, and `StructuredSchemaBuilder` methods accept `Option<String>` family arguments. Structured read/scan APIs still reuse raw `ReadOptions` / `ScanOptions` for family selection.
+`StructuredSchema` is also family-aware: `column_families()` returns per-family typed columns keyed by family name and always includes `default`, while `StructuredSchemaBuilder` methods accept `Option<String>` family arguments. Structured read/scan APIs still reuse raw `ReadOptions` / `ScanOptions` for family selection.
 
 ---
 

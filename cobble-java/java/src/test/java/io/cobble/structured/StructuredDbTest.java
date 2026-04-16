@@ -86,7 +86,8 @@ class StructuredDbTest {
                     .addBytesColumn("metrics", 1)
                     .commit();
             Schema schema = db.currentSchema();
-            assertTrue(schema.columnFamilies().containsKey(1));
+            assertTrue(schema.columnFamilies().containsKey("default"));
+            assertTrue(schema.columnFamilies().containsKey("metrics"));
             assertTrue(schema.getColumnType(1, 0) instanceof Schema.ColumnType.List);
             assertTrue(schema.getColumnType(1, 1) instanceof Schema.ColumnType.Bytes);
 

@@ -119,6 +119,7 @@ Snapshot/coordinator flow is the same as raw `Db`, but values are encoded/decode
 Both `StructuredDb` and `StructuredSingleDb` expose:
 
 - `current_schema()` — returns current structured schema
+- `current_schema().column_families()` — returns family-local structured schemas keyed by family name and always includes `default`
 - `update_schema()` — returns a schema builder that directly holds and mutates inner `cobble::SchemaBuilder`
 - builder `.commit()` — persists and applies schema changes
 - `reload_schema()` — reloads from persisted underlying cobble schema

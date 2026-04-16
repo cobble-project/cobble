@@ -170,6 +170,9 @@ db.put(
         0,
         ColumnValue.ofList(new byte[][] {"a".getBytes()}));
 Row metricsRow = db.get(0, "user:1".getBytes(), "metrics");
+var namedFamilies = db.currentSchema().columnFamilies();
+assert namedFamilies.containsKey("default");
+assert namedFamilies.containsKey("metrics");
 ```
 
 ### Distributed Scan
