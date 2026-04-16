@@ -1,4 +1,5 @@
 use crate::block_cache::{BlockCache, new_block_cache_with_config};
+use crate::db::select_projected_columns;
 use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
@@ -303,6 +304,15 @@ impl ReadOnlyDb {
             column_family_id,
             Some(self.ttl_provider.time_provider()),
         )
+        .map(|value| {
+            value.map(|columns| {
+                if let Some(selected_columns) = options.columns() {
+                    select_projected_columns(columns, selected_columns)
+                } else {
+                    columns
+                }
+            })
+        })
     }
 
     pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<DbIterator<'static>> {

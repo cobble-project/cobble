@@ -174,6 +174,17 @@ where
     Ok(Some(columns))
 }
 
+pub(crate) fn select_projected_columns<T>(
+    mut columns: Vec<Option<T>>,
+    selected_columns: &[usize],
+) -> Vec<Option<T>> {
+    let mut projected = Vec::with_capacity(selected_columns.len());
+    for &column_idx in selected_columns {
+        projected.push(columns.get_mut(column_idx).and_then(|column| column.take()));
+    }
+    projected
+}
+
 impl Db {
     #[inline]
     fn ensure_open(&self) -> Result<()> {
@@ -1005,7 +1016,7 @@ impl Db {
             encoded_key.as_ref(),
             |raw, source_schema| {
                 let mut raw_value = Bytes::copy_from_slice(raw);
-                let mut value = if source_schema.version() == schema.version() {
+                let value = if source_schema.version() == schema.version() {
                     decode_value_masked(
                         &mut raw_value,
                         source_schema
@@ -1041,9 +1052,6 @@ impl Db {
                             *mask_byte &= selected[idx];
                         }
                     }
-                }
-                if let Some(columns) = selected_columns {
-                    value = value.select_columns(columns);
                 }
                 values.push(value);
                 Ok(())
@@ -1115,7 +1123,13 @@ impl Db {
             Some(self.time_provider.as_ref()),
         );
         match result {
-            Ok(value) => Ok(value),
+            Ok(value) => Ok(value.map(|columns| {
+                if let Some(selected_columns) = selected_columns {
+                    select_projected_columns(columns, selected_columns)
+                } else {
+                    columns
+                }
+            })),
             Err(err) => {
                 self.maybe_mark_error_on_read(&err);
                 Err(err)
@@ -1151,6 +1165,7 @@ impl Db {
             .scan_memtable_iterators_with_snapshot(
                 Arc::clone(&snapshot),
                 Arc::clone(&schema),
+                column_family_id,
                 options.columns(),
             )?;
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
@@ -1465,6 +1480,72 @@ mod tests {
                 .level_files_in_tree(metrics_tree_idx, 0)
                 .is_empty()
         );
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_non_default_single_column_family_round_trip_and_scan() {
+        let root = "/tmp/db_cf_single_column_roundtrip";
+        cleanup_test_root(root);
+        let config = Config {
+            num_columns: 2,
+            ..config_with_small_memtable(root)
+        };
+        let db = open_db(config);
+        let mut schema = db.update_schema();
+        schema
+            .add_column(0, None, None, Some("metrics".to_string()))
+            .unwrap();
+        schema.commit();
+
+        db.put_with_options(
+            0,
+            b"k1",
+            0,
+            b"v1",
+            &WriteOptions::with_column_family("metrics"),
+        )
+        .unwrap();
+        db.put_with_options(
+            0,
+            b"k2",
+            0,
+            b"v2",
+            &WriteOptions::with_column_family("metrics"),
+        )
+        .unwrap();
+
+        let value = db
+            .get_with_options(0, b"k1", &ReadOptions::for_column_in_family("metrics", 0))
+            .unwrap()
+            .expect("value present");
+        assert_eq!(value.len(), 1);
+        assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
+
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        let mut iter = db
+            .scan_with_options(
+                0,
+                b"k1".as_slice()..b"k3".as_slice(),
+                &ScanOptions::for_column(0).with_column_family("metrics"),
+            )
+            .unwrap();
+
+        let (k1, cols1) = iter.next().unwrap().unwrap();
+        assert_eq!(k1.as_ref(), b"k1");
+        assert_eq!(cols1.len(), 1);
+        assert_eq!(cols1[0].as_ref().unwrap().as_ref(), b"v1");
+
+        let (k2, cols2) = iter.next().unwrap().unwrap();
+        assert_eq!(k2.as_ref(), b"k2");
+        assert_eq!(cols2.len(), 1);
+        assert_eq!(cols2[0].as_ref().unwrap().as_ref(), b"v2");
+
+        assert!(iter.next().is_none());
 
         cleanup_test_root(root);
     }
@@ -1998,6 +2079,40 @@ mod tests {
         assert_eq!(rows[0].1.as_ref().unwrap().as_ref(), b"new");
         assert_eq!(rows[1].0.as_ref(), b"k2");
         assert_eq!(rows[1].1.as_ref().unwrap().as_ref(), b"v2");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_get_with_projected_merge_operator_column() {
+        let root = "/tmp/db_get_projected_merge_operator_column";
+        cleanup_test_root(root);
+        let config = Config {
+            num_columns: 2,
+            ..config_with_small_memtable(root)
+        };
+        let db = open_db(config);
+
+        let mut schema = db.update_schema();
+        schema
+            .set_column_operator(None, 1, Arc::new(U64CounterMergeOperator))
+            .unwrap();
+        let _ = schema.commit();
+
+        db.put(0, b"k1", 0, b"base").unwrap();
+        db.put(0, b"k1", 1, 1u64.to_le_bytes()).unwrap();
+        db.merge(0, b"k1", 1, 10u64.to_le_bytes()).unwrap();
+
+        let value = db
+            .get_with_options(0, b"k1", &ReadOptions::for_column(1))
+            .unwrap()
+            .expect("value present");
+        assert_eq!(value.len(), 1);
+        assert_eq!(
+            decode_u64_counter(value[0].as_ref().unwrap().as_ref()),
+            11u64
+        );
 
         cleanup_test_root(root);
     }

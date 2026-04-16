@@ -178,6 +178,19 @@ pub extern "system" fn Java_io_cobble_ReadOptions_clearColumnFamily(
         rebuild_read_options(None, read_options.read_options.column_indices.clone());
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ReadOptions_clearColumns(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) {
+    let Some(read_options) = read_options_from_handle_mut_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    read_options.read_options =
+        rebuild_read_options(read_options.read_options.column_family.clone(), None);
+}
+
 fn read_options_from_handle_or_throw_impl(
     env: &mut JNIEnv,
     native_handle: jlong,

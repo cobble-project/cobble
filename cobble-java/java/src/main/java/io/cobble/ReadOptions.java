@@ -47,6 +47,12 @@ public final class ReadOptions extends NativeObject {
         return this;
     }
 
+    /** Clear any previously selected columns and read all columns in the selected family. */
+    public ReadOptions clearColumns() {
+        clearColumns(nativeHandle);
+        return this;
+    }
+
     /** Create options for one selected column. */
     public static ReadOptions forColumn(int columnIndex) {
         return new ReadOptions().column(columnIndex);
@@ -89,6 +95,8 @@ public final class ReadOptions extends NativeObject {
     private static native void setColumnFamily(long nativeHandle, String columnFamily);
 
     private static native void clearColumnFamily(long nativeHandle);
+
+    private static native void clearColumns(long nativeHandle);
 
     private static long loadAndCreateHandle() {
         NativeLoader.load();

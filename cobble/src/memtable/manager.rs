@@ -904,7 +904,10 @@ impl MemtableManager {
                     continue;
                 }
             }
-            let num_columns = active.schema.num_columns();
+            let num_columns = active
+                .schema
+                .num_columns_in_family(key.column_family())
+                .unwrap_or(0);
             if active.memtable.is_none() {
                 drop(active);
                 continue;
@@ -959,7 +962,10 @@ impl MemtableManager {
         key: &RefKey<'_>,
         value: &RefValue<'_>,
     ) -> Result<bool> {
-        let num_columns = self.schema_manager.current_num_columns();
+        let latest_schema = self.schema_manager.latest_schema();
+        let num_columns = latest_schema
+            .num_columns_in_family(key.column_family())
+            .unwrap_or_else(|| self.schema_manager.current_num_columns());
         let capacity = VecMemtable::estimate_capacity_for_ref(
             key,
             value,
@@ -1108,9 +1114,13 @@ impl MemtableManager {
         &self,
         snapshot: Arc<DbState>,
         target_schema: Arc<Schema>,
+        column_family_id: u8,
         selected_columns: Option<&[usize]>,
     ) -> Result<Vec<DynKvIterator>> {
         let mut iterators: Vec<DynKvIterator> = Vec::new();
+        let target_num_columns = target_schema
+            .num_columns_in_family(column_family_id)
+            .unwrap_or(0);
         if let Some(active) = &snapshot.active {
             let source_schema = {
                 let active_guard = active.lock().unwrap();
@@ -1130,7 +1140,7 @@ impl MemtableManager {
             let iter: DynKvIterator = if let Some(columns) = selected_columns {
                 Box::new(ColumnMaskingIterator::new(
                     iter,
-                    target_schema.num_columns(),
+                    target_num_columns,
                     columns,
                 ))
             } else {
@@ -1153,7 +1163,7 @@ impl MemtableManager {
             let iter: DynKvIterator = if let Some(columns) = selected_columns {
                 Box::new(ColumnMaskingIterator::new(
                     iter,
-                    target_schema.num_columns(),
+                    target_num_columns,
                     columns,
                 ))
             } else {

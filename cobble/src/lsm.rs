@@ -1183,11 +1183,6 @@ impl LSMTree {
                 }
             }
             let value = apply_vlog_offset_to_value(value, file.vlog_file_seq_offset)?;
-            let value = if let Some(columns) = selected_columns {
-                value.select_columns(columns)
-            } else {
-                value
-            };
             let should_stop = num_columns > 1 && value.is_terminal();
             if let Some(ref mask) = terminal_mask {
                 for (idx, mask_byte) in mask.iter().enumerate().take(mask_size) {
