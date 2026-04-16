@@ -167,7 +167,7 @@ https://cobble-project.github.io/cobble/latest/getting-started/distributed/
 ### 3) Real-time read while writing (`Reader`)
 
 ```rust
-use cobble::{Reader, ReaderConfig, VolumeDescriptor};
+use cobble::{ReadOptions, Reader, ReaderConfig, VolumeDescriptor};
 
 let read_config = ReaderConfig {
     volumes: VolumeDescriptor::single_volume("file:///tmp/cobble"),
@@ -176,6 +176,11 @@ let read_config = ReaderConfig {
 };
 let mut reader = Reader::open_current(read_config)?;
 let v = reader.get(0, b"user:1")?;
+let metrics = reader.get_with_options(
+    0,
+    b"user:1",
+    &ReadOptions::for_column_in_family("metrics", 0),
+)?;
 reader.refresh()?; // pull newer materialized snapshot
 ```
 
@@ -187,15 +192,21 @@ https://cobble-project.github.io/cobble/latest/getting-started/reader-and-scan/
 ```rust
 use cobble::{ScanOptions, ScanPlan};
 
-let plan = ScanPlan::new(global_manifest);
+let plan = ScanPlan::new(global_manifest); // plan stays bucket-only
+let scan_options = ScanOptions::for_column(0).with_column_family("metrics");
+
 for split in plan.splits() {
-    let scanner = split.create_scanner(config.clone(), &ScanOptions::default())?;
+    let scanner = split.create_scanner(config.clone(), &scan_options)?;
     for row in scanner {
         let (key, columns) = row?;
         // process row...
     }
 }
 ```
+
+If you want to scan a non-default family, pass it when creating the scanner. `ScanPlan` / `ScanSplit` do not bind a family by themselves.
+
+`create_scanner(...)` keeps the full `ScanOptions` inside the worker-side scanner, so `column_family` still takes effect after a split is serialized and reopened elsewhere.
 
 ### 5) Structured DB wrappers (typed columns)
 
@@ -209,6 +220,10 @@ for split in plan.splits() {
 All snapshot/read/scan patterns are the same as core `cobble`, but values are
 encoded/decoded as structured typed columns (`Bytes`/`List`).
 
+Structured wrappers are column-family aware too: `StructuredSchema` keeps
+family-local typed columns, and you still select a family through the same raw
+`ReadOptions` / `ScanOptions` / `WriteOptions`.
+
 ```rust
 use bytes::Bytes;
 use cobble::{Config, VolumeDescriptor};
@@ -221,7 +236,7 @@ config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-structured"
 
 let mut db = StructuredSingleDb::open(config)?;
 db.update_schema()
-  .add_list_column(1, ListConfig {
+  .add_list_column(None, 1, ListConfig {
       max_elements: Some(100),
       retain_mode: ListRetainMode::Last,
       preserve_element_ttl: false,

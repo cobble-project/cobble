@@ -40,6 +40,23 @@ This page summarizes the public Rust API surface of the Cobble crates.
 | `ScanOptions` | Scan/iteration options |
 | `WriteOptions` | Write operation options |
 
+### Metadata & Schema Types
+
+| Type | Description |
+|------|-------------|
+| `Schema` | Current raw schema with family-local metadata |
+| `SchemaBuilder` | Schema evolution builder; column-family aware via optional family arguments |
+| `ShardSnapshotInput` | Shard snapshot DTO used by the coordinator |
+| `GlobalSnapshotManifest` | Materialized global snapshot manifest |
+
+### Column Family Model
+
+- The default family is `default`.
+- Plain raw `put` / `merge` / `delete` / `get` / `scan` APIs use the default family.
+- Raw Rust selects other families through `WriteOptions::with_column_family`, `ReadOptions::for_column_in_family` / `for_columns_in_family` / `with_column_family`, and `ScanOptions::with_column_family`.
+- Named families are created through `SchemaBuilder`, not through config.
+- Distributed routing stays bucket-only, but for `Reader` and `ScanPlan`, the column family should be selected through options. That means only one family is read or scan per operation.
+
 ### Compaction Types
 
 | Type | Description |
@@ -54,9 +71,11 @@ This page summarizes the public Rust API surface of the Cobble crates.
 SingleDb::open(config) -> Result<SingleDb>
 SingleDb::resume(config, global_snapshot_id) -> Result<SingleDb>
 db.put(bucket, key, column, value) -> Result<()>
+db.put_with_options(bucket, key, column, value, &WriteOptions::with_column_family("metrics")) -> Result<()>
 db.merge(bucket, key, column, value) -> Result<()>
 db.delete(bucket, key, column) -> Result<()>
 db.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Bytes>>>>
+db.scan_with_options(bucket, range, &ScanOptions::for_column(0).with_column_family("metrics")) -> Result<DbIterator<'_>>
 db.snapshot() -> Result<u64>
 db.snapshot_with_callback(callback) -> Result<u64>
 ```
@@ -67,6 +86,8 @@ db.snapshot_with_callback(callback) -> Result<u64>
 Db::open(config, bucket_ranges) -> Result<Db>
 Db::open_from_snapshot(config, snapshot_id, db_id) -> Result<Db>
 ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id) -> Result<ReadOnlyDb>
+db.current_schema() -> Arc<Schema>
+db.update_schema() -> SchemaBuilder
 db.put(bucket, key, column, value) -> Result<()>
 db.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Bytes>>>>
 db.snapshot() -> Result<u64>
@@ -78,15 +99,16 @@ db.shard_snapshot_input(snapshot_id) -> Result<ShardSnapshotInput>
 ```rust
 Reader::open_current(reader_config) -> Result<Reader>
 reader.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Bytes>>>>
+reader.current_global_snapshot() -> &GlobalSnapshotManifest
 reader.refresh() -> Result<()>
 ```
 
 #### Scan
 
 ```rust
-ScanPlan::new(manifest) -> ScanPlan
+ScanPlan::new(manifest) -> ScanPlan // bucket-only
 plan.splits() -> Vec<ScanSplit>
-split.create_scanner(config, &scan_options) -> Result<ScanSplitScanner>
+split.create_scanner(config, &scan_options) -> Result<ScanSplitScanner> // choose non-default family here via ScanOptions
 for row in scanner { let (key, columns) = row?; }
 ```
 
@@ -108,6 +130,8 @@ for row in scanner { let (key, columns) = row?; }
 | `StructuredRemoteCompactionServer` | Remote compaction with structured merge ops |
 
 Structured values are represented with `StructuredColumnValue` and configured by `StructuredSchema` (`Bytes` / `List` column types).
+
+`StructuredSchema` is also family-aware: it keeps per-family typed columns, and `StructuredSchemaBuilder` methods accept `Option<String>` family arguments. Structured read/scan APIs still reuse raw `ReadOptions` / `ScanOptions` for family selection.
 
 ---
 
@@ -133,12 +157,17 @@ The Java API mirrors the Rust API. See [Java Bindings](../ffi-bindings/java) for
 |-------|-----------------|
 | `io.cobble.SingleDb` | `SingleDb` |
 | `io.cobble.Db` | `Db` |
+| `io.cobble.ReadOnlyDb` | `ReadOnlyDb` |
 | `io.cobble.Reader` | `Reader` |
 | `io.cobble.Config` | `Config` |
+| `io.cobble.ReadOptions` / `ScanOptions` / `WriteOptions` | Raw family-aware options |
+| `io.cobble.Schema` / `SchemaBuilder` | Raw schema view and evolution builder |
+| `io.cobble.ShardSnapshot` / `GlobalSnapshot` | Snapshot DTOs that preserve named family mapping |
 | `io.cobble.ScanPlan` | `ScanPlan` |
 | `io.cobble.ScanSplit` | `ScanSplit` |
 | `io.cobble.ScanCursor` | Raw scan iterator cursor |
 | `io.cobble.structured.SingleDb` | Structured `SingleDb` |
 | `io.cobble.structured.Db` | Structured `Db` |
+| `io.cobble.structured.Schema` / `StructuredSchemaBuilder` | Structured family-aware schema API |
 | `io.cobble.structured.StructuredScanSplit` | Structured distributed split |
 | `io.cobble.structured.ScanCursor` | Structured scan iterator cursor |

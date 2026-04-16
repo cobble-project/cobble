@@ -137,6 +137,8 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 | `num_columns` | `usize` | 1 | Initial number of columns in the default column family when creating a new DB |
 | `total_buckets` | `u32` | 1 | Total buckets for sharding (1–65536) |
 
+Named column families are added later through schema evolution. Reopen, restore, read-only, and compaction paths use the persisted schema rather than reapplying `num_columns`.
+
 ### Volume Offload
 
 | Parameter | Type | Default | Description |

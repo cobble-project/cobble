@@ -17,7 +17,7 @@ use std::sync::Arc;
 use cobble::{Db, U64CounterMergeOperator};
 
 let mut builder = db.update_schema();
-builder.set_column_operator(2, Arc::new(U64CounterMergeOperator))?;
+builder.set_column_operator(None, 2, Arc::new(U64CounterMergeOperator))?;
 let _new_schema = builder.commit();
 ```
 
@@ -27,7 +27,20 @@ For adding/removing columns with explicit position control:
 let mut builder = db.update_schema();
 builder.add_column(1, None, None, None)?;     // insert new column at index 1
 // or
-builder.delete_column(1)?;              // delete column at index 1
+builder.delete_column(None, 1)?;              // delete column 1 in the default family
+let _new_schema = builder.commit();
+```
+
+Column evolution is family-local. Named families are created through the same builder:
+
+```rust
+let mut builder = db.update_schema();
+builder.add_column(0, None, None, Some("metrics".to_string()))?;
+builder.set_column_operator(
+    Some("metrics".to_string()),
+    0,
+    Arc::new(U64CounterMergeOperator),
+)?;
 let _new_schema = builder.commit();
 ```
 
@@ -58,7 +71,7 @@ This is why deletion is safe online: query behavior switches at schema-commit ti
 Read APIs (`get`, `scan`, `Reader`, `ReadOnlyDb`) always return values in the current schema shape:
 
 - Schema evolution is applied per-row when source files are older than current schema.
-- Column projection (`ReadOptions.column_indices` / `ScanOptions.column_indices`) is interpreted against the current schema.
+- Column projection (`ReadOptions.column_indices` / `ScanOptions.column_indices`) is interpreted against the current schema of the selected column family.
 - Merge operator dispatch uses per-column operator mapping from the active schema (see [Merge Operators](merge-operator)).
 
 In short: callers do not need to branch on file age or schema version.

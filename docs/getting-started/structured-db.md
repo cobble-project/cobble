@@ -32,7 +32,7 @@ config.total_buckets = 1;
 config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-structured-single");
 let mut db = StructuredSingleDb::open(config)?;
 db.update_schema()
-  .add_list_column(1, ListConfig {
+  .add_list_column(None, 1, ListConfig {
       max_elements: Some(100),
       retain_mode: ListRetainMode::Last,
       preserve_element_ttl: false,
@@ -51,6 +51,45 @@ db.merge(0, b"k1", 1, StructuredColumnValue::List(vec![
 let row = db.get(0, b"k1")?.unwrap();
 ```
 
+## Structured Column Families
+
+Structured wrappers use the same family-selection model as raw Cobble:
+
+- add or delete typed columns with `Option<String>` family arguments on the schema builder;
+- use `WriteOptions`, `ReadOptions`, and `ScanOptions` to select a named family at write/read/scan time.
+
+```rust
+use cobble::{ReadOptions, ScanOptions, WriteOptions};
+
+db.update_schema()
+  .add_list_column(Some("metrics".to_string()), 0, ListConfig {
+      max_elements: Some(100),
+      retain_mode: ListRetainMode::Last,
+      preserve_element_ttl: false,
+  })
+  .commit()?;
+
+db.put_with_options(
+    0,
+    b"k-metrics",
+    0,
+    StructuredColumnValue::List(vec![Bytes::from_static(b"a")]),
+    &WriteOptions::with_column_family("metrics"),
+)?;
+
+let row = db.get_with_options(
+    0,
+    b"k-metrics",
+    &ReadOptions::for_column_in_family("metrics", 0),
+)?;
+
+let scanner = db.scan_with_options(
+    0,
+    b"k".as_ref()..b"l".as_ref(),
+    &ScanOptions::for_column(0).with_column_family("metrics"),
+)?;
+```
+
 ## StructuredDb (Distributed shard writer)
 
 ```rust
@@ -63,7 +102,7 @@ config.total_buckets = 1024;
 config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-structured-dist");
 let mut db = StructuredDb::open(config, vec![0u16..=1023u16])?;
 db.update_schema()
-  .add_list_column(1, ListConfig {
+  .add_list_column(None, 1, ListConfig {
       max_elements: Some(100),
       retain_mode: ListRetainMode::Last,
       preserve_element_ttl: false,
@@ -86,16 +125,18 @@ Both `StructuredDb` and `StructuredSingleDb` expose:
 
 Builder methods are applied incrementally to the inner schema builder (matching core schema-builder semantics):
 
-- `add_bytes_column(column)` — set column type back to `Bytes`
-- `add_list_column(column, config)` — set column type to `List`
-- `delete_column(column)` — remove structured typing for this column (fallback to `Bytes`)
+- `add_bytes_column(None, column)` / `add_bytes_column(Some("metrics".to_string()), column)` — set column type to `Bytes`
+- `add_list_column(None, column, config)` / `add_list_column(Some("metrics".to_string()), column, config)` — set column type to `List`
+- `delete_column(None, column)` / `delete_column(Some("metrics".to_string()), column)` — remove structured typing for this family-local column
+
+Adding a typed column in a new family also creates that family in the underlying raw schema.
 
 ## StructuredReader and StructuredReadOnlyDb
 
 Corresponding structured wrappers are provided for `Reader` and `ReadOnlyDb`:
 
 ```rust
-use cobble::{Config, ReaderConfig, VolumeDescriptor};
+use cobble::{Config, ReadOptions, ReaderConfig, ScanOptions, VolumeDescriptor};
 use cobble_data_structure::{StructuredReader, StructuredReadOnlyDb};
 
 let read_config = ReaderConfig {
@@ -105,7 +146,11 @@ let read_config = ReaderConfig {
 };
 
 let mut reader = StructuredReader::open_current(read_config)?;
-let row = reader.get(0, b"k1")?;
+let row = reader.get_with_options(
+    0,
+    b"k1",
+    &ReadOptions::for_column_in_family("metrics", 0),
+)?;
 reader.refresh()?;
 
 let mut config = Config::default();
@@ -113,7 +158,16 @@ config.num_columns = 2;
 config.total_buckets = 1024;
 config.volumes = VolumeDescriptor::single_volume("file:///tmp/my-db");
 let ro = StructuredReadOnlyDb::open(config, snapshot_id, db_id)?;
-let row2 = ro.get(0, b"k1")?;
+let row2 = ro.get_with_options(
+    0,
+    b"k1",
+    &ReadOptions::for_column_in_family("metrics", 0),
+)?;
+let scanner = ro.scan_with_options(
+    0,
+    b"k".as_ref()..b"l".as_ref(),
+    &ScanOptions::for_column(0).with_column_family("metrics"),
+)?;
 ```
 
 ## Structured Distributed Scan
@@ -122,9 +176,12 @@ let row2 = ro.get(0, b"k1")?;
 use cobble::ScanOptions;
 use cobble_data_structure::StructuredScanPlan;
 
-let plan = StructuredScanPlan::new(global_manifest);
+let plan = StructuredScanPlan::new(global_manifest); // still bucket-only
 for split in plan.splits() {
-    let scanner = split.create_scanner(config.clone(), &ScanOptions::default())?;
+    let scanner = split.create_scanner(
+        config.clone(),
+        &ScanOptions::for_column(0).with_column_family("metrics"),
+    )?;
     for row in scanner {
         let (key, columns) = row?;
         // columns: Vec<Option<StructuredColumnValue>>
@@ -132,6 +189,8 @@ for split in plan.splits() {
 }
 ```
 
+As with raw scans, the family is chosen when creating the scanner. If you omit `with_column_family(...)`, the scanner reads the default family.
+
 ## Projection Notes
 
-`ReadOptions`/`ScanOptions` projection is supported. The structured wrappers remap schema indices correctly for projected columns, so decoded values match the projected column order.
+`ReadOptions`/`ScanOptions` projection is supported. Projection indices are interpreted inside the selected column family, and the structured wrappers remap schema indices correctly so decoded values match the projected column order.

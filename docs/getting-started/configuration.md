@@ -170,6 +170,8 @@ All capacity/size fields in `Config` (such as `memtable_capacity`, `l1_base_byte
 | `num_columns` | 1 | Initial number of columns in the default column family when creating a new DB |
 | `total_buckets` | 1 | Total bucket count for sharding (1–65536) |
 
+Named column families are created later through schema evolution. Reopen, restore, `ReadOnlyDb`, and `Reader` all load the actual family widths from persisted schema metadata instead of reusing `num_columns`.
+
 ### Volume Offload
 
 | Parameter | Default | Description |

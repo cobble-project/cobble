@@ -10,11 +10,23 @@ Before diving into specific usage patterns, it helps to understand the core buil
 
 ## The Key-Value Model
 
-Cobble stores data as **key → multi-column value** pairs, grouped into numbered **buckets**. Buckets provide simple horizontal partitioning — you decide how many buckets exist, and how keys are distributed across them is your application's responsibility (typically a hash of the key).
+Cobble stores data as **key → multi-column value** pairs, grouped into numbered **buckets** and named **column families**. Buckets provide simple horizontal partitioning — you decide how many buckets exist, and how keys are distributed across them is your application's responsibility (typically a hash of the key).
 
-Each column in a value is independent: you can put, merge, or delete individual columns without affecting the others. The number of columns is fixed per database configuration but can evolve over time with [schema evolution](../architecture/schema-evolution).
+Each column in a value is independent: you can put, merge, or delete individual columns without affecting the others. Column counts are family-local. `Config.num_columns` only bootstraps the default column family when creating a brand-new database; later column additions, deletions, and named-family creation happen through [schema evolution](../architecture/schema-evolution).
 
 For merge operations, you define a [merge operator](../architecture/merge-operator) that specifies how to combine new values with existing ones. This is useful for patterns like counters, lists, sets, or any case where you want to update a value based on its current state without reading it first.
+
+## Column Families
+
+The column family is a logical grouping of columns that will be stored and accessed together. Data from different column families is kept separate internally, so they are not allowed to be accessed together. You should specify one column family per operation, and if you need to read or write across multiple families, you need to issue separate calls.
+The columns in each family are indexed starting from 0.
+The default family is named `default`. Inside one `Db`, each `(bucket, column family)` maps to its own internal LSM organization, but the public distributed model stays **bucket-only**:
+
+- if a shard owns a bucket, it owns **all** column families in that bucket;
+- `ScanPlan` / `ScanSplit` are bucket/shard work units, not column-family routing units;
+- raw APIs choose a family with `WriteOptions`, `ReadOptions`, and `ScanOptions`.
+
+Limitation: Cobble only support maximum of 230 column families. Do not create more.
 
 ## Core Components
 
@@ -48,7 +60,7 @@ A `Reader` provides **snapshot-following reads** against distributed snapshots. 
 
 A `Scanner` is a **streaming iterator** over a range of keys within a single bucket or shard. It is the low-level primitive underlying both `Reader` scans and distributed scans.
 
-For distributed analytical workloads, a **`ScanPlan`** is generated from a global snapshot, then split into independent **`ScanSplit`** objects — one per shard. Each split can be sent to a different worker, where it creates its own `Scanner` and iterates independently. See [Reader & Distributed Scan](reader-and-scan).
+For distributed analytical workloads, a **`ScanPlan`** is generated from a global snapshot, then split into independent **`ScanSplit`** objects — one per shard. Each split can be sent to a different worker, where it creates its own `Scanner` and iterates independently. The scanner receives the full `ScanOptions`, so **scanner creation is also where you choose a non-default column family**. See [Reader & Distributed Scan](reader-and-scan).
 
 ### StructuredDb (and related wrappers)
 
@@ -62,6 +74,7 @@ Snapshots serve several purposes:
 
 - **Recovery**: After a restart, you restore from the last known-good snapshot. Any writes that were not captured in a snapshot are lost (similar to how a WAL checkpoint works in other systems).
 - **Distributed consistency**: In a multi-shard deployment, a global snapshot ties together the individual shard snapshots into a single consistent view across all `Db` instances.
+- **CF consistency**: shard and global snapshot metadata preserve the same named column families across shards.
 - **Read isolation**: `ReadOnlyDb` and `Reader` operate against a snapshot, so they see a stable view of the data that doesn't change as new writes arrive.
 - **Distributed scan**: A `ScanPlan` is always based on a global snapshot, ensuring that a parallel scan across many shards sees a consistent dataset.
 

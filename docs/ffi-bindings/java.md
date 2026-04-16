@@ -27,12 +27,11 @@ We have published the Java API to Maven Central. You can add it as a dependency 
 For single-machine embedded use. See [Single-Machine Embedded DB](../getting-started/single-db) for the full workflow.
 
 ```java
+import io.cobble.GlobalSnapshot;
 import io.cobble.SingleDb;
-import io.cobble.Config;
-import io.cobble.ReadOptions;
 
-Config config = Config.fromPath("config.yaml");
-SingleDb db = SingleDb.open(config);
+String configPath = "config.yaml";
+SingleDb db = SingleDb.open(configPath);
 
 // Write
 db.put(0, "user:1".getBytes(), 0, "Alice".getBytes());
@@ -41,9 +40,9 @@ db.put(0, "user:1".getBytes(), 0, "Alice".getBytes());
 byte[] value = db.get(0, "user:1".getBytes(), 0);
 
 // Snapshot and resume
-long snapshotId = db.snapshot();
+GlobalSnapshot snapshot = db.snapshot();
 db.close();
-db = SingleDb.resume(config, snapshotId);
+db = SingleDb.resume(configPath, snapshot.id);
 ```
 
 ### Db (Distributed)
@@ -54,7 +53,7 @@ For multi-shard deployments. See [Distributed Deployment](../getting-started/dis
 import io.cobble.Db;
 import io.cobble.ShardSnapshot;
 
-Db db = Db.open(config);
+Db db = Db.open("config.yaml");
 db.put(0, "key".getBytes(), 0, "value".getBytes());
 
 // Create snapshot input for coordinator
@@ -68,9 +67,75 @@ For snapshot-following reads. Reader visibility advances when new snapshots are 
 ```java
 import io.cobble.Reader;
 
-Reader reader = Reader.openCurrent(config);
+Reader reader = Reader.openCurrent("config.yaml");
 byte[] value = reader.get(0, "key".getBytes(), 0);
 reader.refresh();
+```
+
+## Column Families
+
+The Java API exposes column families in two ways:
+
+- convenience overloads with `String columnFamily` on `Db`, `SingleDb`, `ReadOnlyDb`, `Reader`, and structured wrappers;
+- reusable `ReadOptions`, `WriteOptions`, and `ScanOptions` objects.
+
+`ScanPlan` / `StructuredScanPlan` stay bucket-only. To scan a named family, build the plan from a global snapshot as usual, then pass `ScanOptions.columnFamily(...)` when opening the scanner. That scanner-open step is where the family becomes effective.
+
+### Raw API
+
+```java
+import io.cobble.Db;
+import io.cobble.ReadOptions;
+import io.cobble.ScanCursor;
+import io.cobble.ScanOptions;
+import io.cobble.Schema;
+import io.cobble.WriteOptions;
+
+Db db = Db.open("config.yaml");
+db.updateSchema().addColumn("metrics", 0, null, null).commit();
+
+try (WriteOptions write = WriteOptions.withColumnFamily("metrics")) {
+    db.putWithOptions(0, "user:1".getBytes(), 0, "42".getBytes(), write);
+}
+
+try (ReadOptions read = ReadOptions.forColumnInFamily("metrics", 0)) {
+    byte[][] row = db.getWithOptions(0, "user:1".getBytes(), read);
+}
+
+try (ScanOptions scan = ScanOptions.forColumns(0).columnFamily("metrics")) {
+    try (ScanCursor cursor =
+            db.scanWithOptions(0, "user:".getBytes(), "user;".getBytes(), scan)) {
+        for (ScanCursor.Entry entry : cursor) {
+            byte[] key = entry.key;
+            byte[][] columns = entry.columns;
+        }
+    }
+}
+
+Schema schema = db.currentSchema();
+assert schema.columnFamily("metrics") != null;
+```
+
+`ReadOptions` also provides `forColumnsInFamily(...)` and `defaultsInFamily(...)`. `ScanOptions` intentionally uses `forColumns(...).columnFamily(...)`.
+
+Snapshot DTOs also preserve the mapping:
+
+```java
+import io.cobble.Db;
+import io.cobble.DbCoordinator;
+import io.cobble.GlobalSnapshot;
+import io.cobble.ShardSnapshot;
+import java.util.List;
+
+Db db = Db.open("config.yaml");
+DbCoordinator coordinator = DbCoordinator.open("coordinator.yaml");
+ShardSnapshot shardSnapshot = db.snapshot();
+int totalBuckets = 1024;
+long globalSnapshotId = 42L;
+
+GlobalSnapshot globalSnapshot =
+        coordinator.materializeGlobalSnapshot(
+                totalBuckets, globalSnapshotId, List.of(shardSnapshot));
 ```
 
 ### Structured Wrappers
@@ -82,12 +147,29 @@ import io.cobble.structured.SingleDb;
 import io.cobble.structured.ColumnValue;
 import io.cobble.structured.Row;
 
-SingleDb db = SingleDb.open(config);
+SingleDb db = SingleDb.open("config.yaml");
 db.updateSchema()
     .addListColumn(1, io.cobble.structured.ListConfig.of(100, io.cobble.structured.ListRetainMode.LAST))
     .commit();
 db.put(0, "user:1".getBytes(), 0, ColumnValue.ofBytes("Alice".getBytes()));
 Row row = db.get(0, "user:1".getBytes());
+```
+
+Structured schema builders also accept named families, and structured schema views are family-aware:
+
+```java
+db.updateSchema()
+    .addListColumn("metrics", 0, io.cobble.structured.ListConfig.of(
+            100, io.cobble.structured.ListRetainMode.LAST))
+    .commit();
+
+db.put(
+        0,
+        "user:1".getBytes(),
+        "metrics",
+        0,
+        ColumnValue.ofList(new byte[][] {"a".getBytes()}));
+Row metricsRow = db.get(0, "user:1".getBytes(), "metrics");
 ```
 
 ### Distributed Scan
@@ -96,14 +178,16 @@ For parallel analytical scans across shards. See [Reader & Distributed Scan](../
 
 ```java
 import io.cobble.ScanPlan;
+import io.cobble.ScanOptions;
 import io.cobble.ScanSplit;
 import io.cobble.ScanCursor;
 
 ScanPlan plan = ScanPlan.fromGlobalSnapshot(manifest);
 List<ScanSplit> splits = plan.splits();
+ScanOptions scanOptions = ScanOptions.forColumns(0).columnFamily("metrics");
 
 for (ScanSplit split : splits) {
-    try (ScanCursor cursor = split.openScannerWithOptions(config, scanOptions)) {
+    try (ScanCursor cursor = split.openScannerWithOptions("config.yaml", scanOptions)) {
         for (ScanCursor.Entry entry : cursor) {
             byte[] key = entry.key;
             byte[][] columns = entry.columns;
@@ -111,6 +195,8 @@ for (ScanSplit split : splits) {
     }
 }
 ```
+
+Like Rust, the worker-side `ScanCursor` keeps the full `ScanOptions`, so the selected `columnFamily(...)` still applies after a split is serialized and reopened elsewhere. If you omit it, the scanner reads the default family.
 
 ## Memory Management
 

@@ -43,6 +43,44 @@ if let Some(v) = value {
 }
 ```
 
+## Column Families
+
+Plain `put` / `get` / `scan` calls on `SingleDb` target the default family `default`. To create and use a named family, evolve the inner `Db` schema, then pass family-aware options:
+
+```rust
+use cobble::{ReadOptions, ScanOptions, WriteOptions};
+
+let mut builder = db.db().update_schema();
+builder.add_column(0, None, None, Some("metrics".to_string()))?;
+let schema = builder.commit();
+assert!(schema
+    .column_families()
+    .iter()
+    .any(|(name, _num_columns)| name == "metrics"));
+
+db.put_with_options(
+    0,
+    b"user:1",
+    0,
+    b"42",
+    &WriteOptions::with_column_family("metrics"),
+)?;
+
+let metrics = db.get_with_options(
+    0,
+    b"user:1",
+    &ReadOptions::for_column_in_family("metrics", 0),
+)?;
+
+let scanner = db.scan_with_options(
+    0,
+    b"user:".as_ref()..b"user;".as_ref(),
+    &ScanOptions::for_column(0).with_column_family("metrics"),
+)?;
+```
+
+`config.num_columns` only seeds the default family for a brand-new database. Additional families are created later through schema evolution.
+
 ## Snapshot and Resume
 
 Snapshots capture a consistent point-in-time view of the database:

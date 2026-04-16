@@ -13,6 +13,15 @@ For distributed deployments, Cobble uses multiple shard `Db` instances coordinat
 - **Db** — A shard database responsible for a subset of bucket ranges.
 - **DbCoordinator** — A coordinator that assembles shard snapshots into one global snapshot manifest.
 
+## Column Families
+
+Distributed ownership stays **bucket-only**. If a shard owns bucket `100`, it owns every column family inside bucket `100`.
+
+- Reads and writes still choose a named family through `WriteOptions`, `ReadOptions`, and `ScanOptions`.
+- `ScanPlan` / `ScanSplit` stay bucket/shard work units and do not route by family.
+- When a worker opens a scanner from a split, it must pass `ScanOptions::with_column_family(...)` (or Java `ScanOptions.columnFamily(...)`) if it wants a non-default family.
+- Snapshot metadata preserves a consistent named-family mapping across shards, and the coordinator rejects snapshots if shards disagree on it.
+
 ## Opening Shard Databases
 
 Each shard is assigned non-overlapping bucket ranges:
@@ -76,6 +85,8 @@ let s2 = &manifest.shard_snapshots[1];
 let db1 = Db::open_from_snapshot(config1, s1.snapshot_id, s1.db_id.clone())?;
 let db2 = Db::open_from_snapshot(config2, s2.snapshot_id, s2.db_id.clone())?;
 ```
+
+The restored manifest still preserves the named column-family layout, but shard selection and routing remain bucket-range based.
 
 {: .warning }
 > All files referenced by the snapshot (SST, Parquet, VLOG, manifests, schemas) must be accessible from the configured volumes during restore.
