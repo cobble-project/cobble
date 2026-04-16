@@ -8,6 +8,54 @@ pub(crate) enum WriterOptions {
     Parquet(ParquetWriterOptions),
 }
 
+#[derive(Clone)]
+pub(crate) enum WriterOptionsFactory {
+    Sst(SSTWriterOptions),
+    Parquet(ParquetWriterOptions),
+}
+
+impl WriterOptionsFactory {
+    pub(crate) fn build(&self, num_columns: usize) -> WriterOptions {
+        match self {
+            WriterOptionsFactory::Sst(options) => {
+                let mut options = options.clone();
+                options.num_columns = num_columns;
+                WriterOptions::Sst(options)
+            }
+            WriterOptionsFactory::Parquet(options) => {
+                let mut options = options.clone();
+                options.num_columns = num_columns;
+                WriterOptions::Parquet(options)
+            }
+        }
+    }
+
+    pub(crate) fn data_file_type(&self) -> DataFileType {
+        match self {
+            WriterOptionsFactory::Sst(_) => DataFileType::SSTable,
+            WriterOptionsFactory::Parquet(_) => DataFileType::Parquet,
+        }
+    }
+}
+
+impl From<&WriterOptions> for WriterOptionsFactory {
+    fn from(options: &WriterOptions) -> Self {
+        match options {
+            WriterOptions::Sst(options) => WriterOptionsFactory::Sst(options.clone()),
+            WriterOptions::Parquet(options) => WriterOptionsFactory::Parquet(options.clone()),
+        }
+    }
+}
+
+impl From<WriterOptions> for WriterOptionsFactory {
+    fn from(options: WriterOptions) -> Self {
+        match options {
+            WriterOptions::Sst(options) => WriterOptionsFactory::Sst(options),
+            WriterOptions::Parquet(options) => WriterOptionsFactory::Parquet(options),
+        }
+    }
+}
+
 impl WriterOptions {
     pub(crate) fn data_file_type(&self) -> DataFileType {
         match self {

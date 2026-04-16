@@ -432,7 +432,8 @@ pub struct Config {
     pub memtable_buffer_count: usize,
     /// Memtable implementation type.
     pub memtable_type: MemtableType,
-    /// Number of columns in the value schema.
+    /// Initial number of columns in the default column family when creating a brand-new DB.
+    /// Existing DBs load their schema from persisted metadata instead of this setting.
     pub num_columns: usize,
     /// Total number of buckets in the cluster. Should be 1~65536.
     pub total_buckets: u32,

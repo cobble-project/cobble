@@ -808,17 +808,18 @@ impl Db {
         Self::ensure_multi_lsm_scopes_for_schema(&db_state, latest_schema.as_ref())?;
         let last_scope_synced_schema_version = AtomicU64::new(latest_schema.version());
         let lsm_tree = Arc::new(lsm_tree);
-        let mut memtable_writer_options =
-            crate::compaction::build_writer_options(&config, 0, config.data_file_type)?;
+        let mut memtable_writer_options = crate::compaction::build_writer_options(
+            &config,
+            0,
+            config.data_file_type,
+            runtime_num_columns,
+        )?;
         match &mut memtable_writer_options {
             WriterOptions::Sst(sst_options) => {
-                sst_options.num_columns = runtime_num_columns;
                 sst_options.metrics =
                     Some(metrics_manager.sst_writer_metrics(sst_options.compression));
             }
-            WriterOptions::Parquet(parquet_options) => {
-                parquet_options.num_columns = runtime_num_columns;
-            }
+            WriterOptions::Parquet(_) => {}
         }
         let vlog_store = Arc::new(VlogStore::new(
             Arc::clone(&file_manager),
@@ -827,8 +828,8 @@ impl Db {
         ));
         vlog_store.ensure_next_file_seq_at_least(initial_vlog_file_seq);
         // Compaction setup
-        let mut compaction_options = crate::compaction::build_compaction_config(&config)?;
-        compaction_options.num_columns = runtime_num_columns;
+        let compaction_options =
+            crate::compaction::build_compaction_config(&config, runtime_num_columns)?;
         let compaction_worker: Arc<dyn crate::compaction::CompactionWorker> =
             if let Some(addr) = config.compaction_remote_addr.clone() {
                 Arc::new(crate::compaction::RemoteCompactionWorker::new(
@@ -882,7 +883,6 @@ impl Db {
                 buffer_count: config.memtable_buffer_count,
                 memtable_type: config.memtable_type,
                 writer_options: memtable_writer_options,
-                file_builder_factory: None,
                 num_columns: runtime_num_columns,
                 write_stall_limit: config.resolved_write_stall_limit(),
                 schema_manager: Some(Arc::clone(&schema_manager)),

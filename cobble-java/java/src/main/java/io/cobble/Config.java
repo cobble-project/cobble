@@ -33,7 +33,7 @@ public final class Config {
     /** Memtable implementation type. */
     public MemtableType memtableType;
 
-    /** Number of value columns in schema. */
+    /** Initial number of columns in the default column family for a brand-new DB. */
     public Integer numColumns;
 
     /** Total number of buckets in cluster (1..65536). */

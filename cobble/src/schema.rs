@@ -637,21 +637,14 @@ impl SchemaManager {
     pub(crate) fn from_manifest(
         file_manager: &Arc<FileManager>,
         manifest: &ManifestSnapshot,
-        default_num_columns: usize,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
-        Self::from_manifests(
-            file_manager,
-            std::iter::once(manifest),
-            default_num_columns,
-            resolver,
-        )
+        Self::from_manifests(file_manager, std::iter::once(manifest), resolver)
     }
 
     pub(crate) fn from_manifests<'a, I>(
         file_manager: &Arc<FileManager>,
         manifests: I,
-        default_num_columns: usize,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self>
     where
@@ -663,16 +656,9 @@ impl SchemaManager {
         }
         let schemas = schema_ids
             .into_iter()
-            .map(|schema_id| {
-                load_schema(
-                    file_manager,
-                    schema_id,
-                    default_num_columns,
-                    resolver.as_ref(),
-                )
-            })
+            .map(|schema_id| load_schema(file_manager, schema_id, resolver.as_ref()))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self::from_schemas(schemas, default_num_columns))
+        Ok(Self::from_schemas(schemas, 1))
     }
 
     fn from_initial_schema(initial: Arc<Schema>) -> Self {
@@ -811,17 +797,11 @@ impl SchemaManager {
         &self,
         file_manager: &Arc<FileManager>,
         schema_id: u64,
-        default_num_columns: usize,
     ) -> Result<()> {
         if self.schemas.read().unwrap().contains_key(&schema_id) {
             return Ok(());
         }
-        let schema = Arc::new(load_schema(
-            file_manager,
-            schema_id,
-            default_num_columns,
-            None,
-        )?);
+        let schema = Arc::new(load_schema(file_manager, schema_id, None)?);
         self.schemas
             .write()
             .unwrap()
@@ -909,7 +889,6 @@ pub(crate) fn persist_schema(file_manager: &FileManager, schema: &Schema) -> Res
 pub(crate) fn load_schema(
     file_manager: &Arc<FileManager>,
     schema_id: u64,
-    _default_num_columns: usize,
     resolver: Option<&Arc<dyn MergeOperatorResolver>>,
 ) -> Result<Schema> {
     let reader =

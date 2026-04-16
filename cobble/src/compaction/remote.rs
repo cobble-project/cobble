@@ -22,7 +22,7 @@ use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::util::{build_commit_short_id, build_version_string, init_logging};
 use crate::vlog::VlogEdit;
-use crate::writer_options::WriterOptions;
+use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use bytes::Bytes;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -570,16 +570,8 @@ impl RemoteCompactionWorker {
         let num_columns = schema
             .num_columns_in_family(tree_scope.column_family_id)
             .unwrap_or_else(|| schema.num_columns());
-        let mut writer_options =
-            super::build_writer_options(&self.config, output_level, data_file_type)?;
-        match &mut writer_options {
-            WriterOptions::Sst(sst_options) => {
-                sst_options.num_columns = num_columns;
-            }
-            WriterOptions::Parquet(parquet_options) => {
-                parquet_options.num_columns = num_columns;
-            }
-        }
+        let writer_options =
+            super::build_writer_options(&self.config, output_level, data_file_type, num_columns)?;
         let merge_operator_ids =
             schema.operator_ids_for_column_family_id(tree_scope.column_family_id);
         let merge_operator_metadata = schema
@@ -730,7 +722,7 @@ pub struct RemoteCompactionServer {
 
 impl RemoteCompactionServer {
     pub fn new(config: Config) -> Result<Self> {
-        let compaction_config = super::build_compaction_config(&config)?;
+        let compaction_config = super::build_compaction_config(&config, 1)?;
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .thread_name("cobble-compaction")
@@ -940,7 +932,8 @@ impl RemoteCompactionServer {
         let data_file_type = request.writer_options.data_file_type();
         let num_columns = request.writer_options.num_columns();
         let writer_options = request.writer_options.into_writer_options(&metrics_manager);
-        let file_builder_factory = super::make_data_file_builder_factory(writer_options);
+        let file_builder_factory = super::make_data_file_builder_factory(writer_options.clone());
+        let writer_options_factory = WriterOptionsFactory::from(&writer_options);
         let sorted_runs = request
             .runs
             .into_iter()
@@ -993,6 +986,7 @@ impl RemoteCompactionServer {
             ttl_provider,
             schema_manager,
         )
+        .with_writer_options_factory(writer_options_factory)
         .with_column_family(request.column_family_id, num_columns)
         .with_readonly_outputs();
         let result = executor.execute_blocking(task, None);
@@ -1292,7 +1286,7 @@ mod tests {
         let file_manager = Arc::new(
             FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
         );
-        let mut sst_options = build_sst_writer_options(&config, 0);
+        let mut sst_options = build_sst_writer_options(&config, 0, config.num_columns);
         sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
         let value_payload = vec![b'x'; 128];
         let num_columns = sst_options.num_columns;
@@ -1430,9 +1424,8 @@ mod tests {
         let file_manager = Arc::new(
             FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
         );
-        let mut sst_options = build_sst_writer_options(&config, 0);
+        let mut sst_options = build_sst_writer_options(&config, 0, num_columns);
         sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
-        sst_options.num_columns = num_columns;
 
         let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
         let mut schema_builder = schema_manager.builder();

@@ -134,7 +134,7 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `num_columns` | `usize` | 1 | Number of value columns per key |
+| `num_columns` | `usize` | 1 | Initial number of columns in the default column family when creating a new DB |
 | `total_buckets` | `u32` | 1 | Total buckets for sharding (1–65536) |
 
 ### Volume Offload

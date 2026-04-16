@@ -31,7 +31,7 @@
 //! use cobble::{Config, SingleDb, VolumeDescriptor};
 //!
 //! let mut config = Config::default();
-//! config.num_columns = 2;
+//! config.num_columns = 2; // initial width of the default column family
 //! config.total_buckets = 1;
 //! config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-single");
 //!

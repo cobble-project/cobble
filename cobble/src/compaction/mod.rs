@@ -32,7 +32,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::parquet::{ParquetWriter, ParquetWriterOptions};
 use crate::schema::SchemaManager;
 use crate::sst::SSTWriterOptions;
-use crate::writer_options::WriterOptions;
+use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::{error, info};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -122,30 +122,32 @@ impl LocalCompactionWorker {
         let runtime_num_columns = schema
             .num_columns_in_family(tree_scope.column_family_id)
             .unwrap_or_else(|| schema.num_columns());
-        let mut writer_options =
-            match build_writer_options(&self.config, output_level, data_file_type) {
-                Ok(options) => options,
-                Err(err) => {
-                    error!(
-                        "skip compaction submit due to invalid writer size config: {}",
-                        err
-                    );
-                    return None;
-                }
-            };
+        let mut writer_options = match build_writer_options(
+            &self.config,
+            output_level,
+            data_file_type,
+            runtime_num_columns,
+        ) {
+            Ok(options) => options,
+            Err(err) => {
+                error!(
+                    "skip compaction submit due to invalid writer size config: {}",
+                    err
+                );
+                return None;
+            }
+        };
         match &mut writer_options {
             WriterOptions::Sst(sst_options) => {
-                sst_options.num_columns = runtime_num_columns;
                 sst_options.metrics = Some(
                     self.metrics_manager
                         .sst_writer_metrics(sst_options.compression),
                 );
             }
-            WriterOptions::Parquet(parquet_options) => {
-                parquet_options.num_columns = runtime_num_columns;
-            }
+            WriterOptions::Parquet(_) => {}
         }
-        let file_builder_factory = make_data_file_builder_factory(writer_options);
+        let file_builder_factory = make_data_file_builder_factory(writer_options.clone());
+        let writer_options_factory = WriterOptionsFactory::from(&writer_options);
         let task = CompactionTask::new(
             Arc::clone(&self.compaction_metrics),
             sst_metrics,
@@ -158,6 +160,7 @@ impl LocalCompactionWorker {
             ttl_provider,
             Arc::clone(&self.schema_manager),
         )
+        .with_writer_options_factory(writer_options_factory)
         .with_column_family(tree_scope.column_family_id, runtime_num_columns);
         Some(self.submit(task))
     }
@@ -218,17 +221,24 @@ pub(crate) fn make_data_file_builder_factory(
     }
 }
 
-pub(crate) fn build_parquet_writer_options(config: &crate::Config) -> Result<ParquetWriterOptions> {
+pub(crate) fn build_parquet_writer_options(
+    config: &crate::Config,
+    num_columns: usize,
+) -> Result<ParquetWriterOptions> {
     Ok(ParquetWriterOptions {
         row_group_size_bytes: config.parquet_row_group_size_bytes()?.max(1),
-        num_columns: config.num_columns,
+        num_columns,
         ..ParquetWriterOptions::default()
     })
 }
 
-pub(crate) fn build_sst_writer_options(config: &crate::Config, level: u8) -> SSTWriterOptions {
+pub(crate) fn build_sst_writer_options(
+    config: &crate::Config,
+    level: u8,
+    num_columns: usize,
+) -> SSTWriterOptions {
     SSTWriterOptions {
-        num_columns: config.num_columns,
+        num_columns,
         bloom_filter_enabled: config.sst_bloom_filter_enabled,
         bloom_bits_per_key: config.sst_bloom_bits_per_key,
         partitioned_index: config.sst_partitioned_index,
@@ -241,21 +251,29 @@ pub(crate) fn build_writer_options(
     config: &crate::Config,
     level: u8,
     data_file_type: DataFileType,
+    num_columns: usize,
 ) -> Result<WriterOptions> {
     Ok(match data_file_type {
-        DataFileType::SSTable => WriterOptions::Sst(build_sst_writer_options(config, level)),
-        DataFileType::Parquet => WriterOptions::Parquet(build_parquet_writer_options(config)?),
+        DataFileType::SSTable => {
+            WriterOptions::Sst(build_sst_writer_options(config, level, num_columns))
+        }
+        DataFileType::Parquet => {
+            WriterOptions::Parquet(build_parquet_writer_options(config, num_columns)?)
+        }
     })
 }
 
-pub(crate) fn build_compaction_config(config: &crate::Config) -> Result<CompactionConfig> {
+pub(crate) fn build_compaction_config(
+    config: &crate::Config,
+    num_columns: usize,
+) -> Result<CompactionConfig> {
     Ok(CompactionConfig {
         policy: config.compaction_policy,
         l0_file_limit: config.l0_file_limit,
         l1_base_bytes: config.l1_base_bytes_bytes()?,
         level_size_multiplier: config.level_size_multiplier,
         max_level: config.max_level,
-        num_columns: config.num_columns,
+        num_columns,
         target_file_size: config.base_file_size_bytes()?,
         bloom_filter_enabled: config.sst_bloom_filter_enabled,
         bloom_bits_per_key: config.sst_bloom_bits_per_key,
@@ -354,9 +372,8 @@ mod tests {
                 .unwrap(),
         );
 
-        let mut sst_options = build_sst_writer_options(&config, 0);
+        let mut sst_options = build_sst_writer_options(&config, 0, num_columns);
         sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
-        sst_options.num_columns = num_columns;
 
         let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
         let mut schema_builder = schema_manager.builder();
@@ -413,7 +430,7 @@ mod tests {
         ));
 
         let executor = CompactionExecutor::new(
-            build_compaction_config(&config).unwrap(),
+            build_compaction_config(&config, num_columns).unwrap(),
             Arc::clone(&db_lifecycle),
         )
         .unwrap();

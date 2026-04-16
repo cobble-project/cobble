@@ -291,7 +291,6 @@ impl Db {
         let schema_manager = Arc::new(crate::schema::SchemaManager::from_manifest(
             &file_manager,
             &manifest,
-            config.num_columns,
             resolver,
         )?);
         let restored_snapshot_links =
@@ -421,7 +420,6 @@ impl Db {
         let schema_manager = Arc::new(crate::schema::SchemaManager::from_manifests(
             &file_manager,
             loaded.iter().map(|entry| &entry.manifest),
-            config.num_columns,
             resolver,
         )?);
         let max_vlog_file_seq = manifest

@@ -19,6 +19,7 @@ use crate::lsm::{LevelEdit, VersionEdit};
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, SchemaManager};
 use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions};
 use crate::vlog::{VlogEdit, VlogMergeCollector};
+use crate::writer_options::WriterOptionsFactory;
 use log::trace;
 use metrics::{Counter, counter};
 use std::sync::Arc;
@@ -38,6 +39,7 @@ pub struct CompactionTask {
     file_manager: Arc<FileManager>,
     /// Factory function for creating FileBuilder instances.
     file_builder_factory: Arc<FileBuilderFactory>,
+    writer_options_factory: Option<WriterOptionsFactory>,
     /// The data file type for output files.
     data_file_type: DataFileType,
     /// TTL provider for compaction to determine if entries are expired and can be dropped.
@@ -96,6 +98,7 @@ impl CompactionTask {
             output_level,
             file_manager,
             file_builder_factory,
+            writer_options_factory: None,
             data_file_type,
             ttl_provider,
             output_files_readonly: false,
@@ -107,6 +110,14 @@ impl CompactionTask {
 
     pub fn with_readonly_outputs(mut self) -> Self {
         self.output_files_readonly = true;
+        self
+    }
+
+    pub(crate) fn with_writer_options_factory(
+        mut self,
+        writer_options_factory: WriterOptionsFactory,
+    ) -> Self {
+        self.writer_options_factory = Some(writer_options_factory);
         self
     }
 
@@ -317,8 +328,10 @@ impl CompactionExecutor {
         let use_read_ahead =
             options.read_ahead_enabled && tokio::runtime::Handle::try_current().is_ok();
         let target_schema = task.schema_manager.latest_schema();
-        let num_columns = task.num_columns;
         let column_family_id = task.column_family_id;
+        let num_columns = target_schema
+            .num_columns_in_family(column_family_id)
+            .unwrap_or(task.num_columns);
         for run in &task.sorted_runs {
             for file in run.files() {
                 read_bytes = read_bytes.saturating_add(file.size as u64);
@@ -331,7 +344,7 @@ impl CompactionExecutor {
                 let source_schema = schema_manager.schema(file.schema_id)?;
                 let source_num_columns = source_schema
                     .num_columns_in_family(column_family_id)
-                    .unwrap_or(num_columns);
+                    .unwrap_or_else(|| source_schema.num_columns());
                 let reader = file_manager.open_data_file_reader(file.file_id)?;
                 let reader: Box<dyn crate::file::RandomAccessFile> = if use_read_ahead {
                     Box::new(ReadAheadBufferedReader::new(
@@ -447,7 +460,16 @@ impl CompactionExecutor {
                     task.file_manager.create_data_file_with_offload()?
                 };
                 current_file_id = Some(file_id);
-                current_builder = Some((task.file_builder_factory)(Box::new(writer)));
+                current_builder = Some(
+                    if let Some(writer_options_factory) = task.writer_options_factory.as_ref() {
+                        let factory = crate::compaction::make_data_file_builder_factory(
+                            writer_options_factory.build(num_columns),
+                        );
+                        factory(Box::new(writer))
+                    } else {
+                        (task.file_builder_factory)(Box::new(writer))
+                    },
+                );
             }
 
             // Add entry to current file
@@ -606,7 +628,7 @@ mod tests {
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::Value;
     use crate::r#type::{Column, ValueType, decode_merge_separated_array};
-    use crate::writer_options::WriterOptions;
+    use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 
     fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {
         let value = Value::new(vec![Some(Column::new(ValueType::Put, data.to_vec()))]);
@@ -1183,6 +1205,99 @@ mod tests {
             Arc::new(crate::ttl::TTLProvider::disabled()),
             Arc::clone(&schema_manager),
         );
+
+        let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+        assert_eq!(result.new_files().len(), 1);
+        assert_eq!(result.new_files()[0].schema_id, target_schema.version());
+
+        let reader = file_manager
+            .open_data_file_reader(result.new_files()[0].file_id)
+            .unwrap();
+        let mut iter = crate::sst::SSTIterator::with_cache_and_file(
+            Box::new(reader),
+            result.new_files()[0].as_ref(),
+            crate::sst::SSTIteratorOptions {
+                bloom_filter_enabled: true,
+                num_columns: target_schema.num_columns(),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        iter.seek_to_first().unwrap();
+        let (_, mut value) = iter.current().unwrap().unwrap();
+        let decoded =
+            crate::sst::row_codec::decode_value(&mut value, target_schema.num_columns()).unwrap();
+        assert_eq!(decoded.columns().len(), 2);
+        assert_eq!(
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"old"
+        );
+        assert!(decoded.columns()[1].is_none());
+
+        cleanup_test_dir(test_dir);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_compaction_uses_latest_schema_width_when_schema_evolves_after_task_creation() {
+        let test_dir = "/tmp/compaction_runtime_schema_width_test";
+        cleanup_test_dir(test_dir);
+
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", test_dir))
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
+
+        let old_num_columns = 1;
+        let old_file = create_test_sst(
+            &file_manager,
+            vec![(b"k", &make_value_bytes(b"old", old_num_columns))],
+        )
+        .unwrap();
+
+        let schema_manager = Arc::new(SchemaManager::new(old_num_columns));
+        let options = CompactionConfig {
+            num_columns: old_num_columns,
+            bloom_filter_enabled: true,
+            bloom_bits_per_key: 10,
+            ..Default::default()
+        };
+        let writer_options = WriterOptions::Sst(SSTWriterOptions {
+            metrics: None,
+            block_size: options.block_size,
+            buffer_size: options.buffer_size,
+            num_columns: old_num_columns,
+            bloom_filter_enabled: options.bloom_filter_enabled,
+            bloom_bits_per_key: options.bloom_bits_per_key,
+            partitioned_index: options.partitioned_index,
+            compression: crate::SstCompressionAlgorithm::None,
+        });
+        let factory = crate::compaction::make_data_file_builder_factory(writer_options.clone());
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
+        let task = CompactionTask::new(
+            compaction_metrics,
+            sst_metrics,
+            0,
+            vec![SortedRun::new(0, vec![old_file])],
+            1,
+            Arc::clone(&file_manager),
+            factory,
+            DataFileType::SSTable,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
+            Arc::clone(&schema_manager),
+        )
+        .with_writer_options_factory(WriterOptionsFactory::from(writer_options));
+
+        let mut schema_builder = schema_manager.builder();
+        schema_builder.add_column(1, None, None, None).unwrap();
+        let target_schema = schema_builder.commit();
 
         let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
         let result = executor.execute_blocking(task, None).unwrap();

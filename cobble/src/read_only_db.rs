@@ -164,7 +164,6 @@ impl ReadOnlyDb {
         let schema_manager = Arc::new(SchemaManager::from_manifest(
             &file_manager,
             &manifest,
-            config.num_columns,
             resolver,
         )?);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
@@ -175,8 +174,12 @@ impl ReadOnlyDb {
             &tree_scopes,
             tree_versions.into_iter().map(Arc::new).collect(),
         )?;
-        let writer_options =
-            crate::compaction::build_writer_options(&config, 0, config.data_file_type)?;
+        let writer_options = crate::compaction::build_writer_options(
+            &config,
+            0,
+            config.data_file_type,
+            schema_manager.current_num_columns(),
+        )?;
         let vlog_store = Arc::new(VlogStore::new(
             Arc::clone(&file_manager),
             writer_options.buffer_size(),

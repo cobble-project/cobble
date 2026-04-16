@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
 
 use crate::config::MemtableType;
-use crate::data_file::{DataFile, DataFileType};
+use crate::data_file::DataFile;
 use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
 use crate::db_status::DbLifecycle;
 use crate::error::Error::InvalidState;
@@ -26,7 +26,7 @@ use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotManager};
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use crate::r#type::{KvValue, RefKey, RefValue, key_bucket, key_column_family};
 use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
-use crate::writer_options::WriterOptions;
+use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::{debug, trace, warn};
 use metrics::{Counter, counter};
 use std::time::Duration;
@@ -45,7 +45,6 @@ pub(crate) struct MemtableManagerOptions {
     pub(crate) memtable_capacity: usize,
     pub(crate) buffer_count: usize,
     pub(crate) writer_options: WriterOptions,
-    pub(crate) file_builder_factory: Option<Arc<FileBuilderFactory>>,
     pub(crate) num_columns: usize,
     pub(crate) memtable_type: MemtableType,
     pub(crate) write_stall_limit: usize,
@@ -84,7 +83,6 @@ impl Default for MemtableManagerOptions {
                 bloom_filter_enabled: true,
                 ..SSTWriterOptions::default()
             }),
-            file_builder_factory: None,
             num_columns: 1,
             memtable_type: MemtableType::Hash,
             write_stall_limit: 8,
@@ -103,8 +101,7 @@ pub(crate) struct MemtableManager {
     buffer_ready: Arc<Condvar>,
     flush_done: Arc<Condvar>,
     file_manager: Arc<FileManager>,
-    file_builder_factory: Arc<FileBuilderFactory>,
-    writer_options: WriterOptions,
+    writer_options_factory: WriterOptionsFactory,
     lsm_tree: Arc<LSMTree>,
     db_state: Arc<DbStateHandle>,
     db_lifecycle: Arc<DbLifecycle>,
@@ -386,11 +383,6 @@ impl MemtableManager {
             options.memtable_capacity,
             options.memtable_type,
         );
-        let file_builder_factory = options.file_builder_factory.unwrap_or_else(|| {
-            Arc::new(make_data_file_builder_factory(
-                options.writer_options.clone(),
-            ))
-        });
         let vlog_store = options.vlog_store.unwrap_or_else(|| {
             Arc::new(VlogStore::new(
                 Arc::clone(&file_manager),
@@ -398,13 +390,13 @@ impl MemtableManager {
                 usize::MAX,
             ))
         });
+        let writer_options_factory = WriterOptionsFactory::from(&options.writer_options);
         // Initialize the flush worker
         let (worker, flush_tx) = Self::init_flush_worker(
             Arc::clone(&state),
             Arc::clone(&flush_done),
             Arc::clone(&file_manager),
-            Arc::clone(&file_builder_factory),
-            options.writer_options.clone(),
+            writer_options_factory.clone(),
             Arc::clone(&lsm_tree),
             lsm_tree.ttl_provider(),
             Arc::clone(&db_lifecycle),
@@ -419,8 +411,7 @@ impl MemtableManager {
             buffer_ready,
             flush_done,
             file_manager,
-            file_builder_factory,
-            writer_options: options.writer_options,
+            writer_options_factory,
             lsm_tree,
             db_state,
             db_lifecycle,
@@ -472,8 +463,7 @@ impl MemtableManager {
         state: Arc<Mutex<MemtableManagerState>>,
         flush_done: Arc<Condvar>,
         file_manager: Arc<FileManager>,
-        file_builder_factory: Arc<FileBuilderFactory>,
-        writer_options: WriterOptions,
+        writer_options_factory: WriterOptionsFactory,
         lsm_tree: Arc<LSMTree>,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
         db_lifecycle: Arc<DbLifecycle>,
@@ -484,8 +474,6 @@ impl MemtableManager {
         let state_clone = Arc::clone(&state);
         let flush_done_clone = Arc::clone(&flush_done);
         let file_manager_clone = Arc::clone(&file_manager);
-        let file_builder_factory_clone = Arc::clone(&file_builder_factory);
-        let writer_options_clone = writer_options.clone();
         let lsm_tree_clone = Arc::clone(&lsm_tree);
         let db_state_clone = lsm_tree_clone.db_state();
         let ttl_provider_clone = Arc::clone(&ttl_provider);
@@ -520,12 +508,11 @@ impl MemtableManager {
                             job.schema.expect("flush job schema exists"),
                             job.vlog_recorder,
                             Arc::clone(&file_manager_clone),
-                            Arc::clone(&file_builder_factory_clone),
+                            writer_options_factory.clone(),
                             Arc::clone(&ttl_provider_clone),
                             Arc::clone(&vlog_store_clone),
                             multi_lsm_version,
                             0,
-                            writer_options_clone.data_file_type(),
                         );
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
@@ -1389,12 +1376,11 @@ impl MemtableManager {
                 self.schema_manager.latest_schema(),
                 vlog_recorder.map(Arc::new),
                 Arc::clone(&self.file_manager),
-                Arc::clone(&self.file_builder_factory),
+                self.writer_options_factory.clone(),
                 self.lsm_tree.ttl_provider(),
                 Arc::clone(&self.vlog_store),
                 multi_lsm_version,
                 vlog_file_seq_offset,
-                self.writer_options.data_file_type(),
             )?;
             self.metrics.flushes_total.increment(1);
             let flushed_bytes: u64 = result
@@ -1514,12 +1500,11 @@ fn flush_memtable(
     schema: Arc<Schema>,
     vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
     file_manager: Arc<FileManager>,
-    file_builder_factory: Arc<FileBuilderFactory>,
+    writer_options_factory: WriterOptionsFactory,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     vlog_store: Arc<VlogStore>,
     multi_lsm_version: MultiLSMTreeVersion,
     vlog_file_seq_offset: u32,
-    data_file_type: DataFileType,
 ) -> Result<MemtableFlushResult> {
     // Step 1: If there is a vlog recorder with entries, flush it to the vlog store and get the resulting edit.
     let mut vlog_edit = None;
@@ -1573,10 +1558,24 @@ fn flush_memtable(
                     ))
                 })?;
             if let std::collections::btree_map::Entry::Vacant(entry) = builders.entry(tree_idx) {
+                let tree_scope =
+                    multi_lsm_version
+                        .tree_scope_of_tree(tree_idx)
+                        .ok_or_else(|| {
+                            InvalidState(format!(
+                                "missing tree scope for memtable flush tree {}",
+                                tree_idx
+                            ))
+                        })?;
+                let runtime_num_columns = schema
+                    .num_columns_in_family(tree_scope.column_family_id)
+                    .unwrap_or_else(|| schema.num_columns());
                 let (file_id, writer) = file_manager.create_data_file_with_offload()?;
                 entry.insert((
                     file_id,
-                    (file_builder_factory)(Box::new(writer)),
+                    make_data_file_builder_factory(
+                        writer_options_factory.build(runtime_num_columns),
+                    )(Box::new(writer)),
                     bucket,
                     bucket,
                 ));
@@ -1609,6 +1608,7 @@ fn flush_memtable(
         .as_ref()
         .is_some_and(|collector| collector.borrow().has_separated_values());
     let mut data_files_by_tree = Vec::with_capacity(builders.len());
+    let data_file_type = writer_options_factory.data_file_type();
     for (tree_idx, (file_id, builder, min_bucket, max_bucket)) in builders {
         let (start_key, end_key, file_size, footer_bytes) = builder.finish()?;
         let bucket_range = min_bucket..=max_bucket;
@@ -1937,7 +1937,6 @@ mod tests {
                     bloom_filter_enabled: true,
                     ..SSTWriterOptions::default()
                 }),
-                file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
                 ..MemtableManagerOptions::default()
@@ -2024,7 +2023,6 @@ mod tests {
             MemtableManagerOptions {
                 memtable_capacity: 256,
                 buffer_count: 2,
-                file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
                 vlog_store: Some(vlog_store),
@@ -2093,7 +2091,6 @@ mod tests {
             MemtableManagerOptions {
                 memtable_capacity: 256,
                 buffer_count: 2,
-                file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
                 ..MemtableManagerOptions::default()
@@ -2141,7 +2138,6 @@ mod tests {
             MemtableManagerOptions {
                 memtable_capacity: 256,
                 buffer_count: 2,
-                file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
                 schema_manager: Some(Arc::clone(&schema_manager)),
@@ -2178,11 +2174,32 @@ mod tests {
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
+        let second_file = results[0].as_ref().unwrap().data_files_by_tree[0].1.clone();
+        assert_eq!(second_file.schema_id, 1);
+        let reader = file_manager
+            .open_data_file_reader(second_file.file_id)
+            .unwrap();
+        let mut iter = SSTIterator::with_cache_and_file(
+            Box::new(reader),
+            second_file.as_ref(),
+            SSTIteratorOptions {
+                num_columns: 2,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        iter.seek_to_first().unwrap();
+        let (_, mut value) = iter.current().unwrap().unwrap();
+        let decoded = decode_value(&mut value, 2).unwrap();
+        assert_eq!(decoded.columns().len(), 2);
         assert_eq!(
-            results[0].as_ref().unwrap().data_files_by_tree[0]
-                .1
-                .schema_id,
-            1
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"v2"
+        );
+        assert_eq!(
+            decoded.columns()[1].as_ref().unwrap().data().as_ref(),
+            b"v2c1"
         );
 
         cleanup_test_root();
@@ -2213,7 +2230,6 @@ mod tests {
                     bloom_filter_enabled: true,
                     ..SSTWriterOptions::default()
                 }),
-                file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
                 ..MemtableManagerOptions::default()
@@ -2266,7 +2282,6 @@ mod tests {
                     bloom_filter_enabled: true,
                     ..SSTWriterOptions::default()
                 }),
-                file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
                 ..MemtableManagerOptions::default()
@@ -2310,7 +2325,6 @@ mod tests {
                 memtable_capacity: 128,
                 buffer_count: 1,
                 memtable_type: MemtableType::Hash,
-                file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
                 ..MemtableManagerOptions::default()
@@ -2361,7 +2375,6 @@ mod tests {
                     bloom_filter_enabled: true,
                     ..SSTWriterOptions::default()
                 }),
-                file_builder_factory: None,
                 num_columns: 1,
                 write_stall_limit: 8,
                 ..MemtableManagerOptions::default()

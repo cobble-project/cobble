@@ -172,11 +172,8 @@ impl Db {
             let mut writer = self.file_manager.create_metadata_file(&schema_path)?;
             writer.write(payload.as_ref())?;
             writer.close()?;
-            self.schema_manager.register_schema_from_file(
-                &self.file_manager,
-                schema_id,
-                self.config.num_columns,
-            )?;
+            self.schema_manager
+                .register_schema_from_file(&self.file_manager, schema_id)?;
         }
 
         // Step 4: Validate ownership ranges and reserve a conflict-free VLOG seq window.

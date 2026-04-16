@@ -167,7 +167,7 @@ All capacity/size fields in `Config` (such as `memtable_capacity`, `l1_base_byte
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `num_columns` | 1 | Number of value columns |
+| `num_columns` | 1 | Initial number of columns in the default column family when creating a new DB |
 | `total_buckets` | 1 | Total bucket count for sharding (1–65536) |
 
 ### Volume Offload

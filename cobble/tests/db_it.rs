@@ -874,6 +874,72 @@ fn test_single_db_close_waits_snapshot_global_materialization() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_db_open_from_snapshot_ignores_config_num_columns_after_initialization() {
+    let root = "/tmp/db_open_from_snapshot_ignore_num_columns";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        num_columns: 2,
+        block_cache_size: Size::from_const(0),
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config.clone());
+    let db_id = db.id().to_string();
+    db.put(0, b"k1", 0, b"v1").unwrap();
+    db.put(0, b"k1", 1, b"v2").unwrap();
+    let snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    db.close().unwrap();
+
+    let reopen_config = Config {
+        num_columns: 1,
+        ..config.clone()
+    };
+    let reopened = Db::open_from_snapshot(reopen_config, snapshot_id, db_id).unwrap();
+    let value = reopened.get(0, b"k1").unwrap().expect("value present");
+    assert_eq!(value.len(), 2);
+    assert_eq!(value[0].as_deref(), Some(&b"v1"[..]));
+    assert_eq!(value[1].as_deref(), Some(&b"v2"[..]));
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_snapshot_read_only_ignores_config_num_columns_after_initialization() {
+    let root = "/tmp/db_snapshot_readonly_ignore_num_columns";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        num_columns: 2,
+        block_cache_size: Size::from_const(0),
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config.clone());
+    db.put(0, b"k1", 0, b"v1").unwrap();
+    db.put(0, b"k1", 1, b"v2").unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    db.close().unwrap();
+
+    let read_only_config = Config {
+        num_columns: 1,
+        ..config.clone()
+    };
+    let ro = Db::open_read_only(read_only_config, snapshot_id, db.id()).unwrap();
+    let value = ro.get(0, b"k1").unwrap().expect("value present");
+    assert_eq!(value.len(), 2);
+    assert_eq!(value[0].as_deref(), Some(&b"v1"[..]));
+    assert_eq!(value[1].as_deref(), Some(&b"v2"[..]));
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_snapshot_read_only_get_with_vec_memtable() {
     let root = "/tmp/db_snapshot_readonly_vec_memtable";
     cleanup_test_root(root);
