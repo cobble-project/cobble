@@ -3,8 +3,10 @@ package io.cobble.structured;
 import io.cobble.Config;
 import io.cobble.DbCoordinator;
 import io.cobble.GlobalSnapshot;
+import io.cobble.ReadOptions;
 import io.cobble.ScanOptions;
 import io.cobble.ShardSnapshot;
+import io.cobble.WriteOptions;
 
 import org.junit.jupiter.api.Test;
 
@@ -22,7 +24,7 @@ class StructuredDbTest {
     @Test
     void typedBytesAndListPutGetRoundTrip() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-typed-");
-        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
 
         try (Db db = Db.open(config)) {
             db.updateSchema().addListColumn(1, ListConfig.of(100, ListRetainMode.LAST)).commit();
@@ -74,9 +76,142 @@ class StructuredDbTest {
     }
 
     @Test
+    void columnFamilyTypedRoundTripAndScan() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-cf-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            db.updateSchema()
+                    .addListColumn("metrics", 0, ListConfig.of(10, ListRetainMode.LAST))
+                    .addBytesColumn("metrics", 1)
+                    .commit();
+            Schema schema = db.currentSchema();
+            assertTrue(schema.columnFamilies().containsKey(1));
+            assertTrue(schema.getColumnType(1, 0) instanceof Schema.ColumnType.List);
+            assertTrue(schema.getColumnType(1, 1) instanceof Schema.ColumnType.Bytes);
+
+            byte[] key = "metrics-row".getBytes(StandardCharsets.UTF_8);
+            db.put(
+                    0,
+                    key,
+                    "metrics",
+                    0,
+                    ColumnValue.ofList(
+                            new byte[][] {
+                                "a".getBytes(StandardCharsets.UTF_8),
+                            }));
+            db.put(0, key, "metrics", 1, "m1".getBytes(StandardCharsets.UTF_8));
+            db.merge(
+                    0,
+                    key,
+                    "metrics",
+                    0,
+                    ColumnValue.ofList(
+                            new byte[][] {
+                                "b".getBytes(StandardCharsets.UTF_8),
+                            }));
+
+            Row row = db.get(0, key, "metrics");
+            assertNotNull(row);
+            assertEquals(2, row.getColumnCount());
+            assertArrayEquals("m1".getBytes(StandardCharsets.UTF_8), row.getBytes(1));
+            assertArrayEquals(
+                    new byte[][] {
+                        "a".getBytes(StandardCharsets.UTF_8), "b".getBytes(StandardCharsets.UTF_8),
+                    },
+                    row.getList(0));
+
+            try (ReadOptions options = ReadOptions.forColumnInFamily("metrics", 0)) {
+                Row projected = db.getWithOptions(0, key, options);
+                assertNotNull(projected);
+                assertEquals(1, projected.getColumnCount());
+                assertArrayEquals(
+                        new byte[][] {
+                            "a".getBytes(StandardCharsets.UTF_8),
+                            "b".getBytes(StandardCharsets.UTF_8),
+                        },
+                        projected.getList(0));
+            }
+
+            List<Row> rows = new ArrayList<Row>();
+            try (ScanCursor cursor =
+                    db.scan(
+                            0,
+                            "metrics-".getBytes(StandardCharsets.UTF_8),
+                            "metrics.~".getBytes(StandardCharsets.UTF_8),
+                            "metrics")) {
+                ScanBatch batch = cursor.nextBatch();
+                for (int i = 0; i < batch.size(); i++) {
+                    rows.add(batch.getRow(i));
+                }
+                while (batch.hasMore) {
+                    batch = cursor.nextBatch();
+                    for (int i = 0; i < batch.size(); i++) {
+                        rows.add(batch.getRow(i));
+                    }
+                }
+            }
+            assertEquals(1, rows.size());
+            assertArrayEquals("m1".getBytes(StandardCharsets.UTF_8), rows.get(0).getBytes(1));
+
+            db.delete(0, key, "metrics", 1);
+            Row deleted = db.get(0, key, "metrics");
+            assertNotNull(deleted);
+            assertNull(deleted.getColumnValue(1));
+        }
+    }
+
+    @Test
+    void singleDbColumnFamilyTypedRoundTrip() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-single-cf-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (SingleDb db = SingleDb.open(config)) {
+            db.updateSchema()
+                    .addListColumn("metrics", 0, ListConfig.of(10, ListRetainMode.LAST))
+                    .addBytesColumn("metrics", 1)
+                    .commit();
+
+            byte[] key = "single-cf".getBytes(StandardCharsets.UTF_8);
+            try (WriteOptions options = WriteOptions.withColumnFamily("metrics")) {
+                db.putWithOptions(
+                        0,
+                        key,
+                        0,
+                        ColumnValue.ofList(
+                                new byte[][] {
+                                    "x".getBytes(StandardCharsets.UTF_8),
+                                }),
+                        options);
+                db.putWithOptions(
+                        0,
+                        key,
+                        1,
+                        ColumnValue.ofBytes("y".getBytes(StandardCharsets.UTF_8)),
+                        options);
+            }
+
+            Row row = db.get(0, key, "metrics");
+            assertNotNull(row);
+            assertEquals(2, row.getColumnCount());
+            assertArrayEquals("y".getBytes(StandardCharsets.UTF_8), row.getBytes(1));
+            assertArrayEquals(
+                    new byte[][] {
+                        "x".getBytes(StandardCharsets.UTF_8),
+                    },
+                    row.getList(0));
+
+            db.delete(0, key, "metrics", 1);
+            Row deleted = db.get(0, key, "metrics");
+            assertNotNull(deleted);
+            assertNull(deleted.getColumnValue(1));
+        }
+    }
+
+    @Test
     void listMergeAppendsElements() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-merge-");
-        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
 
         try (Db db = Db.open(config)) {
             db.updateSchema().addListColumn(1, ListConfig.of(100, ListRetainMode.LAST)).commit();
@@ -116,7 +251,7 @@ class StructuredDbTest {
     @Test
     void deleteAndAbsentColumnReturnsNull() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-delete-");
-        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
 
         try (Db db = Db.open(config)) {
             db.updateSchema().addListColumn(1, ListConfig.defaults()).commit();
@@ -147,7 +282,7 @@ class StructuredDbTest {
     @Test
     void typedScanCursorYieldsTypedRows() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-scan-");
-        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
 
         try (Db db = Db.open(config)) {
             db.updateSchema().addListColumn(1, ListConfig.of(50, ListRetainMode.LAST)).commit();
@@ -246,7 +381,7 @@ class StructuredDbTest {
     @Test
     void mixedSchemaWithDefaultBytesColumns() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-default-");
-        Config config = new Config().addVolume(dataDir.toString()).numColumns(3).totalBuckets(1);
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
 
         try (Db db = Db.open(config)) {
             db.updateSchema().addListColumn(2, ListConfig.of(10, ListRetainMode.FIRST)).commit();
@@ -284,7 +419,7 @@ class StructuredDbTest {
     @Test
     void listRetainLastCapEnforced() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-cap-");
-        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(0).totalBuckets(1);
 
         try (Db db = Db.open(config)) {
             db.updateSchema().addListColumn(0, ListConfig.of(3, ListRetainMode.LAST)).commit();
@@ -327,7 +462,7 @@ class StructuredDbTest {
     @Test
     void structuredDistributedScanPlanSplitCursorRoundTrip() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-dist-scan-");
-        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
 
         try (Db db = Db.open(config)) {
             db.updateSchema().addListColumn(1, ListConfig.of(50, ListRetainMode.LAST)).commit();

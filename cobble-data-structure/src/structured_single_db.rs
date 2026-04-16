@@ -2,7 +2,6 @@ use crate::structured_db::{
     StructuredColumnValue, StructuredDbIterator, StructuredSchema, StructuredSchemaBuilder,
     StructuredSchemaOwner, StructuredWriteBatch, decode_row, encode_for_write,
     load_structured_schema_from_cobble_schema, persist_structured_schema_on_db,
-    project_decoded_row_for_read, project_structured_schema_for_scan,
 };
 use cobble::{Config, ReadOptions, Result, ScanOptions, SingleDb, WriteOptions};
 use std::ops::Range;
@@ -78,6 +77,7 @@ impl StructuredSingleDb {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
+            options.column_family.as_deref(),
             self.db.db().now_seconds(),
             column,
             value.into(),
@@ -109,6 +109,7 @@ impl StructuredSingleDb {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
+            options.column_family.as_deref(),
             self.db.db().now_seconds(),
             column,
             value.into(),
@@ -122,7 +123,20 @@ impl StructuredSingleDb {
     where
         K: AsRef<[u8]>,
     {
-        self.db.delete(bucket, key, column)
+        self.delete_with_options(bucket, key, column, &WriteOptions::default())
+    }
+
+    pub fn delete_with_options<K>(
+        &self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        options: &WriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.db.delete_with_options(bucket, key, column, options)
     }
 
     pub fn new_write_batch(&self) -> StructuredWriteBatch {
@@ -143,7 +157,8 @@ impl StructuredSingleDb {
         K: AsRef<[u8]>,
     {
         let raw = self.db.get(bucket, key.as_ref())?;
-        raw.map(|columns| decode_row(&self.structured_schema, 0, columns))
+        let default_schema = self.structured_schema.projected(0, None);
+        raw.map(|columns| decode_row(&default_schema, 0, columns))
             .transpose()
     }
 
@@ -156,14 +171,13 @@ impl StructuredSingleDb {
     where
         K: AsRef<[u8]>,
     {
-        let raw = if options.column_indices.is_some() {
-            self.db.get(bucket, key.as_ref())?
-        } else {
-            self.db.get_with_options(bucket, key.as_ref(), options)?
-        };
-        raw.map(|columns| decode_row(&self.structured_schema, 0, columns))
+        let raw = self.db.get_with_options(bucket, key.as_ref(), options)?;
+        let projected_schema = self.structured_schema.project_structured_family(
+            options.column_family.as_deref(),
+            options.column_indices.as_deref(),
+        )?;
+        raw.map(|columns| decode_row(&projected_schema, 0, columns))
             .transpose()
-            .map(|row| row.map(|decoded| project_decoded_row_for_read(decoded, options)))
     }
 
     pub fn scan<'a>(
@@ -181,7 +195,10 @@ impl StructuredSingleDb {
         options: &ScanOptions,
     ) -> Result<StructuredDbIterator<'a>> {
         let inner = self.db.scan_with_options(bucket, range, options)?;
-        let projected_schema = project_structured_schema_for_scan(&self.structured_schema, options);
+        let projected_schema = self.structured_schema.project_structured_family(
+            options.column_family.as_deref(),
+            options.column_indices.as_deref(),
+        )?;
         Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
@@ -247,6 +264,7 @@ mod tests {
     fn apply_test_schema(db: &mut StructuredSingleDb) {
         db.update_schema()
             .add_list_column(
+                None,
                 1,
                 ListConfig {
                     max_elements: Some(3),
@@ -261,7 +279,7 @@ mod tests {
     fn test_config(root: &str) -> Config {
         Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-            num_columns: 2,
+            num_columns: 1,
             total_buckets: 2,
             snapshot_on_flush: true,
             ..Config::default()

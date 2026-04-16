@@ -10,12 +10,13 @@
 //! use cobble_data_structure::{ListConfig, ListRetainMode, StructuredSingleDb};
 //!
 //! let mut config = Config::default();
-//! config.num_columns = 2;
+//! config.num_columns = 1;
 //! config.total_buckets = 1;
 //! config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-ssingle");
 //!
 //! let mut db = StructuredSingleDb::open(config)?;
 //! db.update_schema().add_list_column(
+//!     None,
 //!     1,
 //!     ListConfig {
 //!         max_elements: Some(100),
@@ -61,9 +62,9 @@ mod structured_single_db;
 
 pub use list::{ListConfig, ListRetainMode};
 pub use structured_db::{
-    DataStructureDb, StructuredColumnType, StructuredColumnValue, StructuredDb,
-    StructuredDbIterator, StructuredSchema, StructuredSchemaBuilder, StructuredWriteBatch,
-    structured_merge_operator_resolver, structured_resolvable_operator_ids,
+    DataStructureDb, StructuredColumnFamilySchema, StructuredColumnType, StructuredColumnValue,
+    StructuredDb, StructuredDbIterator, StructuredSchema, StructuredSchemaBuilder,
+    StructuredWriteBatch, structured_merge_operator_resolver, structured_resolvable_operator_ids,
 };
 pub use structured_read_only_db::StructuredReadOnlyDb;
 pub use structured_reader::StructuredReader;

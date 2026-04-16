@@ -21,10 +21,7 @@ fn native_string(env: JNIEnv, _class: JClass, value: &'static str) -> jstring {
     }
 }
 
-pub(crate) fn decode_java_string(
-    env: &mut JNIEnv,
-    value: JString,
-) -> Result<String, String> {
+pub(crate) fn decode_java_string(env: &mut JNIEnv, value: JString) -> Result<String, String> {
     env.get_string(&value)
         .map(|s| s.into())
         .map_err(|err| format!("invalid java string: {}", err))
@@ -40,10 +37,7 @@ pub(crate) fn decode_optional_java_string(
     decode_java_string(env, value).map(Some)
 }
 
-pub(crate) fn decode_java_bytes(
-    env: &mut JNIEnv,
-    value: JByteArray,
-) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_java_bytes(env: &mut JNIEnv, value: JByteArray) -> Result<Vec<u8>, String> {
     env.convert_byte_array(value)
         .map_err(|err| format!("invalid java byte array: {}", err))
 }

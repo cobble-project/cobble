@@ -548,13 +548,20 @@ impl Schema {
         }
     }
 
-    pub fn column_metadata_at(&self, column_idx: usize) -> Option<&JsonValue> {
-        let family = self.default_family()?;
+    pub fn column_metadata_at(
+        &self,
+        column_family: Option<&str>,
+        column_idx: usize,
+    ) -> Result<Option<&JsonValue>> {
+        let column_family_id = self.resolve_column_family_id(column_family)?;
+        let Some(family) = self.column_family_by_id(column_family_id) else {
+            return Ok(None);
+        };
         let actual_idx = family.resolve_visible_column_index(column_idx);
-        family
+        Ok(family
             .column_metadata
             .get(actual_idx)
-            .and_then(|metadata| metadata.as_ref())
+            .and_then(|metadata| metadata.as_ref()))
     }
 
     pub fn column_families(&self) -> Vec<(String, usize)> {
@@ -1048,15 +1055,6 @@ impl SchemaBuilder {
         Ok(())
     }
 
-    pub fn set_column_operator_in_family(
-        &mut self,
-        column_family: impl Into<String>,
-        column_idx: usize,
-        operator: Arc<dyn MergeOperator>,
-    ) -> Result<()> {
-        self.set_column_operator(Some(column_family.into()), column_idx, operator)
-    }
-
     /// Add a new column at the specified index, shifting existing columns at and after that index to the right.
     /// `column_family` sets the target family for the new column; when `None`, it uses `default`.
     /// Cannot be used in the same commit as `delete_column`.
@@ -1098,21 +1096,6 @@ impl SchemaBuilder {
         Ok(())
     }
 
-    pub fn add_column_in_family(
-        &mut self,
-        column_family: impl Into<String>,
-        column_idx: usize,
-        operator: Option<Arc<dyn MergeOperator>>,
-        default_value: Option<Bytes>,
-    ) -> Result<()> {
-        self.add_column(
-            column_idx,
-            operator,
-            default_value,
-            Some(column_family.into()),
-        )
-    }
-
     /// Delete the column at the specified index, shifting existing columns after that index to the left.
     /// Cannot be used in the same commit as `add_column`.
     pub fn delete_column(
@@ -1134,14 +1117,6 @@ impl SchemaBuilder {
         family.operators.remove(column_idx);
         family.column_metadata.remove(column_idx);
         Ok(())
-    }
-
-    pub fn delete_column_in_family(
-        &mut self,
-        column_family: impl Into<String>,
-        column_idx: usize,
-    ) -> Result<()> {
-        self.delete_column(Some(column_family.into()), column_idx)
     }
 
     /// Commit the schema changes and return the new schema.
@@ -1175,6 +1150,11 @@ impl SchemaBuilder {
         ));
         self.column_family_name_index.insert(normalized, next_id);
         Ok(next_id)
+    }
+
+    pub fn ensure_column_family_exists(&mut self, column_family: impl Into<String>) -> Result<u8> {
+        let column_family = column_family.into();
+        self.ensure_column_family(&column_family)
     }
 
     #[inline]
@@ -1471,7 +1451,7 @@ mod tests {
         let manager = Arc::new(SchemaManager::new(1));
         let mut builder = manager.builder();
         builder
-            .add_column_in_family("metrics", 0, None, None)
+            .add_column(0, None, None, Some("metrics".to_string()))
             .expect("add column with column family");
         let schema = builder.commit();
         let families = schema.column_families();
@@ -1488,11 +1468,13 @@ mod tests {
         let manager = Arc::new(SchemaManager::new(1));
         let mut builder = manager.builder();
         builder
-            .add_column_in_family("metrics", 0, None, None)
+            .add_column(0, None, None, Some("metrics".to_string()))
             .unwrap();
-        builder.add_column_in_family("tags", 0, None, None).unwrap();
         builder
-            .add_column_in_family("metrics", 1, None, None)
+            .add_column(0, None, None, Some("tags".to_string()))
+            .unwrap();
+        builder
+            .add_column(1, None, None, Some("metrics".to_string()))
             .unwrap();
         let schema = builder.commit();
         assert_eq!(schema.num_columns(), 1);
@@ -1513,11 +1495,11 @@ mod tests {
         let mut builder = manager.builder();
         for i in 1..MAX_COLUMN_FAMILY_COUNT {
             builder
-                .add_column_in_family(format!("cf{}", i), 0, None, None)
+                .add_column(0, None, None, Some(format!("cf{}", i)))
                 .expect("define column family within limit");
         }
         let err = builder
-            .add_column_in_family("overflow", 0, None, None)
+            .add_column(0, None, None, Some("overflow".to_string()))
             .expect_err("overflow should fail");
         assert!(err.to_string().contains("exceeds max"));
     }
@@ -1527,10 +1509,14 @@ mod tests {
         let manager = Arc::new(SchemaManager::new(1));
         let mut builder = manager.builder();
         builder
-            .add_column_in_family("metrics", 0, None, None)
+            .add_column(0, None, None, Some("metrics".to_string()))
             .unwrap();
         builder
-            .set_column_operator_in_family("metrics", 0, Arc::new(BracketMergeOperator))
+            .set_column_operator(
+                Some("metrics".to_string()),
+                0,
+                Arc::new(BracketMergeOperator),
+            )
             .unwrap();
         let schema = builder.commit();
 

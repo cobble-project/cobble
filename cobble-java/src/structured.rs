@@ -7,8 +7,9 @@
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{decode_scan_open_args, scan_options_from_handle_or_throw};
 use crate::util::{
-    decode_java_bytes, decode_java_string, decode_u16, decode_u64_from_jlong, parse_config_json,
-    throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
+    decode_java_bytes, decode_java_string, decode_optional_java_string, decode_u16,
+    decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
+    to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use bytes::Bytes;
@@ -546,15 +547,19 @@ pub extern "system" fn Java_io_cobble_structured_Db_mergeListWithOptions(
 // ── delete ──────────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_structured_Db_delete(
+pub extern "system" fn Java_io_cobble_structured_Db_deleteWithOptions(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
     bucket: jint,
     key: JByteArray,
     column: jint,
+    write_options_handle: jlong,
 ) {
     let Some(db) = db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let Some(wo) = write_options_from_handle_or_throw(&mut env, write_options_handle) else {
         return;
     };
     let bucket = match decode_u16("bucket", bucket) {
@@ -578,7 +583,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_delete(
             return;
         }
     };
-    if let Err(err) = db.delete(bucket, key, column) {
+    if let Err(err) = db.delete_with_options(bucket, key, column, wo.write_options()) {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -1170,10 +1175,18 @@ pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeA
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
+    column_family: JString,
     column_idx: jint,
 ) {
     let Some(builder) = structured_builder_from_handle(&mut env, native_handle) else {
         return;
+    };
+    let column_family = match decode_optional_java_string(&mut env, column_family) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
     };
     let column = match decode_u16("column", column_idx) {
         Ok(v) => v,
@@ -1184,10 +1197,10 @@ pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeA
     };
     match builder {
         StructuredSchemaBuilderHandle::Db(b) => {
-            b.add_bytes_column(column);
+            b.add_bytes_column(column_family, column);
         }
         StructuredSchemaBuilderHandle::SingleDb(b) => {
-            b.add_bytes_column(column);
+            b.add_bytes_column(column_family, column);
         }
     }
 }
@@ -1197,6 +1210,7 @@ pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeA
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
+    column_family: JString,
     column_idx: jint,
     max_elements: jint,
     retain_mode: JString,
@@ -1204,6 +1218,13 @@ pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeA
 ) {
     let Some(builder) = structured_builder_from_handle(&mut env, native_handle) else {
         return;
+    };
+    let column_family = match decode_optional_java_string(&mut env, column_family) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
     };
     let column = match decode_u16("column", column_idx) {
         Ok(v) => v,
@@ -1238,26 +1259,17 @@ pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeA
     } else {
         Some(max_elements as usize)
     };
+    let config = cobble_data_structure::ListConfig {
+        max_elements,
+        retain_mode,
+        preserve_element_ttl: preserve_element_ttl == JNI_TRUE,
+    };
     match builder {
         StructuredSchemaBuilderHandle::Db(b) => {
-            b.add_list_column(
-                column,
-                cobble_data_structure::ListConfig {
-                    max_elements,
-                    retain_mode,
-                    preserve_element_ttl: preserve_element_ttl == JNI_TRUE,
-                },
-            );
+            b.add_list_column(column_family.clone(), column, config.clone());
         }
         StructuredSchemaBuilderHandle::SingleDb(b) => {
-            b.add_list_column(
-                column,
-                cobble_data_structure::ListConfig {
-                    max_elements,
-                    retain_mode,
-                    preserve_element_ttl: preserve_element_ttl == JNI_TRUE,
-                },
-            );
+            b.add_list_column(column_family, column, config);
         }
     }
 }
@@ -1267,10 +1279,18 @@ pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeD
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
+    column_family: JString,
     column_idx: jint,
 ) {
     let Some(builder) = structured_builder_from_handle(&mut env, native_handle) else {
         return;
+    };
+    let column_family = match decode_optional_java_string(&mut env, column_family) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
     };
     let column = match decode_u16("column", column_idx) {
         Ok(v) => v,
@@ -1281,10 +1301,10 @@ pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeD
     };
     match builder {
         StructuredSchemaBuilderHandle::Db(b) => {
-            b.delete_column(column);
+            b.delete_column(column_family.clone(), column);
         }
         StructuredSchemaBuilderHandle::SingleDb(b) => {
-            b.delete_column(column);
+            b.delete_column(column_family, column);
         }
     }
 }

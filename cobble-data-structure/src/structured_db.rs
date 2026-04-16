@@ -13,8 +13,17 @@ use std::collections::BTreeMap;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+const DEFAULT_COLUMN_FAMILY_ID: u8 = 0;
+const DEFAULT_COLUMN_FAMILY_NAME: &str = "default";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuredSchema {
+    pub column_family_ids: BTreeMap<String, u8>,
+    pub column_families: BTreeMap<u8, StructuredColumnFamilySchema>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredColumnFamilySchema {
     pub columns: BTreeMap<u16, StructuredColumnType>,
 }
 
@@ -32,23 +41,147 @@ pub enum StructuredColumnValue {
     List(Vec<Bytes>),
 }
 
-// ── Shared helpers (used by all Structured* wrappers) ───────────────────────
+impl StructuredColumnFamilySchema {
+    fn structured_column_type(&self, column: u16) -> &StructuredColumnType {
+        self.columns
+            .get(&column)
+            .unwrap_or(&StructuredColumnType::Bytes)
+    }
 
-pub(crate) fn column_type(schema: &StructuredSchema, column: u16) -> &StructuredColumnType {
-    schema
-        .columns
-        .get(&column)
-        .unwrap_or(&StructuredColumnType::Bytes)
+    fn insert_column(&mut self, column: u16, column_type: StructuredColumnType) {
+        let mut shifted = BTreeMap::new();
+        for (existing_column, existing_type) in std::mem::take(&mut self.columns) {
+            let shifted_column = if existing_column >= column {
+                existing_column + 1
+            } else {
+                existing_column
+            };
+            shifted.insert(shifted_column, existing_type);
+        }
+        if !matches!(column_type, StructuredColumnType::Bytes) {
+            shifted.insert(column, column_type);
+        }
+        self.columns = shifted;
+    }
+
+    fn delete_column(&mut self, column: u16) {
+        let mut shifted = BTreeMap::new();
+        for (existing_column, existing_type) in std::mem::take(&mut self.columns) {
+            if existing_column == column {
+                continue;
+            }
+            let shifted_column = if existing_column > column {
+                existing_column - 1
+            } else {
+                existing_column
+            };
+            shifted.insert(shifted_column, existing_type);
+        }
+        self.columns = shifted;
+    }
+}
+
+impl StructuredSchema {
+    pub(crate) fn resolve_column_family_id(&self, column_family: Option<&str>) -> Result<u8> {
+        match column_family {
+            None => Ok(DEFAULT_COLUMN_FAMILY_ID),
+            Some(column_family) if column_family == DEFAULT_COLUMN_FAMILY_NAME => {
+                Ok(DEFAULT_COLUMN_FAMILY_ID)
+            }
+            Some(column_family) => self
+                .column_family_ids
+                .get(column_family)
+                .copied()
+                .ok_or_else(|| {
+                    Error::IoError(format!("Unknown column family '{}'", column_family))
+                }),
+        }
+    }
+
+    pub(crate) fn projected(
+        &self,
+        column_family_id: u8,
+        column_indices: Option<&[usize]>,
+    ) -> StructuredColumnFamilySchema {
+        let columns = self
+            .column_families
+            .get(&column_family_id)
+            .map(|family| &family.columns);
+        let Some(indices) = column_indices else {
+            return columns
+                .cloned()
+                .map(|columns| StructuredColumnFamilySchema { columns })
+                .unwrap_or_default();
+        };
+        let mut projected = BTreeMap::new();
+        for (projected_idx, original_idx) in indices.iter().enumerate() {
+            if let Some(column_type) =
+                columns.and_then(|columns| columns.get(&(*original_idx as u16)))
+            {
+                projected.insert(projected_idx as u16, column_type.clone());
+            }
+        }
+        StructuredColumnFamilySchema { columns: projected }
+    }
+
+    fn insert_structured_column(
+        &mut self,
+        column_family_id: u8,
+        column: u16,
+        column_type: StructuredColumnType,
+    ) {
+        self.column_families
+            .entry(column_family_id)
+            .or_default()
+            .insert_column(column, column_type);
+    }
+
+    fn delete_structured_column(&mut self, column_family_id: u8, column: u16) {
+        self.column_families
+            .entry(column_family_id)
+            .or_default()
+            .delete_column(column);
+    }
+
+    pub(crate) fn project_structured_family(
+        &self,
+        column_family: Option<&str>,
+        column_indices: Option<&[usize]>,
+    ) -> Result<Arc<StructuredColumnFamilySchema>> {
+        let column_family_id = self.resolve_column_family_id(column_family)?;
+        Ok(Arc::new(self.projected(column_family_id, column_indices)))
+    }
+}
+
+impl Default for StructuredSchema {
+    fn default() -> Self {
+        Self {
+            column_family_ids: BTreeMap::from([(
+                DEFAULT_COLUMN_FAMILY_NAME.to_string(),
+                DEFAULT_COLUMN_FAMILY_ID,
+            )]),
+            column_families: BTreeMap::new(),
+        }
+    }
 }
 
 pub(crate) fn encode_for_write(
     schema: &StructuredSchema,
+    column_family: Option<&str>,
     now_seconds: u32,
     column: u16,
     value: StructuredColumnValue,
     ttl_seconds: Option<u32>,
 ) -> Result<Bytes> {
-    match (column_type(schema, column), value) {
+    let column_family_id = schema.resolve_column_family_id(column_family)?;
+    match (
+        schema
+            .column_families
+            .get(&column_family_id)
+            .map(|family| family.structured_column_type(column))
+            .unwrap_or(&StructuredColumnType::Bytes),
+        value,
+    ) {
         (StructuredColumnType::Bytes, StructuredColumnValue::Bytes(value)) => Ok(value),
         (StructuredColumnType::List(config), StructuredColumnValue::List(elements)) => {
             encode_list_for_write(elements, config, ttl_seconds, now_seconds)
@@ -61,7 +194,7 @@ pub(crate) fn encode_for_write(
 }
 
 pub(crate) fn decode_row(
-    schema: &StructuredSchema,
+    schema: &StructuredColumnFamilySchema,
     now_seconds: u32,
     columns: Vec<Option<Bytes>>,
 ) -> Result<Vec<Option<StructuredColumnValue>>> {
@@ -72,7 +205,7 @@ pub(crate) fn decode_row(
             let Some(raw) = column else {
                 return Ok(None);
             };
-            match column_type(schema, idx as u16) {
+            match schema.structured_column_type(idx as u16) {
                 StructuredColumnType::Bytes => Ok(Some(StructuredColumnValue::Bytes(raw))),
                 StructuredColumnType::List(config) => Ok(Some(StructuredColumnValue::List(
                     decode_list_for_read(&raw, config, now_seconds)?,
@@ -82,67 +215,57 @@ pub(crate) fn decode_row(
         .collect()
 }
 
-pub(crate) fn project_structured_schema_for_indices(
-    schema: &StructuredSchema,
-    column_indices: Option<&[usize]>,
-) -> Arc<StructuredSchema> {
-    let Some(indices) = column_indices else {
-        return Arc::new(schema.clone());
-    };
-    let mut columns = BTreeMap::new();
-    for (projected_idx, original_idx) in indices.iter().enumerate() {
-        if let Some(column_type) = schema.columns.get(&(*original_idx as u16)) {
-            columns.insert(projected_idx as u16, column_type.clone());
-        }
-    }
-    Arc::new(StructuredSchema { columns })
-}
-
-pub(crate) fn project_structured_schema_for_scan(
-    schema: &StructuredSchema,
-    options: &ScanOptions,
-) -> Arc<StructuredSchema> {
-    project_structured_schema_for_indices(schema, options.column_indices.as_deref())
-}
-
-pub(crate) fn project_decoded_row_for_read(
-    row: Vec<Option<StructuredColumnValue>>,
-    options: &ReadOptions,
-) -> Vec<Option<StructuredColumnValue>> {
-    let Some(indices) = options.column_indices.as_deref() else {
-        return row;
-    };
-    indices
-        .iter()
-        .map(|&idx| row.get(idx).cloned().unwrap_or(None))
-        .collect()
-}
-
 pub(crate) fn load_structured_schema_from_cobble_schema(
     schema: &Schema,
 ) -> Result<StructuredSchema> {
-    let operator_ids = schema.all_operator_ids();
-    let mut columns = BTreeMap::new();
-    for column_idx in 0..schema.num_columns() {
-        let operator_id = operator_ids
-            .get(column_idx)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        if operator_id == LIST_OPERATOR_ID {
-            let metadata_value = schema.column_metadata_at(column_idx).ok_or_else(|| {
-                Error::FileFormatError(format!("list column {} missing metadata", column_idx))
+    let mut structured_schema = StructuredSchema {
+        column_family_ids: schema.column_family_ids(),
+        ..StructuredSchema::default()
+    };
+    let column_family_ids = structured_schema.column_family_ids.clone();
+    for (column_family, num_columns) in schema.column_families() {
+        let column_family_id = column_family_ids
+            .get(&column_family)
+            .copied()
+            .ok_or_else(|| {
+                Error::FileFormatError(format!("missing column family id for {}", column_family))
             })?;
-            let config =
-                serde_json::from_value::<ListConfig>(metadata_value.clone()).map_err(|err| {
-                    Error::FileFormatError(format!(
-                        "failed to decode list config at column {}: {}",
-                        column_idx, err
-                    ))
-                })?;
-            columns.insert(column_idx as u16, StructuredColumnType::List(config));
+        let operator_ids = if column_family == DEFAULT_COLUMN_FAMILY_NAME {
+            schema.all_operator_ids()
+        } else {
+            schema.operator_ids_in_family(&column_family)?
+        };
+        let mut columns = BTreeMap::new();
+        for column_idx in 0..num_columns {
+            let operator_id = operator_ids
+                .get(column_idx)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if operator_id == LIST_OPERATOR_ID {
+                let metadata_value = schema
+                    .column_metadata_at(Some(column_family.as_str()), column_idx)?
+                    .ok_or_else(|| {
+                        Error::FileFormatError(format!(
+                            "list column {} in column family {} missing metadata",
+                            column_idx, column_family
+                        ))
+                    })?;
+                let config = serde_json::from_value::<ListConfig>(metadata_value.clone()).map_err(
+                    |err| {
+                        Error::FileFormatError(format!(
+                            "failed to decode list config at column {} in column family {}: {}",
+                            column_idx, column_family, err
+                        ))
+                    },
+                )?;
+                columns.insert(column_idx as u16, StructuredColumnType::List(config));
+            }
         }
+        structured_schema
+            .column_families
+            .insert(column_family_id, StructuredColumnFamilySchema { columns });
     }
-    Ok(StructuredSchema { columns })
+    Ok(structured_schema)
 }
 
 pub(crate) fn combined_resolver(
@@ -212,6 +335,7 @@ impl StructuredWriteBatch {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
+            options.column_family.as_deref(),
             self.now_seconds,
             column,
             value.into(),
@@ -226,7 +350,19 @@ impl StructuredWriteBatch {
     where
         K: AsRef<[u8]>,
     {
-        self.inner.delete(bucket, key, column);
+        self.delete_with_options(bucket, key, column, &WriteOptions::default());
+    }
+
+    pub fn delete_with_options<K>(
+        &mut self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        options: &WriteOptions,
+    ) where
+        K: AsRef<[u8]>,
+    {
+        self.inner.delete_with_options(bucket, key, column, options);
     }
 
     pub fn merge<K, V>(&mut self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
@@ -251,6 +387,7 @@ impl StructuredWriteBatch {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
+            options.column_family.as_deref(),
             self.now_seconds,
             column,
             value.into(),
@@ -324,50 +461,149 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
         }
     }
 
-    pub fn add_bytes_column(&mut self, column: u16) -> &mut Self {
-        self.schema.columns.remove(&column);
-        self.apply_inner(|inner| {
-            inner.set_column_operator(None, column as usize, Arc::new(BytesMergeOperator))?;
-            inner.clear_column_metadata(None, column as usize)?;
-            Ok(())
-        });
-        self
-    }
-
-    pub fn add_list_column(&mut self, column: u16, config: ListConfig) -> &mut Self {
-        self.schema
-            .columns
-            .insert(column, StructuredColumnType::List(config.clone()));
-        self.apply_inner(|inner| {
-            inner.set_column_operator(None, column as usize, list_operator(config.clone()))?;
-            inner.set_column_metadata(
-                None,
+    pub fn add_bytes_column(&mut self, column_family: Option<String>, column: u16) -> &mut Self {
+        let Some((column_family_name, core_column_family)) =
+            self.normalize_column_family_or_record_error(column_family)
+        else {
+            return self;
+        };
+        let Some(column_family_id) = self.apply_inner(|inner| {
+            let column_family_id = match core_column_family.as_ref() {
+                Some(column_family) => inner.ensure_column_family_exists(column_family.clone())?,
+                None => DEFAULT_COLUMN_FAMILY_ID,
+            };
+            inner.add_column(
                 column as usize,
-                serde_json::to_value(config).map_err(|err| {
-                    Error::FileFormatError(format!(
-                        "failed to encode list config metadata: {}",
-                        err
-                    ))
-                })?,
+                Some(Arc::new(BytesMergeOperator)),
+                None,
+                core_column_family.clone(),
             )?;
-            Ok(())
-        });
+            Ok(column_family_id)
+        }) else {
+            return self;
+        };
+        self.sync_structured_column_family_id(&column_family_name, column_family_id);
+        if let Some(column_family_id) =
+            self.structured_column_family_id_or_record_error(&column_family_name)
+        {
+            self.schema.insert_structured_column(
+                column_family_id,
+                column,
+                StructuredColumnType::Bytes,
+            );
+        }
         self
     }
 
-    pub fn delete_column(&mut self, column: u16) -> &mut Self {
-        // Structured delete means dropping structured typing for this column (back to Bytes).
-        self.schema.columns.remove(&column);
-        self.apply_inner(|inner| {
-            inner.set_column_operator(None, column as usize, Arc::new(BytesMergeOperator))?;
-            inner.clear_column_metadata(None, column as usize)?;
-            Ok(())
-        });
+    pub fn add_list_column(
+        &mut self,
+        column_family: Option<String>,
+        column: u16,
+        config: ListConfig,
+    ) -> &mut Self {
+        let Some((column_family_name, core_column_family)) =
+            self.normalize_column_family_or_record_error(column_family)
+        else {
+            return self;
+        };
+        let Some(column_family_id) = self.apply_inner(|inner| {
+            let column_family_id = match core_column_family.as_ref() {
+                Some(column_family) => inner.ensure_column_family_exists(column_family.clone())?,
+                None => DEFAULT_COLUMN_FAMILY_ID,
+            };
+            inner.add_column(
+                column as usize,
+                Some(list_operator(config.clone())),
+                None,
+                core_column_family.clone(),
+            )?;
+            Ok(column_family_id)
+        }) else {
+            return self;
+        };
+        self.sync_structured_column_family_id(&column_family_name, column_family_id);
+        if let Some(column_family_id) =
+            self.structured_column_family_id_or_record_error(&column_family_name)
+        {
+            self.schema.insert_structured_column(
+                column_family_id,
+                column,
+                StructuredColumnType::List(config),
+            );
+        }
+        self
+    }
+
+    pub fn delete_column(&mut self, column_family: Option<String>, column: u16) -> &mut Self {
+        let Some((column_family_name, core_column_family)) =
+            self.normalize_column_family_or_record_error(column_family)
+        else {
+            return self;
+        };
+        let Some(()) = self
+            .apply_inner(|inner| inner.delete_column(core_column_family.clone(), column as usize))
+        else {
+            return self;
+        };
+        if let Some(column_family_id) =
+            self.structured_column_family_id_or_record_error(&column_family_name)
+        {
+            self.schema
+                .delete_structured_column(column_family_id, column);
+        }
         self
     }
 
     pub fn current_schema(&self) -> &StructuredSchema {
         &self.schema
+    }
+
+    fn ensure_structured_column_family_id(&self, column_family: &str) -> Result<u8> {
+        if column_family == DEFAULT_COLUMN_FAMILY_NAME {
+            return Ok(DEFAULT_COLUMN_FAMILY_ID);
+        }
+        self.schema
+            .column_family_ids
+            .get(column_family)
+            .copied()
+            .ok_or_else(|| {
+                Error::InvalidState(format!(
+                    "structured schema missing column family id for {}",
+                    column_family
+                ))
+            })
+    }
+
+    fn sync_structured_column_family_id(&mut self, column_family: &str, column_family_id: u8) {
+        if column_family == DEFAULT_COLUMN_FAMILY_NAME {
+            return;
+        }
+        self.schema
+            .column_family_ids
+            .insert(column_family.to_string(), column_family_id);
+    }
+
+    fn normalize_column_family_or_record_error(
+        &mut self,
+        column_family: Option<String>,
+    ) -> Option<(String, Option<String>)> {
+        match normalize_structured_column_family_name(column_family) {
+            Ok(names) => Some(names),
+            Err(err) => {
+                self.pending_error = Some(err);
+                None
+            }
+        }
+    }
+
+    fn structured_column_family_id_or_record_error(&mut self, column_family: &str) -> Option<u8> {
+        match self.ensure_structured_column_family_id(column_family) {
+            Ok(column_family_id) => Some(column_family_id),
+            Err(err) => {
+                self.pending_error = Some(err);
+                None
+            }
+        }
     }
 
     pub fn commit(&mut self) -> Result<StructuredSchema> {
@@ -382,23 +618,50 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
         self.owner.reload_structured_schema_from_core()
     }
 
-    fn apply_inner<F>(&mut self, f: F)
+    fn apply_inner<T, F>(&mut self, f: F) -> Option<T>
     where
-        F: FnOnce(&mut SchemaBuilder) -> Result<()>,
+        F: FnOnce(&mut SchemaBuilder) -> Result<T>,
     {
         if self.pending_error.is_some() {
-            return;
+            return None;
         }
         let Some(inner) = self.inner.as_mut() else {
             self.pending_error = Some(Error::InvalidState(
                 "schema builder already committed".to_string(),
             ));
-            return;
+            return None;
         };
-        if let Err(err) = f(inner) {
-            self.pending_error = Some(err);
+        match f(inner) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                self.pending_error = Some(err);
+                None
+            }
         }
     }
+}
+
+fn normalize_structured_column_family_name(
+    column_family: Option<String>,
+) -> Result<(String, Option<String>)> {
+    let normalized = match column_family {
+        Some(column_family) => {
+            let normalized = column_family.trim().to_string();
+            if normalized.is_empty() {
+                return Err(Error::InvalidState(
+                    "column family name cannot be empty".to_string(),
+                ));
+            }
+            normalized
+        }
+        None => DEFAULT_COLUMN_FAMILY_NAME.to_string(),
+    };
+    let core_column_family = if normalized == DEFAULT_COLUMN_FAMILY_NAME {
+        None
+    } else {
+        Some(normalized.clone())
+    };
+    Ok((normalized, core_column_family))
 }
 
 impl StructuredDb {
@@ -477,7 +740,7 @@ impl StructuredDb {
         &mut self,
         structured_schema: StructuredSchema,
     ) -> Result<StructuredSchema> {
-        persist_structured_schema(&self.db, &structured_schema)?;
+        persist_structured_schema_on_db(&self.db, &structured_schema)?;
         let reloaded = load_structured_schema_from_cobble_schema(&self.db.current_schema())?;
         self.structured_schema = Arc::new(reloaded.clone());
         Ok(reloaded)
@@ -505,6 +768,7 @@ impl StructuredDb {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
+            options.column_family.as_deref(),
             self.db.now_seconds(),
             column,
             value.into(),
@@ -536,6 +800,7 @@ impl StructuredDb {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
+            options.column_family.as_deref(),
             self.db.now_seconds(),
             column,
             value.into(),
@@ -549,7 +814,20 @@ impl StructuredDb {
     where
         K: AsRef<[u8]>,
     {
-        self.db.delete(bucket, key, column)
+        self.delete_with_options(bucket, key, column, &WriteOptions::default())
+    }
+
+    pub fn delete_with_options<K>(
+        &self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        options: &WriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.db.delete_with_options(bucket, key, column, options)
     }
 
     pub fn new_write_batch(&self) -> StructuredWriteBatch {
@@ -565,7 +843,10 @@ impl StructuredDb {
         K: AsRef<[u8]>,
     {
         let raw = self.db.get(bucket, key.as_ref())?;
-        raw.map(|columns| decode_row(&self.structured_schema, 0, columns))
+        let default_schema = self
+            .structured_schema
+            .projected(DEFAULT_COLUMN_FAMILY_ID, None);
+        raw.map(|columns| decode_row(&default_schema, 0, columns))
             .transpose()
     }
 
@@ -578,14 +859,13 @@ impl StructuredDb {
     where
         K: AsRef<[u8]>,
     {
-        let raw = if options.column_indices.is_some() {
-            self.db.get(bucket, key.as_ref())?
-        } else {
-            self.db.get_with_options(bucket, key.as_ref(), options)?
-        };
-        raw.map(|columns| decode_row(&self.structured_schema, 0, columns))
+        let raw = self.db.get_with_options(bucket, key.as_ref(), options)?;
+        let projected_schema = self.structured_schema.project_structured_family(
+            options.column_family.as_deref(),
+            options.column_indices.as_deref(),
+        )?;
+        raw.map(|columns| decode_row(&projected_schema, 0, columns))
             .transpose()
-            .map(|row| row.map(|decoded| project_decoded_row_for_read(decoded, options)))
     }
 
     pub fn scan<'a>(
@@ -603,7 +883,10 @@ impl StructuredDb {
         options: &ScanOptions,
     ) -> Result<StructuredDbIterator<'a>> {
         let inner = self.db.scan_with_options(bucket, range, options)?;
-        let projected_schema = project_structured_schema_for_scan(&self.structured_schema, options);
+        let projected_schema = self.structured_schema.project_structured_family(
+            options.column_family.as_deref(),
+            options.column_indices.as_deref(),
+        )?;
         Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
@@ -683,14 +966,14 @@ pub type DataStructureDb = StructuredDb;
 
 pub struct StructuredDbIterator<'a> {
     inner: DbIterator<'a>,
-    structured_schema: Arc<StructuredSchema>,
+    structured_schema: Arc<StructuredColumnFamilySchema>,
     now_seconds: u32,
 }
 
 impl<'a> StructuredDbIterator<'a> {
     pub(crate) fn new(
         inner: DbIterator<'a>,
-        structured_schema: Arc<StructuredSchema>,
+        structured_schema: Arc<StructuredColumnFamilySchema>,
         now_seconds: u32,
     ) -> Self {
         Self {
@@ -725,25 +1008,64 @@ pub(crate) fn persist_structured_schema_on_db(
     Ok(())
 }
 
-fn persist_structured_schema(db: &Db, structured_schema: &StructuredSchema) -> Result<()> {
-    persist_structured_schema_on_db(db, structured_schema)
-}
-
 fn apply_structured_schema(
     schema: &mut SchemaBuilder,
     structured_schema: &StructuredSchema,
 ) -> Result<()> {
-    for (column, column_type) in &structured_schema.columns {
+    let column_family_names_by_id = structured_schema
+        .column_family_ids
+        .iter()
+        .map(|(name, &id)| (id, name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for (column_family_id, family_schema) in &structured_schema.column_families {
+        let column_family = if *column_family_id == DEFAULT_COLUMN_FAMILY_ID {
+            None
+        } else {
+            Some(
+                column_family_names_by_id
+                    .get(column_family_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::InvalidState(format!(
+                            "unknown structured column family id {}",
+                            column_family_id
+                        ))
+                    })?,
+            )
+        };
+        apply_structured_family(schema, column_family, &family_schema.columns)?;
+    }
+    Ok(())
+}
+
+fn apply_structured_family(
+    schema: &mut SchemaBuilder,
+    column_family: Option<String>,
+    columns: &BTreeMap<u16, StructuredColumnType>,
+) -> Result<()> {
+    if let Some(column_family) = column_family.as_ref()
+        && !columns.is_empty()
+    {
+        schema.ensure_column_family_exists(column_family.clone())?;
+    }
+    for (column, column_type) in columns {
         match column_type {
-            StructuredColumnType::Bytes => {}
+            StructuredColumnType::Bytes => {
+                schema.set_column_operator(
+                    column_family.clone(),
+                    *column as usize,
+                    Arc::new(BytesMergeOperator),
+                )?;
+                schema.clear_column_metadata(column_family.clone(), *column as usize)?;
+            }
             StructuredColumnType::List(config) => {
                 schema.set_column_operator(
-                    None,
+                    column_family.clone(),
                     *column as usize,
                     list_operator(config.clone()),
                 )?;
                 schema.set_column_metadata(
-                    None,
+                    column_family.clone(),
                     *column as usize,
                     serde_json::to_value(config).map_err(|err| {
                         Error::FileFormatError(format!(
@@ -762,10 +1084,20 @@ fn apply_structured_schema(
 mod tests {
     use super::*;
     use crate::list::{ListConfig, ListRetainMode};
-    use cobble::{ReadOptions, VolumeDescriptor};
+    use cobble::{ReadOptions, VolumeDescriptor, WriteOptions};
     use std::thread;
     use std::time::Duration;
     use uuid::Uuid;
+
+    fn default_family_schema(columns: BTreeMap<u16, StructuredColumnType>) -> StructuredSchema {
+        StructuredSchema {
+            column_families: BTreeMap::from([(
+                DEFAULT_COLUMN_FAMILY_ID,
+                StructuredColumnFamilySchema { columns },
+            )]),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn test_structured_db_resume_loads_structured_schema() {
@@ -776,16 +1108,14 @@ mod tests {
             num_columns: 2,
             ..Config::default()
         };
-        let structured_schema = StructuredSchema {
-            columns: BTreeMap::from([(
-                1,
-                StructuredColumnType::List(ListConfig {
-                    max_elements: Some(2),
-                    retain_mode: ListRetainMode::Last,
-                    preserve_element_ttl: true,
-                }),
-            )]),
-        };
+        let structured_schema = default_family_schema(BTreeMap::from([(
+            1,
+            StructuredColumnType::List(ListConfig {
+                max_elements: Some(2),
+                retain_mode: ListRetainMode::Last,
+                preserve_element_ttl: true,
+            }),
+        )]));
         let mut db = StructuredDb::open(config.clone(), vec![0u16..=0u16]).unwrap();
         db.apply_schema(structured_schema.clone()).unwrap();
         db.merge(0, b"k", 1, vec![Bytes::from_static(b"a")])
@@ -809,16 +1139,14 @@ mod tests {
             num_columns: 2,
             ..Config::default()
         };
-        let structured_schema = StructuredSchema {
-            columns: BTreeMap::from([(
-                1,
-                StructuredColumnType::List(ListConfig {
-                    max_elements: Some(2),
-                    retain_mode: ListRetainMode::Last,
-                    preserve_element_ttl: false,
-                }),
-            )]),
-        };
+        let structured_schema = default_family_schema(BTreeMap::from([(
+            1,
+            StructuredColumnType::List(ListConfig {
+                max_elements: Some(2),
+                retain_mode: ListRetainMode::Last,
+                preserve_element_ttl: false,
+            }),
+        )]));
         let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
         db.apply_schema(structured_schema).unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
@@ -871,16 +1199,14 @@ mod tests {
             num_columns: 2,
             ..Config::default()
         };
-        let structured_schema = StructuredSchema {
-            columns: BTreeMap::from([(
-                1,
-                StructuredColumnType::List(ListConfig {
-                    max_elements: Some(3),
-                    retain_mode: ListRetainMode::Last,
-                    preserve_element_ttl: false,
-                }),
-            )]),
-        };
+        let structured_schema = default_family_schema(BTreeMap::from([(
+            1,
+            StructuredColumnType::List(ListConfig {
+                max_elements: Some(3),
+                retain_mode: ListRetainMode::Last,
+                preserve_element_ttl: false,
+            }),
+        )]));
         let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
         db.apply_schema(structured_schema).unwrap();
         let mut batch = db.new_write_batch();
@@ -929,16 +1255,14 @@ mod tests {
             num_columns: 2,
             ..Config::default()
         };
-        let structured_schema = StructuredSchema {
-            columns: BTreeMap::from([(
-                1,
-                StructuredColumnType::List(ListConfig {
-                    max_elements: None,
-                    retain_mode: ListRetainMode::Last,
-                    preserve_element_ttl: false,
-                }),
-            )]),
-        };
+        let structured_schema = default_family_schema(BTreeMap::from([(
+            1,
+            StructuredColumnType::List(ListConfig {
+                max_elements: None,
+                retain_mode: ListRetainMode::Last,
+                preserve_element_ttl: false,
+            }),
+        )]));
         let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
         db.apply_schema(structured_schema).unwrap();
         let mut batch = db.new_write_batch();
@@ -961,16 +1285,14 @@ mod tests {
             num_columns: 2,
             ..Config::default()
         };
-        let structured_schema = StructuredSchema {
-            columns: BTreeMap::from([(
-                1,
-                StructuredColumnType::List(ListConfig {
-                    max_elements: Some(8),
-                    retain_mode: ListRetainMode::Last,
-                    preserve_element_ttl: false,
-                }),
-            )]),
-        };
+        let structured_schema = default_family_schema(BTreeMap::from([(
+            1,
+            StructuredColumnType::List(ListConfig {
+                max_elements: Some(8),
+                retain_mode: ListRetainMode::Last,
+                preserve_element_ttl: false,
+            }),
+        )]));
         let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
         db.apply_schema(structured_schema).unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
@@ -1009,16 +1331,14 @@ mod tests {
             num_columns: 2,
             ..Config::default()
         };
-        let structured_schema = StructuredSchema {
-            columns: BTreeMap::from([(
-                1,
-                StructuredColumnType::List(ListConfig {
-                    max_elements: Some(8),
-                    retain_mode: ListRetainMode::Last,
-                    preserve_element_ttl: false,
-                }),
-            )]),
-        };
+        let structured_schema = default_family_schema(BTreeMap::from([(
+            1,
+            StructuredColumnType::List(ListConfig {
+                max_elements: Some(8),
+                retain_mode: ListRetainMode::Last,
+                preserve_element_ttl: false,
+            }),
+        )]));
         let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
         db.apply_schema(structured_schema).unwrap();
         db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
@@ -1038,6 +1358,190 @@ mod tests {
                 Bytes::from_static(b"a"),
                 Bytes::from_static(b"b"),
             ]))
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_structured_db_column_family_get_scan_and_write_batch() {
+        let root = format!("/tmp/ds_structured_cf_{}", Uuid::new_v4());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            num_columns: 2,
+            ..Config::default()
+        };
+        let metrics_config = ListConfig {
+            max_elements: Some(8),
+            retain_mode: ListRetainMode::Last,
+            preserve_element_ttl: false,
+        };
+
+        let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
+        let schema = db
+            .update_schema()
+            .add_list_column(Some("metrics".to_string()), 0, metrics_config.clone())
+            .commit()
+            .unwrap();
+        assert_eq!(
+            schema
+                .column_families
+                .get(&1)
+                .and_then(|family| family.columns.get(&0)),
+            Some(&StructuredColumnType::List(metrics_config.clone()))
+        );
+
+        let metrics_write = WriteOptions::with_column_family("metrics");
+        db.put_with_options(0, b"k1", 0, vec![Bytes::from_static(b"a")], &metrics_write)
+            .unwrap();
+        db.merge_with_options(0, b"k1", 0, vec![Bytes::from_static(b"b")], &metrics_write)
+            .unwrap();
+
+        let row = db
+            .get_with_options(0, b"k1", &ReadOptions::for_column_in_family("metrics", 0))
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(
+            row[0],
+            Some(StructuredColumnValue::List(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]))
+        );
+
+        let mut iter = db
+            .scan_with_options(
+                0,
+                b"k0".as_ref()..b"k9".as_ref(),
+                &ScanOptions::for_column(0).with_column_family("metrics"),
+            )
+            .unwrap();
+        let first = iter.next().expect("one row").unwrap();
+        assert_eq!(first.0.as_ref(), b"k1");
+        assert_eq!(
+            first.1[0],
+            Some(StructuredColumnValue::List(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]))
+        );
+        assert!(iter.next().is_none());
+
+        let mut batch = db.new_write_batch();
+        batch
+            .put_with_options(0, b"k2", 0, vec![Bytes::from_static(b"c")], &metrics_write)
+            .unwrap();
+        db.write_batch(batch).unwrap();
+
+        let batch_row = db
+            .get_with_options(0, b"k2", &ReadOptions::for_column_in_family("metrics", 0))
+            .unwrap()
+            .expect("batch row exists");
+        assert_eq!(
+            batch_row[0],
+            Some(StructuredColumnValue::List(vec![Bytes::from_static(b"c")]))
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_structured_schema_builder_reindexes_family_local_columns_on_add_and_delete() {
+        let root = format!("/tmp/ds_structured_builder_indexes_{}", Uuid::new_v4());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            num_columns: 1,
+            ..Config::default()
+        };
+        let first = ListConfig {
+            max_elements: Some(4),
+            retain_mode: ListRetainMode::Last,
+            preserve_element_ttl: false,
+        };
+        let second = ListConfig {
+            max_elements: Some(6),
+            retain_mode: ListRetainMode::First,
+            preserve_element_ttl: true,
+        };
+
+        let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
+        let schema = db
+            .update_schema()
+            .add_list_column(None, 1, second.clone())
+            .add_list_column(None, 1, first.clone())
+            .commit()
+            .unwrap();
+        assert_eq!(db.db.current_schema().num_columns(), 3);
+
+        let family = schema
+            .column_families
+            .get(&0)
+            .expect("default family schema");
+        assert_eq!(
+            family.columns.get(&1),
+            Some(&StructuredColumnType::List(first))
+        );
+        assert_eq!(
+            family.columns.get(&2),
+            Some(&StructuredColumnType::List(second.clone()))
+        );
+
+        let schema = db.update_schema().delete_column(None, 1).commit().unwrap();
+        assert_eq!(db.db.current_schema().num_columns(), 2);
+        let family = schema
+            .column_families
+            .get(&0)
+            .expect("default family schema");
+        assert_eq!(
+            family.columns.get(&1),
+            Some(&StructuredColumnType::List(second))
+        );
+        assert!(!family.columns.contains_key(&2));
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_structured_schema_builder_normalizes_column_family_names_after_inner_success() {
+        let root = format!("/tmp/ds_structured_builder_family_name_{}", Uuid::new_v4());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            num_columns: 1,
+            ..Config::default()
+        };
+        let metrics_config = ListConfig {
+            max_elements: Some(5),
+            retain_mode: ListRetainMode::Last,
+            preserve_element_ttl: false,
+        };
+
+        let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
+        let baseline = db.current_schema();
+
+        let mut invalid_builder = db.update_schema();
+        invalid_builder.add_list_column(Some("   ".to_string()), 0, metrics_config.clone());
+        assert_eq!(invalid_builder.current_schema(), &baseline);
+        let err = invalid_builder
+            .commit()
+            .expect_err("empty family should fail");
+        assert!(matches!(err, Error::InvalidState(msg) if msg.contains("cannot be empty")));
+
+        let schema = db
+            .update_schema()
+            .add_list_column(Some(" metrics ".to_string()), 0, metrics_config.clone())
+            .commit()
+            .unwrap();
+        assert_eq!(schema.column_family_ids.get("metrics"), Some(&1));
+        assert!(!schema.column_family_ids.contains_key(" metrics "));
+        assert_eq!(
+            schema
+                .column_families
+                .get(&1)
+                .and_then(|family| family.columns.get(&0)),
+            Some(&StructuredColumnType::List(metrics_config))
         );
 
         db.close().unwrap();

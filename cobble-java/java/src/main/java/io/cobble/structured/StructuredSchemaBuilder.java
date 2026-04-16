@@ -15,17 +15,28 @@ public final class StructuredSchemaBuilder extends NativeObject {
     }
 
     public StructuredSchemaBuilder addBytesColumn(int columnIdx) {
-        nativeAddBytesColumn(nativeHandle, columnIdx);
+        nativeAddBytesColumn(nativeHandle, null, columnIdx);
+        return this;
+    }
+
+    public StructuredSchemaBuilder addBytesColumn(String columnFamily, int columnIdx) {
+        nativeAddBytesColumn(nativeHandle, columnFamily, columnIdx);
         return this;
     }
 
     public StructuredSchemaBuilder addListColumn(int columnIdx, ListConfig config) {
+        return addListColumn(null, columnIdx, config);
+    }
+
+    public StructuredSchemaBuilder addListColumn(
+            String columnFamily, int columnIdx, ListConfig config) {
         if (config == null) {
             throw new IllegalArgumentException("config must not be null");
         }
         Integer maxElements = config.getMaxElements();
         nativeAddListColumn(
                 nativeHandle,
+                columnFamily,
                 columnIdx,
                 maxElements == null ? -1 : maxElements,
                 config.getRetainMode().getId(),
@@ -34,7 +45,12 @@ public final class StructuredSchemaBuilder extends NativeObject {
     }
 
     public StructuredSchemaBuilder deleteColumn(int columnIdx) {
-        nativeDeleteColumn(nativeHandle, columnIdx);
+        nativeDeleteColumn(nativeHandle, null, columnIdx);
+        return this;
+    }
+
+    public StructuredSchemaBuilder deleteColumn(String columnFamily, int columnIdx) {
+        nativeDeleteColumn(nativeHandle, columnFamily, columnIdx);
         return this;
     }
 
@@ -48,16 +64,19 @@ public final class StructuredSchemaBuilder extends NativeObject {
     @Override
     protected native void disposeInternal(long nativeHandle);
 
-    private static native void nativeAddBytesColumn(long nativeHandle, int columnIdx);
+    private static native void nativeAddBytesColumn(
+            long nativeHandle, String columnFamily, int columnIdx);
 
     private static native void nativeAddListColumn(
             long nativeHandle,
+            String columnFamily,
             int columnIdx,
             int maxElements,
             String retainMode,
             boolean preserveElementTtl);
 
-    private static native void nativeDeleteColumn(long nativeHandle, int columnIdx);
+    private static native void nativeDeleteColumn(
+            long nativeHandle, String columnFamily, int columnIdx);
 
     private static native String nativeCommit(long nativeHandle);
 }

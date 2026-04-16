@@ -87,7 +87,7 @@ mod tests {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             base_file_size: Size::from_const(128),
             compaction_threads: 1,
-            num_columns: 2,
+            num_columns: 1,
             ..Config::default()
         };
         let server = Arc::new(StructuredRemoteCompactionServer::new(server_config).unwrap());
@@ -107,7 +107,7 @@ mod tests {
         // Open a StructuredSingleDb with remote compaction pointing to our server
         let db_config = Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-            num_columns: 2,
+            num_columns: 1,
             total_buckets: 1,
             base_file_size: Size::from_const(128),
             compaction_threads: 1,
@@ -118,6 +118,7 @@ mod tests {
         let mut db = crate::StructuredSingleDb::open(db_config).unwrap();
         db.update_schema()
             .add_list_column(
+                None,
                 1,
                 ListConfig {
                     max_elements: Some(5),

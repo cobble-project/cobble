@@ -147,9 +147,23 @@ public final class Db extends NativeObject {
         }
     }
 
+    /** Put a typed column value for a key in a specific column family. */
+    public void put(int bucket, byte[] key, String columnFamily, int column, ColumnValue value) {
+        try (WriteOptions options = WriteOptions.withColumnFamily(columnFamily)) {
+            putWithOptions(bucket, key, column, value, options);
+        }
+    }
+
     /** Convenience: put a bytes value for a column. */
     public void put(int bucket, byte[] key, int column, byte[] value) {
         putBytes(nativeHandle, bucket, key, column, value);
+    }
+
+    /** Convenience: put a bytes value for a column in a specific column family. */
+    public void put(int bucket, byte[] key, String columnFamily, int column, byte[] value) {
+        try (WriteOptions options = WriteOptions.withColumnFamily(columnFamily)) {
+            putWithOptions(bucket, key, column, ColumnValue.ofBytes(value), options);
+        }
     }
 
     /** Put a typed column value with explicit write options. */
@@ -176,9 +190,23 @@ public final class Db extends NativeObject {
         }
     }
 
+    /** Merge a typed column value for a key in a specific column family. */
+    public void merge(int bucket, byte[] key, String columnFamily, int column, ColumnValue value) {
+        try (WriteOptions options = WriteOptions.withColumnFamily(columnFamily)) {
+            mergeWithOptions(bucket, key, column, value, options);
+        }
+    }
+
     /** Convenience: merge a bytes value for a column. */
     public void merge(int bucket, byte[] key, int column, byte[] value) {
         mergeBytes(nativeHandle, bucket, key, column, value);
+    }
+
+    /** Convenience: merge a bytes value for a column in a specific column family. */
+    public void merge(int bucket, byte[] key, String columnFamily, int column, byte[] value) {
+        try (WriteOptions options = WriteOptions.withColumnFamily(columnFamily)) {
+            mergeWithOptions(bucket, key, column, ColumnValue.ofBytes(value), options);
+        }
     }
 
     /** Merge a typed column value with explicit write options. */
@@ -194,7 +222,20 @@ public final class Db extends NativeObject {
 
     /** Delete one column value for a key. */
     public void delete(int bucket, byte[] key, int column) {
-        delete(nativeHandle, bucket, key, column);
+        deleteWithOptions(bucket, key, column, null);
+    }
+
+    /** Delete one column value for a key in a specific column family. */
+    public void delete(int bucket, byte[] key, String columnFamily, int column) {
+        try (WriteOptions options = WriteOptions.withColumnFamily(columnFamily)) {
+            deleteWithOptions(bucket, key, column, options);
+        }
+    }
+
+    /** Delete one column value for a key with explicit write options. */
+    public void deleteWithOptions(int bucket, byte[] key, int column, WriteOptions options) {
+        long woh = options == null ? 0L : options.getNativeHandle();
+        deleteWithOptions(nativeHandle, bucket, key, column, woh);
     }
 
     // ── typed read operations ─────────────────────────────────────────────
@@ -207,6 +248,13 @@ public final class Db extends NativeObject {
     public Row get(int bucket, byte[] key) {
         Object[] raw = getTyped(nativeHandle, bucket, key);
         return Row.fromRawColumns(key, raw);
+    }
+
+    /** Get all columns for a key from a specific column family. */
+    public Row get(int bucket, byte[] key, String columnFamily) {
+        try (ReadOptions options = new ReadOptions().clearColumns().columnFamily(columnFamily)) {
+            return getWithOptions(bucket, key, options);
+        }
     }
 
     /**
@@ -227,6 +275,14 @@ public final class Db extends NativeObject {
      */
     public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
         return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
+    }
+
+    /** Open a structured scan cursor in a specific column family. */
+    public ScanCursor scan(
+            int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, String columnFamily) {
+        try (ScanOptions options = new ScanOptions().columnFamily(columnFamily)) {
+            return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, options);
+        }
     }
 
     /** Open a structured scan cursor with explicit scan options. */
@@ -368,7 +424,8 @@ public final class Db extends NativeObject {
             byte[][] elements,
             long writeOptionsHandle);
 
-    private static native void delete(long nativeHandle, int bucket, byte[] key, int column);
+    private static native void deleteWithOptions(
+            long nativeHandle, int bucket, byte[] key, int column, long writeOptionsHandle);
 
     // typed get: returns Object[] where each element is null | byte[] | byte[][]
     private static native Object[] getTyped(long nativeHandle, int bucket, byte[] key);
