@@ -940,6 +940,74 @@ fn test_db_snapshot_read_only_ignores_config_num_columns_after_initialization() 
 
 #[test]
 #[serial_test::serial(file)]
+fn test_db_snapshot_read_only_with_column_family() {
+    let root = "/tmp/db_snapshot_readonly_cf";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        num_columns: 1,
+        block_cache_size: Size::from_const(0),
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config.clone());
+
+    let mut schema = db.update_schema();
+    schema
+        .add_column(0, None, None, Some("metrics".to_string()))
+        .unwrap();
+    let _schema = schema.commit();
+
+    db.put(0, b"key1", 0, b"default-1").unwrap();
+    db.put_with_options(
+        0,
+        b"key1",
+        0,
+        b"metrics-1",
+        &cobble::WriteOptions::with_column_family("metrics"),
+    )
+    .unwrap();
+    db.put_with_options(
+        0,
+        b"key2",
+        0,
+        b"metrics-2",
+        &cobble::WriteOptions::with_column_family("metrics"),
+    )
+    .unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    db.close().unwrap();
+
+    let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
+    let value = ro
+        .get_with_options(0, b"key1", &ReadOptions::for_column_in_family("metrics", 0))
+        .unwrap()
+        .expect("value present");
+    assert_eq!(value.len(), 1);
+    assert_eq!(value[0].as_deref(), Some(&b"metrics-1"[..]));
+
+    let rows: Vec<_> = ro
+        .scan_with_options(
+            0,
+            b"key1".as_slice()..b"key9".as_slice(),
+            &ScanOptions::for_column(0).with_column_family("metrics"),
+        )
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0.as_ref(), b"key1");
+    assert_eq!(rows[0].1[0].as_deref(), Some(&b"metrics-1"[..]));
+    assert_eq!(rows[1].0.as_ref(), b"key2");
+    assert_eq!(rows[1].1[0].as_deref(), Some(&b"metrics-2"[..]));
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_snapshot_read_only_get_with_vec_memtable() {
     let root = "/tmp/db_snapshot_readonly_vec_memtable";
     cleanup_test_root(root);

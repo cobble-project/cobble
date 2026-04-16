@@ -210,7 +210,7 @@ mod tests {
     use super::*;
     use crate::config::VolumeDescriptor;
     use crate::coordinator::{CoordinatorConfig, DbCoordinator};
-    use crate::{Db, ScanOptions, WriteBatch};
+    use crate::{Db, ScanOptions, WriteBatch, WriteOptions};
     use std::collections::BTreeMap;
 
     fn cleanup_root(path: &str) {
@@ -393,6 +393,79 @@ mod tests {
         // Column projection returns only the selected columns (compact array).
         assert_eq!(results[0].1.len(), 1);
         assert_eq!(results[0].1[0].as_deref(), Some(b"a1".as_slice()));
+
+        cleanup_root(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_scan_plan_column_family_projection() {
+        let root = "/tmp/cobble_scan_plan_cf_proj";
+        cleanup_root(root);
+
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}/db", root)),
+            num_columns: 1,
+            total_buckets: 4,
+            ..Config::default()
+        };
+        let (_db, shard_input) = write_and_snapshot(&config, |db| {
+            let mut schema = db.update_schema();
+            schema
+                .add_column(0, None, None, Some("metrics".to_string()))
+                .unwrap();
+            let latest_schema = schema.commit();
+            assert_eq!(latest_schema.column_family_ids().get("metrics"), Some(&1));
+
+            db.put(0, b"key1", 0, b"default").unwrap();
+            db.put_with_options(
+                0,
+                b"key1",
+                0,
+                b"metrics-1",
+                &WriteOptions::with_column_family("metrics"),
+            )
+            .unwrap();
+            db.put_with_options(
+                0,
+                b"key2",
+                0,
+                b"metrics-2",
+                &WriteOptions::with_column_family("metrics"),
+            )
+            .unwrap();
+        });
+        assert_eq!(shard_input.column_family_ids.get("metrics"), Some(&1));
+
+        let coordinator = DbCoordinator::open(CoordinatorConfig {
+            volumes: vec![crate::config::VolumeDescriptor::new(
+                format!("file://{}/coordinator", root),
+                vec![
+                    crate::config::VolumeUsageKind::PrimaryDataPriorityHigh,
+                    crate::config::VolumeUsageKind::Meta,
+                ],
+            )],
+            snapshot_retention: None,
+        })
+        .unwrap();
+        let global = coordinator
+            .take_global_snapshot(4, vec![shard_input])
+            .unwrap();
+        coordinator.materialize_global_snapshot(&global).unwrap();
+
+        let plan = ScanPlan::new(global);
+        let splits = plan.splits();
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].shard.column_family_ids.get("metrics"), Some(&1));
+
+        let opts = ScanOptions::for_column(0).with_column_family("metrics");
+        let scanner = splits[0].create_scanner(config, &opts).unwrap();
+        let results: Vec<_> = scanner.map(|r| r.unwrap()).collect();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0.as_ref(), b"key1");
+        assert_eq!(results[0].1[0].as_deref(), Some(b"metrics-1".as_slice()));
+        assert_eq!(results[1].0.as_ref(), b"key2");
+        assert_eq!(results[1].1[0].as_deref(), Some(b"metrics-2".as_slice()));
 
         cleanup_root(root);
     }
