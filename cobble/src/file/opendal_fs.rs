@@ -2,13 +2,13 @@ use crate::error::{Error, Result};
 use crate::file::file_system::FileSystem;
 use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::file::opendal_file::{OpendalRandomAccessFile, OpendalSequentialWriteFile};
+use ::opendal::layers::RetryLayer;
+use ::opendal::{Entry, ErrorKind, Metadata, Operator, Scheme};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
-use ::opendal::layers::RetryLayer;
-use ::opendal::{Entry, ErrorKind, Metadata, Operator, Scheme};
 
 pub struct OpendalFileSystem {
     pub(crate) op: Operator,
@@ -349,7 +349,10 @@ impl FileSystem for OpendalFileSystem {
                 let result: opendal::Result<Metadata> = self.op.stat(path).await;
                 result
             })
-            .map(|meta: Metadata| meta.last_modified().map(|ts| ts.into_inner().as_second() as u64))
+            .map(|meta: Metadata| {
+                meta.last_modified()
+                    .map(|ts| ts.into_inner().as_second() as u64)
+            })
             .map_err(|e| Error::IoError(format!("Failed to stat {}: {}", path, e)))
     }
 }

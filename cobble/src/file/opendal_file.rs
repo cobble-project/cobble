@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
+use ::opendal::Buffer;
 use bytes::{Buf, Bytes};
 use std::sync::Arc;
-use ::opendal::Buffer;
 
 pub(crate) struct OpendalRandomAccessFile {
     pub(crate) size: usize,
@@ -24,8 +24,10 @@ impl RandomAccessFile for OpendalRandomAccessFile {
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes> {
         self.runtime
             .block_on(async {
-                let result: opendal::Result<Buffer> =
-                    self.reader.read(offset as u64..(offset + size) as u64).await;
+                let result: opendal::Result<Buffer> = self
+                    .reader
+                    .read(offset as u64..(offset + size) as u64)
+                    .await;
                 result.map(|data: Buffer| data.to_bytes())
             })
             .map_err(|e| {
@@ -46,14 +48,12 @@ impl RandomAccessFile for OpendalRandomAccessFile {
         runtime.spawn(async move {
             let result: opendal::Result<Buffer> =
                 reader.read(offset as u64..(offset + size) as u64).await;
-            result
-                .map(|data: Buffer| data.to_bytes())
-                .map_err(|e| {
-                    Error::IoError(format!(
-                        "Failed to read at offset {} size {}: {}",
-                        offset, size, e
-                    ))
-                })
+            result.map(|data: Buffer| data.to_bytes()).map_err(|e| {
+                Error::IoError(format!(
+                    "Failed to read at offset {} size {}: {}",
+                    offset, size, e
+                ))
+            })
         })
     }
 }

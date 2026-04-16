@@ -1069,9 +1069,9 @@ fn take_shard_checkpoint_for_db(db: &Db) -> Result<StandaloneShardSnapshot> {
     db.snapshot_with_callback(move |result| {
         let _ = tx.send(result);
     })?;
-    let shard_input = rx
-        .recv_timeout(Duration::from_secs(180))
-        .map_err(|_| Error::IoError("shard checkpoint snapshot callback timed out".to_string()))??;
+    let shard_input = rx.recv_timeout(Duration::from_secs(180)).map_err(|_| {
+        Error::IoError("shard checkpoint snapshot callback timed out".to_string())
+    })??;
     Ok(shard_input.into())
 }
 
