@@ -418,7 +418,7 @@ impl Db {
         }
         let mut updated_scopes = Vec::new();
         let mut updated_tree_versions = Vec::new();
-        for (scope, tree_version) in existing_scopes.into_iter().zip(tree_versions.into_iter()) {
+        for (scope, tree_version) in existing_scopes.into_iter().zip(tree_versions) {
             for kept_range in subtract_range_by_cuts(&scope.bucket_range, &shrink_ranges) {
                 let kept_scope =
                     crate::db_state::LSMTreeScope::new(kept_range.clone(), scope.column_family_id);

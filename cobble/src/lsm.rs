@@ -604,7 +604,7 @@ impl LSMTree {
         let mut new_versions = Vec::with_capacity(old_versions.len() + split_ranges.len() - 1);
         for (idx, (scope, version)) in old_scopes
             .into_iter()
-            .zip(old_versions.into_iter())
+            .zip(old_versions)
             .enumerate()
         {
             if idx != tree_idx {
