@@ -146,6 +146,14 @@ fn snapshot_vlog_file_paths(manifest_json: &JsonValue) -> Vec<String> {
         .collect()
 }
 
+fn make_snapshot_cf_value(family: &str, round: u8, idx: u8, fill: u8) -> Vec<u8> {
+    let mut value = format!("{family}-round-{round:02}-row-{idx:02}").into_bytes();
+    if idx.is_multiple_of(2) {
+        value.extend(std::iter::repeat_n(fill, 96));
+    }
+    value
+}
+
 fn config_with_data_file_type(config: Config, data_file_type: &str) -> Config {
     let mut json = serde_json::to_value(config).expect("serialize config");
     json["data_file_type"] = JsonValue::String(data_file_type.to_string());
@@ -945,7 +953,10 @@ fn test_db_snapshot_read_only_with_column_family() {
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_const(2048),
+        memtable_buffer_count: 2,
         num_columns: 1,
+        value_separation_threshold: Some(Size::from_const(16)),
         block_cache_size: Size::from_const(0),
         sst_bloom_filter_enabled: true,
         ..Config::default()
@@ -956,52 +967,148 @@ fn test_db_snapshot_read_only_with_column_family() {
     schema
         .add_column(0, None, None, Some("metrics".to_string()))
         .unwrap();
+    schema
+        .add_column(0, None, None, Some("blobs".to_string()))
+        .unwrap();
     let _schema = schema.commit();
 
-    db.put(0, b"key1", 0, b"default-1").unwrap();
-    db.put_with_options(
-        0,
-        b"key1",
-        0,
-        b"metrics-1",
-        &cobble::WriteOptions::with_column_family("metrics"),
-    )
-    .unwrap();
-    db.put_with_options(
-        0,
-        b"key2",
-        0,
-        b"metrics-2",
-        &cobble::WriteOptions::with_column_family("metrics"),
-    )
-    .unwrap();
+    let mut expected_default = HashMap::new();
+    let mut expected_metrics = HashMap::new();
+    let mut expected_blobs = HashMap::new();
+    let mut manifest_chain = Vec::new();
+    let mut latest_snapshot_id = 0;
+    for round in 0..3u8 {
+        let mut batch = WriteBatch::new();
+        for idx in 0..6u8 {
+            let key = format!("r{round:02}:k{idx:02}").into_bytes();
+            let default_value = make_snapshot_cf_value("default", round, idx, b'd');
+            let metrics_value = make_snapshot_cf_value("metrics", round, idx, b'm');
+            let blobs_value = make_snapshot_cf_value("blobs", round, idx, b'b');
+            batch.put(0, &key, 0, &default_value);
+            batch.put_with_options(
+                0,
+                &key,
+                0,
+                &metrics_value,
+                &cobble::WriteOptions::with_column_family("metrics"),
+            );
+            batch.put_with_options(
+                0,
+                &key,
+                0,
+                &blobs_value,
+                &cobble::WriteOptions::with_column_family("blobs"),
+            );
+            expected_default.insert(key.clone(), default_value);
+            expected_metrics.insert(key.clone(), metrics_value);
+            expected_blobs.insert(key, blobs_value);
+        }
+        db.write_batch(batch).unwrap();
 
-    let snapshot_id = db.snapshot().unwrap();
-    let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+        latest_snapshot_id = db.snapshot().unwrap();
+        let manifest = wait_for_manifest_in_db(root, db.id(), latest_snapshot_id);
+        let manifest_json = serde_json::from_str::<JsonValue>(&manifest).expect("manifest json");
+        assert!(snapshot_tree_file_paths(&manifest_json).len() >= 3);
+        manifest_chain.push(manifest_json);
+    }
     db.close().unwrap();
 
-    let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
-    let value = ro
-        .get_with_options(0, b"key1", &ReadOptions::for_column_in_family("metrics", 0))
+    let total_tree_files: usize = manifest_chain
+        .iter()
+        .map(snapshot_tree_file_paths)
+        .map(|paths| paths.len())
+        .sum();
+    assert!(total_tree_files >= 9);
+    let final_manifest = manifest_chain.last().expect("final manifest");
+    assert!(snapshot_vlog_file_paths(final_manifest).len() >= 3);
+
+    let ro = Db::open_read_only(config, latest_snapshot_id, db.id()).unwrap();
+    let metrics_large = make_snapshot_cf_value("metrics", 2, 4, b'm');
+    let metrics_value = ro
+        .get_with_options(
+            0,
+            b"r02:k04",
+            &ReadOptions::for_column_in_family("metrics", 0),
+        )
         .unwrap()
         .expect("value present");
-    assert_eq!(value.len(), 1);
-    assert_eq!(value[0].as_deref(), Some(&b"metrics-1"[..]));
+    assert_eq!(metrics_value.len(), 1);
+    assert_eq!(metrics_value[0].as_deref(), Some(metrics_large.as_slice()));
 
-    let rows: Vec<_> = ro
+    let blobs_large = make_snapshot_cf_value("blobs", 1, 2, b'b');
+    let blobs_value = ro
+        .get_with_options(
+            0,
+            b"r01:k02",
+            &ReadOptions::for_column_in_family("blobs", 0),
+        )
+        .unwrap()
+        .expect("value present");
+    assert_eq!(blobs_value.len(), 1);
+    assert_eq!(blobs_value[0].as_deref(), Some(blobs_large.as_slice()));
+
+    let scan_range = b"r".as_slice()..b"s".as_slice();
+    let default_rows: Vec<_> = ro
+        .scan(0, scan_range.clone())
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(default_rows.len(), expected_default.len());
+    for (key, value) in default_rows {
+        assert_eq!(
+            value[0].as_deref(),
+            Some(
+                expected_default
+                    .get(key.as_ref())
+                    .expect("default expected value")
+                    .as_slice()
+            )
+        );
+    }
+
+    let metrics_rows: Vec<_> = ro
         .scan_with_options(
             0,
-            b"key1".as_slice()..b"key9".as_slice(),
+            scan_range.clone(),
             &ScanOptions::for_column(0).with_column_family("metrics"),
         )
         .unwrap()
         .map(|row| row.unwrap())
         .collect();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].0.as_ref(), b"key1");
-    assert_eq!(rows[0].1[0].as_deref(), Some(&b"metrics-1"[..]));
-    assert_eq!(rows[1].0.as_ref(), b"key2");
-    assert_eq!(rows[1].1[0].as_deref(), Some(&b"metrics-2"[..]));
+    assert_eq!(metrics_rows.len(), expected_metrics.len());
+    for (key, value) in metrics_rows {
+        assert_eq!(
+            value[0].as_deref(),
+            Some(
+                expected_metrics
+                    .get(key.as_ref())
+                    .expect("metrics expected value")
+                    .as_slice()
+            )
+        );
+    }
+
+    let blobs_rows: Vec<_> = ro
+        .scan_with_options(
+            0,
+            scan_range,
+            &ScanOptions::for_column(0).with_column_family("blobs"),
+        )
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(blobs_rows.len(), expected_blobs.len());
+    for (key, value) in blobs_rows {
+        assert_eq!(
+            value[0].as_deref(),
+            Some(
+                expected_blobs
+                    .get(key.as_ref())
+                    .expect("blobs expected value")
+                    .as_slice()
+            )
+        );
+    }
 
     cleanup_test_root(root);
 }

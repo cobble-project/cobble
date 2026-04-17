@@ -306,48 +306,22 @@ impl LSMTree {
     pub(crate) fn add_level0_files(
         &self,
         to_remove_memtable_id: Uuid,
-        files_by_tree: Vec<(usize, Arc<DataFile>)>,
+        files_by_scope: Vec<(LSMTreeScope, Arc<DataFile>)>,
         vlog_edit: Option<VlogEdit>,
     ) -> Result<Arc<DbState>> {
-        if files_by_tree.is_empty() {
+        if files_by_scope.is_empty() {
             return Err(crate::error::Error::InvalidState(
                 "cannot add empty new files".to_string(),
             ));
         }
         let mut state = self.state.lock().unwrap();
         let snapshot = self.db_state.load();
-        let tree_ranges = snapshot.multi_lsm_version.bucket_ranges();
         let mut grouped: BTreeMap<usize, Vec<Arc<DataFile>>> = BTreeMap::new();
-        for (tree_idx_hint, file) in files_by_tree {
-            if tree_ranges.is_empty() {
-                grouped.entry(0).or_default().push(file);
-                continue;
-            }
-            let mut matched = false;
-            for (tree_idx, tree_range) in tree_ranges.iter().enumerate() {
-                if let Some(effective_bucket_range) =
-                    intersect_bucket_ranges(&file.bucket_range, tree_range)
-                {
-                    let scoped_file = if effective_bucket_range == file.effective_bucket_range
-                        || (effective_bucket_range == file.bucket_range
-                            && file.effective_bucket_range == file.bucket_range)
-                    {
-                        Arc::clone(&file)
-                    } else {
-                        Arc::new(
-                            file.as_ref()
-                                .with_effective_bucket_range(effective_bucket_range),
-                        )
-                    };
-                    grouped.entry(tree_idx).or_default().push(scoped_file);
-                    matched = true;
-                }
-            }
-            if !matched {
-                return Err(crate::error::Error::InvalidState(format!(
-                    "cannot map flush output file {} from tree {} to current multi-lsm ranges",
-                    file.file_id, tree_idx_hint
-                )));
+        for (tree_scope, file) in files_by_scope {
+            for (tree_idx, scoped_file) in
+                Self::remap_flushed_level0_file(&snapshot, &tree_scope, &file)?
+            {
+                grouped.entry(tree_idx).or_default().push(scoped_file);
             }
         }
         let edits: Vec<(usize, VersionEdit)> = grouped
@@ -373,6 +347,56 @@ impl LSMTree {
                 db_state.vlog_version = db_state.vlog_version.apply_edit(edit);
             }
         }))
+    }
+
+    fn remap_flushed_level0_file(
+        snapshot: &Arc<DbState>,
+        source_scope: &LSMTreeScope,
+        file: &Arc<DataFile>,
+    ) -> Result<Vec<(usize, Arc<DataFile>)>> {
+        if let Some(tree_idx) = snapshot
+            .multi_lsm_version
+            .tree_index_for_exact_scope(source_scope)
+        {
+            return Ok(vec![(tree_idx, Arc::clone(file))]);
+        }
+
+        let remapped: Vec<(usize, Arc<DataFile>)> = snapshot
+            .multi_lsm_version
+            .tree_scopes()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(tree_idx, scope)| {
+                if scope.column_family_id != source_scope.column_family_id {
+                    return None;
+                }
+                let effective_bucket_range =
+                    intersect_bucket_ranges(&file.bucket_range, &scope.bucket_range)?;
+                let scoped_file = if effective_bucket_range == file.effective_bucket_range
+                    || (effective_bucket_range == file.bucket_range
+                        && file.effective_bucket_range == file.bucket_range)
+                {
+                    Arc::clone(file)
+                } else {
+                    Arc::new(
+                        file.as_ref()
+                            .with_effective_bucket_range(effective_bucket_range),
+                    )
+                };
+                Some((tree_idx, scoped_file))
+            })
+            .collect();
+
+        if remapped.is_empty() {
+            return Err(crate::error::Error::InvalidState(format!(
+                "cannot map flush output file {} from scope {}..={} cf={} to current multi-lsm scopes",
+                file.file_id,
+                source_scope.bucket_range.start(),
+                source_scope.bucket_range.end(),
+                source_scope.column_family_id
+            )));
+        }
+        Ok(remapped)
     }
 
     pub(crate) fn level_files(&self, level: u8) -> Vec<Arc<DataFile>> {
@@ -1210,7 +1234,7 @@ mod tests {
     use crate::sst::row_codec::{encode_key, encode_value};
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::{Column, Key, Value, ValueType};
-    use crate::vlog::VlogVersion;
+    use crate::vlog::{VlogEdit, VlogVersion};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -1255,6 +1279,27 @@ mod tests {
     fn create_data_file_with_bucket(bucket: u16, size: usize) -> Arc<DataFile> {
         let start_key = encode_key(&Key::new(bucket, b"a".to_vec())).to_vec();
         let end_key = encode_key(&Key::new(bucket, b"z".to_vec())).to_vec();
+        create_data_file_with_size(start_key.as_slice(), end_key.as_slice(), size)
+    }
+
+    fn create_data_file_in_scope(
+        start_bucket: u16,
+        end_bucket: u16,
+        column_family_id: u8,
+        size: usize,
+    ) -> Arc<DataFile> {
+        let start_key = encode_key(&Key::new_with_column_family(
+            start_bucket,
+            column_family_id,
+            b"a".to_vec(),
+        ))
+        .to_vec();
+        let end_key = encode_key(&Key::new_with_column_family(
+            end_bucket,
+            column_family_id,
+            b"z".to_vec(),
+        ))
+        .to_vec();
         create_data_file_with_size(start_key.as_slice(), end_key.as_slice(), size)
     }
 
@@ -1310,6 +1355,12 @@ mod tests {
     fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {
         let value = Value::new(vec![Some(Column::new(ValueType::Put, data.to_vec()))]);
         encode_value(&value, num_columns).to_vec()
+    }
+
+    fn empty_lsm_versions(len: usize) -> Vec<Arc<LSMTreeVersion>> {
+        let mut v: Vec<Arc<LSMTreeVersion>> = Vec::with_capacity(len);
+        (0..len).for_each(|_| v.push(Arc::new(LSMTreeVersion { levels: vec![] })));
+        v
     }
 
     #[derive(Default)]
@@ -2155,5 +2206,99 @@ mod tests {
             b"old"
         );
         cleanup_test_root(root);
+    }
+
+    #[test]
+    fn test_add_level0_files_routes_only_to_matching_column_family_scope() {
+        let db_state = Arc::new(DbStateHandle::new());
+        let scopes = vec![
+            LSMTreeScope::new(0u16..=0u16, DEFAULT_COLUMN_FAMILY_ID),
+            LSMTreeScope::new(0u16..=0u16, 1),
+        ];
+        let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
+            1,
+            &scopes,
+            empty_lsm_versions(scopes.len()),
+        )
+        .unwrap();
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version,
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+
+        let file = create_data_file_in_scope(0, 0, 1, 8);
+        lsm_tree
+            .add_level0_files(
+                Uuid::new_v4(),
+                vec![(LSMTreeScope::new(0u16..=0u16, 1), file)],
+                None,
+            )
+            .unwrap();
+
+        assert!(lsm_tree.level_files_in_tree(0, 0).is_empty());
+        assert_eq!(lsm_tree.level_files_in_tree(1, 0).len(), 1);
+    }
+
+    #[test]
+    fn test_add_level0_files_split_remap_stays_in_same_cf_and_applies_vlog_once() {
+        let db_state = Arc::new(DbStateHandle::new());
+        let scopes = vec![
+            LSMTreeScope::new(0u16..=0u16, DEFAULT_COLUMN_FAMILY_ID),
+            LSMTreeScope::new(1u16..=1u16, DEFAULT_COLUMN_FAMILY_ID),
+            LSMTreeScope::new(0u16..=1u16, 1),
+        ];
+        let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
+            2,
+            &scopes,
+            empty_lsm_versions(scopes.len()),
+        )
+        .unwrap();
+        let tracked_vlog = TrackedFileId::detached(700);
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version,
+            vlog_version: VlogVersion::from_files_with_entries(vec![(7, tracked_vlog, 0)]),
+            active: None,
+            immutables: VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+
+        let file = create_data_file_in_scope(0, 1, DEFAULT_COLUMN_FAMILY_ID, 16);
+        lsm_tree
+            .add_level0_files(
+                Uuid::new_v4(),
+                vec![(
+                    LSMTreeScope::new(0u16..=1u16, DEFAULT_COLUMN_FAMILY_ID),
+                    Arc::clone(&file),
+                )],
+                Some(VlogEdit::from_entry_deltas(vec![(7, 1)])),
+            )
+            .unwrap();
+
+        let tree0_files = lsm_tree.level_files_in_tree(0, 0);
+        let tree1_files = lsm_tree.level_files_in_tree(1, 0);
+        let tree2_files = lsm_tree.level_files_in_tree(2, 0);
+        assert_eq!(tree0_files.len(), 1);
+        assert_eq!(tree1_files.len(), 1);
+        assert!(tree2_files.is_empty());
+        assert_eq!(tree0_files[0].effective_bucket_range, (0u16..=0u16));
+        assert_eq!(tree1_files[0].effective_bucket_range, (1u16..=1u16));
+
+        let files_with_entries = db_state.load().vlog_version.files_with_entries();
+        let (_, _, valid_entries) = files_with_entries
+            .into_iter()
+            .find(|(seq, _, _)| *seq == 7)
+            .expect("vlog file seq 7 should remain tracked");
+        assert_eq!(valid_entries, 1);
     }
 }

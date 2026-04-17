@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 
 use crate::config::MemtableType;
 use crate::data_file::DataFile;
-use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
+use crate::db_state::{DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion};
 use crate::db_status::DbLifecycle;
 use crate::error::Error::InvalidState;
 use crate::error::{Error, Result};
@@ -37,7 +37,7 @@ const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(crate) struct MemtableFlushResult {
-    pub(crate) data_files_by_tree: Vec<(usize, Arc<DataFile>)>,
+    pub(crate) data_files_by_scope: Vec<(LSMTreeScope, Arc<DataFile>)>,
     vlog_edit: Option<VlogEdit>,
 }
 
@@ -142,6 +142,14 @@ struct ActiveMemtableSnapshotJob {
 
 struct ActiveMemtableSnapshotWriteResult {
     active_data: Vec<ActiveMemtableSnapshotData>,
+}
+
+struct FlushTreeBuilder {
+    scope: LSMTreeScope,
+    file_id: u64,
+    builder: Box<dyn FileBuilder>,
+    min_bucket: u16,
+    max_bucket: u16,
 }
 
 pub(crate) struct SnapshotCompletion {
@@ -523,11 +531,11 @@ impl MemtableManager {
                                 debug!(
                                     "memtable flush complete memtable_id={} files={}",
                                     memtable_id,
-                                    res.data_files_by_tree.len()
+                                    res.data_files_by_scope.len()
                                 );
                                 metrics.flushes_total.increment(1);
                                 let flushed_bytes: u64 = res
-                                    .data_files_by_tree
+                                    .data_files_by_scope
                                     .iter()
                                     .map(|(_, file)| file.size as u64)
                                     .sum();
@@ -535,7 +543,7 @@ impl MemtableManager {
                                 let vlog_edit = res.vlog_edit.clone();
                                 let snapshot = match lsm_tree_clone.add_level0_files(
                                     memtable_id,
-                                    res.data_files_by_tree.clone(),
+                                    res.data_files_by_scope.clone(),
                                     vlog_edit,
                                 ) {
                                     Ok(snapshot) => snapshot,
@@ -1384,14 +1392,14 @@ impl MemtableManager {
             )?;
             self.metrics.flushes_total.increment(1);
             let flushed_bytes: u64 = result
-                .data_files_by_tree
+                .data_files_by_scope
                 .iter()
                 .map(|(_, file)| file.size as u64)
                 .sum();
             self.metrics.flush_bytes_total.increment(flushed_bytes);
             self.lsm_tree.add_level0_files(
                 Uuid::new_v4(),
-                result.data_files_by_tree.clone(),
+                result.data_files_by_scope.clone(),
                 result.vlog_edit,
             )?;
             Ok(true)
@@ -1528,7 +1536,7 @@ fn flush_memtable(
         vlog_edit = Some(edit);
     }
     // Step 2: Create data files on-demand per tree and write entries by key bucket.
-    let mut builders: BTreeMap<usize, (u64, Box<dyn FileBuilder>, u16, u16)> = BTreeMap::new();
+    let mut builders: BTreeMap<usize, FlushTreeBuilder> = BTreeMap::new();
     // Try to handle merges during flush if vlog edits are present
     let merge_collector = vlog_edit.as_ref().map(|_| VlogMergeCollector::shared(true));
     let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
@@ -1571,21 +1579,22 @@ fn flush_memtable(
                     .num_columns_in_family(tree_scope.column_family_id)
                     .unwrap_or_else(|| schema.num_columns());
                 let (file_id, writer) = file_manager.create_data_file_with_offload()?;
-                entry.insert((
+                entry.insert(FlushTreeBuilder {
+                    scope: tree_scope,
                     file_id,
-                    make_data_file_builder_factory(
+                    builder: make_data_file_builder_factory(
                         writer_options_factory.build(runtime_num_columns),
                     )(Box::new(writer)),
-                    bucket,
-                    bucket,
-                ));
+                    min_bucket: bucket,
+                    max_bucket: bucket,
+                });
             }
-            let (_, builder, min_bucket, max_bucket) = builders
+            let builder_state = builders
                 .get_mut(&tree_idx)
                 .expect("builder should exist for tree");
-            builder.add(&key, &kv_value)?;
-            *min_bucket = (*min_bucket).min(bucket);
-            *max_bucket = (*max_bucket).max(bucket);
+            builder_state.builder.add(&key, &kv_value)?;
+            builder_state.min_bucket = builder_state.min_bucket.min(bucket);
+            builder_state.max_bucket = builder_state.max_bucket.max(bucket);
         }
         dedup_iter.next()?;
     }
@@ -1607,9 +1616,19 @@ fn flush_memtable(
     let has_separated_values = merge_collector
         .as_ref()
         .is_some_and(|collector| collector.borrow().has_separated_values());
-    let mut data_files_by_tree = Vec::with_capacity(builders.len());
+    let mut data_files_by_scope = Vec::with_capacity(builders.len());
     let data_file_type = writer_options_factory.data_file_type();
-    for (tree_idx, (file_id, builder, min_bucket, max_bucket)) in builders {
+    for (
+        _,
+        FlushTreeBuilder {
+            scope: tree_scope,
+            file_id,
+            builder,
+            min_bucket,
+            max_bucket,
+        },
+    ) in builders
+    {
         let (start_key, end_key, file_size, footer_bytes) = builder.finish()?;
         let bucket_range = min_bucket..=max_bucket;
         let data_file = DataFile::new(
@@ -1626,15 +1645,15 @@ fn flush_memtable(
         .with_vlog_offset(vlog_file_seq_offset)
         .with_separated_values(has_separated_values);
         data_file.set_meta_bytes(footer_bytes);
-        data_files_by_tree.push((tree_idx, Arc::new(data_file)));
+        data_files_by_scope.push((tree_scope, Arc::new(data_file)));
     }
-    if data_files_by_tree.is_empty() {
+    if data_files_by_scope.is_empty() {
         return Err(Error::InvalidState(
             "flush produced no sst entries".to_string(),
         ));
     }
     Ok(MemtableFlushResult {
-        data_files_by_tree,
+        data_files_by_scope,
         vlog_edit,
     })
 }
@@ -1902,6 +1921,7 @@ mod tests {
     use super::*;
     use crate::config::MemtableType;
     use crate::file::{FileManager, FileSystemRegistry};
+    use crate::lsm::LSMTreeVersion;
     use crate::sst::row_codec::decode_value;
     use crate::sst::{SSTIterator, SSTIteratorOptions, SSTWriterOptions};
     use crate::r#type::ValueType;
@@ -1910,6 +1930,12 @@ mod tests {
 
     fn cleanup_test_root() {
         let _ = std::fs::remove_dir_all("/tmp/memtable_manager_test");
+    }
+
+    fn empty_lsm_versions(len: usize) -> Vec<Arc<LSMTreeVersion>> {
+        let mut v: Vec<Arc<LSMTreeVersion>> = Vec::with_capacity(len);
+        (0..len).for_each(|_| v.push(Arc::new(LSMTreeVersion { levels: vec![] })));
+        v
     }
 
     #[test]
@@ -1960,7 +1986,9 @@ mod tests {
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok());
-        let data_file = results[0].as_ref().unwrap().data_files_by_tree[0].1.clone();
+        let data_file = results[0].as_ref().unwrap().data_files_by_scope[0]
+            .1
+            .clone();
         let level0_files = lsm_tree.level_files(0);
         assert_eq!(level0_files.len(), 1);
         assert_eq!(level0_files[0].file_id, data_file.file_id);
@@ -2045,7 +2073,7 @@ mod tests {
         let flush_result = results[0].as_ref().unwrap();
         assert!(flush_result.vlog_edit.is_some());
 
-        let data_file = Arc::clone(&flush_result.data_files_by_tree[0].1);
+        let data_file = Arc::clone(&flush_result.data_files_by_scope[0].1);
         let reader = file_manager
             .open_data_file_reader(data_file.file_id)
             .unwrap();
@@ -2110,10 +2138,398 @@ mod tests {
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
         let flush_result = results[0].as_ref().unwrap();
-        assert_eq!(flush_result.data_files_by_tree.len(), 2);
+        assert_eq!(flush_result.data_files_by_scope.len(), 2);
         assert_eq!(lsm_tree.level_files_in_tree(0, 0).len(), 1);
         assert_eq!(lsm_tree.level_files_in_tree(1, 0).len(), 1);
         cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_memtable_flush_checkin_stays_in_matching_column_family_scope() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_test")
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-test"));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let db_state = Arc::new(DbStateHandle::new());
+        let scopes = vec![
+            LSMTreeScope::new(0u16..=0u16, 0),
+            LSMTreeScope::new(0u16..=0u16, 1),
+        ];
+        let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
+            1,
+            &scopes,
+            empty_lsm_versions(scopes.len()),
+        )
+        .unwrap();
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version,
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: None,
+            immutables: std::collections::VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::clone(&db_state),
+            Arc::clone(&metrics_manager),
+        ));
+        let schema_manager = Arc::new(SchemaManager::new(1));
+        let mut builder = schema_manager.builder();
+        builder
+            .add_column(0, None, None, Some("metrics".to_string()))
+            .unwrap();
+        let schema = builder.commit();
+        let metrics_cf_id = schema.resolve_column_family_id(Some("metrics")).unwrap();
+        let manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 256,
+                buffer_count: 2,
+                num_columns: 1,
+                write_stall_limit: 8,
+                schema_manager: Some(Arc::clone(&schema_manager)),
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        manager.open().unwrap();
+
+        let default_key = RefKey::new(0, b"default");
+        let metrics_key = RefKey::new_with_column_family(0, metrics_cf_id, b"metric");
+        let value = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"v"))]);
+        manager.put(&default_key, &value).unwrap();
+        manager.put(&metrics_key, &value).unwrap();
+
+        manager.flush_active().unwrap();
+        let results = manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        let flush_result = results[0].as_ref().unwrap();
+        assert_eq!(flush_result.data_files_by_scope.len(), 2);
+
+        let mut flushed_scopes = flush_result
+            .data_files_by_scope
+            .iter()
+            .map(|(scope, _)| scope.clone())
+            .collect::<Vec<_>>();
+        flushed_scopes.sort_by_key(|scope| (scope.column_family_id, *scope.bucket_range.start()));
+        assert_eq!(
+            flushed_scopes,
+            vec![
+                LSMTreeScope::new(0u16..=0u16, 0),
+                LSMTreeScope::new(0u16..=0u16, metrics_cf_id),
+            ]
+        );
+        assert_eq!(lsm_tree.level_files_in_tree(0, 0).len(), 1);
+        assert_eq!(lsm_tree.level_files_in_tree(1, 0).len(), 1);
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_restore_active_memtable_snapshot_to_l0_stays_in_matching_column_family_scope() {
+        let source_root = "/tmp/memtable_manager_restore_source";
+        let target_root = "/tmp/memtable_manager_restore_target";
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+
+        let registry = FileSystemRegistry::new();
+        let source_fs = registry
+            .get_or_register(format!("file://{}", source_root))
+            .unwrap();
+        let target_fs = registry
+            .get_or_register(format!("file://{}", target_root))
+            .unwrap();
+        let source_metrics = Arc::new(MetricsManager::new("memtable-restore-source"));
+        let target_metrics = Arc::new(MetricsManager::new("memtable-restore-target"));
+        let source_file_manager =
+            Arc::new(FileManager::with_defaults(source_fs, Arc::clone(&source_metrics)).unwrap());
+        let target_file_manager =
+            Arc::new(FileManager::with_defaults(target_fs, Arc::clone(&target_metrics)).unwrap());
+        let schema_manager = Arc::new(SchemaManager::new(1));
+        let mut schema_builder = schema_manager.builder();
+        schema_builder
+            .add_column(0, None, None, Some("metrics".to_string()))
+            .unwrap();
+        let schema = schema_builder.commit();
+        let metrics_cf_id = schema.resolve_column_family_id(Some("metrics")).unwrap();
+        let scopes = vec![
+            LSMTreeScope::new(0u16..=0u16, 0),
+            LSMTreeScope::new(0u16..=0u16, metrics_cf_id),
+        ];
+        let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
+            1,
+            &scopes,
+            empty_lsm_versions(scopes.len()),
+        )
+        .unwrap();
+
+        let source_db_state = Arc::new(DbStateHandle::new());
+        source_db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: multi_lsm_version.clone(),
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: None,
+            immutables: std::collections::VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+        let source_lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::clone(&source_db_state),
+            Arc::clone(&source_metrics),
+        ));
+        let source_manager = MemtableManager::new(
+            Arc::clone(&source_file_manager),
+            Arc::clone(&source_lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 256,
+                buffer_count: 2,
+                num_columns: 1,
+                write_stall_limit: 8,
+                schema_manager: Some(Arc::clone(&schema_manager)),
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        source_manager.open().unwrap();
+
+        let default_key = RefKey::new(0, b"default");
+        let metrics_key = RefKey::new_with_column_family(0, metrics_cf_id, b"metric");
+        let value = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"v"))]);
+        source_manager.put(&default_key, &value).unwrap();
+        source_manager.put(&metrics_key, &value).unwrap();
+
+        let active = source_manager
+            .db_state
+            .load()
+            .active
+            .clone()
+            .expect("source active memtable should exist");
+        let snapshot_manager = SnapshotManager::new(
+            Arc::clone(&source_file_manager),
+            Arc::clone(&schema_manager),
+            Arc::new(DbLifecycle::new_open()),
+            None,
+            vec![0u16..=0u16],
+        );
+        let snapshot_write = MemtableManager::write_active_memtable_snapshot_data(
+            1,
+            None,
+            &active,
+            &snapshot_manager,
+            &source_file_manager,
+        )
+        .unwrap();
+
+        let target_db_state = Arc::new(DbStateHandle::new());
+        target_db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version,
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: None,
+            immutables: std::collections::VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+        let target_lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::clone(&target_db_state),
+            Arc::clone(&target_metrics),
+        ));
+        let target_vlog_store = Arc::new(VlogStore::new(Arc::clone(&target_file_manager), 64, 8));
+        let target_manager = MemtableManager::new(
+            Arc::clone(&target_file_manager),
+            Arc::clone(&target_lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 256,
+                buffer_count: 2,
+                num_columns: 1,
+                write_stall_limit: 8,
+                schema_manager: Some(Arc::clone(&schema_manager)),
+                vlog_store: Some(target_vlog_store),
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        target_manager.open().unwrap();
+
+        let restored = target_manager
+            .restore_active_memtable_snapshot_to_l0(
+                &source_file_manager,
+                &snapshot_write.active_data,
+                0,
+            )
+            .unwrap();
+
+        assert!(restored);
+        assert_eq!(target_lsm_tree.level_files_in_tree(0, 0).len(), 1);
+        assert_eq!(target_lsm_tree.level_files_in_tree(1, 0).len(), 1);
+
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_restore_active_memtable_snapshot_to_l0_preserves_shared_vlog_across_scopes() {
+        let source_root = "/tmp/memtable_manager_restore_vlog_source";
+        let target_root = "/tmp/memtable_manager_restore_vlog_target";
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+
+        let registry = FileSystemRegistry::new();
+        let source_fs = registry
+            .get_or_register(format!("file://{}", source_root))
+            .unwrap();
+        let target_fs = registry
+            .get_or_register(format!("file://{}", target_root))
+            .unwrap();
+        let source_metrics = Arc::new(MetricsManager::new("memtable-restore-vlog-source"));
+        let target_metrics = Arc::new(MetricsManager::new("memtable-restore-vlog-target"));
+        let source_file_manager =
+            Arc::new(FileManager::with_defaults(source_fs, Arc::clone(&source_metrics)).unwrap());
+        let target_file_manager =
+            Arc::new(FileManager::with_defaults(target_fs, Arc::clone(&target_metrics)).unwrap());
+        let schema_manager = Arc::new(SchemaManager::new(1));
+        let mut schema_builder = schema_manager.builder();
+        schema_builder
+            .add_column(0, None, None, Some("metrics".to_string()))
+            .unwrap();
+        let schema = schema_builder.commit();
+        let metrics_cf_id = schema.resolve_column_family_id(Some("metrics")).unwrap();
+        let scopes = vec![
+            LSMTreeScope::new(0u16..=0u16, 0),
+            LSMTreeScope::new(0u16..=0u16, metrics_cf_id),
+        ];
+        let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
+            1,
+            &scopes,
+            empty_lsm_versions(scopes.len()),
+        )
+        .unwrap();
+
+        let source_db_state = Arc::new(DbStateHandle::new());
+        source_db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: multi_lsm_version.clone(),
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: None,
+            immutables: std::collections::VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+        let source_lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::clone(&source_db_state),
+            Arc::clone(&source_metrics),
+        ));
+        let source_vlog_store = Arc::new(VlogStore::new(Arc::clone(&source_file_manager), 64, 8));
+        let source_manager = MemtableManager::new(
+            Arc::clone(&source_file_manager),
+            Arc::clone(&source_lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 256,
+                buffer_count: 2,
+                num_columns: 1,
+                write_stall_limit: 8,
+                schema_manager: Some(Arc::clone(&schema_manager)),
+                vlog_store: Some(source_vlog_store),
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        source_manager.open().unwrap();
+
+        let long_value = RefValue::new(vec![Some(RefColumn::new(
+            ValueType::Put,
+            b"value-larger-than-threshold",
+        ))]);
+        let default_key = RefKey::new(0, b"default");
+        let metrics_key = RefKey::new_with_column_family(0, metrics_cf_id, b"metric");
+        source_manager.put(&default_key, &long_value).unwrap();
+        source_manager.put(&metrics_key, &long_value).unwrap();
+
+        let active = source_manager
+            .db_state
+            .load()
+            .active
+            .clone()
+            .expect("source active memtable should exist");
+        let snapshot_manager = SnapshotManager::new(
+            Arc::clone(&source_file_manager),
+            Arc::clone(&schema_manager),
+            Arc::new(DbLifecycle::new_open()),
+            None,
+            vec![0u16..=0u16],
+        );
+        let snapshot_write = MemtableManager::write_active_memtable_snapshot_data(
+            1,
+            None,
+            &active,
+            &snapshot_manager,
+            &source_file_manager,
+        )
+        .unwrap();
+
+        let target_db_state = Arc::new(DbStateHandle::new());
+        target_db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version,
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: None,
+            immutables: std::collections::VecDeque::new(),
+            suggested_base_snapshot_id: None,
+        });
+        let target_lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::clone(&target_db_state),
+            Arc::clone(&target_metrics),
+        ));
+        let target_vlog_store = Arc::new(VlogStore::new(Arc::clone(&target_file_manager), 64, 8));
+        let target_manager = MemtableManager::new(
+            Arc::clone(&target_file_manager),
+            Arc::clone(&target_lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 256,
+                buffer_count: 2,
+                num_columns: 1,
+                write_stall_limit: 8,
+                schema_manager: Some(Arc::clone(&schema_manager)),
+                vlog_store: Some(target_vlog_store),
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        target_manager.open().unwrap();
+
+        let restored = target_manager
+            .restore_active_memtable_snapshot_to_l0(
+                &source_file_manager,
+                &snapshot_write.active_data,
+                0,
+            )
+            .unwrap();
+
+        assert!(restored);
+        let tree0_files = target_lsm_tree.level_files_in_tree(0, 0);
+        let tree1_files = target_lsm_tree.level_files_in_tree(1, 0);
+        assert_eq!(tree0_files.len(), 1);
+        assert_eq!(tree1_files.len(), 1);
+        assert!(tree0_files[0].has_separated_values());
+        assert!(tree1_files[0].has_separated_values());
+        assert_eq!(tree0_files[0].vlog_file_seq_offset, 0);
+        assert_eq!(tree1_files[0].vlog_file_seq_offset, 0);
+
+        let files_with_entries = target_db_state.load().vlog_version.files_with_entries();
+        assert_eq!(files_with_entries.len(), 1);
+        assert_eq!(files_with_entries[0].2, 2);
+
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
     }
 
     #[test]
@@ -2165,7 +2581,7 @@ mod tests {
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].as_ref().unwrap().data_files_by_tree[0]
+            results[0].as_ref().unwrap().data_files_by_scope[0]
                 .1
                 .schema_id,
             0
@@ -2174,7 +2590,9 @@ mod tests {
         manager.flush_active().unwrap();
         let results = manager.wait_for_flushes();
         assert_eq!(results.len(), 1);
-        let second_file = results[0].as_ref().unwrap().data_files_by_tree[0].1.clone();
+        let second_file = results[0].as_ref().unwrap().data_files_by_scope[0]
+            .1
+            .clone();
         assert_eq!(second_file.schema_id, 1);
         let reader = file_manager
             .open_data_file_reader(second_file.file_id)
