@@ -80,7 +80,8 @@ public class Schema {
      * entries and therefore behaves as an all-{@code Bytes} family.
      */
     public Map<String, Map<Integer, ColumnType>> columnFamilies() {
-        Map<String, Map<Integer, ColumnType>> out = new java.util.TreeMap<String, Map<Integer, ColumnType>>();
+        Map<String, Map<Integer, ColumnType>> out =
+                new java.util.TreeMap<String, Map<Integer, ColumnType>>();
         for (Map.Entry<String, Integer> entry : columnFamilyIds.entrySet()) {
             out.put(entry.getKey(), familyColumns(entry.getValue()));
         }
@@ -196,7 +197,8 @@ public class Schema {
             return Collections.unmodifiableMap(out);
         }
         for (Map.Entry<String, JsonElement> entry : idsObj.entrySet()) {
-            if (!entry.getValue().isJsonPrimitive() || !entry.getValue().getAsJsonPrimitive().isNumber()) {
+            if (!entry.getValue().isJsonPrimitive()
+                    || !entry.getValue().getAsJsonPrimitive().isNumber()) {
                 continue;
             }
             out.put(entry.getKey(), entry.getValue().getAsInt());
