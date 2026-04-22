@@ -267,6 +267,8 @@ impl Db {
         let db_state = Arc::new(DbStateHandle::new());
         let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
         let db_lifecycle = Arc::new(DbLifecycle::new_initializing());
+        // Fresh open starts from an empty DbState, so bucket-range layout must be initialized here.
+        db_state.configure_multi_lsm(config.total_buckets, &bucket_ranges)?;
         let db = Self::open_with_state(
             config,
             file_manager,
@@ -804,7 +806,6 @@ impl Db {
             )?));
         }
         let latest_schema = schema_manager.latest_schema();
-        db_state.configure_multi_lsm(config.total_buckets, &bucket_ranges)?;
         Self::ensure_multi_lsm_scopes_for_schema(&db_state, latest_schema.as_ref())?;
         let last_scope_synced_schema_version = AtomicU64::new(latest_schema.version());
         let lsm_tree = Arc::new(lsm_tree);
