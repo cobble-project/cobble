@@ -744,6 +744,19 @@ impl StructuredDb {
         })
     }
 
+    pub fn expand_bucket(
+        &self,
+        source_db_id: impl Into<String>,
+        snapshot_id: Option<u64>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+    ) -> Result<u64> {
+        self.db.expand_bucket(source_db_id, snapshot_id, ranges)
+    }
+
+    pub fn shrink_bucket(&self, ranges: Vec<RangeInclusive<u16>>) -> Result<u64> {
+        self.db.shrink_bucket(ranges)
+    }
+
     pub fn id(&self) -> &str {
         self.db.id()
     }

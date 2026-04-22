@@ -515,6 +515,42 @@ class DbBindingTest {
     }
 
     @Test
+    void rangeOpenExpandAndShrinkFlow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-rescale-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(4);
+
+        try (Db source = Db.open(config, 2, 3)) {
+            source.put(2, keyBytes("rescale-source", 2), 0, valueBytes("rescale-source-v", 2));
+            ShardSnapshot shardSnapshot = source.snapshot();
+            assertEquals(1, shardSnapshot.ranges.size());
+            assertEquals(2, shardSnapshot.ranges.get(0).start);
+            assertEquals(3, shardSnapshot.ranges.get(0).end);
+            assertTrue(source.retainSnapshot(shardSnapshot.snapshotId));
+
+            try (Db target = Db.open(config, 0, 1)) {
+                target.put(0, keyBytes("rescale-target", 0), 0, valueBytes("rescale-target-v", 0));
+
+                assertTrue(
+                        target.expandBucket(
+                                        source.id(),
+                                        shardSnapshot.snapshotId,
+                                        new int[] {2},
+                                        new int[] {3})
+                                >= 0L);
+                assertArrayEquals(
+                        valueBytes("rescale-source-v", 2),
+                        target.get(2, keyBytes("rescale-source", 2), 0));
+
+                assertTrue(target.shrinkBucket(new int[] {2}, new int[] {3}) >= 0L);
+                assertArrayEquals(
+                        valueBytes("rescale-target-v", 0),
+                        target.get(0, keyBytes("rescale-target", 0), 0));
+                assertNull(target.get(2, keyBytes("rescale-source", 2), 0));
+            }
+        }
+    }
+
+    @Test
     void dbScanWithBatchCursor() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-db-scan-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);

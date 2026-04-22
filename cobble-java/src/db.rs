@@ -1,15 +1,15 @@
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{ScanCursorHandle, decode_scan_open_args};
 use crate::util::{
-    decode_java_bytes, decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong,
-    parse_config_json, throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
-    to_java_string_or_throw,
+    decode_bucket_ranges, decode_java_bytes, decode_java_string, decode_u16, decode_u32,
+    decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
+    to_java_optional_bytes_2d, to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use cobble::{Config, Db};
 use jni::JNIEnv;
 use jni::JavaVM;
-use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
+use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
 use serde_json::json;
 
@@ -33,23 +33,32 @@ pub extern "system" fn Java_io_cobble_Db_openHandle(
             return 0;
         }
     };
-    let total_buckets = config.total_buckets;
-    if total_buckets == 0 || total_buckets > (u16::MAX as u32) + 1 {
-        throw_illegal_argument(
-            &mut env,
-            format!("invalid total_buckets in config: {}", total_buckets),
-        );
-        return 0;
-    }
-    let range = 0..=((total_buckets - 1) as u16);
-    let db = match Db::open(config, vec![range]) {
-        Ok(db) => db,
+    open_db(&mut env, config)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_openHandleWithRange(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    range_start: jint,
+    range_end: jint,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
             return 0;
         }
     };
-    Box::into_raw(Box::new(db)) as jlong
+    open_db_with_range(&mut env, config, range_start, range_end)
 }
 
 #[unsafe(no_mangle)]
@@ -68,23 +77,28 @@ pub extern "system" fn Java_io_cobble_Db_openHandleFromJson(
     let Some(config) = parse_config_json(&mut env, &json) else {
         return 0;
     };
-    let total_buckets = config.total_buckets;
-    if total_buckets == 0 || total_buckets > (u16::MAX as u32) + 1 {
-        throw_illegal_argument(
-            &mut env,
-            format!("invalid total_buckets in config: {}", total_buckets),
-        );
-        return 0;
-    }
-    let range = 0..=((total_buckets - 1) as u16);
-    let db = match Db::open(config, vec![range]) {
-        Ok(db) => db,
+    open_db(&mut env, config)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_openHandleFromJsonWithRange(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    range_start: jint,
+    range_end: jint,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
         Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
+            throw_illegal_argument(&mut env, err);
             return 0;
         }
     };
-    Box::into_raw(Box::new(db)) as jlong
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    open_db_with_range(&mut env, config, range_start, range_end)
 }
 
 #[unsafe(no_mangle)]
@@ -245,6 +259,90 @@ pub extern "system" fn Java_io_cobble_Db_resumeHandleFromJson(
         }
     };
     Box::into_raw(Box::new(db)) as jlong
+}
+
+fn open_db(env: &mut JNIEnv, config: Config) -> jlong {
+    let max_bucket = match validate_total_buckets(env, &config) {
+        Some(v) => v,
+        None => return 0,
+    };
+    open_db_with_owned_range(env, config, 0, max_bucket)
+}
+
+fn open_db_with_range(
+    env: &mut JNIEnv,
+    config: Config,
+    range_start: jint,
+    range_end: jint,
+) -> jlong {
+    let _ = match validate_total_buckets(env, &config) {
+        Some(v) => v,
+        None => return 0,
+    };
+    let range_start = match decode_u16("rangeStartInclusive", range_start) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    let range_end = match decode_u16("rangeEndInclusive", range_end) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    open_db_with_owned_range(env, config, range_start, range_end)
+}
+
+fn open_db_with_owned_range(
+    env: &mut JNIEnv,
+    config: Config,
+    range_start: u16,
+    range_end: u16,
+) -> jlong {
+    let max_bucket = (config.total_buckets - 1) as u16;
+    if range_start > range_end {
+        throw_illegal_argument(
+            env,
+            format!(
+                "rangeStartInclusive must be <= rangeEndInclusive, got {}..={}",
+                range_start, range_end
+            ),
+        );
+        return 0;
+    }
+    if range_end > max_bucket {
+        throw_illegal_argument(
+            env,
+            format!(
+                "rangeEndInclusive must be <= {}, got {}",
+                max_bucket, range_end
+            ),
+        );
+        return 0;
+    }
+    let db = match Db::open(config, vec![range_start..=range_end]) {
+        Ok(db) => db,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(db)) as jlong
+}
+
+fn validate_total_buckets(env: &mut JNIEnv, config: &Config) -> Option<u16> {
+    let total_buckets = config.total_buckets;
+    if total_buckets == 0 || total_buckets > (u16::MAX as u32) + 1 {
+        throw_illegal_argument(
+            env,
+            format!("invalid total_buckets in config: {}", total_buckets),
+        );
+        return None;
+    }
+    Some((total_buckets - 1) as u16)
 }
 
 #[unsafe(no_mangle)]
@@ -810,6 +908,89 @@ pub extern "system" fn Java_io_cobble_Db_getShardSnapshotJson(
         }
     };
     to_java_string_or_throw(&mut env, payload)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_expandBucket(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    source_db_id: JString,
+    snapshot_id: jlong,
+    range_starts: JIntArray,
+    range_ends: JIntArray,
+) -> jlong {
+    let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    let source_db_id = match decode_java_string(&mut env, source_db_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let snapshot_id = if snapshot_id < 0 {
+        None
+    } else {
+        match decode_u64_from_jlong("snapshotId", snapshot_id) {
+            Ok(v) => Some(v),
+            Err(err) => {
+                throw_illegal_argument(&mut env, err);
+                return 0;
+            }
+        }
+    };
+    let ranges = match decode_bucket_ranges(&mut env, range_starts, range_ends) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let ranges = if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges)
+    };
+    match db.expand_bucket(source_db_id, snapshot_id, ranges) {
+        Ok(v) => v as jlong,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_shrinkBucket(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    range_starts: JIntArray,
+    range_ends: JIntArray,
+) -> jlong {
+    let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    let ranges = match decode_bucket_ranges(&mut env, range_starts, range_ends) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    if ranges.is_empty() {
+        throw_illegal_argument(&mut env, "shrink ranges must not be empty".to_string());
+        return 0;
+    }
+    match db.shrink_bucket(ranges) {
+        Ok(v) => v as jlong,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
 }
 
 fn db_from_handle_or_throw(env: &mut JNIEnv, native_handle: jlong) -> Option<&'static Db> {

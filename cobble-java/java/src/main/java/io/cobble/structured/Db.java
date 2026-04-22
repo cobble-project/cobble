@@ -58,6 +58,16 @@ public final class Db extends NativeObject {
         return new Db(h);
     }
 
+    /** Open a structured DB from a config file path with an explicit bucket range. */
+    public static Db open(String configPath, int rangeStartInclusive, int rangeEndInclusive) {
+        NativeLoader.load();
+        long h = openHandleWithRange(configPath, rangeStartInclusive, rangeEndInclusive);
+        if (h == 0L) {
+            throw new IllegalStateException("failed to open structured db with bucket range");
+        }
+        return new Db(h);
+    }
+
     /** Open a structured DB from Java {@link Config}. */
     public static Db open(Config config) {
         if (config == null) {
@@ -67,6 +77,22 @@ public final class Db extends NativeObject {
         long h = openHandleFromJson(config.toJson());
         if (h == 0L) {
             throw new IllegalStateException("failed to open structured db from config json");
+        }
+        return new Db(h);
+    }
+
+    /** Open a structured DB from Java {@link Config} with an explicit bucket range. */
+    public static Db open(Config config, int rangeStartInclusive, int rangeEndInclusive) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        NativeLoader.load();
+        long h =
+                openHandleFromJsonWithRange(
+                        config.toJson(), rangeStartInclusive, rangeEndInclusive);
+        if (h == 0L) {
+            throw new IllegalStateException(
+                    "failed to open structured db from config json with bucket range");
         }
         return new Db(h);
     }
@@ -128,6 +154,28 @@ public final class Db extends NativeObject {
             throw new IllegalStateException("failed to resume structured db from config json");
         }
         return new Db(h);
+    }
+
+    /** Expand bucket ownership by importing data from another shard snapshot. */
+    public long expandBucket(
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive) {
+        return expandBucket(
+                nativeHandle, sourceDbId, snapshotId, rangeStartsInclusive, rangeEndsInclusive);
+    }
+
+    /** Expand bucket ownership from the latest retained snapshot of the source DB. */
+    public long expandBucket(
+            String sourceDbId, int[] rangeStartsInclusive, int[] rangeEndsInclusive) {
+        return expandBucket(
+                nativeHandle, sourceDbId, -1L, rangeStartsInclusive, rangeEndsInclusive);
+    }
+
+    /** Shrink bucket ownership by removing the given ranges from the current DB. */
+    public long shrinkBucket(int[] rangeStartsInclusive, int[] rangeEndsInclusive) {
+        return shrinkBucket(nativeHandle, rangeStartsInclusive, rangeEndsInclusive);
     }
 
     // ── typed write operations ────────────────────────────────────────────
@@ -361,7 +409,13 @@ public final class Db extends NativeObject {
 
     private static native long openHandle(String configPath);
 
+    private static native long openHandleWithRange(
+            String configPath, int rangeStartInclusive, int rangeEndInclusive);
+
     private static native long openHandleFromJson(String configJson);
+
+    private static native long openHandleFromJsonWithRange(
+            String configJson, int rangeStartInclusive, int rangeEndInclusive);
 
     private static native String currentSchemaJson(long nativeHandle);
 
@@ -454,4 +508,14 @@ public final class Db extends NativeObject {
     private static native boolean retainSnapshot(long nativeHandle, long snapshotId);
 
     private static native String getShardSnapshotJson(long nativeHandle, long snapshotId);
+
+    private static native long expandBucket(
+            long nativeHandle,
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive);
+
+    private static native long shrinkBucket(
+            long nativeHandle, int[] rangeStartsInclusive, int[] rangeEndsInclusive);
 }

@@ -418,6 +418,72 @@ class StructuredDbTest {
     }
 
     @Test
+    void shrinkAndExpandBucketRoundTripKeepsStructuredData() throws IOException {
+        Path sharedDir = Files.createTempDirectory("cobble-structured-rescale-shared-");
+        Config config = new Config().addVolume(sharedDir.toString()).numColumns(1).totalBuckets(4);
+
+        try (Db source = Db.open(config, 2, 3)) {
+            source.updateSchema().addBytesColumn("value-state", 0).commit();
+            source.put(
+                    2,
+                    "bucket-2".getBytes(StandardCharsets.UTF_8),
+                    "value-state",
+                    0,
+                    "value-2".getBytes(StandardCharsets.UTF_8));
+            ShardSnapshot snapshot = source.snapshot();
+            assertTrue(source.retainSnapshot(snapshot.snapshotId));
+
+            try (Db target = Db.open(config, 0, 1)) {
+                target.updateSchema().addBytesColumn("value-state", 0).commit();
+                target.put(
+                        0,
+                        "bucket-0".getBytes(StandardCharsets.UTF_8),
+                        "value-state",
+                        0,
+                        "value-0".getBytes(StandardCharsets.UTF_8));
+
+                assertTrue(
+                        target.expandBucket(
+                                        source.id(),
+                                        snapshot.snapshotId,
+                                        new int[] {2},
+                                        new int[] {3})
+                                >= 0L);
+                Row expanded =
+                        target.get(2, "bucket-2".getBytes(StandardCharsets.UTF_8), "value-state");
+                assertNotNull(expanded);
+                assertArrayEquals("value-2".getBytes(StandardCharsets.UTF_8), expanded.getBytes(0));
+
+                assertTrue(target.shrinkBucket(new int[] {2}, new int[] {3}) >= 0L);
+                assertNotNull(
+                        target.get(0, "bucket-0".getBytes(StandardCharsets.UTF_8), "value-state"));
+                assertNull(
+                        target.get(2, "bucket-2".getBytes(StandardCharsets.UTF_8), "value-state"));
+            }
+        }
+    }
+
+    @Test
+    void openWithBucketRangeLimitsOwnedBuckets() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-open-range-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(4);
+
+        try (Db db = Db.open(config, 1, 2)) {
+            db.updateSchema().addBytesColumn("value-state", 0).commit();
+            db.put(
+                    1,
+                    "bucket-1".getBytes(StandardCharsets.UTF_8),
+                    "value-state",
+                    0,
+                    "value-1".getBytes(StandardCharsets.UTF_8));
+            ShardSnapshot snapshot = db.snapshot();
+            assertEquals(1, snapshot.ranges.size());
+            assertEquals(1, snapshot.ranges.get(0).start);
+            assertEquals(2, snapshot.ranges.get(0).end);
+        }
+    }
+
+    @Test
     void listRetainLastCapEnforced() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-cap-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(0).totalBuckets(1);

@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use cobble::Config;
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JObject, JString};
+use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString};
 use jni::sys::{jint, jlong, jobject, jstring};
+use std::ops::RangeInclusive;
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Utils_versionString(env: JNIEnv, class: JClass) -> jstring {
@@ -68,6 +69,45 @@ pub(crate) fn decode_column_index(value: jint) -> Result<usize, String> {
         return Err(format!("column out of range: {}", value));
     }
     Ok(value as usize)
+}
+
+pub(crate) fn decode_bucket_ranges(
+    env: &mut JNIEnv,
+    starts: JIntArray,
+    ends: JIntArray,
+) -> Result<Vec<RangeInclusive<u16>>, String> {
+    let starts_len = env
+        .get_array_length(&starts)
+        .map_err(|err| format!("invalid range start array: {}", err))?;
+    let ends_len = env
+        .get_array_length(&ends)
+        .map_err(|err| format!("invalid range end array: {}", err))?;
+    if starts_len != ends_len {
+        return Err(format!(
+            "range start/end array length mismatch: {} != {}",
+            starts_len, ends_len
+        ));
+    }
+    let mut raw_starts = vec![0; starts_len as usize];
+    let mut raw_ends = vec![0; ends_len as usize];
+    env.get_int_array_region(&starts, 0, &mut raw_starts)
+        .map_err(|err| format!("invalid range start array: {}", err))?;
+    env.get_int_array_region(&ends, 0, &mut raw_ends)
+        .map_err(|err| format!("invalid range end array: {}", err))?;
+
+    let mut ranges = Vec::with_capacity(raw_starts.len());
+    for (index, (start, end)) in raw_starts.into_iter().zip(raw_ends.into_iter()).enumerate() {
+        let start = decode_u16(&format!("rangeStarts[{}]", index), start)?;
+        let end = decode_u16(&format!("rangeEnds[{}]", index), end)?;
+        if start > end {
+            return Err(format!(
+                "rangeStarts[{}] must be <= rangeEnds[{}], but got {}..={}",
+                index, index, start, end
+            ));
+        }
+        ranges.push(start..=end);
+    }
+    Ok(ranges)
 }
 
 pub(crate) fn throw_illegal_state(env: &mut JNIEnv, message: String) {
