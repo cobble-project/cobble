@@ -12,8 +12,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -341,7 +341,7 @@ class DbBindingTest {
             for (int i = 0; i < count; i++) {
                 db.put(0, keyBytes("snapshot", i), 0, valueBytes("snapshot-v", i));
             }
-            Future<ShardSnapshot> shardSnapshotFuture = db.asyncSnapshot();
+            CompletableFuture<ShardSnapshot> shardSnapshotFuture = db.asyncSnapshot();
             ShardSnapshot shardSnapshot = awaitSnapshot(shardSnapshotFuture);
             assertNotNull(shardSnapshot);
             assertTrue(shardSnapshot.snapshotId >= 0);
@@ -1037,7 +1037,7 @@ class DbBindingTest {
         }
     }
 
-    private static ShardSnapshot awaitSnapshot(Future<ShardSnapshot> future) {
+    private static ShardSnapshot awaitSnapshot(CompletableFuture<ShardSnapshot> future) {
         try {
             return future.get();
         } catch (InterruptedException e) {

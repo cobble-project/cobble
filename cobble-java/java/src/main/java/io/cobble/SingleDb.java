@@ -3,7 +3,6 @@ package io.cobble;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 
 /** Java binding for cobble SingleDb. */
 public final class SingleDb extends NativeObject {
@@ -175,7 +174,7 @@ public final class SingleDb extends NativeObject {
     }
 
     /** Trigger snapshot creation asynchronously and return future of global snapshot payload. */
-    public Future<GlobalSnapshot> asyncSnapshot() {
+    public CompletableFuture<GlobalSnapshot> asyncSnapshot() {
         CompletableFuture<String> snapshotJsonFuture = new CompletableFuture<>();
         asyncSnapshot(nativeHandle, snapshotJsonFuture);
         return snapshotJsonFuture.thenApply(GlobalSnapshot::fromJson);

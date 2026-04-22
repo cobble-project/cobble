@@ -2,7 +2,6 @@ package io.cobble;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 
 /**
  * Java binding for writable Cobble database.
@@ -271,7 +270,7 @@ public final class Db extends NativeObject {
     }
 
     /** Trigger snapshot creation asynchronously and return a future of shard snapshot payload. */
-    public Future<ShardSnapshot> asyncSnapshot() {
+    public CompletableFuture<ShardSnapshot> asyncSnapshot() {
         CompletableFuture<String> snapshotJsonFuture = new CompletableFuture<>();
         asyncSnapshot(nativeHandle, snapshotJsonFuture);
         return snapshotJsonFuture.thenApply(ShardSnapshot::fromJson);

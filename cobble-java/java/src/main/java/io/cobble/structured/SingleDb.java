@@ -11,7 +11,6 @@ import io.cobble.WriteOptions;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 
 /**
  * A structured single-node database with typed column support (Bytes and List).
@@ -251,7 +250,7 @@ public final class SingleDb extends NativeObject {
     // ── snapshot lifecycle ────────────────────────────────────────────────────
 
     /** Trigger snapshot creation asynchronously and return a future of global snapshot. */
-    public Future<GlobalSnapshot> asyncSnapshot() {
+    public CompletableFuture<GlobalSnapshot> asyncSnapshot() {
         CompletableFuture<String> snapshotJsonFuture = new CompletableFuture<>();
         asyncSnapshot(nativeHandle, snapshotJsonFuture);
         return snapshotJsonFuture.thenApply(GlobalSnapshot::fromJson);

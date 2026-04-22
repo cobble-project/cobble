@@ -10,7 +10,6 @@ import io.cobble.WriteOptions;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 
 /**
  * A structured database with typed column support (Bytes and List).
@@ -321,7 +320,7 @@ public final class Db extends NativeObject {
     // ── snapshot lifecycle ────────────────────────────────────────────────
 
     /** Trigger snapshot creation asynchronously and return a future of shard snapshot. */
-    public Future<ShardSnapshot> asyncSnapshot() {
+    public CompletableFuture<ShardSnapshot> asyncSnapshot() {
         CompletableFuture<String> snapshotJsonFuture = new CompletableFuture<>();
         asyncSnapshot(nativeHandle, snapshotJsonFuture);
         return snapshotJsonFuture.thenApply(ShardSnapshot::fromJson);
