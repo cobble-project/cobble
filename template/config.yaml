@@ -98,6 +98,8 @@ time_provider: system                    # system | manual
 
 # Logging.
 log_path: null                           # local path only
+log_max_file_size: "10MiB"              # roll the active file after this size
+log_keep_files: 3                       # total files retained, including the active file
 log_console: false
 log_level: INFO                          # OFF | ERROR | WARN | INFO | DEBUG | TRACE
 

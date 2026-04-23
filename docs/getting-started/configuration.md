@@ -185,6 +185,8 @@ Named column families are created later through schema evolution. Reopen, restor
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `log_path` | `None` | File path for logs (local only) |
+| `log_max_file_size` | `10MiB` | Maximum size of the active log file before rollover |
+| `log_keep_files` | `3` | Total number of log files retained, including the active file |
 | `log_console` | `false` | Enable console log output |
 | `log_level` | `Info` | Log level: `Trace`, `Debug`, `Info`, `Warn`, `Error`, `Off` |
 

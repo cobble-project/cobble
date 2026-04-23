@@ -24,11 +24,34 @@ pub(crate) fn init_logging(config: &Config) {
             root = root.appender("stdout");
         }
         if let Some(ref path) = config.log_path {
-            let file = log4rs::append::file::FileAppender::builder()
-                .build(path)
-                .unwrap();
-            builder =
-                builder.appender(log4rs::config::Appender::builder().build("file", Box::new(file)));
+            let file: Box<dyn log4rs::append::Append> = if config.log_keep_files > 1 {
+                let trigger =
+                    log4rs::append::rolling_file::policy::compound::trigger::size::SizeTrigger::new(
+                        config
+                            .log_max_file_size_bytes()
+                            .expect("log_max_file_size should be validated"),
+                    );
+                let roller =
+                    log4rs::append::rolling_file::policy::compound::roll::fixed_window::FixedWindowRoller::builder()
+                        .base(1)
+                        .build(
+                            &format!("{path}.{{}}"),
+                            (config.log_keep_files - 1) as u32,
+                        )
+                        .unwrap();
+                let policy = log4rs::append::rolling_file::policy::compound::CompoundPolicy::new(
+                    Box::new(trigger),
+                    Box::new(roller),
+                );
+                Box::new(
+                    log4rs::append::rolling_file::RollingFileAppender::builder()
+                        .build(path, Box::new(policy))
+                        .unwrap(),
+                )
+            } else {
+                Box::new(log4rs::append::file::FileAppender::builder().build(path).unwrap())
+            };
+            builder = builder.appender(log4rs::config::Appender::builder().build("file", file));
             root = root.appender("file");
         }
         let root = root.build(config.log_level);

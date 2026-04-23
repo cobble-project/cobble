@@ -117,6 +117,12 @@ public final class Config {
     /** Optional local log file path. */
     public String logPath;
 
+    /** Maximum size in bytes of the active log file before rollover. */
+    public Integer logMaxFileSize;
+
+    /** Total number of log files to retain, including the active file. */
+    public Integer logKeepFiles;
+
     /** Whether logs should also be written to console. */
     public Boolean logConsole;
 

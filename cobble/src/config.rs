@@ -496,6 +496,10 @@ pub struct Config {
     pub time_provider: TimeProviderKind,
     /// Optional log file path. If None, logs go to console only. Must be a local path.
     pub log_path: Option<String>,
+    /// Maximum size of the active log file before rolling.
+    pub log_max_file_size: Size,
+    /// Total number of log files to keep, including the active file.
+    pub log_keep_files: usize,
     /// Whether to enable console logging.
     pub log_console: bool,
     /// Log level filter (trace, debug, info, warn, error, off).
@@ -562,6 +566,8 @@ impl Default for Config {
             value_separation_threshold: None,
             time_provider: TimeProviderKind::default(),
             log_path: None,
+            log_max_file_size: Size::from_mib(10),
+            log_keep_files: 3,
             log_console: false,
             log_level: log::LevelFilter::Info,
             snapshot_on_flush: false,
@@ -659,6 +665,10 @@ impl Config {
             .transpose()
             .map_err(Error::ConfigError)
             .map(|size| size.unwrap_or(0))
+    }
+
+    pub(crate) fn log_max_file_size_bytes(&self) -> Result<u64> {
+        size_to_u64("log_max_file_size", self.log_max_file_size).map_err(Error::ConfigError)
     }
 
     pub(crate) fn hybrid_block_cache_disk_size(
@@ -920,6 +930,16 @@ impl Config {
         self.base_file_size_bytes()?;
         self.parquet_row_group_size_bytes()?;
         self.value_separation_threshold_bytes()?;
+        if self.log_max_file_size_bytes()? == 0 {
+            return Err(Error::ConfigError(
+                "log_max_file_size must be greater than 0".to_string(),
+            ));
+        }
+        if self.log_keep_files == 0 {
+            return Err(Error::ConfigError(
+                "log_keep_files must be greater than 0".to_string(),
+            ));
+        }
         for (idx, volume) in self.volumes.iter().enumerate() {
             if let Some(limit) = volume.size_limit {
                 size_to_u64(&format!("volumes[{idx}].size_limit"), limit)
@@ -1041,6 +1061,8 @@ mod tests {
             value_separation_threshold: Some(Size::from_kib(4)),
             time_provider: crate::time::TimeProviderKind::Manual,
             log_path: Some("/tmp/cobble.log".to_string()),
+            log_max_file_size: Size::from_mib(16),
+            log_keep_files: 5,
             log_console: true,
             log_level: log::LevelFilter::Debug,
             snapshot_on_flush: true,
@@ -1089,6 +1111,8 @@ mod tests {
         );
         assert!(decoded.sst_partitioned_index);
         assert_eq!(decoded.time_provider, crate::time::TimeProviderKind::Manual);
+        assert_eq!(decoded.log_max_file_size, Size::from_mib(16));
+        assert_eq!(decoded.log_keep_files, 5);
         assert_eq!(decoded.log_level, log::LevelFilter::Debug);
         assert_eq!(decoded.snapshot_retention, Some(3));
         assert_eq!(decoded.active_memtable_incremental_snapshot_ratio, 0.5);

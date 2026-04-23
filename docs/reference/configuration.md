@@ -158,6 +158,8 @@ Named column families are added later through schema evolution. Reopen, restore,
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `log_path` | `Option<String>` | `None` | Log file path (must be local) |
+| `log_max_file_size` | `Size` | `10MiB` | Maximum size of the active log file before rollover |
+| `log_keep_files` | `usize` | `3` | Total number of log files retained, including the active file |
 | `log_console` | `bool` | `false` | Enable console logging |
 | `log_level` | `log::LevelFilter` | `Info` | Trace, Debug, Info, Warn, Error, Off |
 
