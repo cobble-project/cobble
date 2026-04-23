@@ -111,24 +111,83 @@ public final class Db extends NativeObject {
 
     /** Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot. */
     public static Db restore(String configPath, long snapshotId, String dbId) {
+        return restore(configPath, snapshotId, dbId, false);
+    }
+
+    /**
+     * Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot.
+     *
+     * <p>Set {@code newDbId} to {@code true} to restore from the source snapshot into a fresh db
+     * identity and start a new snapshot chain.
+     */
+    public static Db restore(String configPath, long snapshotId, String dbId, boolean newDbId) {
         NativeLoader.load();
-        long h = openFromSnapshotHandle(configPath, snapshotId, dbId);
+        long h = restoreHandle(configPath, snapshotId, dbId, newDbId);
         if (h == 0L) {
-            throw new IllegalStateException("failed to restore structured db from snapshot");
+            throw new IllegalStateException(
+                    newDbId
+                            ? "failed to restore structured db from snapshot with fresh db id"
+                            : "failed to restore structured db from snapshot");
         }
         return new Db(h);
     }
 
     /** Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot. */
     public static Db restore(Config config, long snapshotId, String dbId) {
+        return restore(config, snapshotId, dbId, false);
+    }
+
+    /**
+     * Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot.
+     *
+     * <p>Set {@code newDbId} to {@code true} to restore from the source snapshot into a fresh db
+     * identity and start a new snapshot chain.
+     */
+    public static Db restore(Config config, long snapshotId, String dbId, boolean newDbId) {
         if (config == null) {
             throw new IllegalArgumentException("config must not be null");
         }
         NativeLoader.load();
-        long h = openFromSnapshotHandleFromJson(config.toJson(), snapshotId, dbId);
+        long h = restoreHandleFromJson(config.toJson(), snapshotId, dbId, newDbId);
         if (h == 0L) {
             throw new IllegalStateException(
-                    "failed to restore structured db from snapshot config json");
+                    newDbId
+                            ? "failed to restore structured db from snapshot config json with fresh db id"
+                            : "failed to restore structured db from snapshot config json");
+        }
+        return new Db(h);
+    }
+
+    /**
+     * Restore a structured DB from an explicit source manifest path. Schema is auto-loaded from
+     * that source manifest.
+     *
+     * <p>The returned DB always gets a fresh db id and starts a new snapshot chain.
+     */
+    public static Db restoreWithManifest(String configPath, String manifestPath) {
+        NativeLoader.load();
+        long h = restoreWithManifestHandle(configPath, manifestPath);
+        if (h == 0L) {
+            throw new IllegalStateException("failed to restore structured db from manifest path");
+        }
+        return new Db(h);
+    }
+
+    /**
+     * Restore a structured DB from an explicit source manifest path. Schema is auto-loaded from
+     * that source manifest.
+     *
+     * <p>The returned DB always gets a fresh db id and starts a new snapshot chain.
+     */
+    public static Db restoreWithManifest(Config config, String manifestPath) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        NativeLoader.load();
+        long h = restoreWithManifestHandleFromJson(config.toJson(), manifestPath);
+        if (h == 0L) {
+            throw new IllegalStateException(
+                    "failed to restore structured db from manifest path config json");
         }
         return new Db(h);
     }
@@ -421,11 +480,16 @@ public final class Db extends NativeObject {
 
     private static native long createSchemaBuilder(long nativeHandle);
 
-    private static native long openFromSnapshotHandle(
-            String configPath, long snapshotId, String dbId);
+    private static native long restoreHandle(
+            String configPath, long snapshotId, String dbId, boolean newDbId);
 
-    private static native long openFromSnapshotHandleFromJson(
-            String configJson, long snapshotId, String dbId);
+    private static native long restoreHandleFromJson(
+            String configJson, long snapshotId, String dbId, boolean newDbId);
+
+    private static native long restoreWithManifestHandle(String configPath, String manifestPath);
+
+    private static native long restoreWithManifestHandleFromJson(
+            String configJson, String manifestPath);
 
     private static native long resumeHandle(String configPath, String dbId);
 

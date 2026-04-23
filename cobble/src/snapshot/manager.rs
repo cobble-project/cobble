@@ -448,15 +448,9 @@ impl SnapshotManager {
                 .cloned();
             (snapshot, callback, base_snapshot)
         };
-        let manifest_info = snapshot.as_ref().map(|s| SnapshotManifestInfo {
-            id: s.id,
-            manifest_path: s.manifest_path.clone(),
-            bucket_ranges: s.bucket_ranges.clone(),
-            latest_schema_id: s.latest_schema_id,
-        });
         let mut incremental_base_id = None;
         let result = match snapshot {
-            Some(snapshot) => {
+            Some(ref snapshot) => {
                 let resources = Arc::new(MaterializeTempResourceRegistry::new(Arc::clone(
                     &self.file_manager,
                 )));
@@ -500,6 +494,22 @@ impl SnapshotManager {
             }
             None => Err(Error::IoError(format!("Snapshot {} not found", id))),
         };
+        let manifest_info = snapshot.as_ref().and_then(|s| {
+            if result.is_err() {
+                return None;
+            }
+            let manifest_name = snapshot_manifest_name(s.id);
+            let manifest_path = self
+                .file_manager
+                .get_metadata_file_full_path(&manifest_name)
+                .unwrap_or_else(|| s.manifest_path.clone());
+            Some(SnapshotManifestInfo {
+                id: s.id,
+                manifest_path,
+                bucket_ranges: s.bucket_ranges.clone(),
+                latest_schema_id: s.latest_schema_id,
+            })
+        });
         if let Some(callback) = callback {
             callback(
                 result

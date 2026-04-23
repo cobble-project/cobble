@@ -727,6 +727,58 @@ impl StructuredDb {
         })
     }
 
+    pub fn open_new_with_snapshot(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+    ) -> Result<Self> {
+        Self::open_new_with_snapshot_with_resolver(config, snapshot_id, db_id, None)
+    }
+
+    pub fn open_new_with_snapshot_with_resolver(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        let db_id = db_id.into();
+        let db = Db::open_new_with_snapshot_with_resolver(
+            config,
+            snapshot_id,
+            &db_id,
+            Some(combined_resolver(resolver)),
+        )?;
+        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
+        Ok(Self {
+            db,
+            structured_schema: Arc::new(structured_schema),
+        })
+    }
+
+    pub fn open_new_with_manifest_path(
+        config: Config,
+        manifest_path: impl Into<String>,
+    ) -> Result<Self> {
+        Self::open_new_with_manifest_path_with_resolver(config, manifest_path, None)
+    }
+
+    pub fn open_new_with_manifest_path_with_resolver(
+        config: Config,
+        manifest_path: impl Into<String>,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        let db = Db::open_new_with_manifest_path_with_resolver(
+            config,
+            manifest_path,
+            Some(combined_resolver(resolver)),
+        )?;
+        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
+        Ok(Self {
+            db,
+            structured_schema: Arc::new(structured_schema),
+        })
+    }
+
     pub fn resume(config: Config, db_id: impl Into<String>) -> Result<Self> {
         Self::resume_with_resolver(config, db_id, None)
     }

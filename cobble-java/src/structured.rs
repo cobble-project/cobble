@@ -253,12 +253,13 @@ fn open_structured_db_with_range(
 // ── restore / resume ────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_structured_Db_openFromSnapshotHandle(
+pub extern "system" fn Java_io_cobble_structured_Db_restoreHandle(
     mut env: JNIEnv,
     _class: JClass,
     config_path: JString,
     snapshot_id: jlong,
     db_id: JString,
+    new_db_id: jboolean,
 ) -> jlong {
     let config_path = match decode_java_string(&mut env, config_path) {
         Ok(v) => v,
@@ -274,16 +275,17 @@ pub extern "system" fn Java_io_cobble_structured_Db_openFromSnapshotHandle(
             return 0;
         }
     };
-    restore_structured_db(&mut env, config, snapshot_id, db_id)
+    restore_structured_db(&mut env, config, snapshot_id, db_id, new_db_id)
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_structured_Db_openFromSnapshotHandleFromJson(
+pub extern "system" fn Java_io_cobble_structured_Db_restoreHandleFromJson(
     mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
     snapshot_id: jlong,
     db_id: JString,
+    new_db_id: jboolean,
 ) -> jlong {
     let config_json = match decode_java_string(&mut env, config_json) {
         Ok(v) => v,
@@ -295,7 +297,51 @@ pub extern "system" fn Java_io_cobble_structured_Db_openFromSnapshotHandleFromJs
     let Some(config) = parse_config_json(&mut env, &config_json) else {
         return 0;
     };
-    restore_structured_db(&mut env, config, snapshot_id, db_id)
+    restore_structured_db(&mut env, config, snapshot_id, db_id, new_db_id)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_restoreWithManifestHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    manifest_path: JString,
+) -> jlong {
+    let config_path = match decode_java_string(&mut env, config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(&config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    restore_structured_db_from_manifest_path(&mut env, config, manifest_path)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_restoreWithManifestHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    manifest_path: JString,
+) -> jlong {
+    let config_json = match decode_java_string(&mut env, config_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
+    };
+    restore_structured_db_from_manifest_path(&mut env, config, manifest_path)
 }
 
 fn restore_structured_db(
@@ -303,6 +349,7 @@ fn restore_structured_db(
     config: Config,
     snapshot_id: jlong,
     db_id: JString,
+    new_db_id: jboolean,
 ) -> jlong {
     let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
         Ok(v) => v,
@@ -319,10 +366,46 @@ fn restore_structured_db(
         }
     };
     let resolver = cobble_data_structure::structured_merge_operator_resolver();
-    match DataStructureDb::open_from_snapshot_with_resolver(
+    let db = if new_db_id == JNI_TRUE {
+        DataStructureDb::open_new_with_snapshot_with_resolver(
+            config,
+            snapshot_id,
+            db_id,
+            Some(resolver),
+        )
+    } else {
+        DataStructureDb::open_from_snapshot_with_resolver(
+            config,
+            snapshot_id,
+            db_id,
+            Some(resolver),
+        )
+    };
+    match db {
+        Ok(db) => Box::into_raw(Box::new(db)) as jlong,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            0
+        }
+    }
+}
+
+fn restore_structured_db_from_manifest_path(
+    env: &mut JNIEnv,
+    config: Config,
+    manifest_path: JString,
+) -> jlong {
+    let manifest_path = match decode_java_string(env, manifest_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    let resolver = cobble_data_structure::structured_merge_operator_resolver();
+    match DataStructureDb::open_new_with_manifest_path_with_resolver(
         config,
-        snapshot_id,
-        db_id,
+        manifest_path,
         Some(resolver),
     ) {
         Ok(db) => Box::into_raw(Box::new(db)) as jlong,

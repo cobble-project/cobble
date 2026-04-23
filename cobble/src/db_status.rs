@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
 use arc_swap::ArcSwapOption;
+use log::warn;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
-use log::warn;
 
 const STATE_INITIALIZING: u8 = 0;
 const STATE_OPEN: u8 = 1;
@@ -249,7 +249,9 @@ impl DbLifecycle {
         let mut waited = 0u64;
         while self.active_accesses.load(Ordering::Acquire) != 0 {
             if waited >= 30_000 {
-                warn!("waited at least 30 seconds to quit, possible block of get/put method or leak of schema or iter objects.");
+                warn!(
+                    "waited at least 30 seconds to quit, possible block of get/put method or leak of schema or iter objects."
+                );
             }
             let (next_guard, _) = self
                 .access_wait_condvar

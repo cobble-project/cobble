@@ -82,11 +82,16 @@ let manifest = coord.load_global_snapshot(global_snapshot_id)?;
 let s1 = &manifest.shard_snapshots[0];
 let s2 = &manifest.shard_snapshots[1];
 
-let db1 = Db::open_from_snapshot(config1, s1.snapshot_id, s1.db_id.clone())?;
-let db2 = Db::open_from_snapshot(config2, s2.snapshot_id, s2.db_id.clone())?;
+let db1 = Db::open_new_with_snapshot(config1, s1.snapshot_id, s1.db_id.clone())?;
+let db2 = Db::open_new_with_snapshot(config2, s2.snapshot_id, s2.db_id.clone())?;
 ```
 
 The restored manifest still preserves the named column-family layout, but shard selection and routing remain bucket-range based.
+
+Use `Db::open_from_snapshot(...)` only when you intentionally want to keep restoring into the same
+db identity. For bootstrapping a fresh shard runtime, prefer `Db::open_new_with_snapshot(...)`.
+If your checkpoint metadata already stores the exact manifest path, use
+`Db::open_new_with_manifest_path(...)` instead of reconstructing `(db_id, snapshot_id)`.
 
 {: .warning }
 > All files referenced by the snapshot (SST, Parquet, VLOG, manifests, schemas) must be accessible from the configured volumes during restore.

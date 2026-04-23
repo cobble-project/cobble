@@ -81,10 +81,29 @@ public final class Db extends NativeObject {
      * @return restored writable db
      */
     public static Db restore(String configPath, long snapshotId, String dbId) {
+        return restore(configPath, snapshotId, dbId, false);
+    }
+
+    /**
+     * Restore a writable DB from one snapshot.
+     *
+     * <p>Set {@code newDbId} to {@code true} to restore from the source snapshot into a fresh db
+     * identity and start a new snapshot chain.
+     *
+     * @param configPath db config path
+     * @param snapshotId snapshot id
+     * @param dbId source db id
+     * @param newDbId whether to restore into a fresh db identity
+     * @return restored writable db
+     */
+    public static Db restore(String configPath, long snapshotId, String dbId, boolean newDbId) {
         NativeLoader.load();
-        long nativeHandle = openFromSnapshotHandle(configPath, snapshotId, dbId);
+        long nativeHandle = restoreHandle(configPath, snapshotId, dbId, newDbId);
         if (nativeHandle == 0L) {
-            throw new IllegalStateException("failed to restore db from snapshot");
+            throw new IllegalStateException(
+                    newDbId
+                            ? "failed to restore db from snapshot with fresh db id"
+                            : "failed to restore db from snapshot");
         }
         return new Db(nativeHandle);
     }
@@ -98,13 +117,65 @@ public final class Db extends NativeObject {
      * @return restored writable db
      */
     public static Db restore(Config config, long snapshotId, String dbId) {
+        return restore(config, snapshotId, dbId, false);
+    }
+
+    /**
+     * Restore a writable DB from one snapshot.
+     *
+     * <p>Set {@code newDbId} to {@code true} to restore from the source snapshot into a fresh db
+     * identity and start a new snapshot chain.
+     *
+     * @param config Java config
+     * @param snapshotId snapshot id
+     * @param dbId source db id
+     * @param newDbId whether to restore into a fresh db identity
+     * @return restored writable db
+     */
+    public static Db restore(Config config, long snapshotId, String dbId, boolean newDbId) {
         if (config == null) {
             throw new IllegalArgumentException("config must not be null");
         }
         NativeLoader.load();
-        long nativeHandle = openFromSnapshotHandleFromJson(config.toJson(), snapshotId, dbId);
+        long nativeHandle = restoreHandleFromJson(config.toJson(), snapshotId, dbId, newDbId);
         if (nativeHandle == 0L) {
-            throw new IllegalStateException("failed to restore db from snapshot config json");
+            throw new IllegalStateException(
+                    newDbId
+                            ? "failed to restore db from snapshot config json with fresh db id"
+                            : "failed to restore db from snapshot config json");
+        }
+        return new Db(nativeHandle);
+    }
+
+    /**
+     * Restore a writable DB from an explicit source manifest path.
+     *
+     * <p>The manifest path is treated as restore input, and the returned DB always gets a fresh db
+     * id and starts a new snapshot chain.
+     */
+    public static Db restoreWithManifest(String configPath, String manifestPath) {
+        NativeLoader.load();
+        long nativeHandle = restoreWithManifestHandle(configPath, manifestPath);
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("failed to restore db from manifest path");
+        }
+        return new Db(nativeHandle);
+    }
+
+    /**
+     * Restore a writable DB from an explicit source manifest path.
+     *
+     * <p>The manifest path is treated as restore input, and the returned DB always gets a fresh db
+     * id and starts a new snapshot chain.
+     */
+    public static Db restoreWithManifest(Config config, String manifestPath) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle = restoreWithManifestHandleFromJson(config.toJson(), manifestPath);
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("failed to restore db from manifest path config json");
         }
         return new Db(nativeHandle);
     }
@@ -400,11 +471,16 @@ public final class Db extends NativeObject {
     private static native long openHandleFromJsonWithRange(
             String configJson, int rangeStartInclusive, int rangeEndInclusive);
 
-    private static native long openFromSnapshotHandle(
-            String configPath, long snapshotId, String dbId);
+    private static native long restoreHandle(
+            String configPath, long snapshotId, String dbId, boolean newDbId);
 
-    private static native long openFromSnapshotHandleFromJson(
-            String configJson, long snapshotId, String dbId);
+    private static native long restoreHandleFromJson(
+            String configJson, long snapshotId, String dbId, boolean newDbId);
+
+    private static native long restoreWithManifestHandle(String configPath, String manifestPath);
+
+    private static native long restoreWithManifestHandleFromJson(
+            String configJson, String manifestPath);
 
     private static native long resumeHandle(String configPath, String dbId);
 

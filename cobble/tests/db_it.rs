@@ -1765,6 +1765,93 @@ fn test_db_open_from_snapshot_allows_writes() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_db_open_new_with_snapshot_uses_fresh_db_id_and_starts_new_snapshot_chain() {
+    let root = "/tmp/db_open_new_with_snapshot";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_const(128),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: Size::from_const(0),
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config.clone());
+    db.put(0, b"k1", 0, b"v1").unwrap();
+    let snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    let source_db_id = db.id().to_string();
+    db.close().unwrap();
+
+    let restored = Db::open_new_with_snapshot(config.clone(), snapshot_id, &source_db_id).unwrap();
+    assert_ne!(restored.id(), source_db_id);
+    let value = restored
+        .get(0, b"k1")
+        .unwrap()
+        .expect("restored value present");
+    assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
+
+    let first_new_snapshot_id = restored.snapshot().unwrap();
+    let first_new_manifest = wait_for_manifest_in_db(root, restored.id(), first_new_snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&first_new_manifest).unwrap();
+    assert!(
+        manifest_json.get("base_snapshot_id").is_none(),
+        "first snapshot after open_new_with_snapshot should start a new chain"
+    );
+
+    restored.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_open_new_with_manifest_path_uses_fresh_db_id_and_starts_new_snapshot_chain() {
+    let root = "/tmp/db_open_new_with_manifest_path";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_const(128),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: Size::from_const(0),
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config.clone());
+    db.put(0, b"k1", 0, b"v1").unwrap();
+    let snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    let source_db_id = db.id().to_string();
+    let manifest_path = format!(
+        "{}/{}",
+        root,
+        bucket_snapshot_manifest_path(&source_db_id, snapshot_id)
+    );
+    db.close().unwrap();
+
+    let restored = Db::open_new_with_manifest_path(config.clone(), manifest_path).unwrap();
+    assert_ne!(restored.id(), source_db_id);
+    let value = restored
+        .get(0, b"k1")
+        .unwrap()
+        .expect("restored value present");
+    assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
+
+    let first_new_snapshot_id = restored.snapshot().unwrap();
+    let first_new_manifest = wait_for_manifest_in_db(root, restored.id(), first_new_snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&first_new_manifest).unwrap();
+    assert!(
+        manifest_json.get("base_snapshot_id").is_none(),
+        "first snapshot after open_new_with_manifest_path should start a new chain"
+    );
+
+    restored.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_resume_takes_over_snapshot_lifecycle() {
     let root = "/tmp/db_snapshot_takeover";
     cleanup_test_root(root);

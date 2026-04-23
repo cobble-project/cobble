@@ -1525,6 +1525,14 @@ impl FileManager {
         self.meta_volume.fs().open_read(&path)
     }
 
+    pub(crate) fn open_metadata_file_reader_at_path(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn RandomAccessFile>> {
+        let (volume, relative_path) = self.resolve_volume_path(path)?;
+        volume.fs().open_read(&relative_path)
+    }
+
     /// Registers an existing data file without deleting it on drop.
     pub fn register_data_file_readonly(&self, file_id: FileId, path: &str) -> Result<()> {
         let (volume, relative_path) = self.resolve_volume_path(path)?;

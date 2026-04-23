@@ -7,6 +7,7 @@ use crate::file::{
     VLOG_FILE_PRIORITY, lsm_file_priority_for_level,
 };
 use crate::lsm::{LSMTreeVersion, Level};
+use crate::paths::sibling_snapshot_manifest_path;
 use crate::vlog::VlogVersion;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -263,8 +264,90 @@ pub(crate) fn load_manifest_chain(
     Ok(chain)
 }
 
+/// Load the manifest dependency chain starting from an explicit manifest path.
+pub(crate) fn load_manifest_chain_from_path(
+    file_manager: &Arc<FileManager>,
+    manifest_path: &str,
+) -> Result<Vec<LoadedManifest>> {
+    let mut chain = Vec::new();
+    let mut visited = HashSet::new();
+    let mut raw_payloads = Vec::new();
+    let mut next_path = Some(manifest_path.to_string());
+    while let Some(current_path) = next_path {
+        let bytes = read_manifest_payload_at_path(file_manager, &current_path)?;
+        let payload = decode_manifest(bytes.as_ref())?;
+        let current_id = match &payload {
+            ManifestPayload::Snapshot(manifest) => manifest.id,
+            ManifestPayload::IncrementalSnapshot(manifest) => manifest.id,
+        };
+        if !visited.insert(current_id) {
+            return Err(Error::IoError(format!(
+                "Snapshot manifest dependency cycle detected for {}",
+                current_id
+            )));
+        }
+        next_path = match &payload {
+            ManifestPayload::Snapshot(_) => None,
+            ManifestPayload::IncrementalSnapshot(manifest) => Some(sibling_snapshot_manifest_path(
+                &current_path,
+                manifest.base_snapshot_id,
+            )?),
+        };
+        raw_payloads.push((current_id, payload));
+    }
+    raw_payloads.reverse();
+
+    let mut resolved_by_id: HashMap<u64, ManifestSnapshot> = HashMap::new();
+    for (current_id, payload) in raw_payloads {
+        let (base_snapshot_id, resolved_manifest) = match payload {
+            ManifestPayload::Snapshot(manifest) => (None, manifest),
+            ManifestPayload::IncrementalSnapshot(manifest) => {
+                let mut resolved_base = resolved_by_id
+                    .get(&manifest.base_snapshot_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::IoError(format!(
+                            "Missing base manifest {} for snapshot {}",
+                            manifest.base_snapshot_id, current_id
+                        ))
+                    })?;
+                apply_manifest_tree_level_edits(
+                    &mut resolved_base.tree_levels,
+                    &manifest.tree_level_edits,
+                )?;
+                resolved_base.version = manifest.version;
+                resolved_base.vlog_files = manifest.vlog_files;
+                resolved_base.id = manifest.id;
+                resolved_base.seq_id = manifest.seq_id;
+                resolved_base.latest_schema_id = manifest.latest_schema_id;
+                resolved_base.active_memtable_data = manifest.active_memtable_data;
+                resolved_base.bucket_ranges = manifest.bucket_ranges;
+                resolved_base.lsm_tree_bucket_ranges = manifest.lsm_tree_bucket_ranges;
+                resolved_base.tree_scopes = manifest.tree_scopes;
+                (Some(manifest.base_snapshot_id), resolved_base)
+            }
+        };
+        resolved_by_id.insert(current_id, resolved_manifest.clone());
+        chain.push(LoadedManifest {
+            snapshot_id: current_id,
+            base_snapshot_id,
+            manifest: resolved_manifest,
+        });
+    }
+    Ok(chain)
+}
+
 fn read_manifest_payload(file_manager: &Arc<FileManager>, manifest_name: &str) -> Result<Vec<u8>> {
     let reader = file_manager.open_metadata_file_reader_untracked(manifest_name)?;
+    let bytes = MetadataReader::new(reader).read_all()?;
+    Ok(bytes.to_vec())
+}
+
+fn read_manifest_payload_at_path(
+    file_manager: &Arc<FileManager>,
+    manifest_path: &str,
+) -> Result<Vec<u8>> {
+    let reader = file_manager.open_metadata_file_reader_at_path(manifest_path)?;
     let bytes = MetadataReader::new(reader).read_all()?;
     Ok(bytes.to_vec())
 }
@@ -279,6 +362,18 @@ pub(crate) fn load_manifest_for_snapshot(
         .last()
         .map(|entry| entry.manifest)
         .ok_or_else(|| Error::IoError(format!("Snapshot {} not found", snapshot_id)))
+}
+
+/// Load the resolved manifest from an explicit manifest path.
+pub(crate) fn load_manifest_from_path(
+    file_manager: &Arc<FileManager>,
+    manifest_path: &str,
+) -> Result<ManifestSnapshot> {
+    load_manifest_chain_from_path(file_manager, manifest_path)?
+        .into_iter()
+        .last()
+        .map(|entry| entry.manifest)
+        .ok_or_else(|| Error::IoError(format!("Snapshot manifest not found: {}", manifest_path)))
 }
 
 pub(crate) fn apply_manifest_tree_level_edits(

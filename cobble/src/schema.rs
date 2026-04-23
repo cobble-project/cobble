@@ -5,7 +5,7 @@ use crate::merge_operator::{
     MergeOperator, MergeOperatorResolver, default_merge_operator, default_merge_operator_ref,
     merge_operator_by_id,
 };
-use crate::paths::schema_file_relative_path;
+use crate::paths::{schema_file_path_from_snapshot_manifest_path, schema_file_relative_path};
 use crate::snapshot::ManifestSnapshot;
 use crate::r#type::{Column, Value, ValueType};
 use arc_swap::ArcSwap;
@@ -662,6 +662,32 @@ impl SchemaManager {
         Ok(Self::from_schemas(schemas, 1))
     }
 
+    pub(crate) fn from_snapshot_source_manifests<'a, I>(
+        file_manager: &Arc<FileManager>,
+        source_manifest_path: &str,
+        manifests: I,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = &'a ManifestSnapshot>,
+    {
+        let mut schema_ids = BTreeSet::new();
+        for manifest in manifests {
+            collect_schema_ids_from_manifest(manifest, &mut schema_ids);
+        }
+        let schemas = schema_ids
+            .into_iter()
+            .map(|schema_id| {
+                let schema_path =
+                    schema_file_path_from_snapshot_manifest_path(source_manifest_path, schema_id)?;
+                load_schema_from_path(file_manager, schema_id, &schema_path, resolver.as_ref())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let manager = Self::from_schemas(schemas, 1);
+        manager.set_max_persisted_schema_id(None);
+        Ok(manager)
+    }
+
     fn from_initial_schema(initial: Arc<Schema>) -> Self {
         let next_version = initial.version().saturating_add(1);
         let mut versions = BTreeMap::new();
@@ -800,8 +826,29 @@ impl SchemaManager {
         Ok(())
     }
 
+    pub(crate) fn persist_loaded_schemas(&self, file_manager: &FileManager) -> Result<()> {
+        let schemas_to_persist: Vec<Arc<Schema>> = {
+            let schemas = self.schemas.read().unwrap();
+            schemas.values().cloned().collect()
+        };
+        if schemas_to_persist.is_empty() {
+            return Ok(());
+        }
+        let mut max_schema_id = 0;
+        for schema in schemas_to_persist {
+            max_schema_id = max_schema_id.max(schema.version());
+            persist_schema(file_manager, schema.as_ref())?;
+        }
+        *self.max_persisted_schema_id.write().unwrap() = Some(max_schema_id);
+        Ok(())
+    }
+
     pub(crate) fn max_persisted_schema_id(&self) -> Option<u64> {
         *self.max_persisted_schema_id.read().unwrap()
+    }
+
+    pub(crate) fn set_max_persisted_schema_id(&self, max_schema_id: Option<u64>) {
+        *self.max_persisted_schema_id.write().unwrap() = max_schema_id;
     }
 
     pub(crate) fn update_max_persisted_schema_id_from_live(&self, live_schema_ids: &BTreeSet<u64>) {
@@ -909,6 +956,42 @@ pub(crate) fn load_schema(
 ) -> Result<Schema> {
     let reader =
         file_manager.open_metadata_file_reader_untracked(&schema_file_relative_path(schema_id))?;
+    let payload = MetadataReader::new(reader).read_all()?;
+    let schema_file: SchemaFile = serde_json::from_slice(payload.as_ref())
+        .map_err(|err| Error::FileFormatError(format!("Failed to decode schema file: {}", err)))?;
+    if schema_file.id != schema_id {
+        return Err(Error::InvalidState(format!(
+            "Schema file id mismatch: expected {}, got {}",
+            schema_id, schema_file.id
+        )));
+    }
+    if schema_file.format_version != SCHEMA_FILE_FORMAT_VERSION {
+        return Err(Error::FileFormatError(format!(
+            "Unsupported schema file format version {} (expected {})",
+            schema_file.format_version, SCHEMA_FILE_FORMAT_VERSION
+        )));
+    }
+    let column_families = load_column_families(&schema_file, resolver)?;
+    if column_families.len() > MAX_COLUMN_FAMILY_COUNT {
+        return Err(Error::FileFormatError(format!(
+            "column family count {} exceeds max {}",
+            column_families.len(),
+            MAX_COLUMN_FAMILY_COUNT
+        )));
+    }
+    Ok(Schema::new_with_column_families(
+        schema_file.id,
+        column_families,
+    ))
+}
+
+pub(crate) fn load_schema_from_path(
+    file_manager: &Arc<FileManager>,
+    schema_id: u64,
+    schema_path: &str,
+    resolver: Option<&Arc<dyn MergeOperatorResolver>>,
+) -> Result<Schema> {
+    let reader = file_manager.open_metadata_file_reader_at_path(schema_path)?;
     let payload = MetadataReader::new(reader).read_all()?;
     let schema_file: SchemaFile = serde_json::from_slice(payload.as_ref())
         .map_err(|err| Error::FileFormatError(format!("Failed to decode schema file: {}", err)))?;

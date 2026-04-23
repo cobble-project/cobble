@@ -85,6 +85,8 @@ db.snapshot_with_callback(callback) -> Result<u64>
 ```rust
 Db::open(config, bucket_ranges) -> Result<Db>
 Db::open_from_snapshot(config, snapshot_id, db_id) -> Result<Db>
+Db::open_new_with_snapshot(config, snapshot_id, source_db_id) -> Result<Db>
+Db::open_new_with_manifest_path(config, manifest_path) -> Result<Db>
 ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id) -> Result<ReadOnlyDb>
 db.current_schema() -> Arc<Schema>
 db.update_schema() -> SchemaBuilder
@@ -93,6 +95,11 @@ db.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Byte
 db.snapshot() -> Result<u64>
 db.shard_snapshot_input(snapshot_id) -> Result<ShardSnapshotInput>
 ```
+
+`open_from_snapshot` preserves the source db identity and snapshot directory. `open_new_with_snapshot`
+restores from the source snapshot but assigns a fresh db id and starts a new snapshot chain.
+`open_new_with_manifest_path` does the same thing when your checkpoint metadata already stores the
+exact source manifest path.
 
 #### Reader
 
@@ -150,6 +157,8 @@ Structured values are represented with `StructuredColumnValue` and configured by
 ## cobble-java
 
 The Java API mirrors the Rust API. See [Java Bindings](../ffi-bindings/java) for usage details.
+On the Java side, restore flows are exposed as `Db.restore(..., boolean newDbId)` and
+`Db.restoreWithManifest(...)`.
 
 ### Java Classes
 

@@ -41,19 +41,23 @@ Assume:
   - Shard B owns `342..=683`
   - Shard C owns `684..=1023`
 
-### Step 0: start new shard C (direct `open_from_snapshot`)
+### Step 0: start new shard C (fresh restore from snapshot)
 
-Use the latest global snapshot as a consistent baseline, and start shard C **directly** from shard B's snapshot:
+Use the latest global snapshot as a consistent baseline, and start shard C from shard B's snapshot
+with a **fresh db id**:
 
 ```rust
 // from latest global snapshot manifest
 let shard_b_snapshot_id = /* manifest.shard_snapshots for db_b */ ;
 
-// C is a new shard process, bootstrapped directly from snapshot
-let db_c = Db::open_from_snapshot(config_c, shard_b_snapshot_id, db_b.id())?;
+// C is a new shard process, bootstrapped from snapshot with a fresh db id
+let db_c = Db::open_new_with_snapshot(config_c, shard_b_snapshot_id, db_b.id())?;
 ```
 
 Keep read/write traffic paused while this migration is running.
+
+If your rescale metadata already captures the exact source manifest path, prefer
+`Db::open_new_with_manifest_path(...)`.
 
 ### Phase 1: shrink (all shards first)
 

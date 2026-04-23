@@ -58,6 +58,15 @@ db.put(0, "key".getBytes(), 0, "value".getBytes());
 
 // Create snapshot input for coordinator
 ShardSnapshot input = db.snapshot();
+
+// Restore into the same db identity
+Db restored = Db.restore("config.yaml", input.snapshotId, db.id());
+
+// Restore into a fresh db identity
+Db restoredFresh = Db.restore("config.yaml", input.snapshotId, db.id(), true);
+
+// Restore from an explicit manifest path (always creates a fresh db identity)
+Db restoredFromManifest = Db.restoreWithManifest("xxx/SNAPSHOT-1", input.manifestPath);
 ```
 
 ### Reader

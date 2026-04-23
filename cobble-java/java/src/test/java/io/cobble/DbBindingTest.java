@@ -318,6 +318,17 @@ class DbBindingTest {
                 }
             }
 
+            try (io.cobble.structured.Db restoredNew =
+                    io.cobble.structured.Db.restore(
+                            configPath.toString(), shardSnapshot.snapshotId, dbId, true)) {
+                assertNotEquals(dbId, restoredNew.id());
+                for (int i = 0; i < count; i++) {
+                    assertArrayEquals(
+                            valueBytes("st-snap-v", i),
+                            restoredNew.get(0, keyBytes("st-snap", i)).getBytes(0));
+                }
+            }
+
             // resume
             try (io.cobble.structured.Db resumed =
                     io.cobble.structured.Db.resume(configPath.toString(), dbId)) {
@@ -499,10 +510,30 @@ class DbBindingTest {
             }
             ShardSnapshot shardSnapshot = db.snapshot();
             assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
+            assertNotNull(shardSnapshot.manifestPath);
+            assertFalse(shardSnapshot.manifestPath.isEmpty());
             try (Db restored = Db.restore(configPath.toString(), shardSnapshot.snapshotId, dbId)) {
                 for (int i = 0; i < 180; i++) {
                     assertArrayEquals(
                             valueBytes("restore-v", i), restored.get(0, keyBytes("restore", i), 0));
+                }
+            }
+            try (Db restoredNew =
+                    Db.restore(configPath.toString(), shardSnapshot.snapshotId, dbId, true)) {
+                assertNotEquals(dbId, restoredNew.id());
+                for (int i = 0; i < 180; i++) {
+                    assertArrayEquals(
+                            valueBytes("restore-v", i),
+                            restoredNew.get(0, keyBytes("restore", i), 0));
+                }
+            }
+            try (Db restoredFromManifest =
+                    Db.restoreWithManifest(configPath.toString(), shardSnapshot.manifestPath)) {
+                assertNotEquals(dbId, restoredFromManifest.id());
+                for (int i = 0; i < 180; i++) {
+                    assertArrayEquals(
+                            valueBytes("restore-v", i),
+                            restoredFromManifest.get(0, keyBytes("restore", i), 0));
                 }
             }
             try (Db resumed = Db.resume(configPath.toString(), dbId)) {

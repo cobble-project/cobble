@@ -101,30 +101,73 @@ pub extern "system" fn Java_io_cobble_Db_openHandleFromJsonWithRange(
     open_db_with_range(&mut env, config, range_start, range_end)
 }
 
+fn restore_db(
+    env: &mut JNIEnv,
+    config: Config,
+    snapshot_id: jlong,
+    db_id: JString,
+    new_db_id: jboolean,
+) -> jlong {
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    let db_id = match decode_java_string(env, db_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    let db = if new_db_id == JNI_TRUE {
+        Db::open_new_with_snapshot(config, snapshot_id, db_id)
+    } else {
+        Db::open_from_snapshot(config, snapshot_id, db_id)
+    };
+    match db {
+        Ok(v) => Box::into_raw(Box::new(v)) as jlong,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            0
+        }
+    }
+}
+
+fn restore_db_from_manifest_path(
+    env: &mut JNIEnv,
+    config: Config,
+    manifest_path: JString,
+) -> jlong {
+    let manifest_path = match decode_java_string(env, manifest_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    match Db::open_new_with_manifest_path(config, manifest_path) {
+        Ok(v) => Box::into_raw(Box::new(v)) as jlong,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            0
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_Db_openFromSnapshotHandle(
+pub extern "system" fn Java_io_cobble_Db_restoreHandle(
     mut env: JNIEnv,
     _class: JClass,
     config_path: JString,
     snapshot_id: jlong,
     db_id: JString,
+    new_db_id: jboolean,
 ) -> jlong {
     let path = match decode_java_string(&mut env, config_path) {
         Ok(path) => path,
-        Err(err) => {
-            throw_illegal_argument(&mut env, err);
-            return 0;
-        }
-    };
-    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_argument(&mut env, err);
-            return 0;
-        }
-    };
-    let db_id = match decode_java_string(&mut env, db_id) {
-        Ok(v) => v,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return 0;
@@ -137,23 +180,17 @@ pub extern "system" fn Java_io_cobble_Db_openFromSnapshotHandle(
             return 0;
         }
     };
-    let db = match Db::open_from_snapshot(config, snapshot_id, db_id) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
-            return 0;
-        }
-    };
-    Box::into_raw(Box::new(db)) as jlong
+    restore_db(&mut env, config, snapshot_id, db_id, new_db_id)
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_Db_openFromSnapshotHandleFromJson(
+pub extern "system" fn Java_io_cobble_Db_restoreHandleFromJson(
     mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
     snapshot_id: jlong,
     db_id: JString,
+    new_db_id: jboolean,
 ) -> jlong {
     let json = match decode_java_string(&mut env, config_json) {
         Ok(json) => json,
@@ -162,15 +199,45 @@ pub extern "system" fn Java_io_cobble_Db_openFromSnapshotHandleFromJson(
             return 0;
         }
     };
-    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
-        Ok(v) => v,
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    restore_db(&mut env, config, snapshot_id, db_id, new_db_id)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_restoreWithManifestHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    manifest_path: JString,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return 0;
         }
     };
-    let db_id = match decode_java_string(&mut env, db_id) {
-        Ok(v) => v,
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    restore_db_from_manifest_path(&mut env, config, manifest_path)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_restoreWithManifestHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    manifest_path: JString,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return 0;
@@ -179,14 +246,7 @@ pub extern "system" fn Java_io_cobble_Db_openFromSnapshotHandleFromJson(
     let Some(config) = parse_config_json(&mut env, &json) else {
         return 0;
     };
-    let db = match Db::open_from_snapshot(config, snapshot_id, db_id) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
-            return 0;
-        }
-    };
-    Box::into_raw(Box::new(db)) as jlong
+    restore_db_from_manifest_path(&mut env, config, manifest_path)
 }
 
 #[unsafe(no_mangle)]

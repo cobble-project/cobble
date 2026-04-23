@@ -58,7 +58,8 @@
 //!
 //! Restore sequence for historical recovery:
 //! - restore coordinator view first (load global snapshot / current pointer),
-//! - then restore each shard with `Db::open_from_snapshot(config, shard_snapshot_id, db_id)`,
+//! - then restore each shard with
+//!   `Db::open_new_with_snapshot(config, shard_snapshot_id, source_db_id)`,
 //! - continue read/write on restored shard DBs.
 //!
 //! Remote compaction (optional):
