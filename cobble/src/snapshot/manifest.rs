@@ -3,7 +3,7 @@ use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::LSMTreeScope;
 use crate::error::{Error, Result};
 use crate::file::{
-    BufferedWriter, FileManager, MetadataReader, SequentialWriteFile, TrackedFileId,
+    BufferedWriter, FileManager, MetadataReader, SequentialWriteFile, TrackedFile, TrackedFileId,
     VLOG_FILE_PRIORITY, lsm_file_priority_for_level,
 };
 use crate::lsm::{LSMTreeVersion, Level};
@@ -382,7 +382,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             bucket_ranges: snapshot.bucket_ranges.clone(),
             lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
             tree_scopes: snapshot.tree_scopes.clone(),
-            tree_levels: manifest_tree_levels_from_snapshot(&snapshot.lsm_versions, file_manager),
+            tree_levels: manifest_tree_levels_from_snapshot(snapshot, file_manager),
             vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
             active_memtable_data: snapshot.active_memtable_data.clone(),
         })
@@ -419,10 +419,11 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
 }
 
 fn manifest_tree_levels_from_snapshot(
-    lsm_versions: &[LSMTreeVersion],
+    snapshot: &DbSnapshot,
     file_manager: &FileManager,
 ) -> Vec<Vec<ManifestLevel>> {
-    lsm_versions
+    snapshot
+        .lsm_versions
         .iter()
         .map(|version| {
             version
@@ -434,7 +435,13 @@ fn manifest_tree_levels_from_snapshot(
                     files: level
                         .files
                         .iter()
-                        .map(|file| manifest_file_from_data_file(file, file_manager))
+                        .map(|file| {
+                            manifest_file_from_data_file(
+                                file,
+                                &snapshot.tracked_data_files,
+                                file_manager,
+                            )
+                        })
                         .collect(),
                 })
                 .collect()
@@ -442,7 +449,11 @@ fn manifest_tree_levels_from_snapshot(
         .collect()
 }
 
-fn manifest_file_from_data_file(file: &DataFile, file_manager: &FileManager) -> ManifestFile {
+fn manifest_file_from_data_file(
+    file: &DataFile,
+    tracked_data_files: &BTreeMap<u64, Arc<TrackedFile>>,
+    file_manager: &FileManager,
+) -> ManifestFile {
     let path_file_id = file.snapshot_data_file_id().unwrap_or(file.file_id);
     ManifestFile {
         file_id: file.file_id,
@@ -451,8 +462,10 @@ fn manifest_file_from_data_file(file: &DataFile, file_manager: &FileManager) -> 
         size: file.size,
         start_key: to_hex(&file.start_key),
         end_key: to_hex(&file.end_key),
-        path: file_manager
-            .get_data_file_full_path(path_file_id)
+        path: tracked_data_files
+            .get(&file.file_id)
+            .map(|tracked| tracked.absolute_path())
+            .or_else(|| file_manager.get_data_file_full_path(path_file_id))
             .expect("Unknown file ID"),
         has_separated_values: file.has_separated_values,
         bucket_range_start: *file.bucket_range.start(),
@@ -488,6 +501,7 @@ fn manifest_vlog_files_from_snapshot(
 fn build_incremental_level_edits(
     base_levels: &[Level],
     snapshot_levels: &[Level],
+    tracked_data_files: &BTreeMap<u64, Arc<TrackedFile>>,
     file_manager: &FileManager,
 ) -> Option<Vec<ManifestLevelEdit>> {
     let mut edits = Vec::new();
@@ -515,7 +529,7 @@ fn build_incremental_level_edits(
             .files
             .iter()
             .filter(|file| !base_file_ids.contains(&file.file_id))
-            .map(|file| manifest_file_from_data_file(file, file_manager))
+            .map(|file| manifest_file_from_data_file(file, tracked_data_files, file_manager))
             .collect();
         if !new_files.is_empty() {
             if !level.tiered || level.ordinal != 0 || new_files.len() != 1 || !edits.is_empty() {
@@ -552,8 +566,12 @@ fn build_incremental_tree_level_edits(
     let mut tree_edits = Vec::new();
     for (tree_idx, tree_version) in snapshot.lsm_versions.iter().enumerate() {
         let base_tree = base.lsm_versions.get(tree_idx)?;
-        let level_edits =
-            build_incremental_level_edits(&base_tree.levels, &tree_version.levels, file_manager)?;
+        let level_edits = build_incremental_level_edits(
+            &base_tree.levels,
+            &tree_version.levels,
+            &snapshot.tracked_data_files,
+            file_manager,
+        )?;
         if !level_edits.is_empty() {
             tree_edits.push(ManifestTreeLevelEdit {
                 tree_idx,
