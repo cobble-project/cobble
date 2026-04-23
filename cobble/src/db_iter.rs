@@ -1,6 +1,7 @@
 //! This module defines the `DbIterator` struct, which provides an iterator over key-value pairs in the database.
 use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_state::DbState;
+use crate::db_status::DbAccessGuard;
 use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::iterator::{DeduplicatingIterator, MergingIterator};
@@ -17,6 +18,7 @@ pub(crate) struct DbIteratorOptions<'a> {
     pub(crate) end_bound: Option<(Bytes, bool)>,
     pub(crate) snapshot: Arc<DbState>,
     pub(crate) memtable_manager: Option<&'a MemtableManager>,
+    pub(crate) access_guard: Option<DbAccessGuard<'a>>,
     pub(crate) vlog_store: Arc<VlogStore>,
     pub(crate) ttl_provider: Arc<TTLProvider>,
     /// Effective schema for merge and value resolution.
@@ -31,6 +33,7 @@ pub struct DbIterator<'a> {
     end_bound: Option<(Bytes, bool)>,
     snapshot: Arc<DbState>,
     memtable_manager: Option<&'a MemtableManager>,
+    _access_guard: Option<DbAccessGuard<'a>>,
     vlog_store: Arc<VlogStore>,
     ttl_provider: Arc<TTLProvider>,
     schema: Arc<Schema>,
@@ -61,6 +64,7 @@ impl<'a> DbIterator<'a> {
             end_bound: options.end_bound,
             snapshot: options.snapshot,
             memtable_manager: options.memtable_manager,
+            _access_guard: options.access_guard,
             vlog_store: options.vlog_store,
             ttl_provider: options.ttl_provider,
             schema,
@@ -188,6 +192,7 @@ mod tests {
                 end_bound: None,
                 snapshot,
                 memtable_manager: None,
+                access_guard: None,
                 vlog_store,
                 ttl_provider: Arc::new(TTLProvider::disabled()),
                 schema: projected_schema,

@@ -1,7 +1,8 @@
 use crate::error::{Error, Result};
 use arc_swap::ArcSwapOption;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
+use log::warn;
 
 const STATE_INITIALIZING: u8 = 0;
 const STATE_OPEN: u8 = 1;
@@ -57,27 +58,56 @@ pub(crate) enum CloseTransition {
     AlreadyClosingOrClosed,
 }
 
+pub(crate) struct DbAccessGuard<'a> {
+    lifecycle: &'a DbLifecycle,
+}
+
+impl Drop for DbAccessGuard<'_> {
+    fn drop(&mut self) {
+        self.lifecycle.release_access();
+    }
+}
+
+pub(crate) struct OwnedDbAccessGuard {
+    lifecycle: Arc<DbLifecycle>,
+}
+
+impl Drop for OwnedDbAccessGuard {
+    fn drop(&mut self) {
+        self.lifecycle.release_access();
+    }
+}
+
 pub(crate) struct DbLifecycle {
     state: AtomicU8,
+    active_accesses: AtomicUsize,
     error: ArcSwapOption<Error>,
     /// Condvars to notify when the lifecycle enters an error/closing state.
     error_notifiers: Mutex<Vec<Weak<Condvar>>>,
+    access_wait_mutex: Mutex<()>,
+    access_wait_condvar: Condvar,
 }
 
 impl DbLifecycle {
     pub(crate) fn new_initializing() -> Self {
         Self {
             state: AtomicU8::new(STATE_INITIALIZING),
+            active_accesses: AtomicUsize::new(0),
             error: ArcSwapOption::empty(),
             error_notifiers: Mutex::new(Vec::new()),
+            access_wait_mutex: Mutex::new(()),
+            access_wait_condvar: Condvar::new(),
         }
     }
 
     pub(crate) fn new_open() -> Self {
         Self {
             state: AtomicU8::new(STATE_OPEN),
+            active_accesses: AtomicUsize::new(0),
             error: ArcSwapOption::empty(),
             error_notifiers: Mutex::new(Vec::new()),
+            access_wait_mutex: Mutex::new(()),
+            access_wait_condvar: Condvar::new(),
         }
     }
 
@@ -185,6 +215,64 @@ impl DbLifecycle {
         Err(self.error_or_invalid_state())
     }
 
+    pub(crate) fn begin_access(&self) -> Result<DbAccessGuard<'_>> {
+        self.try_begin_access()?;
+        Ok(DbAccessGuard { lifecycle: self })
+    }
+
+    pub(crate) fn begin_owned_access(self: &Arc<Self>) -> Result<OwnedDbAccessGuard> {
+        self.try_begin_access()?;
+        Ok(OwnedDbAccessGuard {
+            lifecycle: Arc::clone(self),
+        })
+    }
+
+    fn try_begin_access(&self) -> Result<()> {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            if current != STATE_OPEN {
+                return Err(self.error_or_invalid_state());
+            }
+            self.active_accesses.fetch_add(1, Ordering::AcqRel);
+            if self.state.load(Ordering::Acquire) == STATE_OPEN {
+                return Ok(());
+            }
+            self.release_access();
+        }
+    }
+
+    pub(crate) fn wait_for_accesses_to_drain(&self) {
+        if self.active_accesses.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut wait_guard = self.access_wait_mutex.lock().unwrap();
+        let mut waited = 0u64;
+        while self.active_accesses.load(Ordering::Acquire) != 0 {
+            if waited >= 30_000 {
+                warn!("waited at least 30 seconds to quit, possible block of get/put method or leak of schema or iter objects.");
+            }
+            let (next_guard, _) = self
+                .access_wait_condvar
+                .wait_timeout(wait_guard, std::time::Duration::from_millis(100))
+                .unwrap();
+            wait_guard = next_guard;
+            waited += 100;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_access_count(&self) -> usize {
+        self.active_accesses.load(Ordering::Acquire)
+    }
+
+    fn release_access(&self) {
+        if self.active_accesses.fetch_sub(1, Ordering::AcqRel) == 1
+            && self.state.load(Ordering::Acquire) == STATE_CLOSING
+        {
+            self.access_wait_condvar.notify_all();
+        }
+    }
+
     fn error_or_invalid_state(&self) -> Error {
         let state = self.state();
         if state == DbLifecycleState::Error
@@ -199,6 +287,8 @@ impl DbLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn test_lifecycle_basic_transitions() {
@@ -227,5 +317,47 @@ mod tests {
         assert_eq!(lifecycle.state(), DbLifecycleState::Error);
         let err = lifecycle.ensure_open().unwrap_err();
         assert_eq!(err.to_string(), original.to_string());
+    }
+
+    #[test]
+    fn test_close_waits_for_inflight_accesses() {
+        let lifecycle = Arc::new(DbLifecycle::new_open());
+        let access = lifecycle.begin_access().unwrap();
+        assert_eq!(lifecycle.active_access_count(), 1);
+
+        let lifecycle_for_thread = Arc::clone(&lifecycle);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            lifecycle_for_thread.begin_close().unwrap();
+            started_tx.send(()).unwrap();
+            lifecycle_for_thread.wait_for_accesses_to_drain();
+            lifecycle_for_thread.mark_closed();
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        drop(access);
+
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(lifecycle.state(), DbLifecycleState::Closed);
+        assert_eq!(lifecycle.active_access_count(), 0);
+    }
+
+    #[test]
+    fn test_begin_access_rejected_after_close_starts() {
+        let lifecycle = DbLifecycle::new_open();
+        assert_eq!(
+            lifecycle.begin_close().unwrap(),
+            CloseTransition::Transitioned
+        );
+        let err = lifecycle
+            .begin_access()
+            .err()
+            .expect("begin_access should fail once close starts");
+        assert!(err.to_string().contains("db is closing"));
     }
 }

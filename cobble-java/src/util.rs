@@ -96,7 +96,7 @@ pub(crate) fn decode_bucket_ranges(
         .map_err(|err| format!("invalid range end array: {}", err))?;
 
     let mut ranges = Vec::with_capacity(raw_starts.len());
-    for (index, (start, end)) in raw_starts.into_iter().zip(raw_ends.into_iter()).enumerate() {
+    for (index, (start, end)) in raw_starts.into_iter().zip(raw_ends).enumerate() {
         let start = decode_u16(&format!("rangeStarts[{}]", index), start)?;
         let end = decode_u16(&format!("rangeEnds[{}]", index), end)?;
         if start > end {

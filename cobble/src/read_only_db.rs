@@ -377,6 +377,7 @@ impl ReadOnlyDb {
                 end_bound,
                 snapshot,
                 memtable_manager: None,
+                access_guard: None,
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 schema: effective_schema,

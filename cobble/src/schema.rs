@@ -1,3 +1,4 @@
+use crate::db_status::OwnedDbAccessGuard;
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, FileManager, MetadataReader};
 use crate::merge_operator::{
@@ -692,11 +693,26 @@ impl SchemaManager {
     }
 
     pub(crate) fn builder(self: &Arc<Self>) -> SchemaBuilder {
-        self.builder_from(self.latest_schema())
+        self.builder_from_with_access(self.latest_schema(), None)
     }
 
     pub(crate) fn builder_from(self: &Arc<Self>, schema: Arc<Schema>) -> SchemaBuilder {
-        SchemaBuilder::from_schema(Arc::clone(self), schema)
+        self.builder_from_with_access(schema, None)
+    }
+
+    pub(crate) fn builder_with_access(
+        self: &Arc<Self>,
+        access_guard: Option<OwnedDbAccessGuard>,
+    ) -> SchemaBuilder {
+        self.builder_from_with_access(self.latest_schema(), access_guard)
+    }
+
+    pub(crate) fn builder_from_with_access(
+        self: &Arc<Self>,
+        schema: Arc<Schema>,
+        access_guard: Option<OwnedDbAccessGuard>,
+    ) -> SchemaBuilder {
+        SchemaBuilder::from_schema(Arc::clone(self), schema, access_guard)
     }
 
     fn commit_build(
@@ -983,10 +999,15 @@ pub struct SchemaBuilder {
     base_schema: Arc<Schema>,
     column_families: Vec<ColumnFamily>,
     column_family_name_index: HashMap<String, u8>,
+    _access_guard: Option<OwnedDbAccessGuard>,
 }
 
 impl SchemaBuilder {
-    fn from_schema(manager: Arc<SchemaManager>, schema: Arc<Schema>) -> Self {
+    fn from_schema(
+        manager: Arc<SchemaManager>,
+        schema: Arc<Schema>,
+        access_guard: Option<OwnedDbAccessGuard>,
+    ) -> Self {
         let mut column_families = schema.column_families.as_ref().clone();
         for family in &mut column_families {
             family.evolution = BuiltinSchemaEvolution::Noop;
@@ -997,6 +1018,7 @@ impl SchemaBuilder {
             base_schema: Arc::clone(&schema),
             column_families,
             column_family_name_index: schema.column_family_name_index.as_ref().clone(),
+            _access_guard: access_guard,
         }
     }
 

@@ -2,7 +2,7 @@ use crate::block_cache::new_block_cache_with_config;
 use crate::db_builder::DbBuilder;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::{DbStateHandle, LSMTreeScope, bucket_range_fits_total};
-use crate::db_status::{CloseTransition, DbLifecycle};
+use crate::db_status::{CloseTransition, DbAccessGuard, DbLifecycle};
 use crate::error::{Error, Result};
 use crate::file::FileManager;
 use crate::lsm::{LSMTree, LSMTreeVersion};
@@ -187,8 +187,8 @@ pub(crate) fn select_projected_columns<T>(
 
 impl Db {
     #[inline]
-    fn ensure_open(&self) -> Result<()> {
-        self.db_lifecycle.ensure_open()
+    fn begin_access(&self) -> Result<DbAccessGuard<'_>> {
+        self.db_lifecycle.begin_access()
     }
 
     fn should_mark_error_on_read(err: &Error) -> bool {
@@ -292,11 +292,13 @@ impl Db {
 
     /// Start a schema update transaction.
     pub fn update_schema(&self) -> SchemaBuilder {
-        self.schema_manager.builder()
+        self.schema_manager
+            .builder_with_access(self.db_lifecycle.begin_owned_access().ok())
     }
 
     /// Return the current schema snapshot.
     pub fn current_schema(&self) -> Arc<Schema> {
+        let _access = self.begin_access().ok();
         self.schema_manager.latest_schema()
     }
 
@@ -455,7 +457,7 @@ impl Db {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.ensure_open()?;
+        let _access = self.begin_access()?;
         let schema = self.schema_manager.latest_schema();
         self.ensure_multi_lsm_scopes_for_schema_if_dirty(schema.as_ref())?;
         let column_family_id = schema.resolve_column_family_id(options.column_family())?;
@@ -557,7 +559,7 @@ impl Db {
     /// put_ref. The memtable manager handles flush-to-L0 when the memtable
     /// is full, separated value extraction to VLOG, and schema validation.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
-        self.ensure_open()?;
+        let _access = self.begin_access()?;
         let mut pending: std::collections::BTreeMap<(u16, u8, Bytes), Value> =
             std::collections::BTreeMap::new();
         let schema = self.schema_manager.latest_schema();
@@ -645,6 +647,7 @@ impl Db {
                 return Err(err);
             }
         }
+        self.db_lifecycle.wait_for_accesses_to_drain();
         if let Some(err) = self.lifecycle_error() {
             self.force_close();
             return Err(err);
@@ -673,7 +676,7 @@ impl Db {
     /// Flush the active memtable and capture an LSM snapshot with a manifest.
     /// The manifest is materialized asynchronously after the flush completes.
     pub fn snapshot(&self) -> Result<u64> {
-        self.ensure_open()?;
+        let _access = self.begin_access()?;
         let db_snapshot = self.snapshot_manager.create_snapshot(None);
         self.memtable_manager
             .flush_snapshot(db_snapshot.id, self.snapshot_manager.clone())?;
@@ -684,7 +687,7 @@ impl Db {
     where
         F: Fn(Result<crate::coordinator::ShardSnapshotInput>) + Send + Sync + 'static,
     {
-        self.ensure_open()?;
+        let _access = self.begin_access()?;
         let db_id = self.id.clone();
         let timestamp_seconds = self.now_seconds();
         let schema_manager = Arc::clone(&self.schema_manager);
@@ -711,15 +714,15 @@ impl Db {
 
     /// Expire a snapshot and release its file references.
     pub fn expire_snapshot(&self, snapshot_id: u64) -> Result<bool> {
-        self.ensure_open()?;
+        let _access = self.begin_access()?;
         self.snapshot_manager.expire_snapshot(snapshot_id)
     }
 
     /// Retain a snapshot to avoid auto-expiration.
     pub fn retain_snapshot(&self, snapshot_id: u64) -> bool {
-        if self.ensure_open().is_err() {
+        let Ok(_access) = self.begin_access() else {
             return false;
-        }
+        };
         self.snapshot_manager.retain_snapshot(snapshot_id)
     }
 
@@ -728,7 +731,7 @@ impl Db {
         &self,
         snapshot_id: u64,
     ) -> Result<crate::coordinator::ShardSnapshotInput> {
-        self.ensure_open()?;
+        let _access = self.begin_access()?;
         let manifest = load_manifest_for_snapshot(&self.file_manager, snapshot_id)?;
         let column_family_ids = self
             .schema_manager
@@ -981,7 +984,7 @@ impl Db {
         key: &[u8],
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<Bytes>>>> {
-        self.ensure_open()?;
+        let _access = self.begin_access()?;
         let schema = self.schema_manager.latest_schema();
         let column_family_id = schema.resolve_column_family_id(options.column_family())?;
         let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
@@ -1148,7 +1151,7 @@ impl Db {
         range: Range<&[u8]>,
         options: &ScanOptions,
     ) -> Result<DbIterator<'a>> {
-        self.ensure_open()?;
+        let access_guard = self.begin_access()?;
         let snapshot = self.db_state.load();
         let schema = self.schema_manager.latest_schema();
         let column_family_id = schema.resolve_column_family_id(options.column_family())?;
@@ -1203,6 +1206,7 @@ impl Db {
                 end_bound,
                 snapshot,
                 memtable_manager: Some(&self.memtable_manager),
+                access_guard: Some(access_guard),
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 schema: effective_schema,
@@ -1247,7 +1251,8 @@ mod tests {
     };
     use serial_test::serial;
     use size::Size;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
 
     fn cleanup_test_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
@@ -2135,6 +2140,69 @@ mod tests {
         assert_eq!(columns[0].as_ref().unwrap().as_ref(), b"old");
         assert!(iter.next().is_none());
 
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_close_waits_for_scan_iterator_drop() {
+        let root = "/tmp/db_close_waits_for_scan_iterator";
+        cleanup_test_root(root);
+        let config = config_with_small_memtable(root);
+        let db = Arc::new(open_db(config));
+
+        db.put(0, b"k1", 0, b"v1").unwrap();
+        let iter = db.scan(0, b"".as_slice()..b"\xff".as_slice()).unwrap();
+
+        let close_db = Arc::clone(&db);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            close_db.close().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        drop(iter);
+
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.join().unwrap();
+
+        let err = db.get(0, b"k1").unwrap_err();
+        assert!(matches!(err, Error::InvalidState(_)));
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_close_waits_for_schema_builder_drop() {
+        let root = "/tmp/db_close_waits_for_schema_builder";
+        cleanup_test_root(root);
+        let config = config_with_small_memtable(root);
+        let db = Arc::new(open_db(config));
+
+        let schema_builder = db.update_schema();
+
+        let close_db = Arc::clone(&db);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            close_db.close().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        drop(schema_builder);
+
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.join().unwrap();
         cleanup_test_root(root);
     }
 

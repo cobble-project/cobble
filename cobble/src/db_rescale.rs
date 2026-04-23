@@ -36,7 +36,7 @@ impl Db {
         ranges: Option<Vec<RangeInclusive<u16>>>,
     ) -> Result<u64> {
         let source_db_id = source_db_id.into();
-        self.ensure_open()?;
+        let _access = self.begin_access()?;
         if source_db_id == self.id {
             return Err(Error::ConfigError(
                 "cannot expand bucket from the same db".to_string(),
@@ -342,7 +342,7 @@ impl Db {
     /// which will be used as the base for future expand operations on the kicked-out ranges,
     /// and returns the snapshot ID of that snapshot.
     pub fn shrink_bucket(&self, ranges: Vec<RangeInclusive<u16>>) -> Result<u64> {
-        self.ensure_open()?;
+        let _access = self.begin_access()?;
         if ranges.is_empty() {
             return Err(Error::ConfigError(
                 "shrink ranges must not be empty".to_string(),
