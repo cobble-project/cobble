@@ -1584,6 +1584,10 @@ fn test_db_restore_from_readonly_snapshot_volume_migrates_files_and_disables_fir
     );
 
     let first_snapshot_after_restore = restored.snapshot().unwrap();
+    assert!(
+        first_snapshot_after_restore > snapshot_id,
+        "first snapshot after restore must advance beyond restored snapshot id"
+    );
     let restore_manifest = wait_for_manifest_in_db(
         &new_snapshot_root,
         restored.id(),

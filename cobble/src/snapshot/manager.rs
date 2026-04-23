@@ -225,6 +225,11 @@ impl SnapshotManager {
         *self.bucket_ranges.write().unwrap() = bucket_ranges;
     }
 
+    pub(crate) fn advance_next_id(&self, min_next_id: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.next_id = state.next_id.max(min_next_id);
+    }
+
     /// Complete a snapshot: persist manifest and manage lifecycle.
     ///
     /// Snapshot flow: (1) capture current LSM tree versions, VLOG version,

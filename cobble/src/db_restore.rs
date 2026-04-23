@@ -340,7 +340,7 @@ impl Db {
         });
         let db = Self::open_with_state(
             config,
-            file_manager,
+            Arc::clone(&file_manager),
             db_state,
             Arc::clone(&db_lifecycle),
             db_id,
@@ -350,6 +350,10 @@ impl Db {
             metrics_manager,
             schema_manager,
         )?;
+        if let Some(max_snapshot_id) = list_snapshot_manifest_ids(&file_manager)?.into_iter().max() {
+            db.snapshot_manager
+                .advance_next_id(max_snapshot_id.saturating_add(1));
+        }
         db.restore_active_memtable_snapshot_to_l0(&active_memtable_data)?;
         db.memtable_manager.open()?;
         db.db_lifecycle.mark_open()?;
