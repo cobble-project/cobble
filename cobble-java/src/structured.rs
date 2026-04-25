@@ -7,8 +7,10 @@
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{decode_scan_open_args, scan_options_from_handle_or_throw};
 use crate::util::{
+    byte_array_class, complete_future_exceptionally, complete_future_with_string,
     decode_bucket_ranges, decode_java_bytes, decode_java_string, decode_optional_java_string,
-    decode_u16, decode_u64_from_jlong, parse_config_json, throw_illegal_argument,
+    decode_u16, decode_u64_from_jlong, new_object_array, new_structured_scan_batch,
+    object_array_class, object_class, parse_config_json, throw_illegal_argument,
     throw_illegal_state, to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
@@ -20,9 +22,7 @@ use cobble_data_structure::{
 };
 use jni::JNIEnv;
 use jni::JavaVM;
-use jni::objects::{
-    GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString, JValue,
-};
+use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
 use serde_json::json;
 
@@ -1730,9 +1730,9 @@ pub(crate) fn to_java_typed_columns(
     env: &mut JNIEnv,
     columns: Vec<Option<StructuredColumnValue>>,
 ) -> std::result::Result<jobject, String> {
-    let array = env
-        .new_object_array(columns.len() as i32, "java/lang/Object", JObject::null())
-        .map_err(|err| err.to_string())?;
+    let object_class = object_class(env)?;
+    let byte_array_class = byte_array_class(env)?;
+    let array = new_object_array(env, columns.len() as i32, object_class)?;
     for (i, col) in columns.into_iter().enumerate() {
         match col {
             None => {} // null already
@@ -1744,9 +1744,7 @@ pub(crate) fn to_java_typed_columns(
                     .map_err(|err| err.to_string())?;
             }
             Some(StructuredColumnValue::List(elements)) => {
-                let inner = env
-                    .new_object_array(elements.len() as i32, "[B", JObject::null())
-                    .map_err(|err| err.to_string())?;
+                let inner = new_object_array(env, elements.len() as i32, byte_array_class)?;
                 for (j, elem) in elements.into_iter().enumerate() {
                     let elem_arr = env
                         .byte_array_from_slice(&elem)
@@ -1767,9 +1765,10 @@ fn to_java_structured_scan_batch(
     batch: StructuredScanBatch,
 ) -> std::result::Result<jobject, String> {
     // keys: byte[][]
-    let keys_array = env
-        .new_object_array(batch.keys.len() as i32, "[B", JObject::null())
-        .map_err(|err| err.to_string())?;
+    let byte_array_class = byte_array_class(env)?;
+    let object_array_class = object_array_class(env)?;
+    let object_class = object_class(env)?;
+    let keys_array = new_object_array(env, batch.keys.len() as i32, byte_array_class)?;
     for (i, key) in batch.keys.iter().enumerate() {
         let arr = env
             .byte_array_from_slice(key)
@@ -1779,17 +1778,9 @@ fn to_java_structured_scan_batch(
     }
 
     // rawColumns: Object[][] where each row is Object[] with null | byte[] | byte[][]
-    let rows_array = env
-        .new_object_array(
-            batch.rows.len() as i32,
-            "[Ljava/lang/Object;",
-            JObject::null(),
-        )
-        .map_err(|err| err.to_string())?;
+    let rows_array = new_object_array(env, batch.rows.len() as i32, object_array_class)?;
     for (i, row) in batch.rows.into_iter().enumerate() {
-        let col_array = env
-            .new_object_array(row.len() as i32, "java/lang/Object", JObject::null())
-            .map_err(|err| err.to_string())?;
+        let col_array = new_object_array(env, row.len() as i32, object_class)?;
         for (j, col) in row.into_iter().enumerate() {
             match col {
                 None => {} // null already
@@ -1801,9 +1792,7 @@ fn to_java_structured_scan_batch(
                         .map_err(|err| err.to_string())?;
                 }
                 Some(StructuredColumnValue::List(elements)) => {
-                    let inner = env
-                        .new_object_array(elements.len() as i32, "[B", JObject::null())
-                        .map_err(|err| err.to_string())?;
+                    let inner = new_object_array(env, elements.len() as i32, byte_array_class)?;
                     for (k, elem) in elements.into_iter().enumerate() {
                         let elem_arr = env
                             .byte_array_from_slice(&elem)
@@ -1833,18 +1822,7 @@ fn to_java_structured_scan_batch(
     let rows_obj = unsafe { JObject::from_raw(rows_array.into_raw() as jobject) };
     let next_obj = unsafe { JObject::from_raw(next_raw) };
 
-    let result = env
-        .new_object(
-            "io/cobble/structured/ScanBatch",
-            "([[B[[Ljava/lang/Object;[BZ)V",
-            &[
-                JValue::Object(&keys_obj),
-                JValue::Object(&rows_obj),
-                JValue::Object(&next_obj),
-                JValue::Bool(if batch.has_more { 1 } else { 0 }),
-            ],
-        )
-        .map_err(|err| err.to_string())?;
+    let result = new_structured_scan_batch(env, &keys_obj, &rows_obj, &next_obj, batch.has_more)?;
     Ok(result.into_raw())
 }
 
@@ -1887,49 +1865,16 @@ fn complete_snapshot_json_future(vm: &JavaVM, future: &GlobalRef, result: cobble
     };
     match result {
         Ok(json) => {
-            let json_obj = match env.new_string(&json) {
-                Ok(v) => JObject::from(v),
-                Err(_) => {
-                    complete_future_exceptionally(
-                        &mut env,
-                        future.as_obj(),
-                        "failed to allocate json string",
-                    );
-                    return;
-                }
-            };
-            let _ = env.call_method(
-                future.as_obj(),
-                "complete",
-                "(Ljava/lang/Object;)Z",
-                &[JValue::Object(&json_obj)],
-            );
+            let _ = complete_future_with_string(&mut env, future.as_obj(), &json).or_else(|_| {
+                complete_future_exceptionally(
+                    &mut env,
+                    future.as_obj(),
+                    "failed to allocate json string",
+                )
+            });
         }
         Err(err) => {
-            complete_future_exceptionally(&mut env, future.as_obj(), &err.to_string());
+            let _ = complete_future_exceptionally(&mut env, future.as_obj(), &err.to_string());
         }
     }
-}
-
-fn complete_future_exceptionally(env: &mut JNIEnv, future: &JObject, message: &str) {
-    let exception_obj = match env.new_string(message) {
-        Ok(msg) => {
-            let msg_obj = JObject::from(msg);
-            match env.new_object(
-                "java/lang/IllegalStateException",
-                "(Ljava/lang/String;)V",
-                &[JValue::Object(&msg_obj)],
-            ) {
-                Ok(v) => v,
-                Err(_) => return,
-            }
-        }
-        Err(_) => return,
-    };
-    let _ = env.call_method(
-        future,
-        "completeExceptionally",
-        "(Ljava/lang/Throwable;)Z",
-        &[JValue::Object(&exception_obj)],
-    );
 }

@@ -1,9 +1,15 @@
 use bytes::Bytes;
 use cobble::Config;
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString};
+use jni::descriptors::Desc;
+use jni::objects::{
+    GlobalRef, JByteArray, JClass, JIntArray, JMethodID, JObject, JObjectArray, JString,
+    JThrowable, JValue,
+};
+use jni::signature::{Primitive, ReturnType};
 use jni::sys::{jint, jlong, jobject, jstring};
 use std::ops::RangeInclusive;
+use std::sync::OnceLock;
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Utils_versionString(env: JNIEnv, class: JClass) -> jstring {
@@ -111,11 +117,35 @@ pub(crate) fn decode_bucket_ranges(
 }
 
 pub(crate) fn throw_illegal_state(env: &mut JNIEnv, message: String) {
-    let _ = env.throw_new("java/lang/IllegalStateException", message);
+    let class = match illegal_state_exception_class(env) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let ctor = match illegal_state_exception_ctor(env) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let exception = match new_exception(env, class, ctor, message) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let _ = env.throw(JThrowable::from(exception));
 }
 
 pub(crate) fn throw_illegal_argument(env: &mut JNIEnv, message: String) {
-    let _ = env.throw_new("java/lang/IllegalArgumentException", message);
+    let class = match illegal_argument_exception_class(env) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let ctor = match illegal_argument_exception_ctor(env) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let exception = match new_exception(env, class, ctor, message) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let _ = env.throw(JThrowable::from(exception));
 }
 
 pub(crate) fn parse_config_json(env: &mut JNIEnv, json: &str) -> Option<Config> {
@@ -142,9 +172,8 @@ pub(crate) fn to_java_optional_bytes_2d(
     env: &mut JNIEnv,
     columns: &[Option<Bytes>],
 ) -> Result<jobject, String> {
-    let array = env
-        .new_object_array(columns.len() as i32, "[B", JObject::null())
-        .map_err(|err| err.to_string())?;
+    let byte_array_class = byte_array_class(env)?;
+    let array = new_object_array(env, columns.len() as i32, byte_array_class)?;
     for (index, column) in columns.iter().enumerate() {
         let Some(bytes) = column.as_ref() else {
             continue;
@@ -156,4 +185,245 @@ pub(crate) fn to_java_optional_bytes_2d(
             .map_err(|err| err.to_string())?;
     }
     Ok(array.into_raw() as jobject)
+}
+
+pub(crate) fn new_object_array<'local>(
+    env: &mut JNIEnv<'local>,
+    length: i32,
+    element_class: &GlobalRef,
+) -> Result<JObjectArray<'local>, String> {
+    env.new_object_array(length, element_class, JObject::null())
+        .map_err(|err| err.to_string())
+}
+
+pub(crate) fn complete_future_with_string(
+    env: &mut JNIEnv,
+    future: &JObject,
+    value: &str,
+) -> Result<(), String> {
+    let value = env.new_string(value).map_err(|err| err.to_string())?;
+    let value_obj = JObject::from(value);
+    let args = [JValue::Object(&value_obj).as_jni()];
+    let method = completable_future_complete_method(env)?;
+    unsafe {
+        env.call_method_unchecked(
+            future,
+            method,
+            ReturnType::Primitive(Primitive::Boolean),
+            &args,
+        )
+    }
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
+pub(crate) fn complete_future_exceptionally(
+    env: &mut JNIEnv,
+    future: &JObject,
+    message: &str,
+) -> Result<(), String> {
+    let class = illegal_state_exception_class(env)?;
+    let ctor = illegal_state_exception_ctor(env)?;
+    let exception = new_exception(env, class, ctor, message.to_string())?;
+    let throwable = JThrowable::from(exception);
+    let args = [JValue::Object(&throwable).as_jni()];
+    let method = completable_future_complete_exceptionally_method(env)?;
+    unsafe {
+        env.call_method_unchecked(
+            future,
+            method,
+            ReturnType::Primitive(Primitive::Boolean),
+            &args,
+        )
+    }
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
+pub(crate) fn new_scan_batch<'local>(
+    env: &mut JNIEnv<'local>,
+    keys_obj: &JObject<'local>,
+    values_obj: &JObject<'local>,
+    next_obj: &JObject<'local>,
+    has_more: bool,
+) -> Result<JObject<'local>, String> {
+    let args = [
+        JValue::Object(keys_obj).as_jni(),
+        JValue::Object(values_obj).as_jni(),
+        JValue::Object(next_obj).as_jni(),
+        JValue::Bool(if has_more { 1 } else { 0 }).as_jni(),
+    ];
+    let class = scan_batch_class(env)?;
+    let ctor = scan_batch_ctor(env)?;
+    unsafe { env.new_object_unchecked(class, ctor, &args) }.map_err(|err| err.to_string())
+}
+
+pub(crate) fn new_structured_scan_batch<'local>(
+    env: &mut JNIEnv<'local>,
+    keys_obj: &JObject<'local>,
+    rows_obj: &JObject<'local>,
+    next_obj: &JObject<'local>,
+    has_more: bool,
+) -> Result<JObject<'local>, String> {
+    let args = [
+        JValue::Object(keys_obj).as_jni(),
+        JValue::Object(rows_obj).as_jni(),
+        JValue::Object(next_obj).as_jni(),
+        JValue::Bool(if has_more { 1 } else { 0 }).as_jni(),
+    ];
+    let class = structured_scan_batch_class(env)?;
+    let ctor = structured_scan_batch_ctor(env)?;
+    unsafe { env.new_object_unchecked(class, ctor, &args) }.map_err(|err| err.to_string())
+}
+
+pub(crate) fn object_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
+    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
+    cached_class(env, &CLASS, "java/lang/Object")
+}
+
+pub(crate) fn object_array_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
+    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
+    cached_class(env, &CLASS, "[Ljava/lang/Object;")
+}
+
+pub(crate) fn byte_array_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
+    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
+    cached_class(env, &CLASS, "[B")
+}
+
+pub(crate) fn byte_array_2d_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
+    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
+    cached_class(env, &CLASS, "[[B")
+}
+
+fn illegal_state_exception_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
+    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
+    cached_class(env, &CLASS, "java/lang/IllegalStateException")
+}
+
+fn illegal_argument_exception_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
+    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
+    cached_class(env, &CLASS, "java/lang/IllegalArgumentException")
+}
+
+fn scan_batch_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
+    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
+    cached_class(env, &CLASS, "io/cobble/ScanBatch")
+}
+
+fn structured_scan_batch_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
+    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
+    cached_class(env, &CLASS, "io/cobble/structured/ScanBatch")
+}
+
+fn completable_future_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
+    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
+    cached_class(env, &CLASS, "java/util/concurrent/CompletableFuture")
+}
+
+fn illegal_state_exception_ctor(env: &mut JNIEnv) -> Result<JMethodID, String> {
+    static METHOD: OnceLock<JMethodID> = OnceLock::new();
+    let class = illegal_state_exception_class(env)?;
+    cached_constructor_id(env, &METHOD, class, "(Ljava/lang/String;)V")
+}
+
+fn illegal_argument_exception_ctor(env: &mut JNIEnv) -> Result<JMethodID, String> {
+    static METHOD: OnceLock<JMethodID> = OnceLock::new();
+    let class = illegal_argument_exception_class(env)?;
+    cached_constructor_id(env, &METHOD, class, "(Ljava/lang/String;)V")
+}
+
+fn scan_batch_ctor(env: &mut JNIEnv) -> Result<JMethodID, String> {
+    static METHOD: OnceLock<JMethodID> = OnceLock::new();
+    let class = scan_batch_class(env)?;
+    cached_constructor_id(env, &METHOD, class, "([[B[[[B[BZ)V")
+}
+
+fn structured_scan_batch_ctor(env: &mut JNIEnv) -> Result<JMethodID, String> {
+    static METHOD: OnceLock<JMethodID> = OnceLock::new();
+    let class = structured_scan_batch_class(env)?;
+    cached_constructor_id(env, &METHOD, class, "([[B[[Ljava/lang/Object;[BZ)V")
+}
+
+fn completable_future_complete_method(env: &mut JNIEnv) -> Result<JMethodID, String> {
+    static METHOD: OnceLock<JMethodID> = OnceLock::new();
+    let class = completable_future_class(env)?;
+    cached_instance_method_id(env, &METHOD, class, "complete", "(Ljava/lang/Object;)Z")
+}
+
+fn completable_future_complete_exceptionally_method(env: &mut JNIEnv) -> Result<JMethodID, String> {
+    static METHOD: OnceLock<JMethodID> = OnceLock::new();
+    let class = completable_future_class(env)?;
+    cached_instance_method_id(
+        env,
+        &METHOD,
+        class,
+        "completeExceptionally",
+        "(Ljava/lang/Throwable;)Z",
+    )
+}
+
+fn cached_class(
+    env: &mut JNIEnv,
+    cache: &'static OnceLock<GlobalRef>,
+    class_name: &str,
+) -> Result<&'static GlobalRef, String> {
+    if let Some(class) = cache.get() {
+        return Ok(class);
+    }
+    let local = env.find_class(class_name).map_err(|err| err.to_string())?;
+    let global = env.new_global_ref(local).map_err(|err| err.to_string())?;
+    let _ = cache.set(global);
+    cache
+        .get()
+        .ok_or_else(|| format!("failed to cache class {}", class_name))
+}
+
+fn cached_constructor_id(
+    env: &mut JNIEnv,
+    cache: &'static OnceLock<JMethodID>,
+    class: &GlobalRef,
+    signature: &str,
+) -> Result<JMethodID, String> {
+    if let Some(method) = cache.get() {
+        return Ok(*method);
+    }
+    let method =
+        Desc::<JMethodID>::lookup((class, signature), env).map_err(|err| err.to_string())?;
+    let _ = cache.set(method);
+    cache
+        .get()
+        .copied()
+        .ok_or_else(|| format!("failed to cache constructor {}", signature))
+}
+
+fn cached_instance_method_id(
+    env: &mut JNIEnv,
+    cache: &'static OnceLock<JMethodID>,
+    class: &GlobalRef,
+    name: &str,
+    signature: &str,
+) -> Result<JMethodID, String> {
+    if let Some(method) = cache.get() {
+        return Ok(*method);
+    }
+    let method =
+        Desc::<JMethodID>::lookup((class, name, signature), env).map_err(|err| err.to_string())?;
+    let _ = cache.set(method);
+    cache
+        .get()
+        .copied()
+        .ok_or_else(|| format!("failed to cache method {}{}", name, signature))
+}
+
+fn new_exception<'local>(
+    env: &mut JNIEnv<'local>,
+    class: &GlobalRef,
+    ctor: JMethodID,
+    message: String,
+) -> Result<JObject<'local>, String> {
+    let message = env.new_string(message).map_err(|err| err.to_string())?;
+    let message_obj = JObject::from(message);
+    let args = [JValue::Object(&message_obj).as_jni()];
+    unsafe { env.new_object_unchecked(class, ctor, &args) }.map_err(|err| err.to_string())
 }

@@ -11,8 +11,9 @@ use crate::structured::{
     decode_write_list_args, to_java_typed_columns,
 };
 use crate::util::{
-    decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong, parse_config_json,
-    throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
+    complete_future_exceptionally, complete_future_with_string, decode_java_string, decode_u16,
+    decode_u32, decode_u64_from_jlong, parse_config_json, throw_illegal_argument,
+    throw_illegal_state, to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use bytes::Bytes;
@@ -20,7 +21,7 @@ use cobble::Config;
 use cobble_data_structure::{StructuredColumnValue, StructuredSingleDb};
 use jni::JNIEnv;
 use jni::JavaVM;
-use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JObjectArray, JString, JValue};
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JObjectArray, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
 
 // ── open ────────────────────────────────────────────────────────────────────
@@ -748,49 +749,16 @@ fn complete_snapshot_json_future(vm: &JavaVM, future: &GlobalRef, result: cobble
     };
     match result {
         Ok(json) => {
-            let json_obj = match env.new_string(&json) {
-                Ok(v) => JObject::from(v),
-                Err(_) => {
-                    complete_future_exceptionally(
-                        &mut env,
-                        future.as_obj(),
-                        "failed to allocate json string",
-                    );
-                    return;
-                }
-            };
-            let _ = env.call_method(
-                future.as_obj(),
-                "complete",
-                "(Ljava/lang/Object;)Z",
-                &[JValue::Object(&json_obj)],
-            );
+            let _ = complete_future_with_string(&mut env, future.as_obj(), &json).or_else(|_| {
+                complete_future_exceptionally(
+                    &mut env,
+                    future.as_obj(),
+                    "failed to allocate json string",
+                )
+            });
         }
         Err(err) => {
-            complete_future_exceptionally(&mut env, future.as_obj(), &err.to_string());
+            let _ = complete_future_exceptionally(&mut env, future.as_obj(), &err.to_string());
         }
     }
-}
-
-fn complete_future_exceptionally(env: &mut JNIEnv, future: &JObject, message: &str) {
-    let exception_obj = match env.new_string(message) {
-        Ok(msg) => {
-            let msg_obj = JObject::from(msg);
-            match env.new_object(
-                "java/lang/IllegalStateException",
-                "(Ljava/lang/String;)V",
-                &[JValue::Object(&msg_obj)],
-            ) {
-                Ok(v) => v,
-                Err(_) => return,
-            }
-        }
-        Err(_) => return,
-    };
-    let _ = env.call_method(
-        future,
-        "completeExceptionally",
-        "(Ljava/lang/Throwable;)Z",
-        &[JValue::Object(&exception_obj)],
-    );
 }

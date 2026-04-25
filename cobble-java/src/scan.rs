@@ -1,11 +1,12 @@
 use crate::util::{
-    decode_column_index, decode_java_bytes, decode_java_string, decode_u16, parse_config_json,
+    byte_array_2d_class, byte_array_class, decode_column_index, decode_java_bytes,
+    decode_java_string, decode_u16, new_object_array, new_scan_batch, parse_config_json,
     throw_illegal_argument, throw_illegal_state,
 };
 use bytes::Bytes;
 use cobble::{Config, DbIterator, Result, ScanOptions, ScanSplit, ScanSplitScanner};
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString, JValue};
+use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString};
 use jni::sys::{jint, jlong, jobject};
 use size::Size;
 use std::sync::OnceLock;
@@ -563,18 +564,7 @@ fn to_java_scan_batch(env: &mut JNIEnv, batch: ScanBatch) -> std::result::Result
     let keys_obj = unsafe { JObject::from_raw(keys_raw) };
     let values_obj = unsafe { JObject::from_raw(values_raw) };
     let next_obj = unsafe { JObject::from_raw(next_raw) };
-    let result = env
-        .new_object(
-            "io/cobble/ScanBatch",
-            "([[B[[[B[BZ)V",
-            &[
-                JValue::Object(&keys_obj),
-                JValue::Object(&values_obj),
-                JValue::Object(&next_obj),
-                JValue::Bool(if batch.has_more { 1 } else { 0 }),
-            ],
-        )
-        .map_err(|err| err.to_string())?;
+    let result = new_scan_batch(env, &keys_obj, &values_obj, &next_obj, batch.has_more)?;
     Ok(result.into_raw())
 }
 
@@ -587,9 +577,8 @@ fn to_java_bytes_array(
     env: &mut JNIEnv,
     items: Vec<Vec<u8>>,
 ) -> std::result::Result<jobject, String> {
-    let array = env
-        .new_object_array(items.len() as i32, "[B", JObject::null())
-        .map_err(|err| err.to_string())?;
+    let byte_array_class = byte_array_class(env)?;
+    let array = new_object_array(env, items.len() as i32, byte_array_class)?;
     for (index, value) in items.into_iter().enumerate() {
         let row = env
             .byte_array_from_slice(&value)
@@ -604,13 +593,11 @@ fn to_java_3d_bytes_array(
     env: &mut JNIEnv,
     items: Vec<ScanValues>,
 ) -> std::result::Result<jobject, String> {
-    let array = env
-        .new_object_array(items.len() as i32, "[[B", JObject::null())
-        .map_err(|err| err.to_string())?;
+    let byte_array_2d_class = byte_array_2d_class(env)?;
+    let byte_array_class = byte_array_class(env)?;
+    let array = new_object_array(env, items.len() as i32, byte_array_2d_class)?;
     for (index, columns) in items.into_iter().enumerate() {
-        let column_array = env
-            .new_object_array(columns.len() as i32, "[B", JObject::null())
-            .map_err(|err| err.to_string())?;
+        let column_array = new_object_array(env, columns.len() as i32, byte_array_class)?;
         for (column_index, bytes) in columns.into_iter().enumerate() {
             if let Some(bytes) = bytes {
                 let column_bytes = env
