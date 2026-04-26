@@ -6,6 +6,8 @@ import io.cobble.structured.Row;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.nio.Buffer;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -1104,6 +1106,80 @@ class DbBindingTest {
         }
     }
 
+    @Test
+    void dbDirectBufferApisReturnExpectedBuffers() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-direct-raw-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        byte[] key = "direct-key".getBytes(StandardCharsets.UTF_8);
+        byte[] smallValue = "small-direct-value".getBytes(StandardCharsets.UTF_8);
+        byte[] largeValue = largeValueBytes("large-direct-value", 1, 4096);
+
+        try (Db db = Db.open(config)) {
+            db.put(0, key, 0, smallValue);
+            db.put(0, key, 1, largeValue);
+
+            ByteBuffer ioBuffer = ByteBuffer.allocateDirect(2048);
+            ((Buffer) ioBuffer).clear();
+            ioBuffer.put(key);
+            try (ReadOptions options = ReadOptions.forColumns(0)) {
+                ByteBuffer encoded =
+                        db.getEncodedDirectWithOptions(0, ioBuffer, key.length, options);
+                assertNotNull(encoded);
+                assertTrue(encoded.isDirect());
+                assertTrue(encoded.limit() > 0);
+            }
+
+            ByteBuffer smallIoBuffer = ByteBuffer.allocateDirect(64);
+            ((Buffer) smallIoBuffer).clear();
+            smallIoBuffer.put(key);
+            try (ReadOptions options = ReadOptions.forColumns(0, 1)) {
+                ByteBuffer encoded =
+                        db.getEncodedDirectWithOptions(0, smallIoBuffer, key.length, options);
+                assertNotNull(encoded);
+                assertNotSame(smallIoBuffer, encoded);
+                assertTrue(encoded.isDirect());
+                assertTrue(encoded.limit() > smallIoBuffer.capacity());
+            }
+
+            try (ReadOptions options = ReadOptions.forColumns(0, 1)) {
+                ByteBuffer[] columns = db.getDirectWithOptions(0, key, options);
+                assertNotNull(columns);
+                assertEquals(2, columns.length);
+                assertNotNull(columns[0]);
+                assertNotNull(columns[1]);
+                assertArrayEquals(smallValue, readDirectBytes(columns[0]));
+                assertArrayEquals(largeValue, readDirectBytes(columns[1]));
+            }
+
+            ByteBuffer keyBuffer = ByteBuffer.allocateDirect(key.length);
+            ((Buffer) keyBuffer).clear();
+            keyBuffer.put(key);
+            ((Buffer) keyBuffer).flip();
+            try (ReadOptions options = ReadOptions.forColumns(0, 1)) {
+                ByteBuffer[] columns = db.getDirectWithOptions(0, keyBuffer, options);
+                assertNotNull(columns);
+                assertEquals(2, columns.length);
+                assertArrayEquals(smallValue, readDirectBytes(columns[0]));
+                assertArrayEquals(largeValue, readDirectBytes(columns[1]));
+            }
+
+            ByteBuffer paddedKeyBuffer = ByteBuffer.allocateDirect(key.length + 32);
+            ((Buffer) paddedKeyBuffer).clear();
+            paddedKeyBuffer.put(key);
+            paddedKeyBuffer.put((byte) 'x');
+            ((Buffer) paddedKeyBuffer).position(paddedKeyBuffer.capacity());
+            try (ReadOptions options = ReadOptions.forColumns(0, 1)) {
+                ByteBuffer[] columns =
+                        db.getDirectWithOptions(0, paddedKeyBuffer, key.length, options);
+                assertNotNull(columns);
+                assertEquals(2, columns.length);
+                assertArrayEquals(smallValue, readDirectBytes(columns[0]));
+                assertArrayEquals(largeValue, readDirectBytes(columns[1]));
+            }
+        }
+    }
+
     private static ShardSnapshot awaitSnapshot(CompletableFuture<ShardSnapshot> future) {
         try {
             return future.get();
@@ -1161,6 +1237,13 @@ class DbBindingTest {
             value[pos] = fill;
         }
         return value;
+    }
+
+    private static byte[] readDirectBytes(ByteBuffer buffer) {
+        ByteBuffer copy = buffer.duplicate();
+        byte[] bytes = new byte[copy.remaining()];
+        copy.get(bytes);
+        return bytes;
     }
 
     @Test

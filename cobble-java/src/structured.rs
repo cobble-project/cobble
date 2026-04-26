@@ -8,10 +8,11 @@ use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{decode_scan_open_args, scan_options_from_handle_or_throw};
 use crate::util::{
     byte_array_class, complete_future_exceptionally, complete_future_with_string,
-    decode_bucket_ranges, decode_java_bytes, decode_java_string, decode_optional_java_string,
-    decode_u16, decode_u64_from_jlong, new_object_array, new_structured_scan_batch,
-    object_array_class, object_class, parse_config_json, throw_illegal_argument,
-    throw_illegal_state, to_java_string_or_throw,
+    decode_bucket_ranges, decode_java_bytes, decode_java_bytes_ref, decode_java_string,
+    decode_optional_java_string, decode_u16, decode_u64_from_jlong, new_object_array,
+    new_structured_scan_batch, object_array_class, object_class, parse_config_json,
+    take_last_overflow_direct_buffer, throw_illegal_argument, throw_illegal_state,
+    to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use bytes::Bytes;
@@ -23,7 +24,7 @@ use cobble_data_structure::{
 use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jintArray, jlong, jobject, jstring};
 use serde_json::json;
 
 pub(crate) enum StructuredSchemaBuilderHandle {
@@ -124,6 +125,64 @@ pub extern "system" fn Java_io_cobble_structured_Db_openHandleFromJsonWithRange(
         return 0;
     };
     open_structured_db_with_range(&mut env, config, range_start, range_end)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_directBufferPoolConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jintArray {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let (buffer_size_bytes, pool_size) = match db.jni_direct_buffer_pool_config() {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    direct_buffer_pool_config_array(&mut env, buffer_size_bytes, pool_size)
+}
+
+fn direct_buffer_pool_config_array(
+    env: &mut JNIEnv,
+    buffer_size_bytes: usize,
+    pool_size: usize,
+) -> jintArray {
+    let buffer_size_jint: jint = match jint::try_from(buffer_size_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_state(
+                env,
+                format!("jni_direct_buffer_size too large: {buffer_size_bytes}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+    let pool_size_jint: jint = match jint::try_from(pool_size) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_state(
+                env,
+                format!("jni_direct_buffer_pool_size too large: {pool_size}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+    let arr = match env.new_int_array(2) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    if let Err(err) = env.set_int_array_region(&arr, 0, &[buffer_size_jint, pool_size_jint]) {
+        throw_illegal_state(env, err.to_string());
+        return std::ptr::null_mut();
+    }
+    arr.into_raw()
 }
 
 #[unsafe(no_mangle)]
@@ -563,6 +622,119 @@ pub extern "system" fn Java_io_cobble_structured_Db_putBytesWithOptions(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_putBytesDirectWithOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key_address: jlong,
+    key_capacity: jint,
+    key_length: jint,
+    column: jint,
+    value_address: jlong,
+    value_capacity: jint,
+    value_length: jint,
+    write_options_handle: jlong,
+) {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key_length = match usize::try_from(key_length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "keyLength must be >= 0".to_string());
+            return;
+        }
+    };
+    let key_capacity = match usize::try_from(key_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "keyCapacity must be >= 0".to_string());
+            return;
+        }
+    };
+    let value_length = match usize::try_from(value_length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "valueLength must be >= 0".to_string());
+            return;
+        }
+    };
+    let value_capacity = match usize::try_from(value_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "valueCapacity must be >= 0".to_string());
+            return;
+        }
+    };
+    let Some(wo) = write_options_from_handle_or_throw(&mut env, write_options_handle) else {
+        return;
+    };
+
+    let key_addr = match usize::try_from(key_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "keyAddress must be > 0".to_string());
+            return;
+        }
+    };
+    if key_length > key_capacity {
+        throw_illegal_argument(
+            &mut env,
+            format!(
+                "keyLength {} exceeds keyBuffer capacity {}",
+                key_length, key_capacity
+            ),
+        );
+        return;
+    }
+
+    let value_addr = match usize::try_from(value_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "valueAddress must be > 0".to_string());
+            return;
+        }
+    };
+    if value_length > value_capacity {
+        throw_illegal_argument(
+            &mut env,
+            format!(
+                "valueLength {} exceeds valueBuffer capacity {}",
+                value_length, value_capacity
+            ),
+        );
+        return;
+    }
+
+    let key = unsafe { std::slice::from_raw_parts(key_addr as *const u8, key_length) };
+    let value = unsafe { std::slice::from_raw_parts(value_addr as *const u8, value_length) };
+    if let Err(err) = db.put_with_options(
+        bucket,
+        key,
+        column,
+        StructuredColumnValue::Bytes(Bytes::copy_from_slice(value)),
+        wo.write_options(),
+    ) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_structured_Db_mergeBytes(
     mut env: JNIEnv,
     _class: JClass,
@@ -784,12 +956,12 @@ pub extern "system" fn Java_io_cobble_structured_Db_deleteWithOptions(
 // ── typed get ───────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_structured_Db_getTyped(
-    mut env: JNIEnv,
+pub extern "system" fn Java_io_cobble_structured_Db_getTyped<'local>(
+    mut env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
     bucket: jint,
-    key: JByteArray,
+    key: JByteArray<'local>,
 ) -> jobject {
     let Some(db) = db_from_handle(&mut env, handle) else {
         return std::ptr::null_mut();
@@ -801,14 +973,14 @@ pub extern "system" fn Java_io_cobble_structured_Db_getTyped(
             return std::ptr::null_mut();
         }
     };
-    let key = match decode_java_bytes(&mut env, key) {
+    let key_bytes = match decode_java_bytes_ref(&mut env, &key) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return std::ptr::null_mut();
         }
     };
-    let values = match db.get(bucket, &key) {
+    let values = match db.get(bucket, &key_bytes) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -828,12 +1000,12 @@ pub extern "system" fn Java_io_cobble_structured_Db_getTyped(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_structured_Db_getTypedWithOptions(
-    mut env: JNIEnv,
+pub extern "system" fn Java_io_cobble_structured_Db_getTypedWithOptions<'local>(
+    mut env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
     bucket: jint,
-    key: JByteArray,
+    key: JByteArray<'local>,
     read_options_handle: jlong,
 ) -> jobject {
     let Some(db) = db_from_handle(&mut env, handle) else {
@@ -846,17 +1018,17 @@ pub extern "system" fn Java_io_cobble_structured_Db_getTypedWithOptions(
             return std::ptr::null_mut();
         }
     };
-    let key = match decode_java_bytes(&mut env, key) {
+    let Some(ro) = read_options_from_handle_or_throw(&mut env, read_options_handle) else {
+        return std::ptr::null_mut();
+    };
+    let key_bytes = match decode_java_bytes_ref(&mut env, &key) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return std::ptr::null_mut();
         }
     };
-    let Some(ro) = read_options_from_handle_or_throw(&mut env, read_options_handle) else {
-        return std::ptr::null_mut();
-    };
-    let values = match db.get_with_options(bucket, &key, ro.read_options()) {
+    let values = match db.get_with_options(bucket, &key_bytes, ro.read_options()) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -873,6 +1045,217 @@ pub extern "system" fn Java_io_cobble_structured_Db_getTypedWithOptions(
             std::ptr::null_mut()
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_getEncodedDirectWithOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    io_address: jlong,
+    io_capacity: jint,
+    key_length: jint,
+    read_options_handle: jlong,
+) -> jint {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let key_length = match usize::try_from(key_length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "keyLength must be >= 0".to_string());
+            return 0;
+        }
+    };
+    let io_capacity = match usize::try_from(io_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "ioCapacity must be >= 0".to_string());
+            return 0;
+        }
+    };
+    let Some(ro) = read_options_from_handle_or_throw(&mut env, read_options_handle) else {
+        return 0;
+    };
+    let direct_addr = match usize::try_from(io_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "ioAddress must be > 0".to_string());
+            return 0;
+        }
+    };
+    if key_length > io_capacity {
+        throw_illegal_argument(
+            &mut env,
+            format!(
+                "keyLength {} exceeds direct buffer capacity {}",
+                key_length, io_capacity
+            ),
+        );
+        return 0;
+    }
+
+    let key = unsafe { std::slice::from_raw_parts(direct_addr as *const u8, key_length) };
+    let values = match db.get_with_options(bucket, key, ro.read_options()) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    encode_structured_columns_to_direct_buffer(&mut env, values, direct_addr, io_capacity)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_getLastDirectOverflowBuffer(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jobject {
+    match take_last_overflow_direct_buffer(&mut env) {
+        Ok(obj) => obj,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn encode_structured_columns_to_direct_buffer<'local>(
+    env: &mut JNIEnv<'local>,
+    values: Option<Vec<Option<StructuredColumnValue>>>,
+    direct_addr: *mut u8,
+    direct_capacity: usize,
+) -> jint {
+    let Some(columns) = values else {
+        return 0;
+    };
+    let encoded_size = match encoded_row_size(&columns) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(env, err);
+            return 0;
+        }
+    };
+    let mut encoded = vec![0u8; encoded_size];
+    let out = encoded.as_mut_slice();
+    if let Err(err) = encode_row_payload(&columns, out) {
+        throw_illegal_state(env, err);
+        return 0;
+    }
+    match write_payload_to_io_or_cached_overflow(env, direct_addr, direct_capacity, out) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(env, err);
+            0
+        }
+    }
+}
+
+fn encoded_row_size(columns: &[Option<StructuredColumnValue>]) -> Result<usize, String> {
+    let mut total = 4usize;
+    for column in columns {
+        total = total
+            .checked_add(1)
+            .ok_or_else(|| "encoded row size overflow".to_string())?;
+        match column {
+            None => {}
+            Some(StructuredColumnValue::Bytes(bytes)) => {
+                total = total
+                    .checked_add(4)
+                    .and_then(|v| v.checked_add(bytes.len()))
+                    .ok_or_else(|| "encoded bytes column size overflow".to_string())?;
+            }
+            Some(StructuredColumnValue::List(list)) => {
+                total = total
+                    .checked_add(4)
+                    .ok_or_else(|| "encoded list size overflow".to_string())?;
+                for element in list {
+                    total = total
+                        .checked_add(4)
+                        .and_then(|v| v.checked_add(element.len()))
+                        .ok_or_else(|| "encoded list element size overflow".to_string())?;
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn encode_row_payload(
+    columns: &[Option<StructuredColumnValue>],
+    out: &mut [u8],
+) -> Result<(), String> {
+    if out.len() < 4 {
+        return Err("output buffer too small for row header".to_string());
+    }
+    let mut offset = 0usize;
+    offset = write_i32_be(out, offset, columns.len())?;
+    for column in columns {
+        match column {
+            None => {
+                offset = write_u8(out, offset, 0)?;
+            }
+            Some(StructuredColumnValue::Bytes(bytes)) => {
+                offset = write_u8(out, offset, 1)?;
+                offset = write_i32_be(out, offset, bytes.len())?;
+                offset = write_slice(out, offset, bytes)?;
+            }
+            Some(StructuredColumnValue::List(list)) => {
+                offset = write_u8(out, offset, 2)?;
+                offset = write_i32_be(out, offset, list.len())?;
+                for element in list {
+                    offset = write_i32_be(out, offset, element.len())?;
+                    offset = write_slice(out, offset, element)?;
+                }
+            }
+        }
+    }
+    if offset != out.len() {
+        return Err("encoded row size mismatch".to_string());
+    }
+    Ok(())
+}
+
+fn write_u8(out: &mut [u8], offset: usize, value: u8) -> Result<usize, String> {
+    let end = offset
+        .checked_add(1)
+        .ok_or_else(|| "output offset overflow".to_string())?;
+    if end > out.len() {
+        return Err("output buffer too small".to_string());
+    }
+    out[offset] = value;
+    Ok(end)
+}
+
+fn write_i32_be(out: &mut [u8], offset: usize, value: usize) -> Result<usize, String> {
+    let value_u32 = u32::try_from(value).map_err(|_| "value does not fit into u32".to_string())?;
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| "output offset overflow".to_string())?;
+    if end > out.len() {
+        return Err("output buffer too small".to_string());
+    }
+    out[offset..end].copy_from_slice(&value_u32.to_be_bytes());
+    Ok(end)
+}
+
+fn write_slice(out: &mut [u8], offset: usize, value: &[u8]) -> Result<usize, String> {
+    let end = offset
+        .checked_add(value.len())
+        .ok_or_else(|| "output offset overflow".to_string())?;
+    if end > out.len() {
+        return Err("output buffer too small".to_string());
+    }
+    out[offset..end].copy_from_slice(value);
+    Ok(end)
 }
 
 // ── typed scan ──────────────────────────────────────────────────────────────

@@ -290,6 +290,13 @@ impl Db {
         &self.id
     }
 
+    pub fn jni_direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
+        Ok((
+            self.config.jni_direct_buffer_size_bytes()?,
+            self.config.jni_direct_buffer_pool_size,
+        ))
+    }
+
     /// Start a schema update transaction.
     pub fn update_schema(&self) -> SchemaBuilder {
         self.schema_manager

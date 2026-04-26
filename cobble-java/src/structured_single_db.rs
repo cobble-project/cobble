@@ -11,9 +11,9 @@ use crate::structured::{
     decode_write_list_args, to_java_typed_columns,
 };
 use crate::util::{
-    complete_future_exceptionally, complete_future_with_string, decode_java_string, decode_u16,
-    decode_u32, decode_u64_from_jlong, parse_config_json, throw_illegal_argument,
-    throw_illegal_state, to_java_string_or_throw,
+    complete_future_exceptionally, complete_future_with_string, decode_java_bytes_ref,
+    decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong, parse_config_json,
+    throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use bytes::Bytes;
@@ -430,12 +430,12 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_deleteWithOptions(
 // ── typed get ───────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_structured_SingleDb_getTyped(
-    mut env: JNIEnv,
+pub extern "system" fn Java_io_cobble_structured_SingleDb_getTyped<'local>(
+    mut env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
     bucket: jint,
-    key: JByteArray,
+    key: JByteArray<'local>,
 ) -> jobject {
     let Some(db) = single_db_from_handle(&mut env, handle) else {
         return std::ptr::null_mut();
@@ -447,14 +447,14 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_getTyped(
             return std::ptr::null_mut();
         }
     };
-    let key = match crate::util::decode_java_bytes(&mut env, key) {
+    let key_bytes = match decode_java_bytes_ref(&mut env, &key) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return std::ptr::null_mut();
         }
     };
-    let values = match db.get(bucket, &key) {
+    let values = match db.get(bucket, &key_bytes) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -474,12 +474,12 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_getTyped(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_structured_SingleDb_getTypedWithOptions(
-    mut env: JNIEnv,
+pub extern "system" fn Java_io_cobble_structured_SingleDb_getTypedWithOptions<'local>(
+    mut env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
     bucket: jint,
-    key: JByteArray,
+    key: JByteArray<'local>,
     read_options_handle: jlong,
 ) -> jobject {
     let Some(db) = single_db_from_handle(&mut env, handle) else {
@@ -492,17 +492,17 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_getTypedWithOptions(
             return std::ptr::null_mut();
         }
     };
-    let key = match crate::util::decode_java_bytes(&mut env, key) {
+    let Some(ro) = read_options_from_handle_or_throw(&mut env, read_options_handle) else {
+        return std::ptr::null_mut();
+    };
+    let key_bytes = match decode_java_bytes_ref(&mut env, &key) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return std::ptr::null_mut();
         }
     };
-    let Some(ro) = read_options_from_handle_or_throw(&mut env, read_options_handle) else {
-        return std::ptr::null_mut();
-    };
-    let values = match db.get_with_options(bucket, &key, ro.read_options()) {
+    let values = match db.get_with_options(bucket, &key_bytes, ro.read_options()) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());

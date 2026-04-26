@@ -163,6 +163,13 @@ Named column families are added later through schema evolution. Reopen, restore,
 | `log_console` | `bool` | `false` | Enable console logging |
 | `log_level` | `log::LevelFilter` | `Info` | Trace, Debug, Info, Warn, Error, Off |
 
+### Java JNI Direct Buffer
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `jni_direct_buffer_size` | `Size` | `2KiB` | Capacity of each pooled direct `ByteBuffer` used by Java direct APIs |
+| `jni_direct_buffer_pool_size` | `usize` | `64` | Maximum number of pooled direct buffers kept per Java process |
+
 ---
 
 ## CoordinatorConfig

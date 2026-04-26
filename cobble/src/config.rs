@@ -500,6 +500,10 @@ pub struct Config {
     pub log_max_file_size: Size,
     /// Total number of log files to keep, including the active file.
     pub log_keep_files: usize,
+    /// Size in bytes of each JNI direct buffer used by Java direct-buffer APIs.
+    pub jni_direct_buffer_size: Size,
+    /// Maximum number of JNI direct buffers kept in the Java-side pool.
+    pub jni_direct_buffer_pool_size: usize,
     /// Whether to enable console logging.
     pub log_console: bool,
     /// Log level filter (trace, debug, info, warn, error, off).
@@ -568,6 +572,8 @@ impl Default for Config {
             log_path: None,
             log_max_file_size: Size::from_mib(10),
             log_keep_files: 3,
+            jni_direct_buffer_size: Size::from_kib(2),
+            jni_direct_buffer_pool_size: 64,
             log_console: false,
             log_level: log::LevelFilter::Info,
             snapshot_on_flush: false,
@@ -669,6 +675,11 @@ impl Config {
 
     pub(crate) fn log_max_file_size_bytes(&self) -> Result<u64> {
         size_to_u64("log_max_file_size", self.log_max_file_size).map_err(Error::ConfigError)
+    }
+
+    pub fn jni_direct_buffer_size_bytes(&self) -> Result<usize> {
+        size_to_usize("jni_direct_buffer_size", self.jni_direct_buffer_size)
+            .map_err(Error::ConfigError)
     }
 
     pub(crate) fn hybrid_block_cache_disk_size(
@@ -930,6 +941,11 @@ impl Config {
         self.base_file_size_bytes()?;
         self.parquet_row_group_size_bytes()?;
         self.value_separation_threshold_bytes()?;
+        if self.jni_direct_buffer_size_bytes()? == 0 {
+            return Err(Error::ConfigError(
+                "jni_direct_buffer_size must be greater than 0".to_string(),
+            ));
+        }
         if self.log_max_file_size_bytes()? == 0 {
             return Err(Error::ConfigError(
                 "log_max_file_size must be greater than 0".to_string(),
@@ -938,6 +954,11 @@ impl Config {
         if self.log_keep_files == 0 {
             return Err(Error::ConfigError(
                 "log_keep_files must be greater than 0".to_string(),
+            ));
+        }
+        if self.jni_direct_buffer_pool_size == 0 {
+            return Err(Error::ConfigError(
+                "jni_direct_buffer_pool_size must be greater than 0".to_string(),
             ));
         }
         for (idx, volume) in self.volumes.iter().enumerate() {
@@ -1063,6 +1084,8 @@ mod tests {
             log_path: Some("/tmp/cobble.log".to_string()),
             log_max_file_size: Size::from_mib(16),
             log_keep_files: 5,
+            jni_direct_buffer_size: Size::from_kib(8),
+            jni_direct_buffer_pool_size: 32,
             log_console: true,
             log_level: log::LevelFilter::Debug,
             snapshot_on_flush: true,
@@ -1113,6 +1136,8 @@ mod tests {
         assert_eq!(decoded.time_provider, crate::time::TimeProviderKind::Manual);
         assert_eq!(decoded.log_max_file_size, Size::from_mib(16));
         assert_eq!(decoded.log_keep_files, 5);
+        assert_eq!(decoded.jni_direct_buffer_size, Size::from_kib(8));
+        assert_eq!(decoded.jni_direct_buffer_pool_size, 32);
         assert_eq!(decoded.log_level, log::LevelFilter::Debug);
         assert_eq!(decoded.snapshot_retention, Some(3));
         assert_eq!(decoded.active_memtable_incremental_snapshot_ratio, 0.5);

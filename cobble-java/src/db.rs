@@ -3,15 +3,16 @@ use crate::scan::{ScanCursorHandle, decode_scan_open_args};
 use crate::util::{
     complete_future_exceptionally, complete_future_with_string, decode_bucket_ranges,
     decode_java_bytes, decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong,
-    parse_config_json, throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
-    to_java_string_or_throw,
+    parse_config_json, take_last_overflow_direct_buffer, throw_illegal_argument,
+    throw_illegal_state, to_java_optional_bytes_2d, to_java_string_or_throw,
+    write_payload_to_io_or_cached_overflow,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use cobble::{Config, Db};
 use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JString};
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jintArray, jlong, jobject, jstring};
 use serde_json::json;
 
 #[unsafe(no_mangle)]
@@ -425,6 +426,25 @@ pub extern "system" fn Java_io_cobble_Db_disposeInternal(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_directBufferPoolConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jintArray {
+    let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let (buffer_size_bytes, pool_size) = match db.jni_direct_buffer_pool_config() {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    direct_buffer_pool_config_array(&mut env, buffer_size_bytes, pool_size)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Db_put(
     mut env: JNIEnv,
     _class: JClass,
@@ -517,6 +537,121 @@ pub extern "system" fn Java_io_cobble_Db_putWithOptions(
     else {
         return;
     };
+    if let Err(err) = db.put_with_options(
+        bucket,
+        key,
+        column,
+        value,
+        write_options_handle.write_options(),
+    ) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_putDirectWithOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key_address: jlong,
+    key_capacity: jint,
+    key_length: jint,
+    column: jint,
+    value_address: jlong,
+    value_capacity: jint,
+    value_length: jint,
+    write_options_handle: jlong,
+) {
+    let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key_length = match usize::try_from(key_length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "keyLength must be >= 0".to_string());
+            return;
+        }
+    };
+    let key_capacity = match usize::try_from(key_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "keyCapacity must be >= 0".to_string());
+            return;
+        }
+    };
+    let value_length = match usize::try_from(value_length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "valueLength must be >= 0".to_string());
+            return;
+        }
+    };
+    let value_capacity = match usize::try_from(value_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "valueCapacity must be >= 0".to_string());
+            return;
+        }
+    };
+    let Some(write_options_handle) =
+        write_options_from_handle_or_throw(&mut env, write_options_handle)
+    else {
+        return;
+    };
+
+    let key_addr = match usize::try_from(key_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "keyAddress must be > 0".to_string());
+            return;
+        }
+    };
+    if key_length > key_capacity {
+        throw_illegal_argument(
+            &mut env,
+            format!(
+                "keyLength {} exceeds keyBuffer capacity {}",
+                key_length, key_capacity
+            ),
+        );
+        return;
+    }
+
+    let value_addr = match usize::try_from(value_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "valueAddress must be > 0".to_string());
+            return;
+        }
+    };
+    if value_length > value_capacity {
+        throw_illegal_argument(
+            &mut env,
+            format!(
+                "valueLength {} exceeds valueBuffer capacity {}",
+                value_length, value_capacity
+            ),
+        );
+        return;
+    }
+
+    let key = unsafe { std::slice::from_raw_parts(key_addr as *const u8, key_length) };
+    let value = unsafe { std::slice::from_raw_parts(value_addr as *const u8, value_length) };
     if let Err(err) = db.put_with_options(
         bucket,
         key,
@@ -680,6 +815,146 @@ pub extern "system" fn Java_io_cobble_Db_get(
             std::ptr::null_mut()
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_getEncodedDirectWithOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    io_address: jlong,
+    io_capacity: jint,
+    key_length: jint,
+    read_options_handle: jlong,
+) -> jint {
+    let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let key_length = match usize::try_from(key_length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "keyLength must be >= 0".to_string());
+            return 0;
+        }
+    };
+    let io_capacity = match usize::try_from(io_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "ioCapacity must be >= 0".to_string());
+            return 0;
+        }
+    };
+    let Some(read_options_handle) =
+        read_options_from_handle_or_throw(&mut env, read_options_handle)
+    else {
+        return 0;
+    };
+    let direct_addr = match usize::try_from(io_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "ioAddress must be > 0".to_string());
+            return 0;
+        }
+    };
+    if key_length > io_capacity {
+        throw_illegal_argument(
+            &mut env,
+            format!(
+                "keyLength {} exceeds ioBuffer capacity {}",
+                key_length, io_capacity
+            ),
+        );
+        return 0;
+    }
+    let key = unsafe { std::slice::from_raw_parts(direct_addr as *const u8, key_length) };
+    let values = match db.get_with_options(bucket, key, read_options_handle.read_options()) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    encode_optional_columns_to_direct_buffer(&mut env, values, direct_addr, io_capacity)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_getLastDirectOverflowBuffer(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jobject {
+    match take_last_overflow_direct_buffer(&mut env) {
+        Ok(obj) => obj,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn encode_optional_columns_to_direct_buffer<'local>(
+    env: &mut JNIEnv<'local>,
+    values: Option<Vec<Option<bytes::Bytes>>>,
+    direct_addr: *mut u8,
+    direct_capacity: usize,
+) -> jint {
+    let Some(values) = values else {
+        return 0;
+    };
+    let encoded = match encode_optional_columns_payload(values.as_slice()) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(env, err);
+            return 0;
+        }
+    };
+    match write_payload_to_io_or_cached_overflow(
+        env,
+        direct_addr,
+        direct_capacity,
+        encoded.as_slice(),
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(env, err);
+            0
+        }
+    }
+}
+
+fn encode_optional_columns_payload(columns: &[Option<bytes::Bytes>]) -> Result<Vec<u8>, String> {
+    let mut total = 4usize;
+    for column in columns {
+        total = total
+            .checked_add(1)
+            .ok_or_else(|| "encoded columns size overflow".to_string())?;
+        if let Some(bytes) = column {
+            total = total
+                .checked_add(4)
+                .and_then(|v| v.checked_add(bytes.len()))
+                .ok_or_else(|| "encoded column size overflow".to_string())?;
+        }
+    }
+    let mut encoded = Vec::with_capacity(total);
+    encoded.extend_from_slice(&(columns.len() as u32).to_be_bytes());
+    for column in columns {
+        match column {
+            None => encoded.push(0),
+            Some(bytes) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                encoded.extend_from_slice(bytes.as_ref());
+            }
+        }
+    }
+    Ok(encoded)
 }
 
 #[unsafe(no_mangle)]
@@ -1061,6 +1336,45 @@ fn db_from_handle_or_throw(env: &mut JNIEnv, native_handle: jlong) -> Option<&'s
     }
     // SAFETY: `native_handle` is created from `Box<Db>` and valid until `disposeInternal`.
     Some(unsafe { &*(native_handle as *const Db) })
+}
+
+fn direct_buffer_pool_config_array(
+    env: &mut JNIEnv,
+    buffer_size_bytes: usize,
+    pool_size: usize,
+) -> jintArray {
+    let buffer_size_jint: jint = match jint::try_from(buffer_size_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_state(
+                env,
+                format!("jni_direct_buffer_size too large: {buffer_size_bytes}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+    let pool_size_jint: jint = match jint::try_from(pool_size) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_state(
+                env,
+                format!("jni_direct_buffer_pool_size too large: {pool_size}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+    let arr = match env.new_int_array(2) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    if let Err(err) = env.set_int_array_region(&arr, 0, &[buffer_size_jint, pool_size_jint]) {
+        throw_illegal_state(env, err.to_string());
+        return std::ptr::null_mut();
+    }
+    arr.into_raw()
 }
 
 fn build_shard_snapshot_payload(db: &Db, snapshot_id: u64) -> std::result::Result<String, String> {

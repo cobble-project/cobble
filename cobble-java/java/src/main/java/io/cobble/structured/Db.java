@@ -8,8 +8,11 @@ import io.cobble.ScanOptions;
 import io.cobble.ShardSnapshot;
 import io.cobble.WriteOptions;
 
+import java.nio.Buffer;
+import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * A structured database with typed column support (Bytes and List).
@@ -41,9 +44,62 @@ import java.util.concurrent.ExecutionException;
  * }</pre>
  */
 public final class Db extends NativeObject {
+    private static volatile DirectBufferPool directBufferPool = DirectBufferPool.defaults();
 
     private Db(long nativeHandle) {
         super(nativeHandle);
+    }
+
+    /**
+     * Configure pooled direct IO buffers used by direct read methods.
+     *
+     * <p>Only pool expansion is allowed. Shrinking either buffer size or max pool size returns
+     * {@code false}.
+     */
+    public static synchronized boolean configureDirectBufferPool(
+            int bufferSizeBytes, int maxPoolSize) {
+        DirectBufferPool current = directBufferPool;
+        if (bufferSizeBytes < current.bufferSizeBytes() || maxPoolSize < current.maxPoolSize()) {
+            return false;
+        }
+        if (bufferSizeBytes == current.bufferSizeBytes() && maxPoolSize == current.maxPoolSize()) {
+            return true;
+        }
+        directBufferPool = new DirectBufferPool(bufferSizeBytes, maxPoolSize);
+        return true;
+    }
+
+    private static void initializeDirectBufferPool(long nativeHandle) {
+        int[] resolved = directBufferPoolConfig(nativeHandle);
+        if (resolved == null || resolved.length != 2) {
+            throw new IllegalStateException("failed to load direct buffer pool config from db");
+        }
+        if (!configureDirectBufferPool(resolved[0], resolved[1])) {
+            throw new IllegalStateException(
+                    "direct buffer pool config can only grow: requested "
+                            + resolved[0]
+                            + " / "
+                            + resolved[1]
+                            + ", current "
+                            + directBufferPool.bufferSizeBytes()
+                            + " / "
+                            + directBufferPool.maxPoolSize());
+        }
+    }
+
+    private static Db wrapOpenedDb(long nativeHandle) {
+        Db db = new Db(nativeHandle);
+        try {
+            initializeDirectBufferPool(nativeHandle);
+            return db;
+        } catch (RuntimeException e) {
+            try {
+                db.close();
+            } catch (RuntimeException closeError) {
+                e.addSuppressed(closeError);
+            }
+            throw e;
+        }
     }
 
     // ── open / restore / resume ───────────────────────────────────────────
@@ -55,7 +111,7 @@ public final class Db extends NativeObject {
         if (h == 0L) {
             throw new IllegalStateException("failed to open structured db");
         }
-        return new Db(h);
+        return wrapOpenedDb(h);
     }
 
     /** Open a structured DB from a config file path with an explicit bucket range. */
@@ -65,7 +121,7 @@ public final class Db extends NativeObject {
         if (h == 0L) {
             throw new IllegalStateException("failed to open structured db with bucket range");
         }
-        return new Db(h);
+        return wrapOpenedDb(h);
     }
 
     /** Open a structured DB from Java {@link Config}. */
@@ -74,11 +130,12 @@ public final class Db extends NativeObject {
             throw new IllegalArgumentException("config must not be null");
         }
         NativeLoader.load();
-        long h = openHandleFromJson(config.toJson());
+        String configJson = config.toJson();
+        long h = openHandleFromJson(configJson);
         if (h == 0L) {
             throw new IllegalStateException("failed to open structured db from config json");
         }
-        return new Db(h);
+        return wrapOpenedDb(h);
     }
 
     /** Open a structured DB from Java {@link Config} with an explicit bucket range. */
@@ -87,14 +144,13 @@ public final class Db extends NativeObject {
             throw new IllegalArgumentException("config must not be null");
         }
         NativeLoader.load();
-        long h =
-                openHandleFromJsonWithRange(
-                        config.toJson(), rangeStartInclusive, rangeEndInclusive);
+        String configJson = config.toJson();
+        long h = openHandleFromJsonWithRange(configJson, rangeStartInclusive, rangeEndInclusive);
         if (h == 0L) {
             throw new IllegalStateException(
                     "failed to open structured db from config json with bucket range");
         }
-        return new Db(h);
+        return wrapOpenedDb(h);
     }
 
     public Schema currentSchema() {
@@ -129,7 +185,7 @@ public final class Db extends NativeObject {
                             ? "failed to restore structured db from snapshot with fresh db id"
                             : "failed to restore structured db from snapshot");
         }
-        return new Db(h);
+        return wrapOpenedDb(h);
     }
 
     /** Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot. */
@@ -148,14 +204,15 @@ public final class Db extends NativeObject {
             throw new IllegalArgumentException("config must not be null");
         }
         NativeLoader.load();
-        long h = restoreHandleFromJson(config.toJson(), snapshotId, dbId, newDbId);
+        String configJson = config.toJson();
+        long h = restoreHandleFromJson(configJson, snapshotId, dbId, newDbId);
         if (h == 0L) {
             throw new IllegalStateException(
                     newDbId
                             ? "failed to restore structured db from snapshot config json with fresh db id"
                             : "failed to restore structured db from snapshot config json");
         }
-        return new Db(h);
+        return wrapOpenedDb(h);
     }
 
     /**
@@ -170,7 +227,7 @@ public final class Db extends NativeObject {
         if (h == 0L) {
             throw new IllegalStateException("failed to restore structured db from manifest path");
         }
-        return new Db(h);
+        return wrapOpenedDb(h);
     }
 
     /**
@@ -184,12 +241,13 @@ public final class Db extends NativeObject {
             throw new IllegalArgumentException("config must not be null");
         }
         NativeLoader.load();
-        long h = restoreWithManifestHandleFromJson(config.toJson(), manifestPath);
+        String configJson = config.toJson();
+        long h = restoreWithManifestHandleFromJson(configJson, manifestPath);
         if (h == 0L) {
             throw new IllegalStateException(
                     "failed to restore structured db from manifest path config json");
         }
-        return new Db(h);
+        return wrapOpenedDb(h);
     }
 
     /** Resume a structured DB from existing folder state. Schema is auto-loaded. */
@@ -199,7 +257,7 @@ public final class Db extends NativeObject {
         if (h == 0L) {
             throw new IllegalStateException("failed to resume structured db");
         }
-        return new Db(h);
+        return wrapOpenedDb(h);
     }
 
     /** Resume a structured DB from existing folder state. Schema is auto-loaded. */
@@ -208,11 +266,12 @@ public final class Db extends NativeObject {
             throw new IllegalArgumentException("config must not be null");
         }
         NativeLoader.load();
-        long h = resumeHandleFromJson(config.toJson(), dbId);
+        String configJson = config.toJson();
+        long h = resumeHandleFromJson(configJson, dbId);
         if (h == 0L) {
             throw new IllegalStateException("failed to resume structured db from config json");
         }
-        return new Db(h);
+        return wrapOpenedDb(h);
     }
 
     /** Expand bucket ownership by importing data from another shard snapshot. */
@@ -281,6 +340,45 @@ public final class Db extends NativeObject {
         } else {
             putListWithOptions(nativeHandle, bucket, key, column, value.asList(), woh);
         }
+    }
+
+    /**
+     * Put one bytes column value with direct ByteBuffer input.
+     *
+     * <p>The key/value buffers are caller-owned and can be reused by the caller across invocations.
+     */
+    public void putDirectWithOptions(
+            int bucket,
+            ByteBuffer keyBuffer,
+            int keyLength,
+            int column,
+            ByteBuffer valueBuffer,
+            int valueLength,
+            WriteOptions options) {
+        if (keyBuffer == null || !keyBuffer.isDirect()) {
+            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
+        }
+        if (valueBuffer == null || !valueBuffer.isDirect()) {
+            throw new IllegalArgumentException("valueBuffer must be a direct ByteBuffer");
+        }
+        if (keyLength < 0 || keyLength > keyBuffer.capacity()) {
+            throw new IllegalArgumentException("keyLength out of range: " + keyLength);
+        }
+        if (valueLength < 0 || valueLength > valueBuffer.capacity()) {
+            throw new IllegalArgumentException("valueLength out of range: " + valueLength);
+        }
+        long woh = options == null ? 0L : options.getNativeHandle();
+        putBytesDirectWithOptions(
+                nativeHandle,
+                bucket,
+                directAddress(keyBuffer),
+                keyBuffer.capacity(),
+                keyLength,
+                column,
+                directAddress(valueBuffer),
+                valueBuffer.capacity(),
+                valueLength,
+                woh);
     }
 
     /**
@@ -372,6 +470,173 @@ public final class Db extends NativeObject {
         long roh = options == null ? 0L : options.getNativeHandle();
         Object[] raw = getTypedWithOptions(nativeHandle, bucket, key, roh);
         return Row.fromRawColumns(key, raw);
+    }
+
+    /**
+     * Get columns for a key through direct ByteBuffer IO.
+     *
+     * <p>The input key and encoded row payload share one IO buffer. The binding keeps a reusable
+     * direct buffer pool (default 2KB) for this path, and returns a temporary larger direct buffer
+     * when the encoded row does not fit in the pooled one.
+     *
+     * @return direct row, or null if key does not exist
+     */
+    public DirectRow getDirectWithOptions(int bucket, byte[] key, ReadOptions options) {
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
+        long roh = options == null ? 0L : options.getNativeHandle();
+        DirectBufferPool pool = directBufferPool;
+        ByteBuffer pooled = pool.acquire();
+        ByteBuffer ioBuffer = pooled;
+        boolean usingPooledForResult = false;
+        boolean pooledReleased = false;
+
+        try {
+            if (key.length > ioBuffer.capacity()) {
+                ioBuffer = ByteBuffer.allocateDirect(key.length);
+            }
+            writeKey(ioBuffer, key);
+            int encodedLength =
+                    getEncodedDirectWithOptions(
+                            nativeHandle,
+                            bucket,
+                            directAddress(ioBuffer),
+                            ioBuffer.capacity(),
+                            key.length,
+                            roh);
+            if (encodedLength == 0) {
+                if (!pooledReleased) {
+                    pool.release(pooled);
+                    pooledReleased = true;
+                }
+                return null;
+            }
+            ByteBuffer resultBuffer = resolveEncodedBuffer(ioBuffer, encodedLength);
+            int decodedLength = Math.abs(encodedLength);
+            if (resultBuffer == pooled) {
+                usingPooledForResult = true;
+            } else {
+                pool.release(pooled);
+                pooledReleased = true;
+            }
+
+            if (!usingPooledForResult) {
+                return DirectRow.decode(resultBuffer, decodedLength, null);
+            }
+
+            AtomicBoolean released = new AtomicBoolean(false);
+            Runnable releaser =
+                    () -> {
+                        if (released.compareAndSet(false, true)) {
+                            pool.release(pooled);
+                        }
+                    };
+            return DirectRow.decode(resultBuffer, decodedLength, releaser);
+        } catch (RuntimeException e) {
+            if (!usingPooledForResult && !pooledReleased) {
+                pool.release(pooled);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Get columns for a key via caller-owned direct key buffer.
+     *
+     * <p>Key bytes are read from {@code keyBuffer[0..keyBuffer.limit())}.
+     */
+    public DirectRow getDirectWithOptions(int bucket, ByteBuffer keyBuffer, ReadOptions options) {
+        if (keyBuffer == null || !keyBuffer.isDirect()) {
+            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
+        }
+        return getDirectWithOptions(bucket, keyBuffer, ((Buffer) keyBuffer).limit(), options);
+    }
+
+    /** Compatibility overload that treats {@code keyBuffer[0..keyLength)} as key bytes. */
+    public DirectRow getDirectWithOptions(
+            int bucket, ByteBuffer keyBuffer, int keyLength, ReadOptions options) {
+        if (keyBuffer == null || !keyBuffer.isDirect()) {
+            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
+        }
+        if (keyLength < 0 || keyLength > keyBuffer.capacity()) {
+            throw new IllegalArgumentException("keyLength out of range: " + keyLength);
+        }
+        long roh = options == null ? 0L : options.getNativeHandle();
+        DirectBufferPool pool = directBufferPool;
+        ByteBuffer pooled = pool.acquire();
+        ByteBuffer ioBuffer = pooled;
+        boolean usingPooledForResult = false;
+        boolean pooledReleased = false;
+
+        try {
+            if (keyLength > ioBuffer.capacity()) {
+                ioBuffer = ByteBuffer.allocateDirect(keyLength);
+            }
+            writeKey(ioBuffer, keyBuffer, keyLength);
+            int encodedLength =
+                    getEncodedDirectWithOptions(
+                            nativeHandle,
+                            bucket,
+                            directAddress(ioBuffer),
+                            ioBuffer.capacity(),
+                            keyLength,
+                            roh);
+            if (encodedLength == 0) {
+                pool.release(pooled);
+                pooledReleased = true;
+                return null;
+            }
+            ByteBuffer resultBuffer = resolveEncodedBuffer(ioBuffer, encodedLength);
+            int decodedLength = Math.abs(encodedLength);
+            if (resultBuffer == pooled) {
+                usingPooledForResult = true;
+                AtomicBoolean released = new AtomicBoolean(false);
+                Runnable releaser =
+                        () -> {
+                            if (released.compareAndSet(false, true)) {
+                                pool.release(pooled);
+                            }
+                        };
+                return DirectRow.decode(resultBuffer, decodedLength, releaser);
+            }
+            pool.release(pooled);
+            pooledReleased = true;
+            return DirectRow.decode(resultBuffer, decodedLength, null);
+        } catch (RuntimeException e) {
+            if (!usingPooledForResult && !pooledReleased) {
+                pool.release(pooled);
+            }
+            throw e;
+        }
+    }
+
+    private static void writeKey(ByteBuffer buffer, byte[] key) {
+        ((Buffer) buffer).clear();
+        buffer.put(key);
+    }
+
+    private static void writeKey(ByteBuffer buffer, ByteBuffer keyBuffer, int keyLength) {
+        ByteBuffer keyView = keyBuffer.duplicate();
+        ((Buffer) keyView).clear();
+        ((Buffer) keyView).limit(keyLength);
+        ((Buffer) buffer).clear();
+        buffer.put(keyView);
+    }
+
+    private static long directAddress(ByteBuffer buffer) {
+        return ((sun.nio.ch.DirectBuffer) buffer).address();
+    }
+
+    private static ByteBuffer resolveEncodedBuffer(ByteBuffer ioBuffer, int encodedLength) {
+        if (encodedLength > 0) {
+            return ioBuffer;
+        }
+        ByteBuffer overflow = getLastDirectOverflowBuffer();
+        if (overflow == null) {
+            throw new IllegalStateException("missing overflow direct buffer from JNI");
+        }
+        return overflow;
     }
 
     /**
@@ -471,6 +736,8 @@ public final class Db extends NativeObject {
     private static native long openHandleWithRange(
             String configPath, int rangeStartInclusive, int rangeEndInclusive);
 
+    private static native int[] directBufferPoolConfig(long nativeHandle);
+
     private static native long openHandleFromJson(String configJson);
 
     private static native long openHandleFromJsonWithRange(
@@ -505,6 +772,18 @@ public final class Db extends NativeObject {
             byte[] key,
             int column,
             byte[] value,
+            long writeOptionsHandle);
+
+    private static native void putBytesDirectWithOptions(
+            long nativeHandle,
+            int bucket,
+            long keyAddress,
+            int keyCapacity,
+            int keyLength,
+            int column,
+            long valueAddress,
+            int valueCapacity,
+            int valueLength,
             long writeOptionsHandle);
 
     private static native void mergeBytes(
@@ -549,6 +828,16 @@ public final class Db extends NativeObject {
 
     private static native Object[] getTypedWithOptions(
             long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
+
+    private static native int getEncodedDirectWithOptions(
+            long nativeHandle,
+            int bucket,
+            long ioAddress,
+            int ioCapacity,
+            int keyLength,
+            long readOptionsHandle);
+
+    private static native ByteBuffer getLastDirectOverflowBuffer();
 
     // typed scan
     private static native long openStructuredScanCursor(

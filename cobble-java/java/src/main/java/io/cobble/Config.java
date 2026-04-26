@@ -123,6 +123,12 @@ public final class Config {
     /** Total number of log files to retain, including the active file. */
     public Integer logKeepFiles;
 
+    /** JNI direct ByteBuffer size in bytes for Java direct APIs. */
+    public Integer jniDirectBufferSize;
+
+    /** Maximum JNI direct ByteBuffers retained in the Java direct-buffer pool. */
+    public Integer jniDirectBufferPoolSize;
+
     /** Whether logs should also be written to console. */
     public Boolean logConsole;
 

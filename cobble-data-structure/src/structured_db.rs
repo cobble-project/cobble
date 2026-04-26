@@ -1033,6 +1033,10 @@ impl StructuredDb {
     pub fn close(&self) -> Result<()> {
         self.db.close()
     }
+
+    pub fn jni_direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
+        self.db.jni_direct_buffer_pool_config()
+    }
 }
 
 impl StructuredSchemaOwner for StructuredDb {

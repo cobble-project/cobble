@@ -127,6 +127,59 @@ assert schema.columnFamily("metrics") != null;
 
 `ReadOptions` also provides `forColumnsInFamily(...)` and `defaultsInFamily(...)`. `ScanOptions` intentionally uses `forColumns(...).columnFamily(...)`.
 
+### Raw API Direct ByteBuffer Path
+
+For lower JNI overhead on non-structured `Db`, Java bindings also provide direct-buffer APIs:
+
+```java
+import io.cobble.Db;
+import io.cobble.ReadOptions;
+import io.cobble.WriteOptions;
+import java.nio.ByteBuffer;
+import java.nio.Buffer;
+
+Db db = Db.open("config.yaml");
+ByteBuffer ioBuffer = ByteBuffer.allocateDirect(2048);
+ByteBuffer valueBuffer = ByteBuffer.allocateDirect(1024);
+
+byte[] key = "user:1".getBytes();
+byte[] value = "alice".getBytes();
+
+((Buffer) ioBuffer).clear();
+ioBuffer.put(key);
+((Buffer) valueBuffer).clear();
+valueBuffer.put(value);
+
+try (WriteOptions write = WriteOptions.forColumn(0)) {
+    db.putDirectWithOptions(0, ioBuffer, key.length, 0, valueBuffer, value.length, write);
+}
+
+try (ReadOptions read = ReadOptions.forColumn(0)) {
+    ByteBuffer encoded = db.getEncodedDirectWithOptions(0, ioBuffer, key.length, read);
+    // encoded == ioBuffer => reused input buffer
+    // encoded != ioBuffer => temporary larger direct buffer was allocated
+}
+
+// Pooled direct API (no caller-managed IO buffer), one direct buffer per selected column.
+try (ReadOptions read = ReadOptions.forColumn(0)) {
+    ByteBuffer[] columns = db.getDirectWithOptions(0, key, read);
+}
+```
+
+`getEncodedDirectWithOptions(...)` returns:
+
+- `null` if key is not found
+- the same `ioBuffer` when payload fits (`encoded == ioBuffer`)
+- a new temporary direct buffer when payload is larger than `ioBuffer.capacity()`
+
+`getDirectWithOptions(...)` returns `ByteBuffer[]` (one element per selected column, `null` for
+missing columns), and each non-null column is a direct `ByteBuffer`.
+
+Direct buffer pool settings are loaded from the opened DB config
+(`jni_direct_buffer_size`, `jni_direct_buffer_pool_size`) during open/restore/resume. Runtime
+updates use `Db.configureDirectBufferPool(sizeBytes, maxPoolSize)`, which is **grow-only**:
+shrinking either value returns `false`.
+
 Snapshot DTOs also preserve the mapping:
 
 ```java
@@ -150,6 +203,16 @@ GlobalSnapshot globalSnapshot =
 ### Structured Wrappers
 
 Structured wrappers are schema-driven and currently support typed `Bytes` and `List` columns. See [Structured DB](../getting-started/structured-db).
+
+Structured direct-read APIs (`getDirect`, `getDirectWithOptions`) use an internal direct-buffer
+pool. Pool settings are loaded from the opened DB config (`jni_direct_buffer_size`,
+`jni_direct_buffer_pool_size`) during open/restore/resume:
+
+- `jni_direct_buffer_size` (default `2KiB`)
+- `jni_direct_buffer_pool_size` (default `64`)
+
+Runtime updates use `Db.configureDirectBufferPool(sizeBytes, maxPoolSize)`, and are grow-only:
+shrinking either value returns `false`.
 
 ```java
 import io.cobble.structured.SingleDb;

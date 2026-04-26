@@ -3,11 +3,12 @@ use cobble::Config;
 use jni::JNIEnv;
 use jni::descriptors::Desc;
 use jni::objects::{
-    GlobalRef, JByteArray, JClass, JIntArray, JMethodID, JObject, JObjectArray, JString,
-    JThrowable, JValue,
+    GlobalRef, JByteArray, JByteBuffer, JClass, JIntArray, JMethodID, JObject, JObjectArray,
+    JString, JThrowable, JValue,
 };
 use jni::signature::{Primitive, ReturnType};
 use jni::sys::{jint, jlong, jobject, jstring};
+use std::cell::RefCell;
 use std::ops::RangeInclusive;
 use std::sync::OnceLock;
 
@@ -45,6 +46,14 @@ pub(crate) fn decode_optional_java_string(
 }
 
 pub(crate) fn decode_java_bytes(env: &mut JNIEnv, value: JByteArray) -> Result<Vec<u8>, String> {
+    env.convert_byte_array(value)
+        .map_err(|err| format!("invalid java byte array: {}", err))
+}
+
+pub(crate) fn decode_java_bytes_ref(
+    env: &mut JNIEnv,
+    value: &JByteArray,
+) -> Result<Vec<u8>, String> {
     env.convert_byte_array(value)
         .map_err(|err| format!("invalid java byte array: {}", err))
 }
@@ -238,6 +247,90 @@ pub(crate) fn complete_future_exceptionally(
     }
     .map(|_| ())
     .map_err(|err| err.to_string())
+}
+
+pub(crate) fn write_payload_to_io_or_cached_overflow<'local>(
+    env: &mut JNIEnv<'local>,
+    io_addr: *mut u8,
+    io_capacity: usize,
+    payload: &[u8],
+) -> Result<jint, String> {
+    if payload.len() > i32::MAX as usize {
+        return Err("encoded payload too large".to_string());
+    }
+    let encoded_len = payload.len() as jint;
+    if payload.len() <= io_capacity {
+        let out = unsafe { std::slice::from_raw_parts_mut(io_addr, payload.len()) };
+        out.copy_from_slice(payload);
+        return Ok(encoded_len);
+    }
+    let overflow = get_or_grow_overflow_direct_buffer(env, encoded_len)?;
+    let overflow_addr = env
+        .get_direct_buffer_address(&overflow)
+        .map_err(|err| format!("failed to access overflow direct buffer: {err}"))?;
+    let out = unsafe { std::slice::from_raw_parts_mut(overflow_addr, payload.len()) };
+    out.copy_from_slice(payload);
+    Ok(-encoded_len)
+}
+
+pub(crate) fn take_last_overflow_direct_buffer<'local>(
+    env: &mut JNIEnv<'local>,
+) -> Result<jobject, String> {
+    LAST_OVERFLOW_DIRECT_BUFFER.with(|slot| {
+        let guard = slot.borrow();
+        let Some(global) = guard.as_ref() else {
+            return Ok(std::ptr::null_mut());
+        };
+        let local = env
+            .new_local_ref(global.as_obj())
+            .map_err(|err| err.to_string())?;
+        Ok(local.into_raw())
+    })
+}
+
+thread_local! {
+    static LAST_OVERFLOW_DIRECT_BUFFER: RefCell<Option<GlobalRef>> = RefCell::new(None);
+}
+
+fn get_or_grow_overflow_direct_buffer<'local>(
+    env: &mut JNIEnv<'local>,
+    required: jint,
+) -> Result<JByteBuffer<'local>, String> {
+    LAST_OVERFLOW_DIRECT_BUFFER.with(|slot| {
+        if let Some(existing) = slot.borrow().as_ref() {
+            let local = env
+                .new_local_ref(existing.as_obj())
+                .map_err(|err| err.to_string())?;
+            let buffer = JByteBuffer::from(local);
+            let capacity = env
+                .get_direct_buffer_capacity(&buffer)
+                .map_err(|err| format!("failed to get overflow direct buffer capacity: {err}"))?;
+            if capacity >= required as usize {
+                return Ok(buffer);
+            }
+        }
+
+        let fresh = allocate_direct_byte_buffer(env, required)?;
+        let global = env.new_global_ref(&fresh).map_err(|err| err.to_string())?;
+        *slot.borrow_mut() = Some(global);
+        Ok(fresh)
+    })
+}
+
+fn allocate_direct_byte_buffer<'local>(
+    env: &mut JNIEnv<'local>,
+    size: jint,
+) -> Result<JByteBuffer<'local>, String> {
+    let value = env
+        .call_static_method(
+            "java/nio/ByteBuffer",
+            "allocateDirect",
+            "(I)Ljava/nio/ByteBuffer;",
+            &[JValue::Int(size)],
+        )
+        .map_err(|err| err.to_string())?;
+    let obj = value.l().map_err(|err| err.to_string())?;
+    Ok(JByteBuffer::from(obj))
 }
 
 pub(crate) fn new_scan_batch<'local>(

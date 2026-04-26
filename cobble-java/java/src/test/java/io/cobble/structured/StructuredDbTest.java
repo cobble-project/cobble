@@ -11,6 +11,8 @@ import io.cobble.WriteOptions;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.nio.Buffer;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -601,5 +603,65 @@ class StructuredDbTest {
         }
     }
 
+    @Test
+    void structuredDirectBufferApisHandleFitAndOverflow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-direct-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        byte[] smallKey = "direct-small".getBytes(StandardCharsets.UTF_8);
+        byte[] largeKey = "direct-large".getBytes(StandardCharsets.UTF_8);
+        byte[] smallValue = "small-structured-value".getBytes(StandardCharsets.UTF_8);
+        byte[] largeValue = new byte[4096];
+        for (int i = 0; i < largeValue.length; i++) {
+            largeValue[i] = (byte) ('a' + (i % 26));
+        }
+
+        try (Db db = Db.open(config)) {
+            db.put(0, smallKey, 0, ColumnValue.ofBytes(smallValue));
+            db.put(0, largeKey, 0, ColumnValue.ofBytes(largeValue));
+
+            try (ReadOptions options = ReadOptions.forColumns(0);
+                    DirectRow small = db.getDirectWithOptions(0, smallKey, options)) {
+                assertNotNull(small);
+                assertArrayEquals(smallValue, readDirectBytes(small.getBytes(0)));
+            }
+
+            try (ReadOptions options = ReadOptions.forColumns(0);
+                    DirectRow large = db.getDirectWithOptions(0, largeKey, options)) {
+                assertNotNull(large);
+                assertArrayEquals(largeValue, readDirectBytes(large.getBytes(0)));
+            }
+
+            ByteBuffer keyBuffer = ByteBuffer.allocateDirect(largeKey.length);
+            ((Buffer) keyBuffer).clear();
+            keyBuffer.put(largeKey);
+            ((Buffer) keyBuffer).flip();
+            try (ReadOptions options = ReadOptions.forColumns(0);
+                    DirectRow large = db.getDirectWithOptions(0, keyBuffer, options)) {
+                assertNotNull(large);
+                assertArrayEquals(largeValue, readDirectBytes(large.getBytes(0)));
+            }
+
+            ByteBuffer paddedKeyBuffer = ByteBuffer.allocateDirect(largeKey.length + 32);
+            ((Buffer) paddedKeyBuffer).clear();
+            paddedKeyBuffer.put(largeKey);
+            paddedKeyBuffer.put((byte) 'x');
+            ((Buffer) paddedKeyBuffer).position(paddedKeyBuffer.capacity());
+            try (ReadOptions options = ReadOptions.forColumns(0);
+                    DirectRow large =
+                            db.getDirectWithOptions(0, paddedKeyBuffer, largeKey.length, options)) {
+                assertNotNull(large);
+                assertArrayEquals(largeValue, readDirectBytes(large.getBytes(0)));
+            }
+        }
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    private static byte[] readDirectBytes(ByteBuffer buffer) {
+        ByteBuffer copy = buffer.duplicate();
+        byte[] bytes = new byte[copy.remaining()];
+        copy.get(bytes);
+        return bytes;
+    }
 }
