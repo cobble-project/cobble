@@ -191,6 +191,42 @@ impl HashMemtable {
     fn bucket_index_from_hash(&self, hash: u64) -> usize {
         (hash as usize) % self.bucket_count
     }
+
+    pub(crate) fn iter_with_bounds(
+        &self,
+        start_inclusive: Option<&[u8]>,
+        end_exclusive: Option<&[u8]>,
+    ) -> MemtableKvIterator<'_> {
+        let mut entries: Vec<(&[u8], &[u8], usize)> = Vec::new();
+        let mut offset = 0;
+        while offset < self.data_end {
+            if offset + 8 > self.data_end {
+                break;
+            }
+            let mut slice = &self.buffer[offset..self.data_end];
+            let key_len = slice.get_u32() as usize;
+            let value_len = slice.get_u32() as usize;
+            if key_len + value_len > slice.remaining() {
+                break;
+            }
+            let key = &slice[..key_len];
+            if let Some(start) = start_inclusive
+                && key < start
+            {
+                offset += Self::entry_size(key_len, value_len);
+                continue;
+            }
+            if let Some(end) = end_exclusive
+                && key >= end
+            {
+                offset += Self::entry_size(key_len, value_len);
+                continue;
+            }
+            entries.push((key, &slice[key_len..key_len + value_len], offset));
+            offset += Self::entry_size(key_len, value_len);
+        }
+        MemtableKvIterator::new(entries)
+    }
 }
 
 impl Memtable for HashMemtable {
@@ -395,26 +431,7 @@ impl Memtable for HashMemtable {
     /// Returns an iterator over all key-value pairs ordered by key bytes ascending.
     /// For duplicate keys, values are yielded in reverse insertion order (latest first).
     fn iter(&self) -> MemtableKvIterator<'_> {
-        let mut entries: Vec<(&[u8], &[u8], usize)> = Vec::new();
-        let mut offset = 0;
-        while offset < self.data_end {
-            if offset + 8 > self.data_end {
-                break;
-            }
-            let mut slice = &self.buffer[offset..self.data_end];
-            let key_len = slice.get_u32() as usize;
-            let value_len = slice.get_u32() as usize;
-            if key_len + value_len > slice.remaining() {
-                break;
-            }
-            entries.push((
-                &slice[..key_len],
-                &slice[key_len..key_len + value_len],
-                offset,
-            ));
-            offset += Self::entry_size(key_len, value_len);
-        }
-        MemtableKvIterator::new(entries)
+        self.iter_with_bounds(None, None)
     }
 
     type ValueIter<'a>

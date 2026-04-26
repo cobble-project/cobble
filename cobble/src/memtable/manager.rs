@@ -17,7 +17,7 @@ use crate::iterator::{
 use crate::lsm::LSMTree;
 use crate::memtable::vlog::{MemtableVlogRecorder, rewrite_ref_value_for_memtable};
 use crate::memtable::{HashMemtable, SkiplistMemtable, VecMemtable};
-use crate::memtable::{Memtable, MemtableImpl, MemtableKvIter, MemtableReclaimer};
+use crate::memtable::{Memtable, MemtableImpl, MemtableReclaimer};
 use crate::metrics_manager::MetricsManager;
 use crate::parquet::{ParquetWriter, ParquetWriterOptions};
 use crate::paths::snapshot_active_data_relative_path;
@@ -177,106 +177,160 @@ enum MemtableScanSource {
 
 struct MemtableScanIterator {
     source: MemtableScanSource,
-    seek_target: Option<Bytes>,
-    next_offset: usize,
+    start_bound_inclusive: Option<Bytes>,
+    end_bound_exclusive: Option<Bytes>,
+    entries: Vec<(Bytes, Bytes)>,
+    next_index: usize,
     current_key: Option<Bytes>,
     current_value: Option<Bytes>,
 }
 
 impl MemtableScanIterator {
-    fn for_active(active: Arc<Mutex<ActiveMemtable>>) -> Self {
+    fn for_active(
+        active: Arc<Mutex<ActiveMemtable>>,
+        start_bound_inclusive: Option<Bytes>,
+        end_bound_exclusive: Option<Bytes>,
+    ) -> Self {
         Self {
             source: MemtableScanSource::Active(active),
-            seek_target: None,
-            next_offset: 0,
+            start_bound_inclusive,
+            end_bound_exclusive,
+            entries: Vec::new(),
+            next_index: 0,
             current_key: None,
             current_value: None,
         }
     }
 
-    fn for_immutable(memtable: Arc<MemtableImpl>) -> Self {
+    fn for_immutable(
+        memtable: Arc<MemtableImpl>,
+        start_bound_inclusive: Option<Bytes>,
+        end_bound_exclusive: Option<Bytes>,
+    ) -> Self {
         Self {
             source: MemtableScanSource::Immutable(memtable),
-            seek_target: None,
-            next_offset: 0,
+            start_bound_inclusive,
+            end_bound_exclusive,
+            entries: Vec::new(),
+            next_index: 0,
             current_key: None,
             current_value: None,
         }
     }
 
-    fn read_entry_from_iter(
-        iter: &mut MemtableKvIter<'_>,
+    fn collect_entries_from_iter<'a, I>(
+        iter: &mut I,
         seek_target: Option<&[u8]>,
-        offset: usize,
-    ) -> Result<Option<(Bytes, Bytes)>> {
+        end_bound_exclusive: Option<&[u8]>,
+    ) -> Result<Vec<(Bytes, Bytes)>>
+    where
+        I: KvIterator<'a>,
+    {
         if let Some(target) = seek_target {
             iter.seek(target)?;
         } else {
             iter.seek_to_first()?;
         }
-        for _ in 0..=offset {
-            if !iter.next()? {
-                return Ok(None);
+        let mut entries = Vec::new();
+        while iter.next()? {
+            if let Some((key, kv_value)) = iter.take_current()? {
+                if let Some(end) = end_bound_exclusive
+                    && key.as_ref() >= end
+                {
+                    break;
+                }
+                // Memtable iterators always produce encoded values.
+                entries.push((key, kv_value.unwrap_encoded()));
             }
         }
-        match iter.take_current()? {
-            Some((key, kv_value)) => {
-                // Memtable iterators always produce encoded values.
-                let value = kv_value.unwrap_encoded();
-                Ok(Some((key, value)))
+        Ok(entries)
+    }
+
+    fn collect_entries_from_memtable(
+        memtable: &MemtableImpl,
+        seek_target: Option<&[u8]>,
+        end_bound_exclusive: Option<&[u8]>,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        match memtable {
+            MemtableImpl::Hash(hash_memtable) => {
+                let mut iter = hash_memtable.iter_with_bounds(seek_target, end_bound_exclusive);
+                Self::collect_entries_from_iter(&mut iter, seek_target, end_bound_exclusive)
             }
-            None => Ok(None),
+            _ => {
+                let mut iter = memtable.iter();
+                Self::collect_entries_from_iter(&mut iter, seek_target, end_bound_exclusive)
+            }
         }
     }
 
-    fn read_entry_at_offset(&self, offset: usize) -> Result<Option<(Bytes, Bytes)>> {
-        let seek_target = self.seek_target.as_deref();
-        match &self.source {
+    fn reload_entries(&mut self, seek_target: Option<&[u8]>) -> Result<()> {
+        let effective_start = match (self.start_bound_inclusive.as_ref(), seek_target) {
+            (Some(bound), Some(target)) => {
+                if bound.as_ref() >= target {
+                    Some(bound.clone())
+                } else {
+                    Some(Bytes::copy_from_slice(target))
+                }
+            }
+            (Some(bound), None) => Some(bound.clone()),
+            (None, Some(target)) => Some(Bytes::copy_from_slice(target)),
+            (None, None) => None,
+        };
+        let start_bound_inclusive = effective_start.as_deref();
+        let end_bound_exclusive = self.end_bound_exclusive.as_deref();
+        self.entries = match &self.source {
             MemtableScanSource::Active(active) => {
                 let active = active.lock().unwrap();
                 let Some(memtable) = active.memtable.as_ref() else {
-                    return Ok(None);
+                    self.entries.clear();
+                    self.current_key = None;
+                    self.current_value = None;
+                    self.next_index = 0;
+                    return Ok(());
                 };
-                let mut iter = memtable.iter();
-                Self::read_entry_from_iter(&mut iter, seek_target, offset)
+                Self::collect_entries_from_memtable(
+                    memtable,
+                    start_bound_inclusive,
+                    end_bound_exclusive,
+                )?
             }
-            MemtableScanSource::Immutable(memtable) => {
-                let mut iter = memtable.iter();
-                Self::read_entry_from_iter(&mut iter, seek_target, offset)
-            }
-        }
+            MemtableScanSource::Immutable(memtable) => Self::collect_entries_from_memtable(
+                memtable.as_ref(),
+                start_bound_inclusive,
+                end_bound_exclusive,
+            )?,
+        };
+        self.prime_current();
+        Ok(())
     }
 
-    fn prime_current(&mut self) -> Result<()> {
-        if let Some((key, value)) = self.read_entry_at_offset(0)? {
+    fn prime_current(&mut self) {
+        if let Some((key, value)) = self.entries.first().cloned() {
             self.current_key = Some(key);
             self.current_value = Some(value);
-            self.next_offset = 1;
+            self.next_index = 1;
         } else {
             self.current_key = None;
             self.current_value = None;
-            self.next_offset = 0;
+            self.next_index = 0;
         }
-        Ok(())
     }
 }
 
 impl<'a> KvIterator<'a> for MemtableScanIterator {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
-        self.seek_target = Some(Bytes::copy_from_slice(target));
-        self.prime_current()
+        self.reload_entries(Some(target))
     }
 
     fn seek_to_first(&mut self) -> Result<()> {
-        self.seek_target = None;
-        self.prime_current()
+        self.reload_entries(None)
     }
 
     fn next(&mut self) -> Result<bool> {
-        if let Some((key, value)) = self.read_entry_at_offset(self.next_offset)? {
+        if let Some((key, value)) = self.entries.get(self.next_index).cloned() {
             self.current_key = Some(key);
             self.current_value = Some(value);
-            self.next_offset += 1;
+            self.next_index += 1;
             Ok(true)
         } else {
             self.current_key = None;
@@ -1111,6 +1165,8 @@ impl MemtableManager {
         target_schema: Arc<Schema>,
         column_family_id: u8,
         selected_columns: Option<&[usize]>,
+        start_bound_inclusive: Option<Bytes>,
+        end_bound_exclusive: Option<Bytes>,
     ) -> Result<Vec<DynKvIterator>> {
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let target_num_columns = target_schema
@@ -1121,7 +1177,11 @@ impl MemtableManager {
                 let active_guard = active.lock().unwrap();
                 Arc::clone(&active_guard.schema)
             };
-            let iter = MemtableScanIterator::for_active(Arc::clone(active));
+            let iter = MemtableScanIterator::for_active(
+                Arc::clone(active),
+                start_bound_inclusive.clone(),
+                end_bound_exclusive.clone(),
+            );
             let iter: DynKvIterator = if source_schema.version() == target_schema.version() {
                 Box::new(iter)
             } else {
@@ -1144,7 +1204,11 @@ impl MemtableManager {
             iterators.push(iter);
         }
         for immutable in snapshot.immutables.iter().rev() {
-            let iter = MemtableScanIterator::for_immutable(Arc::clone(&immutable.memtable));
+            let iter = MemtableScanIterator::for_immutable(
+                Arc::clone(&immutable.memtable),
+                start_bound_inclusive.clone(),
+                end_bound_exclusive.clone(),
+            );
             let iter: DynKvIterator = if immutable.schema.version() == target_schema.version() {
                 Box::new(iter)
             } else {

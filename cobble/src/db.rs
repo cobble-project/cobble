@@ -1178,6 +1178,16 @@ impl Db {
                 max_index, num_columns
             )));
         }
+        let encode_scan_key = |key: &[u8]| {
+            let mut encoded = BytesMut::with_capacity(4 + key.len());
+            encode_key_ref_into(
+                &RefKey::new_with_column_family(bucket, column_family_id, key),
+                &mut encoded,
+            );
+            encoded.freeze()
+        };
+        let start_key = encode_scan_key(range.start);
+        let end_key = encode_scan_key(range.end);
         let memtable_iters = self
             .memtable_manager
             .scan_memtable_iterators_with_snapshot(
@@ -1185,6 +1195,8 @@ impl Db {
                 Arc::clone(&schema),
                 column_family_id,
                 options.columns(),
+                Some(start_key.clone()),
+                Some(end_key.clone()),
             )?;
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
@@ -1203,16 +1215,7 @@ impl Db {
                 return Err(err);
             }
         };
-        let encode_scan_key = |key: &[u8]| {
-            let mut encoded = BytesMut::with_capacity(4 + key.len());
-            encode_key_ref_into(
-                &RefKey::new_with_column_family(bucket, column_family_id, key),
-                &mut encoded,
-            );
-            encoded.freeze()
-        };
-        let start_key = encode_scan_key(range.start);
-        let end_bound = Some((encode_scan_key(range.end), false));
+        let end_bound = Some((end_key, false));
         let mut iter = DbIterator::new(
             memtable_iters,
             lsm_iters,
