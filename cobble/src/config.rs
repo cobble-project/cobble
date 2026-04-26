@@ -1,8 +1,10 @@
 use crate::SstCompressionAlgorithm;
 use crate::data_file::DataFileType;
 use crate::error::{Error, Result};
+use crate::schema::Schema;
 use crate::time::TimeProviderKind;
 use crate::util::{normalize_storage_path_to_url, size_to_u64, size_to_usize};
+use arc_swap::ArcSwapOption;
 use config::{Config as ConfigLoader, File as ConfigFile, FileFormat as ConfigFileFormat};
 use log::warn;
 use rand::seq::SliceRandom;
@@ -10,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use size::Size;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use toml::Value as TomlValue;
 use url::Url;
 
@@ -233,21 +235,42 @@ pub struct ReadOptions {
     pub column_family: Option<String>,
     pub column_indices: Option<Vec<usize>>,
     max_index: Option<usize>,
-    cached_masks: Arc<Mutex<Option<ReadOptionsMasks>>>,
+    cached_masks: Arc<ArcSwapOption<ReadOptionsMasks>>,
+    cached_column_family_id: Arc<ArcSwapOption<ColumnFamilyCacheEntry>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct ScanOptions {
     pub read_ahead_bytes: Size,
     pub column_indices: Option<Vec<usize>>,
     pub column_family: Option<String>,
     max_index: Option<usize>,
+    cached_resolution: Arc<ArcSwapOption<ScanOptionsCacheEntry>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct WriteOptions {
     pub ttl_seconds: Option<u32>,
     pub column_family: Option<String>,
+    cached_column_family_id: Arc<ArcSwapOption<ColumnFamilyCacheEntry>>,
+}
+
+#[derive(Clone, Debug)]
+struct ColumnFamilyCacheEntry {
+    schema_version: u64,
+    column_family_id: u8,
+}
+
+#[derive(Clone)]
+pub(crate) struct ScanOptionsResolved {
+    pub(crate) column_family_id: u8,
+    pub(crate) effective_schema: Arc<Schema>,
+}
+
+#[derive(Clone)]
+struct ScanOptionsCacheEntry {
+    schema_version: u64,
+    resolved: ScanOptionsResolved,
 }
 
 impl WriteOptions {
@@ -255,6 +278,7 @@ impl WriteOptions {
         Self {
             ttl_seconds: Some(ttl_seconds),
             column_family: None,
+            cached_column_family_id: Arc::new(ArcSwapOption::empty()),
         }
     }
 
@@ -262,11 +286,28 @@ impl WriteOptions {
         Self {
             ttl_seconds: None,
             column_family: Some(column_family.into()),
+            cached_column_family_id: Arc::new(ArcSwapOption::empty()),
         }
     }
 
     pub(crate) fn column_family(&self) -> Option<&str> {
         self.column_family.as_deref()
+    }
+
+    pub(crate) fn resolve_column_family_id_cached(&self, schema: &Schema) -> Result<u8> {
+        let schema_version = schema.version();
+        if let Some(cache) = self.cached_column_family_id.load_full()
+            && cache.schema_version == schema_version
+        {
+            return Ok(cache.column_family_id);
+        }
+        let column_family_id = schema.resolve_column_family_id(self.column_family())?;
+        self.cached_column_family_id
+            .store(Some(Arc::new(ColumnFamilyCacheEntry {
+                schema_version,
+                column_family_id,
+            })));
+        Ok(column_family_id)
     }
 }
 
@@ -283,7 +324,41 @@ impl Default for ReadOptions {
             column_family: None,
             column_indices: None,
             max_index: None,
-            cached_masks: Arc::new(Mutex::new(None)),
+            cached_masks: Arc::new(ArcSwapOption::empty()),
+            cached_column_family_id: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            read_ahead_bytes: Size::from_const(0),
+            column_indices: None,
+            column_family: None,
+            max_index: None,
+            cached_resolution: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+}
+
+impl std::fmt::Debug for ScanOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanOptions")
+            .field("read_ahead_bytes", &self.read_ahead_bytes)
+            .field("column_indices", &self.column_indices)
+            .field("column_family", &self.column_family)
+            .field("max_index", &self.max_index)
+            .finish()
+    }
+}
+
+impl Default for WriteOptions {
+    fn default() -> Self {
+        Self {
+            ttl_seconds: None,
+            column_family: None,
+            cached_column_family_id: Arc::new(ArcSwapOption::empty()),
         }
     }
 }
@@ -306,11 +381,13 @@ impl ScanOptions {
             column_indices,
             column_family: None,
             max_index,
+            cached_resolution: Arc::new(ArcSwapOption::empty()),
         }
     }
 
     pub fn with_column_family(mut self, column_family: impl Into<String>) -> Self {
         self.column_family = Some(column_family.into());
+        self.invalidate_caches();
         self
     }
 
@@ -328,6 +405,36 @@ impl ScanOptions {
 
     pub(crate) fn read_ahead_bytes(&self) -> Result<usize> {
         size_to_usize("scan.read_ahead_bytes", self.read_ahead_bytes).map_err(Error::ConfigError)
+    }
+
+    pub(crate) fn resolve_cached(&self, schema: &Arc<Schema>) -> Result<ScanOptionsResolved> {
+        let schema_version = schema.version();
+        if let Some(cache) = self.cached_resolution.load_full()
+            && cache.schema_version == schema_version
+        {
+            return Ok(cache.resolved.clone());
+        }
+
+        let column_family_id = schema.resolve_column_family_id(self.column_family())?;
+        let effective_schema = if let Some(columns) = self.columns() {
+            schema.project_in_family(column_family_id, columns)
+        } else {
+            Arc::clone(schema)
+        };
+        let resolved = ScanOptionsResolved {
+            column_family_id,
+            effective_schema,
+        };
+        self.cached_resolution
+            .store(Some(Arc::new(ScanOptionsCacheEntry {
+                schema_version,
+                resolved: resolved.clone(),
+            })));
+        Ok(resolved)
+    }
+
+    fn invalidate_caches(&mut self) {
+        self.cached_resolution = Arc::new(ArcSwapOption::empty());
     }
 }
 
@@ -359,12 +466,14 @@ impl ReadOptions {
             column_family,
             column_indices,
             max_index,
-            cached_masks: Arc::new(Mutex::new(None)),
+            cached_masks: Arc::new(ArcSwapOption::empty()),
+            cached_column_family_id: Arc::new(ArcSwapOption::empty()),
         }
     }
 
     pub fn with_column_family(mut self, column_family: impl Into<String>) -> Self {
         self.column_family = Some(column_family.into());
+        self.invalidate_caches();
         self
     }
 
@@ -381,15 +490,35 @@ impl ReadOptions {
     }
 
     pub(crate) fn masks(&self, num_columns: usize) -> ReadOptionsMasks {
-        let mut guard = self.cached_masks.lock().unwrap();
-        if guard
-            .as_ref()
-            .map(|mask| mask.num_columns != num_columns)
-            .unwrap_or(true)
+        if let Some(mask) = self.cached_masks.load_full()
+            && mask.num_columns == num_columns
         {
-            *guard = Some(self.build_masks(num_columns));
+            return mask.as_ref().clone();
         }
-        guard.as_ref().expect("cached mask initialized").clone()
+        let mask = Arc::new(self.build_masks(num_columns));
+        self.cached_masks.store(Some(Arc::clone(&mask)));
+        mask.as_ref().clone()
+    }
+
+    pub(crate) fn resolve_column_family_id_cached(&self, schema: &Schema) -> Result<u8> {
+        let schema_version = schema.version();
+        if let Some(cache) = self.cached_column_family_id.load_full()
+            && cache.schema_version == schema_version
+        {
+            return Ok(cache.column_family_id);
+        }
+        let column_family_id = schema.resolve_column_family_id(self.column_family())?;
+        self.cached_column_family_id
+            .store(Some(Arc::new(ColumnFamilyCacheEntry {
+                schema_version,
+                column_family_id,
+            })));
+        Ok(column_family_id)
+    }
+
+    fn invalidate_caches(&mut self) {
+        self.cached_masks = Arc::new(ArcSwapOption::empty());
+        self.cached_column_family_id = Arc::new(ArcSwapOption::empty());
     }
 
     fn build_masks(&self, num_columns: usize) -> ReadOptionsMasks {
@@ -1023,9 +1152,11 @@ mod tests {
     };
     use crate::SstCompressionAlgorithm;
     use crate::data_file::DataFileType;
+    use crate::schema::Schema;
     use size::Size;
     use std::io::Write;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::Builder;
 
     #[test]
@@ -1238,6 +1369,53 @@ mod tests {
         let options = WriteOptions::with_column_family("metrics");
         assert_eq!(options.column_family(), Some("metrics"));
         assert_eq!(options.ttl_seconds, None);
+    }
+
+    #[test]
+    fn test_write_options_column_family_cache_invalidates_on_schema_change() {
+        let schema_v1 = Schema::new_for_column_family(1, 1, vec![], vec![]);
+        let schema_v2 = Schema::new_for_column_family(2, 2, vec![], vec![]);
+        let options = WriteOptions::with_column_family("remote-cf-1");
+
+        let resolved = options.resolve_column_family_id_cached(&schema_v1).unwrap();
+        assert_eq!(resolved, 1);
+
+        let err = options
+            .resolve_column_family_id_cached(&schema_v2)
+            .expect_err("schema version change should invalidate cache");
+        assert!(matches!(err, Error::IoError(msg) if msg.contains("Unknown column family")));
+    }
+
+    #[test]
+    fn test_read_options_cache_invalidates_via_with_column_family() {
+        let schema = Schema::new_for_column_family(1, 1, vec![], vec![]);
+        let options = ReadOptions::for_column(0);
+        assert_eq!(options.resolve_column_family_id_cached(&schema).unwrap(), 0);
+
+        let options = options.with_column_family("remote-cf-1");
+        assert_eq!(options.resolve_column_family_id_cached(&schema).unwrap(), 1);
+
+        let options = options.with_column_family("missing");
+        let err = options
+            .resolve_column_family_id_cached(&schema)
+            .expect_err("with_column_family should invalidate and re-resolve");
+        assert!(matches!(err, Error::IoError(msg) if msg.contains("Unknown column family")));
+    }
+
+    #[test]
+    fn test_scan_options_cache_invalidates_via_with_column_family() {
+        let schema = Arc::new(Schema::new(7, 3, vec![]));
+        let options = ScanOptions::for_column(0);
+
+        let first = options.resolve_cached(&schema).unwrap();
+        assert_eq!(first.effective_schema.num_columns_in_family(0), Some(1));
+
+        let options = options.with_column_family("missing");
+        let err = match options.resolve_cached(&schema) {
+            Ok(_) => panic!("with_column_family should invalidate and re-resolve"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::IoError(msg) if msg.contains("Unknown column family")));
     }
 
     #[test]

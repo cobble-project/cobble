@@ -289,7 +289,7 @@ pub(crate) fn take_last_overflow_direct_buffer<'local>(
 }
 
 thread_local! {
-    static LAST_OVERFLOW_DIRECT_BUFFER: RefCell<Option<GlobalRef>> = RefCell::new(None);
+    static LAST_OVERFLOW_DIRECT_BUFFER: RefCell<Option<GlobalRef>> = const { RefCell::new(None) };
 }
 
 fn get_or_grow_overflow_direct_buffer<'local>(

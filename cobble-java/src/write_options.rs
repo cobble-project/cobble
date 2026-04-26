@@ -3,7 +3,6 @@ use cobble::WriteOptions;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jint, jlong};
-use std::sync::OnceLock;
 
 pub(crate) struct WriteOptionsHandle {
     write_options: WriteOptions,
@@ -25,9 +24,6 @@ pub(crate) fn write_options_from_handle_or_throw(
     env: &mut JNIEnv,
     native_handle: jlong,
 ) -> Option<&'static WriteOptionsHandle> {
-    if native_handle == 0 {
-        return Some(default_write_options_handle());
-    }
     write_options_from_handle_or_throw_impl(env, native_handle)
 }
 
@@ -147,9 +143,4 @@ fn write_options_from_handle_mut_or_throw(
     }
     // SAFETY: `native_handle` is created from `Box<WriteOptionsHandle>` and valid until dispose.
     Some(unsafe { &mut *(native_handle as *mut WriteOptionsHandle) })
-}
-
-fn default_write_options_handle() -> &'static WriteOptionsHandle {
-    static DEFAULT_WRITE_OPTIONS_HANDLE: OnceLock<WriteOptionsHandle> = OnceLock::new();
-    DEFAULT_WRITE_OPTIONS_HANDLE.get_or_init(WriteOptionsHandle::new)
 }

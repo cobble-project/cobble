@@ -56,10 +56,10 @@ let row = db.get(0, b"k1")?.unwrap();
 Structured wrappers use the same family-selection model as raw Cobble:
 
 - add or delete typed columns with `Option<String>` family arguments on the schema builder;
-- use `WriteOptions`, `ReadOptions`, and `ScanOptions` to select a named family at write/read/scan time.
+- use `StructuredWriteOptions`, `StructuredReadOptions`, and `StructuredScanOptions` to select a named family at write/read/scan time.
 
 ```rust
-use cobble::{ReadOptions, ScanOptions, WriteOptions};
+use cobble_data_structure::{StructuredReadOptions, StructuredScanOptions, StructuredWriteOptions};
 
 db.update_schema()
   .add_list_column(Some("metrics".to_string()), 0, ListConfig {
@@ -74,19 +74,19 @@ db.put_with_options(
     b"k-metrics",
     0,
     StructuredColumnValue::List(vec![Bytes::from_static(b"a")]),
-    &WriteOptions::with_column_family("metrics"),
+    &StructuredWriteOptions::with_column_family("metrics"),
 )?;
 
 let row = db.get_with_options(
     0,
     b"k-metrics",
-    &ReadOptions::for_column_in_family("metrics", 0),
+    &StructuredReadOptions::for_column_in_family("metrics", 0),
 )?;
 
 let scanner = db.scan_with_options(
     0,
     b"k".as_ref()..b"l".as_ref(),
-    &ScanOptions::for_column(0).with_column_family("metrics"),
+    &StructuredScanOptions::for_column(0).with_column_family("metrics"),
 )?;
 ```
 
@@ -137,8 +137,10 @@ Adding a typed column in a new family also creates that family in the underlying
 Corresponding structured wrappers are provided for `Reader` and `ReadOnlyDb`:
 
 ```rust
-use cobble::{Config, ReadOptions, ReaderConfig, ScanOptions, VolumeDescriptor};
-use cobble_data_structure::{StructuredReader, StructuredReadOnlyDb};
+use cobble::{Config, ReaderConfig, VolumeDescriptor};
+use cobble_data_structure::{
+    StructuredReadOnlyDb, StructuredReadOptions, StructuredReader, StructuredScanOptions,
+};
 
 let read_config = ReaderConfig {
     volumes: VolumeDescriptor::single_volume("file:///tmp/my-db"),
@@ -150,7 +152,7 @@ let mut reader = StructuredReader::open_current(read_config)?;
 let row = reader.get_with_options(
     0,
     b"k1",
-    &ReadOptions::for_column_in_family("metrics", 0),
+    &StructuredReadOptions::for_column_in_family("metrics", 0),
 )?;
 reader.refresh()?;
 
@@ -162,26 +164,25 @@ let ro = StructuredReadOnlyDb::open(config, snapshot_id, db_id)?;
 let row2 = ro.get_with_options(
     0,
     b"k1",
-    &ReadOptions::for_column_in_family("metrics", 0),
+    &StructuredReadOptions::for_column_in_family("metrics", 0),
 )?;
 let scanner = ro.scan_with_options(
     0,
     b"k".as_ref()..b"l".as_ref(),
-    &ScanOptions::for_column(0).with_column_family("metrics"),
+    &StructuredScanOptions::for_column(0).with_column_family("metrics"),
 )?;
 ```
 
 ## Structured Distributed Scan
 
 ```rust
-use cobble::ScanOptions;
-use cobble_data_structure::StructuredScanPlan;
+use cobble_data_structure::{StructuredScanOptions, StructuredScanPlan};
 
 let plan = StructuredScanPlan::new(global_manifest); // still bucket-only
 for split in plan.splits() {
     let scanner = split.create_scanner(
         config.clone(),
-        &ScanOptions::for_column(0).with_column_family("metrics"),
+        &StructuredScanOptions::for_column(0).with_column_family("metrics"),
     )?;
     for row in scanner {
         let (key, columns) = row?;
@@ -194,4 +195,4 @@ As with raw scans, the family is chosen when creating the scanner. If you omit `
 
 ## Projection Notes
 
-`ReadOptions`/`ScanOptions` projection is supported. Projection indices are interpreted inside the selected column family, and the structured wrappers remap schema indices correctly so decoded values match the projected column order.
+`StructuredReadOptions`/`StructuredScanOptions` projection is supported. Projection indices are interpreted inside the selected column family, and the structured wrappers remap schema indices correctly so decoded values match the projected column order.

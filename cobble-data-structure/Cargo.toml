@@ -29,6 +29,7 @@ storage-s3 = ["cobble/storage-s3"]
 storage-sftp = ["cobble/storage-sftp"]
 
 [dependencies]
+arc-swap = { workspace = true }
 bytes = { workspace = true }
 cobble = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

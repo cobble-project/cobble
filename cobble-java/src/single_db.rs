@@ -247,18 +247,23 @@ pub extern "system" fn Java_io_cobble_SingleDb_putWithOptions(
             return;
         }
     };
-    let Some(write_options_handle) =
-        write_options_from_handle_or_throw(&mut env, write_options_handle)
-    else {
-        return;
+    let result = if write_options_handle == 0 {
+        db.put(bucket, key, column, value)
+    } else {
+        let Some(write_options_handle) =
+            write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.put_with_options(
+            bucket,
+            key,
+            column,
+            value,
+            write_options_handle.write_options(),
+        )
     };
-    if let Err(err) = db.put_with_options(
-        bucket,
-        key,
-        column,
-        value,
-        write_options_handle.write_options(),
-    ) {
+    if let Err(err) = result {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -351,18 +356,23 @@ pub extern "system" fn Java_io_cobble_SingleDb_mergeWithOptions(
             return;
         }
     };
-    let Some(write_options_handle) =
-        write_options_from_handle_or_throw(&mut env, write_options_handle)
-    else {
-        return;
+    let result = if write_options_handle == 0 {
+        db.merge(bucket, key, column, value)
+    } else {
+        let Some(write_options_handle) =
+            write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.merge_with_options(
+            bucket,
+            key,
+            column,
+            value,
+            write_options_handle.write_options(),
+        )
     };
-    if let Err(err) = db.merge_with_options(
-        bucket,
-        key,
-        column,
-        value,
-        write_options_handle.write_options(),
-    ) {
+    if let Err(err) = result {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -393,12 +403,16 @@ pub extern "system" fn Java_io_cobble_SingleDb_get(
             return std::ptr::null_mut();
         }
     };
-    let Some(read_options_handle) =
-        read_options_from_handle_or_throw(&mut env, read_options_handle)
-    else {
-        return std::ptr::null_mut();
-    };
-    let values = match db.get_with_options(bucket, &key, read_options_handle.read_options()) {
+    let values = match if read_options_handle == 0 {
+        db.get(bucket, &key)
+    } else {
+        let Some(read_options_handle) =
+            read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        db.get_with_options(bucket, &key, read_options_handle.read_options())
+    } {
         Ok(values) => values,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -489,14 +503,17 @@ pub extern "system" fn Java_io_cobble_SingleDb_deleteWithOptions(
             return;
         }
     };
-    let Some(write_options_handle) =
-        write_options_from_handle_or_throw(&mut env, write_options_handle)
-    else {
-        return;
-    };
-    if let Err(err) =
+    let result = if write_options_handle == 0 {
+        db.delete(bucket, key, column)
+    } else {
+        let Some(write_options_handle) =
+            write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
         db.delete_with_options(bucket, key, column, write_options_handle.write_options())
-    {
+    };
+    if let Err(err) = result {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -662,20 +679,32 @@ pub extern "system" fn Java_io_cobble_SingleDb_openScanCursor(
     ) else {
         return 0;
     };
-    let iter = match db.scan_with_options(
-        args.bucket,
-        args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
-        args.scan_options_handle.scan_options(),
-    ) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
-            return 0;
-        }
+    let iter = match args.scan_options_handle {
+        Some(scan_options_handle) => match db.scan_with_options(
+            args.bucket,
+            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+            scan_options_handle.scan_options(),
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        },
+        None => match db.scan(
+            args.bucket,
+            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        },
     };
     Box::into_raw(Box::new(ScanCursorHandle::from_static_iter(
         iter,
-        args.scan_options_handle.batch_size(),
+        args.batch_size,
     ))) as jlong
 }
 

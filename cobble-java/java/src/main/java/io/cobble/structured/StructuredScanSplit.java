@@ -2,7 +2,6 @@ package io.cobble.structured;
 
 import io.cobble.Config;
 import io.cobble.NativeLoader;
-import io.cobble.ScanOptions;
 import io.cobble.ShardSnapshot;
 
 import com.google.gson.Gson;

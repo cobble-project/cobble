@@ -86,7 +86,7 @@ reader.refresh();
 The Java API exposes column families in two ways:
 
 - convenience overloads with `String columnFamily` on `Db`, `SingleDb`, `ReadOnlyDb`, `Reader`, and structured wrappers;
-- reusable `ReadOptions`, `WriteOptions`, and `ScanOptions` objects.
+- reusable options objects (`io.cobble.*Options` for raw APIs, `io.cobble.structured.*Options` for structured APIs).
 
 `ScanPlan` / `StructuredScanPlan` stay bucket-only. To scan a named family, build the plan from a global snapshot as usual, then pass `ScanOptions.columnFamily(...)` when opening the scanner. That scanner-open step is where the family becomes effective.
 
@@ -126,6 +126,9 @@ assert schema.columnFamily("metrics") != null;
 ```
 
 `ReadOptions` also provides `forColumnsInFamily(...)` and `defaultsInFamily(...)`. `ScanOptions` intentionally uses `forColumns(...).columnFamily(...)`.
+
+For Java `*WithOptions(...)` methods, passing `null` means "no explicit options": JNI routes directly
+to Cobble core no-options APIs (it does not synthesize default options objects in JNI).
 
 ### Raw API Direct ByteBuffer Path
 
@@ -203,6 +206,15 @@ GlobalSnapshot globalSnapshot =
 ### Structured Wrappers
 
 Structured wrappers are schema-driven and currently support typed `Bytes` and `List` columns. See [Structured DB](../getting-started/structured-db).
+
+On Java APIs, options class names stay unchanged but package paths are split:
+structured wrappers take `io.cobble.structured.ReadOptions`,
+`io.cobble.structured.ScanOptions`, and `io.cobble.structured.WriteOptions`.
+Raw wrappers keep using `io.cobble.ReadOptions`, `io.cobble.ScanOptions`,
+and `io.cobble.WriteOptions`.
+
+Structured `*WithOptions(...)` methods follow the same `null` behavior as raw APIs: `null` routes to
+core no-options paths directly.
 
 Structured direct-read APIs (`getDirect`, `getDirectWithOptions`) use an internal direct-buffer
 pool. Pool settings are loaded from the opened DB config (`jni_direct_buffer_size`,

@@ -1,14 +1,16 @@
 use crate::structured_db::{
-    StructuredColumnValue, StructuredDbIterator, StructuredSchema, combined_resolver, decode_row,
-    load_structured_schema_from_cobble_schema,
+    StructuredColumnValue, StructuredDbIterator, StructuredReadOptions, StructuredScanOptions,
+    StructuredSchema, combined_resolver, decode_row, load_structured_schema_from_cobble_schema,
 };
-use cobble::{Config, MergeOperatorResolver, ReadOnlyDb, ReadOptions, Result, ScanOptions};
+use cobble::{Config, MergeOperatorResolver, ReadOnlyDb, Result};
 use std::ops::Range;
 use std::sync::Arc;
 
 pub struct StructuredReadOnlyDb {
     db: ReadOnlyDb,
     structured_schema: Arc<StructuredSchema>,
+    default_read_options: StructuredReadOptions,
+    default_scan_options: StructuredScanOptions,
 }
 
 impl StructuredReadOnlyDb {
@@ -32,6 +34,8 @@ impl StructuredReadOnlyDb {
         Ok(Self {
             db,
             structured_schema: Arc::new(structured_schema),
+            default_read_options: StructuredReadOptions::default(),
+            default_scan_options: StructuredScanOptions::default(),
         })
     }
 
@@ -48,42 +52,35 @@ impl StructuredReadOnlyDb {
         bucket: u16,
         key: &[u8],
     ) -> Result<Option<Vec<Option<StructuredColumnValue>>>> {
-        let raw = self.db.get(bucket, key)?;
-        let default_schema = self.structured_schema.projected(0, None);
-        raw.map(|columns| decode_row(&default_schema, 0, columns))
-            .transpose()
+        self.get_with_options(bucket, key, &self.default_read_options)
     }
 
     pub fn get_with_options(
         &self,
         bucket: u16,
         key: &[u8],
-        options: &ReadOptions,
+        options: &StructuredReadOptions,
     ) -> Result<Option<Vec<Option<StructuredColumnValue>>>> {
-        let raw = self.db.get_with_options(bucket, key, options)?;
-        let projected_schema = self.structured_schema.project_structured_family(
-            options.column_family.as_deref(),
-            options.column_indices.as_deref(),
-        )?;
+        let raw = self.db.get_with_options(bucket, key, options.as_cobble())?;
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
         raw.map(|columns| decode_row(&projected_schema, 0, columns))
             .transpose()
     }
 
     pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<StructuredDbIterator<'static>> {
-        self.scan_with_options(bucket, range, &ScanOptions::default())
+        self.scan_with_options(bucket, range, &self.default_scan_options)
     }
 
     pub fn scan_with_options(
         &self,
         bucket: u16,
         range: Range<&[u8]>,
-        options: &ScanOptions,
+        options: &StructuredScanOptions,
     ) -> Result<StructuredDbIterator<'static>> {
-        let inner = self.db.scan_with_options(bucket, range, options)?;
-        let projected_schema = self.structured_schema.project_structured_family(
-            options.column_family.as_deref(),
-            options.column_indices.as_deref(),
-        )?;
+        let inner = self
+            .db
+            .scan_with_options(bucket, range, options.as_cobble())?;
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
         Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 }
@@ -95,7 +92,7 @@ mod tests {
     use crate::list::{ListConfig, ListRetainMode};
     use crate::structured_db::StructuredDb;
     use bytes::Bytes;
-    use cobble::{ReadOptions, VolumeDescriptor, WriteOptions};
+    use cobble::VolumeDescriptor;
     use std::collections::BTreeMap;
     use std::thread;
     use std::time::Duration;
@@ -214,7 +211,7 @@ mod tests {
 
         let rodb = StructuredReadOnlyDb::open(config, snap_id, db_id).unwrap();
         let row = rodb
-            .get_with_options(0, b"k1", &ReadOptions::for_column(1))
+            .get_with_options(0, b"k1", &StructuredReadOptions::for_column(1))
             .unwrap()
             .expect("row exists");
         assert_eq!(row.len(), 1);
@@ -240,7 +237,7 @@ mod tests {
             .add_list_column(Some("metrics".to_string()), 0, metrics_config.clone())
             .commit()
             .unwrap();
-        let metrics_write = WriteOptions::with_column_family("metrics");
+        let metrics_write = crate::StructuredWriteOptions::with_column_family("metrics");
         db.put_with_options(0, b"k1", 0, vec![Bytes::from_static(b"a")], &metrics_write)
             .unwrap();
         db.merge_with_options(0, b"k1", 0, vec![Bytes::from_static(b"b")], &metrics_write)
@@ -254,7 +251,11 @@ mod tests {
         assert!(rodb.current_schema().column_families.contains_key(&1));
 
         let row = rodb
-            .get_with_options(0, b"k1", &ReadOptions::for_column_in_family("metrics", 0))
+            .get_with_options(
+                0,
+                b"k1",
+                &StructuredReadOptions::for_column_in_family("metrics", 0),
+            )
             .unwrap()
             .expect("row exists");
         assert_eq!(
@@ -269,7 +270,7 @@ mod tests {
             .scan_with_options(
                 0,
                 b"k0".as_ref()..b"k9".as_ref(),
-                &ScanOptions::for_column(0).with_column_family("metrics"),
+                &StructuredScanOptions::for_column(0).with_column_family("metrics"),
             )
             .unwrap();
         let first = iter.next().expect("one row").unwrap();

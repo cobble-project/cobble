@@ -1,15 +1,19 @@
 use crate::structured_db::{
-    StructuredColumnValue, StructuredDbIterator, StructuredSchema, StructuredSchemaBuilder,
-    StructuredSchemaOwner, StructuredWriteBatch, decode_row, encode_for_write,
+    StructuredColumnValue, StructuredDbIterator, StructuredReadOptions, StructuredScanOptions,
+    StructuredSchema, StructuredSchemaBuilder, StructuredSchemaOwner, StructuredWriteBatch,
+    StructuredWriteOptions, decode_row, encode_for_write,
     load_structured_schema_from_cobble_schema, persist_structured_schema_on_db,
 };
-use cobble::{Config, ReadOptions, Result, ScanOptions, SingleDb, WriteOptions};
+use cobble::{Config, Result, SingleDb};
 use std::ops::Range;
 use std::sync::Arc;
 
 pub struct StructuredSingleDb {
     db: SingleDb,
     structured_schema: Arc<StructuredSchema>,
+    default_write_options: StructuredWriteOptions,
+    default_read_options: StructuredReadOptions,
+    default_scan_options: StructuredScanOptions,
 }
 
 impl StructuredSingleDb {
@@ -20,6 +24,9 @@ impl StructuredSingleDb {
         Ok(Self {
             db,
             structured_schema: Arc::new(structured_schema),
+            default_write_options: StructuredWriteOptions::default(),
+            default_read_options: StructuredReadOptions::default(),
+            default_scan_options: StructuredScanOptions::default(),
         })
     }
 
@@ -37,9 +44,16 @@ impl StructuredSingleDb {
 }
 
 impl StructuredSingleDb {
+    fn reset_default_options(&mut self) {
+        self.default_write_options = StructuredWriteOptions::default();
+        self.default_read_options = StructuredReadOptions::default();
+        self.default_scan_options = StructuredScanOptions::default();
+    }
+
     pub fn reload_schema(&mut self) -> Result<()> {
         let schema = load_structured_schema_from_cobble_schema(&self.db.db().current_schema())?;
         self.structured_schema = Arc::new(schema);
+        self.reset_default_options();
         Ok(())
     }
 
@@ -50,6 +64,7 @@ impl StructuredSingleDb {
         persist_structured_schema_on_db(self.db.db(), &structured_schema)?;
         let reloaded = load_structured_schema_from_cobble_schema(&self.db.db().current_schema())?;
         self.structured_schema = Arc::new(reloaded.clone());
+        self.reset_default_options();
         Ok(reloaded)
     }
 
@@ -60,7 +75,7 @@ impl StructuredSingleDb {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        self.put_with_options(bucket, key, column, value, &WriteOptions::default())
+        self.put_with_options(bucket, key, column, value, &self.default_write_options)
     }
 
     pub fn put_with_options<K, V>(
@@ -69,7 +84,7 @@ impl StructuredSingleDb {
         key: K,
         column: u16,
         value: V,
-        options: &WriteOptions,
+        options: &StructuredWriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -77,14 +92,14 @@ impl StructuredSingleDb {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
-            options.column_family.as_deref(),
+            options.column_family(),
             self.db.db().now_seconds(),
             column,
             value.into(),
-            options.ttl_seconds,
+            options.ttl_seconds(),
         )?;
         self.db
-            .put_with_options(bucket, key, column, encoded, options)
+            .put_with_options(bucket, key, column, encoded, options.as_cobble())
     }
 
     pub fn merge<K, V>(&self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
@@ -92,7 +107,7 @@ impl StructuredSingleDb {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        self.merge_with_options(bucket, key, column, value, &WriteOptions::default())
+        self.merge_with_options(bucket, key, column, value, &self.default_write_options)
     }
 
     pub fn merge_with_options<K, V>(
@@ -101,7 +116,7 @@ impl StructuredSingleDb {
         key: K,
         column: u16,
         value: V,
-        options: &WriteOptions,
+        options: &StructuredWriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -109,21 +124,21 @@ impl StructuredSingleDb {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
-            options.column_family.as_deref(),
+            options.column_family(),
             self.db.db().now_seconds(),
             column,
             value.into(),
-            options.ttl_seconds,
+            options.ttl_seconds(),
         )?;
         self.db
-            .merge_with_options(bucket, key, column, encoded, options)
+            .merge_with_options(bucket, key, column, encoded, options.as_cobble())
     }
 
     pub fn delete<K>(&self, bucket: u16, key: K, column: u16) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
-        self.delete_with_options(bucket, key, column, &WriteOptions::default())
+        self.delete_with_options(bucket, key, column, &self.default_write_options)
     }
 
     pub fn delete_with_options<K>(
@@ -131,12 +146,13 @@ impl StructuredSingleDb {
         bucket: u16,
         key: K,
         column: u16,
-        options: &WriteOptions,
+        options: &StructuredWriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
-        self.db.delete_with_options(bucket, key, column, options)
+        self.db
+            .delete_with_options(bucket, key, column, options.as_cobble())
     }
 
     pub fn new_write_batch(&self) -> StructuredWriteBatch {
@@ -156,26 +172,22 @@ impl StructuredSingleDb {
     where
         K: AsRef<[u8]>,
     {
-        let raw = self.db.get(bucket, key.as_ref())?;
-        let default_schema = self.structured_schema.projected(0, None);
-        raw.map(|columns| decode_row(&default_schema, 0, columns))
-            .transpose()
+        self.get_with_options(bucket, key, &self.default_read_options)
     }
 
     pub fn get_with_options<K>(
         &self,
         bucket: u16,
         key: K,
-        options: &ReadOptions,
+        options: &StructuredReadOptions,
     ) -> Result<Option<Vec<Option<StructuredColumnValue>>>>
     where
         K: AsRef<[u8]>,
     {
-        let raw = self.db.get_with_options(bucket, key.as_ref(), options)?;
-        let projected_schema = self.structured_schema.project_structured_family(
-            options.column_family.as_deref(),
-            options.column_indices.as_deref(),
-        )?;
+        let raw = self
+            .db
+            .get_with_options(bucket, key.as_ref(), options.as_cobble())?;
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
         raw.map(|columns| decode_row(&projected_schema, 0, columns))
             .transpose()
     }
@@ -185,20 +197,19 @@ impl StructuredSingleDb {
         bucket: u16,
         range: Range<&[u8]>,
     ) -> Result<StructuredDbIterator<'a>> {
-        self.scan_with_options(bucket, range, &ScanOptions::default())
+        self.scan_with_options(bucket, range, &self.default_scan_options)
     }
 
     pub fn scan_with_options<'a>(
         &'a self,
         bucket: u16,
         range: Range<&[u8]>,
-        options: &ScanOptions,
+        options: &StructuredScanOptions,
     ) -> Result<StructuredDbIterator<'a>> {
-        let inner = self.db.scan_with_options(bucket, range, options)?;
-        let projected_schema = self.structured_schema.project_structured_family(
-            options.column_family.as_deref(),
-            options.column_indices.as_deref(),
-        )?;
+        let inner = self
+            .db
+            .scan_with_options(bucket, range, options.as_cobble())?;
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
         Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
@@ -256,7 +267,7 @@ mod tests {
     use super::*;
     use crate::list::{ListConfig, ListRetainMode};
     use bytes::Bytes;
-    use cobble::{ReadOptions, VolumeDescriptor};
+    use cobble::VolumeDescriptor;
     use std::thread;
     use std::time::Duration;
     use uuid::Uuid;
@@ -400,7 +411,7 @@ mod tests {
             .unwrap();
 
         let row = db
-            .get_with_options(0, b"k1", &ReadOptions::for_column(1))
+            .get_with_options(0, b"k1", &StructuredReadOptions::for_column(1))
             .unwrap()
             .expect("row exists");
         assert_eq!(row.len(), 1);

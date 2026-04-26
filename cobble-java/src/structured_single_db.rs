@@ -4,18 +4,18 @@
 // Typed put/merge accept both bytes (byte[]) and list (byte[][]).
 // Typed get returns Object[] where each element is null | byte[] | byte[][].
 
-use crate::read_options::read_options_from_handle_or_throw;
-use crate::scan::decode_scan_open_args;
 use crate::structured::{
     StructuredScanCursorHandle, StructuredSchemaBuilderHandle, decode_write_bytes_args,
     decode_write_list_args, to_java_typed_columns,
 };
+use crate::structured_read_options::structured_read_options_from_handle_or_throw;
+use crate::structured_scan_options::decode_structured_scan_open_args;
+use crate::structured_write_options::structured_write_options_from_handle_or_throw;
 use crate::util::{
     complete_future_exceptionally, complete_future_with_string, decode_java_bytes_ref,
     decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong, parse_config_json,
     throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
 };
-use crate::write_options::write_options_from_handle_or_throw;
 use bytes::Bytes;
 use cobble::Config;
 use cobble_data_structure::{StructuredColumnValue, StructuredSingleDb};
@@ -194,16 +194,28 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_putBytesWithOptions(
     else {
         return;
     };
-    let Some(wo) = write_options_from_handle_or_throw(&mut env, write_options_handle) else {
-        return;
+    let result = if write_options_handle == 0 {
+        db.put(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
+        )
+    } else {
+        let Some(wo) =
+            structured_write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.put_with_options(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
+            wo.write_options(),
+        )
     };
-    if let Err(err) = db.put_with_options(
-        bucket,
-        key,
-        col,
-        StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
-        wo.write_options(),
-    ) {
+    if let Err(err) = result {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -255,16 +267,28 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_mergeBytesWithOptions(
     else {
         return;
     };
-    let Some(wo) = write_options_from_handle_or_throw(&mut env, write_options_handle) else {
-        return;
+    let result = if write_options_handle == 0 {
+        db.merge(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
+        )
+    } else {
+        let Some(wo) =
+            structured_write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.merge_with_options(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
+            wo.write_options(),
+        )
     };
-    if let Err(err) = db.merge_with_options(
-        bucket,
-        key,
-        col,
-        StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
-        wo.write_options(),
-    ) {
+    if let Err(err) = result {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -313,16 +337,23 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_putListWithOptions(
     else {
         return;
     };
-    let Some(wo) = write_options_from_handle_or_throw(&mut env, write_options_handle) else {
-        return;
+    let result = if write_options_handle == 0 {
+        db.put(bucket, key, col, StructuredColumnValue::List(list))
+    } else {
+        let Some(wo) =
+            structured_write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.put_with_options(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::List(list),
+            wo.write_options(),
+        )
     };
-    if let Err(err) = db.put_with_options(
-        bucket,
-        key,
-        col,
-        StructuredColumnValue::List(list),
-        wo.write_options(),
-    ) {
+    if let Err(err) = result {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -369,16 +400,23 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_mergeListWithOptions(
     else {
         return;
     };
-    let Some(wo) = write_options_from_handle_or_throw(&mut env, write_options_handle) else {
-        return;
+    let result = if write_options_handle == 0 {
+        db.merge(bucket, key, col, StructuredColumnValue::List(list))
+    } else {
+        let Some(wo) =
+            structured_write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.merge_with_options(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::List(list),
+            wo.write_options(),
+        )
     };
-    if let Err(err) = db.merge_with_options(
-        bucket,
-        key,
-        col,
-        StructuredColumnValue::List(list),
-        wo.write_options(),
-    ) {
+    if let Err(err) = result {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -396,9 +434,6 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_deleteWithOptions(
     write_options_handle: jlong,
 ) {
     let Some(db) = single_db_from_handle(&mut env, handle) else {
-        return;
-    };
-    let Some(wo) = write_options_from_handle_or_throw(&mut env, write_options_handle) else {
         return;
     };
     let bucket = match decode_u16("bucket", bucket) {
@@ -422,7 +457,17 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_deleteWithOptions(
             return;
         }
     };
-    if let Err(err) = db.delete_with_options(bucket, key, column, wo.write_options()) {
+    let result = if write_options_handle == 0 {
+        db.delete(bucket, key, column)
+    } else {
+        let Some(wo) =
+            structured_write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.delete_with_options(bucket, key, column, wo.write_options())
+    };
+    if let Err(err) = result {
         throw_illegal_state(&mut env, err.to_string());
     }
 }
@@ -492,9 +537,6 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_getTypedWithOptions<'l
             return std::ptr::null_mut();
         }
     };
-    let Some(ro) = read_options_from_handle_or_throw(&mut env, read_options_handle) else {
-        return std::ptr::null_mut();
-    };
     let key_bytes = match decode_java_bytes_ref(&mut env, &key) {
         Ok(v) => v,
         Err(err) => {
@@ -502,7 +544,15 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_getTypedWithOptions<'l
             return std::ptr::null_mut();
         }
     };
-    let values = match db.get_with_options(bucket, &key_bytes, ro.read_options()) {
+    let values = match if read_options_handle == 0 {
+        db.get(bucket, &key_bytes)
+    } else {
+        let Some(ro) = structured_read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        db.get_with_options(bucket, &key_bytes, ro.read_options())
+    } {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -536,7 +586,7 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_openStructuredScanCurs
     let Some(db) = single_db_from_handle(&mut env, handle) else {
         return 0;
     };
-    let Some(args) = decode_scan_open_args(
+    let Some(args) = decode_structured_scan_open_args(
         &mut env,
         bucket,
         start_key_inclusive,
@@ -545,16 +595,25 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_openStructuredScanCurs
     ) else {
         return 0;
     };
-    let batch_size = args.scan_options_handle.batch_size();
+    let batch_size = args.batch_size;
     let range = args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice();
-    let iter =
-        match db.scan_with_options(args.bucket, range, args.scan_options_handle.scan_options()) {
+    let iter = if let Some(scan_options_handle) = args.scan_options_handle {
+        match db.scan_with_options(args.bucket, range, scan_options_handle.scan_options()) {
             Ok(iter) => iter,
             Err(err) => {
                 throw_illegal_state(&mut env, err.to_string());
                 return 0;
             }
-        };
+        }
+    } else {
+        match db.scan(args.bucket, range) {
+            Ok(iter) => iter,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        }
+    };
     // SAFETY: StructuredDbIterator borrows from StructuredSingleDb which is alive as long as
     // the Java SingleDb object keeps the native handle.
     let iter = unsafe {

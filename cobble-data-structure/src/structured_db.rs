@@ -2,6 +2,7 @@ use crate::list::{
     LIST_OPERATOR_ID, ListConfig, decode_list_for_read, encode_list_for_write, list_operator,
     list_operator_from_metadata,
 };
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use cobble::{
     BytesMergeOperator, Config, Db, DbIterator, Error, MergeOperatorResolver, ReadOptions, Result,
@@ -344,7 +345,13 @@ impl StructuredWriteBatch {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        self.put_with_options(bucket, key, column, value, &WriteOptions::default())
+        self.put_with_options(
+            bucket,
+            key,
+            column,
+            value,
+            &StructuredWriteOptions::default(),
+        )
     }
 
     pub fn put_with_options<K, V>(
@@ -353,7 +360,7 @@ impl StructuredWriteBatch {
         key: K,
         column: u16,
         value: V,
-        options: &WriteOptions,
+        options: &StructuredWriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -361,14 +368,14 @@ impl StructuredWriteBatch {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
-            options.column_family.as_deref(),
+            options.column_family(),
             self.now_seconds,
             column,
             value.into(),
-            options.ttl_seconds,
+            options.ttl_seconds(),
         )?;
         self.inner
-            .put_with_options(bucket, key, column, encoded, options);
+            .put_with_options(bucket, key, column, encoded, options.as_cobble());
         Ok(())
     }
 
@@ -376,7 +383,7 @@ impl StructuredWriteBatch {
     where
         K: AsRef<[u8]>,
     {
-        self.delete_with_options(bucket, key, column, &WriteOptions::default());
+        self.delete_with_options(bucket, key, column, &StructuredWriteOptions::default());
     }
 
     pub fn delete_with_options<K>(
@@ -384,11 +391,12 @@ impl StructuredWriteBatch {
         bucket: u16,
         key: K,
         column: u16,
-        options: &WriteOptions,
+        options: &StructuredWriteOptions,
     ) where
         K: AsRef<[u8]>,
     {
-        self.inner.delete_with_options(bucket, key, column, options);
+        self.inner
+            .delete_with_options(bucket, key, column, options.as_cobble());
     }
 
     pub fn merge<K, V>(&mut self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
@@ -396,7 +404,13 @@ impl StructuredWriteBatch {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        self.merge_with_options(bucket, key, column, value, &WriteOptions::default())
+        self.merge_with_options(
+            bucket,
+            key,
+            column,
+            value,
+            &StructuredWriteOptions::default(),
+        )
     }
 
     pub fn merge_with_options<K, V>(
@@ -405,7 +419,7 @@ impl StructuredWriteBatch {
         key: K,
         column: u16,
         value: V,
-        options: &WriteOptions,
+        options: &StructuredWriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -413,14 +427,14 @@ impl StructuredWriteBatch {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
-            options.column_family.as_deref(),
+            options.column_family(),
             self.now_seconds,
             column,
             value.into(),
-            options.ttl_seconds,
+            options.ttl_seconds(),
         )?;
         self.inner
-            .merge_with_options(bucket, key, column, encoded, options);
+            .merge_with_options(bucket, key, column, encoded, options.as_cobble());
         Ok(())
     }
 
@@ -460,6 +474,225 @@ impl From<Vec<Vec<u8>>> for StructuredColumnValue {
 pub struct StructuredDb {
     db: Db,
     structured_schema: Arc<StructuredSchema>,
+    default_write_options: StructuredWriteOptions,
+    default_read_options: StructuredReadOptions,
+    default_scan_options: StructuredScanOptions,
+}
+
+#[derive(Clone, Debug)]
+struct StructuredProjectionCacheEntry {
+    schema_ptr: usize,
+    projected_schema: Arc<StructuredColumnFamilySchema>,
+}
+
+fn resolve_structured_projection_cached(
+    cache: &Arc<ArcSwapOption<StructuredProjectionCacheEntry>>,
+    structured_schema: &Arc<StructuredSchema>,
+    column_family: Option<&str>,
+    column_indices: Option<&[usize]>,
+) -> Result<Arc<StructuredColumnFamilySchema>> {
+    let schema_ptr = Arc::as_ptr(structured_schema) as usize;
+    if let Some(entry) = cache.load_full()
+        && entry.schema_ptr == schema_ptr
+    {
+        return Ok(Arc::clone(&entry.projected_schema));
+    }
+    let projected = structured_schema.project_structured_family(column_family, column_indices)?;
+    cache.store(Some(Arc::new(StructuredProjectionCacheEntry {
+        schema_ptr,
+        projected_schema: Arc::clone(&projected),
+    })));
+    Ok(projected)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StructuredWriteOptions {
+    inner: WriteOptions,
+}
+
+impl StructuredWriteOptions {
+    pub fn with_ttl(ttl_seconds: u32) -> Self {
+        Self {
+            inner: WriteOptions::with_ttl(ttl_seconds),
+        }
+    }
+
+    pub fn with_column_family(column_family: impl Into<String>) -> Self {
+        Self {
+            inner: WriteOptions::with_column_family(column_family),
+        }
+    }
+
+    pub fn as_cobble(&self) -> &WriteOptions {
+        &self.inner
+    }
+
+    pub fn into_cobble(self) -> WriteOptions {
+        self.inner
+    }
+
+    pub fn ttl_seconds(&self) -> Option<u32> {
+        self.inner.ttl_seconds
+    }
+
+    pub fn column_family(&self) -> Option<&str> {
+        self.inner.column_family.as_deref()
+    }
+}
+
+impl From<WriteOptions> for StructuredWriteOptions {
+    fn from(value: WriteOptions) -> Self {
+        Self { inner: value }
+    }
+}
+
+impl From<StructuredWriteOptions> for WriteOptions {
+    fn from(value: StructuredWriteOptions) -> Self {
+        value.inner
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StructuredReadOptions {
+    inner: ReadOptions,
+    projected_schema_cache: Arc<ArcSwapOption<StructuredProjectionCacheEntry>>,
+}
+
+impl Default for StructuredReadOptions {
+    fn default() -> Self {
+        Self::from(ReadOptions::default())
+    }
+}
+
+impl StructuredReadOptions {
+    pub fn for_column(column_index: usize) -> Self {
+        Self::from(ReadOptions::for_column(column_index))
+    }
+
+    pub fn for_columns(column_indices: Vec<usize>) -> Self {
+        Self::from(ReadOptions::for_columns(column_indices))
+    }
+
+    pub fn for_column_in_family(column_family: impl Into<String>, column_index: usize) -> Self {
+        Self::from(ReadOptions::for_column_in_family(
+            column_family,
+            column_index,
+        ))
+    }
+
+    pub fn for_columns_in_family(
+        column_family: impl Into<String>,
+        column_indices: Vec<usize>,
+    ) -> Self {
+        Self::from(ReadOptions::for_columns_in_family(
+            column_family,
+            column_indices,
+        ))
+    }
+
+    pub fn with_column_family(mut self, column_family: impl Into<String>) -> Self {
+        self.inner = self.inner.with_column_family(column_family);
+        self.projected_schema_cache = Arc::new(ArcSwapOption::empty());
+        self
+    }
+
+    pub fn as_cobble(&self) -> &ReadOptions {
+        &self.inner
+    }
+
+    pub fn into_cobble(self) -> ReadOptions {
+        self.inner
+    }
+
+    pub(crate) fn resolve_projected_schema_cached(
+        &self,
+        structured_schema: &Arc<StructuredSchema>,
+    ) -> Result<Arc<StructuredColumnFamilySchema>> {
+        resolve_structured_projection_cached(
+            &self.projected_schema_cache,
+            structured_schema,
+            self.inner.column_family.as_deref(),
+            self.inner.column_indices.as_deref(),
+        )
+    }
+}
+
+impl From<ReadOptions> for StructuredReadOptions {
+    fn from(value: ReadOptions) -> Self {
+        Self {
+            inner: value,
+            projected_schema_cache: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+}
+
+impl From<StructuredReadOptions> for ReadOptions {
+    fn from(value: StructuredReadOptions) -> Self {
+        value.inner
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StructuredScanOptions {
+    inner: ScanOptions,
+    projected_schema_cache: Arc<ArcSwapOption<StructuredProjectionCacheEntry>>,
+}
+
+impl Default for StructuredScanOptions {
+    fn default() -> Self {
+        Self::from(ScanOptions::default())
+    }
+}
+
+impl StructuredScanOptions {
+    pub fn for_column(column_index: usize) -> Self {
+        Self::from(ScanOptions::for_column(column_index))
+    }
+
+    pub fn for_columns(column_indices: Vec<usize>) -> Self {
+        Self::from(ScanOptions::for_columns(column_indices))
+    }
+
+    pub fn with_column_family(mut self, column_family: impl Into<String>) -> Self {
+        self.inner = self.inner.with_column_family(column_family);
+        self.projected_schema_cache = Arc::new(ArcSwapOption::empty());
+        self
+    }
+
+    pub fn as_cobble(&self) -> &ScanOptions {
+        &self.inner
+    }
+
+    pub fn into_cobble(self) -> ScanOptions {
+        self.inner
+    }
+
+    pub(crate) fn resolve_projected_schema_cached(
+        &self,
+        structured_schema: &Arc<StructuredSchema>,
+    ) -> Result<Arc<StructuredColumnFamilySchema>> {
+        resolve_structured_projection_cached(
+            &self.projected_schema_cache,
+            structured_schema,
+            self.inner.column_family.as_deref(),
+            self.inner.column_indices.as_deref(),
+        )
+    }
+}
+
+impl From<ScanOptions> for StructuredScanOptions {
+    fn from(value: ScanOptions) -> Self {
+        Self {
+            inner: value,
+            projected_schema_cache: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+}
+
+impl From<StructuredScanOptions> for ScanOptions {
+    fn from(value: StructuredScanOptions) -> Self {
+        value.inner
+    }
 }
 
 pub trait StructuredSchemaOwner {
@@ -694,13 +927,27 @@ fn normalize_structured_column_family_name(
 }
 
 impl StructuredDb {
-    pub fn open(config: Config, bucket_ranges: Vec<RangeInclusive<u16>>) -> Result<Self> {
-        let db = Db::open(config, bucket_ranges)?;
-        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
+    fn from_db(db: Db) -> Result<Self> {
+        let structured_schema = Arc::new(load_structured_schema_from_cobble_schema(
+            &db.current_schema(),
+        )?);
         Ok(Self {
             db,
-            structured_schema: Arc::new(structured_schema),
+            structured_schema,
+            default_write_options: StructuredWriteOptions::default(),
+            default_read_options: StructuredReadOptions::default(),
+            default_scan_options: StructuredScanOptions::default(),
         })
+    }
+
+    fn reset_default_options(&mut self) {
+        self.default_write_options = StructuredWriteOptions::default();
+        self.default_read_options = StructuredReadOptions::default();
+        self.default_scan_options = StructuredScanOptions::default();
+    }
+
+    pub fn open(config: Config, bucket_ranges: Vec<RangeInclusive<u16>>) -> Result<Self> {
+        Self::from_db(Db::open(config, bucket_ranges)?)
     }
 
     pub fn open_from_snapshot(
@@ -717,17 +964,12 @@ impl StructuredDb {
         db_id: impl Into<String>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
-        let db = Db::open_from_snapshot_with_resolver(
+        Self::from_db(Db::open_from_snapshot_with_resolver(
             config,
             snapshot_id,
             db_id,
             Some(combined_resolver(resolver)),
-        )?;
-        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
-        Ok(Self {
-            db,
-            structured_schema: Arc::new(structured_schema),
-        })
+        )?)
     }
 
     pub fn open_new_with_snapshot(
@@ -745,17 +987,12 @@ impl StructuredDb {
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
         let db_id = db_id.into();
-        let db = Db::open_new_with_snapshot_with_resolver(
+        Self::from_db(Db::open_new_with_snapshot_with_resolver(
             config,
             snapshot_id,
             &db_id,
             Some(combined_resolver(resolver)),
-        )?;
-        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
-        Ok(Self {
-            db,
-            structured_schema: Arc::new(structured_schema),
-        })
+        )?)
     }
 
     pub fn open_new_with_manifest_path(
@@ -770,16 +1007,11 @@ impl StructuredDb {
         manifest_path: impl Into<String>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
-        let db = Db::open_new_with_manifest_path_with_resolver(
+        Self::from_db(Db::open_new_with_manifest_path_with_resolver(
             config,
             manifest_path,
             Some(combined_resolver(resolver)),
-        )?;
-        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
-        Ok(Self {
-            db,
-            structured_schema: Arc::new(structured_schema),
-        })
+        )?)
     }
 
     pub fn resume(config: Config, db_id: impl Into<String>) -> Result<Self> {
@@ -791,12 +1023,11 @@ impl StructuredDb {
         db_id: impl Into<String>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
-        let db = Db::resume_with_resolver(config, db_id, Some(combined_resolver(resolver)))?;
-        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
-        Ok(Self {
-            db,
-            structured_schema: Arc::new(structured_schema),
-        })
+        Self::from_db(Db::resume_with_resolver(
+            config,
+            db_id,
+            Some(combined_resolver(resolver)),
+        )?)
     }
 
     pub fn expand_bucket(
@@ -827,6 +1058,7 @@ impl StructuredDb {
     pub fn reload_schema(&mut self) -> Result<()> {
         let schema = load_structured_schema_from_cobble_schema(&self.db.current_schema())?;
         self.structured_schema = Arc::new(schema);
+        self.reset_default_options();
         Ok(())
     }
 
@@ -837,6 +1069,7 @@ impl StructuredDb {
         persist_structured_schema_on_db(&self.db, &structured_schema)?;
         let reloaded = load_structured_schema_from_cobble_schema(&self.db.current_schema())?;
         self.structured_schema = Arc::new(reloaded.clone());
+        self.reset_default_options();
         Ok(reloaded)
     }
 
@@ -845,7 +1078,7 @@ impl StructuredDb {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        self.put_with_options(bucket, key, column, value, &WriteOptions::default())
+        self.put_with_options(bucket, key, column, value, &self.default_write_options)
     }
 
     pub fn put_with_options<K, V>(
@@ -854,7 +1087,7 @@ impl StructuredDb {
         key: K,
         column: u16,
         value: V,
-        options: &WriteOptions,
+        options: &StructuredWriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -862,14 +1095,14 @@ impl StructuredDb {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
-            options.column_family.as_deref(),
+            options.column_family(),
             self.db.now_seconds(),
             column,
             value.into(),
-            options.ttl_seconds,
+            options.ttl_seconds(),
         )?;
         self.db
-            .put_with_options(bucket, key, column, encoded, options)
+            .put_with_options(bucket, key, column, encoded, options.as_cobble())
     }
 
     pub fn merge<K, V>(&self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
@@ -877,7 +1110,7 @@ impl StructuredDb {
         K: AsRef<[u8]>,
         V: Into<StructuredColumnValue>,
     {
-        self.merge_with_options(bucket, key, column, value, &WriteOptions::default())
+        self.merge_with_options(bucket, key, column, value, &self.default_write_options)
     }
 
     pub fn merge_with_options<K, V>(
@@ -886,7 +1119,7 @@ impl StructuredDb {
         key: K,
         column: u16,
         value: V,
-        options: &WriteOptions,
+        options: &StructuredWriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -894,21 +1127,21 @@ impl StructuredDb {
     {
         let encoded = encode_for_write(
             &self.structured_schema,
-            options.column_family.as_deref(),
+            options.column_family(),
             self.db.now_seconds(),
             column,
             value.into(),
-            options.ttl_seconds,
+            options.ttl_seconds(),
         )?;
         self.db
-            .merge_with_options(bucket, key, column, encoded, options)
+            .merge_with_options(bucket, key, column, encoded, options.as_cobble())
     }
 
     pub fn delete<K>(&self, bucket: u16, key: K, column: u16) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
-        self.delete_with_options(bucket, key, column, &WriteOptions::default())
+        self.delete_with_options(bucket, key, column, &self.default_write_options)
     }
 
     pub fn delete_with_options<K>(
@@ -916,12 +1149,13 @@ impl StructuredDb {
         bucket: u16,
         key: K,
         column: u16,
-        options: &WriteOptions,
+        options: &StructuredWriteOptions,
     ) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
-        self.db.delete_with_options(bucket, key, column, options)
+        self.db
+            .delete_with_options(bucket, key, column, options.as_cobble())
     }
 
     pub fn new_write_batch(&self) -> StructuredWriteBatch {
@@ -936,28 +1170,22 @@ impl StructuredDb {
     where
         K: AsRef<[u8]>,
     {
-        let raw = self.db.get(bucket, key.as_ref())?;
-        let default_schema = self
-            .structured_schema
-            .projected(DEFAULT_COLUMN_FAMILY_ID, None);
-        raw.map(|columns| decode_row(&default_schema, 0, columns))
-            .transpose()
+        self.get_with_options(bucket, key, &self.default_read_options)
     }
 
     pub fn get_with_options<K>(
         &self,
         bucket: u16,
         key: K,
-        options: &ReadOptions,
+        options: &StructuredReadOptions,
     ) -> Result<Option<Vec<Option<StructuredColumnValue>>>>
     where
         K: AsRef<[u8]>,
     {
-        let raw = self.db.get_with_options(bucket, key.as_ref(), options)?;
-        let projected_schema = self.structured_schema.project_structured_family(
-            options.column_family.as_deref(),
-            options.column_indices.as_deref(),
-        )?;
+        let raw = self
+            .db
+            .get_with_options(bucket, key.as_ref(), options.as_cobble())?;
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
         raw.map(|columns| decode_row(&projected_schema, 0, columns))
             .transpose()
     }
@@ -967,20 +1195,19 @@ impl StructuredDb {
         bucket: u16,
         range: Range<&[u8]>,
     ) -> Result<StructuredDbIterator<'a>> {
-        self.scan_with_options(bucket, range, &ScanOptions::default())
+        self.scan_with_options(bucket, range, &self.default_scan_options)
     }
 
     pub fn scan_with_options<'a>(
         &'a self,
         bucket: u16,
         range: Range<&[u8]>,
-        options: &ScanOptions,
+        options: &StructuredScanOptions,
     ) -> Result<StructuredDbIterator<'a>> {
-        let inner = self.db.scan_with_options(bucket, range, options)?;
-        let projected_schema = self.structured_schema.project_structured_family(
-            options.column_family.as_deref(),
-            options.column_indices.as_deref(),
-        )?;
+        let inner = self
+            .db
+            .scan_with_options(bucket, range, options.as_cobble())?;
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
         Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
@@ -1019,18 +1246,19 @@ impl StructuredDb {
         &self,
         bucket: u16,
         key: &[u8],
-        options: &ReadOptions,
+        options: &StructuredReadOptions,
     ) -> Result<Option<Vec<Option<Bytes>>>> {
-        self.db.get_with_options(bucket, key, options)
+        self.db.get_with_options(bucket, key, options.as_cobble())
     }
 
     pub fn scan_raw<'a>(
         &'a self,
         bucket: u16,
         range: Range<&[u8]>,
-        options: &ScanOptions,
+        options: &StructuredScanOptions,
     ) -> Result<DbIterator<'a>> {
-        self.db.scan_with_options(bucket, range, options)
+        self.db
+            .scan_with_options(bucket, range, options.as_cobble())
     }
 
     pub fn close(&self) -> Result<()> {
@@ -1182,7 +1410,7 @@ fn apply_structured_family(
 mod tests {
     use super::*;
     use crate::list::{ListConfig, ListRetainMode};
-    use cobble::{ReadOptions, VolumeDescriptor, WriteOptions};
+    use cobble::VolumeDescriptor;
     use std::thread;
     use std::time::Duration;
     use uuid::Uuid;
@@ -1405,7 +1633,7 @@ mod tests {
             .scan_with_options(
                 0,
                 b"k0".as_ref()..b"k9".as_ref(),
-                &ScanOptions::for_column(1),
+                &StructuredScanOptions::for_column(1),
             )
             .unwrap();
         let first = iter.next().expect("one row").unwrap();
@@ -1449,7 +1677,7 @@ mod tests {
             .unwrap();
 
         let row = db
-            .get_with_options(0, b"k1", &ReadOptions::for_column(1))
+            .get_with_options(0, b"k1", &StructuredReadOptions::for_column(1))
             .unwrap()
             .expect("row exists");
         assert_eq!(row.len(), 1);
@@ -1493,14 +1721,18 @@ mod tests {
             Some(&StructuredColumnType::List(metrics_config.clone()))
         );
 
-        let metrics_write = WriteOptions::with_column_family("metrics");
+        let metrics_write = StructuredWriteOptions::with_column_family("metrics");
         db.put_with_options(0, b"k1", 0, vec![Bytes::from_static(b"a")], &metrics_write)
             .unwrap();
         db.merge_with_options(0, b"k1", 0, vec![Bytes::from_static(b"b")], &metrics_write)
             .unwrap();
 
         let row = db
-            .get_with_options(0, b"k1", &ReadOptions::for_column_in_family("metrics", 0))
+            .get_with_options(
+                0,
+                b"k1",
+                &StructuredReadOptions::for_column_in_family("metrics", 0),
+            )
             .unwrap()
             .expect("row exists");
         assert_eq!(
@@ -1515,7 +1747,7 @@ mod tests {
             .scan_with_options(
                 0,
                 b"k0".as_ref()..b"k9".as_ref(),
-                &ScanOptions::for_column(0).with_column_family("metrics"),
+                &StructuredScanOptions::for_column(0).with_column_family("metrics"),
             )
             .unwrap();
         let first = iter.next().expect("one row").unwrap();
@@ -1537,7 +1769,11 @@ mod tests {
         db.write_batch(batch).unwrap();
 
         let batch_row = db
-            .get_with_options(0, b"k2", &ReadOptions::for_column_in_family("metrics", 0))
+            .get_with_options(
+                0,
+                b"k2",
+                &StructuredReadOptions::for_column_in_family("metrics", 0),
+            )
             .unwrap()
             .expect("batch row exists");
         assert_eq!(

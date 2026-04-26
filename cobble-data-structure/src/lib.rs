@@ -63,8 +63,9 @@ mod structured_single_db;
 pub use list::{ListConfig, ListRetainMode};
 pub use structured_db::{
     DataStructureDb, StructuredColumnFamilySchema, StructuredColumnType, StructuredColumnValue,
-    StructuredDb, StructuredDbIterator, StructuredSchema, StructuredSchemaBuilder,
-    StructuredWriteBatch, structured_merge_operator_resolver, structured_resolvable_operator_ids,
+    StructuredDb, StructuredDbIterator, StructuredReadOptions, StructuredScanOptions,
+    StructuredSchema, StructuredSchemaBuilder, StructuredWriteBatch, StructuredWriteOptions,
+    structured_merge_operator_resolver, structured_resolvable_operator_ids,
 };
 pub use structured_read_only_db::StructuredReadOnlyDb;
 pub use structured_reader::StructuredReader;

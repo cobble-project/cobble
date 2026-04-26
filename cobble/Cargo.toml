@@ -31,8 +31,8 @@ storage-s3 = ["opendal/services-s3"]
 storage-sftp = ["opendal/services-sftp"]
 
 [dependencies]
+arc-swap = { workspace = true }
 bytes = { workspace = true }
-arc-swap = "1.7.1"
 crc32fast = "1.4.2"
 dashmap = "6.1.0"
 foyer = "0.22.3"

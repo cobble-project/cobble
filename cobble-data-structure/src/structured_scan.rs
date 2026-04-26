@@ -1,11 +1,11 @@
 use crate::structured_db::{
-    StructuredColumnFamilySchema, StructuredColumnValue, combined_resolver, decode_row,
-    load_structured_schema_from_cobble_schema,
+    StructuredColumnFamilySchema, StructuredColumnValue, StructuredScanOptions, combined_resolver,
+    decode_row, load_structured_schema_from_cobble_schema,
 };
 use bytes::Bytes;
 use cobble::{
-    Config, GlobalSnapshotManifest, MergeOperatorResolver, ReadOnlyDb, Result, ScanOptions,
-    ScanPlan, ScanSplit, ScanSplitScanner, ShardSnapshotRef,
+    Config, GlobalSnapshotManifest, MergeOperatorResolver, ReadOnlyDb, Result, ScanPlan, ScanSplit,
+    ScanSplitScanner, ShardSnapshotRef,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -68,19 +68,34 @@ impl From<StructuredScanSplit> for ScanSplit {
 }
 
 impl StructuredScanSplit {
+    pub fn create_scanner_without_options(
+        &self,
+        config: Config,
+    ) -> Result<StructuredScanSplitScanner> {
+        self.create_scanner_without_options_internal(config, None)
+    }
+
     pub fn create_scanner(
         &self,
         config: Config,
-        options: &ScanOptions,
+        options: &StructuredScanOptions,
     ) -> Result<StructuredScanSplitScanner> {
         self.create_scanner_internal(config, None, options)
+    }
+
+    pub fn create_scanner_with_resolver_without_options(
+        &self,
+        config: Config,
+        resolver: Arc<dyn MergeOperatorResolver>,
+    ) -> Result<StructuredScanSplitScanner> {
+        self.create_scanner_without_options_internal(config, Some(resolver))
     }
 
     pub fn create_scanner_with_resolver(
         &self,
         config: Config,
         resolver: Arc<dyn MergeOperatorResolver>,
-        options: &ScanOptions,
+        options: &StructuredScanOptions,
     ) -> Result<StructuredScanSplitScanner> {
         self.create_scanner_internal(config, Some(resolver), options)
     }
@@ -89,7 +104,7 @@ impl StructuredScanSplit {
         &self,
         config: Config,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
-        options: &ScanOptions,
+        options: &StructuredScanOptions,
     ) -> Result<StructuredScanSplitScanner> {
         let resolver = combined_resolver(resolver);
         let read_only = ReadOnlyDb::open_with_db_id_and_resolver(
@@ -101,12 +116,36 @@ impl StructuredScanSplit {
         let structured_schema = Arc::new(load_structured_schema_from_cobble_schema(
             &read_only.current_schema(),
         )?);
-        let projected_schema = structured_schema.project_structured_family(
-            options.column_family.as_deref(),
-            options.column_indices.as_deref(),
+        let projected_schema = options.resolve_projected_schema_cached(&structured_schema)?;
+        let scanner = ScanSplit::from(self.clone()).create_scanner_with_resolver(
+            config,
+            resolver,
+            options.as_cobble(),
         )?;
+        Ok(StructuredScanSplitScanner {
+            inner: scanner,
+            structured_schema: projected_schema,
+        })
+    }
+
+    fn create_scanner_without_options_internal(
+        &self,
+        config: Config,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<StructuredScanSplitScanner> {
+        let resolver = combined_resolver(resolver);
+        let read_only = ReadOnlyDb::open_with_db_id_and_resolver(
+            config.clone(),
+            self.shard.snapshot_id,
+            self.shard.db_id.clone(),
+            Arc::clone(&resolver),
+        )?;
+        let structured_schema = Arc::new(load_structured_schema_from_cobble_schema(
+            &read_only.current_schema(),
+        )?);
+        let projected_schema = Arc::new(structured_schema.projected(0, None));
         let scanner = ScanSplit::from(self.clone())
-            .create_scanner_with_resolver(config, resolver, options)?;
+            .create_scanner_with_resolver_without_options(config, resolver)?;
         Ok(StructuredScanSplitScanner {
             inner: scanner,
             structured_schema: projected_schema,
@@ -135,11 +174,12 @@ impl Iterator for StructuredScanSplitScanner {
 mod tests {
     use super::*;
     use crate::list::{ListConfig, ListRetainMode};
-    use crate::{StructuredColumnType, StructuredDb, StructuredSchema};
-    use cobble::WriteOptions;
+    use crate::{
+        StructuredColumnType, StructuredDb, StructuredScanOptions, StructuredSchema,
+        StructuredWriteOptions,
+    };
     use cobble::{
-        CoordinatorConfig, DbCoordinator, ScanOptions, ShardSnapshotInput, VolumeDescriptor,
-        VolumeUsageKind,
+        CoordinatorConfig, DbCoordinator, ShardSnapshotInput, VolumeDescriptor, VolumeUsageKind,
     };
     use std::collections::BTreeMap;
 
@@ -244,7 +284,7 @@ mod tests {
         assert_eq!(splits.len(), 1);
 
         let scanner = splits[0]
-            .create_scanner(config, &ScanOptions::default())
+            .create_scanner(config, &StructuredScanOptions::default())
             .unwrap();
         let results: Vec<_> = scanner.map(|r| r.unwrap()).collect();
         assert_eq!(results.len(), 2);
@@ -272,7 +312,7 @@ mod tests {
             .add_list_column(Some("metrics".to_string()), 0, ListConfig::default())
             .commit()
             .unwrap();
-        let metrics_write = WriteOptions::with_column_family("metrics");
+        let metrics_write = StructuredWriteOptions::with_column_family("metrics");
         db.put_with_options(0, b"k1", 0, vec![Bytes::from_static(b"a")], &metrics_write)
             .unwrap();
         db.merge_with_options(0, b"k1", 0, vec![Bytes::from_static(b"b")], &metrics_write)
@@ -308,7 +348,7 @@ mod tests {
         let scanner = split
             .create_scanner(
                 config,
-                &ScanOptions::for_column(0).with_column_family("metrics"),
+                &StructuredScanOptions::for_column(0).with_column_family("metrics"),
             )
             .unwrap();
         let rows: Vec<_> = scanner.map(|r| r.unwrap()).collect();
@@ -377,7 +417,7 @@ mod tests {
 
         let split = StructuredScanPlan::new(global).splits().remove(0);
         let scanner = split
-            .create_scanner(config, &ScanOptions::for_column(1))
+            .create_scanner(config, &StructuredScanOptions::for_column(1))
             .unwrap();
         let rows: Vec<_> = scanner.map(|r| r.unwrap()).collect();
         assert_eq!(rows.len(), 1);

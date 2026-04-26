@@ -52,6 +52,9 @@ pub struct Db {
     snapshot_manager: SnapshotManager,
     schema_manager: Arc<SchemaManager>,
     last_scope_synced_schema_version: AtomicU64,
+    default_write_options: WriteOptions,
+    default_read_options: ReadOptions,
+    default_scan_options: ScanOptions,
     time_provider: Arc<dyn TimeProvider>,
     ttl_provider: Arc<TTLProvider>,
 }
@@ -467,7 +470,7 @@ impl Db {
         let _access = self.begin_access()?;
         let schema = self.schema_manager.latest_schema();
         self.ensure_multi_lsm_scopes_for_schema_if_dirty(schema.as_ref())?;
-        let column_family_id = schema.resolve_column_family_id(options.column_family())?;
+        let column_family_id = options.resolve_column_family_id_cached(schema.as_ref())?;
         let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         let column_idx = column as usize;
         if column_idx >= num_columns {
@@ -493,7 +496,7 @@ impl Db {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.put_with_options(bucket, key, column, value, &WriteOptions::default())
+        self.put_with_options(bucket, key, column, value, &self.default_write_options)
     }
 
     /// Insert a single key/value pair into the given bucket and column with write options.
@@ -517,7 +520,7 @@ impl Db {
     where
         K: AsRef<[u8]>,
     {
-        self.delete_with_options(bucket, key, column, &WriteOptions::default())
+        self.delete_with_options(bucket, key, column, &self.default_write_options)
     }
 
     /// Delete a single column value in the given bucket with write options.
@@ -540,7 +543,7 @@ impl Db {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.merge_with_options(bucket, key, column, value, &WriteOptions::default())
+        self.merge_with_options(bucket, key, column, value, &self.default_write_options)
     }
 
     /// Merge a value into the given bucket and column with write options.
@@ -922,6 +925,9 @@ impl Db {
             snapshot_manager,
             schema_manager,
             last_scope_synced_schema_version,
+            default_write_options: WriteOptions::default(),
+            default_read_options: ReadOptions::default(),
+            default_scan_options: ScanOptions::default(),
             time_provider,
             ttl_provider,
         })
@@ -982,7 +988,7 @@ impl Db {
     /// resolve VLOG pointers for separated values → apply TTL expiration
     /// and schema evolution when SST schema differs from current.
     pub fn get(&self, bucket: u16, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
-        self.get_with_options(bucket, key, &ReadOptions::default())
+        self.get_with_options(bucket, key, &self.default_read_options)
     }
 
     pub fn get_with_options(
@@ -993,7 +999,7 @@ impl Db {
     ) -> Result<Option<Vec<Option<Bytes>>>> {
         let _access = self.begin_access()?;
         let schema = self.schema_manager.latest_schema();
-        let column_family_id = schema.resolve_column_family_id(options.column_family())?;
+        let column_family_id = options.resolve_column_family_id_cached(schema.as_ref())?;
         let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         if let Some(max_index) = options.max_index()
             && max_index >= num_columns
@@ -1149,7 +1155,7 @@ impl Db {
     }
 
     pub fn scan<'a>(&'a self, bucket: u16, range: Range<&[u8]>) -> Result<DbIterator<'a>> {
-        self.scan_with_options(bucket, range, &ScanOptions::default())
+        self.scan_with_options(bucket, range, &self.default_scan_options)
     }
 
     pub fn scan_with_options<'a>(
@@ -1161,7 +1167,8 @@ impl Db {
         let access_guard = self.begin_access()?;
         let snapshot = self.db_state.load();
         let schema = self.schema_manager.latest_schema();
-        let column_family_id = schema.resolve_column_family_id(options.column_family())?;
+        let resolved_scan_options = options.resolve_cached(&schema)?;
+        let column_family_id = resolved_scan_options.column_family_id;
         let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         if let Some(max_index) = options.max_index()
             && max_index >= num_columns
@@ -1189,7 +1196,7 @@ impl Db {
             bucket,
             column_family_id,
         );
-        let (lsm_iters, effective_schema) = match lsm_iters {
+        let lsm_iters = match lsm_iters {
             Ok(result) => result,
             Err(err) => {
                 self.maybe_mark_error_on_read(&err);
@@ -1216,7 +1223,7 @@ impl Db {
                 access_guard: Some(access_guard),
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
-                schema: effective_schema,
+                schema: resolved_scan_options.effective_schema,
                 column_family_id,
             },
         );

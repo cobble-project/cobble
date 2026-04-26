@@ -965,7 +965,7 @@ impl LSMTree {
         selected_columns: Option<&[usize]>,
         bucket: u16,
         column_family_id: u8,
-    ) -> Result<(Vec<DynKvIterator>, Arc<Schema>)> {
+    ) -> Result<Vec<DynKvIterator>> {
         let selected_columns = selected_columns.map(|columns| columns.to_vec());
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let use_read_ahead = read_ahead_bytes > 0 && tokio::runtime::Handle::try_current().is_ok();
@@ -1077,12 +1077,7 @@ impl LSMTree {
             });
             iterators.push(Box::new(run_iter));
         }
-        let effective_schema = if let Some(columns) = selected_columns.as_deref() {
-            target_schema.project_in_family(column_family_id, columns)
-        } else {
-            target_schema
-        };
-        Ok((iterators, effective_schema))
+        Ok(iterators)
     }
 
     /// Get values from one data file for the given encoded key.

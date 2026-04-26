@@ -32,6 +32,8 @@ pub struct ReadOnlyDb {
     lsm_tree: Arc<LSMTree>,
     vlog_store: Arc<VlogStore>,
     schema_manager: Arc<SchemaManager>,
+    default_read_options: ReadOptions,
+    default_scan_options: ScanOptions,
     ttl_provider: Arc<TTLProvider>,
     metrics_manager: Arc<MetricsManager>,
 }
@@ -218,6 +220,8 @@ impl ReadOnlyDb {
             lsm_tree,
             vlog_store,
             schema_manager,
+            default_read_options: ReadOptions::default(),
+            default_scan_options: ScanOptions::default(),
             ttl_provider,
             metrics_manager,
         })
@@ -239,7 +243,7 @@ impl ReadOnlyDb {
 
     /// Lookup a key in a bucket across the snapshot LSM levels.
     pub fn get(&self, bucket: u16, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
-        self.get_with_options(bucket, key, &ReadOptions::default())
+        self.get_with_options(bucket, key, &self.default_read_options)
     }
 
     pub fn get_with_options(
@@ -249,7 +253,7 @@ impl ReadOnlyDb {
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<Bytes>>>> {
         let schema = self.schema_manager.latest_schema();
-        let column_family_id = schema.resolve_column_family_id(options.column_family())?;
+        let column_family_id = options.resolve_column_family_id_cached(schema.as_ref())?;
         let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         if let Some(max_index) = options.max_index()
             && max_index >= num_columns
@@ -319,7 +323,21 @@ impl ReadOnlyDb {
     }
 
     pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<DbIterator<'static>> {
-        self.scan_with_options(bucket, range, &ScanOptions::default())
+        self.scan_with_options(bucket, range, &self.default_scan_options)
+    }
+
+    pub fn scan_bounds(
+        &self,
+        bucket: u16,
+        start_key_inclusive: Option<&[u8]>,
+        end_key_exclusive: Option<&[u8]>,
+    ) -> Result<DbIterator<'static>> {
+        self.scan_with_options_bounds(
+            bucket,
+            start_key_inclusive,
+            end_key_exclusive,
+            &self.default_scan_options,
+        )
     }
 
     pub fn scan_with_options(
@@ -340,7 +358,8 @@ impl ReadOnlyDb {
     ) -> Result<DbIterator<'static>> {
         let snapshot = self.lsm_tree.db_state().load();
         let schema = self.schema_manager.latest_schema();
-        let column_family_id = schema.resolve_column_family_id(options.column_family())?;
+        let resolved_scan_options = options.resolve_cached(&schema)?;
+        let column_family_id = resolved_scan_options.column_family_id;
         let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
         if let Some(max_index) = options.max_index()
             && max_index >= num_columns
@@ -350,7 +369,7 @@ impl ReadOnlyDb {
                 max_index, num_columns
             )));
         }
-        let (lsm_iters, effective_schema) = self.lsm_tree.scan_with_snapshot(
+        let lsm_iters = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
             Arc::clone(&schema),
@@ -380,7 +399,7 @@ impl ReadOnlyDb {
                 access_guard: None,
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
-                schema: effective_schema,
+                schema: resolved_scan_options.effective_schema,
                 column_family_id,
             },
         );

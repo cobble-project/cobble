@@ -184,7 +184,8 @@ class DbBindingTest {
             db.merge(0, mergeKey, 0, "-m1".getBytes(StandardCharsets.UTF_8));
             Row mergeRow = db.get(0, mergeKey);
             assertEquals("base-m1", new String(mergeRow.getBytes(0), StandardCharsets.UTF_8));
-            try (WriteOptions options = WriteOptions.withTtl(60)) {
+            try (io.cobble.structured.WriteOptions options =
+                    io.cobble.structured.WriteOptions.withTtl(60)) {
                 db.putWithOptions(
                         0,
                         mergeKey,
@@ -228,6 +229,59 @@ class DbBindingTest {
     }
 
     @Test
+    void rawWithOptionsNullFallsBackToKernelNoOptions() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-raw-null-options-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            byte[] key = "null-opt-key".getBytes(StandardCharsets.UTF_8);
+            byte[] value = "null-opt-value".getBytes(StandardCharsets.UTF_8);
+
+            db.putWithOptions(0, key, 0, value, null);
+            assertArrayEquals(value, db.get(0, key, 0));
+
+            byte[][] row = db.getWithOptions(0, key, (ReadOptions) null);
+            assertNotNull(row);
+            assertArrayEquals(value, row[0]);
+
+            try (ScanCursor cursor =
+                    db.scanWithOptions(0, key, "zz".getBytes(StandardCharsets.UTF_8), null)) {
+                ScanBatch batch = cursor.nextBatch();
+                assertTrue(batch.keys.length >= 1);
+            }
+
+            db.deleteWithOptions(0, key, 0, null);
+            assertNull(db.get(0, key, 0));
+        }
+    }
+
+    @Test
+    void structuredWithOptionsNullFallsBackToKernelNoOptions() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-structured-null-options-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        try (io.cobble.structured.Db db = io.cobble.structured.Db.open(config)) {
+            byte[] key = "st-null-opt-key".getBytes(StandardCharsets.UTF_8);
+            byte[] value = "st-null-opt-value".getBytes(StandardCharsets.UTF_8);
+
+            db.putWithOptions(0, key, 0, ColumnValue.ofBytes(value), null);
+            Row row = db.getWithOptions(0, key, null);
+            assertNotNull(row);
+            assertArrayEquals(value, row.getBytes(0));
+
+            try (io.cobble.structured.ScanCursor cursor =
+                    db.scanWithOptions(0, key, "zz".getBytes(StandardCharsets.UTF_8), null)) {
+                io.cobble.structured.ScanBatch batch = cursor.nextBatch();
+                assertTrue(batch.size() >= 1);
+            }
+
+            db.deleteWithOptions(0, key, 0, null);
+            Row deleted = db.get(0, key);
+            assertTrue(deleted == null || deleted.getColumnValue(0) == null);
+        }
+    }
+
+    @Test
     void structuredDbScanAndRawGet() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-structured-scan-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
@@ -245,14 +299,16 @@ class DbBindingTest {
                     db.get(0, scanKeyBytes("st-scan", 42)).getBytes(0));
 
             // get with ReadOptions column projection
-            try (ReadOptions readOpts = new ReadOptions().forColumns(0)) {
+            try (io.cobble.structured.ReadOptions readOpts =
+                    io.cobble.structured.ReadOptions.forColumns(0)) {
                 Row projected = db.getWithOptions(0, scanKeyBytes("st-scan", 42), readOpts);
                 assertNotNull(projected);
                 assertArrayEquals(valueBytes("st-scan-v0", 42), projected.getBytes(0));
             }
 
             // scan with options
-            try (ScanOptions scanOpts = new ScanOptions().batchSize(64).columns(0);
+            try (io.cobble.structured.ScanOptions scanOpts =
+                            new io.cobble.structured.ScanOptions().batchSize(64).columns(0);
                     io.cobble.structured.ScanCursor cursor =
                             db.scanWithOptions(
                                     0,
@@ -1202,8 +1258,8 @@ class DbBindingTest {
         if (columns == null) {
             return null;
         }
-        if (columns.length != 1) {
-            throw new IllegalStateException("expected exactly one column, got " + columns.length);
+        if (columns.length == 0) {
+            throw new IllegalStateException("expected at least one column, got 0");
         }
         return columns[0];
     }

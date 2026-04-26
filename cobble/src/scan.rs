@@ -82,7 +82,12 @@ impl ScanSplit {
         config: Config,
         options: &ScanOptions,
     ) -> Result<ScanSplitScanner> {
-        self.create_scanner_internal(config, None, options)
+        self.create_scanner_internal(config, None, Some(options))
+    }
+
+    /// Create a scanner with default scan behavior (no explicit scan options).
+    pub fn create_scanner_without_options(&self, config: Config) -> Result<ScanSplitScanner> {
+        self.create_scanner_internal(config, None, None)
     }
 
     /// Create a scanner with a merge operator resolver.
@@ -92,14 +97,23 @@ impl ScanSplit {
         resolver: Arc<dyn MergeOperatorResolver>,
         options: &ScanOptions,
     ) -> Result<ScanSplitScanner> {
-        self.create_scanner_internal(config, Some(resolver), options)
+        self.create_scanner_internal(config, Some(resolver), Some(options))
+    }
+
+    /// Create a scanner with a merge operator resolver and default scan behavior.
+    pub fn create_scanner_with_resolver_without_options(
+        &self,
+        config: Config,
+        resolver: Arc<dyn MergeOperatorResolver>,
+    ) -> Result<ScanSplitScanner> {
+        self.create_scanner_internal(config, Some(resolver), None)
     }
 
     fn create_scanner_internal(
         &self,
         config: Config,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
-        options: &ScanOptions,
+        options: Option<&ScanOptions>,
     ) -> Result<ScanSplitScanner> {
         let db = match resolver {
             Some(resolver) => ReadOnlyDb::open_with_db_id_and_resolver(
@@ -125,7 +139,7 @@ impl ScanSplit {
             buckets,
             self.start.clone(),
             self.end.clone(),
-            options.clone(),
+            options.cloned(),
         )
     }
 }
@@ -141,7 +155,7 @@ pub struct ScanSplitScanner {
     current_iter: Option<DbIterator<'static>>,
     start: Option<Vec<u8>>,
     end: Option<Vec<u8>>,
-    scan_options: ScanOptions,
+    scan_options: Option<ScanOptions>,
 }
 
 impl ScanSplitScanner {
@@ -150,7 +164,7 @@ impl ScanSplitScanner {
         buckets: Vec<u16>,
         start: Option<Vec<u8>>,
         end: Option<Vec<u8>>,
-        scan_options: ScanOptions,
+        scan_options: Option<ScanOptions>,
     ) -> Result<Self> {
         let mut scanner = Self {
             db,
@@ -170,9 +184,13 @@ impl ScanSplitScanner {
             let bucket = self.buckets[self.current_bucket_index];
             let start = self.start.as_deref();
             let end = self.end.as_deref();
-            let iter = self
-                .db
-                .scan_with_options_bounds(bucket, start, end, &self.scan_options)?;
+            let iter = match self.scan_options.as_ref() {
+                Some(scan_options) => {
+                    self.db
+                        .scan_with_options_bounds(bucket, start, end, scan_options)?
+                }
+                None => self.db.scan_bounds(bucket, start, end)?,
+            };
             self.current_iter = Some(iter);
         } else {
             self.current_iter = None;

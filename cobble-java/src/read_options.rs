@@ -5,7 +5,6 @@ use cobble::ReadOptions;
 use jni::JNIEnv;
 use jni::objects::{JClass, JIntArray, JObject, JString};
 use jni::sys::{jint, jlong};
-use std::sync::OnceLock;
 
 pub(crate) struct ReadOptionsHandle {
     read_options: ReadOptions,
@@ -41,13 +40,14 @@ fn rebuild_read_options(
     }
 }
 
+fn replace_read_options(handle: &mut ReadOptionsHandle, read_options: ReadOptions) {
+    handle.read_options = read_options;
+}
+
 pub(crate) fn read_options_from_handle_or_throw(
     env: &mut JNIEnv,
     native_handle: jlong,
 ) -> Option<&'static ReadOptionsHandle> {
-    if native_handle == 0 {
-        return Some(default_read_options_handle());
-    }
     read_options_from_handle_or_throw_impl(env, native_handle)
 }
 
@@ -94,10 +94,11 @@ pub extern "system" fn Java_io_cobble_ReadOptions_setColumn(
             return;
         }
     };
-    read_options.read_options = match read_options.read_options.column_family.clone() {
+    let next = match read_options.read_options.column_family.clone() {
         Some(column_family) => ReadOptions::for_column_in_family(column_family, column_index),
         None => ReadOptions::for_column(column_index),
     };
+    replace_read_options(read_options, next);
 }
 
 #[unsafe(no_mangle)]
@@ -136,10 +137,11 @@ pub extern "system" fn Java_io_cobble_ReadOptions_setColumns(
             }
         }
     }
-    read_options.read_options = match read_options.read_options.column_family.clone() {
+    let next = match read_options.read_options.column_family.clone() {
         Some(column_family) => ReadOptions::for_columns_in_family(column_family, decoded),
         None => ReadOptions::for_columns(decoded),
     };
+    replace_read_options(read_options, next);
 }
 
 #[unsafe(no_mangle)]
@@ -159,10 +161,11 @@ pub extern "system" fn Java_io_cobble_ReadOptions_setColumnFamily(
             return;
         }
     };
-    read_options.read_options = rebuild_read_options(
+    let next = rebuild_read_options(
         Some(column_family),
         read_options.read_options.column_indices.clone(),
     );
+    replace_read_options(read_options, next);
 }
 
 #[unsafe(no_mangle)]
@@ -174,8 +177,8 @@ pub extern "system" fn Java_io_cobble_ReadOptions_clearColumnFamily(
     let Some(read_options) = read_options_from_handle_mut_or_throw(&mut env, native_handle) else {
         return;
     };
-    read_options.read_options =
-        rebuild_read_options(None, read_options.read_options.column_indices.clone());
+    let next = rebuild_read_options(None, read_options.read_options.column_indices.clone());
+    replace_read_options(read_options, next);
 }
 
 #[unsafe(no_mangle)]
@@ -187,8 +190,8 @@ pub extern "system" fn Java_io_cobble_ReadOptions_clearColumns(
     let Some(read_options) = read_options_from_handle_mut_or_throw(&mut env, native_handle) else {
         return;
     };
-    read_options.read_options =
-        rebuild_read_options(read_options.read_options.column_family.clone(), None);
+    let next = rebuild_read_options(read_options.read_options.column_family.clone(), None);
+    replace_read_options(read_options, next);
 }
 
 fn read_options_from_handle_or_throw_impl(
@@ -213,9 +216,4 @@ fn read_options_from_handle_mut_or_throw(
     }
     // SAFETY: `native_handle` is created from `Box<ReadOptionsHandle>` and valid until dispose.
     Some(unsafe { &mut *(native_handle as *mut ReadOptionsHandle) })
-}
-
-fn default_read_options_handle() -> &'static ReadOptionsHandle {
-    static DEFAULT_READ_OPTIONS_HANDLE: OnceLock<ReadOptionsHandle> = OnceLock::new();
-    DEFAULT_READ_OPTIONS_HANDLE.get_or_init(ReadOptionsHandle::new)
 }

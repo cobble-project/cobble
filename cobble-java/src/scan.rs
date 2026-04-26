@@ -9,7 +9,6 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString};
 use jni::sys::{jint, jlong, jobject};
 use size::Size;
-use std::sync::OnceLock;
 
 const DEFAULT_SCAN_BATCH_SIZE: usize = 256;
 
@@ -60,7 +59,8 @@ pub(crate) struct ScanOpenArgs {
     pub(crate) bucket: u16,
     pub(crate) start_key_inclusive: Vec<u8>,
     pub(crate) end_key_exclusive: Vec<u8>,
-    pub(crate) scan_options_handle: &'static ScanOptionsHandle,
+    pub(crate) scan_options_handle: Option<&'static ScanOptionsHandle>,
+    pub(crate) batch_size: usize,
 }
 
 pub(crate) fn decode_scan_open_args(
@@ -91,12 +91,18 @@ pub(crate) fn decode_scan_open_args(
             return None;
         }
     };
-    let scan_options_handle = scan_options_from_handle_or_throw(env, scan_options_handle)?;
+    let (scan_options_handle, batch_size) = if scan_options_handle == 0 {
+        (None, DEFAULT_SCAN_BATCH_SIZE)
+    } else {
+        let handle = scan_options_from_handle_or_throw(env, scan_options_handle)?;
+        (Some(handle), handle.batch_size())
+    };
     Some(ScanOpenArgs {
         bucket,
         start_key_inclusive,
         end_key_exclusive,
         scan_options_handle,
+        batch_size,
     })
 }
 
@@ -108,8 +114,8 @@ type ScanValues = Vec<Option<Vec<u8>>>;
 type ScanRow = (Vec<u8>, ScanValues);
 
 enum ScanCursorIter {
-    Db(DbIterator<'static>),
-    Split(ScanSplitScanner),
+    Db(Box<DbIterator<'static>>),
+    Split(Box<ScanSplitScanner>),
 }
 
 impl ScanCursorHandle {
@@ -119,7 +125,7 @@ impl ScanCursorHandle {
     ) -> ScanCursorHandle {
         ScanCursorHandle {
             inner: Box::new(StaticScanCursorInner {
-                iter: ScanCursorIter::Db(iter),
+                iter: ScanCursorIter::Db(Box::new(iter)),
                 batch_size,
                 pending: None,
                 exhausted: false,
@@ -133,7 +139,7 @@ impl ScanCursorHandle {
     ) -> ScanCursorHandle {
         ScanCursorHandle {
             inner: Box::new(StaticScanCursorInner {
-                iter: ScanCursorIter::Split(iter),
+                iter: ScanCursorIter::Split(Box::new(iter)),
                 batch_size,
                 pending: None,
                 exhausted: false,
@@ -208,8 +214,8 @@ impl StaticScanCursorInner {
 
     fn next_row(&mut self) -> Option<cobble::Result<(Bytes, Vec<Option<Bytes>>)>> {
         match &mut self.iter {
-            ScanCursorIter::Db(iter) => iter.next(),
-            ScanCursorIter::Split(iter) => iter.next(),
+            ScanCursorIter::Db(iter) => iter.as_mut().next(),
+            ScanCursorIter::Split(iter) => iter.as_mut().next(),
         }
     }
 }
@@ -500,28 +506,39 @@ fn open_split_scan_cursor(
             return 0;
         }
     };
-    let Some(options_handle) = scan_options_from_handle_or_throw(env, scan_options_handle) else {
-        return 0;
-    };
-    let scanner = match split.create_scanner(config, options_handle.scan_options()) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_state(env, err.to_string());
+    let (scanner, batch_size) = if scan_options_handle == 0 {
+        match split.create_scanner_without_options(config) {
+            Ok(v) => (v, DEFAULT_SCAN_BATCH_SIZE),
+            Err(err) => {
+                throw_illegal_state(env, err.to_string());
+                return 0;
+            }
+        }
+    } else {
+        let Some(options_handle) = scan_options_from_handle_or_throw(env, scan_options_handle)
+        else {
             return 0;
+        };
+        match split.create_scanner(config, options_handle.scan_options()) {
+            Ok(v) => (v, options_handle.batch_size()),
+            Err(err) => {
+                throw_illegal_state(env, err.to_string());
+                return 0;
+            }
         }
     };
     Box::into_raw(Box::new(ScanCursorHandle::from_split_scanner(
-        scanner,
-        options_handle.batch_size(),
+        scanner, batch_size,
     ))) as jlong
 }
 
 pub(crate) fn scan_options_from_handle_or_throw(
-    _env: &mut JNIEnv,
+    env: &mut JNIEnv,
     native_handle: jlong,
 ) -> Option<&'static ScanOptionsHandle> {
     if native_handle == 0 {
-        return Some(default_scan_options_handle());
+        throw_illegal_state(env, "scan options handle is disposed".to_string());
+        return None;
     }
     // SAFETY: `native_handle` is created from `Box<ScanOptionsHandle>` and valid until dispose.
     Some(unsafe { &*(native_handle as *const ScanOptionsHandle) })
@@ -566,11 +583,6 @@ fn to_java_scan_batch(env: &mut JNIEnv, batch: ScanBatch) -> std::result::Result
     let next_obj = unsafe { JObject::from_raw(next_raw) };
     let result = new_scan_batch(env, &keys_obj, &values_obj, &next_obj, batch.has_more)?;
     Ok(result.into_raw())
-}
-
-fn default_scan_options_handle() -> &'static ScanOptionsHandle {
-    static DEFAULT_SCAN_OPTIONS_HANDLE: OnceLock<ScanOptionsHandle> = OnceLock::new();
-    DEFAULT_SCAN_OPTIONS_HANDLE.get_or_init(ScanOptionsHandle::new)
 }
 
 fn to_java_bytes_array(

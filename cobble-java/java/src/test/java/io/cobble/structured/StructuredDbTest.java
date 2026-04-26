@@ -3,10 +3,7 @@ package io.cobble.structured;
 import io.cobble.Config;
 import io.cobble.DbCoordinator;
 import io.cobble.GlobalSnapshot;
-import io.cobble.ReadOptions;
-import io.cobble.ScanOptions;
 import io.cobble.ShardSnapshot;
-import io.cobble.WriteOptions;
 
 import org.junit.jupiter.api.Test;
 

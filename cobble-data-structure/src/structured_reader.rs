@@ -1,10 +1,10 @@
 use crate::structured_db::{
-    StructuredColumnValue, StructuredDbIterator, StructuredSchema, combined_resolver, decode_row,
-    load_structured_schema_from_cobble_schema,
+    StructuredColumnValue, StructuredDbIterator, StructuredReadOptions, StructuredScanOptions,
+    StructuredSchema, combined_resolver, decode_row, load_structured_schema_from_cobble_schema,
 };
 use cobble::{
-    GlobalSnapshotManifest, GlobalSnapshotSummary, ReadOnlyDb, ReadOptions, Reader, ReaderConfig,
-    Result, ScanOptions, VolumeDescriptor,
+    GlobalSnapshotManifest, GlobalSnapshotSummary, ReadOnlyDb, Reader, ReaderConfig, Result,
+    VolumeDescriptor,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -12,6 +12,8 @@ use std::sync::Arc;
 pub struct StructuredReader {
     reader: Reader,
     structured_schema: Arc<StructuredSchema>,
+    default_read_options: StructuredReadOptions,
+    default_scan_options: StructuredScanOptions,
 }
 
 impl StructuredReader {
@@ -23,6 +25,8 @@ impl StructuredReader {
         Ok(Self {
             reader,
             structured_schema: Arc::new(structured_schema),
+            default_read_options: StructuredReadOptions::default(),
+            default_scan_options: StructuredScanOptions::default(),
         })
     }
 
@@ -34,6 +38,8 @@ impl StructuredReader {
         Ok(Self {
             reader,
             structured_schema: Arc::new(structured_schema),
+            default_read_options: StructuredReadOptions::default(),
+            default_scan_options: StructuredScanOptions::default(),
         })
     }
 
@@ -48,23 +54,20 @@ impl StructuredReader {
         bucket_id: u16,
         key: &[u8],
     ) -> Result<Option<Vec<Option<StructuredColumnValue>>>> {
-        let raw = self.reader.get(bucket_id, key)?;
-        let default_schema = self.structured_schema.projected(0, None);
-        raw.map(|columns| decode_row(&default_schema, 0, columns))
-            .transpose()
+        let default_options = self.default_read_options.clone();
+        self.get_with_options(bucket_id, key, &default_options)
     }
 
     pub fn get_with_options(
         &mut self,
         bucket_id: u16,
         key: &[u8],
-        options: &ReadOptions,
+        options: &StructuredReadOptions,
     ) -> Result<Option<Vec<Option<StructuredColumnValue>>>> {
-        let raw = self.reader.get_with_options(bucket_id, key, options)?;
-        let projected_schema = self.structured_schema.project_structured_family(
-            options.column_family.as_deref(),
-            options.column_indices.as_deref(),
-        )?;
+        let raw = self
+            .reader
+            .get_with_options(bucket_id, key, options.as_cobble())?;
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
         raw.map(|columns| decode_row(&projected_schema, 0, columns))
             .transpose()
     }
@@ -74,20 +77,20 @@ impl StructuredReader {
         bucket_id: u16,
         range: Range<&[u8]>,
     ) -> Result<StructuredDbIterator<'static>> {
-        self.scan_with_options(bucket_id, range, &ScanOptions::default())
+        let default_options = self.default_scan_options.clone();
+        self.scan_with_options(bucket_id, range, &default_options)
     }
 
     pub fn scan_with_options(
         &mut self,
         bucket_id: u16,
         range: Range<&[u8]>,
-        options: &ScanOptions,
+        options: &StructuredScanOptions,
     ) -> Result<StructuredDbIterator<'static>> {
-        let inner = self.reader.scan_with_options(bucket_id, range, options)?;
-        let projected_schema = self.structured_schema.project_structured_family(
-            options.column_family.as_deref(),
-            options.column_indices.as_deref(),
-        )?;
+        let inner = self
+            .reader
+            .scan_with_options(bucket_id, range, options.as_cobble())?;
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
         Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
@@ -148,7 +151,7 @@ mod tests {
     use crate::list::{ListConfig, ListRetainMode};
     use crate::structured_single_db::StructuredSingleDb;
     use bytes::Bytes;
-    use cobble::{ReadOptions, VolumeDescriptor, WriteOptions};
+    use cobble::VolumeDescriptor;
     use std::collections::BTreeMap;
     use std::thread;
     use std::time::Duration;
@@ -315,7 +318,7 @@ mod tests {
         };
         let mut reader = StructuredReader::open(read_config, snap_id).unwrap();
         let row = reader
-            .get_with_options(0, b"k1", &ReadOptions::for_column(1))
+            .get_with_options(0, b"k1", &StructuredReadOptions::for_column(1))
             .unwrap()
             .expect("row exists");
         assert_eq!(row.len(), 1);
@@ -340,7 +343,7 @@ mod tests {
             .add_list_column(Some("metrics".to_string()), 0, metrics_config.clone())
             .commit()
             .unwrap();
-        let metrics_write = WriteOptions::with_column_family("metrics");
+        let metrics_write = crate::StructuredWriteOptions::with_column_family("metrics");
         db.put_with_options(0, b"k1", 0, vec![Bytes::from_static(b"a")], &metrics_write)
             .unwrap();
         db.merge_with_options(0, b"k1", 0, vec![Bytes::from_static(b"b")], &metrics_write)
@@ -358,7 +361,11 @@ mod tests {
         assert!(reader.current_schema().column_families.contains_key(&1));
 
         let row = reader
-            .get_with_options(0, b"k1", &ReadOptions::for_column_in_family("metrics", 0))
+            .get_with_options(
+                0,
+                b"k1",
+                &StructuredReadOptions::for_column_in_family("metrics", 0),
+            )
             .unwrap()
             .expect("row exists");
         assert_eq!(
@@ -373,7 +380,7 @@ mod tests {
             .scan_with_options(
                 0,
                 b"k0".as_ref()..b"k9".as_ref(),
-                &ScanOptions::for_column(0).with_column_family("metrics"),
+                &StructuredScanOptions::for_column(0).with_column_family("metrics"),
             )
             .unwrap();
         let first = iter.next().expect("one row").unwrap();
