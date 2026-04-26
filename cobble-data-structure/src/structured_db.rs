@@ -634,6 +634,9 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
 
     pub fn commit(&mut self) -> Result<StructuredSchema> {
         if let Some(err) = self.pending_error.take() {
+            // Drop the inner schema builder immediately so its DB access guard
+            // is released even when commit fails.
+            self.inner.take();
             return Err(err);
         }
         let inner = self
@@ -1281,6 +1284,7 @@ mod tests {
             ]))
         );
         assert!(iter.next().is_none());
+        drop(iter);
 
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
@@ -1337,6 +1341,7 @@ mod tests {
         let second = iter.next().expect("second row").unwrap();
         assert_eq!(second.0.as_ref(), b"k2");
         assert!(iter.next().is_none());
+        drop(iter);
 
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
@@ -1413,6 +1418,7 @@ mod tests {
                 Bytes::from_static(b"b"),
             ]))
         );
+        drop(iter);
 
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
@@ -1522,6 +1528,7 @@ mod tests {
             ]))
         );
         assert!(iter.next().is_none());
+        drop(iter);
 
         let mut batch = db.new_write_batch();
         batch

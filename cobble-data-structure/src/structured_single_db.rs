@@ -315,6 +315,7 @@ mod tests {
         let first = iter.next().expect("one row").unwrap();
         assert_eq!(first.0.as_ref(), b"k1");
         assert!(iter.next().is_none());
+        drop(iter);
 
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
