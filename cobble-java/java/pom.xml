@@ -42,6 +42,7 @@
     <junit.version>5.10.2</junit.version>
     <native.lib.name>cobblejni</native.lib.name>
     <cobble.skip.local.native.copy>false</cobble.skip.local.native.copy>
+    <surefire.test.jvm.args></surefire.test.jvm.args>
   </properties>
 
   <dependencies>
@@ -140,6 +141,7 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
         <configuration>
+          <argLine>${surefire.test.jvm.args}</argLine>
           <useSystemClassLoader>true</useSystemClassLoader>
         </configuration>
       </plugin>
@@ -178,6 +180,32 @@
   </build>
 
   <profiles>
+    <profile>
+      <id>java11-plus</id>
+      <activation>
+        <jdk>[11,)</jdk>
+      </activation>
+      <properties>
+        <surefire.test.jvm.args>--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED</surefire.test.jvm.args>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <version>3.1</version>
+            <configuration>
+              <fork>true</fork>
+              <compilerArgs>
+                <arg>-J--add-opens=java.base/java.lang=ALL-UNNAMED</arg>
+                <arg>-J--add-opens=java.base/java.util=ALL-UNNAMED</arg>
+                <arg>-J--add-opens=java.base/sun.nio.ch=ALL-UNNAMED</arg>
+              </compilerArgs>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
     <profile>
       <id>release-publish</id>
       <build>
