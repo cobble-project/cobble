@@ -170,9 +170,158 @@ struct ActiveMemtableCheckpoint {
     recorder_checkpoint: Option<u32>,
 }
 
+#[derive(Clone)]
 enum MemtableScanSource {
     Active(Arc<Mutex<ActiveMemtable>>),
     Immutable(Arc<MemtableImpl>),
+}
+
+struct SkiplistScanCursor {
+    source: MemtableScanSource,
+    end_bound_exclusive: Option<Bytes>,
+    next_node: Option<u32>,
+    current_key: Option<Bytes>,
+    current_value: Option<Bytes>,
+}
+
+impl SkiplistScanCursor {
+    fn new(source: MemtableScanSource, end_bound_exclusive: Option<Bytes>) -> Self {
+        Self {
+            source,
+            end_bound_exclusive,
+            next_node: None,
+            current_key: None,
+            current_value: None,
+        }
+    }
+
+    fn read_skiplist_node(&self, node: u32) -> Result<Option<(Bytes, Bytes, Option<u32>)>> {
+        let read_from_skiplist = |memtable: &SkiplistMemtable| {
+            memtable.node_entry(node).map(|(key, value)| {
+                (
+                    Bytes::copy_from_slice(key),
+                    Bytes::copy_from_slice(value),
+                    memtable.next_node_offset(node),
+                )
+            })
+        };
+        match &self.source {
+            MemtableScanSource::Active(active) => {
+                let active = active.lock().unwrap();
+                let Some(memtable) = active.memtable.as_ref() else {
+                    return Ok(None);
+                };
+                match memtable {
+                    MemtableImpl::Skiplist(skiplist_memtable) => {
+                        Ok(read_from_skiplist(skiplist_memtable))
+                    }
+                    _ => Err(InvalidState(
+                        "skiplist iterator expected skiplist active memtable".to_string(),
+                    )),
+                }
+            }
+            MemtableScanSource::Immutable(memtable) => match memtable.as_ref() {
+                MemtableImpl::Skiplist(skiplist_memtable) => {
+                    Ok(read_from_skiplist(skiplist_memtable))
+                }
+                _ => Err(InvalidState(
+                    "skiplist iterator expected skiplist immutable memtable".to_string(),
+                )),
+            },
+        }
+    }
+
+    fn skiplist_start_node(&self, seek_target: Option<&[u8]>) -> Result<Option<u32>> {
+        let find_start = |memtable: &SkiplistMemtable| {
+            if let Some(target) = seek_target {
+                memtable.lower_bound_node_offset(target)
+            } else {
+                memtable.first_node_offset()
+            }
+        };
+        match &self.source {
+            MemtableScanSource::Active(active) => {
+                let active = active.lock().unwrap();
+                let Some(memtable) = active.memtable.as_ref() else {
+                    return Ok(None);
+                };
+                match memtable {
+                    MemtableImpl::Skiplist(skiplist_memtable) => Ok(find_start(skiplist_memtable)),
+                    _ => Err(InvalidState(
+                        "skiplist iterator expected skiplist active memtable".to_string(),
+                    )),
+                }
+            }
+            MemtableScanSource::Immutable(memtable) => match memtable.as_ref() {
+                MemtableImpl::Skiplist(skiplist_memtable) => Ok(find_start(skiplist_memtable)),
+                _ => Err(InvalidState(
+                    "skiplist iterator expected skiplist immutable memtable".to_string(),
+                )),
+            },
+        }
+    }
+
+    fn advance(&mut self) -> Result<bool> {
+        let Some(node) = self.next_node else {
+            self.current_key = None;
+            self.current_value = None;
+            return Ok(false);
+        };
+        let Some((key, value, next_node)) = self.read_skiplist_node(node)? else {
+            self.next_node = None;
+            self.current_key = None;
+            self.current_value = None;
+            return Ok(false);
+        };
+        self.next_node = next_node;
+        if let Some(end) = self.end_bound_exclusive.as_deref()
+            && key.as_ref() >= end
+        {
+            self.next_node = None;
+            self.current_key = None;
+            self.current_value = None;
+            return Ok(false);
+        }
+        self.current_key = Some(key);
+        self.current_value = Some(value);
+        Ok(true)
+    }
+
+    fn seek_inner(&mut self, target: Option<&[u8]>) -> Result<()> {
+        self.next_node = self.skiplist_start_node(target)?;
+        let _ = self.advance()?;
+        Ok(())
+    }
+}
+
+impl<'a> KvIterator<'a> for SkiplistScanCursor {
+    fn seek(&mut self, target: &[u8]) -> Result<()> {
+        self.seek_inner(Some(target))
+    }
+
+    fn seek_to_first(&mut self) -> Result<()> {
+        self.seek_inner(None)
+    }
+
+    fn next(&mut self) -> Result<bool> {
+        self.advance()
+    }
+
+    fn valid(&self) -> bool {
+        self.current_key.is_some() && self.current_value.is_some()
+    }
+
+    fn key(&self) -> Result<Option<&[u8]>> {
+        Ok(self.current_key.as_deref())
+    }
+
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        Ok(self.current_key.take())
+    }
+
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        Ok(self.current_value.take().map(KvValue::Encoded))
+    }
 }
 
 struct MemtableScanIterator {
@@ -181,6 +330,7 @@ struct MemtableScanIterator {
     end_bound_exclusive: Option<Bytes>,
     entries: Vec<(Bytes, Bytes)>,
     next_index: usize,
+    skiplist_iter: Option<SkiplistScanCursor>,
     current_key: Option<Bytes>,
     current_value: Option<Bytes>,
 }
@@ -197,6 +347,7 @@ impl MemtableScanIterator {
             end_bound_exclusive,
             entries: Vec::new(),
             next_index: 0,
+            skiplist_iter: None,
             current_key: None,
             current_value: None,
         }
@@ -213,6 +364,7 @@ impl MemtableScanIterator {
             end_bound_exclusive,
             entries: Vec::new(),
             next_index: 0,
+            skiplist_iter: None,
             current_key: None,
             current_value: None,
         }
@@ -263,21 +415,12 @@ impl MemtableScanIterator {
         }
     }
 
-    fn reload_entries(&mut self, seek_target: Option<&[u8]>) -> Result<()> {
-        let effective_start = match (self.start_bound_inclusive.as_ref(), seek_target) {
-            (Some(bound), Some(target)) => {
-                if bound.as_ref() >= target {
-                    Some(bound.clone())
-                } else {
-                    Some(Bytes::copy_from_slice(target))
-                }
-            }
-            (Some(bound), None) => Some(bound.clone()),
-            (None, Some(target)) => Some(Bytes::copy_from_slice(target)),
-            (None, None) => None,
-        };
-        let start_bound_inclusive = effective_start.as_deref();
-        let end_bound_exclusive = self.end_bound_exclusive.as_deref();
+    fn reload_collected_entries(
+        &mut self,
+        start_bound_inclusive: Option<&[u8]>,
+        end_bound_exclusive: Option<&[u8]>,
+    ) -> Result<()> {
+        self.skiplist_iter = None;
         self.entries = match &self.source {
             MemtableScanSource::Active(active) => {
                 let active = active.lock().unwrap();
@@ -304,6 +447,50 @@ impl MemtableScanIterator {
         Ok(())
     }
 
+    fn reload_skiplist_stream(&mut self, start_bound_inclusive: Option<&[u8]>) -> Result<()> {
+        self.entries.clear();
+        self.next_index = 0;
+        self.current_key = None;
+        self.current_value = None;
+        let mut skiplist_iter =
+            SkiplistScanCursor::new(self.source.clone(), self.end_bound_exclusive.clone());
+        if let Some(target) = start_bound_inclusive {
+            skiplist_iter.seek(target)?;
+        } else {
+            skiplist_iter.seek_to_first()?;
+        }
+        self.skiplist_iter = Some(skiplist_iter);
+        Ok(())
+    }
+
+    fn reload_entries(&mut self, seek_target: Option<&[u8]>) -> Result<()> {
+        let effective_start = match (self.start_bound_inclusive.as_ref(), seek_target) {
+            (Some(bound), Some(target)) => {
+                if bound.as_ref() >= target {
+                    Some(bound.clone())
+                } else {
+                    Some(Bytes::copy_from_slice(target))
+                }
+            }
+            (Some(bound), None) => Some(bound.clone()),
+            (None, Some(target)) => Some(Bytes::copy_from_slice(target)),
+            (None, None) => None,
+        };
+        let start_bound_inclusive = effective_start.as_deref();
+        let end_bound_exclusive = self.end_bound_exclusive.clone();
+        let end_bound_exclusive_ref = end_bound_exclusive.as_deref();
+        let source_is_immutable_skiplist = matches!(
+            &self.source,
+            MemtableScanSource::Immutable(memtable)
+                if matches!(memtable.as_ref(), MemtableImpl::Skiplist(_))
+        );
+        if source_is_immutable_skiplist {
+            self.reload_skiplist_stream(start_bound_inclusive)
+        } else {
+            self.reload_collected_entries(start_bound_inclusive, end_bound_exclusive_ref)
+        }
+    }
+
     fn prime_current(&mut self) {
         if let Some((key, value)) = self.entries.first().cloned() {
             self.current_key = Some(key);
@@ -327,6 +514,9 @@ impl<'a> KvIterator<'a> for MemtableScanIterator {
     }
 
     fn next(&mut self) -> Result<bool> {
+        if let Some(iter) = self.skiplist_iter.as_mut() {
+            return iter.next();
+        }
         if let Some((key, value)) = self.entries.get(self.next_index).cloned() {
             self.current_key = Some(key);
             self.current_value = Some(value);
@@ -340,18 +530,30 @@ impl<'a> KvIterator<'a> for MemtableScanIterator {
     }
 
     fn valid(&self) -> bool {
+        if let Some(iter) = self.skiplist_iter.as_ref() {
+            return iter.valid();
+        }
         self.current_key.is_some() && self.current_value.is_some()
     }
 
     fn key(&self) -> Result<Option<&[u8]>> {
+        if let Some(iter) = self.skiplist_iter.as_ref() {
+            return iter.key();
+        }
         Ok(self.current_key.as_deref())
     }
 
     fn take_key(&mut self) -> Result<Option<Bytes>> {
+        if let Some(iter) = self.skiplist_iter.as_mut() {
+            return iter.take_key();
+        }
         Ok(self.current_key.take())
     }
 
     fn take_value(&mut self) -> Result<Option<KvValue>> {
+        if let Some(iter) = self.skiplist_iter.as_mut() {
+            return iter.take_value();
+        }
         Ok(self.current_value.take().map(KvValue::Encoded))
     }
 }

@@ -4,11 +4,14 @@
 use bytes::BufMut;
 
 use crate::error::{Error, Result};
-use crate::memtable::iter::OrderedMemtableKvIterator;
+use crate::iterator::KvIterator;
 use crate::memtable::vlog::{RewrittenValuePlan, encode_rewritten_value};
 use crate::memtable::{Memtable, MemtableReclaimer};
 use crate::sst::row_codec::{encode_key_ref_into, encode_value_ref_into};
+use crate::r#type::KvValue;
 use crate::r#type::{RefKey, RefValue};
+use crate::util::unsafe_bytes;
+use bytes::Bytes;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
@@ -16,7 +19,14 @@ const NULL_OFFSET: u32 = u32::MAX;
 const MAX_HEIGHT: usize = 12;
 const NODE_HEADER_SIZE: usize = 12; // entry_offset(u32) + ordinal(u32) + height(u8) + reserved(3)
 
-pub(crate) type MemtableKvIterator<'a> = OrderedMemtableKvIterator<'a>;
+pub(crate) struct SkiplistMemtableIter<'a> {
+    mem: &'a SkiplistMemtable,
+    next_node: u32,
+    current_key: Option<&'a [u8]>,
+    current_value: Option<&'a [u8]>,
+}
+
+pub(crate) type MemtableKvIterator<'a> = SkiplistMemtableIter<'a>;
 
 pub(crate) struct SkiplistMemtable {
     buffer: Vec<u8>,
@@ -32,6 +42,69 @@ pub(crate) struct MemtableValueIter<'a> {
     mem: &'a SkiplistMemtable,
     key: Vec<u8>,
     next_node: u32,
+}
+
+impl<'a> SkiplistMemtableIter<'a> {
+    fn new(mem: &'a SkiplistMemtable) -> Self {
+        Self {
+            mem,
+            next_node: NULL_OFFSET,
+            current_key: None,
+            current_value: None,
+        }
+    }
+}
+
+impl<'a> KvIterator<'a> for SkiplistMemtableIter<'a> {
+    fn seek(&mut self, target: &[u8]) -> Result<()> {
+        self.next_node = self.mem.lower_bound_node(target);
+        self.current_key = None;
+        self.current_value = None;
+        Ok(())
+    }
+
+    fn seek_to_first(&mut self) -> Result<()> {
+        self.next_node = self.mem.heads[0];
+        self.current_key = None;
+        self.current_value = None;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<bool> {
+        if self.next_node == NULL_OFFSET {
+            self.current_key = None;
+            self.current_value = None;
+            return Ok(false);
+        }
+        let node = self.next_node;
+        self.next_node = self.mem.node_next(node, 0).unwrap_or(NULL_OFFSET);
+        let Some((key, value)) = self.mem.node_key_value(node) else {
+            self.current_key = None;
+            self.current_value = None;
+            return Ok(false);
+        };
+        self.current_key = Some(key);
+        self.current_value = Some(value);
+        Ok(true)
+    }
+
+    fn valid(&self) -> bool {
+        self.current_key.is_some() && self.current_value.is_some()
+    }
+
+    fn key(&self) -> Result<Option<&[u8]>> {
+        Ok(self.current_key)
+    }
+
+    fn take_key(&mut self) -> Result<Option<Bytes>> {
+        Ok(self.current_key.map(unsafe_bytes))
+    }
+
+    fn take_value(&mut self) -> Result<Option<KvValue>> {
+        Ok(self
+            .current_value
+            .map(|v| KvValue::Encoded(unsafe_bytes(v))))
+    }
 }
 
 impl SkiplistMemtable {
@@ -147,10 +220,6 @@ impl SkiplistMemtable {
         Some(self.read_u32_le(Self::node_offset(node))? as usize)
     }
 
-    fn node_ordinal(&self, node: u32) -> Option<u32> {
-        self.read_u32_le(Self::node_offset(node).checked_add(4)?)
-    }
-
     fn node_next(&self, node: u32, level: usize) -> Option<u32> {
         let height = self.node_height(node)?;
         if level >= height {
@@ -160,6 +229,37 @@ impl SkiplistMemtable {
             .checked_add(NODE_HEADER_SIZE)?
             .checked_add(level * 4)?;
         self.read_u32_le(pos)
+    }
+
+    pub(crate) fn first_node_offset(&self) -> Option<u32> {
+        let node = self.heads[0];
+        if node == NULL_OFFSET {
+            None
+        } else {
+            Some(node)
+        }
+    }
+
+    pub(crate) fn lower_bound_node_offset(&self, target: &[u8]) -> Option<u32> {
+        let node = self.lower_bound_node(target);
+        if node == NULL_OFFSET {
+            None
+        } else {
+            Some(node)
+        }
+    }
+
+    pub(crate) fn next_node_offset(&self, node: u32) -> Option<u32> {
+        let next = self.node_next(node, 0)?;
+        if next == NULL_OFFSET {
+            None
+        } else {
+            Some(next)
+        }
+    }
+
+    pub(crate) fn node_entry(&self, node: u32) -> Option<(&[u8], &[u8])> {
+        self.node_key_value(node)
     }
 
     fn set_node_next(&mut self, node: u32, level: usize, next: u32) -> Result<()> {
@@ -494,17 +594,7 @@ impl Memtable for SkiplistMemtable {
     }
 
     fn iter(&self) -> Self::KvIter<'_> {
-        let mut entries: Vec<(&[u8], &[u8], usize)> = Vec::new();
-        let mut node = self.heads[0];
-        while node != NULL_OFFSET {
-            let Some((key, value)) = self.node_key_value(node) else {
-                break;
-            };
-            let ordinal = self.node_ordinal(node).unwrap_or(0) as usize;
-            entries.push((key, value, ordinal));
-            node = self.node_next(node, 0).unwrap_or(NULL_OFFSET);
-        }
-        MemtableKvIterator::new(entries)
+        MemtableKvIterator::new(self)
     }
 
     type ValueIter<'a>
