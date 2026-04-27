@@ -167,8 +167,8 @@ Named column families are added later through schema evolution. Reopen, restore,
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `jni_direct_buffer_size` | `Size` | `2KiB` | Capacity of each pooled direct `ByteBuffer` used by Java direct APIs |
-| `jni_direct_buffer_pool_size` | `usize` | `64` | Maximum number of pooled direct buffers kept per Java process |
+| `jni_direct_buffer_size` | `Size` | `2KiB` | Capacity of each pooled direct `ByteBuffer` used by Java direct get/scan APIs (`Db.getDirect*`, `Db.scanDirect*`, structured direct APIs) |
+| `jni_direct_buffer_pool_size` | `usize` | `64` | Maximum number of pooled direct buffers kept per Java process for raw + structured Java direct APIs |
 
 ---
 

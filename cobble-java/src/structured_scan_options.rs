@@ -105,6 +105,69 @@ pub(crate) fn decode_structured_scan_open_args(
     })
 }
 
+pub(crate) fn decode_structured_scan_open_direct_args(
+    env: &mut JNIEnv,
+    bucket: jint,
+    start_key_address: jlong,
+    start_key_length: jint,
+    end_key_address: jlong,
+    end_key_length: jint,
+    scan_options_handle: jlong,
+) -> Option<StructuredScanOpenArgs> {
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return None;
+        }
+    };
+    let start_key_inclusive = decode_direct_bytes(
+        env,
+        "startKeyInclusive",
+        start_key_address,
+        start_key_length,
+    )?;
+    let end_key_exclusive =
+        decode_direct_bytes(env, "endKeyExclusive", end_key_address, end_key_length)?;
+    let (scan_options_handle, batch_size) = if scan_options_handle == 0 {
+        (None, DEFAULT_SCAN_BATCH_SIZE)
+    } else {
+        let handle = structured_scan_options_from_handle_or_throw(env, scan_options_handle)?;
+        (Some(handle), handle.batch_size())
+    };
+    Some(StructuredScanOpenArgs {
+        bucket,
+        start_key_inclusive,
+        end_key_exclusive,
+        scan_options_handle,
+        batch_size,
+    })
+}
+
+fn decode_direct_bytes(
+    env: &mut JNIEnv,
+    name: &str,
+    address: jlong,
+    length: jint,
+) -> Option<Vec<u8>> {
+    let length = match usize::try_from(length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(env, format!("{name} length must be >= 0"));
+            return None;
+        }
+    };
+    let address = match usize::try_from(address) {
+        Ok(v) if v != 0 => v as *const u8,
+        _ => {
+            throw_illegal_argument(env, format!("{name} address must be > 0"));
+            return None;
+        }
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(address, length) };
+    Some(bytes.to_vec())
+}
+
 pub(crate) fn structured_scan_options_from_handle_or_throw(
     env: &mut JNIEnv,
     native_handle: jlong,

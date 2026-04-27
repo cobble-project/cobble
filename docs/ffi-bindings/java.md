@@ -136,7 +136,11 @@ For lower JNI overhead on non-structured `Db`, Java bindings also provide direct
 
 ```java
 import io.cobble.Db;
+import io.cobble.DirectColumns;
+import io.cobble.DirectScanCursor;
+import io.cobble.DirectScanEntry;
 import io.cobble.ReadOptions;
+import io.cobble.ScanOptions;
 import io.cobble.WriteOptions;
 import java.nio.ByteBuffer;
 import java.nio.Buffer;
@@ -167,6 +171,34 @@ try (ReadOptions read = ReadOptions.forColumn(0)) {
 try (ReadOptions read = ReadOptions.forColumn(0)) {
     ByteBuffer[] columns = db.getDirectWithOptions(0, key, read);
 }
+
+// Zero-copy pooled direct API. Close it when done so pooled buffers can be reused.
+try (ReadOptions read = ReadOptions.forColumns(0);
+     DirectColumns columns = db.getDirectColumnsWithOptions(0, key, read)) {
+    ByteBuffer column0 = columns.get(0);
+}
+
+ByteBuffer scanStart = ByteBuffer.allocateDirect(64);
+ByteBuffer scanEnd = ByteBuffer.allocateDirect(64);
+((Buffer) scanStart).clear();
+scanStart.put("user:".getBytes());
+((Buffer) scanEnd).clear();
+scanEnd.put("user;".getBytes());
+
+try (ScanOptions scan = new ScanOptions().batchSize(128).columns(0);
+     DirectScanCursor cursor =
+             db.scanDirectWithOptions(
+                     0,
+                     scanStart,
+                     "user:".length(),
+                     scanEnd,
+                     "user;".length(),
+                     scan)) {
+    for (DirectScanEntry entry : cursor) {
+        ByteBuffer directKey = entry.getKey();
+        ByteBuffer directValue = entry.getColumn(0);
+    }
+}
 ```
 
 `getEncodedDirectWithOptions(...)` returns:
@@ -177,6 +209,19 @@ try (ReadOptions read = ReadOptions.forColumn(0)) {
 
 `getDirectWithOptions(...)` returns `ByteBuffer[]` (one element per selected column, `null` for
 missing columns), and each non-null column is a direct `ByteBuffer`.
+
+`getDirectColumnsWithOptions(...)` is the zero-copy variant of `getDirectWithOptions(...)`: it
+returns a `DirectColumns` view over the JNI-owned direct payload instead of copying each selected
+column into a fresh direct buffer.
+
+`scanDirectWithOptions(...)` returns a `DirectScanCursor` whose batches are encoded into pooled
+direct buffers. Each `DirectScanEntry` exposes:
+
+- `getKey()` → direct `ByteBuffer`
+- `getColumn(i)` → direct `ByteBuffer` (or `null` for a missing raw column)
+
+Like structured direct scan, one direct scan batch remains valid only until the cursor advances to
+the next batch or closes.
 
 Direct buffer pool settings are loaded from the opened DB config
 (`jni_direct_buffer_size`, `jni_direct_buffer_pool_size`) during open/restore/resume. Runtime
@@ -225,6 +270,39 @@ pool. Pool settings are loaded from the opened DB config (`jni_direct_buffer_siz
 
 Runtime updates use `Db.configureDirectBufferPool(sizeBytes, maxPoolSize)`, and are grow-only:
 shrinking either value returns `false`.
+
+Structured direct scan follows the same pooled direct-buffer model:
+
+```java
+import io.cobble.structured.DirectRow;
+import io.cobble.structured.DirectScanCursor;
+import io.cobble.structured.DirectScanRow;
+import io.cobble.structured.ScanOptions;
+import java.nio.ByteBuffer;
+import java.nio.Buffer;
+
+ByteBuffer start = ByteBuffer.allocateDirect(64);
+ByteBuffer end = ByteBuffer.allocateDirect(64);
+((Buffer) start).clear();
+start.put("user:".getBytes());
+((Buffer) end).clear();
+end.put("user;".getBytes());
+
+try (ScanOptions scan = new ScanOptions().batchSize(128).columns(0);
+     DirectScanCursor cursor =
+             db.scanDirectWithOptions(0, start, "user:".length(), end, "user;".length(), scan)) {
+    for (DirectScanRow row : cursor) {
+        ByteBuffer keyBytes = row.getKey();
+        ByteBuffer valueBytes = row.getBytes(0);
+    }
+}
+```
+
+Structured `DirectScanRow` reuses the existing `DirectRow` column encoding:
+
+- `getKey()` → direct key slice
+- `getBytes(i)` → direct `ByteBuffer`
+- `getList(i)` → `List<ByteBuffer>`
 
 ```java
 import io.cobble.structured.SingleDb;

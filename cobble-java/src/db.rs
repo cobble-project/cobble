@@ -1366,7 +1366,10 @@ pub extern "system" fn Java_io_cobble_Db_shrinkBucket(
     }
 }
 
-fn db_from_handle_or_throw(env: &mut JNIEnv, native_handle: jlong) -> Option<&'static Db> {
+pub(crate) fn db_from_handle_or_throw(
+    env: &mut JNIEnv,
+    native_handle: jlong,
+) -> Option<&'static Db> {
     if native_handle == 0 {
         throw_illegal_state(env, "db handle is disposed".to_string());
         return None;

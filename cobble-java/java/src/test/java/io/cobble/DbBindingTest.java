@@ -1236,6 +1236,173 @@ class DbBindingTest {
         }
     }
 
+    @Test
+    void dbDirectColumnViewsHandleFitAndOverflow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-direct-raw-view-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        byte[] key = "direct-view-key".getBytes(StandardCharsets.UTF_8);
+        byte[] smallValue = "small-direct-view".getBytes(StandardCharsets.UTF_8);
+        byte[] largeValue = largeValueBytes("large-direct-view", 1, 4096);
+
+        try (Db db = Db.open(config)) {
+            db.put(0, key, 0, smallValue);
+            db.put(0, key, 1, largeValue);
+
+            try (ReadOptions options = ReadOptions.forColumns(0, 1);
+                    DirectColumns columns = db.getDirectColumnsWithOptions(0, key, options)) {
+                assertNotNull(columns);
+                assertEquals(2, columns.size());
+                assertArrayEquals(smallValue, readDirectBytes(columns.get(0)));
+                assertArrayEquals(largeValue, readDirectBytes(columns.get(1)));
+            }
+
+            ByteBuffer keyBuffer = ByteBuffer.allocateDirect(key.length);
+            ((Buffer) keyBuffer).clear();
+            keyBuffer.put(key);
+            ((Buffer) keyBuffer).flip();
+            try (ReadOptions options = ReadOptions.forColumns(0, 1);
+                    DirectColumns columns = db.getDirectColumnsWithOptions(0, keyBuffer, options)) {
+                assertNotNull(columns);
+                assertEquals(2, columns.size());
+                assertArrayEquals(smallValue, readDirectBytes(columns.get(0)));
+                assertArrayEquals(largeValue, readDirectBytes(columns.get(1)));
+            }
+
+            ByteBuffer paddedKeyBuffer = ByteBuffer.allocateDirect(key.length + 32);
+            ((Buffer) paddedKeyBuffer).clear();
+            paddedKeyBuffer.put(key);
+            paddedKeyBuffer.put((byte) 'x');
+            ((Buffer) paddedKeyBuffer).position(paddedKeyBuffer.capacity());
+            try (ReadOptions options = ReadOptions.forColumns(0, 1);
+                    DirectColumns columns =
+                            db.getDirectColumnsWithOptions(
+                                    0, paddedKeyBuffer, key.length, options)) {
+                assertNotNull(columns);
+                assertEquals(2, columns.size());
+                assertArrayEquals(smallValue, readDirectBytes(columns.get(0)));
+                assertArrayEquals(largeValue, readDirectBytes(columns.get(1)));
+            }
+        }
+    }
+
+    @Test
+    void dbDirectScanCursorHandlesFitAndOverflow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-direct-raw-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 8; i++) {
+                byte[] key =
+                        String.format("direct-raw-scan-%02d", i).getBytes(StandardCharsets.UTF_8);
+                byte[] value0 =
+                        i == 4
+                                ? largeValueBytes("direct-raw-scan-large", i, 4096)
+                                : ("direct-raw-scan-value-" + i).getBytes(StandardCharsets.UTF_8);
+                byte[] value1 = ("direct-raw-scan-side-" + i).getBytes(StandardCharsets.UTF_8);
+                db.put(0, key, 0, value0);
+                db.put(0, key, 1, value1);
+            }
+
+            byte[] start = "direct-raw-scan-02".getBytes(StandardCharsets.UTF_8);
+            byte[] end = "direct-raw-scan-07".getBytes(StandardCharsets.UTF_8);
+            ByteBuffer startBuffer = ByteBuffer.allocateDirect(start.length + 8);
+            ByteBuffer endBuffer = ByteBuffer.allocateDirect(end.length + 8);
+            ((Buffer) startBuffer).clear();
+            startBuffer.put(start);
+            ((Buffer) endBuffer).clear();
+            endBuffer.put(end);
+
+            try (ScanOptions options = new ScanOptions().batchSize(2).columns(0, 1);
+                    DirectScanCursor cursor =
+                            db.scanDirectWithOptions(
+                                    0, startBuffer, start.length, endBuffer, end.length, options)) {
+                List<byte[]> seenKeys = new ArrayList<>();
+                List<byte[]> seenValue0 = new ArrayList<>();
+                List<byte[]> seenValue1 = new ArrayList<>();
+                for (DirectScanEntry entry : cursor) {
+                    seenKeys.add(readDirectBytes(entry.getKey()));
+                    seenValue0.add(readDirectBytes(entry.getColumn(0)));
+                    seenValue1.add(readDirectBytes(entry.getColumn(1)));
+                }
+
+                assertEquals(5, seenKeys.size());
+                for (int i = 0; i < seenKeys.size(); i++) {
+                    int expected = i + 2;
+                    assertArrayEquals(
+                            String.format("direct-raw-scan-%02d", expected)
+                                    .getBytes(StandardCharsets.UTF_8),
+                            seenKeys.get(i));
+                    byte[] expectedValue0 =
+                            expected == 4
+                                    ? largeValueBytes("direct-raw-scan-large", expected, 4096)
+                                    : ("direct-raw-scan-value-" + expected)
+                                            .getBytes(StandardCharsets.UTF_8);
+                    assertArrayEquals(expectedValue0, seenValue0.get(i));
+                    assertArrayEquals(
+                            ("direct-raw-scan-side-" + expected).getBytes(StandardCharsets.UTF_8),
+                            seenValue1.get(i));
+                }
+            }
+        }
+    }
+
+    @Test
+    void rawDirectApisNullOptionsAndBatchSemantics() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-direct-raw-null-opt-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 3; i++) {
+                byte[] key =
+                        String.format("direct-null-scan-%02d", i).getBytes(StandardCharsets.UTF_8);
+                db.put(0, key, 0, ("value-a-" + i).getBytes(StandardCharsets.UTF_8));
+                db.put(0, key, 1, ("value-b-" + i).getBytes(StandardCharsets.UTF_8));
+            }
+
+            byte[] midKey = "direct-null-scan-01".getBytes(StandardCharsets.UTF_8);
+            try (DirectColumns columns =
+                    db.getDirectColumnsWithOptions(0, midKey, (ReadOptions) null)) {
+                assertNotNull(columns);
+                assertEquals(2, columns.size());
+                assertArrayEquals(
+                        "value-a-1".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(columns.get(0)));
+                assertArrayEquals(
+                        "value-b-1".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(columns.get(1)));
+            }
+
+            byte[] start = "direct-null-scan-00".getBytes(StandardCharsets.UTF_8);
+            byte[] end = "direct-null-scan-03".getBytes(StandardCharsets.UTF_8);
+            ByteBuffer startBuffer = ByteBuffer.allocateDirect(start.length + 8);
+            ByteBuffer endBuffer = ByteBuffer.allocateDirect(end.length + 8);
+            ((Buffer) startBuffer).clear();
+            startBuffer.put(start);
+            ((Buffer) endBuffer).clear();
+            endBuffer.put(end);
+
+            try (DirectScanCursor cursor =
+                    db.scanDirectWithOptions(
+                            0, startBuffer, start.length, endBuffer, end.length, null)) {
+                DirectScanBatch batch1 = cursor.nextBatch();
+                assertEquals(3, batch1.size());
+                assertFalse(batch1.hasMore);
+                assertArrayEquals(start, readDirectBytes(batch1.getEntry(0).getKey()));
+                assertArrayEquals(
+                        "value-a-0".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(batch1.getEntry(0).getColumn(0)));
+                assertArrayEquals(
+                        "value-b-2".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(batch1.getEntry(2).getColumn(1)));
+
+                DirectScanBatch batch2 = cursor.nextBatch();
+                assertEquals(0, batch2.size());
+                assertFalse(batch2.hasMore);
+            }
+        }
+    }
+
     private static ShardSnapshot awaitSnapshot(CompletableFuture<ShardSnapshot> future) {
         try {
             return future.get();

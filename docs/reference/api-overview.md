@@ -175,8 +175,12 @@ On the Java side, restore flows are exposed as `Db.restore(..., boolean newDbId)
 | `io.cobble.ScanPlan` | `ScanPlan` |
 | `io.cobble.ScanSplit` | `ScanSplit` |
 | `io.cobble.ScanCursor` | Raw scan iterator cursor |
+| `io.cobble.DirectColumns` | Zero-copy raw direct read view |
+| `io.cobble.DirectScanCursor` / `DirectScanBatch` / `DirectScanEntry` | Raw direct scan cursor and batch/row views |
 | `io.cobble.structured.SingleDb` | Structured `SingleDb` |
 | `io.cobble.structured.Db` | Structured `Db` |
 | `io.cobble.structured.Schema` / `StructuredSchemaBuilder` | Structured family-aware schema API |
 | `io.cobble.structured.StructuredScanSplit` | Structured distributed split |
 | `io.cobble.structured.ScanCursor` | Structured scan iterator cursor |
+| `io.cobble.structured.DirectRow` | Structured zero-copy direct read view |
+| `io.cobble.structured.DirectScanCursor` / `DirectScanBatch` / `DirectScanRow` | Structured direct scan cursor and batch/row views |

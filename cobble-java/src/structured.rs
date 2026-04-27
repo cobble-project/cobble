@@ -7,7 +7,7 @@
 use crate::structured_read_options::structured_read_options_from_handle_or_throw;
 use crate::structured_scan_options::{
     DEFAULT_SCAN_BATCH_SIZE, decode_structured_scan_open_args,
-    structured_scan_options_from_handle_or_throw,
+    decode_structured_scan_open_direct_args, structured_scan_options_from_handle_or_throw,
 };
 use crate::structured_write_options::structured_write_options_from_handle_or_throw;
 use crate::util::{
@@ -1380,6 +1380,58 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredScanCursor(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_openStructuredDirectScanCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    start_key_address: jlong,
+    start_key_length: jint,
+    end_key_address: jlong,
+    end_key_length: jint,
+    scan_options_handle: jlong,
+) -> jlong {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    let Some(args) = decode_structured_scan_open_direct_args(
+        &mut env,
+        bucket,
+        start_key_address,
+        start_key_length,
+        end_key_address,
+        end_key_length,
+        scan_options_handle,
+    ) else {
+        return 0;
+    };
+    let batch_size = args.batch_size;
+    let range = args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice();
+    let iter = if let Some(scan_options_handle) = args.scan_options_handle {
+        match db.scan_with_options(args.bucket, range, scan_options_handle.scan_options()) {
+            Ok(iter) => iter,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        }
+    } else {
+        match db.scan(args.bucket, range) {
+            Ok(iter) => iter,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        }
+    };
+    let iter = unsafe {
+        std::mem::transmute::<StructuredDbIterator<'_>, StructuredDbIterator<'static>>(iter)
+    };
+    let cursor = StructuredScanCursorHandle::new(iter, batch_size);
+    Box::into_raw(Box::new(cursor)) as jlong
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_structured_StructuredScanSplit_openStructuredSplitScanCursor(
     mut env: JNIEnv,
     _class: JClass,
@@ -1803,6 +1855,81 @@ impl StructuredScanCursorHandle {
         })
     }
 
+    fn next_batch_direct<'local>(
+        &mut self,
+        env: &mut JNIEnv<'local>,
+        io_addr: *mut u8,
+        io_capacity: usize,
+    ) -> jint {
+        if self.exhausted {
+            return 0;
+        }
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&0u32.to_be_bytes());
+        encoded.push(0);
+        let mut row_count = 0usize;
+
+        if let Some((key, cols)) = self.pending.take() {
+            if let Err(err) = append_direct_scan_row_payload(&mut encoded, &key, &cols) {
+                throw_illegal_state(env, err);
+                return 0;
+            }
+            row_count += 1;
+        }
+
+        while row_count < self.batch_size {
+            match self.next_row() {
+                Some(Ok((key, cols))) => {
+                    if let Err(err) = append_direct_scan_row_payload(&mut encoded, &key, &cols) {
+                        throw_illegal_state(env, err);
+                        return 0;
+                    }
+                    row_count += 1;
+                }
+                Some(Err(err)) => {
+                    throw_illegal_state(env, err.to_string());
+                    return 0;
+                }
+                None => {
+                    self.exhausted = true;
+                    break;
+                }
+            }
+        }
+
+        if row_count == 0 {
+            self.exhausted = true;
+            return 0;
+        }
+
+        let mut has_more = false;
+        if !self.exhausted {
+            match self.next_row() {
+                Some(Ok((key, cols))) => {
+                    self.pending = Some((key, cols));
+                    has_more = true;
+                }
+                Some(Err(err)) => {
+                    throw_illegal_state(env, err.to_string());
+                    return 0;
+                }
+                None => {
+                    self.exhausted = true;
+                }
+            }
+        }
+
+        encoded[0..4].copy_from_slice(&(row_count as u32).to_be_bytes());
+        encoded[4] = if has_more { 1 } else { 0 };
+        match write_payload_to_io_or_cached_overflow(env, io_addr, io_capacity, &encoded) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(env, err);
+                0
+            }
+        }
+    }
+
     fn next_row(&mut self) -> Option<cobble::Result<(Bytes, Vec<Option<StructuredColumnValue>>)>> {
         match &mut self.iter {
             StructuredScanCursorIter::Db(iter) => iter.as_mut().next(),
@@ -1829,6 +1956,31 @@ impl StructuredScanBatch {
     }
 }
 
+fn append_direct_scan_row_payload(
+    encoded: &mut Vec<u8>,
+    key: &[u8],
+    columns: &[Option<StructuredColumnValue>],
+) -> Result<(), String> {
+    let row_size = encoded_row_size(columns)?;
+    let needed = encoded
+        .len()
+        .checked_add(4)
+        .and_then(|v| v.checked_add(key.len()))
+        .and_then(|v| v.checked_add(4))
+        .and_then(|v| v.checked_add(row_size))
+        .ok_or_else(|| "encoded direct scan batch size overflow".to_string())?;
+    let previous_len = encoded.len();
+    encoded.resize(needed, 0);
+    encoded[previous_len..previous_len + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
+    let mut cursor = previous_len + 4;
+    encoded[cursor..cursor + key.len()].copy_from_slice(key);
+    cursor += key.len();
+    encoded[cursor..cursor + 4].copy_from_slice(&(row_size as u32).to_be_bytes());
+    cursor += 4;
+    encode_row_payload(columns, &mut encoded[cursor..cursor + row_size])?;
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_structured_ScanCursor_disposeInternal(
     mut env: JNIEnv,
@@ -1843,6 +1995,15 @@ pub extern "system" fn Java_io_cobble_structured_ScanCursor_disposeInternal(
         return;
     }
     let _boxed = unsafe { Box::from_raw(native_handle as *mut StructuredScanCursorHandle) };
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_disposeInternal(
+    env: JNIEnv,
+    obj: JObject,
+    native_handle: jlong,
+) {
+    Java_io_cobble_structured_ScanCursor_disposeInternal(env, obj, native_handle);
 }
 
 #[unsafe(no_mangle)]
@@ -1868,6 +2029,34 @@ pub extern "system" fn Java_io_cobble_structured_ScanCursor_nextBatchInternal(
             std::ptr::null_mut()
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_nextBatchDirectInternal(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    io_address: jlong,
+    io_capacity: jint,
+) -> jint {
+    let Some(cursor) = structured_scan_cursor_from_handle(&mut env, native_handle) else {
+        return 0;
+    };
+    let io_capacity = match usize::try_from(io_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "ioCapacity must be >= 0".to_string());
+            return 0;
+        }
+    };
+    let io_address = match usize::try_from(io_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "ioAddress must be > 0".to_string());
+            return 0;
+        }
+    };
+    cursor.next_batch_direct(&mut env, io_address, io_capacity)
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────

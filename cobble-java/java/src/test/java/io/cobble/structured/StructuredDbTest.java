@@ -653,12 +653,117 @@ class StructuredDbTest {
         }
     }
 
+    @Test
+    void structuredDirectScanCursorHandlesFitAndOverflow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-direct-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 8; i++) {
+                byte[] key = String.format("direct-scan-%02d", i).getBytes(StandardCharsets.UTF_8);
+                byte[] value =
+                        i == 4
+                                ? largeValueBytes("direct-scan-large", i, 4096)
+                                : ("direct-scan-value-" + i).getBytes(StandardCharsets.UTF_8);
+                db.put(0, key, 0, ColumnValue.ofBytes(value));
+            }
+
+            byte[] start = "direct-scan-02".getBytes(StandardCharsets.UTF_8);
+            byte[] end = "direct-scan-07".getBytes(StandardCharsets.UTF_8);
+            ByteBuffer startBuffer = ByteBuffer.allocateDirect(start.length + 8);
+            ByteBuffer endBuffer = ByteBuffer.allocateDirect(end.length + 8);
+            ((Buffer) startBuffer).clear();
+            startBuffer.put(start);
+            ((Buffer) endBuffer).clear();
+            endBuffer.put(end);
+
+            try (ScanOptions options = new ScanOptions().batchSize(2).columns(0);
+                    DirectScanCursor cursor =
+                            db.scanDirectWithOptions(
+                                    0, startBuffer, start.length, endBuffer, end.length, options)) {
+                java.util.List<byte[]> seenKeys = new ArrayList<>();
+                java.util.List<byte[]> seenValues = new ArrayList<>();
+                for (DirectScanRow row : cursor) {
+                    seenKeys.add(readDirectBytes(row.getKey()));
+                    seenValues.add(readDirectBytes(row.getBytes(0)));
+                }
+
+                assertEquals(5, seenKeys.size());
+                for (int i = 0; i < seenKeys.size(); i++) {
+                    int expected = i + 2;
+                    assertArrayEquals(
+                            String.format("direct-scan-%02d", expected)
+                                    .getBytes(StandardCharsets.UTF_8),
+                            seenKeys.get(i));
+                    byte[] expectedValue =
+                            expected == 4
+                                    ? largeValueBytes("direct-scan-large", expected, 4096)
+                                    : ("direct-scan-value-" + expected)
+                                            .getBytes(StandardCharsets.UTF_8);
+                    assertArrayEquals(expectedValue, seenValues.get(i));
+                }
+            }
+        }
+    }
+
+    @Test
+    void structuredDirectScanSupportsNullOptionsAndBatchTraversal() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-direct-scan-null-opt-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 3; i++) {
+                byte[] key =
+                        String.format("st-direct-null-%02d", i).getBytes(StandardCharsets.UTF_8);
+                db.put(
+                        0,
+                        key,
+                        0,
+                        ColumnValue.ofBytes(("st-value-" + i).getBytes(StandardCharsets.UTF_8)));
+            }
+
+            byte[] start = "st-direct-null-00".getBytes(StandardCharsets.UTF_8);
+            byte[] end = "st-direct-null-03".getBytes(StandardCharsets.UTF_8);
+            ByteBuffer startBuffer = ByteBuffer.allocateDirect(start.length + 8);
+            ByteBuffer endBuffer = ByteBuffer.allocateDirect(end.length + 8);
+            ((Buffer) startBuffer).clear();
+            startBuffer.put(start);
+            ((Buffer) endBuffer).clear();
+            endBuffer.put(end);
+
+            try (DirectScanCursor cursor =
+                    db.scanDirectWithOptions(
+                            0, startBuffer, start.length, endBuffer, end.length, null)) {
+                DirectScanBatch batch1 = cursor.nextBatch();
+                assertEquals(3, batch1.size());
+                assertFalse(batch1.hasMore);
+                assertArrayEquals(start, readDirectBytes(batch1.getRow(0).getKey()));
+                assertArrayEquals(
+                        "st-value-2".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(batch1.getRow(2).getBytes(0)));
+
+                DirectScanBatch batch2 = cursor.nextBatch();
+                assertEquals(0, batch2.size());
+                assertFalse(batch2.hasMore);
+            }
+        }
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     private static byte[] readDirectBytes(ByteBuffer buffer) {
         ByteBuffer copy = buffer.duplicate();
         byte[] bytes = new byte[copy.remaining()];
         copy.get(bytes);
+        return bytes;
+    }
+
+    private static byte[] largeValueBytes(String prefix, int seed, int length) {
+        byte[] bytes = new byte[length];
+        byte[] prefixBytes = (prefix + "-" + seed + "-").getBytes(StandardCharsets.UTF_8);
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = prefixBytes[i % prefixBytes.length];
+        }
         return bytes;
     }
 }

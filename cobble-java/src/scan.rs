@@ -1,7 +1,7 @@
 use crate::util::{
     byte_array_2d_class, byte_array_class, decode_column_index, decode_java_bytes,
     decode_java_string, decode_u16, new_object_array, new_scan_batch, parse_config_json,
-    throw_illegal_argument, throw_illegal_state,
+    throw_illegal_argument, throw_illegal_state, write_payload_to_io_or_cached_overflow,
 };
 use bytes::Bytes;
 use cobble::{Config, DbIterator, Result, ScanOptions, ScanSplit, ScanSplitScanner};
@@ -10,7 +10,7 @@ use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString};
 use jni::sys::{jint, jlong, jobject};
 use size::Size;
 
-const DEFAULT_SCAN_BATCH_SIZE: usize = 256;
+const DEFAULT_SCAN_BATCH_SIZE: usize = 16;
 
 pub(crate) struct ScanOptionsHandle {
     scan_options: ScanOptions,
@@ -106,6 +106,69 @@ pub(crate) fn decode_scan_open_args(
     })
 }
 
+pub(crate) fn decode_scan_open_direct_args(
+    env: &mut JNIEnv,
+    bucket: jint,
+    start_key_address: jlong,
+    start_key_length: jint,
+    end_key_address: jlong,
+    end_key_length: jint,
+    scan_options_handle: jlong,
+) -> Option<ScanOpenArgs> {
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return None;
+        }
+    };
+    let start_key_inclusive = decode_direct_bytes(
+        env,
+        "startKeyInclusive",
+        start_key_address,
+        start_key_length,
+    )?;
+    let end_key_exclusive =
+        decode_direct_bytes(env, "endKeyExclusive", end_key_address, end_key_length)?;
+    let (scan_options_handle, batch_size) = if scan_options_handle == 0 {
+        (None, DEFAULT_SCAN_BATCH_SIZE)
+    } else {
+        let handle = scan_options_from_handle_or_throw(env, scan_options_handle)?;
+        (Some(handle), handle.batch_size())
+    };
+    Some(ScanOpenArgs {
+        bucket,
+        start_key_inclusive,
+        end_key_exclusive,
+        scan_options_handle,
+        batch_size,
+    })
+}
+
+fn decode_direct_bytes(
+    env: &mut JNIEnv,
+    name: &str,
+    address: jlong,
+    length: jint,
+) -> Option<Vec<u8>> {
+    let length = match usize::try_from(length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(env, format!("{name} length must be >= 0"));
+            return None;
+        }
+    };
+    let address = match usize::try_from(address) {
+        Ok(v) if v != 0 => v as *const u8,
+        _ => {
+            throw_illegal_argument(env, format!("{name} address must be > 0"));
+            return None;
+        }
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(address, length) };
+    Some(bytes.to_vec())
+}
+
 pub(crate) struct ScanCursorHandle {
     inner: Box<StaticScanCursorInner>,
 }
@@ -149,6 +212,15 @@ impl ScanCursorHandle {
 
     fn next_batch(&mut self) -> Result<ScanBatch> {
         self.inner.next_batch()
+    }
+
+    fn next_batch_direct<'local>(
+        &mut self,
+        env: &mut JNIEnv<'local>,
+        io_addr: *mut u8,
+        io_capacity: usize,
+    ) -> jint {
+        self.inner.next_batch_direct(env, io_addr, io_capacity)
     }
 }
 
@@ -212,6 +284,90 @@ impl StaticScanCursorInner {
         })
     }
 
+    fn next_batch_direct<'local>(
+        &mut self,
+        env: &mut JNIEnv<'local>,
+        io_addr: *mut u8,
+        io_capacity: usize,
+    ) -> jint {
+        if self.exhausted {
+            return 0;
+        }
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&0u32.to_be_bytes());
+        encoded.push(0);
+        let mut row_count = 0usize;
+
+        if let Some((key, value)) = self.pending.take() {
+            if let Err(err) = append_direct_scan_row_payload(&mut encoded, &key, &value) {
+                throw_illegal_state(env, err);
+                return 0;
+            }
+            row_count += 1;
+        }
+
+        while row_count < self.batch_size {
+            match self.next_row() {
+                Some(Ok(row)) => {
+                    if let Some((key, value)) = convert_row(row) {
+                        if let Err(err) = append_direct_scan_row_payload(&mut encoded, &key, &value)
+                        {
+                            throw_illegal_state(env, err);
+                            return 0;
+                        }
+                        row_count += 1;
+                    }
+                }
+                Some(Err(err)) => {
+                    throw_illegal_state(env, err.to_string());
+                    return 0;
+                }
+                None => {
+                    self.exhausted = true;
+                    break;
+                }
+            }
+        }
+
+        if row_count == 0 {
+            self.exhausted = true;
+            return 0;
+        }
+
+        let mut has_more = false;
+        if !self.exhausted {
+            loop {
+                match self.next_row() {
+                    Some(Ok(row)) => {
+                        if let Some(next_row) = convert_row(row) {
+                            self.pending = Some(next_row);
+                            has_more = true;
+                            break;
+                        }
+                    }
+                    Some(Err(err)) => {
+                        throw_illegal_state(env, err.to_string());
+                        return 0;
+                    }
+                    None => {
+                        self.exhausted = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        encoded[0..4].copy_from_slice(&(row_count as u32).to_be_bytes());
+        encoded[4] = if has_more { 1 } else { 0 };
+        match write_payload_to_io_or_cached_overflow(env, io_addr, io_capacity, &encoded) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(env, err);
+                0
+            }
+        }
+    }
+
     fn next_row(&mut self) -> Option<cobble::Result<(Bytes, Vec<Option<Bytes>>)>> {
         match &mut self.iter {
             ScanCursorIter::Db(iter) => iter.as_mut().next(),
@@ -249,6 +405,83 @@ impl ScanBatch {
             has_more: false,
         }
     }
+}
+
+fn append_direct_scan_row_payload(
+    encoded: &mut Vec<u8>,
+    key: &[u8],
+    columns: &[Option<Vec<u8>>],
+) -> Result<(), String> {
+    let row_size = encoded_optional_columns_payload_size(columns)?;
+    let needed = encoded
+        .len()
+        .checked_add(4)
+        .and_then(|v| v.checked_add(key.len()))
+        .and_then(|v| v.checked_add(4))
+        .and_then(|v| v.checked_add(row_size))
+        .ok_or_else(|| "encoded direct scan batch size overflow".to_string())?;
+    let previous_len = encoded.len();
+    encoded.resize(needed, 0);
+    encoded[previous_len..previous_len + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
+    let mut cursor = previous_len + 4;
+    encoded[cursor..cursor + key.len()].copy_from_slice(key);
+    cursor += key.len();
+    encoded[cursor..cursor + 4].copy_from_slice(&(row_size as u32).to_be_bytes());
+    cursor += 4;
+    encode_optional_columns_payload_into(columns, &mut encoded[cursor..cursor + row_size])?;
+    Ok(())
+}
+
+pub(crate) fn encoded_optional_columns_payload_size<T: AsRef<[u8]>>(
+    columns: &[Option<T>],
+) -> Result<usize, String> {
+    let mut total = 4usize;
+    for column in columns {
+        total = total
+            .checked_add(1)
+            .ok_or_else(|| "encoded columns size overflow".to_string())?;
+        if let Some(bytes) = column {
+            total = total
+                .checked_add(4)
+                .and_then(|v| v.checked_add(bytes.as_ref().len()))
+                .ok_or_else(|| "encoded column size overflow".to_string())?;
+        }
+    }
+    Ok(total)
+}
+
+pub(crate) fn encode_optional_columns_payload_into<T: AsRef<[u8]>>(
+    columns: &[Option<T>],
+    dst: &mut [u8],
+) -> Result<(), String> {
+    let expected_len = encoded_optional_columns_payload_size(columns)?;
+    if dst.len() != expected_len {
+        return Err(format!(
+            "direct columns payload size mismatch: expected {}, got {}",
+            expected_len,
+            dst.len()
+        ));
+    }
+    dst[0..4].copy_from_slice(&(columns.len() as u32).to_be_bytes());
+    let mut cursor = 4usize;
+    for column in columns {
+        match column {
+            None => {
+                dst[cursor] = 0;
+                cursor += 1;
+            }
+            Some(bytes) => {
+                let bytes = bytes.as_ref();
+                dst[cursor] = 1;
+                cursor += 1;
+                dst[cursor..cursor + 4].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+                cursor += 4;
+                dst[cursor..cursor + bytes.len()].copy_from_slice(bytes);
+                cursor += bytes.len();
+            }
+        }
+    }
+    Ok(())
 }
 
 #[unsafe(no_mangle)]
@@ -416,6 +649,15 @@ pub extern "system" fn Java_io_cobble_ScanCursor_disposeInternal(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_DirectScanCursor_disposeInternal(
+    env: JNIEnv,
+    obj: JObject,
+    native_handle: jlong,
+) {
+    Java_io_cobble_ScanCursor_disposeInternal(env, obj, native_handle);
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_ScanCursor_nextBatchInternal(
     mut env: JNIEnv,
     _class: JClass,
@@ -438,6 +680,89 @@ pub extern "system" fn Java_io_cobble_ScanCursor_nextBatchInternal(
             std::ptr::null_mut()
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_DirectScanCursor_nextBatchDirectInternal(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    io_address: jlong,
+    io_capacity: jint,
+) -> jint {
+    let Some(cursor) = scan_cursor_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    let io_capacity = match usize::try_from(io_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "ioCapacity must be >= 0".to_string());
+            return 0;
+        }
+    };
+    let io_address = match usize::try_from(io_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "ioAddress must be > 0".to_string());
+            return 0;
+        }
+    };
+    cursor.next_batch_direct(&mut env, io_address, io_capacity)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_openDirectScanCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    start_key_address: jlong,
+    start_key_length: jint,
+    end_key_address: jlong,
+    end_key_length: jint,
+    scan_options_handle: jlong,
+) -> jlong {
+    let Some(db) = super::db::db_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    let Some(args) = decode_scan_open_direct_args(
+        &mut env,
+        bucket,
+        start_key_address,
+        start_key_length,
+        end_key_address,
+        end_key_length,
+        scan_options_handle,
+    ) else {
+        return 0;
+    };
+    let iter = match args.scan_options_handle {
+        Some(scan_options_handle) => match db.scan_with_options(
+            args.bucket,
+            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+            scan_options_handle.scan_options(),
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        },
+        None => match db.scan(
+            args.bucket,
+            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        },
+    };
+    Box::into_raw(Box::new(ScanCursorHandle::from_static_iter(
+        iter,
+        args.batch_size,
+    ))) as jlong
 }
 
 #[unsafe(no_mangle)]

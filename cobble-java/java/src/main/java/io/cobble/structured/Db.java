@@ -621,11 +621,11 @@ public final class Db extends NativeObject {
         buffer.put(keyView);
     }
 
-    private static long directAddress(ByteBuffer buffer) {
+    static long directAddress(ByteBuffer buffer) {
         return ((sun.nio.ch.DirectBuffer) buffer).address();
     }
 
-    private static ByteBuffer resolveEncodedBuffer(ByteBuffer ioBuffer, int encodedLength) {
+    static ByteBuffer resolveEncodedBuffer(ByteBuffer ioBuffer, int encodedLength) {
         if (encodedLength > 0) {
             return ioBuffer;
         }
@@ -664,6 +664,47 @@ public final class Db extends NativeObject {
             throw new IllegalStateException("failed to open structured scan cursor");
         }
         return new ScanCursor(h);
+    }
+
+    /**
+     * Open a structured direct scan cursor with caller-owned direct range buffers.
+     *
+     * <p>The direct cursor keeps batch payloads in pooled direct buffers so scan results can be
+     * consumed without JNI byte[] materialization.
+     */
+    public DirectScanCursor scanDirectWithOptions(
+            int bucket,
+            ByteBuffer startKeyInclusive,
+            int startKeyLength,
+            ByteBuffer endKeyExclusive,
+            int endKeyLength,
+            ScanOptions options) {
+        if (startKeyInclusive == null || !startKeyInclusive.isDirect()) {
+            throw new IllegalArgumentException("startKeyInclusive must be a direct ByteBuffer");
+        }
+        if (endKeyExclusive == null || !endKeyExclusive.isDirect()) {
+            throw new IllegalArgumentException("endKeyExclusive must be a direct ByteBuffer");
+        }
+        if (startKeyLength < 0 || startKeyLength > startKeyInclusive.capacity()) {
+            throw new IllegalArgumentException("startKeyLength out of range: " + startKeyLength);
+        }
+        if (endKeyLength < 0 || endKeyLength > endKeyExclusive.capacity()) {
+            throw new IllegalArgumentException("endKeyLength out of range: " + endKeyLength);
+        }
+        long soh = options == null ? 0L : options.getNativeHandle();
+        long h =
+                openStructuredDirectScanCursor(
+                        nativeHandle,
+                        bucket,
+                        directAddress(startKeyInclusive),
+                        startKeyLength,
+                        directAddress(endKeyExclusive),
+                        endKeyLength,
+                        soh);
+        if (h == 0L) {
+            throw new IllegalStateException("failed to open structured direct scan cursor");
+        }
+        return new DirectScanCursor(h, directBufferPool);
     }
 
     // ── metadata / time ───────────────────────────────────────────────────
@@ -834,7 +875,7 @@ public final class Db extends NativeObject {
             int keyLength,
             long readOptionsHandle);
 
-    private static native ByteBuffer getLastDirectOverflowBuffer();
+    static native ByteBuffer getLastDirectOverflowBuffer();
 
     // typed scan
     private static native long openStructuredScanCursor(
@@ -842,6 +883,15 @@ public final class Db extends NativeObject {
             int bucket,
             byte[] startKeyInclusive,
             byte[] endKeyExclusive,
+            long scanOptionsHandle);
+
+    private static native long openStructuredDirectScanCursor(
+            long nativeHandle,
+            int bucket,
+            long startKeyAddress,
+            int startKeyLength,
+            long endKeyAddress,
+            int endKeyLength,
             long scanOptionsHandle);
 
     private static native String id(long nativeHandle);
