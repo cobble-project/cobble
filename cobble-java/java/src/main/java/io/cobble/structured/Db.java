@@ -379,6 +379,47 @@ public final class Db extends NativeObject {
     }
 
     /**
+     * Put one pre-encoded Cobble list payload with caller-owned direct buffers.
+     *
+     * <p>{@code encodedListBuffer[0..encodedListLength)} must already match Cobble core list value
+     * encoding for the target list column.
+     */
+    public void putEncodedListDirectWithOptions(
+            int bucket,
+            ByteBuffer keyBuffer,
+            int keyLength,
+            int column,
+            ByteBuffer encodedListBuffer,
+            int encodedListLength,
+            WriteOptions options) {
+        if (keyBuffer == null || !keyBuffer.isDirect()) {
+            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
+        }
+        if (encodedListBuffer == null || !encodedListBuffer.isDirect()) {
+            throw new IllegalArgumentException("encodedListBuffer must be a direct ByteBuffer");
+        }
+        if (keyLength < 0 || keyLength > keyBuffer.capacity()) {
+            throw new IllegalArgumentException("keyLength out of range: " + keyLength);
+        }
+        if (encodedListLength < 0 || encodedListLength > encodedListBuffer.capacity()) {
+            throw new IllegalArgumentException(
+                    "encodedListLength out of range: " + encodedListLength);
+        }
+        long woh = options == null ? 0L : options.getNativeHandle();
+        putEncodedListDirectWithOptions(
+                nativeHandle,
+                bucket,
+                directAddress(keyBuffer),
+                keyBuffer.capacity(),
+                keyLength,
+                column,
+                directAddress(encodedListBuffer),
+                encodedListBuffer.capacity(),
+                encodedListLength,
+                woh);
+    }
+
+    /**
      * Merge a typed column value for a key.
      *
      * <p>For list columns, merge appends the given elements to the list.
@@ -419,6 +460,47 @@ public final class Db extends NativeObject {
         } else {
             mergeListWithOptions(nativeHandle, bucket, key, column, value.asList(), woh);
         }
+    }
+
+    /**
+     * Merge one pre-encoded Cobble list payload with caller-owned direct buffers.
+     *
+     * <p>{@code encodedListBuffer[0..encodedListLength)} must already match Cobble core list value
+     * encoding for the target list column.
+     */
+    public void mergeEncodedListDirectWithOptions(
+            int bucket,
+            ByteBuffer keyBuffer,
+            int keyLength,
+            int column,
+            ByteBuffer encodedListBuffer,
+            int encodedListLength,
+            WriteOptions options) {
+        if (keyBuffer == null || !keyBuffer.isDirect()) {
+            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
+        }
+        if (encodedListBuffer == null || !encodedListBuffer.isDirect()) {
+            throw new IllegalArgumentException("encodedListBuffer must be a direct ByteBuffer");
+        }
+        if (keyLength < 0 || keyLength > keyBuffer.capacity()) {
+            throw new IllegalArgumentException("keyLength out of range: " + keyLength);
+        }
+        if (encodedListLength < 0 || encodedListLength > encodedListBuffer.capacity()) {
+            throw new IllegalArgumentException(
+                    "encodedListLength out of range: " + encodedListLength);
+        }
+        long woh = options == null ? 0L : options.getNativeHandle();
+        mergeEncodedListDirectWithOptions(
+                nativeHandle,
+                bucket,
+                directAddress(keyBuffer),
+                keyBuffer.capacity(),
+                keyLength,
+                column,
+                directAddress(encodedListBuffer),
+                encodedListBuffer.capacity(),
+                encodedListLength,
+                woh);
     }
 
     /** Delete one column value for a key. */
@@ -847,6 +929,18 @@ public final class Db extends NativeObject {
             byte[][] elements,
             long writeOptionsHandle);
 
+    private static native void putEncodedListDirectWithOptions(
+            long nativeHandle,
+            int bucket,
+            long keyAddress,
+            int keyCapacity,
+            int keyLength,
+            int column,
+            long encodedListAddress,
+            int encodedListCapacity,
+            int encodedListLength,
+            long writeOptionsHandle);
+
     private static native void mergeList(
             long nativeHandle, int bucket, byte[] key, int column, byte[][] elements);
 
@@ -856,6 +950,18 @@ public final class Db extends NativeObject {
             byte[] key,
             int column,
             byte[][] elements,
+            long writeOptionsHandle);
+
+    private static native void mergeEncodedListDirectWithOptions(
+            long nativeHandle,
+            int bucket,
+            long keyAddress,
+            int keyCapacity,
+            int keyLength,
+            int column,
+            long encodedListAddress,
+            int encodedListCapacity,
+            int encodedListLength,
             long writeOptionsHandle);
 
     private static native void deleteWithOptions(

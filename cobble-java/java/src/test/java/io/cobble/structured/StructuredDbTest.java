@@ -654,6 +654,102 @@ class StructuredDbTest {
     }
 
     @Test
+    void structuredDirectEncodedListWriteAndMergeHandleFitAndOverflow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-direct-list-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        byte[] key = "direct-list".getBytes(StandardCharsets.UTF_8);
+        byte[] smallElement = "direct-list-small".getBytes(StandardCharsets.UTF_8);
+        byte[] largeElement = largeValueBytes("direct-list-large", 0, 4096);
+        byte[] tailElement = "direct-list-tail".getBytes(StandardCharsets.UTF_8);
+
+        try (Db db = Db.open(config)) {
+            db.updateSchema().addListColumn(0, ListConfig.of(10, ListRetainMode.LAST)).commit();
+
+            ByteBuffer keyBuffer = directBufferOf(key);
+            DirectListValueBuilder builder = new DirectListValueBuilder(256);
+            builder.beginElement();
+            builder.outputStream().write(smallElement);
+            builder.finishElement();
+            db.putEncodedListDirectWithOptions(
+                    0, keyBuffer, key.length, 0, builder.buffer(), builder.length(), null);
+
+            try (ReadOptions options = ReadOptions.forColumns(0);
+                    DirectRow row = db.getDirectWithOptions(0, keyBuffer, key.length, options)) {
+                assertNotNull(row);
+                assertFalse(row.isNull(0));
+                assertEquals(1, row.getListElementCount(0));
+                assertArrayEquals(smallElement, readDirectBytes(row.getListElement(0, 0)));
+            }
+
+            builder.clear();
+            builder.append(directBufferOf(largeElement), largeElement.length);
+            builder.append(tailElement);
+            db.mergeEncodedListDirectWithOptions(
+                    0, keyBuffer, key.length, 0, builder.buffer(), builder.length(), null);
+
+            Row typed = db.get(0, key);
+            assertNotNull(typed);
+            byte[][] list = typed.getList(0);
+            assertEquals(3, list.length);
+            assertArrayEquals(smallElement, list[0]);
+            assertArrayEquals(largeElement, list[1]);
+            assertArrayEquals(tailElement, list[2]);
+
+            try (ReadOptions options = ReadOptions.forColumns(0);
+                    DirectRow row = db.getDirectWithOptions(0, keyBuffer, key.length, options)) {
+                assertNotNull(row);
+                assertFalse(row.isNull(0));
+                assertEquals(3, row.getListElementCount(0));
+                assertArrayEquals(smallElement, readDirectBytes(row.getListElement(0, 0)));
+                assertArrayEquals(largeElement, readDirectBytes(row.getListElement(0, 1)));
+                assertArrayEquals(tailElement, readDirectBytes(row.getListElement(0, 2)));
+            }
+        }
+    }
+
+    @Test
+    void structuredDirectEncodedListWriteRejectsBytesColumn() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-direct-list-column-check-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        byte[] key = "direct-list-bytes-column".getBytes(StandardCharsets.UTF_8);
+        try (Db db = Db.open(config)) {
+            ByteBuffer keyBuffer = directBufferOf(key);
+            DirectListValueBuilder builder = new DirectListValueBuilder(64);
+            builder.append("value".getBytes(StandardCharsets.UTF_8));
+
+            IllegalStateException putError =
+                    assertThrows(
+                            IllegalStateException.class,
+                            () ->
+                                    db.putEncodedListDirectWithOptions(
+                                            0,
+                                            keyBuffer,
+                                            key.length,
+                                            0,
+                                            builder.buffer(),
+                                            builder.length(),
+                                            null));
+            assertTrue(putError.getMessage().contains("not a LIST column"));
+
+            IllegalStateException mergeError =
+                    assertThrows(
+                            IllegalStateException.class,
+                            () ->
+                                    db.mergeEncodedListDirectWithOptions(
+                                            0,
+                                            keyBuffer,
+                                            key.length,
+                                            0,
+                                            builder.buffer(),
+                                            builder.length(),
+                                            null));
+            assertTrue(mergeError.getMessage().contains("not a LIST column"));
+        }
+    }
+
+    @Test
     void structuredDirectScanCursorHandlesFitAndOverflow() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-direct-scan-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
@@ -756,6 +852,14 @@ class StructuredDbTest {
         byte[] bytes = new byte[copy.remaining()];
         copy.get(bytes);
         return bytes;
+    }
+
+    private static ByteBuffer directBufferOf(byte[] bytes) {
+        ByteBuffer buffer = ByteBuffer.allocateDirect(bytes.length);
+        ((Buffer) buffer).clear();
+        buffer.put(bytes);
+        ((Buffer) buffer).flip();
+        return buffer;
     }
 
     private static byte[] largeValueBytes(String prefix, int seed, int length) {

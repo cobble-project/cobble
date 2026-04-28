@@ -99,6 +99,32 @@ public final class DirectRow implements AutoCloseable {
         return value.list();
     }
 
+    public boolean isNull(int column) {
+        return getColumnValue(column) == null;
+    }
+
+    public int getListElementCount(int column) {
+        ColumnValue value = getColumnValue(column);
+        if (value == null) {
+            throw new IllegalStateException("column " + column + " is NULL");
+        }
+        if (value.isBytes()) {
+            throw new IllegalStateException("column " + column + " is BYTES");
+        }
+        return value.listSize();
+    }
+
+    public ByteBuffer getListElement(int column, int index) {
+        ColumnValue value = getColumnValue(column);
+        if (value == null) {
+            throw new IllegalStateException("column " + column + " is NULL");
+        }
+        if (value.isBytes()) {
+            throw new IllegalStateException("column " + column + " is BYTES");
+        }
+        return value.listElement(index);
+    }
+
     private ColumnValue getColumnValue(int column) {
         if (column < 0 || column >= columns.length) {
             throw new IllegalArgumentException("column out of range: " + column);
@@ -170,6 +196,20 @@ public final class DirectRow implements AutoCloseable {
                 copied.add(element.duplicate());
             }
             return copied;
+        }
+
+        int listSize() {
+            return list == null ? 0 : list.size();
+        }
+
+        ByteBuffer listElement(int index) {
+            if (list == null) {
+                throw new IllegalStateException("column is not LIST");
+            }
+            if (index < 0 || index >= list.size()) {
+                throw new IndexOutOfBoundsException("list index out of range: " + index);
+            }
+            return list.get(index).duplicate();
         }
     }
 }

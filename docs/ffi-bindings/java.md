@@ -261,8 +261,8 @@ and `io.cobble.WriteOptions`.
 Structured `*WithOptions(...)` methods follow the same `null` behavior as raw APIs: `null` routes to
 core no-options paths directly.
 
-Structured direct-read APIs (`getDirect`, `getDirectWithOptions`) use an internal direct-buffer
-pool. Pool settings are loaded from the opened DB config (`jni_direct_buffer_size`,
+Structured direct-buffer APIs (`getDirect`, `getDirectWithOptions`, `scanDirectWithOptions`) use
+an internal direct-buffer pool. Pool settings are loaded from the opened DB config (`jni_direct_buffer_size`,
 `jni_direct_buffer_pool_size`) during open/restore/resume:
 
 - `jni_direct_buffer_size` (default `2KiB`)
@@ -270,6 +270,55 @@ pool. Pool settings are loaded from the opened DB config (`jni_direct_buffer_siz
 
 Runtime updates use `Db.configureDirectBufferPool(sizeBytes, maxPoolSize)`, and are grow-only:
 shrinking either value returns `false`.
+
+For list-heavy workloads, Java bindings also provide a list-specific direct payload builder that
+matches Cobble core list value encoding directly, so callers can skip structured-row decoding on
+the JNI side:
+
+```java
+import io.cobble.structured.DirectListValueBuilder;
+import io.cobble.structured.WriteOptions;
+import java.io.IOException;
+import java.nio.Buffer;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+
+byte[] keyBytes = "user:1".getBytes(StandardCharsets.UTF_8);
+ByteBuffer key = ByteBuffer.allocateDirect(keyBytes.length);
+((Buffer) key).clear();
+key.put(keyBytes);
+
+DirectListValueBuilder listBuilder = new DirectListValueBuilder(256);
+try {
+    listBuilder.beginElement();
+    listBuilder.outputStream().write("a".getBytes(StandardCharsets.UTF_8));
+    listBuilder.finishElement();
+} catch (IOException e) {
+    throw new RuntimeException(e);
+}
+listBuilder.append("b".getBytes(StandardCharsets.UTF_8)); // convenience API
+
+try (WriteOptions write = WriteOptions.defaults()) {
+    db.mergeEncodedListDirectWithOptions(
+            0,
+            key,
+            keyBytes.length,
+            0,
+            listBuilder.buffer(),
+            listBuilder.length(),
+            write);
+}
+```
+
+`putEncodedListDirectWithOptions(...)` replaces the list column with the encoded payload, while
+`mergeEncodedListDirectWithOptions(...)` applies list merge semantics (append/retain per schema).
+Both methods require the target column to be a `LIST` column.
+
+`DirectListValueBuilder` writes the raw list payload format used by Cobble core:
+
+- little-endian `u32` element count
+- for each element: optional little-endian TTL timestamp (when enabled), little-endian `u32`
+  length, then element bytes
 
 Structured direct scan follows the same pooled direct-buffer model:
 
@@ -303,6 +352,7 @@ Structured `DirectScanRow` reuses the existing `DirectRow` column encoding:
 - `getKey()` → direct key slice
 - `getBytes(i)` → direct `ByteBuffer`
 - `getList(i)` → `List<ByteBuffer>`
+- `isNull(i)` / `getListElementCount(i)` / `getListElement(i, j)` → allocation-light list access
 
 ```java
 import io.cobble.structured.SingleDb;

@@ -961,6 +961,68 @@ pub extern "system" fn Java_io_cobble_structured_Db_mergeListWithOptions(
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_putEncodedListDirectWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key_address: jlong,
+    key_capacity: jint,
+    key_length: jint,
+    column: jint,
+    encoded_list_address: jlong,
+    encoded_list_capacity: jint,
+    encoded_list_length: jint,
+    write_options_handle: jlong,
+) {
+    apply_encoded_list_direct_with_options(
+        &mut env,
+        handle,
+        bucket,
+        key_address,
+        key_capacity,
+        key_length,
+        column,
+        encoded_list_address,
+        encoded_list_capacity,
+        encoded_list_length,
+        write_options_handle,
+        false,
+    );
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_mergeEncodedListDirectWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key_address: jlong,
+    key_capacity: jint,
+    key_length: jint,
+    column: jint,
+    encoded_list_address: jlong,
+    encoded_list_capacity: jint,
+    encoded_list_length: jint,
+    write_options_handle: jlong,
+) {
+    apply_encoded_list_direct_with_options(
+        &mut env,
+        handle,
+        bucket,
+        key_address,
+        key_capacity,
+        key_length,
+        column,
+        encoded_list_address,
+        encoded_list_capacity,
+        encoded_list_length,
+        write_options_handle,
+        true,
+    );
+}
+
 // ── delete ──────────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
@@ -1325,6 +1387,112 @@ fn write_slice(out: &mut [u8], offset: usize, value: &[u8]) -> Result<usize, Str
     }
     out[offset..end].copy_from_slice(value);
     Ok(end)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_encoded_list_direct_with_options(
+    env: &mut JNIEnv,
+    handle: jlong,
+    bucket: jint,
+    key_address: jlong,
+    key_capacity: jint,
+    key_length: jint,
+    column: jint,
+    encoded_list_address: jlong,
+    encoded_list_capacity: jint,
+    encoded_list_length: jint,
+    write_options_handle: jlong,
+    merge: bool,
+) {
+    let Some(db) = db_from_handle(env, handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return;
+        }
+    };
+    let Some(key) = decode_direct_buffer_slice(env, "key", key_address, key_capacity, key_length)
+    else {
+        return;
+    };
+    let Some(encoded_list) = decode_direct_buffer_slice(
+        env,
+        "encodedList",
+        encoded_list_address,
+        encoded_list_capacity,
+        encoded_list_length,
+    ) else {
+        return;
+    };
+    let encoded = Bytes::copy_from_slice(encoded_list);
+    let result = if write_options_handle == 0 {
+        if merge {
+            db.merge_encoded_list(bucket, key, column, encoded)
+        } else {
+            db.put_encoded_list(bucket, key, column, encoded)
+        }
+    } else {
+        let Some(wo) = structured_write_options_from_handle_or_throw(env, write_options_handle)
+        else {
+            return;
+        };
+        if merge {
+            db.merge_encoded_list_with_options(bucket, key, column, encoded, wo.write_options())
+        } else {
+            db.put_encoded_list_with_options(bucket, key, column, encoded, wo.write_options())
+        }
+    };
+    if let Err(err) = result {
+        throw_illegal_state(env, err.to_string());
+    }
+}
+
+fn decode_direct_buffer_slice<'a>(
+    env: &mut JNIEnv,
+    label: &str,
+    address: jlong,
+    capacity: jint,
+    length: jint,
+) -> Option<&'a [u8]> {
+    let capacity = match usize::try_from(capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(env, format!("{label}Capacity must be >= 0"));
+            return None;
+        }
+    };
+    let length = match usize::try_from(length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(env, format!("{label}Length must be >= 0"));
+            return None;
+        }
+    };
+    let address = match usize::try_from(address) {
+        Ok(v) if v != 0 => v as *const u8,
+        _ => {
+            throw_illegal_argument(env, format!("{label}Address must be > 0"));
+            return None;
+        }
+    };
+    if length > capacity {
+        throw_illegal_argument(
+            env,
+            format!("{label}Length {length} exceeds direct buffer capacity {capacity}"),
+        );
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(address, length) })
 }
 
 // ── typed scan ──────────────────────────────────────────────────────────────

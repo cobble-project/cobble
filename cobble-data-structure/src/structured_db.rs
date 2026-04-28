@@ -220,6 +220,26 @@ pub(crate) fn encode_for_write(
     }
 }
 
+fn ensure_list_column(
+    schema: &StructuredSchema,
+    column_family: Option<&str>,
+    column: u16,
+) -> Result<()> {
+    let column_family_id = schema.resolve_column_family_id(column_family)?;
+    match schema
+        .column_families
+        .get(&column_family_id)
+        .map(|family| family.structured_column_type(column))
+        .unwrap_or(&StructuredColumnType::Bytes)
+    {
+        StructuredColumnType::List(_) => Ok(()),
+        StructuredColumnType::Bytes => Err(Error::InputError(format!(
+            "column {} is not a LIST column",
+            column,
+        ))),
+    }
+}
+
 pub(crate) fn decode_row(
     schema: &StructuredColumnFamilySchema,
     now_seconds: u32,
@@ -1105,6 +1125,37 @@ impl StructuredDb {
             .put_with_options(bucket, key, column, encoded, options.as_cobble())
     }
 
+    pub fn put_encoded_list<K, B>(&self, bucket: u16, key: K, column: u16, encoded: B) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        B: Into<Bytes>,
+    {
+        self.put_encoded_list_with_options(
+            bucket,
+            key,
+            column,
+            encoded,
+            &self.default_write_options,
+        )
+    }
+
+    pub fn put_encoded_list_with_options<K, B>(
+        &self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        encoded: B,
+        options: &StructuredWriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        B: Into<Bytes>,
+    {
+        ensure_list_column(&self.structured_schema, options.column_family(), column)?;
+        self.db
+            .put_with_options(bucket, key, column, encoded.into(), options.as_cobble())
+    }
+
     pub fn merge<K, V>(&self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -1135,6 +1186,43 @@ impl StructuredDb {
         )?;
         self.db
             .merge_with_options(bucket, key, column, encoded, options.as_cobble())
+    }
+
+    pub fn merge_encoded_list<K, B>(
+        &self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        encoded: B,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        B: Into<Bytes>,
+    {
+        self.merge_encoded_list_with_options(
+            bucket,
+            key,
+            column,
+            encoded,
+            &self.default_write_options,
+        )
+    }
+
+    pub fn merge_encoded_list_with_options<K, B>(
+        &self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        encoded: B,
+        options: &StructuredWriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        B: Into<Bytes>,
+    {
+        ensure_list_column(&self.structured_schema, options.column_family(), column)?;
+        self.db
+            .merge_with_options(bucket, key, column, encoded.into(), options.as_cobble())
     }
 
     pub fn delete<K>(&self, bucket: u16, key: K, column: u16) -> Result<()>
