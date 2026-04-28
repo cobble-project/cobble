@@ -66,7 +66,7 @@ Db restored = Db.restore("config.yaml", input.snapshotId, db.id());
 Db restoredFresh = Db.restore("config.yaml", input.snapshotId, db.id(), true);
 
 // Restore from an explicit manifest path (always creates a fresh db identity)
-Db restoredFromManifest = Db.restoreWithManifest("xxx/SNAPSHOT-1", input.manifestPath);
+Db restoredFromManifest = Db.restoreWithManifest("config.yaml", input.manifestPath);
 ```
 
 ### Reader
@@ -81,337 +81,125 @@ byte[] value = reader.get(0, "key".getBytes(), 0);
 reader.refresh();
 ```
 
-## Column Families
+## Write APIs
 
-The Java API exposes column families in two ways:
+Column family can be passed either by `String columnFamily` overloads or via options objects
+(`io.cobble.*Options` / `io.cobble.structured.*Options`).
 
-- convenience overloads with `String columnFamily` on `Db`, `SingleDb`, `ReadOnlyDb`, `Reader`, and structured wrappers;
-- reusable options objects (`io.cobble.*Options` for raw APIs, `io.cobble.structured.*Options` for structured APIs).
-
-`ScanPlan` / `StructuredScanPlan` stay bucket-only. To scan a named family, build the plan from a global snapshot as usual, then pass `ScanOptions.columnFamily(...)` when opening the scanner. That scanner-open step is where the family becomes effective.
-
-### Raw API
+### 1) `byte[]` style (simple)
 
 ```java
-import io.cobble.Db;
-import io.cobble.ReadOptions;
-import io.cobble.ScanCursor;
-import io.cobble.ScanOptions;
-import io.cobble.Schema;
-import io.cobble.WriteOptions;
-
 Db db = Db.open("config.yaml");
-db.updateSchema().addColumn("metrics", 0, null, null).commit();
+db.put(0, "user:1".getBytes(), 0, "Alice".getBytes());
+```
 
-try (WriteOptions write = WriteOptions.withColumnFamily("metrics")) {
-    db.putWithOptions(0, "user:1".getBytes(), 0, "42".getBytes(), write);
+### 2) Direct buffer style (low JNI overhead)
+
+```java
+ByteBuffer key = ByteBuffer.allocateDirect(64);
+ByteBuffer value = ByteBuffer.allocateDirect(256);
+// write key/value bytes...
+db.putDirectWithOptions(0, key, keyLen, 0, value, valueLen, null);
+```
+
+### 3) Structured style (typed columns)
+
+```java
+io.cobble.structured.Db sdb = io.cobble.structured.Db.open("config.yaml");
+sdb.put(0, "user:1".getBytes(), 0, io.cobble.structured.ColumnValue.ofBytes("Alice".getBytes()));
+```
+
+### 4) Structured list-direct style (best for list writes)
+
+```java
+DirectListValueBuilder b = new DirectListValueBuilder(256);
+b.append("a".getBytes());
+b.append("b".getBytes());
+sdb.mergeEncodedListDirectWithOptions(0, keyBuf, keyLen, 0, b.buffer(), b.length(), null);
+```
+
+## Read APIs
+
+### 1) `byte[]` style (simple)
+
+```java
+byte[] value = db.get(0, "user:1".getBytes(), 0);
+```
+
+### 2) Direct view style (`DirectColumns` / `DirectRow`)
+
+```java
+try (DirectColumns cols = db.getDirectColumnsWithOptions(0, "user:1".getBytes(), ReadOptions.forColumns(0))) {
+    ByteBuffer v = cols.get(0);
 }
+```
 
-try (ReadOptions read = ReadOptions.forColumnInFamily("metrics", 0)) {
-    byte[][] row = db.getWithOptions(0, "user:1".getBytes(), read);
+```java
+try (io.cobble.structured.DirectRow row =
+        sdb.getDirectWithOptions(0, "user:1".getBytes(), io.cobble.structured.ReadOptions.forColumns(0))) {
+    ByteBuffer v = row.getBytes(0);
 }
+```
 
-try (ScanOptions scan = ScanOptions.forColumns(0).columnFamily("metrics")) {
-    try (ScanCursor cursor =
-            db.scanWithOptions(0, "user:".getBytes(), "user;".getBytes(), scan)) {
-        for (ScanCursor.Entry entry : cursor) {
-            byte[] key = entry.key;
-            byte[][] columns = entry.columns;
+### 3) Encoded direct style (`DirectEncodedRow`) — recommended hot path
+
+```java
+try (DirectEncodedRow row = db.getDirectEncodedRowWithOptions(0, "user:1".getBytes(), ReadOptions.forColumns(0))) {
+    byte[] v = row.decodeColumn(0, in -> decodeBytes(in));
+}
+```
+
+```java
+try (io.cobble.structured.DirectEncodedRow row =
+        sdb.getDirectEncodedRowWithOptions(0, keyBuf, keyLen, io.cobble.structured.ReadOptions.forColumns(0))) {
+    List<MyType> list = row.decodeListColumn(0, in -> decodeMyType(in));
+}
+```
+
+### 4) Scan (local + distributed)
+
+```java
+try (DirectScanCursor cursor = db.scanDirectWithOptions(0, startBuf, startLen, endBuf, endLen, null)) {
+    for (DirectScanEntry e : cursor) {
+        ByteBuffer k = e.getKey();
+    }
+}
+```
+
+```java
+try (io.cobble.structured.DirectScanCursor cursor =
+        sdb.scanDirectWithOptions(0, startBuf, startLen, endBuf, endLen, null)) {
+    while (true) {
+        try (io.cobble.structured.DirectEncodedScanBatch batch = cursor.nextEncodedBatch()) {
+            if (batch.size() == 0) {
+                break;
+            }
+            for (io.cobble.structured.DirectEncodedScanRow row = batch.nextRow();
+                    row != null;
+                    row = batch.nextRow()) {
+                consume(row.getKey(), row.decodeBytesColumn(0, MyCodec::decode));
+            }
         }
     }
 }
-
-Schema schema = db.currentSchema();
-assert schema.columnFamily("metrics") != null;
 ```
 
-`ReadOptions` also provides `forColumnsInFamily(...)` and `defaultsInFamily(...)`. `ScanOptions` intentionally uses `forColumns(...).columnFamily(...)`.
-
-For Java `*WithOptions(...)` methods, passing `null` means "no explicit options": JNI routes directly
-to Cobble core no-options APIs (it does not synthesize default options objects in JNI).
-
-### Raw API Direct ByteBuffer Path
-
-For lower JNI overhead on non-structured `Db`, Java bindings also provide direct-buffer APIs:
-
 ```java
-import io.cobble.Db;
-import io.cobble.DirectColumns;
-import io.cobble.DirectScanCursor;
-import io.cobble.DirectScanEntry;
-import io.cobble.ReadOptions;
-import io.cobble.ScanOptions;
-import io.cobble.WriteOptions;
-import java.nio.ByteBuffer;
-import java.nio.Buffer;
-
-Db db = Db.open("config.yaml");
-ByteBuffer ioBuffer = ByteBuffer.allocateDirect(2048);
-ByteBuffer valueBuffer = ByteBuffer.allocateDirect(1024);
-
-byte[] key = "user:1".getBytes();
-byte[] value = "alice".getBytes();
-
-((Buffer) ioBuffer).clear();
-ioBuffer.put(key);
-((Buffer) valueBuffer).clear();
-valueBuffer.put(value);
-
-try (WriteOptions write = WriteOptions.forColumn(0)) {
-    db.putDirectWithOptions(0, ioBuffer, key.length, 0, valueBuffer, value.length, write);
-}
-
-try (ReadOptions read = ReadOptions.forColumn(0)) {
-    ByteBuffer encoded = db.getEncodedDirectWithOptions(0, ioBuffer, key.length, read);
-    // encoded == ioBuffer => reused input buffer
-    // encoded != ioBuffer => temporary larger direct buffer was allocated
-}
-
-// Pooled direct API (no caller-managed IO buffer), one direct buffer per selected column.
-try (ReadOptions read = ReadOptions.forColumn(0)) {
-    ByteBuffer[] columns = db.getDirectWithOptions(0, key, read);
-}
-
-// Zero-copy pooled direct API. Close it when done so pooled buffers can be reused.
-try (ReadOptions read = ReadOptions.forColumns(0);
-     DirectColumns columns = db.getDirectColumnsWithOptions(0, key, read)) {
-    ByteBuffer column0 = columns.get(0);
-}
-
-ByteBuffer scanStart = ByteBuffer.allocateDirect(64);
-ByteBuffer scanEnd = ByteBuffer.allocateDirect(64);
-((Buffer) scanStart).clear();
-scanStart.put("user:".getBytes());
-((Buffer) scanEnd).clear();
-scanEnd.put("user;".getBytes());
-
-try (ScanOptions scan = new ScanOptions().batchSize(128).columns(0);
-     DirectScanCursor cursor =
-             db.scanDirectWithOptions(
-                     0,
-                     scanStart,
-                     "user:".length(),
-                     scanEnd,
-                     "user;".length(),
-                     scan)) {
-    for (DirectScanEntry entry : cursor) {
-        ByteBuffer directKey = entry.getKey();
-        ByteBuffer directValue = entry.getColumn(0);
-    }
-}
-```
-
-`getEncodedDirectWithOptions(...)` returns:
-
-- `null` if key is not found
-- the same `ioBuffer` when payload fits (`encoded == ioBuffer`)
-- a new temporary direct buffer when payload is larger than `ioBuffer.capacity()`
-
-`getDirectWithOptions(...)` returns `ByteBuffer[]` (one element per selected column, `null` for
-missing columns), and each non-null column is a direct `ByteBuffer`.
-
-`getDirectColumnsWithOptions(...)` is the zero-copy variant of `getDirectWithOptions(...)`: it
-returns a `DirectColumns` view over the JNI-owned direct payload instead of copying each selected
-column into a fresh direct buffer.
-
-`scanDirectWithOptions(...)` returns a `DirectScanCursor` whose batches are encoded into pooled
-direct buffers. Each `DirectScanEntry` exposes:
-
-- `getKey()` → direct `ByteBuffer`
-- `getColumn(i)` → direct `ByteBuffer` (or `null` for a missing raw column)
-
-Like structured direct scan, one direct scan batch remains valid only until the cursor advances to
-the next batch or closes.
-
-Direct buffer pool settings are loaded from the opened DB config
-(`jni_direct_buffer_size`, `jni_direct_buffer_pool_size`) during open/restore/resume. Runtime
-updates use `Db.configureDirectBufferPool(sizeBytes, maxPoolSize)`, which is **grow-only**:
-shrinking either value returns `false`.
-
-Snapshot DTOs also preserve the mapping:
-
-```java
-import io.cobble.Db;
-import io.cobble.DbCoordinator;
-import io.cobble.GlobalSnapshot;
-import io.cobble.ShardSnapshot;
-import java.util.List;
-
-Db db = Db.open("config.yaml");
-DbCoordinator coordinator = DbCoordinator.open("coordinator.yaml");
-ShardSnapshot shardSnapshot = db.snapshot();
-int totalBuckets = 1024;
-long globalSnapshotId = 42L;
-
-GlobalSnapshot globalSnapshot =
-        coordinator.materializeGlobalSnapshot(
-                totalBuckets, globalSnapshotId, List.of(shardSnapshot));
-```
-
-### Structured Wrappers
-
-Structured wrappers are schema-driven and currently support typed `Bytes` and `List` columns. See [Structured DB](../getting-started/structured-db).
-
-On Java APIs, options class names stay unchanged but package paths are split:
-structured wrappers take `io.cobble.structured.ReadOptions`,
-`io.cobble.structured.ScanOptions`, and `io.cobble.structured.WriteOptions`.
-Raw wrappers keep using `io.cobble.ReadOptions`, `io.cobble.ScanOptions`,
-and `io.cobble.WriteOptions`.
-
-Structured `*WithOptions(...)` methods follow the same `null` behavior as raw APIs: `null` routes to
-core no-options paths directly.
-
-Structured direct-buffer APIs (`getDirect`, `getDirectWithOptions`, `scanDirectWithOptions`) use
-an internal direct-buffer pool. Pool settings are loaded from the opened DB config (`jni_direct_buffer_size`,
-`jni_direct_buffer_pool_size`) during open/restore/resume:
-
-- `jni_direct_buffer_size` (default `2KiB`)
-- `jni_direct_buffer_pool_size` (default `64`)
-
-Runtime updates use `Db.configureDirectBufferPool(sizeBytes, maxPoolSize)`, and are grow-only:
-shrinking either value returns `false`.
-
-For list-heavy workloads, Java bindings also provide a list-specific direct payload builder that
-matches Cobble core list value encoding directly, so callers can skip structured-row decoding on
-the JNI side:
-
-```java
-import io.cobble.structured.DirectListValueBuilder;
-import io.cobble.structured.WriteOptions;
-import java.io.IOException;
-import java.nio.Buffer;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
-
-byte[] keyBytes = "user:1".getBytes(StandardCharsets.UTF_8);
-ByteBuffer key = ByteBuffer.allocateDirect(keyBytes.length);
-((Buffer) key).clear();
-key.put(keyBytes);
-
-DirectListValueBuilder listBuilder = new DirectListValueBuilder(256);
-try {
-    listBuilder.beginElement();
-    listBuilder.outputStream().write("a".getBytes(StandardCharsets.UTF_8));
-    listBuilder.finishElement();
-} catch (IOException e) {
-    throw new RuntimeException(e);
-}
-listBuilder.append("b".getBytes(StandardCharsets.UTF_8)); // convenience API
-
-try (WriteOptions write = WriteOptions.defaults()) {
-    db.mergeEncodedListDirectWithOptions(
-            0,
-            key,
-            keyBytes.length,
-            0,
-            listBuilder.buffer(),
-            listBuilder.length(),
-            write);
-}
-```
-
-`putEncodedListDirectWithOptions(...)` replaces the list column with the encoded payload, while
-`mergeEncodedListDirectWithOptions(...)` applies list merge semantics (append/retain per schema).
-Both methods require the target column to be a `LIST` column.
-
-`DirectListValueBuilder` writes the raw list payload format used by Cobble core:
-
-- little-endian `u32` element count
-- for each element: optional little-endian TTL timestamp (when enabled), little-endian `u32`
-  length, then element bytes
-
-Structured direct scan follows the same pooled direct-buffer model:
-
-```java
-import io.cobble.structured.DirectRow;
-import io.cobble.structured.DirectScanCursor;
-import io.cobble.structured.DirectScanRow;
-import io.cobble.structured.ScanOptions;
-import java.nio.ByteBuffer;
-import java.nio.Buffer;
-
-ByteBuffer start = ByteBuffer.allocateDirect(64);
-ByteBuffer end = ByteBuffer.allocateDirect(64);
-((Buffer) start).clear();
-start.put("user:".getBytes());
-((Buffer) end).clear();
-end.put("user;".getBytes());
-
-try (ScanOptions scan = new ScanOptions().batchSize(128).columns(0);
-     DirectScanCursor cursor =
-             db.scanDirectWithOptions(0, start, "user:".length(), end, "user;".length(), scan)) {
-    for (DirectScanRow row : cursor) {
-        ByteBuffer keyBytes = row.getKey();
-        ByteBuffer valueBytes = row.getBytes(0);
-    }
-}
-```
-
-Structured `DirectScanRow` reuses the existing `DirectRow` column encoding:
-
-- `getKey()` → direct key slice
-- `getBytes(i)` → direct `ByteBuffer`
-- `getList(i)` → `List<ByteBuffer>`
-- `isNull(i)` / `getListElementCount(i)` / `getListElement(i, j)` → allocation-light list access
-
-```java
-import io.cobble.structured.SingleDb;
-import io.cobble.structured.ColumnValue;
-import io.cobble.structured.Row;
-
-SingleDb db = SingleDb.open("config.yaml");
-db.updateSchema()
-    .addListColumn(1, io.cobble.structured.ListConfig.of(100, io.cobble.structured.ListRetainMode.LAST))
-    .commit();
-db.put(0, "user:1".getBytes(), 0, ColumnValue.ofBytes("Alice".getBytes()));
-Row row = db.get(0, "user:1".getBytes());
-```
-
-Structured schema builders also accept named families, and structured schema views are family-aware:
-
-```java
-db.updateSchema()
-    .addListColumn("metrics", 0, io.cobble.structured.ListConfig.of(
-            100, io.cobble.structured.ListRetainMode.LAST))
-    .commit();
-
-db.put(
-        0,
-        "user:1".getBytes(),
-        "metrics",
-        0,
-        ColumnValue.ofList(new byte[][] {"a".getBytes()}));
-Row metricsRow = db.get(0, "user:1".getBytes(), "metrics");
-var namedFamilies = db.currentSchema().columnFamilies();
-assert namedFamilies.containsKey("default");
-assert namedFamilies.containsKey("metrics");
-```
-
-### Distributed Scan
-
-For parallel analytical scans across shards. See [Reader & Distributed Scan](../getting-started/reader-and-scan).
-
-```java
-import io.cobble.ScanPlan;
-import io.cobble.ScanOptions;
-import io.cobble.ScanSplit;
-import io.cobble.ScanCursor;
-
 ScanPlan plan = ScanPlan.fromGlobalSnapshot(manifest);
-List<ScanSplit> splits = plan.splits();
-ScanOptions scanOptions = ScanOptions.forColumns(0).columnFamily("metrics");
-
-for (ScanSplit split : splits) {
-    try (ScanCursor cursor = split.openScannerWithOptions("config.yaml", scanOptions)) {
-        for (ScanCursor.Entry entry : cursor) {
-            byte[] key = entry.key;
-            byte[][] columns = entry.columns;
-        }
-    }
+for (ScanSplit split : plan.splits()) {
+    try (ScanCursor c = split.openScannerWithOptions("config.yaml", ScanOptions.forColumns(0))) {}
 }
 ```
 
-Like Rust, the worker-side `ScanCursor` keeps the full `ScanOptions`, so the selected `columnFamily(...)` still applies after a split is serialized and reopened elsewhere. If you omit it, the scanner reads the default family.
+## Performance Guidance
+
+For hot paths, prefer direct buffer APIs.
+
+| Style | Typical cost | Recommendation |
+|---|---|---|
+| `byte[]` | Most JNI copy/allocation | Good for simplicity |
+| Direct view (`DirectColumns`/`DirectRow`) | Lower copy, lower allocation | Good default for performance |
+| `DirectEncodedRow` | Lowest decode overhead, best control | **Best performance path** |
 
 ## Memory Management
 
@@ -444,6 +232,14 @@ To produce a **single multi-platform jar** (including `debug` + `release` JNI li
 - Trigger: **Actions -> Build Java Multi-platform JAR -> Run workflow**
 - Output: downloadable jar artifact from the workflow run
 
+The platforms included in the multi-platform jar are:
+
+- `macos-aarch64`
+- `macos-x86_64`
+- `linux-x86_64`
+- `linux-aarch64`
+- `windows-x86_64`
+
 For publishing, the same workflow also runs on **GitHub Release published** events and deploys the multi-platform build to **Maven Central** (via Sonatype `central-publishing-maven-plugin`).
 
 Required repository secrets for release publishing:
@@ -452,9 +248,3 @@ Required repository secrets for release publishing:
 - `MAVEN_CENTRAL_PASSWORD` (Central Portal user token password)
 - `MAVEN_GPG_PRIVATE_KEY` (ASCII-armored private key, or base64-encoded armored key)
 - `MAVEN_GPG_PASSPHRASE`
-
-- `macos-aarch64`
-- `macos-x86_64`
-- `linux-x86_64`
-- `linux-aarch64`
-- `windows-x86_64`

@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class DirectScanCursor extends NativeObject implements Iterable<DirectScanRow> {
     private final DirectBufferPool pool;
     private boolean iteratorCreated = false;
-    private DirectScanBatch currentBatch = DirectScanBatch.empty();
+    private Runnable currentBatchCloser = () -> {};
 
     DirectScanCursor(long nativeHandle, DirectBufferPool pool) {
         super(nativeHandle);
@@ -36,14 +36,15 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
             if (encodedLength == 0) {
                 pool.release(pooled);
                 pooledReleased = true;
-                currentBatch = DirectScanBatch.empty();
-                return currentBatch;
+                DirectScanBatch batch = DirectScanBatch.empty();
+                currentBatchCloser = batch::close;
+                return batch;
             }
             ByteBuffer resultBuffer = Db.resolveEncodedBuffer(pooled, encodedLength);
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
                 AtomicBoolean released = new AtomicBoolean(false);
-                currentBatch =
+                DirectScanBatch batch =
                         DirectScanBatch.decode(
                                 resultBuffer,
                                 decodedLength,
@@ -52,12 +53,62 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
                                         pool.release(pooled);
                                     }
                                 });
-                return currentBatch;
+                currentBatchCloser = batch::close;
+                return batch;
             }
             pool.release(pooled);
             pooledReleased = true;
-            currentBatch = DirectScanBatch.decode(resultBuffer, decodedLength, null);
-            return currentBatch;
+            DirectScanBatch batch = DirectScanBatch.decode(resultBuffer, decodedLength, null);
+            currentBatchCloser = batch::close;
+            return batch;
+        } catch (RuntimeException e) {
+            if (!pooledReleased) {
+                pool.release(pooled);
+            }
+            throw e;
+        }
+    }
+
+    public DirectEncodedScanBatch nextEncodedBatch() {
+        closeCurrentBatch();
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("direct scan cursor is disposed");
+        }
+        ByteBuffer pooled = pool.acquire();
+        boolean pooledReleased = false;
+        try {
+            int encodedLength =
+                    nextBatchDirectInternal(
+                            nativeHandle, Db.directAddress(pooled), pooled.capacity());
+            if (encodedLength == 0) {
+                pool.release(pooled);
+                pooledReleased = true;
+                DirectEncodedScanBatch batch = DirectEncodedScanBatch.empty();
+                currentBatchCloser = batch::close;
+                return batch;
+            }
+            ByteBuffer resultBuffer = Db.resolveEncodedBuffer(pooled, encodedLength);
+            int decodedLength = Math.abs(encodedLength);
+            if (resultBuffer == pooled) {
+                AtomicBoolean released = new AtomicBoolean(false);
+                DirectEncodedScanBatch batch =
+                        DirectEncodedScanBatch.decode(
+                                resultBuffer,
+                                decodedLength,
+                                () -> {
+                                    if (released.compareAndSet(false, true)) {
+                                        pool.release(pooled);
+                                    }
+                                });
+                currentBatchCloser = batch::close;
+                return batch;
+            }
+            pool.release(pooled);
+            pooledReleased = true;
+            DirectEncodedScanBatch batch =
+                    DirectEncodedScanBatch.decode(resultBuffer, decodedLength, null);
+            currentBatchCloser = batch::close;
+            return batch;
         } catch (RuntimeException e) {
             if (!pooledReleased) {
                 pool.release(pooled);
@@ -101,9 +152,9 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
     }
 
     private void closeCurrentBatch() {
-        DirectScanBatch batch = currentBatch;
-        currentBatch = DirectScanBatch.empty();
-        batch.close();
+        Runnable closer = currentBatchCloser;
+        currentBatchCloser = () -> {};
+        closer.run();
     }
 
     @Override

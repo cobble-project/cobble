@@ -5,7 +5,9 @@ import io.cobble.structured.Row;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -1257,6 +1259,16 @@ class DbBindingTest {
                 assertArrayEquals(largeValue, readDirectBytes(columns.get(1)));
             }
 
+            try (ReadOptions options = ReadOptions.forColumns(0, 1);
+                    DirectEncodedRow row = db.getDirectEncodedRowWithOptions(0, key, options)) {
+                assertNotNull(row);
+                assertEquals(2, row.size());
+                assertArrayEquals(
+                        smallValue, row.decodeColumn(0, DbBindingTest::readInputStreamBytes));
+                assertArrayEquals(
+                        largeValue, row.decodeColumn(1, DbBindingTest::readInputStreamBytes));
+            }
+
             ByteBuffer keyBuffer = ByteBuffer.allocateDirect(key.length);
             ((Buffer) keyBuffer).clear();
             keyBuffer.put(key);
@@ -1267,6 +1279,17 @@ class DbBindingTest {
                 assertEquals(2, columns.size());
                 assertArrayEquals(smallValue, readDirectBytes(columns.get(0)));
                 assertArrayEquals(largeValue, readDirectBytes(columns.get(1)));
+            }
+
+            try (ReadOptions options = ReadOptions.forColumns(0, 1);
+                    DirectEncodedRow row =
+                            db.getDirectEncodedRowWithOptions(0, keyBuffer, key.length, options)) {
+                assertNotNull(row);
+                assertEquals(2, row.size());
+                assertArrayEquals(
+                        smallValue, row.decodeColumn(0, DbBindingTest::readInputStreamBytes));
+                assertArrayEquals(
+                        largeValue, row.decodeColumn(1, DbBindingTest::readInputStreamBytes));
             }
 
             ByteBuffer paddedKeyBuffer = ByteBuffer.allocateDirect(key.length + 32);
@@ -1467,6 +1490,16 @@ class DbBindingTest {
         byte[] bytes = new byte[copy.remaining()];
         copy.get(bytes);
         return bytes;
+    }
+
+    private static byte[] readInputStreamBytes(InputStream input) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[256];
+        int read;
+        while ((read = input.read(buffer)) != -1) {
+            out.write(buffer, 0, read);
+        }
+        return out.toByteArray();
     }
 
     @Test

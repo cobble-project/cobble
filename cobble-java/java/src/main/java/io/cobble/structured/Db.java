@@ -552,15 +552,14 @@ public final class Db extends NativeObject {
     }
 
     /**
-     * Get columns for a key through direct ByteBuffer IO.
+     * Get one encoded structured row through key bytes.
      *
      * <p>The input key and encoded row payload share one IO buffer. The binding keeps a reusable
      * direct buffer pool (default 2KB) for this path, and returns a temporary larger direct buffer
      * when the encoded row does not fit in the pooled one.
-     *
-     * @return direct row, or null if key does not exist
      */
-    public DirectRow getDirectWithOptions(int bucket, byte[] key, ReadOptions options) {
+    public DirectEncodedRow getDirectEncodedRowWithOptions(
+            int bucket, byte[] key, ReadOptions options) {
         if (key == null) {
             throw new IllegalArgumentException("key must not be null");
         }
@@ -601,7 +600,7 @@ public final class Db extends NativeObject {
             }
 
             if (!usingPooledForResult) {
-                return DirectRow.decode(resultBuffer, decodedLength, null);
+                return new DirectEncodedRow(resultBuffer, decodedLength, null);
             }
 
             AtomicBoolean released = new AtomicBoolean(false);
@@ -611,11 +610,32 @@ public final class Db extends NativeObject {
                             pool.release(pooled);
                         }
                     };
-            return DirectRow.decode(resultBuffer, decodedLength, releaser);
+            return new DirectEncodedRow(resultBuffer, decodedLength, releaser);
         } catch (RuntimeException e) {
             if (!usingPooledForResult && !pooledReleased) {
                 pool.release(pooled);
             }
+            throw e;
+        }
+    }
+
+    /**
+     * Get columns for a key through direct ByteBuffer IO.
+     *
+     * <p>Returns decoded column views backed by one encoded direct row payload.
+     *
+     * @return direct row, or null if key does not exist
+     */
+    public DirectRow getDirectWithOptions(int bucket, byte[] key, ReadOptions options) {
+        DirectEncodedRow encoded = getDirectEncodedRowWithOptions(bucket, key, options);
+        if (encoded == null) {
+            return null;
+        }
+        Runnable releaser = encoded.takeReleaser();
+        try {
+            return DirectRow.decode(encoded.buffer(), encoded.length(), releaser);
+        } catch (RuntimeException e) {
+            releaser.run();
             throw e;
         }
     }
@@ -632,8 +652,27 @@ public final class Db extends NativeObject {
         return getDirectWithOptions(bucket, keyBuffer, ((Buffer) keyBuffer).limit(), options);
     }
 
-    /** Compatibility overload that treats {@code keyBuffer[0..keyLength)} as key bytes. */
-    public DirectRow getDirectWithOptions(
+    /**
+     * Get one encoded structured row through caller-owned direct key buffer.
+     *
+     * <p>The returned payload uses the same encoded row format consumed by {@link DirectRow#decode}
+     * and remains valid until {@link DirectEncodedRow#close()}.
+     */
+    public DirectEncodedRow getDirectEncodedRowWithOptions(
+            int bucket, ByteBuffer keyBuffer, ReadOptions options) {
+        if (keyBuffer == null || !keyBuffer.isDirect()) {
+            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
+        }
+        return getDirectEncodedRowWithOptions(
+                bucket, keyBuffer, ((Buffer) keyBuffer).limit(), options);
+    }
+
+    /**
+     * Compatibility overload that treats {@code keyBuffer[0..keyLength)} as key bytes.
+     *
+     * <p>The caller must close returned rows to release pooled buffers.
+     */
+    public DirectEncodedRow getDirectEncodedRowWithOptions(
             int bucket, ByteBuffer keyBuffer, int keyLength, ReadOptions options) {
         if (keyBuffer == null || !keyBuffer.isDirect()) {
             throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
@@ -645,8 +684,8 @@ public final class Db extends NativeObject {
         DirectBufferPool pool = directBufferPool;
         ByteBuffer pooled = pool.acquire();
         ByteBuffer ioBuffer = pooled;
-        boolean usingPooledForResult = false;
         boolean pooledReleased = false;
+        boolean usingPooledForResult = false;
 
         try {
             if (keyLength > ioBuffer.capacity()) {
@@ -663,7 +702,6 @@ public final class Db extends NativeObject {
                             roh);
             if (encodedLength == 0) {
                 pool.release(pooled);
-                pooledReleased = true;
                 return null;
             }
             ByteBuffer resultBuffer = resolveEncodedBuffer(ioBuffer, encodedLength);
@@ -677,15 +715,50 @@ public final class Db extends NativeObject {
                                 pool.release(pooled);
                             }
                         };
-                return DirectRow.decode(resultBuffer, decodedLength, releaser);
+                return new DirectEncodedRow(resultBuffer, decodedLength, releaser);
             }
             pool.release(pooled);
             pooledReleased = true;
-            return DirectRow.decode(resultBuffer, decodedLength, null);
+            return new DirectEncodedRow(resultBuffer, decodedLength, null);
         } catch (RuntimeException e) {
-            if (!usingPooledForResult && !pooledReleased) {
+            if (!pooledReleased && !usingPooledForResult) {
                 pool.release(pooled);
             }
+            throw e;
+        }
+    }
+
+    /**
+     * @deprecated Use {@link #getDirectEncodedRowWithOptions(int, ByteBuffer, ReadOptions)}.
+     */
+    @Deprecated
+    public DirectEncodedRow getEncodedDirectRowWithOptions(
+            int bucket, ByteBuffer keyBuffer, ReadOptions options) {
+        return getDirectEncodedRowWithOptions(bucket, keyBuffer, options);
+    }
+
+    /**
+     * @deprecated Use {@link #getDirectEncodedRowWithOptions(int, ByteBuffer, int, ReadOptions)}.
+     */
+    @Deprecated
+    public DirectEncodedRow getEncodedDirectRowWithOptions(
+            int bucket, ByteBuffer keyBuffer, int keyLength, ReadOptions options) {
+        return getDirectEncodedRowWithOptions(bucket, keyBuffer, keyLength, options);
+    }
+
+    /** Compatibility overload that treats {@code keyBuffer[0..keyLength)} as key bytes. */
+    public DirectRow getDirectWithOptions(
+            int bucket, ByteBuffer keyBuffer, int keyLength, ReadOptions options) {
+        DirectEncodedRow encoded =
+                getDirectEncodedRowWithOptions(bucket, keyBuffer, keyLength, options);
+        if (encoded == null) {
+            return null;
+        }
+        Runnable releaser = encoded.takeReleaser();
+        try {
+            return DirectRow.decode(encoded.buffer(), encoded.length(), releaser);
+        } catch (RuntimeException e) {
+            releaser.run();
             throw e;
         }
     }

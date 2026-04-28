@@ -383,12 +383,13 @@ public final class Db extends NativeObject {
     }
 
     /**
-     * Get selected columns for one key as a zero-copy direct view.
+     * Get selected columns for one key as an encoded zero-copy direct row view.
      *
-     * <p>The returned columns reference either the pooled IO buffer or an overflow direct buffer.
+     * <p>The returned payload references either the pooled IO buffer or an overflow direct buffer.
      * Close the returned view when done so pooled buffers can be reused.
      */
-    public DirectColumns getDirectColumnsWithOptions(int bucket, byte[] key, ReadOptions options) {
+    public DirectEncodedRow getDirectEncodedRowWithOptions(
+            int bucket, byte[] key, ReadOptions options) {
         if (key == null) {
             throw new IllegalArgumentException("key must not be null");
         }
@@ -428,11 +429,11 @@ public final class Db extends NativeObject {
                                 pool.release(pooled);
                             }
                         };
-                return DirectColumns.decode(resultBuffer, decodedLength, releaser);
+                return new DirectEncodedRow(resultBuffer, decodedLength, releaser);
             }
             pool.release(pooled);
             pooledReleased = true;
-            return DirectColumns.decode(resultBuffer, decodedLength, null);
+            return new DirectEncodedRow(resultBuffer, decodedLength, null);
         } catch (RuntimeException e) {
             if (!usingPooledForResult && !pooledReleased) {
                 pool.release(pooled);
@@ -442,20 +443,20 @@ public final class Db extends NativeObject {
     }
 
     /**
-     * Get selected columns for one key as a zero-copy direct view via caller-owned direct key
-     * buffer.
+     * Get selected columns for one key as an encoded zero-copy direct row view via caller-owned
+     * direct key buffer.
      */
-    public DirectColumns getDirectColumnsWithOptions(
+    public DirectEncodedRow getDirectEncodedRowWithOptions(
             int bucket, ByteBuffer keyBuffer, ReadOptions options) {
         if (keyBuffer == null || !keyBuffer.isDirect()) {
             throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
         }
-        return getDirectColumnsWithOptions(
+        return getDirectEncodedRowWithOptions(
                 bucket, keyBuffer, ((Buffer) keyBuffer).limit(), options);
     }
 
     /** Compatibility overload that treats {@code keyBuffer[0..keyLength)} as key bytes. */
-    public DirectColumns getDirectColumnsWithOptions(
+    public DirectEncodedRow getDirectEncodedRowWithOptions(
             int bucket, ByteBuffer keyBuffer, int keyLength, ReadOptions options) {
         if (keyBuffer == null || !keyBuffer.isDirect()) {
             throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
@@ -499,11 +500,11 @@ public final class Db extends NativeObject {
                                 pool.release(pooled);
                             }
                         };
-                return DirectColumns.decode(resultBuffer, decodedLength, releaser);
+                return new DirectEncodedRow(resultBuffer, decodedLength, releaser);
             }
             pool.release(pooled);
             pooledReleased = true;
-            return DirectColumns.decode(resultBuffer, decodedLength, null);
+            return new DirectEncodedRow(resultBuffer, decodedLength, null);
         } catch (RuntimeException e) {
             if (!usingPooledForResult && !pooledReleased) {
                 pool.release(pooled);
@@ -512,35 +513,61 @@ public final class Db extends NativeObject {
         }
     }
 
+    /** Get selected columns for one key as a zero-copy direct view. */
+    public DirectColumns getDirectColumnsWithOptions(int bucket, byte[] key, ReadOptions options) {
+        DirectEncodedRow encoded = getDirectEncodedRowWithOptions(bucket, key, options);
+        if (encoded == null) {
+            return null;
+        }
+        Runnable releaser = encoded.takeReleaser();
+        try {
+            return DirectColumns.decode(encoded.buffer(), encoded.length(), releaser);
+        } catch (RuntimeException e) {
+            releaser.run();
+            throw e;
+        }
+    }
+
+    /** Get selected columns for one key as a zero-copy direct view via direct key buffer. */
+    public DirectColumns getDirectColumnsWithOptions(
+            int bucket, ByteBuffer keyBuffer, ReadOptions options) {
+        DirectEncodedRow encoded = getDirectEncodedRowWithOptions(bucket, keyBuffer, options);
+        if (encoded == null) {
+            return null;
+        }
+        Runnable releaser = encoded.takeReleaser();
+        try {
+            return DirectColumns.decode(encoded.buffer(), encoded.length(), releaser);
+        } catch (RuntimeException e) {
+            releaser.run();
+            throw e;
+        }
+    }
+
+    /** Compatibility overload that treats {@code keyBuffer[0..keyLength)} as key bytes. */
+    public DirectColumns getDirectColumnsWithOptions(
+            int bucket, ByteBuffer keyBuffer, int keyLength, ReadOptions options) {
+        DirectEncodedRow encoded =
+                getDirectEncodedRowWithOptions(bucket, keyBuffer, keyLength, options);
+        if (encoded == null) {
+            return null;
+        }
+        Runnable releaser = encoded.takeReleaser();
+        try {
+            return DirectColumns.decode(encoded.buffer(), encoded.length(), releaser);
+        } catch (RuntimeException e) {
+            releaser.run();
+            throw e;
+        }
+    }
+
     /** Get one key via pooled direct IO and return one direct buffer per selected column. */
     public ByteBuffer[] getDirectWithOptions(int bucket, byte[] key, ReadOptions options) {
-        if (key == null) {
-            throw new IllegalArgumentException("key must not be null");
-        }
-        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
-        DirectBufferPool pool = directBufferPool;
-        ByteBuffer pooled = pool.acquire();
-        ByteBuffer ioBuffer = pooled;
-        try {
-            if (key.length > ioBuffer.capacity()) {
-                ioBuffer = ByteBuffer.allocateDirect(key.length);
-            }
-            writeKey(ioBuffer, key);
-            int encodedLength =
-                    getEncodedDirectWithOptions(
-                            nativeHandle,
-                            bucket,
-                            directAddress(ioBuffer),
-                            ioBuffer.capacity(),
-                            key.length,
-                            readOptionsHandle);
-            if (encodedLength == 0) {
+        try (DirectEncodedRow encoded = getDirectEncodedRowWithOptions(bucket, key, options)) {
+            if (encoded == null) {
                 return null;
             }
-            ByteBuffer encoded = resolveEncodedBuffer(ioBuffer, encodedLength);
-            return decodeDirectColumns(encoded, Math.abs(encodedLength));
-        } finally {
-            pool.release(pooled);
+            return decodeDirectColumns(encoded.buffer(), encoded.length());
         }
     }
 
@@ -560,36 +587,12 @@ public final class Db extends NativeObject {
     /** Compatibility overload that treats {@code keyBuffer[0..keyLength)} as key bytes. */
     public ByteBuffer[] getDirectWithOptions(
             int bucket, ByteBuffer keyBuffer, int keyLength, ReadOptions options) {
-        if (keyBuffer == null || !keyBuffer.isDirect()) {
-            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
-        }
-        if (keyLength < 0 || keyLength > keyBuffer.capacity()) {
-            throw new IllegalArgumentException("keyLength out of range: " + keyLength);
-        }
-        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
-        DirectBufferPool pool = directBufferPool;
-        ByteBuffer pooled = pool.acquire();
-        ByteBuffer ioBuffer = pooled;
-        try {
-            if (keyLength > ioBuffer.capacity()) {
-                ioBuffer = ByteBuffer.allocateDirect(keyLength);
-            }
-            writeKey(ioBuffer, keyBuffer, keyLength);
-            int encodedLength =
-                    getEncodedDirectWithOptions(
-                            nativeHandle,
-                            bucket,
-                            directAddress(ioBuffer),
-                            ioBuffer.capacity(),
-                            keyLength,
-                            readOptionsHandle);
-            if (encodedLength == 0) {
+        try (DirectEncodedRow encoded =
+                getDirectEncodedRowWithOptions(bucket, keyBuffer, keyLength, options)) {
+            if (encoded == null) {
                 return null;
             }
-            ByteBuffer encoded = resolveEncodedBuffer(ioBuffer, encodedLength);
-            return decodeDirectColumns(encoded, Math.abs(encodedLength));
-        } finally {
-            pool.release(pooled);
+            return decodeDirectColumns(encoded.buffer(), encoded.length());
         }
     }
 

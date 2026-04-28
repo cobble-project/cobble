@@ -7,7 +7,9 @@ import io.cobble.ShardSnapshot;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -705,6 +707,42 @@ class StructuredDbTest {
                 assertArrayEquals(largeElement, readDirectBytes(row.getListElement(0, 1)));
                 assertArrayEquals(tailElement, readDirectBytes(row.getListElement(0, 2)));
             }
+
+            try (ReadOptions options = ReadOptions.forColumns(0);
+                    DirectEncodedRow row =
+                            db.getDirectEncodedRowWithOptions(0, keyBuffer, key.length, options)) {
+                assertNotNull(row);
+                List<String> decoded =
+                        row.decodeListColumn(
+                                0,
+                                input ->
+                                        new String(
+                                                readInputStreamBytes(input),
+                                                StandardCharsets.UTF_8));
+                assertEquals(3, decoded.size());
+                assertEquals(new String(smallElement, StandardCharsets.UTF_8), decoded.get(0));
+                assertEquals(new String(largeElement, StandardCharsets.UTF_8), decoded.get(1));
+                assertEquals(new String(tailElement, StandardCharsets.UTF_8), decoded.get(2));
+            }
+        }
+    }
+
+    @Test
+    void structuredDirectEncodedRowBytesDecoderRoundTrip() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-direct-encoded-bytes-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        byte[] key = "encoded-bytes".getBytes(StandardCharsets.UTF_8);
+        byte[] value = "encoded-bytes-value".getBytes(StandardCharsets.UTF_8);
+
+        try (Db db = Db.open(config)) {
+            db.put(0, key, 0, ColumnValue.ofBytes(value));
+            try (ReadOptions options = ReadOptions.forColumns(0);
+                    DirectEncodedRow row = db.getDirectEncodedRowWithOptions(0, key, options)) {
+                assertNotNull(row);
+                assertEquals(1, row.columnCount());
+                byte[] decoded = row.decodeBytesColumn(0, StructuredDbTest::readInputStreamBytes);
+                assertArrayEquals(value, decoded);
+            }
         }
     }
 
@@ -803,6 +841,67 @@ class StructuredDbTest {
     }
 
     @Test
+    void structuredDirectEncodedScanBatchSupportsNextRowTraversal() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-direct-encoded-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 5; i++) {
+                byte[] key = String.format("encoded-scan-%02d", i).getBytes(StandardCharsets.UTF_8);
+                byte[] value = ("encoded-scan-value-" + i).getBytes(StandardCharsets.UTF_8);
+                db.put(0, key, 0, ColumnValue.ofBytes(value));
+            }
+
+            byte[] start = "encoded-scan-00".getBytes(StandardCharsets.UTF_8);
+            byte[] end = "encoded-scan-05".getBytes(StandardCharsets.UTF_8);
+            ByteBuffer startBuffer = ByteBuffer.allocateDirect(start.length + 8);
+            ByteBuffer endBuffer = ByteBuffer.allocateDirect(end.length + 8);
+            ((Buffer) startBuffer).clear();
+            startBuffer.put(start);
+            ((Buffer) endBuffer).clear();
+            endBuffer.put(end);
+
+            try (ScanOptions options = new ScanOptions().batchSize(2).columns(0);
+                    DirectScanCursor cursor =
+                            db.scanDirectWithOptions(
+                                    0, startBuffer, start.length, endBuffer, end.length, options)) {
+                java.util.List<String> seen = new ArrayList<>();
+                while (true) {
+                    DirectEncodedScanBatch batch = cursor.nextEncodedBatch();
+                    if (batch.size() == 0) {
+                        assertFalse(batch.hasMore);
+                        break;
+                    }
+                    try {
+                        while (true) {
+                            DirectEncodedScanRow row = batch.nextRow();
+                            if (row == null) {
+                                break;
+                            }
+                            String keyString =
+                                    new String(
+                                            readDirectBytes(row.getKey()), StandardCharsets.UTF_8);
+                            String valueString =
+                                    new String(
+                                            row.decodeBytesColumn(
+                                                    0, StructuredDbTest::readInputStreamBytes),
+                                            StandardCharsets.UTF_8);
+                            seen.add(keyString + "=" + valueString);
+                        }
+                        assertNull(batch.nextRow());
+                    } finally {
+                        batch.close();
+                    }
+                }
+
+                assertEquals(5, seen.size());
+                assertEquals("encoded-scan-00=encoded-scan-value-0", seen.get(0));
+                assertEquals("encoded-scan-04=encoded-scan-value-4", seen.get(4));
+            }
+        }
+    }
+
+    @Test
     void structuredDirectScanSupportsNullOptionsAndBatchTraversal() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-direct-scan-null-opt-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
@@ -860,6 +959,16 @@ class StructuredDbTest {
         buffer.put(bytes);
         ((Buffer) buffer).flip();
         return buffer;
+    }
+
+    private static byte[] readInputStreamBytes(InputStream input) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[256];
+        int read;
+        while ((read = input.read(buffer)) != -1) {
+            out.write(buffer, 0, read);
+        }
+        return out.toByteArray();
     }
 
     private static byte[] largeValueBytes(String prefix, int seed, int length) {
