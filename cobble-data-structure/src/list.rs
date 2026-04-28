@@ -72,6 +72,16 @@ impl MergeOperator for ListMergeOperator {
             return Ok((existing_value, None));
         }
 
+        if !self.config.preserve_element_ttl
+            && self.config.max_elements.is_none()
+            && existing_value.is_empty()
+            && operands.len() == 1
+        {
+            let operand = operands.into_iter().next().expect("len checked to be one");
+            let _ = parse_payload_body(&operand)?;
+            return Ok((operand, None));
+        }
+
         // Fast path: validate payloads, then splice raw encoded bodies without decode/re-encode.
         if let Some(merged) = try_fast_append_batch(&existing_value, &operands, &self.config)? {
             return Ok((merged, None));
