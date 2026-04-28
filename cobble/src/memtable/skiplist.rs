@@ -17,7 +17,13 @@ use std::collections::BTreeMap;
 
 const NULL_OFFSET: u32 = u32::MAX;
 const MAX_HEIGHT: usize = 12;
-const NODE_HEADER_SIZE: usize = 12; // entry_offset(u32) + ordinal(u32) + height(u8) + reserved(3)
+const NODE_ENTRY_OFFSET_POS: usize = 0;
+const NODE_KEY_START_POS: usize = 4;
+const NODE_KEY_LEN_POS: usize = 8;
+const NODE_HEIGHT_POS: usize = 12;
+const NODE_KEY_PREFIX_POS: usize = 16;
+const NODE_KEY_PREFIX_SIZE: usize = 16;
+const NODE_HEADER_SIZE: usize = 32; // entry_offset(u32) + key_start(u32) + key_len(u32) + height(u8) + reserved(3) + key_prefix([u8; 16])
 
 pub(crate) struct SkiplistMemtableIter<'a> {
     mem: &'a SkiplistMemtable,
@@ -160,19 +166,12 @@ impl SkiplistMemtable {
         Ok(start)
     }
 
-    fn hash_key(key: &[u8]) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-        const FNV_PRIME: u64 = 0x100000001b3;
-        let mut hash = FNV_OFFSET;
-        for &b in key {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-        hash
-    }
-
-    fn choose_height(key: &[u8], ordinal: u32) -> usize {
-        let mut bits = Self::hash_key(key) ^ ((ordinal as u64).wrapping_mul(0x9e3779b97f4a7c15));
+    fn choose_height(ordinal: u32) -> usize {
+        // SplitMix64-style mix on insertion ordinal to avoid key/order correlation.
+        let mut bits = (ordinal as u64).wrapping_add(0x9e3779b97f4a7c15);
+        bits = (bits ^ (bits >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        bits = (bits ^ (bits >> 27)).wrapping_mul(0x94d049bb133111eb);
+        bits ^= bits >> 31;
         let mut height = 1usize;
         while height < MAX_HEIGHT && (bits & 0x3) == 0 {
             height += 1;
@@ -208,7 +207,7 @@ impl SkiplistMemtable {
 
     fn node_height(&self, node: u32) -> Option<usize> {
         let off = Self::node_offset(node);
-        let height_pos = off.checked_add(8)?;
+        let height_pos = off.checked_add(NODE_HEIGHT_POS)?;
         let header_end = off.checked_add(NODE_HEADER_SIZE)?;
         if header_end > self.buffer.len() {
             return None;
@@ -217,7 +216,28 @@ impl SkiplistMemtable {
     }
 
     fn node_entry_offset(&self, node: u32) -> Option<usize> {
-        Some(self.read_u32_le(Self::node_offset(node))? as usize)
+        let off = Self::node_offset(node);
+        Some(self.read_u32_le(off.checked_add(NODE_ENTRY_OFFSET_POS)?)? as usize)
+    }
+
+    fn node_key_start(&self, node: u32) -> Option<usize> {
+        let off = Self::node_offset(node);
+        Some(self.read_u32_le(off.checked_add(NODE_KEY_START_POS)?)? as usize)
+    }
+
+    fn node_key_len(&self, node: u32) -> Option<usize> {
+        let off = Self::node_offset(node);
+        Some(self.read_u32_le(off.checked_add(NODE_KEY_LEN_POS)?)? as usize)
+    }
+
+    fn node_key_prefix(&self, node: u32) -> Option<&[u8]> {
+        let off = Self::node_offset(node);
+        let start = off.checked_add(NODE_KEY_PREFIX_POS)?;
+        let end = start.checked_add(NODE_KEY_PREFIX_SIZE)?;
+        if end > self.buffer.len() {
+            return None;
+        }
+        Some(&self.buffer[start..end])
     }
 
     fn node_next(&self, node: u32, level: usize) -> Option<u32> {
@@ -287,44 +307,84 @@ impl SkiplistMemtable {
         }
     }
 
-    fn parse_entry(&self, entry_offset: usize) -> Option<(&[u8], &[u8])> {
-        let key_len = self.read_u32_le(entry_offset)? as usize;
-        let value_len = self.read_u32_le(entry_offset.checked_add(4)?)? as usize;
-        let key_start = entry_offset.checked_add(8)?;
-        let value_start = key_start.checked_add(key_len)?;
-        let end = value_start.checked_add(value_len)?;
-        if end > self.data_end {
+    fn node_key(&self, node: u32) -> Option<&[u8]> {
+        let key_start = self.node_key_start(node)?;
+        let key_len = self.node_key_len(node)?;
+        let key_end = key_start.checked_add(key_len)?;
+        if key_end > self.data_end {
             return None;
         }
-        Some((
-            &self.buffer[key_start..value_start],
-            &self.buffer[value_start..end],
-        ))
+        Some(&self.buffer[key_start..key_end])
     }
 
     fn node_key_value(&self, node: u32) -> Option<(&[u8], &[u8])> {
         let entry_offset = self.node_entry_offset(node)?;
-        self.parse_entry(entry_offset)
+        let key = self.node_key(node)?;
+        let value_len = self.read_u32_le(entry_offset.checked_add(4)?)? as usize;
+        let value_start = self
+            .node_key_start(node)?
+            .checked_add(self.node_key_len(node)?)?;
+        let value_end = value_start.checked_add(value_len)?;
+        if value_end > self.data_end {
+            return None;
+        }
+        Some((key, &self.buffer[value_start..value_end]))
     }
 
     fn compare_node_key(&self, node: u32, key: &[u8]) -> Option<Ordering> {
-        let (node_key, _) = self.node_key_value(node)?;
-        Some(node_key.cmp(key))
+        let node_key_len = self.node_key_len(node)?;
+        let prefix_len = NODE_KEY_PREFIX_SIZE.min(node_key_len).min(key.len());
+        let prefix_cmp = self.node_key_prefix(node)?[..prefix_len].cmp(&key[..prefix_len]);
+        if prefix_cmp != Ordering::Equal {
+            return Some(prefix_cmp);
+        }
+        if node_key_len <= prefix_len && key.len() <= prefix_len {
+            return Some(node_key_len.cmp(&key.len()));
+        }
+        Some(self.node_key(node)?.cmp(key))
+    }
+
+    fn find_greater_or_equal_node(&self, key: &[u8]) -> u32 {
+        let mut current = NULL_OFFSET;
+        let mut last_bigger = NULL_OFFSET;
+        for level in (0..self.max_height).rev() {
+            loop {
+                let next = self.level_next(current, level);
+                if next == NULL_OFFSET || next == last_bigger {
+                    break;
+                }
+                match self.compare_node_key(next, key) {
+                    Some(Ordering::Less) => current = next,
+                    Some(Ordering::Equal | Ordering::Greater) | None => {
+                        last_bigger = next;
+                        break;
+                    }
+                }
+            }
+        }
+        if last_bigger != NULL_OFFSET {
+            last_bigger
+        } else {
+            self.level_next(current, 0)
+        }
     }
 
     fn find_predecessors_for_key(&self, key: &[u8]) -> [u32; MAX_HEIGHT] {
         let mut update = [NULL_OFFSET; MAX_HEIGHT];
         let mut current = NULL_OFFSET;
+        let mut last_not_after = NULL_OFFSET;
         for level in (0..self.max_height).rev() {
             loop {
                 let next = self.level_next(current, level);
-                if next == NULL_OFFSET {
+                if next == NULL_OFFSET || next == last_not_after {
                     break;
                 }
                 match self.compare_node_key(next, key) {
                     Some(Ordering::Less) => current = next,
-                    Some(Ordering::Equal | Ordering::Greater) => break,
-                    None => break,
+                    Some(Ordering::Equal | Ordering::Greater) | None => {
+                        last_not_after = next;
+                        break;
+                    }
                 }
             }
             update[level] = current;
@@ -333,15 +393,17 @@ impl SkiplistMemtable {
     }
 
     fn lower_bound_node(&self, key: &[u8]) -> u32 {
-        let update = self.find_predecessors_for_key(key);
-        if update[0] == NULL_OFFSET {
-            self.heads[0]
-        } else {
-            self.node_next(update[0], 0).unwrap_or(NULL_OFFSET)
-        }
+        self.find_greater_or_equal_node(key)
     }
 
-    fn alloc_node(&mut self, entry_offset: usize, ordinal: u32, height: usize) -> Result<u32> {
+    fn alloc_node(
+        &mut self,
+        entry_offset: usize,
+        key_start: usize,
+        key_len: usize,
+        key: &[u8],
+        height: usize,
+    ) -> Result<u32> {
         let node_size = Self::node_size(height);
         let node_start = self.alloc_arena(node_size)?;
         let node = u32::try_from(node_start)
@@ -351,9 +413,20 @@ impl SkiplistMemtable {
             u32::try_from(entry_offset)
                 .map_err(|_| Error::InvalidState("entry offset exceeds u32".to_string()))?,
         );
-        slice.put_u32_le(ordinal);
+        slice.put_u32_le(
+            u32::try_from(key_start)
+                .map_err(|_| Error::InvalidState("key start exceeds u32".to_string()))?,
+        );
+        slice.put_u32_le(
+            u32::try_from(key_len)
+                .map_err(|_| Error::InvalidState("key length exceeds u32".to_string()))?,
+        );
         slice.put_u8(height as u8);
         slice.put_slice(&[0u8; 3]);
+        let mut key_prefix = [0u8; NODE_KEY_PREFIX_SIZE];
+        let prefix_len = key.len().min(NODE_KEY_PREFIX_SIZE);
+        key_prefix[..prefix_len].copy_from_slice(&key[..prefix_len]);
+        slice.put_slice(&key_prefix);
         for _ in 0..height {
             slice.put_u32_le(NULL_OFFSET);
         }
@@ -395,13 +468,16 @@ impl SkiplistMemtable {
 impl Memtable for SkiplistMemtable {
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let ordinal = self.next_ordinal;
-        let height = Self::choose_height(key, ordinal);
+        let height = Self::choose_height(ordinal);
         let data_len = Self::entry_size(key.len(), value.len());
         let node_len = Self::node_size(height);
         self.has_space(data_len + node_len)?;
         let update = self.find_predecessors_for_key(key);
         let entry_offset = self.write_data(key, value);
-        let node = self.alloc_node(entry_offset, ordinal, height)?;
+        let key_start = entry_offset
+            .checked_add(8)
+            .ok_or_else(|| Error::InvalidState("key start overflow".to_string()))?;
+        let node = self.alloc_node(entry_offset, key_start, key.len(), key, height)?;
         self.link_node(node, height, &update)?;
         self.next_ordinal = self
             .next_ordinal
@@ -422,7 +498,7 @@ impl Memtable for SkiplistMemtable {
         let mut key_slice = encoded_key.as_mut_slice();
         encode_key_ref_into(key, &mut key_slice);
         let ordinal = self.next_ordinal;
-        let height = Self::choose_height(&encoded_key, ordinal);
+        let height = Self::choose_height(ordinal);
         let data_len = Self::entry_size(key_len, value_len);
         let node_len = Self::node_size(height);
         self.has_space(data_len + node_len)?;
@@ -435,7 +511,10 @@ impl Memtable for SkiplistMemtable {
         slice.put_slice(&encoded_key);
         encode_value_ref_into(value, num_columns, &mut slice);
         self.data_end = end;
-        let node = self.alloc_node(start, ordinal, height)?;
+        let key_start = start
+            .checked_add(8)
+            .ok_or_else(|| Error::InvalidState("key start overflow".to_string()))?;
+        let node = self.alloc_node(start, key_start, key_len, &encoded_key, height)?;
         self.link_node(node, height, &update)?;
         self.next_ordinal = self
             .next_ordinal
@@ -456,7 +535,7 @@ impl Memtable for SkiplistMemtable {
         let mut key_slice = encoded_key.as_mut_slice();
         encode_key_ref_into(key, &mut key_slice);
         let ordinal = self.next_ordinal;
-        let height = Self::choose_height(&encoded_key, ordinal);
+        let height = Self::choose_height(ordinal);
         let data_len = Self::entry_size(key_len, value_len);
         let node_len = Self::node_size(height);
         self.has_space(data_len + node_len)?;
@@ -469,7 +548,10 @@ impl Memtable for SkiplistMemtable {
         slice.put_slice(&encoded_key);
         encode_rewritten_value(plan, num_columns, &mut slice[..value_len]);
         self.data_end = end;
-        let node = self.alloc_node(start, ordinal, height)?;
+        let key_start = start
+            .checked_add(8)
+            .ok_or_else(|| Error::InvalidState("key start overflow".to_string()))?;
+        let node = self.alloc_node(start, key_start, key_len, &encoded_key, height)?;
         self.link_node(node, height, &update)?;
         self.next_ordinal = self
             .next_ordinal
@@ -707,5 +789,118 @@ mod tests {
         let _ = mem.append_blob(b"-extra").unwrap();
         mem.rollback_blob_cursor(checkpoint);
         assert_eq!(mem.read_blob(offset, 4).unwrap(), b"blob");
+    }
+
+    #[test]
+    fn predecessor_search_matches_lower_bound_for_missing_and_present_keys() {
+        let mut mem = SkiplistMemtable::with_capacity(8192);
+        for (key, value) in [
+            (b"aa".as_slice(), b"v1".as_slice()),
+            (b"ab", b"v2"),
+            (b"ac", b"v3"),
+            (b"b", b"v4"),
+            (b"ba", b"v5"),
+            (b"c", b"v6"),
+        ] {
+            mem.put(key, value).unwrap();
+        }
+
+        for (target, expected_pred, expected_lower_bound) in [
+            (b"a".as_slice(), None, Some(b"aa".as_slice())),
+            (b"aa", None, Some(b"aa")),
+            (b"aad", Some(b"aa".as_slice()), Some(b"ab".as_slice())),
+            (b"ab", Some(b"aa".as_slice()), Some(b"ab".as_slice())),
+            (b"ad", Some(b"ac".as_slice()), Some(b"b".as_slice())),
+            (b"bb", Some(b"ba".as_slice()), Some(b"c".as_slice())),
+            (b"d", Some(b"c".as_slice()), None),
+        ] {
+            let lower_bound = mem.lower_bound_node(target);
+            let lower_bound_key = if lower_bound == NULL_OFFSET {
+                None
+            } else {
+                Some(mem.node_entry(lower_bound).unwrap().0)
+            };
+            assert_eq!(lower_bound_key, expected_lower_bound, "target {:?}", target);
+
+            let update = mem.find_predecessors_for_key(target);
+            let predecessor = update[0];
+            let predecessor_key = if predecessor == NULL_OFFSET {
+                None
+            } else {
+                Some(mem.node_entry(predecessor).unwrap().0)
+            };
+            assert_eq!(predecessor_key, expected_pred, "target {:?}", target);
+
+            let derived_lower_bound = if predecessor == NULL_OFFSET {
+                mem.heads[0]
+            } else {
+                mem.node_next(predecessor, 0).unwrap_or(NULL_OFFSET)
+            };
+            assert_eq!(derived_lower_bound, lower_bound, "target {:?}", target);
+        }
+    }
+
+    #[test]
+    fn large_scale_put_get_and_iteration_order() {
+        const ENTRY_COUNT: usize = 20_000;
+        let mut mem = SkiplistMemtable::with_capacity(16 * 1024 * 1024);
+        for i in 0..ENTRY_COUNT {
+            let key_id = (i * 11939 + 7) % ENTRY_COUNT;
+            let key = format!("k{:08}", key_id);
+            let value = format!("v{:08}", key_id);
+            mem.put(key.as_bytes(), value.as_bytes()).unwrap();
+        }
+
+        for i in 0..ENTRY_COUNT {
+            let key = format!("k{:08}", i);
+            let expected = format!("v{:08}", i);
+            assert_eq!(mem.get(key.as_bytes()).unwrap(), expected.as_bytes());
+        }
+
+        let mut iter = mem.iter();
+        iter.seek_to_first().unwrap();
+        let mut last_key = Vec::<u8>::new();
+        let mut seen = 0usize;
+        while iter.next().unwrap() {
+            let key = iter.take_key().unwrap().unwrap();
+            if !last_key.is_empty() {
+                assert!(last_key.as_slice() <= key.as_ref());
+            }
+            last_key.clear();
+            last_key.extend_from_slice(key.as_ref());
+            seen += 1;
+        }
+        assert_eq!(seen, ENTRY_COUNT);
+    }
+
+    #[test]
+    fn large_scale_overwrite_keeps_latest_and_full_history() {
+        const KEY_COUNT: usize = 2_000;
+        const VERSIONS_PER_KEY: usize = 10;
+        let mut mem = SkiplistMemtable::with_capacity(16 * 1024 * 1024);
+
+        for version in 0..VERSIONS_PER_KEY {
+            for key_id in 0..KEY_COUNT {
+                let key = format!("k{:05}", key_id);
+                let value = format!("v{:02}-{:05}", version, key_id);
+                mem.put(key.as_bytes(), value.as_bytes()).unwrap();
+            }
+        }
+
+        for key_id in [0usize, 17, 311, 1023, KEY_COUNT - 1] {
+            let key = format!("k{:05}", key_id);
+            let latest = format!("v{:02}-{:05}", VERSIONS_PER_KEY - 1, key_id);
+            assert_eq!(mem.get(key.as_bytes()).unwrap(), latest.as_bytes());
+
+            let collected = mem
+                .get_all(key.as_bytes())
+                .map(|v| String::from_utf8(v.to_vec()).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(collected.len(), VERSIONS_PER_KEY);
+            for (idx, value) in collected.iter().enumerate() {
+                let expected_version = VERSIONS_PER_KEY - 1 - idx;
+                assert_eq!(*value, format!("v{:02}-{:05}", expected_version, key_id));
+            }
+        }
     }
 }
