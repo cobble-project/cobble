@@ -1,9 +1,10 @@
 package io.cobble.structured;
 
+import io.cobble.DirectIoUtils;
+import io.cobble.UnsafeAccess;
+
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.Buffer;
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -16,6 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * arrays.
  */
 public final class DirectEncodedRow implements AutoCloseable {
+    private static final String PAYLOAD_NAME = "encoded structured direct row payload";
     private static final byte TAG_NULL = 0;
     private static final byte TAG_BYTES = 1;
     private static final byte TAG_LIST = 2;
@@ -26,21 +28,22 @@ public final class DirectEncodedRow implements AutoCloseable {
                 public void run() {}
             };
 
-    private final ByteBuffer buffer;
+    private final long address;
     private final int length;
     private final Runnable releaser;
     private final AtomicBoolean closed;
 
-    DirectEncodedRow(ByteBuffer buffer, int length, Runnable releaser) {
-        this.buffer = buffer;
+    DirectEncodedRow(long address, int length, Runnable releaser) {
+        if (address == 0L) {
+            throw new IllegalArgumentException("address must not be 0");
+        }
+        if (length < 0) {
+            throw new IllegalArgumentException("length must be >= 0");
+        }
+        this.address = address;
         this.length = length;
         this.releaser = releaser == null ? NO_OP : releaser;
         this.closed = new AtomicBoolean(false);
-    }
-
-    /** Returns the underlying encoded direct buffer. */
-    public ByteBuffer buffer() {
-        return buffer;
     }
 
     /** Returns encoded payload length in bytes. */
@@ -50,18 +53,19 @@ public final class DirectEncodedRow implements AutoCloseable {
 
     /** Returns the number of columns encoded in this row. */
     public int columnCount() {
-        ByteBuffer view = rowView();
-        return readLength(view, "column count");
+        return DirectIoUtils.readLength(address, length, 0, "column count", PAYLOAD_NAME);
     }
 
     /** Returns whether the target column is NULL. */
     public boolean isNull(int column) {
-        ByteBuffer view = rowView();
-        int columnCount = readLength(view, "column count");
+        int offset = 0;
+        int columnCount =
+                DirectIoUtils.readLength(address, length, offset, "column count", PAYLOAD_NAME);
+        offset += Integer.BYTES;
         ensureColumnInRange(column, columnCount);
         for (int i = 0; i < columnCount; i++) {
-            ensureRemaining(view, 1);
-            byte tag = view.get();
+            byte tag = DirectIoUtils.readByte(address, length, offset, PAYLOAD_NAME);
+            offset += 1;
             switch (tag) {
                 case TAG_NULL:
                     if (i == column) {
@@ -69,18 +73,24 @@ public final class DirectEncodedRow implements AutoCloseable {
                     }
                     break;
                 case TAG_BYTES:
-                    int bytesLength = readLength(view, "bytes length");
+                    int bytesLength =
+                            DirectIoUtils.readLength(
+                                    address, length, offset, "bytes length", PAYLOAD_NAME);
+                    offset += Integer.BYTES;
                     if (i == column) {
                         return false;
                     }
-                    skipBytes(view, bytesLength);
+                    offset = skipBytes(offset, bytesLength);
                     break;
                 case TAG_LIST:
-                    int elementCount = readLength(view, "list element count");
+                    int elementCount =
+                            DirectIoUtils.readLength(
+                                    address, length, offset, "list element count", PAYLOAD_NAME);
+                    offset += Integer.BYTES;
                     if (i == column) {
                         return false;
                     }
-                    skipList(view, elementCount);
+                    offset = skipList(offset, elementCount);
                     break;
                 default:
                     throw new IllegalStateException("unknown direct row column tag: " + tag);
@@ -98,13 +108,15 @@ public final class DirectEncodedRow implements AutoCloseable {
         if (decoder == null) {
             throw new NullPointerException("decoder");
         }
-        ByteBuffer view = rowView();
-        int columnCount = readLength(view, "column count");
+        int offset = 0;
+        int columnCount =
+                DirectIoUtils.readLength(address, length, offset, "column count", PAYLOAD_NAME);
+        offset += Integer.BYTES;
         ensureColumnInRange(column, columnCount);
-        ReusableByteBufferInputStream inputStream = new ReusableByteBufferInputStream();
+        ReusableDirectAddressInputStream inputStream = new ReusableDirectAddressInputStream();
         for (int i = 0; i < columnCount; i++) {
-            ensureRemaining(view, 1);
-            byte tag = view.get();
+            byte tag = DirectIoUtils.readByte(address, length, offset, PAYLOAD_NAME);
+            offset += 1;
             switch (tag) {
                 case TAG_NULL:
                     if (i == column) {
@@ -112,21 +124,27 @@ public final class DirectEncodedRow implements AutoCloseable {
                     }
                     break;
                 case TAG_BYTES:
-                    int bytesLength = readLength(view, "bytes length");
+                    int bytesLength =
+                            DirectIoUtils.readLength(
+                                    address, length, offset, "bytes length", PAYLOAD_NAME);
+                    offset += Integer.BYTES;
                     if (i == column) {
-                        ByteBuffer bytes = sliceCurrent(view, bytesLength);
-                        inputStream.reset(bytes);
+                        DirectIoUtils.ensureRemaining(length, offset, bytesLength, PAYLOAD_NAME);
+                        inputStream.reset(address + offset, bytesLength);
                         return decoder.decode(inputStream);
                     }
-                    skipBytes(view, bytesLength);
+                    offset = skipBytes(offset, bytesLength);
                     break;
                 case TAG_LIST:
-                    int elementCount = readLength(view, "list element count");
+                    int elementCount =
+                            DirectIoUtils.readLength(
+                                    address, length, offset, "list element count", PAYLOAD_NAME);
+                    offset += Integer.BYTES;
                     if (i == column) {
                         throw new IllegalStateException(
                                 "expected BYTES column in direct row but found LIST");
                     }
-                    skipList(view, elementCount);
+                    offset = skipList(offset, elementCount);
                     break;
                 default:
                     throw new IllegalStateException("unknown direct row column tag: " + tag);
@@ -147,13 +165,15 @@ public final class DirectEncodedRow implements AutoCloseable {
         if (decoder == null) {
             throw new NullPointerException("decoder");
         }
-        ByteBuffer view = rowView();
-        int columnCount = readLength(view, "column count");
+        int offset = 0;
+        int columnCount =
+                DirectIoUtils.readLength(address, length, offset, "column count", PAYLOAD_NAME);
+        offset += Integer.BYTES;
         ensureColumnInRange(column, columnCount);
-        ReusableByteBufferInputStream inputStream = new ReusableByteBufferInputStream();
+        ReusableDirectAddressInputStream inputStream = new ReusableDirectAddressInputStream();
         for (int i = 0; i < columnCount; i++) {
-            ensureRemaining(view, 1);
-            byte tag = view.get();
+            byte tag = DirectIoUtils.readByte(address, length, offset, PAYLOAD_NAME);
+            offset += 1;
             switch (tag) {
                 case TAG_NULL:
                     if (i == column) {
@@ -161,25 +181,39 @@ public final class DirectEncodedRow implements AutoCloseable {
                     }
                     break;
                 case TAG_BYTES:
-                    int bytesLength = readLength(view, "bytes length");
+                    int bytesLength =
+                            DirectIoUtils.readLength(
+                                    address, length, offset, "bytes length", PAYLOAD_NAME);
+                    offset += Integer.BYTES;
                     if (i == column) {
                         throw new IllegalStateException(
                                 "expected LIST column in direct row but found BYTES");
                     }
-                    skipBytes(view, bytesLength);
+                    offset = skipBytes(offset, bytesLength);
                     break;
                 case TAG_LIST:
-                    int elementCount = readLength(view, "list element count");
+                    int elementCount =
+                            DirectIoUtils.readLength(
+                                    address, length, offset, "list element count", PAYLOAD_NAME);
+                    offset += Integer.BYTES;
                     if (i != column) {
-                        skipList(view, elementCount);
+                        offset = skipList(offset, elementCount);
                         break;
                     }
                     List<T> decoded = new ArrayList<>(elementCount);
                     for (int j = 0; j < elementCount; j++) {
-                        int elementLength = readLength(view, "list element length");
-                        ByteBuffer element = sliceCurrent(view, elementLength);
-                        inputStream.reset(element);
+                        int elementLength =
+                                DirectIoUtils.readLength(
+                                        address,
+                                        length,
+                                        offset,
+                                        "list element length",
+                                        PAYLOAD_NAME);
+                        offset += Integer.BYTES;
+                        DirectIoUtils.ensureRemaining(length, offset, elementLength, PAYLOAD_NAME);
+                        inputStream.reset(address + offset, elementLength);
                         decoded.add(decoder.decode(inputStream));
+                        offset += elementLength;
                     }
                     return decoded;
                 default:
@@ -203,27 +237,21 @@ public final class DirectEncodedRow implements AutoCloseable {
         }
     }
 
-    private ByteBuffer rowView() {
-        ByteBuffer view = buffer.duplicate();
-        ((Buffer) view).clear();
-        if (length < Integer.BYTES || length > view.capacity()) {
-            throw new IllegalStateException("invalid encoded direct row length: " + length);
-        }
-        ((Buffer) view).limit(length);
-        return view;
+    private int skipBytes(int offset, int bytesLength) {
+        DirectIoUtils.ensureRemaining(length, offset, bytesLength, PAYLOAD_NAME);
+        return offset + bytesLength;
     }
 
-    private static void skipBytes(ByteBuffer view, int bytesLength) {
-        ensureRemaining(view, bytesLength);
-        ((Buffer) view).position(view.position() + bytesLength);
-    }
-
-    private static void skipList(ByteBuffer view, int elementCount) {
+    private int skipList(int offset, int elementCount) {
         for (int i = 0; i < elementCount; i++) {
-            int elementLength = readLength(view, "list element length");
-            ensureRemaining(view, elementLength);
-            ((Buffer) view).position(view.position() + elementLength);
+            int elementLength =
+                    DirectIoUtils.readLength(
+                            address, length, offset, "list element length", PAYLOAD_NAME);
+            offset += Integer.BYTES;
+            DirectIoUtils.ensureRemaining(length, offset, elementLength, PAYLOAD_NAME);
+            offset += elementLength;
         }
+        return offset;
     }
 
     private static void ensureColumnInRange(int column, int columnCount) {
@@ -232,57 +260,50 @@ public final class DirectEncodedRow implements AutoCloseable {
         }
     }
 
-    private static int readLength(ByteBuffer view, String fieldName) {
-        ensureRemaining(view, Integer.BYTES);
-        int value = view.getInt();
-        if (value < 0) {
-            throw new IllegalStateException("invalid " + fieldName + ": " + value);
-        }
-        return value;
-    }
-
-    private static void ensureRemaining(ByteBuffer view, int size) {
-        if (size < 0 || view.remaining() < size) {
-            throw new IllegalStateException("malformed encoded direct row payload");
-        }
-    }
-
-    private static ByteBuffer sliceCurrent(ByteBuffer view, int length) {
-        ensureRemaining(view, length);
-        ByteBuffer slice = view.slice();
-        ((Buffer) slice).limit(length);
-        ((Buffer) view).position(view.position() + length);
-        return slice;
-    }
-
     /** Decoder function that maps one column payload stream to a value. */
     @FunctionalInterface
     public interface ColumnDecoder<T> {
         T decode(InputStream input) throws IOException;
     }
 
-    private static final class ReusableByteBufferInputStream extends InputStream {
-        private ByteBuffer current;
+    private static final class ReusableDirectAddressInputStream extends InputStream {
+        private long currentAddress;
+        private int remaining;
 
-        private void reset(ByteBuffer source) {
-            this.current = source.duplicate();
+        private void reset(long startAddress, int length) {
+            this.currentAddress = startAddress;
+            this.remaining = length;
         }
 
         @Override
         public int read() {
-            if (current == null || !current.hasRemaining()) {
+            if (remaining <= 0) {
                 return -1;
             }
-            return current.get() & 0xFF;
+            int value = UnsafeAccess.getByte(currentAddress) & 0xFF;
+            currentAddress += 1;
+            remaining -= 1;
+            return value;
         }
 
         @Override
         public int read(byte[] bytes, int offset, int length) {
-            if (current == null || !current.hasRemaining()) {
+            if (bytes == null) {
+                throw new NullPointerException("bytes");
+            }
+            if ((offset | length | (offset + length) | (bytes.length - (offset + length))) < 0) {
+                throw new IndexOutOfBoundsException("invalid byte[] range");
+            }
+            if (length == 0) {
+                return 0;
+            }
+            if (remaining <= 0) {
                 return -1;
             }
-            int readable = Math.min(length, current.remaining());
-            current.get(bytes, offset, readable);
+            int readable = Math.min(length, remaining);
+            UnsafeAccess.copyMemory(currentAddress, bytes, offset, readable);
+            currentAddress += readable;
+            remaining -= readable;
             return readable;
         }
     }

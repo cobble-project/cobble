@@ -1426,6 +1426,75 @@ class DbBindingTest {
         }
     }
 
+    @Test
+    void rawDirectEncodedScanBatchSupportsNextEntryTraversal() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-direct-raw-encoded-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 5; i++) {
+                byte[] key =
+                        String.format("encoded-raw-scan-%02d", i).getBytes(StandardCharsets.UTF_8);
+                db.put(0, key, 0, ("encoded-raw-value-a-" + i).getBytes(StandardCharsets.UTF_8));
+                db.put(0, key, 1, ("encoded-raw-value-b-" + i).getBytes(StandardCharsets.UTF_8));
+            }
+
+            byte[] start = "encoded-raw-scan-00".getBytes(StandardCharsets.UTF_8);
+            byte[] end = "encoded-raw-scan-05".getBytes(StandardCharsets.UTF_8);
+            ByteBuffer startBuffer = ByteBuffer.allocateDirect(start.length + 8);
+            ByteBuffer endBuffer = ByteBuffer.allocateDirect(end.length + 8);
+            ((Buffer) startBuffer).clear();
+            startBuffer.put(start);
+            ((Buffer) endBuffer).clear();
+            endBuffer.put(end);
+
+            try (ScanOptions options = new ScanOptions().batchSize(2).columns(0, 1);
+                    DirectScanCursor cursor =
+                            db.scanDirectWithOptions(
+                                    0, startBuffer, start.length, endBuffer, end.length, options)) {
+                List<String> seen = new ArrayList<>();
+                while (true) {
+                    try (DirectEncodedScanBatch batch = cursor.nextEncodedBatch()) {
+                        if (batch.size() == 0) {
+                            assertFalse(batch.hasMore);
+                            break;
+                        }
+                        while (true) {
+                            DirectEncodedScanEntry entry = batch.nextEntry();
+                            if (entry == null) {
+                                break;
+                            }
+                            String keyString =
+                                    new String(
+                                            readDirectBytes(entry.getKey()),
+                                            StandardCharsets.UTF_8);
+                            String valueA =
+                                    new String(
+                                            entry.decodeColumn(
+                                                    0, DbBindingTest::readInputStreamBytes),
+                                            StandardCharsets.UTF_8);
+                            String valueB =
+                                    new String(
+                                            entry.decodeColumn(
+                                                    1, DbBindingTest::readInputStreamBytes),
+                                            StandardCharsets.UTF_8);
+                            seen.add(keyString + "=" + valueA + "/" + valueB);
+                        }
+                        assertNull(batch.nextEntry());
+                    }
+                }
+
+                assertEquals(5, seen.size());
+                assertEquals(
+                        "encoded-raw-scan-00=encoded-raw-value-a-0/encoded-raw-value-b-0",
+                        seen.get(0));
+                assertEquals(
+                        "encoded-raw-scan-04=encoded-raw-value-a-4/encoded-raw-value-b-4",
+                        seen.get(4));
+            }
+        }
+    }
+
     private static ShardSnapshot awaitSnapshot(CompletableFuture<ShardSnapshot> future) {
         try {
             return future.get();

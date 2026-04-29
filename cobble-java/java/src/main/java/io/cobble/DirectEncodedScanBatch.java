@@ -3,13 +3,14 @@ package io.cobble;
 import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** One direct-buffer-backed raw scan batch. The underlying buffers remain valid until closed. */
-public final class DirectScanBatch implements AutoCloseable {
-    private static final String PAYLOAD_NAME = "direct scan batch payload";
+/** One encoded direct-buffer-backed raw scan batch. */
+public final class DirectEncodedScanBatch implements AutoCloseable {
+    private static final String PAYLOAD_NAME = "encoded direct scan batch payload";
 
-    private static final DirectScanBatch EMPTY =
-            new DirectScanBatch(
+    private static final DirectEncodedScanBatch EMPTY =
+            new DirectEncodedScanBatch(
                     ByteBuffer.allocateDirect(1),
+                    0,
                     0,
                     false,
                     new int[0],
@@ -18,8 +19,9 @@ public final class DirectScanBatch implements AutoCloseable {
                     new int[0],
                     () -> {});
 
-    final boolean hasMore;
+    public final boolean hasMore;
     private final ByteBuffer encoded;
+    private final int encodedLength;
     private final int size;
     private final int[] keyOffsets;
     private final int[] keyLengths;
@@ -27,9 +29,11 @@ public final class DirectScanBatch implements AutoCloseable {
     private final int[] valueLengths;
     private final Runnable onClose;
     private final AtomicBoolean closed;
+    private int nextEntryIndex;
 
-    private DirectScanBatch(
+    private DirectEncodedScanBatch(
             ByteBuffer encoded,
+            int encodedLength,
             int size,
             boolean hasMore,
             int[] keyOffsets,
@@ -38,6 +42,7 @@ public final class DirectScanBatch implements AutoCloseable {
             int[] valueLengths,
             Runnable onClose) {
         this.encoded = encoded;
+        this.encodedLength = encodedLength;
         this.size = size;
         this.hasMore = hasMore;
         this.keyOffsets = keyOffsets;
@@ -46,13 +51,14 @@ public final class DirectScanBatch implements AutoCloseable {
         this.valueLengths = valueLengths;
         this.onClose = onClose;
         this.closed = new AtomicBoolean(false);
+        this.nextEntryIndex = 0;
     }
 
-    static DirectScanBatch empty() {
+    static DirectEncodedScanBatch empty() {
         return EMPTY;
     }
 
-    static DirectScanBatch decode(ByteBuffer encoded, int encodedLength, Runnable onClose) {
+    static DirectEncodedScanBatch decode(ByteBuffer encoded, int encodedLength, Runnable onClose) {
         long address = DirectIoUtils.directAddress(encoded);
         if (encodedLength < 5 || encodedLength > encoded.capacity()) {
             throw new IllegalStateException(
@@ -93,8 +99,9 @@ public final class DirectScanBatch implements AutoCloseable {
         if (offset != encodedLength) {
             throw new IllegalStateException("unexpected trailing bytes in direct scan batch");
         }
-        return new DirectScanBatch(
+        return new DirectEncodedScanBatch(
                 encoded,
+                encodedLength,
                 rowCount,
                 hasMoreByte == 1,
                 keyOffsets,
@@ -108,22 +115,41 @@ public final class DirectScanBatch implements AutoCloseable {
         return size;
     }
 
-    public DirectScanEntry getEntry(int index) {
-        if (index < 0 || index >= size) {
-            throw new IndexOutOfBoundsException("row index out of range: " + index);
+    public ByteBuffer getKey(int index) {
+        checkIndex(index);
+        return DirectIoUtils.slice(encoded, keyOffsets[index], keyLengths[index], PAYLOAD_NAME);
+    }
+
+    public DirectEncodedRow getEncodedRow(int index) {
+        checkIndex(index);
+        return new DirectEncodedRow(
+                DirectIoUtils.directAddress(encoded) + valueOffsets[index],
+                valueLengths[index],
+                null);
+    }
+
+    public DirectEncodedScanEntry getEntry(int index) {
+        checkIndex(index);
+        return new DirectEncodedScanEntry(getKey(index), getEncodedRow(index));
+    }
+
+    public DirectEncodedScanEntry nextEntry() {
+        if (nextEntryIndex >= size) {
+            return null;
         }
-        ByteBuffer key =
-                DirectIoUtils.slice(encoded, keyOffsets[index], keyLengths[index], PAYLOAD_NAME);
-        ByteBuffer values =
-                DirectIoUtils.slice(
-                        encoded, valueOffsets[index], valueLengths[index], PAYLOAD_NAME);
-        return new DirectScanEntry(key, DirectColumns.decode(values, valueLengths[index], null));
+        return getEntry(nextEntryIndex++);
     }
 
     @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
             onClose.run();
+        }
+    }
+
+    private void checkIndex(int index) {
+        if (index < 0 || index >= size) {
+            throw new IndexOutOfBoundsException("row index out of range: " + index);
         }
     }
 }

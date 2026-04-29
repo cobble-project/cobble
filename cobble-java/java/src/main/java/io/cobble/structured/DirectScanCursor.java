@@ -1,6 +1,7 @@
 package io.cobble.structured;
 
 import io.cobble.BatchIterator;
+import io.cobble.DirectIoUtils;
 import io.cobble.NativeObject;
 
 import java.nio.ByteBuffer;
@@ -32,7 +33,7 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
         try {
             int encodedLength =
                     nextBatchDirectInternal(
-                            nativeHandle, Db.directAddress(pooled), pooled.capacity());
+                            nativeHandle, DirectIoUtils.directAddress(pooled), pooled.capacity());
             if (encodedLength == 0) {
                 pool.release(pooled);
                 pooledReleased = true;
@@ -40,7 +41,9 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
                 currentBatchCloser = batch::close;
                 return batch;
             }
-            ByteBuffer resultBuffer = Db.resolveEncodedBuffer(pooled, encodedLength);
+            ByteBuffer resultBuffer =
+                    DirectIoUtils.resolveEncodedBuffer(
+                            pooled, encodedLength, Db.getLastDirectOverflowBuffer());
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
                 AtomicBoolean released = new AtomicBoolean(false);
@@ -79,7 +82,7 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
         try {
             int encodedLength =
                     nextBatchDirectInternal(
-                            nativeHandle, Db.directAddress(pooled), pooled.capacity());
+                            nativeHandle, DirectIoUtils.directAddress(pooled), pooled.capacity());
             if (encodedLength == 0) {
                 pool.release(pooled);
                 pooledReleased = true;
@@ -87,7 +90,9 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
                 currentBatchCloser = batch::close;
                 return batch;
             }
-            ByteBuffer resultBuffer = Db.resolveEncodedBuffer(pooled, encodedLength);
+            ByteBuffer resultBuffer =
+                    DirectIoUtils.resolveEncodedBuffer(
+                            pooled, encodedLength, Db.getLastDirectOverflowBuffer());
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
                 AtomicBoolean released = new AtomicBoolean(false);

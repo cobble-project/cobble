@@ -1,6 +1,7 @@
 package io.cobble.structured;
 
-import java.nio.Buffer;
+import io.cobble.DirectIoUtils;
+
 import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -10,9 +11,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>The backing batch buffer remains valid until {@link #close()}.
  */
 public final class DirectEncodedScanBatch implements AutoCloseable {
+    private static final String PAYLOAD_NAME = "encoded structured direct scan batch payload";
+
     private static final DirectEncodedScanBatch EMPTY =
             new DirectEncodedScanBatch(
                     ByteBuffer.allocateDirect(1),
+                    0,
                     0,
                     false,
                     new int[0],
@@ -23,6 +27,7 @@ public final class DirectEncodedScanBatch implements AutoCloseable {
 
     public final boolean hasMore;
     private final ByteBuffer encoded;
+    private final int encodedLength;
     private final int size;
     private final int[] keyOffsets;
     private final int[] keyLengths;
@@ -34,6 +39,7 @@ public final class DirectEncodedScanBatch implements AutoCloseable {
 
     private DirectEncodedScanBatch(
             ByteBuffer encoded,
+            int encodedLength,
             int size,
             boolean hasMore,
             int[] keyOffsets,
@@ -42,6 +48,7 @@ public final class DirectEncodedScanBatch implements AutoCloseable {
             int[] rowLengths,
             Runnable onClose) {
         this.encoded = encoded;
+        this.encodedLength = encodedLength;
         this.size = size;
         this.hasMore = hasMore;
         this.keyOffsets = keyOffsets;
@@ -58,17 +65,18 @@ public final class DirectEncodedScanBatch implements AutoCloseable {
     }
 
     static DirectEncodedScanBatch decode(ByteBuffer encoded, int encodedLength, Runnable onClose) {
-        ByteBuffer view = encoded.duplicate();
-        ((Buffer) view).clear();
-        if (encodedLength < 5 || encodedLength > view.capacity()) {
+        long address = DirectIoUtils.directAddress(encoded);
+        if (encodedLength < 5 || encodedLength > encoded.capacity()) {
             throw new IllegalStateException(
                     "invalid encoded direct scan batch length: " + encodedLength);
         }
-        ((Buffer) view).limit(encodedLength);
+        int offset = 0;
 
-        int rowCount = readLength(view, "row count");
-        ensureRemaining(view, 1);
-        byte hasMoreByte = view.get();
+        int rowCount =
+                DirectIoUtils.readLength(address, encodedLength, offset, "row count", PAYLOAD_NAME);
+        offset += Integer.BYTES;
+        byte hasMoreByte = DirectIoUtils.readByte(address, encodedLength, offset, PAYLOAD_NAME);
+        offset += 1;
         if (hasMoreByte != 0 && hasMoreByte != 1) {
             throw new IllegalStateException(
                     "invalid direct scan batch hasMore flag: " + hasMoreByte);
@@ -79,21 +87,28 @@ public final class DirectEncodedScanBatch implements AutoCloseable {
         int[] rowOffsets = new int[rowCount];
         int[] rowLengths = new int[rowCount];
         for (int i = 0; i < rowCount; i++) {
-            keyLengths[i] = readLength(view, "key length");
-            keyOffsets[i] = view.position();
-            ensureRemaining(view, keyLengths[i]);
-            ((Buffer) view).position(view.position() + keyLengths[i]);
+            keyLengths[i] =
+                    DirectIoUtils.readLength(
+                            address, encodedLength, offset, "key length", PAYLOAD_NAME);
+            offset += Integer.BYTES;
+            keyOffsets[i] = offset;
+            DirectIoUtils.ensureRemaining(encodedLength, offset, keyLengths[i], PAYLOAD_NAME);
+            offset += keyLengths[i];
 
-            rowLengths[i] = readLength(view, "row length");
-            rowOffsets[i] = view.position();
-            ensureRemaining(view, rowLengths[i]);
-            ((Buffer) view).position(view.position() + rowLengths[i]);
+            rowLengths[i] =
+                    DirectIoUtils.readLength(
+                            address, encodedLength, offset, "row length", PAYLOAD_NAME);
+            offset += Integer.BYTES;
+            rowOffsets[i] = offset;
+            DirectIoUtils.ensureRemaining(encodedLength, offset, rowLengths[i], PAYLOAD_NAME);
+            offset += rowLengths[i];
         }
-        if (view.hasRemaining()) {
+        if (offset != encodedLength) {
             throw new IllegalStateException("unexpected trailing bytes in direct scan batch");
         }
         return new DirectEncodedScanBatch(
                 encoded,
+                encodedLength,
                 rowCount,
                 hasMoreByte == 1,
                 keyOffsets,
@@ -109,13 +124,13 @@ public final class DirectEncodedScanBatch implements AutoCloseable {
 
     public ByteBuffer getKey(int index) {
         checkIndex(index);
-        return slice(encoded, keyOffsets[index], keyLengths[index]);
+        return DirectIoUtils.slice(encoded, keyOffsets[index], keyLengths[index], PAYLOAD_NAME);
     }
 
     public DirectEncodedRow getEncodedRow(int index) {
         checkIndex(index);
-        ByteBuffer row = slice(encoded, rowOffsets[index], rowLengths[index]);
-        return new DirectEncodedRow(row, rowLengths[index], null);
+        return new DirectEncodedRow(
+                DirectIoUtils.directAddress(encoded) + rowOffsets[index], rowLengths[index], null);
     }
 
     /**
@@ -128,9 +143,14 @@ public final class DirectEncodedScanBatch implements AutoCloseable {
             return null;
         }
         int index = nextRowIndex++;
-        ByteBuffer key = slice(encoded, keyOffsets[index], keyLengths[index]);
-        ByteBuffer row = slice(encoded, rowOffsets[index], rowLengths[index]);
-        return new DirectEncodedScanRow(key, new DirectEncodedRow(row, rowLengths[index], null));
+        ByteBuffer key =
+                DirectIoUtils.slice(encoded, keyOffsets[index], keyLengths[index], PAYLOAD_NAME);
+        return new DirectEncodedScanRow(
+                key,
+                new DirectEncodedRow(
+                        DirectIoUtils.directAddress(encoded) + rowOffsets[index],
+                        rowLengths[index],
+                        null));
     }
 
     @Override
@@ -144,28 +164,5 @@ public final class DirectEncodedScanBatch implements AutoCloseable {
         if (index < 0 || index >= size) {
             throw new IndexOutOfBoundsException("row index out of range: " + index);
         }
-    }
-
-    private static void ensureRemaining(ByteBuffer view, int size) {
-        if (size < 0 || view.remaining() < size) {
-            throw new IllegalStateException("malformed direct scan batch payload");
-        }
-    }
-
-    private static int readLength(ByteBuffer view, String fieldName) {
-        ensureRemaining(view, Integer.BYTES);
-        int len = view.getInt();
-        if (len < 0) {
-            throw new IllegalStateException("invalid " + fieldName + ": " + len);
-        }
-        return len;
-    }
-
-    private static ByteBuffer slice(ByteBuffer source, int offset, int length) {
-        ByteBuffer view = source.duplicate();
-        ((Buffer) view).clear();
-        ((Buffer) view).position(offset);
-        ((Buffer) view).limit(offset + length);
-        return view.slice();
     }
 }

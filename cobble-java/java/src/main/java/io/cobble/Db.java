@@ -328,11 +328,11 @@ public final class Db extends NativeObject {
         putDirectWithOptions(
                 nativeHandle,
                 bucket,
-                directAddress(keyBuffer),
+                DirectIoUtils.directAddress(keyBuffer),
                 keyBuffer.capacity(),
                 keyLength,
                 column,
-                directAddress(valueBuffer),
+                DirectIoUtils.directAddress(valueBuffer),
                 valueBuffer.capacity(),
                 valueLength,
                 writeOptionsHandle);
@@ -390,56 +390,10 @@ public final class Db extends NativeObject {
      */
     public DirectEncodedRow getDirectEncodedRowWithOptions(
             int bucket, byte[] key, ReadOptions options) {
-        if (key == null) {
-            throw new IllegalArgumentException("key must not be null");
-        }
-        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
-        DirectBufferPool pool = directBufferPool;
-        ByteBuffer pooled = pool.acquire();
-        ByteBuffer ioBuffer = pooled;
-        boolean usingPooledForResult = false;
-        boolean pooledReleased = false;
-
-        try {
-            if (key.length > ioBuffer.capacity()) {
-                ioBuffer = ByteBuffer.allocateDirect(key.length);
-            }
-            writeKey(ioBuffer, key);
-            int encodedLength =
-                    getEncodedDirectWithOptions(
-                            nativeHandle,
-                            bucket,
-                            directAddress(ioBuffer),
-                            ioBuffer.capacity(),
-                            key.length,
-                            readOptionsHandle);
-            if (encodedLength == 0) {
-                pool.release(pooled);
-                pooledReleased = true;
-                return null;
-            }
-            ByteBuffer resultBuffer = resolveEncodedBuffer(ioBuffer, encodedLength);
-            int decodedLength = Math.abs(encodedLength);
-            if (resultBuffer == pooled) {
-                usingPooledForResult = true;
-                AtomicBoolean released = new AtomicBoolean(false);
-                Runnable releaser =
-                        () -> {
-                            if (released.compareAndSet(false, true)) {
-                                pool.release(pooled);
-                            }
-                        };
-                return new DirectEncodedRow(resultBuffer, decodedLength, releaser);
-            }
-            pool.release(pooled);
-            pooledReleased = true;
-            return new DirectEncodedRow(resultBuffer, decodedLength, null);
-        } catch (RuntimeException e) {
-            if (!usingPooledForResult && !pooledReleased) {
-                pool.release(pooled);
-            }
-            throw e;
-        }
+        EncodedDirectResult encoded = readEncodedDirectResult(bucket, key, options);
+        return encoded == null
+                ? null
+                : new DirectEncodedRow(encoded.address, encoded.length, encoded.releaser);
     }
 
     /**
@@ -458,72 +412,23 @@ public final class Db extends NativeObject {
     /** Compatibility overload that treats {@code keyBuffer[0..keyLength)} as key bytes. */
     public DirectEncodedRow getDirectEncodedRowWithOptions(
             int bucket, ByteBuffer keyBuffer, int keyLength, ReadOptions options) {
-        if (keyBuffer == null || !keyBuffer.isDirect()) {
-            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
-        }
-        if (keyLength < 0 || keyLength > keyBuffer.capacity()) {
-            throw new IllegalArgumentException("keyLength out of range: " + keyLength);
-        }
-        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
-        DirectBufferPool pool = directBufferPool;
-        ByteBuffer pooled = pool.acquire();
-        ByteBuffer ioBuffer = pooled;
-        boolean usingPooledForResult = false;
-        boolean pooledReleased = false;
-
-        try {
-            if (keyLength > ioBuffer.capacity()) {
-                ioBuffer = ByteBuffer.allocateDirect(keyLength);
-            }
-            writeKey(ioBuffer, keyBuffer, keyLength);
-            int encodedLength =
-                    getEncodedDirectWithOptions(
-                            nativeHandle,
-                            bucket,
-                            directAddress(ioBuffer),
-                            ioBuffer.capacity(),
-                            keyLength,
-                            readOptionsHandle);
-            if (encodedLength == 0) {
-                pool.release(pooled);
-                pooledReleased = true;
-                return null;
-            }
-            ByteBuffer resultBuffer = resolveEncodedBuffer(ioBuffer, encodedLength);
-            int decodedLength = Math.abs(encodedLength);
-            if (resultBuffer == pooled) {
-                usingPooledForResult = true;
-                AtomicBoolean released = new AtomicBoolean(false);
-                Runnable releaser =
-                        () -> {
-                            if (released.compareAndSet(false, true)) {
-                                pool.release(pooled);
-                            }
-                        };
-                return new DirectEncodedRow(resultBuffer, decodedLength, releaser);
-            }
-            pool.release(pooled);
-            pooledReleased = true;
-            return new DirectEncodedRow(resultBuffer, decodedLength, null);
-        } catch (RuntimeException e) {
-            if (!usingPooledForResult && !pooledReleased) {
-                pool.release(pooled);
-            }
-            throw e;
-        }
+        EncodedDirectResult encoded =
+                readEncodedDirectResult(bucket, keyBuffer, keyLength, options);
+        return encoded == null
+                ? null
+                : new DirectEncodedRow(encoded.address, encoded.length, encoded.releaser);
     }
 
     /** Get selected columns for one key as a zero-copy direct view. */
     public DirectColumns getDirectColumnsWithOptions(int bucket, byte[] key, ReadOptions options) {
-        DirectEncodedRow encoded = getDirectEncodedRowWithOptions(bucket, key, options);
+        EncodedDirectResult encoded = readEncodedDirectResult(bucket, key, options);
         if (encoded == null) {
             return null;
         }
-        Runnable releaser = encoded.takeReleaser();
         try {
-            return DirectColumns.decode(encoded.buffer(), encoded.length(), releaser);
+            return DirectColumns.decode(encoded.buffer, encoded.length, encoded.releaser);
         } catch (RuntimeException e) {
-            releaser.run();
+            encoded.releaser.run();
             throw e;
         }
     }
@@ -531,15 +436,18 @@ public final class Db extends NativeObject {
     /** Get selected columns for one key as a zero-copy direct view via direct key buffer. */
     public DirectColumns getDirectColumnsWithOptions(
             int bucket, ByteBuffer keyBuffer, ReadOptions options) {
-        DirectEncodedRow encoded = getDirectEncodedRowWithOptions(bucket, keyBuffer, options);
+        if (keyBuffer == null || !keyBuffer.isDirect()) {
+            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
+        }
+        EncodedDirectResult encoded =
+                readEncodedDirectResult(bucket, keyBuffer, ((Buffer) keyBuffer).limit(), options);
         if (encoded == null) {
             return null;
         }
-        Runnable releaser = encoded.takeReleaser();
         try {
-            return DirectColumns.decode(encoded.buffer(), encoded.length(), releaser);
+            return DirectColumns.decode(encoded.buffer, encoded.length, encoded.releaser);
         } catch (RuntimeException e) {
-            releaser.run();
+            encoded.releaser.run();
             throw e;
         }
     }
@@ -547,27 +455,29 @@ public final class Db extends NativeObject {
     /** Compatibility overload that treats {@code keyBuffer[0..keyLength)} as key bytes. */
     public DirectColumns getDirectColumnsWithOptions(
             int bucket, ByteBuffer keyBuffer, int keyLength, ReadOptions options) {
-        DirectEncodedRow encoded =
-                getDirectEncodedRowWithOptions(bucket, keyBuffer, keyLength, options);
+        EncodedDirectResult encoded =
+                readEncodedDirectResult(bucket, keyBuffer, keyLength, options);
         if (encoded == null) {
             return null;
         }
-        Runnable releaser = encoded.takeReleaser();
         try {
-            return DirectColumns.decode(encoded.buffer(), encoded.length(), releaser);
+            return DirectColumns.decode(encoded.buffer, encoded.length, encoded.releaser);
         } catch (RuntimeException e) {
-            releaser.run();
+            encoded.releaser.run();
             throw e;
         }
     }
 
     /** Get one key via pooled direct IO and return one direct buffer per selected column. */
     public ByteBuffer[] getDirectWithOptions(int bucket, byte[] key, ReadOptions options) {
-        try (DirectEncodedRow encoded = getDirectEncodedRowWithOptions(bucket, key, options)) {
-            if (encoded == null) {
-                return null;
-            }
-            return decodeDirectColumns(encoded.buffer(), encoded.length());
+        EncodedDirectResult encoded = readEncodedDirectResult(bucket, key, options);
+        if (encoded == null) {
+            return null;
+        }
+        try {
+            return DirectIoUtils.decodeDirectColumnsCopy(encoded.address, encoded.length);
+        } finally {
+            encoded.releaser.run();
         }
     }
 
@@ -587,12 +497,15 @@ public final class Db extends NativeObject {
     /** Compatibility overload that treats {@code keyBuffer[0..keyLength)} as key bytes. */
     public ByteBuffer[] getDirectWithOptions(
             int bucket, ByteBuffer keyBuffer, int keyLength, ReadOptions options) {
-        try (DirectEncodedRow encoded =
-                getDirectEncodedRowWithOptions(bucket, keyBuffer, keyLength, options)) {
-            if (encoded == null) {
-                return null;
-            }
-            return decodeDirectColumns(encoded.buffer(), encoded.length());
+        EncodedDirectResult encoded =
+                readEncodedDirectResult(bucket, keyBuffer, keyLength, options);
+        if (encoded == null) {
+            return null;
+        }
+        try {
+            return DirectIoUtils.decodeDirectColumnsCopy(encoded.address, encoded.length);
+        } finally {
+            encoded.releaser.run();
         }
     }
 
@@ -622,102 +535,21 @@ public final class Db extends NativeObject {
                 getEncodedDirectWithOptions(
                         nativeHandle,
                         bucket,
-                        directAddress(ioBuffer),
+                        DirectIoUtils.directAddress(ioBuffer),
                         ioBuffer.capacity(),
                         keyLength,
                         readOptionsHandle);
         if (encodedLength == 0) {
             return null;
         }
-        ByteBuffer encoded = resolveEncodedBuffer(ioBuffer, encodedLength);
+        ByteBuffer encoded =
+                DirectIoUtils.resolveEncodedBuffer(
+                        ioBuffer, encodedLength, getLastDirectOverflowBuffer());
         int length = Math.abs(encodedLength);
         ByteBuffer view = encoded.duplicate();
         ((Buffer) view).clear();
         ((Buffer) view).limit(length);
         return view;
-    }
-
-    private static void writeKey(ByteBuffer buffer, byte[] key) {
-        ((Buffer) buffer).clear();
-        buffer.put(key);
-    }
-
-    private static void writeKey(ByteBuffer buffer, ByteBuffer keyBuffer, int keyLength) {
-        ByteBuffer keyView = keyBuffer.duplicate();
-        ((Buffer) keyView).clear();
-        ((Buffer) keyView).limit(keyLength);
-        ((Buffer) buffer).clear();
-        buffer.put(keyView);
-    }
-
-    static long directAddress(ByteBuffer buffer) {
-        return ((sun.nio.ch.DirectBuffer) buffer).address();
-    }
-
-    static ByteBuffer resolveEncodedBuffer(ByteBuffer ioBuffer, int encodedLength) {
-        if (encodedLength > 0) {
-            return ioBuffer;
-        }
-        ByteBuffer overflow = getLastDirectOverflowBuffer();
-        if (overflow == null) {
-            throw new IllegalStateException("missing overflow direct buffer from JNI");
-        }
-        return overflow;
-    }
-
-    private static ByteBuffer[] decodeDirectColumns(ByteBuffer encodedBuffer, int encodedLength) {
-        if (encodedLength <= 0) {
-            throw new IllegalStateException("invalid direct payload length: " + encodedLength);
-        }
-        ByteBuffer view = encodedBuffer.duplicate();
-        ((Buffer) view).clear();
-        ((Buffer) view).limit(encodedLength);
-        if (view.remaining() < 4) {
-            throw new IllegalStateException("invalid direct payload: missing column count");
-        }
-        int columnCount = view.getInt();
-        if (columnCount < 0) {
-            throw new IllegalStateException("invalid direct payload: negative column count");
-        }
-        ByteBuffer[] columns = new ByteBuffer[columnCount];
-        for (int i = 0; i < columnCount; i++) {
-            if (view.remaining() < 1) {
-                throw new IllegalStateException(
-                        "invalid direct payload: missing presence flag for column " + i);
-            }
-            int present = view.get() & 0xFF;
-            if (present == 0) {
-                columns[i] = null;
-                continue;
-            }
-            if (present != 1) {
-                throw new IllegalStateException(
-                        "invalid direct payload: bad presence flag "
-                                + present
-                                + " for column "
-                                + i);
-            }
-            if (view.remaining() < 4) {
-                throw new IllegalStateException(
-                        "invalid direct payload: missing length for column " + i);
-            }
-            int length = view.getInt();
-            if (length < 0 || view.remaining() < length) {
-                throw new IllegalStateException(
-                        "invalid direct payload: bad length " + length + " for column " + i);
-            }
-            ByteBuffer column = ByteBuffer.allocateDirect(length);
-            ByteBuffer slice = view.slice();
-            ((Buffer) slice).limit(length);
-            column.put(slice);
-            ((Buffer) column).flip();
-            columns[i] = column;
-            ((Buffer) view).position(view.position() + length);
-        }
-        if (view.hasRemaining()) {
-            throw new IllegalStateException("invalid direct payload: trailing bytes");
-        }
-        return columns;
     }
 
     /** Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive). */
@@ -780,15 +612,157 @@ public final class Db extends NativeObject {
                 openDirectScanCursor(
                         nativeHandle,
                         bucket,
-                        directAddress(startKeyInclusive),
+                        DirectIoUtils.directAddress(startKeyInclusive),
                         startKeyLength,
-                        directAddress(endKeyExclusive),
+                        DirectIoUtils.directAddress(endKeyExclusive),
                         endKeyLength,
                         scanOptionsHandle);
         if (handle == 0L) {
             throw new IllegalStateException("failed to open direct scan cursor");
         }
         return new DirectScanCursor(handle, directBufferPool);
+    }
+
+    private EncodedDirectResult readEncodedDirectResult(
+            int bucket, byte[] key, ReadOptions options) {
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
+        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
+        DirectBufferPool pool = directBufferPool;
+        ByteBuffer pooled = pool.acquire();
+        ByteBuffer ioBuffer = pooled;
+        boolean pooledReleased = false;
+        boolean usingPooledForResult = false;
+        try {
+            if (key.length > ioBuffer.capacity()) {
+                ioBuffer = ByteBuffer.allocateDirect(key.length);
+            }
+            DirectIoUtils.copyKey(ioBuffer, key);
+            int encodedLength =
+                    getEncodedDirectWithOptions(
+                            nativeHandle,
+                            bucket,
+                            DirectIoUtils.directAddress(ioBuffer),
+                            ioBuffer.capacity(),
+                            key.length,
+                            readOptionsHandle);
+            if (encodedLength == 0) {
+                pool.release(pooled);
+                return null;
+            }
+            ByteBuffer resultBuffer =
+                    DirectIoUtils.resolveEncodedBuffer(
+                            ioBuffer, encodedLength, getLastDirectOverflowBuffer());
+            int decodedLength = Math.abs(encodedLength);
+            if (resultBuffer == pooled) {
+                usingPooledForResult = true;
+                AtomicBoolean released = new AtomicBoolean(false);
+                Runnable releaser =
+                        () -> {
+                            if (released.compareAndSet(false, true)) {
+                                pool.release(pooled);
+                            }
+                        };
+                return new EncodedDirectResult(
+                        resultBuffer,
+                        DirectIoUtils.directAddress(resultBuffer),
+                        decodedLength,
+                        releaser);
+            }
+            pool.release(pooled);
+            pooledReleased = true;
+            return new EncodedDirectResult(
+                    resultBuffer,
+                    DirectIoUtils.directAddress(resultBuffer),
+                    decodedLength,
+                    () -> {});
+        } catch (RuntimeException e) {
+            if (!pooledReleased && !usingPooledForResult) {
+                pool.release(pooled);
+            }
+            throw e;
+        }
+    }
+
+    private EncodedDirectResult readEncodedDirectResult(
+            int bucket, ByteBuffer keyBuffer, int keyLength, ReadOptions options) {
+        if (keyBuffer == null || !keyBuffer.isDirect()) {
+            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
+        }
+        if (keyLength < 0 || keyLength > keyBuffer.capacity()) {
+            throw new IllegalArgumentException("keyLength out of range: " + keyLength);
+        }
+        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
+        DirectBufferPool pool = directBufferPool;
+        ByteBuffer pooled = pool.acquire();
+        ByteBuffer ioBuffer = pooled;
+        boolean pooledReleased = false;
+        boolean usingPooledForResult = false;
+        try {
+            if (keyLength > ioBuffer.capacity()) {
+                ioBuffer = ByteBuffer.allocateDirect(keyLength);
+            }
+            DirectIoUtils.copyKey(ioBuffer, keyBuffer, keyLength);
+            int encodedLength =
+                    getEncodedDirectWithOptions(
+                            nativeHandle,
+                            bucket,
+                            DirectIoUtils.directAddress(ioBuffer),
+                            ioBuffer.capacity(),
+                            keyLength,
+                            readOptionsHandle);
+            if (encodedLength == 0) {
+                pool.release(pooled);
+                return null;
+            }
+            ByteBuffer resultBuffer =
+                    DirectIoUtils.resolveEncodedBuffer(
+                            ioBuffer, encodedLength, getLastDirectOverflowBuffer());
+            int decodedLength = Math.abs(encodedLength);
+            if (resultBuffer == pooled) {
+                usingPooledForResult = true;
+                AtomicBoolean released = new AtomicBoolean(false);
+                Runnable releaser =
+                        () -> {
+                            if (released.compareAndSet(false, true)) {
+                                pool.release(pooled);
+                            }
+                        };
+                return new EncodedDirectResult(
+                        resultBuffer,
+                        DirectIoUtils.directAddress(resultBuffer),
+                        decodedLength,
+                        releaser);
+            }
+            pool.release(pooled);
+            pooledReleased = true;
+            return new EncodedDirectResult(
+                    resultBuffer,
+                    DirectIoUtils.directAddress(resultBuffer),
+                    decodedLength,
+                    () -> {});
+        } catch (RuntimeException e) {
+            if (!pooledReleased && !usingPooledForResult) {
+                pool.release(pooled);
+            }
+            throw e;
+        }
+    }
+
+    private static final class EncodedDirectResult {
+        private final ByteBuffer buffer;
+        private final long address;
+        private final int length;
+        private final Runnable releaser;
+
+        private EncodedDirectResult(
+                ByteBuffer buffer, long address, int length, Runnable releaser) {
+            this.buffer = buffer;
+            this.address = address;
+            this.length = length;
+            this.releaser = releaser;
+        }
     }
 
     /**

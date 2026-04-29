@@ -2,8 +2,6 @@ package io.cobble;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.Buffer;
-import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -13,27 +11,30 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * column with an {@link InputStream}-based mapper without materializing intermediate heap arrays.
  */
 public final class DirectEncodedRow implements AutoCloseable {
+    private static final String PAYLOAD_NAME = "encoded direct row payload";
+
     private static final Runnable NO_OP =
             new Runnable() {
                 @Override
                 public void run() {}
             };
 
-    private final ByteBuffer buffer;
+    private final long address;
     private final int length;
     private final Runnable releaser;
     private final AtomicBoolean closed;
 
-    DirectEncodedRow(ByteBuffer buffer, int length, Runnable releaser) {
-        this.buffer = buffer;
+    DirectEncodedRow(long address, int length, Runnable releaser) {
+        if (address == 0L) {
+            throw new IllegalArgumentException("address must not be 0");
+        }
+        if (length < 0) {
+            throw new IllegalArgumentException("length must be >= 0");
+        }
+        this.address = address;
         this.length = length;
         this.releaser = releaser == null ? NO_OP : releaser;
         this.closed = new AtomicBoolean(false);
-    }
-
-    /** Returns the underlying encoded direct buffer. */
-    public ByteBuffer buffer() {
-        return buffer;
     }
 
     /** Returns encoded payload length in bytes. */
@@ -43,18 +44,19 @@ public final class DirectEncodedRow implements AutoCloseable {
 
     /** Returns the selected column count in this encoded row payload. */
     public int size() {
-        ByteBuffer view = rowView();
-        return readLength(view, "column count");
+        return DirectIoUtils.readLength(address, length, 0, "column count", PAYLOAD_NAME);
     }
 
     /** Returns whether the target selected column is missing/null. */
     public boolean isNull(int column) {
-        ByteBuffer view = rowView();
-        int columnCount = readLength(view, "column count");
+        int offset = 0;
+        int columnCount =
+                DirectIoUtils.readLength(address, length, offset, "column count", PAYLOAD_NAME);
+        offset += Integer.BYTES;
         ensureColumnInRange(column, columnCount);
         for (int i = 0; i < columnCount; i++) {
-            ensureRemaining(view, 1);
-            int present = view.get() & 0xFF;
+            int present = DirectIoUtils.readUnsignedByte(address, length, offset, PAYLOAD_NAME);
+            offset += 1;
             if (present == 0) {
                 if (i == column) {
                     return true;
@@ -65,11 +67,14 @@ public final class DirectEncodedRow implements AutoCloseable {
                 throw new IllegalStateException(
                         "invalid direct encoded row payload: bad presence flag " + present);
             }
-            int valueLength = readLength(view, "column length");
+            int valueLength =
+                    DirectIoUtils.readLength(
+                            address, length, offset, "column length", PAYLOAD_NAME);
+            offset += Integer.BYTES;
             if (i == column) {
                 return false;
             }
-            skipBytes(view, valueLength);
+            offset = skipBytes(offset, valueLength);
         }
         throw new IllegalStateException("missing column in encoded direct row: " + column);
     }
@@ -83,13 +88,15 @@ public final class DirectEncodedRow implements AutoCloseable {
         if (decoder == null) {
             throw new NullPointerException("decoder");
         }
-        ByteBuffer view = rowView();
-        int columnCount = readLength(view, "column count");
+        int offset = 0;
+        int columnCount =
+                DirectIoUtils.readLength(address, length, offset, "column count", PAYLOAD_NAME);
+        offset += Integer.BYTES;
         ensureColumnInRange(column, columnCount);
-        ReusableByteBufferInputStream inputStream = new ReusableByteBufferInputStream();
+        ReusableDirectAddressInputStream inputStream = new ReusableDirectAddressInputStream();
         for (int i = 0; i < columnCount; i++) {
-            ensureRemaining(view, 1);
-            int present = view.get() & 0xFF;
+            int present = DirectIoUtils.readUnsignedByte(address, length, offset, PAYLOAD_NAME);
+            offset += 1;
             if (present == 0) {
                 if (i == column) {
                     return null;
@@ -100,13 +107,16 @@ public final class DirectEncodedRow implements AutoCloseable {
                 throw new IllegalStateException(
                         "invalid direct encoded row payload: bad presence flag " + present);
             }
-            int valueLength = readLength(view, "column length");
+            int valueLength =
+                    DirectIoUtils.readLength(
+                            address, length, offset, "column length", PAYLOAD_NAME);
+            offset += Integer.BYTES;
             if (i != column) {
-                skipBytes(view, valueLength);
+                offset = skipBytes(offset, valueLength);
                 continue;
             }
-            ByteBuffer value = sliceCurrent(view, valueLength);
-            inputStream.reset(value);
+            DirectIoUtils.ensureRemaining(length, offset, valueLength, PAYLOAD_NAME);
+            inputStream.reset(address + offset, valueLength);
             return decoder.decode(inputStream);
         }
         throw new IllegalStateException("missing column in encoded direct row: " + column);
@@ -126,47 +136,14 @@ public final class DirectEncodedRow implements AutoCloseable {
         }
     }
 
-    private ByteBuffer rowView() {
-        ByteBuffer view = buffer.duplicate();
-        ((Buffer) view).clear();
-        if (length < Integer.BYTES || length > view.capacity()) {
-            throw new IllegalStateException("invalid encoded direct row length: " + length);
-        }
-        ((Buffer) view).limit(length);
-        return view;
+    private int skipBytes(int offset, int bytesLength) {
+        DirectIoUtils.ensureRemaining(length, offset, bytesLength, PAYLOAD_NAME);
+        return offset + bytesLength;
     }
 
     private static void ensureColumnInRange(int column, int columnCount) {
         if (column < 0 || column >= columnCount) {
             throw new IllegalArgumentException("column out of range: " + column);
-        }
-    }
-
-    private static int readLength(ByteBuffer view, String fieldName) {
-        ensureRemaining(view, Integer.BYTES);
-        int value = view.getInt();
-        if (value < 0) {
-            throw new IllegalStateException("invalid " + fieldName + ": " + value);
-        }
-        return value;
-    }
-
-    private static void skipBytes(ByteBuffer view, int bytesLength) {
-        ensureRemaining(view, bytesLength);
-        ((Buffer) view).position(view.position() + bytesLength);
-    }
-
-    private static ByteBuffer sliceCurrent(ByteBuffer view, int bytesLength) {
-        ensureRemaining(view, bytesLength);
-        ByteBuffer slice = view.slice();
-        ((Buffer) slice).limit(bytesLength);
-        ((Buffer) view).position(view.position() + bytesLength);
-        return slice;
-    }
-
-    private static void ensureRemaining(ByteBuffer view, int size) {
-        if (size < 0 || view.remaining() < size) {
-            throw new IllegalStateException("malformed encoded direct row payload");
         }
     }
 
@@ -176,28 +153,44 @@ public final class DirectEncodedRow implements AutoCloseable {
         T decode(InputStream input) throws IOException;
     }
 
-    private static final class ReusableByteBufferInputStream extends InputStream {
-        private ByteBuffer current;
+    private static final class ReusableDirectAddressInputStream extends InputStream {
+        private long currentAddress;
+        private int remaining;
 
-        private void reset(ByteBuffer source) {
-            this.current = source.duplicate();
+        private void reset(long startAddress, int length) {
+            this.currentAddress = startAddress;
+            this.remaining = length;
         }
 
         @Override
         public int read() {
-            if (current == null || !current.hasRemaining()) {
+            if (remaining <= 0) {
                 return -1;
             }
-            return current.get() & 0xFF;
+            int value = UnsafeAccess.getByte(currentAddress) & 0xFF;
+            currentAddress += 1;
+            remaining -= 1;
+            return value;
         }
 
         @Override
         public int read(byte[] bytes, int offset, int length) {
-            if (current == null || !current.hasRemaining()) {
+            if (bytes == null) {
+                throw new NullPointerException("bytes");
+            }
+            if ((offset | length | (offset + length) | (bytes.length - (offset + length))) < 0) {
+                throw new IndexOutOfBoundsException("invalid byte[] range");
+            }
+            if (length == 0) {
+                return 0;
+            }
+            if (remaining <= 0) {
                 return -1;
             }
-            int readable = Math.min(length, current.remaining());
-            current.get(bytes, offset, readable);
+            int readable = Math.min(length, remaining);
+            UnsafeAccess.copyMemory(currentAddress, bytes, offset, readable);
+            currentAddress += readable;
+            remaining -= readable;
             return readable;
         }
     }
