@@ -692,7 +692,7 @@ impl Default for Config {
             total_buckets: 1,
             l0_file_limit: 4,
             write_stall_limit: None,
-            l1_base_bytes: Size::from_mib(64),
+            l1_base_bytes: Size::from_mib(256),
             level_size_multiplier: 10,
             max_level: 6,
             compaction_policy: CompactionPolicyKind::RoundRobin,

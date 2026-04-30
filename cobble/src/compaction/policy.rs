@@ -34,7 +34,7 @@ impl Default for CompactionConfig {
         Self {
             policy: CompactionPolicyKind::RoundRobin,
             l0_file_limit: 4,
-            l1_base_bytes: 64 * 1024 * 1024,
+            l1_base_bytes: 256 * 1024 * 1024,
             level_size_multiplier: 10,
             max_level: 6,
             block_size: 4096,
