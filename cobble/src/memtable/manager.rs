@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
 
@@ -24,7 +25,7 @@ use crate::paths::snapshot_active_data_relative_path;
 use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotManager};
 use crate::sst::{SSTWriter, SSTWriterOptions};
-use crate::r#type::{KvValue, RefKey, RefValue, key_bucket, key_column_family};
+use crate::r#type::{KvValue, RefKey, RefValue, ValueType, key_bucket, key_column_family};
 use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::{debug, trace, warn};
@@ -326,8 +327,24 @@ impl<'a> KvIterator<'a> for SkiplistScanCursor {
 
 struct MemtableScanIterator {
     source: MemtableScanSource,
+    /// Scan lower bound already encoded in DB key space.
     start_bound_inclusive: Option<Bytes>,
+    /// Scan upper bound already encoded in DB key space.
     end_bound_exclusive: Option<Bytes>,
+    /// Optional projected-row visibility filter used only on the collect path.
+    /// When present, collected rows that are provably invisible for the projection
+    /// (for example all selected columns are empty/Delete) do not count toward `max_rows`.
+    row_filter: Option<MemtableRowFilter>,
+    /// The caller-requested visible-row limit for this memtable layer.
+    /// This is only meaningful on paths that materialize collected entries eagerly.
+    max_rows: Option<usize>,
+    /// Shared allowance flowing from newer collected memtables to older collected memtables.
+    /// Each invisible shadowing row found in an upper collected layer increments this allowance,
+    /// so lower collected layers fetch extra candidates before the final DbIterator dedup pass.
+    shadow_allowance: Option<Arc<AtomicUsize>>,
+    /// Marks the first collected memtable iterator in the chain so it can reset the shared
+    /// allowance before a seek starts walking newer-to-older collected layers.
+    shadow_allowance_root: bool,
     entries: Vec<(Bytes, Bytes)>,
     next_index: usize,
     skiplist_iter: Option<SkiplistScanCursor>,
@@ -335,16 +352,47 @@ struct MemtableScanIterator {
     current_value: Option<Bytes>,
 }
 
+#[derive(Clone)]
+struct MemtableRowFilter {
+    num_columns: usize,
+    selected_columns: Option<Vec<usize>>,
+}
+
+fn build_memtable_row_filter(
+    source_schema: &Arc<Schema>,
+    target_schema_version: u64,
+    column_family_id: u8,
+    selected_columns: Option<&[usize]>,
+) -> Option<MemtableRowFilter> {
+    if source_schema.version() != target_schema_version {
+        return None;
+    }
+    Some(MemtableRowFilter {
+        num_columns: source_schema
+            .num_columns_in_family(column_family_id)
+            .unwrap_or(0),
+        selected_columns: selected_columns.map(|columns| columns.to_vec()),
+    })
+}
+
 impl MemtableScanIterator {
     fn for_active(
         active: Arc<Mutex<ActiveMemtable>>,
         start_bound_inclusive: Option<Bytes>,
         end_bound_exclusive: Option<Bytes>,
+        row_filter: Option<MemtableRowFilter>,
+        max_rows: Option<usize>,
+        shadow_allowance: Option<Arc<AtomicUsize>>,
+        shadow_allowance_root: bool,
     ) -> Self {
         Self {
             source: MemtableScanSource::Active(active),
             start_bound_inclusive,
             end_bound_exclusive,
+            row_filter,
+            max_rows,
+            shadow_allowance,
+            shadow_allowance_root,
             entries: Vec::new(),
             next_index: 0,
             skiplist_iter: None,
@@ -357,11 +405,19 @@ impl MemtableScanIterator {
         memtable: Arc<MemtableImpl>,
         start_bound_inclusive: Option<Bytes>,
         end_bound_exclusive: Option<Bytes>,
+        row_filter: Option<MemtableRowFilter>,
+        max_rows: Option<usize>,
+        shadow_allowance: Option<Arc<AtomicUsize>>,
+        shadow_allowance_root: bool,
     ) -> Self {
         Self {
             source: MemtableScanSource::Immutable(memtable),
             start_bound_inclusive,
             end_bound_exclusive,
+            row_filter,
+            max_rows,
+            shadow_allowance,
+            shadow_allowance_root,
             entries: Vec::new(),
             next_index: 0,
             skiplist_iter: None,
@@ -370,56 +426,21 @@ impl MemtableScanIterator {
         }
     }
 
-    fn collect_entries_from_iter<'a, I>(
-        iter: &mut I,
-        seek_target: Option<&[u8]>,
-        end_bound_exclusive: Option<&[u8]>,
-    ) -> Result<Vec<(Bytes, Bytes)>>
-    where
-        I: KvIterator<'a>,
-    {
-        if let Some(target) = seek_target {
-            iter.seek(target)?;
-        } else {
-            iter.seek_to_first()?;
-        }
-        let mut entries = Vec::new();
-        while iter.next()? {
-            if let Some((key, kv_value)) = iter.take_current()? {
-                if let Some(end) = end_bound_exclusive
-                    && key.as_ref() >= end
-                {
-                    break;
-                }
-                // Memtable iterators always produce encoded values.
-                entries.push((key, kv_value.unwrap_encoded()));
-            }
-        }
-        Ok(entries)
-    }
-
-    fn collect_entries_from_memtable(
-        memtable: &MemtableImpl,
-        seek_target: Option<&[u8]>,
-        end_bound_exclusive: Option<&[u8]>,
-    ) -> Result<Vec<(Bytes, Bytes)>> {
-        match memtable {
-            MemtableImpl::Hash(hash_memtable) => {
-                let mut iter = hash_memtable.iter_with_bounds(seek_target, end_bound_exclusive);
-                Self::collect_entries_from_iter(&mut iter, seek_target, end_bound_exclusive)
-            }
-            _ => {
-                let mut iter = memtable.iter();
-                Self::collect_entries_from_iter(&mut iter, seek_target, end_bound_exclusive)
-            }
-        }
-    }
-
     fn reload_collected_entries(
         &mut self,
         start_bound_inclusive: Option<&[u8]>,
         end_bound_exclusive: Option<&[u8]>,
     ) -> Result<()> {
+        if self.shadow_allowance_root
+            && let Some(shadow_allowance) = self.shadow_allowance.as_ref()
+        {
+            shadow_allowance.store(0, Ordering::Relaxed);
+        }
+        let effective_max_rows = if self.row_filter.is_some() {
+            self.max_rows
+        } else {
+            None
+        };
         self.skiplist_iter = None;
         self.entries = match &self.source {
             MemtableScanSource::Active(active) => {
@@ -431,17 +452,27 @@ impl MemtableScanIterator {
                     self.next_index = 0;
                     return Ok(());
                 };
-                Self::collect_entries_from_memtable(
+                collect_limited_entries_from_memtable(
                     memtable,
                     start_bound_inclusive,
                     end_bound_exclusive,
+                    self.row_filter.as_ref(),
+                    effective_max_rows,
+                    self.shadow_allowance.as_ref(),
                 )?
+                .0
             }
-            MemtableScanSource::Immutable(memtable) => Self::collect_entries_from_memtable(
-                memtable.as_ref(),
-                start_bound_inclusive,
-                end_bound_exclusive,
-            )?,
+            MemtableScanSource::Immutable(memtable) => {
+                collect_limited_entries_from_memtable(
+                    memtable.as_ref(),
+                    start_bound_inclusive,
+                    end_bound_exclusive,
+                    self.row_filter.as_ref(),
+                    effective_max_rows,
+                    self.shadow_allowance.as_ref(),
+                )?
+                .0
+            }
         };
         self.prime_current();
         Ok(())
@@ -500,6 +531,124 @@ impl MemtableScanIterator {
             self.current_key = None;
             self.current_value = None;
             self.next_index = 0;
+        }
+    }
+}
+
+fn row_counts_toward_max_rows(
+    encoded_value: &Bytes,
+    row_filter: &MemtableRowFilter,
+) -> Result<bool> {
+    let decoded = KvValue::Encoded(encoded_value.clone()).into_decoded(row_filter.num_columns)?;
+    let has_visible_column = if let Some(selected_columns) = row_filter.selected_columns.as_ref() {
+        selected_columns.iter().any(|&index| {
+            decoded.columns().get(index).is_some_and(|column| {
+                column
+                    .as_ref()
+                    .is_some_and(|column| column.value_type() != &ValueType::Delete)
+            })
+        })
+    } else {
+        decoded.columns().iter().any(|column| {
+            column
+                .as_ref()
+                .is_some_and(|column| column.value_type() != &ValueType::Delete)
+        })
+    };
+    Ok(has_visible_column)
+}
+
+fn collect_limited_entries_from_iter<'a, I>(
+    iter: &mut I,
+    seek_target: Option<&[u8]>,
+    end_bound_exclusive: Option<&[u8]>,
+    row_filter: Option<&MemtableRowFilter>,
+    max_rows: Option<usize>,
+    shadow_allowance: Option<&Arc<AtomicUsize>>,
+) -> Result<(Vec<(Bytes, Bytes)>, usize)>
+where
+    I: KvIterator<'a>,
+{
+    if let Some(target) = seek_target {
+        iter.seek(target)?;
+    } else {
+        iter.seek_to_first()?;
+    }
+    let mut entries = Vec::new();
+    let mut visible_rows = 0usize;
+    let mut filtered_shadow_rows = 0usize;
+    // The local max_rows budget starts from the caller's requested visible-row cap,
+    // then inherits any extra allowance already earned by newer collected memtables.
+    // That inherited allowance compensates for newer invisible shadowing rows that can
+    // suppress same-key values in this older collected layer during the final dedup pass.
+    let effective_max_rows = max_rows.map(|max_rows| {
+        max_rows + shadow_allowance.map_or(0, |allowance| allowance.load(Ordering::Relaxed))
+    });
+    while iter.next()? {
+        if let Some((key, kv_value)) = iter.take_current()? {
+            if let Some(end) = end_bound_exclusive
+                && key.as_ref() >= end
+            {
+                break;
+            }
+            let encoded_value = kv_value.unwrap_encoded();
+            let counts_toward_limit = if let Some(row_filter) = row_filter {
+                row_counts_toward_max_rows(&encoded_value, row_filter)?
+            } else {
+                true
+            };
+            entries.push((key, encoded_value));
+            if counts_toward_limit {
+                visible_rows += 1;
+            } else {
+                filtered_shadow_rows += 1;
+                // This row is already provably invisible for the projected read, but it can still
+                // shadow an older same-key value. Propagate one extra slot to lower collected
+                // memtables so they can fetch the next candidate instead of being truncated early.
+                if let Some(shadow_allowance) = shadow_allowance {
+                    shadow_allowance.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if let Some(max_rows) = effective_max_rows
+                && visible_rows >= max_rows
+            {
+                break;
+            }
+        }
+    }
+    Ok((entries, filtered_shadow_rows))
+}
+
+fn collect_limited_entries_from_memtable(
+    memtable: &MemtableImpl,
+    seek_target: Option<&[u8]>,
+    end_bound_exclusive: Option<&[u8]>,
+    row_filter: Option<&MemtableRowFilter>,
+    max_rows: Option<usize>,
+    shadow_allowance: Option<&Arc<AtomicUsize>>,
+) -> Result<(Vec<(Bytes, Bytes)>, usize)> {
+    match memtable {
+        MemtableImpl::Hash(hash_memtable) => {
+            let mut iter = hash_memtable.iter_with_bounds(seek_target, end_bound_exclusive);
+            collect_limited_entries_from_iter(
+                &mut iter,
+                seek_target,
+                end_bound_exclusive,
+                row_filter,
+                max_rows,
+                shadow_allowance,
+            )
+        }
+        _ => {
+            let mut iter = memtable.iter();
+            collect_limited_entries_from_iter(
+                &mut iter,
+                seek_target,
+                end_bound_exclusive,
+                row_filter,
+                max_rows,
+                shadow_allowance,
+            )
         }
     }
 }
@@ -1361,6 +1510,7 @@ impl MemtableManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan_memtable_iterators_with_snapshot(
         &self,
         snapshot: Arc<DbState>,
@@ -1369,23 +1519,47 @@ impl MemtableManager {
         selected_columns: Option<&[usize]>,
         start_bound_inclusive: Option<Bytes>,
         end_bound_exclusive: Option<Bytes>,
+        max_rows: Option<usize>,
     ) -> Result<Vec<DynKvIterator>> {
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let target_num_columns = target_schema
             .num_columns_in_family(column_family_id)
             .unwrap_or(0);
+        let shared_shadow_allowance = max_rows.map(|_| Arc::new(AtomicUsize::new(0)));
+        let mut first_collecting_iterator = true;
+        let mut deeper_collected_limits_allowed = true;
         if let Some(active) = &snapshot.active {
             let source_schema = {
                 let active_guard = active.lock().unwrap();
                 Arc::clone(&active_guard.schema)
             };
-            let iter = MemtableScanIterator::for_active(
+            let row_filter = build_memtable_row_filter(
+                &source_schema,
+                target_schema.version(),
+                column_family_id,
+                selected_columns,
+            );
+            if max_rows.is_some() && row_filter.is_none() {
+                deeper_collected_limits_allowed = false;
+            }
+            let shadow_allowance = row_filter
+                .as_ref()
+                .and_then(|_| shared_shadow_allowance.as_ref().map(Arc::clone));
+            let shadow_allowance_root = shadow_allowance.is_some() && first_collecting_iterator;
+            if shadow_allowance.is_some() {
+                first_collecting_iterator = false;
+            }
+            let iter: DynKvIterator = Box::new(MemtableScanIterator::for_active(
                 Arc::clone(active),
                 start_bound_inclusive.clone(),
                 end_bound_exclusive.clone(),
-            );
+                row_filter,
+                max_rows,
+                shadow_allowance,
+                shadow_allowance_root,
+            ));
             let iter: DynKvIterator = if source_schema.version() == target_schema.version() {
-                Box::new(iter)
+                iter
             } else {
                 Box::new(SchemaEvolvingIterator::new(
                     iter,
@@ -1406,13 +1580,45 @@ impl MemtableManager {
             iterators.push(iter);
         }
         for immutable in snapshot.immutables.iter().rev() {
-            let iter = MemtableScanIterator::for_immutable(
+            let skiplist_streaming =
+                matches!(immutable.memtable.as_ref(), MemtableImpl::Skiplist(_));
+            let row_filter = if deeper_collected_limits_allowed && !skiplist_streaming {
+                build_memtable_row_filter(
+                    &immutable.schema,
+                    target_schema.version(),
+                    column_family_id,
+                    selected_columns,
+                )
+            } else {
+                None
+            };
+            let row_filter_missing = row_filter.is_none();
+            let shadow_allowance = if skiplist_streaming {
+                None
+            } else {
+                row_filter
+                    .as_ref()
+                    .and_then(|_| shared_shadow_allowance.as_ref().map(Arc::clone))
+            };
+            let shadow_allowance_root = shadow_allowance.is_some() && first_collecting_iterator;
+            if shadow_allowance.is_some() {
+                first_collecting_iterator = false;
+            }
+            let iter: DynKvIterator = Box::new(MemtableScanIterator::for_immutable(
                 Arc::clone(&immutable.memtable),
                 start_bound_inclusive.clone(),
                 end_bound_exclusive.clone(),
-            );
+                row_filter,
+                if deeper_collected_limits_allowed && !skiplist_streaming {
+                    max_rows
+                } else {
+                    None
+                },
+                shadow_allowance,
+                shadow_allowance_root,
+            ));
             let iter: DynKvIterator = if immutable.schema.version() == target_schema.version() {
-                Box::new(iter)
+                iter
             } else {
                 Box::new(SchemaEvolvingIterator::new(
                     iter,
@@ -1431,6 +1637,9 @@ impl MemtableManager {
                 iter
             };
             iterators.push(iter);
+            if skiplist_streaming || (max_rows.is_some() && row_filter_missing) {
+                deeper_collected_limits_allowed = false;
+            }
         }
         Ok(iterators)
     }
@@ -2186,13 +2395,18 @@ fn make_data_file_builder_factory(writer_options: WriterOptions) -> FileBuilderF
 mod tests {
     use super::*;
     use crate::config::MemtableType;
+    use crate::db_iter::{DbIterator, DbIteratorOptions};
+    use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
     use crate::file::{FileManager, FileSystemRegistry};
     use crate::lsm::LSMTreeVersion;
-    use crate::sst::row_codec::decode_value;
+    use crate::sst::row_codec::{decode_value, encode_key_ref_into};
     use crate::sst::{SSTIterator, SSTIteratorOptions, SSTWriterOptions};
     use crate::r#type::ValueType;
     use crate::r#type::{RefColumn, RefKey, RefValue};
     use crate::vlog::VlogStore;
+    use bytes::{Bytes, BytesMut};
+    use std::collections::VecDeque;
+    use uuid::Uuid;
 
     fn cleanup_test_root() {
         let _ = std::fs::remove_dir_all("/tmp/memtable_manager_test");
@@ -2202,6 +2416,150 @@ mod tests {
         let mut v: Vec<Arc<LSMTreeVersion>> = Vec::with_capacity(len);
         (0..len).for_each(|_| v.push(Arc::new(LSMTreeVersion { levels: vec![] })));
         v
+    }
+
+    fn build_test_memtable(
+        memtable_type: MemtableType,
+        entries: &[(&[u8], ValueType, &[u8])],
+    ) -> MemtableImpl {
+        let mut memtable = match memtable_type {
+            MemtableType::Hash => MemtableImpl::Hash(HashMemtable::with_capacity(4096)),
+            MemtableType::Skiplist => MemtableImpl::Skiplist(SkiplistMemtable::with_capacity(4096)),
+            MemtableType::Vec => MemtableImpl::Vec(VecMemtable::with_capacity(4096)),
+        };
+        for (key_bytes, value_type, value_bytes) in entries {
+            let key = RefKey::new(0, key_bytes);
+            let value = RefValue::new(vec![Some(RefColumn::new(*value_type, value_bytes))]);
+            memtable.put_ref(&key, &value, 1).unwrap();
+        }
+        memtable
+    }
+
+    fn encode_scan_key(key: &[u8]) -> Bytes {
+        let mut encoded = BytesMut::with_capacity(3 + key.len());
+        encode_key_ref_into(&RefKey::new(0, key), &mut encoded);
+        encoded.freeze()
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_scan_max_rows_shadow_allowance_disables_deeper_collected_limits_after_skiplist() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_test")
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-shadow-allowance-test"));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::new(DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
+        let manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 4096,
+                buffer_count: 2,
+                num_columns: 1,
+                write_stall_limit: 8,
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        manager.open().unwrap();
+
+        let schema = manager.schema_manager.latest_schema();
+        let active = Arc::new(Mutex::new(ActiveMemtable {
+            id: Uuid::new_v4(),
+            schema: Arc::clone(&schema),
+            memtable: Some(build_test_memtable(
+                MemtableType::Hash,
+                &[
+                    (b"a".as_slice(), ValueType::Delete, b""),
+                    (b"c".as_slice(), ValueType::Delete, b""),
+                    (b"e".as_slice(), ValueType::Delete, b""),
+                ],
+            )),
+            vlog_recorder: None,
+        }));
+        let immutables = VecDeque::from(vec![
+            ImmutableMemtable {
+                id: Uuid::new_v4(),
+                schema: Arc::clone(&schema),
+                memtable: Arc::new(build_test_memtable(
+                    MemtableType::Hash,
+                    &[
+                        (b"a".as_slice(), ValueType::Put, b"va"),
+                        (b"b".as_slice(), ValueType::Put, b"vb"),
+                        (b"c".as_slice(), ValueType::Put, b"vc"),
+                        (b"d".as_slice(), ValueType::Put, b"vd"),
+                        (b"e".as_slice(), ValueType::Put, b"ve"),
+                        (b"f".as_slice(), ValueType::Put, b"vf"),
+                    ],
+                )),
+                vlog_recorder: None,
+            },
+            ImmutableMemtable {
+                id: Uuid::new_v4(),
+                schema: Arc::clone(&schema),
+                memtable: Arc::new(build_test_memtable(
+                    MemtableType::Skiplist,
+                    &[
+                        (b"b".as_slice(), ValueType::Delete, b""),
+                        (b"d".as_slice(), ValueType::Delete, b""),
+                    ],
+                )),
+                vlog_recorder: None,
+            },
+        ]);
+        let snapshot = Arc::new(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: Vec::new() }),
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: Some(active),
+            immutables,
+            suggested_base_snapshot_id: None,
+        });
+
+        let start_key = encode_scan_key(b"");
+        let end_key = encode_scan_key(b"\xff");
+        let memtable_iters = manager
+            .scan_memtable_iterators_with_snapshot(
+                Arc::clone(&snapshot),
+                Arc::clone(&schema),
+                0,
+                Some(&[0]),
+                Some(start_key.clone()),
+                Some(end_key.clone()),
+                Some(1),
+            )
+            .unwrap();
+        let mut iter = DbIterator::new(
+            memtable_iters,
+            Vec::new(),
+            DbIteratorOptions {
+                end_bound: Some((end_key.clone(), false)),
+                max_rows: Some(1),
+                snapshot,
+                memtable_manager: Some(&manager),
+                access_guard: None,
+                vlog_store: Arc::clone(&manager.vlog_store),
+                ttl_provider: manager.lsm_tree.ttl_provider(),
+                schema,
+                column_family_id: 0,
+            },
+        );
+        iter.seek(start_key.as_ref()).unwrap();
+
+        let rows: Vec<(Bytes, Vec<Option<Bytes>>)> = iter.collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, Bytes::from_static(b"f"));
+        assert_eq!(rows[0].1[0].as_deref(), Some(b"vf".as_slice()));
+
+        cleanup_test_root();
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 pub(crate) struct DbIteratorOptions<'a> {
     pub(crate) end_bound: Option<(Bytes, bool)>,
+    pub(crate) max_rows: Option<usize>,
     pub(crate) snapshot: Arc<DbState>,
     pub(crate) memtable_manager: Option<&'a MemtableManager>,
     pub(crate) access_guard: Option<DbAccessGuard<'a>>,
@@ -39,6 +40,7 @@ pub struct DbIterator<'a> {
     schema: Arc<Schema>,
     num_columns: usize,
     column_family_id: u8,
+    remaining_rows: Option<usize>,
 }
 
 impl<'a> DbIterator<'a> {
@@ -70,6 +72,7 @@ impl<'a> DbIterator<'a> {
             schema,
             num_columns,
             column_family_id: options.column_family_id,
+            remaining_rows: options.max_rows,
         }
     }
 
@@ -86,6 +89,9 @@ impl<'a> DbIterator<'a> {
     }
 
     fn next_row(&mut self) -> Result<Option<(Bytes, Vec<Option<Bytes>>)>> {
+        if self.remaining_rows == Some(0) {
+            return Ok(None);
+        }
         while self.inner.valid() {
             let Some((mut encoded_key, kv_value)) = self.inner.take_current()? else {
                 self.inner.next()?;
@@ -122,6 +128,9 @@ impl<'a> DbIterator<'a> {
                 Some(self.ttl_provider.time_provider()),
             )?;
             if let Some(columns) = columns {
+                if let Some(remaining_rows) = self.remaining_rows.as_mut() {
+                    *remaining_rows -= 1;
+                }
                 return Ok(Some((Bytes::copy_from_slice(key.data()), columns)));
             }
         }
@@ -190,6 +199,7 @@ mod tests {
             Vec::new(),
             DbIteratorOptions {
                 end_bound: None,
+                max_rows: None,
                 snapshot,
                 memtable_manager: None,
                 access_guard: None,

@@ -37,6 +37,7 @@ fn rebuild_scan_options(
     column_family: Option<String>,
     column_indices: Option<Vec<usize>>,
     read_ahead_bytes: Size,
+    max_rows: Option<usize>,
 ) -> StructuredScanOptions {
     let mut scan_options = match column_indices {
         Some(column_indices) => match column_family {
@@ -51,6 +52,9 @@ fn rebuild_scan_options(
         },
     };
     scan_options.read_ahead_bytes = read_ahead_bytes;
+    if let Some(max_rows) = max_rows {
+        scan_options.set_max_rows(max_rows);
+    }
     StructuredScanOptions::from(scan_options)
 }
 
@@ -291,10 +295,12 @@ pub extern "system" fn Java_io_cobble_structured_ScanOptions_setColumns(
         }
     }
     let current = scan_options.scan_options.clone().into_cobble();
+    let max_rows = current.max_rows();
     scan_options.scan_options = rebuild_scan_options(
         current.column_family,
         Some(decoded),
         current.read_ahead_bytes,
+        max_rows,
     );
 }
 
@@ -318,10 +324,12 @@ pub extern "system" fn Java_io_cobble_structured_ScanOptions_setColumnFamily(
         }
     };
     let current = scan_options.scan_options.clone().into_cobble();
+    let max_rows = current.max_rows();
     scan_options.scan_options = rebuild_scan_options(
         Some(column_family),
         current.column_indices,
         current.read_ahead_bytes,
+        max_rows,
     );
 }
 
@@ -337,8 +345,34 @@ pub extern "system" fn Java_io_cobble_structured_ScanOptions_clearColumnFamily(
         return;
     };
     let current = scan_options.scan_options.clone().into_cobble();
-    scan_options.scan_options =
-        rebuild_scan_options(None, current.column_indices, current.read_ahead_bytes);
+    let max_rows = current.max_rows();
+    scan_options.scan_options = rebuild_scan_options(
+        None,
+        current.column_indices,
+        current.read_ahead_bytes,
+        max_rows,
+    );
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_ScanOptions_setMaxRows(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    max_rows: jint,
+) {
+    let Some(scan_options) =
+        structured_scan_options_from_handle_mut_or_throw(&mut env, native_handle)
+    else {
+        return;
+    };
+    if max_rows <= 0 {
+        throw_illegal_argument(&mut env, format!("maxRows must be > 0: {}", max_rows));
+        return;
+    }
+    let mut raw = scan_options.scan_options.clone().into_cobble();
+    raw.set_max_rows(max_rows as usize);
+    scan_options.scan_options = StructuredScanOptions::from(raw);
 }
 
 fn structured_scan_options_from_handle_mut_or_throw(

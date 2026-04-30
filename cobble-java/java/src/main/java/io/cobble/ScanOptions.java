@@ -28,6 +28,14 @@ public final class ScanOptions extends NativeObject {
         return this;
     }
 
+    public ScanOptions maxRows(int value) {
+        if (value <= 0) {
+            throw new IllegalArgumentException("maxRows must be > 0");
+        }
+        setMaxRows(nativeHandle, value);
+        return this;
+    }
+
     public ScanOptions columns(int... columnIndices) {
         int[] effective = columnIndices;
         if (effective == null || effective.length == 0) {
@@ -82,6 +90,8 @@ public final class ScanOptions extends NativeObject {
     private static native void setReadAheadBytes(long nativeHandle, int readAheadBytes);
 
     private static native void setBatchSize(long nativeHandle, int batchSize);
+
+    private static native void setMaxRows(long nativeHandle, int maxRows);
 
     private static native void setColumns(long nativeHandle, int[] columns);
 

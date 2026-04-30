@@ -394,6 +394,7 @@ impl ReadOnlyDb {
             lsm_iters,
             DbIteratorOptions {
                 end_bound,
+                max_rows: options.max_rows(),
                 snapshot,
                 memtable_manager: None,
                 access_guard: None,

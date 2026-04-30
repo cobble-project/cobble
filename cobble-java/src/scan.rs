@@ -38,6 +38,7 @@ fn rebuild_scan_options(
     column_family: Option<String>,
     column_indices: Option<Vec<usize>>,
     read_ahead_bytes: Size,
+    max_rows: Option<usize>,
 ) -> ScanOptions {
     let mut scan_options = match column_indices {
         Some(column_indices) => match column_family {
@@ -52,6 +53,9 @@ fn rebuild_scan_options(
         },
     };
     scan_options.read_ahead_bytes = read_ahead_bytes;
+    if let Some(max_rows) = max_rows {
+        scan_options.set_max_rows(max_rows);
+    }
     scan_options
 }
 
@@ -587,6 +591,7 @@ pub extern "system" fn Java_io_cobble_ScanOptions_setColumns(
         scan_options.scan_options.column_family.clone(),
         Some(decoded),
         scan_options.scan_options.read_ahead_bytes,
+        scan_options.scan_options.max_rows(),
     );
 }
 
@@ -611,6 +616,7 @@ pub extern "system" fn Java_io_cobble_ScanOptions_setColumnFamily(
         Some(column_family),
         scan_options.scan_options.column_indices.clone(),
         scan_options.scan_options.read_ahead_bytes,
+        scan_options.scan_options.max_rows(),
     );
 }
 
@@ -627,7 +633,25 @@ pub extern "system" fn Java_io_cobble_ScanOptions_clearColumnFamily(
         None,
         scan_options.scan_options.column_indices.clone(),
         scan_options.scan_options.read_ahead_bytes,
+        scan_options.scan_options.max_rows(),
     );
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_ScanOptions_setMaxRows(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    max_rows: jint,
+) {
+    let Some(scan_options) = scan_options_from_handle_mut_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    if max_rows <= 0 {
+        throw_illegal_argument(&mut env, format!("maxRows must be > 0: {}", max_rows));
+        return;
+    }
+    scan_options.scan_options.set_max_rows(max_rows as usize);
 }
 
 #[unsafe(no_mangle)]

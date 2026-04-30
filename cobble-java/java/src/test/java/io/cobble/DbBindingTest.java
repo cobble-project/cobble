@@ -165,6 +165,20 @@ class DbBindingTest {
                     assertEquals(210, rows);
                 }
             }
+
+            try (ScanOptions scanOptions = new ScanOptions().columns(0).batchSize(4).maxRows(3)) {
+                try (ScanCursor cursor = db.scanWithOptions(0, scanStart, scanEnd, scanOptions)) {
+                    int rows = 0;
+                    while (true) {
+                        ScanBatch batch = cursor.nextBatch();
+                        rows += batch.keys.length;
+                        if (!batch.hasMore) {
+                            break;
+                        }
+                    }
+                    assertTrue(rows > 0 && rows <= 3);
+                }
+            }
         }
     }
 

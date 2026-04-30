@@ -245,6 +245,7 @@ pub struct ScanOptions {
     pub column_indices: Option<Vec<usize>>,
     pub column_family: Option<String>,
     max_index: Option<usize>,
+    max_rows: Option<usize>,
     cached_resolution: Arc<ArcSwapOption<ScanOptionsCacheEntry>>,
 }
 
@@ -337,6 +338,7 @@ impl Default for ScanOptions {
             column_indices: None,
             column_family: None,
             max_index: None,
+            max_rows: None,
             cached_resolution: Arc::new(ArcSwapOption::empty()),
         }
     }
@@ -349,6 +351,7 @@ impl std::fmt::Debug for ScanOptions {
             .field("column_indices", &self.column_indices)
             .field("column_family", &self.column_family)
             .field("max_index", &self.max_index)
+            .field("max_rows", &self.max_rows)
             .finish()
     }
 }
@@ -381,6 +384,7 @@ impl ScanOptions {
             column_indices,
             column_family: None,
             max_index,
+            max_rows: None,
             cached_resolution: Arc::new(ArcSwapOption::empty()),
         }
     }
@@ -388,6 +392,12 @@ impl ScanOptions {
     pub fn with_column_family(mut self, column_family: impl Into<String>) -> Self {
         self.column_family = Some(column_family.into());
         self.invalidate_caches();
+        self
+    }
+
+    pub fn with_max_rows(mut self, max_rows: usize) -> Self {
+        assert!(max_rows > 0, "max_rows must be > 0");
+        self.max_rows = Some(max_rows);
         self
     }
 
@@ -401,6 +411,19 @@ impl ScanOptions {
 
     pub(crate) fn max_index(&self) -> Option<usize> {
         self.max_index
+    }
+
+    pub fn max_rows(&self) -> Option<usize> {
+        self.max_rows
+    }
+
+    pub fn set_max_rows(&mut self, max_rows: usize) {
+        assert!(max_rows > 0, "max_rows must be > 0");
+        self.max_rows = Some(max_rows);
+    }
+
+    pub fn clear_max_rows(&mut self) {
+        self.max_rows = None;
     }
 
     pub(crate) fn read_ahead_bytes(&self) -> Result<usize> {

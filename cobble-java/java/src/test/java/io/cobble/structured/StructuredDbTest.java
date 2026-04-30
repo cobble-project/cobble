@@ -343,6 +343,20 @@ class StructuredDbTest {
 
             assertEquals(count, allRows.size());
 
+            try (ScanOptions scanOptions = new ScanOptions().batchSize(4).maxRows(3)) {
+                int limitedRows = 0;
+                try (ScanCursor cursor = db.scanWithOptions(0, start, end, scanOptions)) {
+                    while (true) {
+                        ScanBatch batch = cursor.nextBatch();
+                        limitedRows += batch.size();
+                        if (!batch.hasMore) {
+                            break;
+                        }
+                    }
+                }
+                assertTrue(limitedRows > 0 && limitedRows <= 3);
+            }
+
             // Debug: check first row details
             Row firstRow = allRows.get(0);
             int colCount = firstRow.getColumnCount();

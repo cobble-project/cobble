@@ -1197,6 +1197,7 @@ impl Db {
                 options.columns(),
                 Some(start_key.clone()),
                 Some(end_key.clone()),
+                options.max_rows(),
             )?;
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
@@ -1221,6 +1222,7 @@ impl Db {
             lsm_iters,
             DbIteratorOptions {
                 end_bound,
+                max_rows: options.max_rows(),
                 snapshot,
                 memtable_manager: Some(&self.memtable_manager),
                 access_guard: Some(access_guard),
