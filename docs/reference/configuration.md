@@ -80,6 +80,7 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 | `sst_bloom_filter_enabled` | `bool` | `false` | Enable bloom filter per SST file |
 | `sst_bloom_bits_per_key` | `u32` | 10 | Bits per key for bloom filter |
 | `sst_partitioned_index` | `bool` | `false` | Enable two-level partitioned index |
+| `sst_data_block_restart_interval` | `usize` | 16 | Restart interval in SST data blocks (`>1` enables prefix compression, `1` disables; range `1..=65535`) |
 | `sst_compression_by_level` | `Vec<SstCompressionAlgorithm>` | `[None, None, Lz4]` | Compression per level |
 
 ### Parquet

@@ -780,6 +780,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
@@ -915,6 +916,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
@@ -1082,6 +1084,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
@@ -1189,6 +1192,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
@@ -1276,6 +1280,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
         });
         let factory = crate::compaction::make_data_file_builder_factory(writer_options.clone());
@@ -1409,6 +1414,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
@@ -1481,6 +1487,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));

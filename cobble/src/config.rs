@@ -631,6 +631,9 @@ pub struct Config {
     pub sst_bloom_bits_per_key: u32,
     /// Whether to enable two-level index and filter blocks in SST files.
     pub sst_partitioned_index: bool,
+    /// Number of entries between restart points in SST data-block encoding.
+    /// Values > 1 enable prefix compression; value 1 disables prefix compression.
+    pub sst_data_block_restart_interval: usize,
     /// Output data-file format used by flush/compaction writers.
     pub data_file_type: DataFileType,
     /// Target parquet row-group size in bytes when parquet output format is selected.
@@ -710,6 +713,7 @@ impl Default for Config {
             sst_bloom_filter_enabled: false,
             sst_bloom_bits_per_key: 10,
             sst_partitioned_index: false,
+            sst_data_block_restart_interval: 16,
             data_file_type: DataFileType::SSTable,
             parquet_row_group_size_bytes: Size::from_kib(256),
             sst_compression_by_level: vec![
@@ -1113,6 +1117,16 @@ impl Config {
                 "jni_direct_buffer_pool_size must be greater than 0".to_string(),
             ));
         }
+        if self.sst_data_block_restart_interval == 0 {
+            return Err(Error::ConfigError(
+                "sst_data_block_restart_interval must be greater than 0".to_string(),
+            ));
+        }
+        if self.sst_data_block_restart_interval > u16::MAX as usize {
+            return Err(Error::ConfigError(
+                "sst_data_block_restart_interval must be less than or equal to 65535".to_string(),
+            ));
+        }
         for (idx, volume) in self.volumes.iter().enumerate() {
             if let Some(limit) = volume.size_limit {
                 size_to_u64(&format!("volumes[{idx}].size_limit"), limit)
@@ -1224,6 +1238,7 @@ mod tests {
             sst_bloom_filter_enabled: true,
             sst_bloom_bits_per_key: 11,
             sst_partitioned_index: true,
+            sst_data_block_restart_interval: 32,
             data_file_type: DataFileType::Parquet,
             parquet_row_group_size_bytes: Size::from_kib(4),
             sst_compression_by_level: vec![

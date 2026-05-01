@@ -1083,6 +1083,7 @@ mod tests {
                     bloom_filter_enabled: true,
                     bloom_bits_per_key: bits_per_key,
                     partitioned_index: true,
+                    data_block_restart_interval: 16,
                     compression: crate::SstCompressionAlgorithm::None,
                 },
             );

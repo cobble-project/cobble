@@ -49,6 +49,8 @@ pub struct SSTWriterOptions {
     pub bloom_bits_per_key: u32,
     /// Enable two-level index/filter blocks.
     pub partitioned_index: bool,
+    /// Number of entries between full restart keys in prefix-compressed data blocks.
+    pub data_block_restart_interval: usize,
     /// Compression algorithm for data blocks.
     pub compression: SstCompressionAlgorithm,
 }
@@ -63,6 +65,7 @@ impl Default for SSTWriterOptions {
             bloom_filter_enabled: false,
             bloom_bits_per_key: 10,
             partitioned_index: false,
+            data_block_restart_interval: 16,
             compression: SstCompressionAlgorithm::None,
         }
     }
@@ -84,7 +87,11 @@ pub struct SSTWriter<W: SequentialWriteFile> {
 impl<W: SequentialWriteFile> SSTWriter<W> {
     pub fn new(writer: W, options: SSTWriterOptions) -> Self {
         let buffered_writer = BufferedWriter::new(writer, options.buffer_size);
-        let data_block_builder = BlockBuilder::new(options.block_size);
+        let data_block_builder = BlockBuilder::new_with_prefix(
+            options.block_size,
+            options.data_block_restart_interval.max(1),
+            options.data_block_restart_interval > 1,
+        );
         let metrics = options
             .metrics
             .clone()
@@ -166,7 +173,11 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         // Replace the builder with a new one and build the old one
         let old_builder = std::mem::replace(
             &mut self.data_block_builder,
-            BlockBuilder::new(self.options.block_size),
+            BlockBuilder::new_with_prefix(
+                self.options.block_size,
+                self.options.data_block_restart_interval.max(1),
+                self.options.data_block_restart_interval > 1,
+            ),
         );
         let mut block = old_builder.build();
         let block_id = self.pending_data_blocks.len() as u32;
@@ -519,6 +530,7 @@ mod tests {
                 bloom_filter_enabled: true,
                 bloom_bits_per_key: 10,
                 partitioned_index: false,
+                data_block_restart_interval: 16,
                 compression: crate::SstCompressionAlgorithm::None,
             },
         );

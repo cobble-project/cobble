@@ -242,6 +242,7 @@ pub(crate) fn build_sst_writer_options(
         bloom_filter_enabled: config.sst_bloom_filter_enabled,
         bloom_bits_per_key: config.sst_bloom_bits_per_key,
         partitioned_index: config.sst_partitioned_index,
+        data_block_restart_interval: config.sst_data_block_restart_interval,
         compression: config.sst_compression_for_level(level),
         ..SSTWriterOptions::default()
     }

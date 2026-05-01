@@ -173,6 +173,7 @@ struct RemoteSstOptions {
     bloom_filter_enabled: bool,
     bloom_bits_per_key: u32,
     partitioned_index: bool,
+    data_block_restart_interval: usize,
     compression: crate::SstCompressionAlgorithm,
 }
 
@@ -185,6 +186,7 @@ impl RemoteSstOptions {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            data_block_restart_interval: options.data_block_restart_interval,
             compression: options.compression,
         }
     }
@@ -198,6 +200,7 @@ impl RemoteSstOptions {
             bloom_filter_enabled: self.bloom_filter_enabled,
             bloom_bits_per_key: self.bloom_bits_per_key,
             partitioned_index: self.partitioned_index,
+            data_block_restart_interval: self.data_block_restart_interval,
             compression: self.compression,
         }
     }
