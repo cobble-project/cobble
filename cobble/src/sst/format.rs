@@ -328,6 +328,9 @@ impl Block {
     }
 
     pub(crate) fn find_equal_or_greater_idx(&self, target: &Bytes) -> Result<usize> {
+        if self.prefix_compressed {
+            return self.find_equal_or_greater_idx_prefix(target);
+        }
         let mut left = 0;
         let mut right = self.offsets_len();
         while left < right {
@@ -388,6 +391,120 @@ impl Block {
             return Err(Error::IoError("Corrupted prefix value bytes".to_string()));
         }
         Ok((suffix_start, suffix_end, value_start, value_end))
+    }
+
+    fn compare_prefix_restart_key_with_target(
+        &self,
+        idx: usize,
+        target: &[u8],
+    ) -> Result<std::cmp::Ordering> {
+        let offset = self.offsets[idx] as usize;
+        let data = self.data.as_ref();
+        if offset + 10 > data.len() {
+            return Err(Error::IoError("Corrupted prefix entry header".to_string()));
+        }
+        let shared = u16::from_le_bytes(
+            data[offset..offset + 2]
+                .try_into()
+                .expect("slice length checked"),
+        );
+        if shared != 0 {
+            return Err(Error::IoError(
+                "Corrupted prefix restart entry (shared != 0)".to_string(),
+            ));
+        }
+        let suffix_len = u32::from_le_bytes(
+            data[offset + 2..offset + 6]
+                .try_into()
+                .expect("slice length checked"),
+        ) as usize;
+        let suffix_start = offset + 10;
+        let suffix_end = suffix_start + suffix_len;
+        if suffix_end > data.len() {
+            return Err(Error::IoError("Corrupted prefix key suffix".to_string()));
+        }
+        let compare_len = suffix_len.min(target.len());
+        let restart_prefix = &data[suffix_start..suffix_start + compare_len];
+        let target_prefix = &target[..compare_len];
+        match restart_prefix.cmp(target_prefix) {
+            std::cmp::Ordering::Equal => Ok(suffix_len.cmp(&target.len())),
+            other => Ok(other),
+        }
+    }
+
+    fn find_equal_or_greater_idx_prefix(&self, target: &Bytes) -> Result<usize> {
+        let entry_count = self.offsets_len();
+        if entry_count == 0 {
+            return Ok(0);
+        }
+
+        let interval = self.restart_interval.max(1) as usize;
+        let restart_count = entry_count.div_ceil(interval);
+        let target_bytes = target.as_ref();
+        let target_len = target_bytes.len();
+
+        // Binary-search restart keys first, then linearly scan only the chosen restart interval.
+        let mut left = -1isize;
+        let mut right = restart_count as isize - 1;
+        while left != right {
+            let mid = left + (right - left + 1) / 2;
+            let restart_idx = mid as usize * interval;
+            match self.compare_prefix_restart_key_with_target(restart_idx, target_bytes)? {
+                std::cmp::Ordering::Less => left = mid,
+                std::cmp::Ordering::Greater => right = mid - 1,
+                std::cmp::Ordering::Equal => return Ok(restart_idx),
+            }
+        }
+
+        let start_restart = if left < 0 { 0 } else { left as usize };
+        let start_idx = start_restart * interval;
+        let end_idx = (start_idx + interval).min(entry_count);
+        let data = self.data.as_ref();
+        let mut key_prefix = Vec::<u8>::with_capacity(target_len);
+        let mut key_len = 0usize;
+
+        for entry_idx in start_idx..end_idx {
+            let offset = self.offsets[entry_idx] as usize;
+            if offset + 10 > data.len() {
+                return Err(Error::IoError("Corrupted prefix entry header".to_string()));
+            }
+            let shared = u16::from_le_bytes(
+                data[offset..offset + 2]
+                    .try_into()
+                    .expect("slice length checked"),
+            ) as usize;
+            let (suffix_start, suffix_end, _, _) = self.decode_prefix_entry_bounds(entry_idx)?;
+            if entry_idx == start_idx && shared != 0 {
+                return Err(Error::IoError(
+                    "Corrupted prefix restart entry (shared != 0)".to_string(),
+                ));
+            }
+            if shared > key_len {
+                return Err(Error::IoError(
+                    "Corrupted prefix key (shared prefix out of bounds)".to_string(),
+                ));
+            }
+            let suffix_len = suffix_end - suffix_start;
+            key_len = shared + suffix_len;
+
+            let prefix_shared = shared.min(target_len);
+            if key_prefix.len() > prefix_shared {
+                key_prefix.truncate(prefix_shared);
+            }
+            let prefix_needed = key_len.min(target_len).saturating_sub(prefix_shared);
+            if prefix_needed > 0 {
+                key_prefix.extend_from_slice(&data[suffix_start..suffix_start + prefix_needed]);
+            }
+
+            match key_prefix.as_slice().cmp(&target_bytes[..key_prefix.len()]) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Greater => return Ok(entry_idx),
+                std::cmp::Ordering::Equal if key_len >= target_len => return Ok(entry_idx),
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+
+        Ok(end_idx)
     }
 
     fn decode_prefix_key(&self, idx: usize) -> Result<Bytes> {
@@ -663,5 +780,64 @@ mod tests {
         assert!(shared_len(&decoded, 1) > 0);
         assert_eq!(shared_len(&decoded, 2), 0);
         assert!(shared_len(&decoded, 3) > 0);
+    }
+
+    #[test]
+    fn test_block_prefix_seek_binary_then_linear_interval() {
+        let mut builder = BlockBuilder::new_with_prefix(4096, 3, true);
+        for i in 1..=8 {
+            let key = format!("map:key:{i:04}");
+            let value = format!("v{i}");
+            builder.add(key.as_bytes(), value.as_bytes());
+        }
+        let decoded = Block::decode(builder.build().encode()).unwrap();
+
+        assert_eq!(
+            decoded
+                .find_equal_or_greater_idx(&Bytes::from("map:key:0000"))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            decoded
+                .find_equal_or_greater_idx(&Bytes::from("map:key:0004"))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            decoded
+                .find_equal_or_greater_idx(&Bytes::from("map:key:0005"))
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            decoded
+                .find_equal_or_greater_idx(&Bytes::from("map:key:9999"))
+                .unwrap(),
+            decoded.offsets_len()
+        );
+    }
+
+    #[test]
+    fn test_block_prefix_seek_uses_target_prefix_and_key_len() {
+        let mut builder = BlockBuilder::new_with_prefix(4096, 4, true);
+        builder.add(b"abc", b"v1");
+        builder.add(b"abcx", b"v2");
+        builder.add(b"abcxy", b"v3");
+        builder.add(b"abcz", b"v4");
+        let decoded = Block::decode(builder.build().encode()).unwrap();
+
+        assert_eq!(
+            decoded.find_equal_or_greater_idx(&Bytes::from("abc")).unwrap(),
+            0
+        );
+        assert_eq!(
+            decoded.find_equal_or_greater_idx(&Bytes::from("abcd")).unwrap(),
+            1
+        );
+        assert_eq!(
+            decoded.find_equal_or_greater_idx(&Bytes::from("abcxz")).unwrap(),
+            3
+        );
     }
 }
