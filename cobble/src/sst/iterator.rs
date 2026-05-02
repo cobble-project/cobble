@@ -9,7 +9,7 @@ use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, KvValue, Value};
 use crate::util::unsafe_bytes;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use metrics::{Counter, counter};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -123,6 +123,18 @@ pub(crate) struct SSTIterator {
 }
 
 impl SSTIterator {
+    #[inline]
+    fn normalized_encoded_value(&self, value: Bytes) -> Bytes {
+        if self.footer.value_has_ttl {
+            return value;
+        }
+        let mut out = BytesMut::with_capacity(value.len() + 4);
+        out.put_u32_le(0);
+        // todo: avoid copy when ttl is null
+        out.extend_from_slice(value.as_ref());
+        out.freeze()
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         file: Box<dyn RandomAccessFile>,
@@ -681,7 +693,7 @@ impl SSTIterator {
             && self.current_entry_idx < block.offsets_len()
         {
             let (key, value) = block.get(self.current_entry_idx)?;
-            return Ok(Some((key, value)));
+            return Ok(Some((key, self.normalized_encoded_value(value))));
         }
         Ok(None)
     }
@@ -703,7 +715,7 @@ impl SSTIterator {
             && self.current_entry_idx < block.offsets_len()
         {
             let value = block.value(self.current_entry_idx)?;
-            return Ok(Some(value));
+            return Ok(Some(self.normalized_encoded_value(value)));
         }
         Ok(None)
     }
@@ -1085,6 +1097,7 @@ mod tests {
                     partitioned_index: true,
                     data_block_restart_interval: 16,
                     compression: crate::SstCompressionAlgorithm::None,
+                    value_has_ttl: true,
                 },
             );
 
@@ -1324,5 +1337,60 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all("/tmp/sst_typed_kv_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_typed_kv_without_ttl_header() {
+        use crate::r#type::{Column, Key, Value, ValueType};
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_typed_kv_no_ttl_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/sst_typed_kv_no_ttl_test")
+            .unwrap();
+
+        {
+            let writer_file = fs.open_write("typed_no_ttl.sst").unwrap();
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    num_columns: 1,
+                    value_has_ttl: false,
+                    ..SSTWriterOptions::default()
+                },
+            );
+            let key = Key::new(1, b"user:1".to_vec());
+            let value = Value::new_with_expired_at(
+                vec![Some(Column::new(ValueType::Put, b"Alice".to_vec()))],
+                Some(12345),
+            );
+            writer.add_kv(&key, &value).unwrap();
+            writer.finish().unwrap();
+        }
+
+        {
+            let reader_file = fs.open_read("typed_no_ttl.sst").unwrap();
+            let mut iter = SSTIterator::with_cache(
+                reader_file,
+                0,
+                SSTIteratorOptions {
+                    num_columns: 1,
+                    ..SSTIteratorOptions::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            iter.seek_to_first().unwrap();
+            let value = iter.current_value().unwrap().unwrap();
+            assert_eq!(value.expired_at(), None);
+            assert_eq!(
+                value.columns()[0].as_ref().unwrap().data().as_ref(),
+                b"Alice"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_typed_kv_no_ttl_test");
     }
 }

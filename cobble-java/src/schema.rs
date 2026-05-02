@@ -3,7 +3,7 @@ use crate::util::{
     throw_illegal_state, to_java_string_or_throw,
 };
 use bytes::Bytes;
-use cobble::{Db, Schema, SchemaBuilder, SingleDb, merge_operator_by_id};
+use cobble::{ColumnFamilyOptions, Db, Schema, SchemaBuilder, SingleDb, merge_operator_by_id};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jint, jlong, jstring};
@@ -19,6 +19,8 @@ struct SchemaColumnFamilyJson {
     name: String,
     num_columns: usize,
     operator_ids: Vec<String>,
+    options: ColumnFamilyOptions,
+    value_has_ttl: bool,
 }
 
 #[derive(Serialize)]
@@ -43,6 +45,8 @@ fn schema_to_json_string(schema: &Schema) -> Result<String, String> {
             name,
             num_columns,
             operator_ids,
+            options: schema.column_family_options_in_family(id),
+            value_has_ttl: schema.value_has_ttl_in_family(id),
         });
     }
     let payload = SchemaJson {
@@ -328,6 +332,47 @@ pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeDeleteColumn(
         }
     };
     if let Err(err) = builder.delete_column(column_family, column_idx as usize) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SchemaBuilder_nativeSetColumnFamilyOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    column_family: JString,
+    options_json: JString,
+) {
+    let Some(builder) = builder_from_handle(native_handle) else {
+        throw_illegal_state(&mut env, "schema builder handle is disposed".to_string());
+        return;
+    };
+    let column_family = match decode_optional_java_string(&mut env, column_family) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let options_json = match decode_java_string(&mut env, options_json) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let options = match serde_json::from_str::<ColumnFamilyOptions>(&options_json) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(
+                &mut env,
+                format!("invalid column family options json: {}", err),
+            );
+            return;
+        }
+    };
+    if let Err(err) = builder.set_column_family_options(column_family, options) {
         throw_illegal_state(&mut env, err.to_string());
     }
 }

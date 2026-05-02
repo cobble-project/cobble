@@ -833,6 +833,30 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
         self
     }
 
+    pub fn set_column_family_options(
+        &mut self,
+        column_family: Option<String>,
+        options: cobble::ColumnFamilyOptions,
+    ) -> &mut Self {
+        let Some((column_family_name, core_column_family)) =
+            self.normalize_column_family_or_record_error(column_family)
+        else {
+            return self;
+        };
+        let Some(column_family_id) = self.apply_inner(|inner| {
+            let column_family_id = match core_column_family.as_ref() {
+                Some(column_family) => inner.ensure_column_family_exists(column_family.clone())?,
+                None => DEFAULT_COLUMN_FAMILY_ID,
+            };
+            inner.set_column_family_options(core_column_family.clone(), options.clone())?;
+            Ok(column_family_id)
+        }) else {
+            return self;
+        };
+        self.sync_structured_column_family_id(&column_family_name, column_family_id);
+        self
+    }
+
     pub fn current_schema(&self) -> &StructuredSchema {
         &self.schema
     }

@@ -2053,12 +2053,13 @@ fn flush_memtable(
                 let runtime_num_columns = schema
                     .num_columns_in_family(tree_scope.column_family_id)
                     .unwrap_or_else(|| schema.num_columns());
+                let value_has_ttl = schema.value_has_ttl_in_family(tree_scope.column_family_id);
                 let (file_id, writer) = file_manager.create_data_file_with_offload()?;
                 entry.insert(FlushTreeBuilder {
                     scope: tree_scope,
                     file_id,
                     builder: make_data_file_builder_factory(
-                        writer_options_factory.build(runtime_num_columns),
+                        writer_options_factory.build(runtime_num_columns, value_has_ttl),
                     )(Box::new(writer)),
                     min_bucket: bucket,
                     max_bucket: bucket,
@@ -2367,6 +2368,7 @@ fn make_sst_builder_factory(options: SSTWriterOptions) -> FileBuilderFactory {
                 partitioned_index: options.partitioned_index,
                 data_block_restart_interval: options.data_block_restart_interval,
                 compression: options.compression,
+                value_has_ttl: options.value_has_ttl,
             },
         )) as Box<dyn FileBuilder>
     })

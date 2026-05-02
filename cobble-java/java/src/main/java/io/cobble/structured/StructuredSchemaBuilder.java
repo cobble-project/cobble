@@ -1,6 +1,10 @@
 package io.cobble.structured;
 
+import io.cobble.ColumnFamilyOptions;
 import io.cobble.NativeObject;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 
 /**
  * Builder for structured schema updates.
@@ -9,6 +13,7 @@ import io.cobble.NativeObject;
  * all accumulated changes.
  */
 public final class StructuredSchemaBuilder extends NativeObject {
+    private static final Gson GSON = new GsonBuilder().create();
 
     StructuredSchemaBuilder(long nativeHandle) {
         super(nativeHandle);
@@ -54,6 +59,21 @@ public final class StructuredSchemaBuilder extends NativeObject {
         return this;
     }
 
+    /**
+     * Applies column-family options for structured schemas.
+     *
+     * <p>For TTL behavior: if {@code options.valueHasTtl == false}, write-time TTL values are
+     * ignored for that column family.
+     */
+    public StructuredSchemaBuilder setColumnFamilyOptions(
+            String columnFamily, ColumnFamilyOptions options) {
+        if (options == null) {
+            throw new IllegalArgumentException("options must not be null");
+        }
+        nativeSetColumnFamilyOptions(nativeHandle, columnFamily, GSON.toJson(options));
+        return this;
+    }
+
     public Schema commit() {
         long handle = nativeHandle;
         nativeHandle = 0L;
@@ -77,6 +97,9 @@ public final class StructuredSchemaBuilder extends NativeObject {
 
     private static native void nativeDeleteColumn(
             long nativeHandle, String columnFamily, int columnIdx);
+
+    private static native void nativeSetColumnFamilyOptions(
+            long nativeHandle, String columnFamily, String optionsJson);
 
     private static native String nativeCommit(long nativeHandle);
 }

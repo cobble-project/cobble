@@ -2415,6 +2415,51 @@ pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeD
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeSetColumnFamilyOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    column_family: JString,
+    options_json: JString,
+) {
+    let Some(builder) = structured_builder_from_handle(&mut env, native_handle) else {
+        return;
+    };
+    let column_family = match decode_optional_java_string(&mut env, column_family) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let options_json = match decode_java_string(&mut env, options_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let options = match serde_json::from_str::<cobble::ColumnFamilyOptions>(&options_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(
+                &mut env,
+                format!("invalid column family options json: {}", err),
+            );
+            return;
+        }
+    };
+    match builder {
+        StructuredSchemaBuilderHandle::Db(b) => {
+            b.set_column_family_options(column_family.clone(), options.clone());
+        }
+        StructuredSchemaBuilderHandle::SingleDb(b) => {
+            b.set_column_family_options(column_family, options);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_structured_StructuredSchemaBuilder_nativeCommit(
     mut env: JNIEnv,
     _class: JClass,

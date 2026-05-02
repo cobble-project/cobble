@@ -202,6 +202,7 @@ impl RemoteSstOptions {
             partitioned_index: self.partitioned_index,
             data_block_restart_interval: self.data_block_restart_interval,
             compression: self.compression,
+            value_has_ttl: true,
         }
     }
 }
@@ -974,6 +975,7 @@ impl RemoteCompactionServer {
                 request.column_family_id,
                 merge_operators,
                 request.merge_operator_metadata.clone(),
+                crate::schema::ColumnFamilyOptions::default(),
             )],
             num_columns,
         ));

@@ -57,6 +57,13 @@ This page summarizes the public Rust API surface of the Cobble crates.
 - Named families are created through `SchemaBuilder`, not through config.
 - Distributed routing stays bucket-only, but for `Reader` and `ScanPlan`, the column family should be selected through options. That means only one family is read or scan per operation.
 
+### ColumnFamilyOptions and TTL Behavior
+
+- `SchemaBuilder::set_column_family_options` allows setting `ColumnFamilyOptions` for each family, which currently only includes `value_has_ttl`. Setting this to `false` allows the cobble optimize storage for values without TTL.
+- `value_has_ttl` controls whether write-time TTL input is effective in that family:
+  - `true`: write-time TTL may set expiration
+  - `false`: write-time TTL input is ignored
+
 ### Compaction Types
 
 | Type | Description |

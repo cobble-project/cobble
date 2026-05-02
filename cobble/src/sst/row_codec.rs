@@ -1049,6 +1049,7 @@ mod tests {
                     partitioned_index: false,
                     data_block_restart_interval: 16,
                     compression: crate::SstCompressionAlgorithm::None,
+                    value_has_ttl: true,
                 },
             );
 

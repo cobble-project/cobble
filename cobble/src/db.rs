@@ -480,9 +480,10 @@ impl Db {
             )));
         }
         let column = RefColumn::new(value_type, value.as_ref());
+        let value_has_ttl = schema.value_has_ttl_in_family(column_family_id);
         let expired_at = self
             .ttl_provider
-            .get_expiration_timestamp(options.ttl_seconds);
+            .get_expiration_timestamp(if value_has_ttl { options.ttl_seconds } else { None });
         let mut columns: Vec<Option<RefColumn<'_>>> = vec![None; num_columns];
         columns[column_idx] = Some(column);
         let record = RefValue::new_with_expired_at(columns, expired_at);
@@ -589,7 +590,13 @@ impl Db {
             let (column, expired_at) = match op {
                 WriteOp::Put(_, value, ttl_secs) => (
                     Column::new(ValueType::Put, value),
-                    self.ttl_provider.get_expiration_timestamp(ttl_secs),
+                    self.ttl_provider.get_expiration_timestamp(if schema
+                        .value_has_ttl_in_family(column_family_id)
+                    {
+                        ttl_secs
+                    } else {
+                        None
+                    }),
                 ),
                 WriteOp::Delete(_) => (
                     Column::new(ValueType::Delete, Bytes::new()),
@@ -597,7 +604,13 @@ impl Db {
                 ),
                 WriteOp::Merge(_, value, ttl_secs) => (
                     Column::new(ValueType::Merge, value),
-                    self.ttl_provider.get_expiration_timestamp(ttl_secs),
+                    self.ttl_provider.get_expiration_timestamp(if schema
+                        .value_has_ttl_in_family(column_family_id)
+                    {
+                        ttl_secs
+                    } else {
+                        None
+                    }),
                 ),
             };
             let mut columns = vec![None; num_columns];

@@ -1,5 +1,8 @@
 package io.cobble;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+
 /**
  * Builder for schema updates. Each operation is validated immediately by the native engine. Call
  * {@link #commit()} to atomically apply all changes.
@@ -7,6 +10,7 @@ package io.cobble;
  * <p>Obtain via {@link Db#updateSchema()} or {@link SingleDb#updateSchema()}.
  */
 public final class SchemaBuilder extends NativeObject {
+    private static final Gson GSON = new GsonBuilder().create();
 
     SchemaBuilder(long nativeHandle) {
         super(nativeHandle);
@@ -62,6 +66,20 @@ public final class SchemaBuilder extends NativeObject {
         return this;
     }
 
+    /**
+     * Applies column-family options on top of the existing schema family.
+     *
+     * <p>For TTL behavior: if {@code options.valueHasTtl == false}, write-time TTL values are
+     * ignored for that column family.
+     */
+    public SchemaBuilder setColumnFamilyOptions(String columnFamily, ColumnFamilyOptions options) {
+        if (options == null) {
+            throw new IllegalArgumentException("options must not be null");
+        }
+        nativeSetColumnFamilyOptions(nativeHandle, columnFamily, GSON.toJson(options));
+        return this;
+    }
+
     /** Commit all accumulated operations atomically and return the new schema. */
     public Schema commit() {
         long handle = nativeHandle;
@@ -90,6 +108,9 @@ public final class SchemaBuilder extends NativeObject {
 
     private static native void nativeDeleteColumn(
             long nativeHandle, String columnFamily, int columnIdx);
+
+    private static native void nativeSetColumnFamilyOptions(
+            long nativeHandle, String columnFamily, String optionsJson);
 
     private static native String nativeCommit(long nativeHandle);
 }

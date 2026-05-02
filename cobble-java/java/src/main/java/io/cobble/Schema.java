@@ -39,11 +39,24 @@ public final class Schema implements Serializable {
         @SerializedName("operator_ids")
         public List<String> operatorIds = new ArrayList<>();
 
+        @SerializedName("options")
+        public ColumnFamilyOptions options = ColumnFamilyOptions.defaults();
+
+        @SerializedName("value_has_ttl")
+        public boolean valueHasTtl = true;
+
         public String mergeOperatorId(int columnIdx) {
             if (columnIdx < 0 || columnIdx >= operatorIds.size()) {
                 return null;
             }
             return operatorIds.get(columnIdx);
+        }
+
+        public ColumnFamilyOptions effectiveOptions() {
+            if (options == null) {
+                return ColumnFamilyOptions.defaults().valueHasTtl(valueHasTtl);
+            }
+            return options;
         }
     }
 

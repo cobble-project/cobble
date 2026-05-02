@@ -154,7 +154,7 @@ pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
 pub use read_only_db::ReadOnlyDb;
 pub use reader::{GlobalSnapshotSummary, Reader, ReaderConfig};
 pub use scan::{ScanPlan, ScanSplit, ScanSplitScanner};
-pub use schema::{Schema, SchemaBuilder};
+pub use schema::{ColumnFamilyOptions, Schema, SchemaBuilder};
 pub use single_db::SingleDb;
 pub use sst::SstCompressionAlgorithm;
 pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProviderKind};

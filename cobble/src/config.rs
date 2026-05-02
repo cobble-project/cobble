@@ -1411,8 +1411,20 @@ mod tests {
 
     #[test]
     fn test_write_options_column_family_cache_invalidates_on_schema_change() {
-        let schema_v1 = Schema::new_for_column_family(1, 1, vec![], vec![]);
-        let schema_v2 = Schema::new_for_column_family(2, 2, vec![], vec![]);
+        let schema_v1 = Schema::new_for_column_family(
+            1,
+            1,
+            vec![],
+            vec![],
+            crate::schema::ColumnFamilyOptions::default(),
+        );
+        let schema_v2 = Schema::new_for_column_family(
+            2,
+            2,
+            vec![],
+            vec![],
+            crate::schema::ColumnFamilyOptions::default(),
+        );
         let options = WriteOptions::with_column_family("remote-cf-1");
 
         let resolved = options.resolve_column_family_id_cached(&schema_v1).unwrap();
@@ -1426,7 +1438,13 @@ mod tests {
 
     #[test]
     fn test_read_options_cache_invalidates_via_with_column_family() {
-        let schema = Schema::new_for_column_family(1, 1, vec![], vec![]);
+        let schema = Schema::new_for_column_family(
+            1,
+            1,
+            vec![],
+            vec![],
+            crate::schema::ColumnFamilyOptions::default(),
+        );
         let options = ReadOptions::for_column(0);
         assert_eq!(options.resolve_column_family_id_cached(&schema).unwrap(), 0);
 

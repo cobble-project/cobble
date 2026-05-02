@@ -15,11 +15,12 @@ pub(crate) enum WriterOptionsFactory {
 }
 
 impl WriterOptionsFactory {
-    pub(crate) fn build(&self, num_columns: usize) -> WriterOptions {
+    pub(crate) fn build(&self, num_columns: usize, value_has_ttl: bool) -> WriterOptions {
         match self {
             WriterOptionsFactory::Sst(options) => {
                 let mut options = options.clone();
                 options.num_columns = num_columns;
+                options.value_has_ttl = value_has_ttl;
                 WriterOptions::Sst(options)
             }
             WriterOptionsFactory::Parquet(options) => {

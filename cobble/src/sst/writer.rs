@@ -53,6 +53,8 @@ pub struct SSTWriterOptions {
     pub data_block_restart_interval: usize,
     /// Compression algorithm for data blocks.
     pub compression: SstCompressionAlgorithm,
+    /// Whether encoded values written to this SST include the 4-byte TTL header.
+    pub value_has_ttl: bool,
 }
 
 impl Default for SSTWriterOptions {
@@ -67,6 +69,7 @@ impl Default for SSTWriterOptions {
             partitioned_index: false,
             data_block_restart_interval: 16,
             compression: SstCompressionAlgorithm::None,
+            value_has_ttl: true,
         }
     }
 }
@@ -136,8 +139,20 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             self.current_block_first_key = Some(key.to_vec());
         }
 
+        let normalized_value = if self.options.value_has_ttl {
+            Bytes::copy_from_slice(value)
+        } else {
+            if value.len() < 4 {
+                return Err(Error::IoError(format!(
+                    "Invalid encoded value for no-ttl SST writer: expected >= 4 bytes, got {}",
+                    value.len()
+                )));
+            }
+            Bytes::copy_from_slice(&value[4..])
+        };
+
         // Add to current data block
-        self.data_block_builder.add(key, value);
+        self.data_block_builder.add(key, normalized_value.as_ref());
         if let Some(builder) = &mut self.bloom_filter_builder {
             builder.add(key);
         }
@@ -261,6 +276,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
                 filter_size,
                 filter_enabled,
                 false,
+                self.options.value_has_ttl,
             );
             let footer_encoded = footer.encode();
             let meta_bytes = footer_encoded.clone();
@@ -375,6 +391,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             filter_size,
             filter_enabled,
             self.options.partitioned_index,
+            self.options.value_has_ttl,
         );
         let footer_encoded = footer.encode();
         let meta_bytes = footer_encoded.clone();
@@ -532,6 +549,7 @@ mod tests {
                 partitioned_index: false,
                 data_block_restart_interval: 16,
                 compression: crate::SstCompressionAlgorithm::None,
+                value_has_ttl: true,
             },
         );
 

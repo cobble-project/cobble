@@ -332,6 +332,7 @@ impl CompactionExecutor {
         let num_columns = target_schema
             .num_columns_in_family(column_family_id)
             .unwrap_or(task.num_columns);
+        let value_has_ttl = target_schema.value_has_ttl_in_family(column_family_id);
         for run in &task.sorted_runs {
             for file in run.files() {
                 read_bytes = read_bytes.saturating_add(file.size as u64);
@@ -463,7 +464,7 @@ impl CompactionExecutor {
                 current_builder = Some(
                     if let Some(writer_options_factory) = task.writer_options_factory.as_ref() {
                         let factory = crate::compaction::make_data_file_builder_factory(
-                            writer_options_factory.build(num_columns),
+                            writer_options_factory.build(num_columns, value_has_ttl),
                         );
                         factory(Box::new(writer))
                     } else {
@@ -782,6 +783,7 @@ mod tests {
             partitioned_index: options.partitioned_index,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
+            value_has_ttl: true,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
@@ -918,6 +920,7 @@ mod tests {
             partitioned_index: options.partitioned_index,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
+            value_has_ttl: true,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
@@ -1086,6 +1089,7 @@ mod tests {
             partitioned_index: options.partitioned_index,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
+            value_has_ttl: true,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
@@ -1194,6 +1198,7 @@ mod tests {
             partitioned_index: options.partitioned_index,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
+            value_has_ttl: true,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
@@ -1282,6 +1287,7 @@ mod tests {
             partitioned_index: options.partitioned_index,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
+            value_has_ttl: true,
         });
         let factory = crate::compaction::make_data_file_builder_factory(writer_options.clone());
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
@@ -1416,6 +1422,7 @@ mod tests {
             partitioned_index: options.partitioned_index,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
+            value_has_ttl: true,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
@@ -1489,6 +1496,7 @@ mod tests {
             partitioned_index: options.partitioned_index,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
+            value_has_ttl: true,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));

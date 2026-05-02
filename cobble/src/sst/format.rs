@@ -14,6 +14,7 @@ pub(crate) const FOOTER_SIZE: usize = 44; // 8 + 8 + 8 + 8 + 4 + 4 + 4
 
 const FOOTER_FLAG_FILTER_PRESENT: u32 = 0x1;
 const FOOTER_FLAG_PARTITIONED_INDEX: u32 = 0x2;
+const FOOTER_FLAG_VALUE_WITHOUT_TTL: u32 = 0x4;
 
 #[derive(Debug, Clone)]
 pub struct Footer {
@@ -23,6 +24,7 @@ pub struct Footer {
     pub filter_block_size: u64,
     pub filter_present: bool,
     pub partitioned_index: bool,
+    pub value_has_ttl: bool,
 }
 
 impl Footer {
@@ -33,6 +35,7 @@ impl Footer {
         filter_block_size: u64,
         filter_present: bool,
         partitioned_index: bool,
+        value_has_ttl: bool,
     ) -> Self {
         Self {
             index_block_offset,
@@ -41,6 +44,7 @@ impl Footer {
             filter_block_size,
             filter_present,
             partitioned_index,
+            value_has_ttl,
         }
     }
 
@@ -56,6 +60,9 @@ impl Footer {
         }
         if self.partitioned_index {
             flags |= FOOTER_FLAG_PARTITIONED_INDEX;
+        }
+        if !self.value_has_ttl {
+            flags |= FOOTER_FLAG_VALUE_WITHOUT_TTL;
         }
         buf.put_u32_le(flags);
         buf.put_u32_le(SST_FOOTER_VERSION_CURRENT);
@@ -102,6 +109,7 @@ impl Footer {
             filter_block_size,
             filter_present: (flags & FOOTER_FLAG_FILTER_PRESENT) != 0,
             partitioned_index: (flags & FOOTER_FLAG_PARTITIONED_INDEX) != 0,
+            value_has_ttl: (flags & FOOTER_FLAG_VALUE_WITHOUT_TTL) == 0,
         })
     }
 }
@@ -669,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_footer_encode_decode() {
-        let footer = Footer::new(100, 200, 300, 400, true, false);
+        let footer = Footer::new(100, 200, 300, 400, true, false, true);
         let encoded = footer.encode();
         assert_eq!(encoded.len(), FOOTER_SIZE);
 
@@ -680,11 +688,12 @@ mod tests {
         assert_eq!(decoded.filter_block_size, 400);
         assert!(decoded.filter_present);
         assert!(!decoded.partitioned_index);
+        assert!(decoded.value_has_ttl);
     }
 
     #[test]
     fn test_footer_contains_version() {
-        let footer = Footer::new(10, 20, 30, 40, true, true);
+        let footer = Footer::new(10, 20, 30, 40, true, true, false);
         let encoded = footer.encode();
         let decoded = Footer::decode(&encoded).unwrap();
         assert_eq!(decoded.index_block_offset, 10);
@@ -693,6 +702,7 @@ mod tests {
         assert_eq!(decoded.filter_block_size, 40);
         assert!(decoded.filter_present);
         assert!(decoded.partitioned_index);
+        assert!(!decoded.value_has_ttl);
     }
 
     #[test]
@@ -828,15 +838,21 @@ mod tests {
         let decoded = Block::decode(builder.build().encode()).unwrap();
 
         assert_eq!(
-            decoded.find_equal_or_greater_idx(&Bytes::from("abc")).unwrap(),
+            decoded
+                .find_equal_or_greater_idx(&Bytes::from("abc"))
+                .unwrap(),
             0
         );
         assert_eq!(
-            decoded.find_equal_or_greater_idx(&Bytes::from("abcd")).unwrap(),
+            decoded
+                .find_equal_or_greater_idx(&Bytes::from("abcd"))
+                .unwrap(),
             1
         );
         assert_eq!(
-            decoded.find_equal_or_greater_idx(&Bytes::from("abcxz")).unwrap(),
+            decoded
+                .find_equal_or_greater_idx(&Bytes::from("abcxz"))
+                .unwrap(),
             3
         );
     }

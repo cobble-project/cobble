@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::test_utils::read_metadata_payload_from_path_for_test;
 use cobble::{
-    CompactionPolicyKind, Config, Db, MemtableType, MetricValue, ReadOptions, Reader, ReaderConfig,
-    ScanOptions, SingleDb, TimeProviderKind, U64CounterMergeOperator, VolumeDescriptor,
+    ColumnFamilyOptions, CompactionPolicyKind, Config, Db, MemtableType, MergeOperator,
+    MetricValue, ReadOptions, Reader, ReaderConfig, ScanOptions, SingleDb, TimeProvider,
+    TimeProviderKind, U64CounterMergeOperator, ValueType, VolumeDescriptor,
     VolumeUsageKind, WriteBatch,
 };
 use serde_json::Value as JsonValue;
@@ -44,6 +45,30 @@ fn wait_for_missing(path: &str) {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(!Path::new(path).exists(), "path still exists: {}", path);
+}
+
+fn decode_u64_counter(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(bytes.try_into().expect("u64 counter bytes"))
+}
+
+struct TimeAwareMergeOperator;
+
+impl MergeOperator for TimeAwareMergeOperator {
+    fn merge(
+        &self,
+        existing_value: bytes::Bytes,
+        value: bytes::Bytes,
+        time_provider: Option<&dyn TimeProvider>,
+    ) -> cobble::Result<(bytes::Bytes, Option<ValueType>)> {
+        let base = if existing_value.is_empty() {
+            0
+        } else {
+            decode_u64_counter(existing_value.as_ref())
+        };
+        let delta = decode_u64_counter(value.as_ref());
+        let now = time_provider.map_or(0, TimeProvider::now_seconds) as u64;
+        Ok(((base + delta + now).to_le_bytes().to_vec().into(), None))
+    }
 }
 
 fn schema_file_path(root: &str, db_id: &str, schema_id: u64) -> String {
@@ -770,6 +795,243 @@ fn test_db_ttl_default_ttl_with_manual_time() {
     // Move to expiry boundary
     db.set_time(5_005);
     assert!(db.get(0, b"foo").unwrap().is_none());
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_ttl_is_ignored_when_column_family_ttl_disabled() {
+    let root = "/tmp/db_it_ttl_cf_disabled";
+    cleanup_test_root(root);
+
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_mib(4),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        l0_file_limit: 2,
+        write_stall_limit: None,
+        l1_base_bytes: Size::from_mib(16),
+        level_size_multiplier: 2,
+        max_level: 4,
+        compaction_policy: CompactionPolicyKind::RoundRobin,
+        block_cache_size: Size::from_const(0),
+        base_file_size: Size::from_mib(4),
+        ttl_enabled: true,
+        default_ttl_seconds: None,
+        time_provider: TimeProviderKind::Manual,
+        log_path: None,
+        log_console: false,
+        log_level: log::LevelFilter::Info,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config);
+
+    let mut schema = db.update_schema();
+    schema
+        .set_column_family_options(None, ColumnFamilyOptions { value_has_ttl: false })
+        .unwrap();
+    schema.commit();
+
+    let options = cobble::WriteOptions::with_ttl(10);
+    db.put_with_options(0, b"key", 0, b"value", &options).unwrap();
+
+    db.set_time(1_011);
+    let v = db.get(0, b"key").unwrap().unwrap();
+    assert_eq!(v[0].as_ref().unwrap().as_ref(), b"value");
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_merge_keeps_old_ttl_behavior_when_family_ttl_disabled() {
+    let root = "/tmp/db_it_ttl_merge_disable_family";
+    cleanup_test_root(root);
+
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_mib(4),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        ttl_enabled: true,
+        default_ttl_seconds: None,
+        time_provider: TimeProviderKind::Manual,
+        block_cache_size: Size::from_const(0),
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config);
+    db.set_time(1_000);
+
+    let mut schema = db.update_schema();
+    schema
+        .set_column_operator(None, 0, Arc::new(U64CounterMergeOperator))
+        .unwrap();
+    schema.commit();
+
+    db.put_with_options(
+        0,
+        b"counter",
+        0,
+        10u64.to_le_bytes(),
+        &cobble::WriteOptions::with_ttl(5),
+    )
+        .unwrap();
+
+    let mut schema = db.update_schema();
+    schema
+        .set_column_family_options(None, ColumnFamilyOptions { value_has_ttl: false })
+        .unwrap();
+    schema.commit();
+
+    db.merge_with_options(
+        0,
+        b"counter",
+        0,
+        4u64.to_le_bytes(),
+        &cobble::WriteOptions::with_ttl(100),
+    )
+    .unwrap();
+    db.snapshot().unwrap();
+
+    let before_expire = db.get(0, b"counter").unwrap().expect("value before expiry");
+    assert_eq!(
+        decode_u64_counter(before_expire[0].as_ref().unwrap().as_ref()),
+        14
+    );
+
+    db.set_time(1_006);
+    let after_old_expire = db
+        .get(0, b"counter")
+        .unwrap()
+        .expect("new merge value should still exist");
+    assert_eq!(
+        decode_u64_counter(after_old_expire[0].as_ref().unwrap().as_ref()),
+        4
+    );
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_merge_respects_ttl_after_family_ttl_reenabled() {
+    let root = "/tmp/db_it_ttl_merge_reenable_family";
+    cleanup_test_root(root);
+
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_mib(4),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        ttl_enabled: true,
+        default_ttl_seconds: None,
+        time_provider: TimeProviderKind::Manual,
+        block_cache_size: Size::from_const(0),
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config);
+    db.set_time(2_000);
+
+    let mut schema = db.update_schema();
+    schema
+        .set_column_operator(None, 0, Arc::new(U64CounterMergeOperator))
+        .unwrap();
+    schema
+        .set_column_family_options(None, ColumnFamilyOptions { value_has_ttl: false })
+        .unwrap();
+    schema.commit();
+
+    db.put_with_options(
+        0,
+        b"counter",
+        0,
+        10u64.to_le_bytes(),
+        &cobble::WriteOptions::with_ttl(5),
+    )
+        .unwrap();
+
+    let mut schema = db.update_schema();
+    schema
+        .set_column_family_options(None, ColumnFamilyOptions { value_has_ttl: true })
+        .unwrap();
+    schema.commit();
+
+    db.merge_with_options(
+        0,
+        b"counter",
+        0,
+        4u64.to_le_bytes(),
+        &cobble::WriteOptions::with_ttl(3),
+    )
+    .unwrap();
+    db.snapshot().unwrap();
+
+    let before_new_expire = db.get(0, b"counter").unwrap().expect("value before expiry");
+    assert_eq!(
+        decode_u64_counter(before_new_expire[0].as_ref().unwrap().as_ref()),
+        14
+    );
+
+    db.set_time(2_004);
+    let after_new_expire = db
+        .get(0, b"counter")
+        .unwrap()
+        .expect("old value without ttl should remain");
+    assert_eq!(
+        decode_u64_counter(after_new_expire[0].as_ref().unwrap().as_ref()),
+        10
+    );
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_merge_operator_still_receives_time_provider_when_family_ttl_disabled() {
+    let root = "/tmp/db_it_ttl_merge_time_provider";
+    cleanup_test_root(root);
+
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_mib(4),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        ttl_enabled: true,
+        default_ttl_seconds: None,
+        time_provider: TimeProviderKind::Manual,
+        block_cache_size: Size::from_const(0),
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config);
+    db.set_time(7);
+
+    let mut schema = db.update_schema();
+    schema
+        .set_column_operator(None, 0, Arc::new(TimeAwareMergeOperator))
+        .unwrap();
+    schema
+        .set_column_family_options(None, ColumnFamilyOptions { value_has_ttl: false })
+        .unwrap();
+    schema.commit();
+
+    db.put(0, b"counter", 0, 10u64.to_le_bytes()).unwrap();
+    db.merge_with_options(
+        0,
+        b"counter",
+        0,
+        5u64.to_le_bytes(),
+        &cobble::WriteOptions::with_ttl(30),
+    )
+    .unwrap();
+
+    let value = db.get(0, b"counter").unwrap().expect("value present");
+    assert_eq!(decode_u64_counter(value[0].as_ref().unwrap().as_ref()), 22);
 
     cleanup_test_root(root);
 }

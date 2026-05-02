@@ -23,12 +23,35 @@ pub(crate) const DEFAULT_COLUMN_FAMILY_NAME: &str = "default";
 pub(crate) const MAX_COLUMN_FAMILY_COUNT: usize = 230;
 const SCHEMA_FILE_FORMAT_VERSION: u32 = 1;
 
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+/// Column-family scoped schema options.
+///
+/// These options are persisted in schema metadata and applied to write/read behavior.
+/// For example, when `value_has_ttl` is `false`, write-side TTL input is ignored for
+/// that column family.
+pub struct ColumnFamilyOptions {
+    /// Whether values in this column family carry a value-level TTL timestamp.
+    ///
+    /// - `true`: write options TTL may set `expired_at`.
+    /// - `false`: write options TTL is ignored and values are written without expiration.
+    pub value_has_ttl: bool,
+}
+
+impl Default for ColumnFamilyOptions {
+    fn default() -> Self {
+        Self {
+            value_has_ttl: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ColumnFamily {
     id: u8,
     name: String,
     operators: Vec<Arc<dyn MergeOperator>>,
     column_metadata: Vec<Option<JsonValue>>,
+    options: ColumnFamilyOptions,
     evolution: BuiltinSchemaEvolution,
     projection: Option<Vec<usize>>,
 }
@@ -39,6 +62,7 @@ impl ColumnFamily {
         name: String,
         mut operators: Vec<Arc<dyn MergeOperator>>,
         mut column_metadata: Vec<Option<JsonValue>>,
+        options: ColumnFamilyOptions,
     ) -> Self {
         if column_metadata.len() < operators.len() {
             column_metadata.resize_with(operators.len(), || None);
@@ -53,6 +77,7 @@ impl ColumnFamily {
             name,
             operators,
             column_metadata,
+            options,
             evolution: BuiltinSchemaEvolution::Noop,
             projection: None,
         }
@@ -89,6 +114,7 @@ fn default_column_families(num_columns: usize) -> Vec<ColumnFamily> {
         DEFAULT_COLUMN_FAMILY_NAME.to_string(),
         vec![default_merge_operator(); num_columns],
         vec![None; num_columns],
+        ColumnFamilyOptions::default(),
     )]
 }
 
@@ -105,6 +131,7 @@ struct ColumnFamilyFile {
     name: String,
     merge_operator_ids: Vec<String>,
     column_metadata: Vec<Option<JsonValue>>,
+    options: ColumnFamilyOptions,
     evolution_id: Option<String>,
     evolution_indexes: Option<Vec<usize>>,
     evolution_default_values: Option<Vec<Option<Vec<u8>>>>,
@@ -307,6 +334,7 @@ impl Schema {
                 DEFAULT_COLUMN_FAMILY_NAME.to_string(),
                 operators,
                 vec![None; num_columns],
+                ColumnFamilyOptions::default(),
             )],
         )
     }
@@ -316,6 +344,7 @@ impl Schema {
         column_family_id: u8,
         operators: Vec<Arc<dyn MergeOperator>>,
         column_metadata: Vec<Option<JsonValue>>,
+        options: ColumnFamilyOptions,
     ) -> Self {
         let family_name = if column_family_id == DEFAULT_COLUMN_FAMILY_ID {
             DEFAULT_COLUMN_FAMILY_NAME.to_string()
@@ -329,6 +358,7 @@ impl Schema {
                 family_name,
                 operators,
                 column_metadata,
+                options,
             )],
         )
     }
@@ -348,6 +378,7 @@ impl Schema {
                     DEFAULT_COLUMN_FAMILY_NAME.to_string(),
                     Vec::new(),
                     Vec::new(),
+                    ColumnFamilyOptions::default(),
                 ),
             );
         }
@@ -395,6 +426,18 @@ impl Schema {
     pub(crate) fn num_columns_in_family(&self, column_family_id: u8) -> Option<usize> {
         self.column_family_by_id(column_family_id)
             .map(ColumnFamily::visible_num_columns)
+    }
+
+    pub fn value_has_ttl_in_family(&self, column_family_id: u8) -> bool {
+        self.column_family_by_id(column_family_id)
+            .map(|family| family.options.value_has_ttl)
+            .unwrap_or(true)
+    }
+
+    pub fn column_family_options_in_family(&self, column_family_id: u8) -> ColumnFamilyOptions {
+        self.column_family_by_id(column_family_id)
+            .map(|family| family.options.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn column_family_id_list(&self) -> Vec<u8> {
@@ -927,6 +970,7 @@ pub(crate) fn persist_schema(file_manager: &FileManager, schema: &Schema) -> Res
                 name: family.name.clone(),
                 merge_operator_ids: family.operator_ids(),
                 column_metadata: family.column_metadata.clone(),
+                options: family.options.clone(),
                 evolution_id,
                 evolution_indexes,
                 evolution_default_values,
@@ -1047,6 +1091,7 @@ fn load_column_families(
             family.name.clone(),
             operators,
             family.column_metadata.clone(),
+            family.options.clone(),
         );
         column_family.evolution = decode_evolution(
             family.evolution_id.as_deref(),
@@ -1231,6 +1276,7 @@ impl SchemaBuilder {
             normalized.clone(),
             Vec::new(),
             Vec::new(),
+            ColumnFamilyOptions::default(),
         ));
         self.column_family_name_index.insert(normalized, next_id);
         Ok(next_id)
@@ -1239,6 +1285,28 @@ impl SchemaBuilder {
     pub fn ensure_column_family_exists(&mut self, column_family: impl Into<String>) -> Result<u8> {
         let column_family = column_family.into();
         self.ensure_column_family(&column_family)
+    }
+
+    pub fn set_column_family_value_has_ttl(
+        &mut self,
+        column_family: Option<String>,
+        value_has_ttl: bool,
+    ) -> Result<()> {
+        self.set_column_family_options(column_family, ColumnFamilyOptions { value_has_ttl })
+    }
+
+    /// Set all persisted options for one column family.
+    ///
+    /// When `options.value_has_ttl` is `false`, TTL supplied through write options is
+    /// ignored for that family.
+    pub fn set_column_family_options(
+        &mut self,
+        column_family: Option<String>,
+        options: ColumnFamilyOptions,
+    ) -> Result<()> {
+        let family_position = self.resolve_existing_family_position(column_family)?;
+        self.column_families[family_position].options = options;
+        Ok(())
     }
 
     #[inline]
@@ -1612,5 +1680,26 @@ mod tests {
             schema.operator_ids_in_family("metrics").unwrap(),
             vec![BracketMergeOperator.id().to_string()]
         );
+    }
+
+    #[test]
+    fn test_schema_builder_column_family_value_ttl_option() {
+        let manager = Arc::new(SchemaManager::new(1));
+        let mut builder = manager.builder();
+        builder
+            .add_column(0, None, None, Some("metrics".to_string()))
+            .unwrap();
+        builder
+            .set_column_family_options(
+                Some("metrics".to_string()),
+                ColumnFamilyOptions {
+                    value_has_ttl: false,
+                },
+            )
+            .unwrap();
+        let schema = builder.commit();
+        let metrics_cf = schema.resolve_column_family_id(Some("metrics")).unwrap();
+        assert!(!schema.value_has_ttl_in_family(metrics_cf));
+        assert!(schema.value_has_ttl_in_family(DEFAULT_COLUMN_FAMILY_ID));
     }
 }
