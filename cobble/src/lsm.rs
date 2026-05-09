@@ -1,7 +1,7 @@
 use crate::block_cache::BlockCache;
 use crate::compaction::{
     CompactionConfig, CompactionPlan, CompactionPolicy, CompactionWorker, MinOverlapPolicy,
-    RoundRobinPolicy, build_runs_for_plan, level_threshold,
+    RoundRobinPolicy, ScorePriorityPolicy, build_runs_for_plan, level_threshold,
 };
 use crate::data_file::{DataFile, DataFileType, intersect_bucket_ranges};
 use crate::db_status::DbLifecycle;
@@ -447,6 +447,9 @@ impl LSMTree {
         match kind {
             crate::config::CompactionPolicyKind::RoundRobin => Box::new(RoundRobinPolicy::new()),
             crate::config::CompactionPolicyKind::MinOverlap => Box::new(MinOverlapPolicy::new()),
+            crate::config::CompactionPolicyKind::ScorePriority => {
+                Box::new(ScorePriorityPolicy::new())
+            }
         }
     }
 

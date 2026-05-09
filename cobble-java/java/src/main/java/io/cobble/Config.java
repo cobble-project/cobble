@@ -244,7 +244,9 @@ public final class Config {
         @SerializedName("round_robin")
         ROUND_ROBIN,
         @SerializedName("min_overlap")
-        MIN_OVERLAP
+        MIN_OVERLAP,
+        @SerializedName("score_priority")
+        SCORE_PRIORITY
     }
 
     public enum PrimaryVolumeOffloadPolicyKind {

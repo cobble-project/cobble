@@ -101,13 +101,20 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `compaction_policy` | `CompactionPolicyKind` | `RoundRobin` | Policy: `RoundRobin` or `MinOverlap` |
+| `compaction_policy` | `CompactionPolicyKind` | `RoundRobin` | Policy: `RoundRobin`, `MinOverlap`, or `ScorePriority` |
 | `compaction_read_ahead_enabled` | `bool` | `true` | Buffered reads during compaction |
 | `compaction_remote_addr` | `Option<String>` | `None` | Remote compaction server address (host:port) |
 | `compaction_threads` | `usize` | 4 | Compaction thread pool size |
 | `compaction_remote_timeout_ms` | `u64` | 300,000 | Remote compaction timeout (milliseconds) |
 | `compaction_server_max_concurrent` | `usize` | 4 | Max concurrent tasks on remote server |
 | `compaction_server_max_queued` | `usize` | 64 | Max queued tasks before rejecting |
+
+`compaction_policy` accepts:
+
+- `round_robin` - rotate through files in oversized non-`L0` levels
+- `min_overlap` - choose the next file with the smallest overlap in the next level
+- `score_priority` - prefer the highest-scored level first, then pick files in a RocksDB-style min-overlap order with a per-level cursor and RocksDB-style trivial-move gating
+
 
 ### Value Separation
 

@@ -186,6 +186,192 @@ impl MinOverlapPolicy {
     }
 }
 
+/// A score-priority policy aligned with RocksDB's leveled compaction scoring.
+///
+/// It computes an L0 score from both file count and aggregate bytes, computes
+/// L1+ scores as level_bytes / level_target, sorts levels by descending score,
+/// and compacts the highest-priority level whose score is >= 1.0.
+pub(crate) struct ScorePriorityPolicy {
+    next_indices: Vec<usize>,
+}
+
+impl ScorePriorityPolicy {
+    pub(crate) fn new() -> Self {
+        Self {
+            next_indices: Vec::new(),
+        }
+    }
+
+    fn level_total_size(level: &Level) -> usize {
+        level.files.iter().map(|file| file.size).sum()
+    }
+
+    fn score_for_level(level: &Level, config: &CompactionConfig) -> f64 {
+        if level.ordinal >= config.max_level {
+            return 0.0;
+        }
+        if level.ordinal == 0 {
+            let file_score = if config.l0_file_limit == 0 {
+                0.0
+            } else {
+                level.files.len() as f64 / config.l0_file_limit as f64
+            };
+            let size_score = if config.l1_base_bytes == 0 {
+                0.0
+            } else {
+                Self::level_total_size(level) as f64 / config.l1_base_bytes as f64
+            };
+            file_score.max(size_score)
+        } else {
+            let threshold = level_threshold(
+                config.l1_base_bytes,
+                config.level_size_multiplier,
+                level.ordinal,
+            );
+            if threshold == 0 {
+                0.0
+            } else {
+                Self::level_total_size(level) as f64 / threshold as f64
+            }
+        }
+    }
+
+    fn scored_levels(levels: &[Level], config: &CompactionConfig) -> Vec<(u8, f64)> {
+        let mut scored: Vec<(u8, f64)> = levels
+            .iter()
+            .filter(|level| level.ordinal < config.max_level)
+            .map(|level| (level.ordinal, Self::score_for_level(level, config)))
+            .collect();
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        scored
+    }
+
+    fn max_trivial_move_bytes(config: &CompactionConfig) -> usize {
+        config.target_file_size.saturating_mul(25)
+    }
+
+    fn grandparent_overlap_size(levels: &[Level], selected_level: u8, file: &DataFile) -> usize {
+        levels
+            .iter()
+            .find(|level| level.ordinal == selected_level + 2)
+            .map(|level| overlap_size(file, level.files.as_slice()))
+            .unwrap_or(0)
+    }
+
+    fn rocksdb_trivial_move(
+        levels: &[Level],
+        selected_level: u8,
+        file: &DataFile,
+        config: &CompactionConfig,
+    ) -> bool {
+        let output_files: &[Arc<DataFile>] = levels
+            .iter()
+            .find(|level| level.ordinal == selected_level + 1)
+            .map(|level| level.files.as_slice())
+            .unwrap_or(&[]);
+        output_files.iter().all(|other| !file_overlap(file, other))
+            && file.size.saturating_add(Self::grandparent_overlap_size(
+                levels,
+                selected_level,
+                file,
+            )) <= Self::max_trivial_move_bytes(config)
+    }
+
+    fn next_index(&mut self, level: u8, len: usize) -> usize {
+        if self.next_indices.len() <= level as usize {
+            self.next_indices.resize(level as usize + 1, 0);
+        }
+        if len == 0 {
+            return 0;
+        }
+        self.next_indices[level as usize] % len
+    }
+
+    fn advance_index(&mut self, level: u8, next: usize) {
+        if self.next_indices.len() <= level as usize {
+            self.next_indices.resize(level as usize + 1, 0);
+        }
+        self.next_indices[level as usize] = next;
+    }
+
+    fn pick_level_plan(
+        &mut self,
+        levels: &[Level],
+        selected_level: u8,
+        config: &CompactionConfig,
+    ) -> Option<CompactionPlan> {
+        let input_level = levels
+            .iter()
+            .find(|level| level.ordinal == selected_level)?;
+        let output_files: &[Arc<DataFile>] = levels
+            .iter()
+            .find(|level| level.ordinal == selected_level + 1)
+            .map(|level| level.files.as_slice())
+            .unwrap_or(&[]);
+        let mut ordered: Vec<&Arc<DataFile>> = input_level.files.iter().collect();
+        ordered.sort_by(|left, right| {
+            let left_overlap = overlap_size(left, output_files) as u128;
+            let right_overlap = overlap_size(right, output_files) as u128;
+            let left_size = left.size.max(1) as u128;
+            let right_size = right.size.max(1) as u128;
+            match (left_overlap * right_size).cmp(&(right_overlap * left_size)) {
+                Ordering::Equal => match left_overlap.cmp(&right_overlap) {
+                    Ordering::Equal => left.file_id.cmp(&right.file_id),
+                    ord => ord,
+                },
+                ord => ord,
+            }
+        });
+        let idx = self.next_index(selected_level, ordered.len());
+        let file = *ordered.get(idx)?;
+        self.advance_index(selected_level, idx + 1);
+        Some(CompactionPlan {
+            input_level: selected_level,
+            output_level: selected_level + 1,
+            base_file_id: file.file_id,
+            trivial_move: Self::rocksdb_trivial_move(levels, selected_level, file, config),
+        })
+    }
+}
+
+impl CompactionPolicy for ScorePriorityPolicy {
+    fn pick(&mut self, levels: &[Level], config: CompactionConfig) -> Option<CompactionPlan> {
+        if levels.is_empty() {
+            return None;
+        }
+        for (level_ordinal, score) in Self::scored_levels(levels, &config) {
+            if score < 1.0 {
+                break;
+            }
+            if level_ordinal == 0 {
+                let level0 = levels.iter().find(|level| level.ordinal == 0)?;
+                let base_file_id = level0
+                    .files
+                    .iter()
+                    .map(|file| file.file_id)
+                    .min()
+                    .unwrap_or(0);
+                return Some(CompactionPlan {
+                    input_level: 0,
+                    output_level: 1,
+                    base_file_id,
+                    trivial_move: false,
+                });
+            }
+            if let Some(plan) = self.pick_level_plan(levels, level_ordinal, &config) {
+                return Some(plan);
+            }
+        }
+        None
+    }
+}
+
 impl CompactionPolicy for MinOverlapPolicy {
     fn pick(&mut self, levels: &[Level], config: CompactionConfig) -> Option<CompactionPlan> {
         if levels.is_empty() {
@@ -798,5 +984,295 @@ mod tests {
             .pick(&[level0, level1, level2], config)
             .expect("plan");
         assert_eq!(plan.input_level, 2);
+    }
+
+    #[test]
+    fn test_score_priority_prefers_l0_when_l0_score_is_higher() {
+        let config = CompactionConfig {
+            l0_file_limit: 2,
+            l1_base_bytes: 10,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: vec![
+                make_file(1, b"a", b"b", 1),
+                make_file(2, b"c", b"d", 1),
+                make_file(3, b"e", b"f", 1),
+                make_file(4, b"g", b"h", 1),
+                make_file(5, b"i", b"j", 1),
+            ],
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![make_file(6, b"a", b"z", 15)],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: vec![make_file(7, b"a", b"z", 150)],
+        };
+        let level3 = Level {
+            ordinal: 3,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy
+            .pick(&[level0, level1, level2, level3], config)
+            .expect("plan");
+        assert_eq!(plan.input_level, 0);
+        assert_eq!(plan.base_file_id, 1);
+    }
+
+    #[test]
+    fn test_score_priority_prefers_highest_scored_non_l0_level() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 10,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: vec![
+                make_file(1, b"a", b"b", 1),
+                make_file(2, b"c", b"d", 1),
+                make_file(3, b"e", b"f", 1),
+                make_file(4, b"g", b"h", 1),
+            ],
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![make_file(5, b"a", b"m", 25)],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: vec![make_file(6, b"a", b"m", 90)],
+        };
+        let level3 = Level {
+            ordinal: 3,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy
+            .pick(&[level0, level1, level2, level3], config)
+            .expect("plan");
+        assert_eq!(plan.input_level, 1);
+        assert_eq!(plan.base_file_id, 5);
+    }
+
+    #[test]
+    fn test_score_priority_uses_l0_size_guard() {
+        let config = CompactionConfig {
+            l0_file_limit: 10,
+            l1_base_bytes: 10,
+            level_size_multiplier: 10,
+            max_level: 3,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: vec![make_file(1, b"a", b"b", 8), make_file(2, b"c", b"d", 8)],
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy
+            .pick(&[level0, level1, level2], config)
+            .expect("plan");
+        assert_eq!(plan.input_level, 0);
+    }
+
+    #[test]
+    fn test_score_priority_prefers_min_overlap_ratio_within_level() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 10,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![make_file(1, b"a", b"f", 60), make_file(2, b"g", b"h", 20)],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: vec![make_file(3, b"a", b"f", 50), make_file(4, b"g", b"h", 1)],
+        };
+        let level3 = Level {
+            ordinal: 3,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy
+            .pick(&[level0, level1, level2, level3], config)
+            .expect("plan");
+        assert_eq!(plan.input_level, 1);
+        assert_eq!(plan.base_file_id, 2);
+    }
+
+    #[test]
+    fn test_score_priority_trivial_move_uses_single_file_when_growing_new_level() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 100,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![
+                make_file(1, b"a", b"b", 40),
+                make_file(2, b"c", b"d", 40),
+                make_file(3, b"e", b"f", 40),
+                make_file(4, b"g", b"h", 40),
+                make_file(5, b"i", b"j", 40),
+            ],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let level3 = Level {
+            ordinal: 3,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy
+            .pick(&[level0, level1, level2, level3], config)
+            .expect("plan");
+        assert!(plan.trivial_move);
+        assert_eq!(plan.input_level, 1);
+        assert_eq!(plan.output_level, 2);
+        assert_eq!(plan.base_file_id, 1);
+    }
+
+    #[test]
+    fn test_score_priority_uses_cursor_to_advance_overlap_sorted_files() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 100,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![
+                make_file(1, b"a", b"b", 40),
+                make_file(2, b"c", b"d", 40),
+                make_file(3, b"e", b"f", 40),
+                make_file(4, b"g", b"h", 40),
+                make_file(5, b"i", b"j", 40),
+            ],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: vec![make_file(6, b"e", b"f", 10)],
+        };
+        let level3 = Level {
+            ordinal: 3,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let first = policy
+            .pick(
+                &[
+                    level0.clone(),
+                    level1.clone(),
+                    level2.clone(),
+                    level3.clone(),
+                ],
+                config,
+            )
+            .expect("plan");
+        let second = policy
+            .pick(&[level0, level1, level2, level3], config)
+            .expect("plan");
+        assert!(first.trivial_move);
+        assert_eq!(first.base_file_id, 1);
+        assert_eq!(second.base_file_id, 2);
+    }
+
+    #[test]
+    fn test_score_priority_trivial_move_respects_grandparent_budget() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 50,
+            level_size_multiplier: 10,
+            max_level: 4,
+            target_file_size: 10,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![make_file(1, b"a", b"b", 100)],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let level3 = Level {
+            ordinal: 3,
+            tiered: false,
+            files: vec![make_file(2, b"a", b"b", 200)],
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy
+            .pick(&[level0, level1, level2, level3], config)
+            .expect("plan");
+        assert!(!plan.trivial_move);
     }
 }

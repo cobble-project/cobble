@@ -91,6 +91,7 @@ where
 pub enum CompactionPolicyKind {
     RoundRobin,
     MinOverlap,
+    ScorePriority,
 }
 
 /// Primary-volume offload policy selection.
@@ -1225,7 +1226,7 @@ mod tests {
             l1_base_bytes: Size::from_kib(8),
             level_size_multiplier: 7,
             max_level: 4,
-            compaction_policy: super::CompactionPolicyKind::MinOverlap,
+            compaction_policy: super::CompactionPolicyKind::ScorePriority,
             block_cache_size: Size::from_const(256),
             block_cache_hybrid_enabled: true,
             block_cache_hybrid_disk_size: Some(Size::from_kib(1)),
@@ -1299,7 +1300,7 @@ mod tests {
         assert_eq!(decoded.write_stall_limit, Some(12));
         assert_eq!(
             decoded.compaction_policy,
-            super::CompactionPolicyKind::MinOverlap
+            super::CompactionPolicyKind::ScorePriority
         );
         assert!(decoded.sst_partitioned_index);
         assert_eq!(decoded.time_provider, crate::time::TimeProviderKind::Manual);

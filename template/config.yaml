@@ -57,7 +57,7 @@ level_size_multiplier: 10
 max_level: 6
 
 # Compaction strategy and remote-compaction network settings.
-compaction_policy: round_robin           # round_robin | min_overlap
+compaction_policy: round_robin           # round_robin | min_overlap | score_priority
 compaction_read_ahead_enabled: true
 compaction_remote_addr: null             # "host:port" to enable remote compaction
 compaction_threads: 4
