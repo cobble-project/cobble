@@ -5,8 +5,8 @@ use cobble::test_utils::read_metadata_payload_from_path_for_test;
 use cobble::{
     ColumnFamilyOptions, CompactionPolicyKind, Config, Db, MemtableType, MergeOperator,
     MetricValue, ReadOptions, Reader, ReaderConfig, ScanOptions, SingleDb, TimeProvider,
-    TimeProviderKind, U64CounterMergeOperator, ValueType, VolumeDescriptor,
-    VolumeUsageKind, WriteBatch,
+    TimeProviderKind, U64CounterMergeOperator, ValueType, VolumeDescriptor, VolumeUsageKind,
+    WriteBatch,
 };
 use serde_json::Value as JsonValue;
 use size::Size;
@@ -831,12 +831,18 @@ fn test_db_ttl_is_ignored_when_column_family_ttl_disabled() {
 
     let mut schema = db.update_schema();
     schema
-        .set_column_family_options(None, ColumnFamilyOptions { value_has_ttl: false })
+        .set_column_family_options(
+            None,
+            ColumnFamilyOptions {
+                value_has_ttl: false,
+            },
+        )
         .unwrap();
     schema.commit();
 
     let options = cobble::WriteOptions::with_ttl(10);
-    db.put_with_options(0, b"key", 0, b"value", &options).unwrap();
+    db.put_with_options(0, b"key", 0, b"value", &options)
+        .unwrap();
 
     db.set_time(1_011);
     let v = db.get(0, b"key").unwrap().unwrap();
@@ -879,11 +885,16 @@ fn test_db_merge_keeps_old_ttl_behavior_when_family_ttl_disabled() {
         10u64.to_le_bytes(),
         &cobble::WriteOptions::with_ttl(5),
     )
-        .unwrap();
+    .unwrap();
 
     let mut schema = db.update_schema();
     schema
-        .set_column_family_options(None, ColumnFamilyOptions { value_has_ttl: false })
+        .set_column_family_options(
+            None,
+            ColumnFamilyOptions {
+                value_has_ttl: false,
+            },
+        )
         .unwrap();
     schema.commit();
 
@@ -942,7 +953,12 @@ fn test_db_merge_respects_ttl_after_family_ttl_reenabled() {
         .set_column_operator(None, 0, Arc::new(U64CounterMergeOperator))
         .unwrap();
     schema
-        .set_column_family_options(None, ColumnFamilyOptions { value_has_ttl: false })
+        .set_column_family_options(
+            None,
+            ColumnFamilyOptions {
+                value_has_ttl: false,
+            },
+        )
         .unwrap();
     schema.commit();
 
@@ -953,11 +969,16 @@ fn test_db_merge_respects_ttl_after_family_ttl_reenabled() {
         10u64.to_le_bytes(),
         &cobble::WriteOptions::with_ttl(5),
     )
-        .unwrap();
+    .unwrap();
 
     let mut schema = db.update_schema();
     schema
-        .set_column_family_options(None, ColumnFamilyOptions { value_has_ttl: true })
+        .set_column_family_options(
+            None,
+            ColumnFamilyOptions {
+                value_has_ttl: true,
+            },
+        )
         .unwrap();
     schema.commit();
 
@@ -1016,7 +1037,12 @@ fn test_db_merge_operator_still_receives_time_provider_when_family_ttl_disabled(
         .set_column_operator(None, 0, Arc::new(TimeAwareMergeOperator))
         .unwrap();
     schema
-        .set_column_family_options(None, ColumnFamilyOptions { value_has_ttl: false })
+        .set_column_family_options(
+            None,
+            ColumnFamilyOptions {
+                value_has_ttl: false,
+            },
+        )
         .unwrap();
     schema.commit();
 
