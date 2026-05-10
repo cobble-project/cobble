@@ -1304,7 +1304,10 @@ impl SchemaBuilder {
         column_family: Option<String>,
         options: ColumnFamilyOptions,
     ) -> Result<()> {
-        let family_position = self.resolve_existing_family_position(column_family)?;
+        let family_position = match column_family {
+            Some(name) => usize::from(self.ensure_column_family(name.as_str())?),
+            None => usize::from(DEFAULT_COLUMN_FAMILY_ID),
+        };
         self.column_families[family_position].options = options;
         Ok(())
     }
@@ -1701,5 +1704,23 @@ mod tests {
         let metrics_cf = schema.resolve_column_family_id(Some("metrics")).unwrap();
         assert!(!schema.value_has_ttl_in_family(metrics_cf));
         assert!(schema.value_has_ttl_in_family(DEFAULT_COLUMN_FAMILY_ID));
+    }
+
+    #[test]
+    fn test_set_column_family_options_creates_missing_family() {
+        let manager = Arc::new(SchemaManager::new(1));
+        let mut builder = manager.builder();
+        builder
+            .set_column_family_options(
+                Some("metrics".to_string()),
+                ColumnFamilyOptions {
+                    value_has_ttl: false,
+                },
+            )
+            .unwrap();
+        let schema = builder.commit();
+        let metrics_cf = schema.resolve_column_family_id(Some("metrics")).unwrap();
+        assert_eq!(schema.num_columns_in_family(metrics_cf), Some(0));
+        assert!(!schema.value_has_ttl_in_family(metrics_cf));
     }
 }
