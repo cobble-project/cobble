@@ -380,6 +380,45 @@ public final class Db extends NativeObject {
     }
 
     /**
+     * Merge one bytes column value with direct ByteBuffer input.
+     *
+     * <p>The key/value buffers are caller-owned and can be reused by the caller across invocations.
+     */
+    public void mergeDirectWithOptions(
+            int bucket,
+            ByteBuffer keyBuffer,
+            int keyLength,
+            int column,
+            ByteBuffer valueBuffer,
+            int valueLength,
+            WriteOptions options) {
+        if (keyBuffer == null || !keyBuffer.isDirect()) {
+            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
+        }
+        if (valueBuffer == null || !valueBuffer.isDirect()) {
+            throw new IllegalArgumentException("valueBuffer must be a direct ByteBuffer");
+        }
+        if (keyLength < 0 || keyLength > keyBuffer.capacity()) {
+            throw new IllegalArgumentException("keyLength out of range: " + keyLength);
+        }
+        if (valueLength < 0 || valueLength > valueBuffer.capacity()) {
+            throw new IllegalArgumentException("valueLength out of range: " + valueLength);
+        }
+        long woh = options == null ? 0L : options.getNativeHandle();
+        mergeBytesDirectWithOptions(
+                nativeHandle,
+                bucket,
+                DirectIoUtils.directAddress(keyBuffer),
+                keyBuffer.capacity(),
+                keyLength,
+                column,
+                DirectIoUtils.directAddress(valueBuffer),
+                valueBuffer.capacity(),
+                valueLength,
+                woh);
+    }
+
+    /**
      * Put one pre-encoded Cobble list payload with caller-owned direct buffers.
      *
      * <p>{@code encodedListBuffer[0..encodedListLength)} must already match Cobble core list value
@@ -1001,6 +1040,18 @@ public final class Db extends NativeObject {
             byte[] key,
             int column,
             byte[] value,
+            long writeOptionsHandle);
+
+    private static native void mergeBytesDirectWithOptions(
+            long nativeHandle,
+            int bucket,
+            long keyAddress,
+            int keyCapacity,
+            int keyLength,
+            int column,
+            long valueAddress,
+            int valueCapacity,
+            int valueLength,
             long writeOptionsHandle);
 
     // list put/merge

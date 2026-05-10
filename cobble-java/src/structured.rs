@@ -833,6 +833,130 @@ pub extern "system" fn Java_io_cobble_structured_Db_mergeBytesWithOptions(
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_mergeBytesDirectWithOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key_address: jlong,
+    key_capacity: jint,
+    key_length: jint,
+    column: jint,
+    value_address: jlong,
+    value_capacity: jint,
+    value_length: jint,
+    write_options_handle: jlong,
+) {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key_length = match usize::try_from(key_length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "keyLength must be >= 0".to_string());
+            return;
+        }
+    };
+    let key_capacity = match usize::try_from(key_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "keyCapacity must be >= 0".to_string());
+            return;
+        }
+    };
+    let value_length = match usize::try_from(value_length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "valueLength must be >= 0".to_string());
+            return;
+        }
+    };
+    let value_capacity = match usize::try_from(value_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "valueCapacity must be >= 0".to_string());
+            return;
+        }
+    };
+    let key_addr = match usize::try_from(key_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "keyAddress must be > 0".to_string());
+            return;
+        }
+    };
+    if key_length > key_capacity {
+        throw_illegal_argument(
+            &mut env,
+            format!(
+                "keyLength {} exceeds keyBuffer capacity {}",
+                key_length, key_capacity
+            ),
+        );
+        return;
+    }
+
+    let value_addr = match usize::try_from(value_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "valueAddress must be > 0".to_string());
+            return;
+        }
+    };
+    if value_length > value_capacity {
+        throw_illegal_argument(
+            &mut env,
+            format!(
+                "valueLength {} exceeds valueBuffer capacity {}",
+                value_length, value_capacity
+            ),
+        );
+        return;
+    }
+
+    let key = unsafe { std::slice::from_raw_parts(key_addr as *const u8, key_length) };
+    let value = unsafe { std::slice::from_raw_parts(value_addr as *const u8, value_length) };
+    let result = if write_options_handle == 0 {
+        db.merge(
+            bucket,
+            key,
+            column,
+            StructuredColumnValue::Bytes(Bytes::copy_from_slice(value)),
+        )
+    } else {
+        let Some(wo) =
+            structured_write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.merge_with_options(
+            bucket,
+            key,
+            column,
+            StructuredColumnValue::Bytes(Bytes::copy_from_slice(value)),
+            wo.write_options(),
+        )
+    };
+    if let Err(err) = result {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
 // ── list put / merge ────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]

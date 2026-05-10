@@ -357,6 +357,46 @@ public final class Db extends NativeObject {
         mergeWithOptions(nativeHandle, bucket, key, column, value, writeOptionsHandle);
     }
 
+    /**
+     * Merge one column value using caller-owned direct buffers.
+     *
+     * <p>Both {@code keyBuffer} and {@code valueBuffer} must be direct ByteBuffers. Only bytes in
+     * range {@code [0, keyLength)} / {@code [0, valueLength)} are consumed.
+     */
+    public void mergeDirectWithOptions(
+            int bucket,
+            ByteBuffer keyBuffer,
+            int keyLength,
+            int column,
+            ByteBuffer valueBuffer,
+            int valueLength,
+            WriteOptions options) {
+        if (keyBuffer == null || !keyBuffer.isDirect()) {
+            throw new IllegalArgumentException("keyBuffer must be a direct ByteBuffer");
+        }
+        if (valueBuffer == null || !valueBuffer.isDirect()) {
+            throw new IllegalArgumentException("valueBuffer must be a direct ByteBuffer");
+        }
+        if (keyLength < 0 || keyLength > keyBuffer.capacity()) {
+            throw new IllegalArgumentException("keyLength out of range: " + keyLength);
+        }
+        if (valueLength < 0 || valueLength > valueBuffer.capacity()) {
+            throw new IllegalArgumentException("valueLength out of range: " + valueLength);
+        }
+        long writeOptionsHandle = options == null ? 0L : options.nativeHandle;
+        mergeDirectWithOptions(
+                nativeHandle,
+                bucket,
+                DirectIoUtils.directAddress(keyBuffer),
+                keyBuffer.capacity(),
+                keyLength,
+                column,
+                DirectIoUtils.directAddress(valueBuffer),
+                valueBuffer.capacity(),
+                valueLength,
+                writeOptionsHandle);
+    }
+
     /** Get one column by index. */
     public byte[] get(int bucket, byte[] key, int column) {
         try (ReadOptions options = ReadOptions.forColumn(column)) {
@@ -970,6 +1010,18 @@ public final class Db extends NativeObject {
             byte[] key,
             int column,
             byte[] value,
+            long writeOptionsHandle);
+
+    private static native void mergeDirectWithOptions(
+            long nativeHandle,
+            int bucket,
+            long keyAddress,
+            int keyCapacity,
+            int keyLength,
+            int column,
+            long valueAddress,
+            int valueCapacity,
+            int valueLength,
             long writeOptionsHandle);
 
     private static native byte[][] get(
