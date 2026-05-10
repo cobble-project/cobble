@@ -16,7 +16,7 @@ use crate::iterator::{
     ColumnMaskingIterator, DeduplicatingIterator, KvIterator, SchemaEvolvingIterator,
 };
 use crate::lsm::LSMTree;
-use crate::memtable::vlog::{MemtableVlogRecorder, rewrite_ref_value_for_memtable};
+use crate::memtable::vlog::rewrite_kv_value_for_flush;
 use crate::memtable::{HashMemtable, SkiplistMemtable, VecMemtable};
 use crate::memtable::{Memtable, MemtableImpl, MemtableReclaimer};
 use crate::metrics_manager::MetricsManager;
@@ -26,7 +26,7 @@ use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotManager};
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use crate::r#type::{KvValue, RefKey, RefValue, ValueType, key_bucket, key_column_family};
-use crate::vlog::{VlogEdit, VlogMergeCollector, VlogPointer, VlogStore};
+use crate::vlog::{VlogEdit, VlogStore};
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::{debug, trace, warn};
 use metrics::{Counter, counter};
@@ -132,7 +132,6 @@ struct FlushJob {
     memtable_id: Option<Uuid>,
     memtable: Option<Arc<MemtableImpl>>,
     schema: Option<Arc<Schema>>,
-    vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
     snapshot: Option<SnapshotCompletion>,
     active_memtable_snapshot: Option<ActiveMemtableSnapshotJob>,
 }
@@ -143,6 +142,26 @@ struct ActiveMemtableSnapshotJob {
 
 struct ActiveMemtableSnapshotWriteResult {
     active_data: Vec<ActiveMemtableSnapshotData>,
+}
+
+fn validate_ref_value_for_memtable(value: &RefValue<'_>, num_columns: usize) -> Result<()> {
+    for column in value.columns().iter().take(num_columns) {
+        if let Some(column) = column
+            && matches!(
+                column.value_type,
+                ValueType::PutSeparated
+                    | ValueType::MergeSeparated
+                    | ValueType::MergeSeparatedArray
+                    | ValueType::PutSeparatedArray
+            )
+        {
+            return Err(Error::InputError(format!(
+                "User writes must not use separated value types: {:?}",
+                column.value_type
+            )));
+        }
+    }
+    Ok(())
 }
 
 struct FlushTreeBuilder {
@@ -162,13 +181,6 @@ pub(crate) struct ActiveMemtable {
     id: Uuid,
     schema: Arc<Schema>,
     memtable: Option<MemtableImpl>,
-    vlog_recorder: Option<MemtableVlogRecorder>,
-}
-
-#[derive(Clone, Copy)]
-struct ActiveMemtableCheckpoint {
-    blob_cursor: usize,
-    recorder_checkpoint: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -712,32 +724,6 @@ pub(crate) struct ImmutableMemtable {
     pub(crate) id: Uuid,
     schema: Arc<Schema>,
     memtable: Arc<MemtableImpl>,
-    vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
-}
-
-impl ActiveMemtable {
-    fn checkpoint(&self) -> ActiveMemtableCheckpoint {
-        let memtable = self.memtable.as_ref().expect("active memtable exists");
-        ActiveMemtableCheckpoint {
-            blob_cursor: memtable.blob_cursor_checkpoint(),
-            recorder_checkpoint: self
-                .vlog_recorder
-                .as_ref()
-                .map(MemtableVlogRecorder::checkpoint),
-        }
-    }
-
-    fn restore_checkpoint(&mut self, checkpoint: ActiveMemtableCheckpoint) {
-        let memtable = self.memtable.as_mut().expect("active memtable exists");
-        memtable.rollback_blob_cursor(checkpoint.blob_cursor);
-        if let Some(recorder_checkpoint) = checkpoint.recorder_checkpoint {
-            if let Some(recorder) = self.vlog_recorder.as_mut() {
-                recorder.rollback(recorder_checkpoint);
-            }
-        } else {
-            self.vlog_recorder = None;
-        }
-    }
 }
 
 impl MemtableManager {
@@ -919,13 +905,11 @@ impl MemtableManager {
                         let result = flush_memtable(
                             memtable.as_ref(),
                             job.schema.expect("flush job schema exists"),
-                            job.vlog_recorder,
                             Arc::clone(&file_manager_clone),
                             writer_options_factory.clone(),
                             Arc::clone(&ttl_provider_clone),
                             Arc::clone(&vlog_store_clone),
                             multi_lsm_version,
-                            0,
                         );
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
@@ -1094,39 +1078,10 @@ impl MemtableManager {
             segments.clear();
             0
         };
-        let mut vlog_file_seq = None;
-        let mut vlog_start_offset = 0u32;
-        let mut vlog_end_offset = 0u32;
-        if let Some(recorder) = active_guard.vlog_recorder.as_ref()
-            && recorder.has_entries()
-        {
-            vlog_file_seq = Some(recorder.file_seq());
-            vlog_end_offset = recorder.checkpoint();
-            vlog_start_offset = segments
-                .iter()
-                .rev()
-                .find_map(|segment| {
-                    (segment.vlog_file_seq == vlog_file_seq).then_some(segment.vlog_end_offset)
-                })
-                .unwrap_or(0);
-            if vlog_start_offset > vlog_end_offset {
-                vlog_start_offset = 0;
-            }
-        }
-        if data_start_offset < data_end_offset || vlog_start_offset < vlog_end_offset {
+        if data_start_offset < data_end_offset {
             let path = snapshot_active_data_relative_path(snapshot_id);
             let mut writer = file_manager.create_metadata_file(&path)?;
-            let mut data_bytes_written = 0usize;
-            if data_start_offset < data_end_offset {
-                data_bytes_written = memtable.write_data_since(data_start_offset, &mut writer)?;
-            }
-            if vlog_start_offset < vlog_end_offset {
-                let recorder = active_guard
-                    .vlog_recorder
-                    .as_ref()
-                    .expect("vlog recorder exists when offsets advance");
-                let _ = recorder.write_data_since(memtable, vlog_start_offset, &mut writer)?;
-            }
+            memtable.write_data_since(data_start_offset, &mut writer)?;
             writer.close()?;
             segments.push(ActiveMemtableSnapshotData {
                 path,
@@ -1134,10 +1089,6 @@ impl MemtableManager {
                 memtable_id: memtable_id.clone(),
                 start_offset: data_start_offset as u64,
                 end_offset: data_end_offset as u64,
-                vlog_file_seq,
-                vlog_start_offset,
-                vlog_end_offset,
-                vlog_data_file_offset: data_bytes_written as u64,
             });
         }
         Ok(ActiveMemtableSnapshotWriteResult {
@@ -1195,7 +1146,6 @@ impl MemtableManager {
                 id: memtable_id,
                 schema,
                 memtable: Some(memtable),
-                vlog_recorder: None,
             }));
             db_state.cas_mutate(snapshot.seq_id, |db_state, snapshot| {
                 Some(DbState {
@@ -1313,45 +1263,21 @@ impl MemtableManager {
                 continue;
             }
             // Steps:
-            // 1) checkpoint active memtable state (blob arena + vlog recorder offsets)
-            // 2) rewrite large columns to vlog pointers
-            // 3) stream the final encoded value into memtable storage
-            // 4) restore checkpoint on any error/full condition
-            let checkpoint = active.checkpoint();
-            let rewrite_result = {
-                let ActiveMemtable {
-                    memtable,
-                    vlog_recorder,
-                    ..
-                } = &mut *active;
-                let memtable = memtable.as_mut().expect("active memtable exists");
-                rewrite_ref_value_for_memtable(
-                    value,
-                    &self.vlog_store,
-                    memtable,
-                    vlog_recorder,
-                    num_columns,
-                )
-            };
-            let rewrite_plan = match rewrite_result {
-                Ok(rewritten) => rewritten,
-                Err(err) => {
-                    self.handle_memtable_put_error(&err, active, checkpoint, key, value)?;
-                    continue;
-                }
-            };
+            // 1) reject user-supplied separated value tags
+            // 2) encode the original value into memtable storage
+            // 3) handle memtable-full by rotating/allocating a new active buffer
+            if let Err(err) = validate_ref_value_for_memtable(value, num_columns) {
+                self.handle_memtable_put_error(&err, active, key, value)?;
+                continue;
+            }
             let put_result = {
                 let memtable = active.memtable.as_mut().expect("active memtable exists");
-                if let Some(plan) = rewrite_plan.as_ref() {
-                    memtable.put_ref_rewritten(key, plan, num_columns)
-                } else {
-                    memtable.put_ref(key, value, num_columns)
-                }
+                memtable.put_ref(key, value, num_columns)
             };
             match put_result {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    self.handle_memtable_put_error(&err, active, checkpoint, key, value)?;
+                    self.handle_memtable_put_error(&err, active, key, value)?;
                 }
             }
         }
@@ -1366,12 +1292,7 @@ impl MemtableManager {
         let num_columns = latest_schema
             .num_columns_in_family(key.column_family())
             .unwrap_or_else(|| self.schema_manager.current_num_columns());
-        let capacity = VecMemtable::estimate_capacity_for_ref(
-            key,
-            value,
-            num_columns,
-            self.vlog_store.as_ref(),
-        );
+        let capacity = VecMemtable::estimate_capacity_for_ref(key, value, num_columns);
         {
             // Disallow other reclaimer calls to make active buffer
             // while we are trying to allocate a special memtable.
@@ -1389,7 +1310,6 @@ impl MemtableManager {
             };
             let mut active = active.lock().unwrap();
             let old_memtable = active.memtable.take();
-            active.vlog_recorder = None;
             drop(active);
             self.db_state
                 .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
@@ -1439,8 +1359,7 @@ impl MemtableManager {
     fn handle_memtable_put_error(
         &self,
         err: &Error,
-        mut active: MutexGuard<ActiveMemtable>,
-        checkpoint: ActiveMemtableCheckpoint,
+        active: MutexGuard<ActiveMemtable>,
         key: &RefKey<'_>,
         value: &RefValue<'_>,
     ) -> Result<()> {
@@ -1449,7 +1368,6 @@ impl MemtableManager {
                 needed: _needed,
                 remaining: _remaining,
             } => {
-                active.restore_checkpoint(checkpoint);
                 if active
                     .memtable
                     .as_ref()
@@ -1465,7 +1383,6 @@ impl MemtableManager {
                 }
             }
             _ => {
-                active.restore_checkpoint(checkpoint);
                 return Err(err.clone());
             }
         }
@@ -1644,30 +1561,6 @@ impl MemtableManager {
         Ok(iterators)
     }
 
-    pub(crate) fn read_vlog_pointer_with_snapshot(
-        &self,
-        snapshot: Arc<DbState>,
-        pointer: VlogPointer,
-    ) -> Result<Option<Bytes>> {
-        if let Some(active) = &snapshot.active {
-            let active = active.lock().unwrap();
-            if let (Some(memtable), Some(recorder)) =
-                (active.memtable.as_ref(), active.vlog_recorder.as_ref())
-                && let Some(value) = recorder.read_pointer(memtable, pointer)?
-            {
-                return Ok(Some(value));
-            }
-        }
-        for immutable in snapshot.immutables.iter().rev() {
-            if let Some(recorder) = immutable.vlog_recorder.as_ref()
-                && let Some(value) = recorder.read_pointer(immutable.memtable.as_ref(), pointer)?
-            {
-                return Ok(Some(value));
-            }
-        }
-        Ok(None)
-    }
-
     pub(crate) fn flush_active(&self) -> Result<Option<Uuid>> {
         let auto_snapshot = self
             .auto_snapshot_manager
@@ -1731,13 +1624,11 @@ impl MemtableManager {
                         .memtable
                         .take()
                         .expect("active memtable exists");
-                    let active_vlog_recorder = inner_active.vlog_recorder.take().map(Arc::new);
                     let mut immutables = snapshot_state.immutables.clone();
                     let new_immutable = ImmutableMemtable {
                         id: inner_active.id,
                         schema: Arc::clone(&inner_active.schema),
                         memtable: Arc::new(active_memtable),
-                        vlog_recorder: active_vlog_recorder,
                     };
                     to_flush = Some(new_immutable.clone());
                     immutables.push_back(new_immutable);
@@ -1771,7 +1662,6 @@ impl MemtableManager {
                 memtable_id: Some(to_flush.id),
                 memtable: Some(to_flush.memtable),
                 schema: Some(to_flush.schema),
-                vlog_recorder: to_flush.vlog_recorder,
                 snapshot,
                 active_memtable_snapshot: None,
             }
@@ -1781,7 +1671,6 @@ impl MemtableManager {
                 memtable_id: None,
                 memtable: None,
                 schema: None,
-                vlog_recorder: None,
                 snapshot,
                 active_memtable_snapshot: Some(active_memtable_snapshot),
             }
@@ -1791,7 +1680,6 @@ impl MemtableManager {
                 memtable_id: None,
                 memtable: None,
                 schema: None,
-                vlog_recorder: None,
                 snapshot,
                 active_memtable_snapshot: None,
             }
@@ -1835,7 +1723,6 @@ impl MemtableManager {
         &self,
         source_file_manager: &Arc<FileManager>,
         segments: &[ActiveMemtableSnapshotData],
-        vlog_file_seq_offset: u32,
     ) -> Result<bool> {
         if segments.is_empty() {
             return Ok(false);
@@ -1848,7 +1735,7 @@ impl MemtableManager {
             state.restore_in_progress = true;
         }
         let result = (|| {
-            let (memtable, vlog_recorder) =
+            let memtable =
                 decode_active_snapshot_segments_into_memtable(source_file_manager, segments)?;
             if memtable.is_empty() {
                 return Ok(false);
@@ -1857,13 +1744,11 @@ impl MemtableManager {
             let result = flush_memtable(
                 &memtable,
                 self.schema_manager.latest_schema(),
-                vlog_recorder.map(Arc::new),
                 Arc::clone(&self.file_manager),
                 self.writer_options_factory.clone(),
                 self.lsm_tree.ttl_provider(),
                 Arc::clone(&self.vlog_store),
                 multi_lsm_version,
-                vlog_file_seq_offset,
             )?;
             self.metrics.flushes_total.increment(1);
             let flushed_bytes: u64 = result
@@ -1972,61 +1857,34 @@ impl Drop for MemtableManager {
 
 /// Flush a sealed memtable to L0 SST files.
 ///
-/// Flush path: (1) write separated blob payloads to VLOG if the memtable
-/// has a vlog recorder, (2) iterate memtable entries in sorted order,
-/// (3) route each key to the correct LSM tree by bucket, (4) write per-tree
-/// L0 SST files via FileBuilder, (5) return data files and vlog edit for
-/// atomic LSM version update.
+/// Flush path: (1) iterate memtable entries in sorted order, (2) route each
+/// key to the correct LSM tree by bucket, (3) separate large values into a
+/// freshly created VLOG writer on demand, (4) write per-tree L0 SST files via
+/// FileBuilder, (5) return data files and vlog edit for atomic LSM version
+/// update.
 #[allow(clippy::too_many_arguments)]
 fn flush_memtable(
     memtable: &impl Memtable,
     schema: Arc<Schema>,
-    vlog_recorder: Option<Arc<MemtableVlogRecorder>>,
     file_manager: Arc<FileManager>,
     writer_options_factory: WriterOptionsFactory,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     vlog_store: Arc<VlogStore>,
     multi_lsm_version: MultiLSMTreeVersion,
-    vlog_file_seq_offset: u32,
 ) -> Result<MemtableFlushResult> {
-    // Step 1: If there is a vlog recorder with entries, flush it to the vlog store and get the resulting edit.
     let mut vlog_edit = None;
-    if let Some(recorder) = vlog_recorder
-        && recorder.has_entries()
-    {
-        let target_file_seq = recorder
-            .file_seq()
-            .checked_add(vlog_file_seq_offset)
-            .ok_or_else(|| {
-                Error::IoError(format!(
-                    "VLOG file seq overflow: {} + {}",
-                    recorder.file_seq(),
-                    vlog_file_seq_offset
-                ))
-            })?;
-        let (mut writer, mut edit) = vlog_store.create_writer_for_seq(target_file_seq)?;
-        recorder.flush_to_writer(memtable, &mut writer)?;
-        edit.add_entry_delta(target_file_seq, recorder.entry_count() as i64);
-        writer.close()?;
-        vlog_edit = Some(edit);
-    }
-    // Step 2: Create data files on-demand per tree and write entries by key bucket.
+    let mut flush_vlog_writer = None;
+    let mut flush_separated_entries = 0usize;
     let mut builders: BTreeMap<usize, FlushTreeBuilder> = BTreeMap::new();
-    // Try to handle merges during flush if vlog edits are present
-    let merge_collector = vlog_edit.as_ref().map(|_| VlogMergeCollector::shared(true));
-    let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
     let mut dedup_iter = DeduplicatingIterator::new(
         PrimedIterator::new(memtable.iter()),
         None,
         ttl_provider,
-        merge_callback,
+        None,
         Arc::clone(&schema),
     );
     dedup_iter.seek_to_first()?;
     while dedup_iter.valid() {
-        if let Some(collector) = merge_collector.as_ref() {
-            collector.borrow_mut().check_error()?;
-        }
         if let Some((key, kv_value)) = dedup_iter.take_current()? {
             let bucket = key_bucket(&key)
                 .ok_or_else(|| InvalidState("encoded key missing bucket/cf prefix".to_string()))?;
@@ -2068,30 +1926,31 @@ fn flush_memtable(
             let builder_state = builders
                 .get_mut(&tree_idx)
                 .expect("builder should exist for tree");
+            let runtime_num_columns = schema
+                .num_columns_in_family(builder_state.scope.column_family_id)
+                .unwrap_or_else(|| schema.num_columns());
+            let (kv_value, separated) = rewrite_kv_value_for_flush(
+                kv_value,
+                runtime_num_columns,
+                &vlog_store,
+                &mut flush_vlog_writer,
+                &mut vlog_edit,
+            )?;
+            flush_separated_entries += separated;
             builder_state.builder.add(&key, &kv_value)?;
             builder_state.min_bucket = builder_state.min_bucket.min(bucket);
             builder_state.max_bucket = builder_state.max_bucket.max(bucket);
         }
         dedup_iter.next()?;
     }
-    if let Some(collector) = merge_collector.as_ref() {
-        collector.borrow_mut().check_error()?;
-    }
-    if let (Some(edit), Some(collector)) = (&mut vlog_edit, merge_collector.as_ref()) {
-        for (file_seq, delta) in collector.borrow().removed_entry_deltas() {
-            let shifted_file_seq = file_seq.checked_add(vlog_file_seq_offset).ok_or_else(|| {
-                InvalidState(format!(
-                    "VLOG file seq overflow: {} + {}",
-                    file_seq, vlog_file_seq_offset
-                ))
-            })?;
-            edit.add_entry_delta(shifted_file_seq, delta);
+    if let Some(mut writer) = flush_vlog_writer {
+        let file_seq = writer.file_seq();
+        writer.close()?;
+        if let Some(edit) = vlog_edit.as_mut() {
+            edit.add_entry_delta(file_seq, flush_separated_entries as i64);
         }
     }
-    // Step 3: Finish data files and construct the resulting `MemtableFlushResult`.
-    let has_separated_values = merge_collector
-        .as_ref()
-        .is_some_and(|collector| collector.borrow().has_separated_values());
+    let has_separated_values = flush_separated_entries > 0;
     let mut data_files_by_scope = Vec::with_capacity(builders.len());
     let data_file_type = writer_options_factory.data_file_type();
     for (
@@ -2118,7 +1977,6 @@ fn flush_memtable(
             bucket_range.clone(),
             bucket_range,
         )
-        .with_vlog_offset(vlog_file_seq_offset)
         .with_separated_values(has_separated_values);
         data_file.set_meta_bytes(footer_bytes);
         data_files_by_scope.push((tree_scope, Arc::new(data_file)));
@@ -2137,9 +1995,9 @@ fn flush_memtable(
 fn decode_active_snapshot_segments_into_memtable(
     file_manager: &Arc<FileManager>,
     segments: &[ActiveMemtableSnapshotData],
-) -> Result<(VecMemtable, Option<MemtableVlogRecorder>)> {
+) -> Result<VecMemtable> {
     if segments.is_empty() {
-        return Ok((VecMemtable::with_capacity(1), None));
+        return Ok(VecMemtable::with_capacity(1));
     }
     let first = &segments[0];
     let mut expected_data_start = 0u64;
@@ -2157,17 +2015,9 @@ fn decode_active_snapshot_segments_into_memtable(
                 "active memtable snapshot data offsets are discontinuous".to_string(),
             ));
         }
-        if segment.vlog_end_offset < segment.vlog_start_offset {
-            return Err(Error::InvalidState(
-                "active memtable snapshot vlog offsets are invalid".to_string(),
-            ));
-        }
         expected_data_start = segment.end_offset;
         required_capacity = required_capacity
             .checked_add(segment.end_offset - segment.start_offset)
-            .and_then(|v| {
-                v.checked_add((segment.vlog_end_offset - segment.vlog_start_offset) as u64)
-            })
             .ok_or_else(|| {
                 Error::IoError("active memtable snapshot capacity overflow".to_string())
             })?;
@@ -2175,23 +2025,11 @@ fn decode_active_snapshot_segments_into_memtable(
     let capacity = usize::try_from(required_capacity.max(1))
         .map_err(|_| Error::IoError("active memtable snapshot too large".to_string()))?;
     let mut memtable = VecMemtable::with_capacity(capacity);
-    let mut recorder: Option<MemtableVlogRecorder> = None;
 
     for segment in segments {
         let reader = file_manager.open_metadata_file_reader_untracked(&segment.path)?;
         let segment_payload = MetadataReader::new(reader).read_all()?;
-        let segment_bytes = segment_payload.as_ref();
-        let vlog_data_file_offset = usize::try_from(segment.vlog_data_file_offset)
-            .map_err(|_| Error::InvalidState("invalid vlog_data_file_offset".to_string()))?;
-        if vlog_data_file_offset > segment_bytes.len() {
-            return Err(Error::InvalidState(format!(
-                "vlog_data_file_offset out of range: {} > {}",
-                vlog_data_file_offset,
-                segment_bytes.len()
-            )));
-        }
-        let kv_bytes = &segment_bytes[..vlog_data_file_offset];
-        let vlog_bytes = &segment_bytes[vlog_data_file_offset..];
+        let kv_bytes = segment_payload.as_ref();
         let expected_kv_len = usize::try_from(segment.end_offset - segment.start_offset)
             .map_err(|_| Error::IoError("active memtable kv length overflow".to_string()))?;
         if kv_bytes.len() != expected_kv_len {
@@ -2199,16 +2037,6 @@ fn decode_active_snapshot_segments_into_memtable(
                 "active memtable kv bytes mismatch: {} != {}",
                 kv_bytes.len(),
                 expected_kv_len
-            )));
-        }
-        let expected_vlog_len =
-            usize::try_from((segment.vlog_end_offset - segment.vlog_start_offset) as u64)
-                .map_err(|_| Error::IoError("active memtable vlog length overflow".to_string()))?;
-        if vlog_bytes.len() != expected_vlog_len {
-            return Err(Error::InvalidState(format!(
-                "active memtable vlog bytes mismatch: {} != {}",
-                vlog_bytes.len(),
-                expected_vlog_len
             )));
         }
         let mut kv_pos = 0usize;
@@ -2254,57 +2082,9 @@ fn decode_active_snapshot_segments_into_memtable(
             )?;
             kv_pos = entry_end;
         }
-        if expected_vlog_len > 0 {
-            let file_seq = segment.vlog_file_seq.ok_or_else(|| {
-                Error::InvalidState("missing vlog_file_seq for vlog snapshot data".to_string())
-            })?;
-            let recorder_ref = recorder.get_or_insert_with(|| MemtableVlogRecorder::new(file_seq));
-            if recorder_ref.file_seq() != file_seq {
-                return Err(Error::InvalidState(
-                    "active memtable vlog file seq mismatch".to_string(),
-                ));
-            }
-            if recorder_ref.checkpoint() != segment.vlog_start_offset {
-                return Err(Error::InvalidState(format!(
-                    "active memtable vlog start offset mismatch: {} != {}",
-                    recorder_ref.checkpoint(),
-                    segment.vlog_start_offset
-                )));
-            }
-            let mut vlog_pos = 0usize;
-            while vlog_pos < vlog_bytes.len() {
-                if vlog_pos + 4 > vlog_bytes.len() {
-                    return Err(Error::InvalidState(
-                        "truncated active memtable vlog record header".to_string(),
-                    ));
-                }
-                let payload_len =
-                    u32::from_le_bytes(vlog_bytes[vlog_pos..vlog_pos + 4].try_into().unwrap())
-                        as usize;
-                vlog_pos += 4;
-                let payload_end = vlog_pos.checked_add(payload_len).ok_or_else(|| {
-                    Error::IoError("active memtable vlog entry overflow".to_string())
-                })?;
-                if payload_end > vlog_bytes.len() {
-                    return Err(Error::InvalidState(
-                        "truncated active memtable vlog record body".to_string(),
-                    ));
-                }
-                let payload = &vlog_bytes[vlog_pos..payload_end];
-                let _ = recorder_ref.append_value(&mut memtable, payload)?;
-                vlog_pos = payload_end;
-            }
-            if recorder_ref.checkpoint() != segment.vlog_end_offset {
-                return Err(Error::InvalidState(format!(
-                    "active memtable vlog end offset mismatch: {} != {}",
-                    recorder_ref.checkpoint(),
-                    segment.vlog_end_offset
-                )));
-            }
-        }
     }
 
-    Ok((memtable, recorder))
+    Ok(memtable)
 }
 
 struct PrimedIterator<I> {
@@ -2485,7 +2265,6 @@ mod tests {
                     (b"e".as_slice(), ValueType::Delete, b""),
                 ],
             )),
-            vlog_recorder: None,
         }));
         let immutables = VecDeque::from(vec![
             ImmutableMemtable {
@@ -2502,7 +2281,6 @@ mod tests {
                         (b"f".as_slice(), ValueType::Put, b"vf"),
                     ],
                 )),
-                vlog_recorder: None,
             },
             ImmutableMemtable {
                 id: Uuid::new_v4(),
@@ -2514,7 +2292,6 @@ mod tests {
                         (b"d".as_slice(), ValueType::Delete, b""),
                     ],
                 )),
-                vlog_recorder: None,
             },
         ]);
         let snapshot = Arc::new(DbState {
@@ -2989,7 +2766,6 @@ mod tests {
             .restore_active_memtable_snapshot_to_l0(
                 &source_file_manager,
                 &snapshot_write.active_data,
-                0,
             )
             .unwrap();
 
@@ -3137,7 +2913,6 @@ mod tests {
             .restore_active_memtable_snapshot_to_l0(
                 &source_file_manager,
                 &snapshot_write.active_data,
-                0,
             )
             .unwrap();
 

@@ -398,7 +398,7 @@ impl<W: SequentialWriteFile> VlogWriter<W> {
         }
     }
 
-    fn file_seq(&self) -> VlogFileSeq {
+    pub(crate) fn file_seq(&self) -> VlogFileSeq {
         self.file_seq
     }
 

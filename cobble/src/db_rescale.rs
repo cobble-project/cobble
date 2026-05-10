@@ -195,12 +195,6 @@ impl Db {
             .vlog_files
             .iter()
             .map(|file| file.file_seq)
-            .chain(
-                source_manifest
-                    .active_memtable_data
-                    .iter()
-                    .filter_map(|segment| segment.vlog_file_seq),
-            )
             .max();
         let vlog_file_seq_offset = if let Some(max_seq) = source_vlog_max_seq {
             let span = max_seq
@@ -325,12 +319,11 @@ impl Db {
         });
         drop(guard);
 
-        // Step 8: Replay source active memtable snapshot segments into L0 with a file-level VLOG seq offset.
+        // Step 8: Replay source active memtable snapshot segments into L0.
         self.snapshot_manager.set_bucket_ranges(updated_ranges);
         self.restore_active_memtable_snapshot_to_l0_with_source(
             &source_file_manager,
             &source_manifest.active_memtable_data,
-            vlog_file_seq_offset,
         )?;
         Ok(source_snapshot_id)
     }

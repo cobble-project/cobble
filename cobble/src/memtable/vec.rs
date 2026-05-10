@@ -1,13 +1,10 @@
 //! A simple in-memory memtable implementation backed by bytes-owned KV pairs.
 use crate::error::{Error, Result};
 use crate::memtable::iter::OrderedMemtableKvIterator;
-use crate::memtable::vlog::{RewrittenValuePlan, encode_rewritten_value};
 use crate::memtable::{Memtable, MemtableReclaimer};
 use crate::sst::row_codec::{encode_key_ref_into, encode_value_ref_into};
-use crate::r#type::{RefKey, RefValue, ValueType};
-use crate::vlog::VlogStore;
-use bytes::{Bytes, BytesMut};
-use std::collections::BTreeMap;
+use crate::r#type::{RefKey, RefValue};
+use bytes::Bytes;
 
 pub(crate) type MemtableKvIterator<'a> = OrderedMemtableKvIterator<'a>;
 
@@ -15,7 +12,6 @@ pub(crate) struct VecMemtable {
     entries: Vec<(Bytes, Bytes)>,
     entry_data_offsets: Vec<usize>,
     data_end: usize,
-    blobs: BytesMut,
     capacity: usize,
     used_bytes: usize,
     reclaimer: Option<MemtableReclaimer>,
@@ -33,7 +29,6 @@ impl VecMemtable {
             entries: Vec::new(),
             entry_data_offsets: Vec::new(),
             data_end: 0,
-            blobs: BytesMut::new(),
             capacity,
             used_bytes: 0,
             reclaimer: None,
@@ -57,20 +52,10 @@ impl VecMemtable {
         key: &RefKey<'_>,
         value: &RefValue<'_>,
         num_columns: usize,
-        vlog_store: &VlogStore,
     ) -> usize {
         let key_len = key.encoded_len();
         let value_len = value.encoded_len(num_columns);
-        let mut blob_bytes = 0usize;
-        for column in value.columns().iter().take(num_columns).flatten() {
-            if !matches!(column.value_type, ValueType::Put | ValueType::Merge) {
-                continue;
-            }
-            if vlog_store.should_separate(column.data().len()) {
-                blob_bytes = blob_bytes.saturating_add(4 + column.data().len());
-            }
-        }
-        Self::entry_size(key_len, value_len).saturating_add(blob_bytes)
+        Self::entry_size(key_len, value_len)
     }
 
     fn has_space(&self, needed: usize) -> Result<()> {
@@ -120,29 +105,6 @@ impl Memtable for VecMemtable {
         Ok(())
     }
 
-    fn put_ref_rewritten(
-        &mut self,
-        key: &RefKey<'_>,
-        plan: &RewrittenValuePlan<'_>,
-        num_columns: usize,
-    ) -> Result<()> {
-        let key_len = key.encoded_len();
-        let value_len = plan.encoded_len(num_columns);
-        let needed = Self::entry_size(key_len, value_len);
-        self.has_space(needed)?;
-        let mut encoded_key = vec![0u8; key_len];
-        let mut encoded_value = vec![0u8; value_len];
-        let mut key_slice = encoded_key.as_mut_slice();
-        encode_key_ref_into(key, &mut key_slice);
-        encode_rewritten_value(plan, num_columns, &mut encoded_value[..]);
-        self.entry_data_offsets.push(self.data_end);
-        self.data_end += needed;
-        self.entries
-            .push((Bytes::from(encoded_key), Bytes::from(encoded_value)));
-        self.used_bytes += needed;
-        Ok(())
-    }
-
     fn get(&self, key: &[u8]) -> Option<&[u8]> {
         self.entries
             .iter()
@@ -165,72 +127,6 @@ impl Memtable for VecMemtable {
 
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    fn append_blob(&mut self, data: &[u8]) -> Result<usize> {
-        let encoded_len = 4usize
-            .checked_add(data.len())
-            .ok_or_else(|| Error::IoError("VLOG encoded value length overflow".to_string()))?;
-        self.has_space(encoded_len)?;
-        let offset = self.blobs.len();
-        self.blobs.extend_from_slice(
-            &(u32::try_from(data.len()).map_err(|_| {
-                Error::IoError(format!("VLOG value too large: {} bytes", data.len()))
-            })?)
-            .to_le_bytes(),
-        );
-        self.blobs.extend_from_slice(data);
-        self.used_bytes += encoded_len;
-        Ok(offset + 4)
-    }
-
-    fn read_blob(&self, offset: usize, len: usize) -> Option<&[u8]> {
-        let end = offset.checked_add(len)?;
-        if end > self.blobs.len() {
-            return None;
-        }
-        Some(&self.blobs[offset..end])
-    }
-
-    fn flush_blobs_to_vlog_writer(
-        &self,
-        _entries: &BTreeMap<u32, (usize, usize)>,
-        writer: &mut crate::vlog::VlogWriter<Box<dyn crate::file::SequentialWriteFile>>,
-    ) -> Result<()> {
-        writer.write_encoded_records(&self.blobs)
-    }
-
-    fn write_vlog_data_since(
-        &self,
-        _entries: &BTreeMap<u32, (usize, usize)>,
-        offset: u32,
-        writer: &mut dyn crate::file::SequentialWriteFile,
-    ) -> Result<usize> {
-        let offset = usize::try_from(offset).map_err(|_| {
-            Error::InvalidState(format!("invalid vec memtable vlog offset {}", offset))
-        })?;
-        if offset > self.blobs.len() {
-            return Err(Error::InvalidState(format!(
-                "invalid vec memtable vlog offset {} > {}",
-                offset,
-                self.blobs.len()
-            )));
-        }
-        let data = &self.blobs[offset..];
-        writer.write(data)?;
-        Ok(data.len())
-    }
-
-    fn blob_cursor_checkpoint(&self) -> usize {
-        self.blobs.len()
-    }
-
-    fn rollback_blob_cursor(&mut self, checkpoint: usize) {
-        if checkpoint <= self.blobs.len() {
-            let reclaimed = self.blobs.len() - checkpoint;
-            self.blobs.truncate(checkpoint);
-            self.used_bytes = self.used_bytes.saturating_sub(reclaimed);
-        }
     }
 
     fn data_offset(&self) -> usize {
@@ -393,16 +289,5 @@ mod tests {
             assert_eq!(got.0.as_ref(), exp.0);
             assert_eq!(got.1.as_ref(), exp.1);
         }
-    }
-
-    #[test]
-    fn blob_storage_round_trip() {
-        let mut mem = VecMemtable::with_capacity(128);
-        let offset = mem.append_blob(b"blob").unwrap();
-        assert_eq!(mem.read_blob(offset, 4).unwrap(), b"blob");
-        let checkpoint = mem.blob_cursor_checkpoint();
-        let _ = mem.append_blob(b"-extra").unwrap();
-        mem.rollback_blob_cursor(checkpoint);
-        assert_eq!(mem.read_blob(offset, 4).unwrap(), b"blob");
     }
 }

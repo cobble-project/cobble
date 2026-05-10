@@ -16,14 +16,6 @@ pub(crate) struct ActiveMemtableSnapshotData {
     pub(crate) start_offset: u64,
     /// Exclusive end offset of KV bytes in memtable data stream.
     pub(crate) end_offset: u64,
-    /// VLOG file sequence used by this memtable segment, if separated values exist.
-    pub(crate) vlog_file_seq: Option<u32>,
-    /// Inclusive start offset of VLOG bytes in recorder stream.
-    pub(crate) vlog_start_offset: u32,
-    /// Exclusive end offset of VLOG bytes in recorder stream.
-    pub(crate) vlog_end_offset: u32,
-    /// Byte offset inside `path` where this segment's VLOG payload starts.
-    pub(crate) vlog_data_file_offset: u64,
 }
 
 pub(super) fn collect_active_memtable_snapshot_segments(

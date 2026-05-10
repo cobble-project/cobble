@@ -1,11 +1,10 @@
 //! Skiplist-indexed memtable implementation with a single preallocated buffer.
 //! The buffer stores encoded KV entries (left-to-right) and arena allocations
-//! for skiplist nodes plus vlog blobs (right-to-left).
+//! for skiplist nodes (right-to-left).
 use bytes::BufMut;
 
 use crate::error::{Error, Result};
 use crate::iterator::KvIterator;
-use crate::memtable::vlog::{RewrittenValuePlan, encode_rewritten_value};
 use crate::memtable::{Memtable, MemtableReclaimer};
 use crate::sst::row_codec::{encode_key_ref_into, encode_value_ref_into};
 use crate::r#type::KvValue;
@@ -13,7 +12,6 @@ use crate::r#type::{RefKey, RefValue};
 use crate::util::unsafe_bytes;
 use bytes::Bytes;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 
 const NULL_OFFSET: u32 = u32::MAX;
 const MAX_HEIGHT: usize = 12;
@@ -523,43 +521,6 @@ impl Memtable for SkiplistMemtable {
         Ok(())
     }
 
-    fn put_ref_rewritten(
-        &mut self,
-        key: &RefKey<'_>,
-        plan: &RewrittenValuePlan<'_>,
-        num_columns: usize,
-    ) -> Result<()> {
-        let key_len = key.encoded_len();
-        let value_len = plan.encoded_len(num_columns);
-        let mut encoded_key = vec![0u8; key_len];
-        let mut key_slice = encoded_key.as_mut_slice();
-        encode_key_ref_into(key, &mut key_slice);
-        let ordinal = self.next_ordinal;
-        let height = Self::choose_height(ordinal);
-        let data_len = Self::entry_size(key_len, value_len);
-        let node_len = Self::node_size(height);
-        self.has_space(data_len + node_len)?;
-        let update = self.find_predecessors_for_key(&encoded_key);
-        let start = self.data_end;
-        let end = start + data_len;
-        let mut slice = &mut self.buffer[start..end];
-        slice.put_u32_le(key_len as u32);
-        slice.put_u32_le(value_len as u32);
-        slice.put_slice(&encoded_key);
-        encode_rewritten_value(plan, num_columns, &mut slice[..value_len]);
-        self.data_end = end;
-        let key_start = start
-            .checked_add(8)
-            .ok_or_else(|| Error::InvalidState("key start overflow".to_string()))?;
-        let node = self.alloc_node(start, key_start, key_len, &encoded_key, height)?;
-        self.link_node(node, height, &update)?;
-        self.next_ordinal = self
-            .next_ordinal
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidState("memtable ordinal overflow".to_string()))?;
-        Ok(())
-    }
-
     fn get(&self, key: &[u8]) -> Option<&[u8]> {
         let node = self.lower_bound_node(key);
         if node == NULL_OFFSET {
@@ -583,76 +544,6 @@ impl Memtable for SkiplistMemtable {
 
     fn is_empty(&self) -> bool {
         self.data_end == 0
-    }
-
-    fn append_blob(&mut self, data: &[u8]) -> Result<usize> {
-        let start = self.alloc_arena(data.len())?;
-        self.buffer[start..start + data.len()].copy_from_slice(data);
-        Ok(start)
-    }
-
-    fn read_blob(&self, offset: usize, len: usize) -> Option<&[u8]> {
-        let end = offset.checked_add(len)?;
-        if offset < self.arena_cursor || end > self.buffer.len() {
-            return None;
-        }
-        Some(&self.buffer[offset..end])
-    }
-
-    fn flush_blobs_to_vlog_writer(
-        &self,
-        entries: &BTreeMap<u32, (usize, usize)>,
-        writer: &mut crate::vlog::VlogWriter<Box<dyn crate::file::SequentialWriteFile>>,
-    ) -> Result<()> {
-        for (payload_start, payload_len) in entries.values() {
-            let payload = self
-                .read_blob(*payload_start, *payload_len)
-                .ok_or_else(|| {
-                    Error::IoError(format!(
-                        "VLOG recorder payload out of range at {} (len {})",
-                        payload_start, payload_len
-                    ))
-                })?;
-            writer.add_value(payload)?;
-        }
-        Ok(())
-    }
-
-    fn write_vlog_data_since(
-        &self,
-        entries: &BTreeMap<u32, (usize, usize)>,
-        offset: u32,
-        writer: &mut dyn crate::file::SequentialWriteFile,
-    ) -> Result<usize> {
-        let mut written = 0usize;
-        for (_entry_offset, (payload_start, payload_len)) in entries.range(offset..) {
-            let end = payload_start
-                .checked_add(*payload_len)
-                .ok_or_else(|| Error::IoError("VLOG payload range overflow".to_string()))?;
-            if *payload_start < self.arena_cursor || end > self.buffer.len() {
-                return Err(Error::IoError(format!(
-                    "VLOG recorder payload out of range at {} (len {})",
-                    payload_start, payload_len
-                )));
-            }
-            let len_u32 = u32::try_from(*payload_len).map_err(|_| {
-                Error::IoError(format!("VLOG value too large: {} bytes", payload_len))
-            })?;
-            writer.write(&len_u32.to_le_bytes())?;
-            writer.write(&self.buffer[*payload_start..end])?;
-            written = written.saturating_add(4 + *payload_len);
-        }
-        Ok(written)
-    }
-
-    fn blob_cursor_checkpoint(&self) -> usize {
-        self.arena_cursor
-    }
-
-    fn rollback_blob_cursor(&mut self, checkpoint: usize) {
-        if checkpoint <= self.buffer.len() && checkpoint >= self.data_end {
-            self.arena_cursor = checkpoint;
-        }
     }
 
     fn data_offset(&self) -> usize {
@@ -778,17 +669,6 @@ mod tests {
             Error::MemtableFull { .. } => {}
             _ => panic!("unexpected error type"),
         }
-    }
-
-    #[test]
-    fn blob_storage_round_trip() {
-        let mut mem = SkiplistMemtable::with_capacity(256);
-        let offset = mem.append_blob(b"blob").unwrap();
-        assert_eq!(mem.read_blob(offset, 4).unwrap(), b"blob");
-        let checkpoint = mem.blob_cursor_checkpoint();
-        let _ = mem.append_blob(b"-extra").unwrap();
-        mem.rollback_blob_cursor(checkpoint);
-        assert_eq!(mem.read_blob(offset, 4).unwrap(), b"blob");
     }
 
     #[test]

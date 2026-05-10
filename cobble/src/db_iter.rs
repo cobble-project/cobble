@@ -105,23 +105,9 @@ impl<'a> DbIterator<'a> {
             let value = kv_value.into_decoded(self.num_columns)?;
             let columns = value_to_vec_of_columns_with_vlog(
                 value,
-                |pointer| match self
-                    .vlog_store
-                    .read_pointer(&self.snapshot.vlog_version, pointer)
-                {
-                    Ok(value) => Ok(value),
-                    Err(vlog_err) => {
-                        if let Some(memtable_manager) = self.memtable_manager {
-                            memtable_manager
-                                .read_vlog_pointer_with_snapshot(
-                                    Arc::clone(&self.snapshot),
-                                    pointer,
-                                )?
-                                .ok_or(vlog_err)
-                        } else {
-                            Err(vlog_err)
-                        }
-                    }
+                |pointer| {
+                    self.vlog_store
+                        .read_pointer(&self.snapshot.vlog_version, pointer)
                 },
                 &self.schema,
                 self.column_family_id,

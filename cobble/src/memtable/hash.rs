@@ -4,20 +4,17 @@ use bytes::{Buf, BufMut};
 
 use crate::error::{Error, Result};
 use crate::memtable::iter::OrderedMemtableKvIterator;
-use crate::memtable::vlog::{RewrittenValuePlan, encode_rewritten_value};
 use crate::memtable::{Memtable, MemtableReclaimer};
 use crate::sst::row_codec::{encode_key_ref_into, encode_value_ref_into};
 use crate::r#type::{RefKey, RefValue};
-use std::collections::BTreeMap;
 
 pub(crate) type MemtableKvIterator<'a> = OrderedMemtableKvIterator<'a>;
 
-/// Hash-indexed memtable storing entries, blobs, index nodes and bucket table in one buffer.
+/// Hash-indexed memtable storing entries and index nodes in one buffer.
 ///
 /// Layout:
 /// - `[0, data_end)`: encoded KV entries, appended left-to-right.
-/// - `[index_cursor, bucket_base)`: scratch area grown right-to-left by blob payloads and hash
-///   index nodes.
+/// - `[index_cursor, bucket_base)`: scratch area grown right-to-left by hash index nodes.
 /// - `[bucket_base, capacity)`: fixed bucket head table (`u32` offsets).
 pub(crate) struct HashMemtable {
     buffer: Vec<u8>,
@@ -260,32 +257,6 @@ impl Memtable for HashMemtable {
         Ok(())
     }
 
-    fn put_ref_rewritten(
-        &mut self,
-        key: &RefKey<'_>,
-        plan: &RewrittenValuePlan<'_>,
-        num_columns: usize,
-    ) -> Result<()> {
-        let value_len = plan.encoded_len(num_columns);
-        let key_len = key.encoded_len();
-        let data_len = Self::entry_size(key_len, value_len);
-        self.has_space(data_len)?;
-        let start = self.data_end;
-        let end = start + data_len;
-        let mut slice = &mut self.buffer[start..end];
-        slice.put_u32(key_len as u32);
-        slice.put_u32(value_len as u32);
-        encode_key_ref_into(key, &mut slice);
-        encode_rewritten_value(plan, num_columns, &mut slice[..value_len]);
-        self.data_end = end;
-        let key_offset = start + 8;
-        let hash = Self::hash_key(&self.buffer[key_offset..key_offset + key_len]);
-        let bucket = self.bucket_index_from_hash(hash);
-        let node_off = self.write_index(bucket, hash, start as u32);
-        self.set_bucket_head(bucket, node_off);
-        Ok(())
-    }
-
     fn get(&self, key: &[u8]) -> Option<&[u8]> {
         let hash = Self::hash_key(key);
         let bucket = self.bucket_index_from_hash(hash);
@@ -331,81 +302,6 @@ impl Memtable for HashMemtable {
 
     fn is_empty(&self) -> bool {
         self.data_end == 0
-    }
-
-    fn append_blob(&mut self, data: &[u8]) -> Result<usize> {
-        if self.data_end + data.len() > self.index_cursor {
-            return Err(Error::MemtableFull {
-                needed: data.len(),
-                remaining: self.index_cursor.saturating_sub(self.data_end),
-            });
-        }
-        let start = self.index_cursor - data.len();
-        self.buffer[start..self.index_cursor].copy_from_slice(data);
-        self.index_cursor = start;
-        Ok(start)
-    }
-
-    fn read_blob(&self, offset: usize, len: usize) -> Option<&[u8]> {
-        let end = offset.checked_add(len)?;
-        if offset < self.index_cursor || end > self.bucket_base {
-            return None;
-        }
-        Some(&self.buffer[offset..end])
-    }
-
-    fn flush_blobs_to_vlog_writer(
-        &self,
-        entries: &BTreeMap<u32, (usize, usize)>,
-        writer: &mut crate::vlog::VlogWriter<Box<dyn crate::file::SequentialWriteFile>>,
-    ) -> Result<()> {
-        for (payload_start, payload_len) in entries.values() {
-            let payload = self
-                .read_blob(*payload_start, *payload_len)
-                .ok_or_else(|| {
-                    Error::IoError(format!(
-                        "VLOG recorder payload out of range at {} (len {})",
-                        payload_start, payload_len
-                    ))
-                })?;
-            writer.add_value(payload)?;
-        }
-        Ok(())
-    }
-
-    fn write_vlog_data_since(
-        &self,
-        entries: &BTreeMap<u32, (usize, usize)>,
-        offset: u32,
-        writer: &mut dyn crate::file::SequentialWriteFile,
-    ) -> Result<usize> {
-        let mut written = 0usize;
-        for (_entry_offset, (payload_start, payload_len)) in entries.range(offset..) {
-            let end = payload_start
-                .checked_add(*payload_len)
-                .ok_or_else(|| Error::IoError("VLOG payload range overflow".to_string()))?;
-            if *payload_start < self.index_cursor || end > self.bucket_base {
-                return Err(Error::IoError(format!(
-                    "VLOG recorder payload out of range at {} (len {})",
-                    payload_start, payload_len
-                )));
-            }
-            let len_u32 = u32::try_from(*payload_len).map_err(|_| {
-                Error::IoError(format!("VLOG value too large: {} bytes", payload_len))
-            })?;
-            writer.write(&len_u32.to_le_bytes())?;
-            writer.write(&self.buffer[*payload_start..end])?;
-            written = written.saturating_add(4 + *payload_len);
-        }
-        Ok(written)
-    }
-
-    fn blob_cursor_checkpoint(&self) -> usize {
-        self.index_cursor
-    }
-
-    fn rollback_blob_cursor(&mut self, checkpoint: usize) {
-        self.index_cursor = checkpoint;
     }
 
     fn data_offset(&self) -> usize {
@@ -573,32 +469,5 @@ mod tests {
             assert_eq!(got.0.as_ref(), exp.0);
             assert_eq!(got.1.as_ref(), exp.1);
         }
-    }
-
-    #[test]
-    fn blob_storage_does_not_affect_kv_iteration() {
-        let mut mem = HashMemtable::with_capacity(512);
-        mem.put(b"k1", b"v1").unwrap();
-        let blob_offset = mem.append_blob(b"blob-payload").unwrap();
-        mem.put(b"k2", b"v2").unwrap();
-
-        assert_eq!(
-            mem.read_blob(blob_offset, "blob-payload".len()).unwrap(),
-            b"blob-payload"
-        );
-
-        let mut iter = mem.iter();
-        iter.seek_to_first().unwrap();
-        let mut entries = Vec::new();
-        while iter.next().unwrap() {
-            let key = iter.take_key().unwrap().unwrap();
-            let value = iter.take_value().unwrap().unwrap().unwrap_encoded();
-            entries.push((key, value));
-        }
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0.as_ref(), b"k1");
-        assert_eq!(entries[0].1.as_ref(), b"v1");
-        assert_eq!(entries[1].0.as_ref(), b"k2");
-        assert_eq!(entries[1].1.as_ref(), b"v2");
     }
 }

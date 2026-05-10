@@ -967,7 +967,7 @@ impl Db {
     ) -> Result<()> {
         let restored = self
             .memtable_manager
-            .restore_active_memtable_snapshot_to_l0(&self.file_manager, segments, 0)?;
+            .restore_active_memtable_snapshot_to_l0(&self.file_manager, segments)?;
         if !segments.is_empty() && !restored {
             return Err(Error::InvalidState(
                 "active memtable snapshot restore did not flush".to_string(),
@@ -980,15 +980,10 @@ impl Db {
         &self,
         source_file_manager: &Arc<FileManager>,
         segments: &[ActiveMemtableSnapshotData],
-        vlog_file_seq_offset: u32,
     ) -> Result<()> {
         let restored = self
             .memtable_manager
-            .restore_active_memtable_snapshot_to_l0(
-                source_file_manager,
-                segments,
-                vlog_file_seq_offset,
-            )?;
+            .restore_active_memtable_snapshot_to_l0(source_file_manager, segments)?;
         if !segments.is_empty() && !restored {
             return Err(Error::InvalidState(
                 "active memtable snapshot restore did not flush".to_string(),
@@ -1142,15 +1137,9 @@ impl Db {
         }
         let result = value_to_vec_of_columns_with_vlog(
             merged,
-            |pointer| match self
-                .vlog_store
-                .read_pointer(&snapshot.vlog_version, pointer)
-            {
-                Ok(value) => Ok(value),
-                Err(vlog_err) => self
-                    .memtable_manager
-                    .read_vlog_pointer_with_snapshot(Arc::clone(&snapshot), pointer)?
-                    .ok_or(vlog_err),
+            |pointer| {
+                self.vlog_store
+                    .read_pointer(&snapshot.vlog_version, pointer)
             },
             &schema,
             column_family_id,

@@ -575,7 +575,7 @@ mod tests {
         let _ = fs.create_dir(&snapshot_dir);
         let _ = fs.create_dir(&schema_dir);
         let mut schema_writer = fs.open_write(&schema_path).unwrap();
-        let schema_payload = br#"{"format_version":1,"id":0,"column_families":[{"id":0,"name":"default","merge_operator_ids":[],"column_metadata":[null],"evolution_id":"noop"}]}"#;
+        let schema_payload = br#"{"format_version":1,"id":0,"column_families":[{"id":0,"name":"default","merge_operator_ids":[],"column_metadata":[null],"options":{"value_has_ttl":true},"evolution_id":"noop"}]}"#;
         let schema_bytes = encode_metadata_payload_for_test(schema_payload);
         schema_writer.write(&schema_bytes).unwrap();
         schema_writer.close().unwrap();
