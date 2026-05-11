@@ -681,7 +681,8 @@ impl SSTIterator {
             block.decode_prefix_key_into(self.current_entry_idx, &mut key)?;
         }
         self.cached_prefix_key_block_id.set(Some(block_id));
-        self.cached_prefix_key_entry_idx.set(Some(self.current_entry_idx));
+        self.cached_prefix_key_entry_idx
+            .set(Some(self.current_entry_idx));
         Ok(())
     }
 
@@ -724,7 +725,8 @@ impl SSTIterator {
         }
         let value = block.value(self.current_entry_idx)?;
         *self.cached_value_bytes.borrow_mut() = Some(value.clone());
-        self.cached_value_entry_idx.set(Some(self.current_entry_idx));
+        self.cached_value_entry_idx
+            .set(Some(self.current_entry_idx));
         Ok(Some(value))
     }
 
@@ -1338,14 +1340,9 @@ mod tests {
 
         {
             let reader_file = fs.open_read("prefix_scan.sst").unwrap();
-            let mut iter = SSTIterator::with_cache(
-                reader_file,
-                0,
-                SSTIteratorOptions::default(),
-                None,
-                None,
-            )
-            .unwrap();
+            let mut iter =
+                SSTIterator::with_cache(reader_file, 0, SSTIteratorOptions::default(), None, None)
+                    .unwrap();
 
             iter.seek_to_first().unwrap();
             for idx in 0..6 {

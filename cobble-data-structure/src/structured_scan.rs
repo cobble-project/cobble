@@ -158,6 +158,19 @@ pub struct StructuredScanSplitScanner {
     structured_schema: Arc<StructuredColumnFamilySchema>,
 }
 
+impl StructuredScanSplitScanner {
+    pub fn consume_next_row<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
+    where
+        F: FnMut(&Bytes, &[Option<StructuredColumnValue>]) -> Result<T>,
+    {
+        let structured_schema = Arc::clone(&self.structured_schema);
+        self.inner.consume_next_row(|key, columns| {
+            let decoded = decode_row(&structured_schema, 0, columns.to_vec())?;
+            consumer(key, &decoded)
+        })
+    }
+}
+
 impl Iterator for StructuredScanSplitScanner {
     type Item = Result<(Bytes, Vec<Option<StructuredColumnValue>>)>;
 
@@ -297,6 +310,66 @@ mod tests {
             ]))
         );
         assert_eq!(results[1].0.as_ref(), b"k2");
+
+        cleanup_root(root);
+    }
+
+    #[test]
+    fn test_structured_scan_split_scanner_consume_next_row() {
+        let root = "/tmp/structured_scan_split_scanner_consume";
+        cleanup_root(root);
+
+        let config = test_config(root);
+        let (_db, shard_input) = write_and_snapshot(&config, test_schema(), |db| {
+            db.put(0, b"k1", 0, b"v1".to_vec()).unwrap();
+            db.merge(0, b"k1", 1, vec![b"a".to_vec()]).unwrap();
+            db.merge(0, b"k1", 1, vec![b"b".to_vec()]).unwrap();
+            db.put(0, b"k2", 0, b"v2".to_vec()).unwrap();
+        });
+
+        let coordinator = DbCoordinator::open(CoordinatorConfig {
+            volumes: vec![VolumeDescriptor::new(
+                format!("file://{}/coordinator", root),
+                vec![
+                    VolumeUsageKind::PrimaryDataPriorityHigh,
+                    VolumeUsageKind::Meta,
+                ],
+            )],
+            snapshot_retention: None,
+        })
+        .unwrap();
+        let global = coordinator
+            .take_global_snapshot(4, vec![shard_input])
+            .unwrap();
+        coordinator.materialize_global_snapshot(&global).unwrap();
+
+        let mut scanner = StructuredScanPlan::new(global)
+            .splits()
+            .remove(0)
+            .create_scanner(config, &StructuredScanOptions::default())
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = scanner
+            .consume_next_row(|key, columns| Ok((key.clone(), columns.to_vec())))
+            .unwrap()
+        {
+            rows.push(row);
+        }
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.as_ref(), b"k1");
+        assert_eq!(
+            rows[0].1[1],
+            Some(StructuredColumnValue::List(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]))
+        );
+        assert_eq!(rows[1].0.as_ref(), b"k2");
+        assert_eq!(
+            rows[1].1[0],
+            Some(StructuredColumnValue::Bytes(Bytes::from_static(b"v2")))
+        );
 
         cleanup_root(root);
     }

@@ -163,8 +163,6 @@ pub(crate) struct ScanCursorHandle {
     inner: Box<StaticScanCursorInner>,
 }
 
-type RawScanValues = Vec<Option<Bytes>>;
-type RawScanRow = (Bytes, RawScanValues);
 enum ScanCursorIter {
     Db(Box<DbIterator<'static>>),
     Split(Box<ScanSplitScanner>),
@@ -214,55 +212,36 @@ impl StaticScanCursorInner {
         if self.exhausted {
             return 0;
         }
-        let row = match self.next_live_row() {
+        let encoded = match self.consume_next_live_row(|key, columns| {
+            write_direct_scan_entry_payload(env, io_addr, io_capacity, key.as_ref(), columns)
+                .map_err(cobble::Error::IoError)
+        }) {
             Ok(row) => row,
             Err(err) => {
                 throw_illegal_state(env, err.to_string());
                 return 0;
             }
         };
-        let Some((key, columns)) = row else {
+        let Some(encoded) = encoded else {
             self.exhausted = true;
             return 0;
         };
-
-        match write_direct_scan_entry_payload(env, io_addr, io_capacity, key.as_ref(), &columns) {
-            Ok(v) => v,
-            Err(err) => {
-                throw_illegal_state(env, err);
-                0
-            }
-        }
+        encoded
     }
 
-    fn next_row(&mut self) -> Option<cobble::Result<RawScanRow>> {
+    fn consume_next_live_row<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
+    where
+        F: FnMut(&Bytes, &[Option<Bytes>]) -> Result<T>,
+    {
         match &mut self.iter {
-            ScanCursorIter::Db(iter) => iter.as_mut().next(),
-            ScanCursorIter::Split(iter) => iter.as_mut().next(),
+            ScanCursorIter::Db(iter) => iter
+                .as_mut()
+                .consume_next_row(|key, columns| consumer(key, columns)),
+            ScanCursorIter::Split(iter) => iter
+                .as_mut()
+                .consume_next_row(|key, columns| consumer(key, columns)),
         }
     }
-
-    fn next_live_row(&mut self) -> Result<Option<RawScanRow>> {
-        loop {
-            match self.next_row() {
-                Some(Ok(row)) => {
-                    if let Some(row) = filter_live_row(row) {
-                        return Ok(Some(row));
-                    }
-                }
-                Some(Err(err)) => return Err(err),
-                None => return Ok(None),
-            }
-        }
-    }
-}
-
-fn filter_live_row(row: RawScanRow) -> Option<RawScanRow> {
-    let (_, columns) = &row;
-    if columns.iter().all(|c| c.is_none()) {
-        return None;
-    }
-    Some(row)
 }
 
 fn encoded_direct_scan_entry_payload_size<T: AsRef<[u8]>>(

@@ -2095,31 +2095,34 @@ impl StructuredScanCursorHandle {
         if self.exhausted {
             return 0;
         }
-        let row = match self.next_row() {
-            Some(Ok(row)) => Some(row),
-            Some(Err(err)) => {
+        let encoded = match self.consume_next_row(|key, cols| {
+            write_direct_scan_row_payload(env, io_addr, io_capacity, key.as_ref(), cols)
+                .map_err(cobble::Error::IoError)
+        }) {
+            Ok(row) => row,
+            Err(err) => {
                 throw_illegal_state(env, err.to_string());
                 return 0;
             }
-            None => None,
         };
-        let Some((key, cols)) = row else {
+        let Some(encoded) = encoded else {
             self.exhausted = true;
             return 0;
         };
-        match write_direct_scan_row_payload(env, io_addr, io_capacity, &key, &cols) {
-            Ok(v) => v,
-            Err(err) => {
-                throw_illegal_state(env, err);
-                0
-            }
-        }
+        encoded
     }
 
-    fn next_row(&mut self) -> Option<cobble::Result<(Bytes, Vec<Option<StructuredColumnValue>>)>> {
+    fn consume_next_row<T, F>(&mut self, mut consumer: F) -> cobble::Result<Option<T>>
+    where
+        F: FnMut(&Bytes, &[Option<StructuredColumnValue>]) -> cobble::Result<T>,
+    {
         match &mut self.iter {
-            StructuredScanCursorIter::Db(iter) => iter.as_mut().next(),
-            StructuredScanCursorIter::Split(iter) => iter.as_mut().next(),
+            StructuredScanCursorIter::Db(iter) => iter
+                .as_mut()
+                .consume_next_row(|key, columns| consumer(key, columns)),
+            StructuredScanCursorIter::Split(iter) => iter
+                .as_mut()
+                .consume_next_row(|key, columns| consumer(key, columns)),
         }
     }
 }

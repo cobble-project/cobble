@@ -1420,6 +1420,18 @@ impl<'a> StructuredDbIterator<'a> {
             now_seconds,
         }
     }
+
+    pub fn consume_next_row<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
+    where
+        F: FnMut(&Bytes, &[Option<StructuredColumnValue>]) -> Result<T>,
+    {
+        let structured_schema = Arc::clone(&self.structured_schema);
+        let now_seconds = self.now_seconds;
+        self.inner.consume_next_row(|key, columns| {
+            let decoded = decode_row(&structured_schema, now_seconds, columns.to_vec())?;
+            consumer(key, &decoded)
+        })
+    }
 }
 
 impl Iterator for StructuredDbIterator<'_> {
@@ -2014,6 +2026,66 @@ mod tests {
             }))
         );
 
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_structured_db_iterator_consume_next_row() {
+        let root = format!("/tmp/ds_structured_consume_scan_{}", Uuid::new_v4());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            num_columns: 2,
+            ..Config::default()
+        };
+        let structured_schema = default_family_schema(BTreeMap::from([(
+            1,
+            StructuredColumnType::List(ListConfig {
+                max_elements: Some(8),
+                retain_mode: ListRetainMode::Last,
+                preserve_element_ttl: false,
+            }),
+        )]));
+        let mut db = StructuredDb::open(config, vec![0u16..=0u16]).unwrap();
+        db.apply_schema(structured_schema).unwrap();
+        db.put(0, b"k1", 0, Bytes::from_static(b"v0")).unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"a")])
+            .unwrap();
+        db.merge(0, b"k1", 1, vec![Bytes::from_static(b"b")])
+            .unwrap();
+        db.put(0, b"k2", 0, Bytes::from_static(b"v2")).unwrap();
+
+        let mut iter = db
+            .scan_with_options(
+                0,
+                b"k0".as_ref()..b"k9".as_ref(),
+                &StructuredScanOptions::default(),
+            )
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = iter
+            .consume_next_row(|key, columns| Ok((key.clone(), columns.to_vec())))
+            .unwrap()
+        {
+            rows.push(row);
+        }
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.as_ref(), b"k1");
+        assert_eq!(
+            rows[0].1[1],
+            Some(StructuredColumnValue::List(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ]))
+        );
+        assert_eq!(rows[1].0.as_ref(), b"k2");
+        assert_eq!(
+            rows[1].1[0],
+            Some(StructuredColumnValue::Bytes(Bytes::from_static(b"v2")))
+        );
+
+        drop(iter);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }

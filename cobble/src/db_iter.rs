@@ -10,6 +10,7 @@ use crate::memtable::MemtableManager;
 use crate::schema::Schema;
 use crate::sst::row_codec::decode_key;
 use crate::ttl::TTLProvider;
+use crate::r#type::Key;
 use crate::vlog::VlogStore;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -88,7 +89,7 @@ impl<'a> DbIterator<'a> {
         }
     }
 
-    fn next_row(&mut self) -> Result<Option<(Bytes, Vec<Option<Bytes>>)>> {
+    fn decode_next_row(&mut self) -> Result<Option<(Key, Vec<Option<Bytes>>)>> {
         if self.remaining_rows == Some(0) {
             return Ok(None);
         }
@@ -101,7 +102,7 @@ impl<'a> DbIterator<'a> {
             if self.is_past_end(encoded_key.as_ref()) {
                 return Ok(None);
             }
-            let mut key = decode_key(&mut encoded_key)?;
+            let key = decode_key(&mut encoded_key)?;
             let value = kv_value.into_decoded(self.num_columns)?;
             let columns = value_to_vec_of_columns_with_vlog(
                 value,
@@ -114,13 +115,34 @@ impl<'a> DbIterator<'a> {
                 Some(self.ttl_provider.time_provider()),
             )?;
             if let Some(columns) = columns {
-                if let Some(remaining_rows) = self.remaining_rows.as_mut() {
-                    *remaining_rows -= 1;
-                }
-                return Ok(Some((key.take_data(), columns)));
+                return Ok(Some((key, columns)));
             }
         }
         Ok(None)
+    }
+
+    pub fn consume_next_row<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
+    where
+        F: FnMut(&Bytes, &[Option<Bytes>]) -> Result<T>,
+    {
+        let Some((key, columns)) = self.decode_next_row()? else {
+            return Ok(None);
+        };
+        let consumed = consumer(key.data(), &columns)?;
+        if let Some(remaining_rows) = self.remaining_rows.as_mut() {
+            *remaining_rows -= 1;
+        }
+        Ok(Some(consumed))
+    }
+
+    fn next_row(&mut self) -> Result<Option<(Bytes, Vec<Option<Bytes>>)>> {
+        let Some((mut key, columns)) = self.decode_next_row()? else {
+            return Ok(None);
+        };
+        if let Some(remaining_rows) = self.remaining_rows.as_mut() {
+            *remaining_rows -= 1;
+        }
+        Ok(Some((key.take_data(), columns)))
     }
 }
 
@@ -135,13 +157,19 @@ impl Iterator for DbIterator<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::VolumeDescriptor;
     use crate::db_state::MultiLSMTreeVersion;
     use crate::file::{FileManager, FileSystemRegistry};
     use crate::lsm::LSMTreeVersion;
     use crate::metrics_manager::MetricsManager;
     use crate::schema::SchemaManager;
+    use crate::{Config, Db, WriteBatch};
     use serial_test::serial;
     use std::collections::VecDeque;
+
+    fn cleanup_root(path: &str) {
+        let _ = std::fs::remove_dir_all(path);
+    }
 
     #[test]
     #[serial(file)]
@@ -198,5 +226,45 @@ mod tests {
 
         assert_eq!(iter.num_columns, 1);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_iterator_consume_next_row_passes_bytes_key() {
+        let root = "/tmp/db_iterator_consume_next_row";
+        cleanup_root(root);
+
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}/db", root)),
+            num_columns: 2,
+            total_buckets: 4,
+            ..Config::default()
+        };
+        let db = Db::open(config, vec![0u16..=3u16]).unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(0, b"key1", 0, b"a0");
+        batch.put(0, b"key1", 1, b"a1");
+        batch.put(0, b"key2", 0, b"b0");
+        db.write_batch(batch).unwrap();
+
+        let mut iter = db.scan(0, b"key1"..b"key9").unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = iter
+            .consume_next_row(|key, columns| Ok((key.clone(), columns.to_vec())))
+            .unwrap()
+        {
+            rows.push(row);
+        }
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.as_ref(), b"key1");
+        assert_eq!(rows[0].1.len(), 2);
+        assert_eq!(rows[0].1[0].as_deref(), Some(b"a0".as_slice()));
+        assert_eq!(rows[0].1[1].as_deref(), Some(b"a1".as_slice()));
+        assert_eq!(rows[1].0.as_ref(), b"key2");
+        assert_eq!(rows[1].1[0].as_deref(), Some(b"b0".as_slice()));
+        assert_eq!(rows[1].1[1].as_deref(), None);
+
+        cleanup_root(root);
     }
 }

@@ -638,7 +638,12 @@ impl Block {
         Ok(())
     }
 
-    fn apply_prefix_entry(&self, entry_idx: usize, restart_idx: usize, key: &mut Vec<u8>) -> Result<()> {
+    fn apply_prefix_entry(
+        &self,
+        entry_idx: usize,
+        restart_idx: usize,
+        key: &mut Vec<u8>,
+    ) -> Result<()> {
         let data = self.data.as_ref();
         let offset = self.offsets[entry_idx] as usize;
         if offset + 10 > data.len() {
