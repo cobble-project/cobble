@@ -206,6 +206,11 @@ impl Key {
     pub(crate) fn data(&self) -> &Bytes {
         &self.data
     }
+
+    /// Take & return the ownership of the data.
+    pub(crate) fn take_data(&mut self) -> Bytes {
+        std::mem::take(&mut self.data)
+    }
 }
 
 pub(crate) fn key_bucket(key: &[u8]) -> Option<u16> {

@@ -101,7 +101,7 @@ impl<'a> DbIterator<'a> {
             if self.is_past_end(encoded_key.as_ref()) {
                 return Ok(None);
             }
-            let key = decode_key(&mut encoded_key)?;
+            let mut key = decode_key(&mut encoded_key)?;
             let value = kv_value.into_decoded(self.num_columns)?;
             let columns = value_to_vec_of_columns_with_vlog(
                 value,
@@ -117,7 +117,7 @@ impl<'a> DbIterator<'a> {
                 if let Some(remaining_rows) = self.remaining_rows.as_mut() {
                     *remaining_rows -= 1;
                 }
-                return Ok(Some((Bytes::copy_from_slice(key.data()), columns)));
+                return Ok(Some((key.take_data(), columns)));
             }
         }
         Ok(None)
