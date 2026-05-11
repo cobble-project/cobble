@@ -159,6 +159,16 @@ try (io.cobble.structured.DirectEncodedRow row =
 ### 4) Scan (local + distributed)
 
 ```java
+try (ScanCursor cursor = db.scanWithOptions(0, start, end, ScanOptions.forColumns(0))) {
+    for (ScanCursor.Entry entry = cursor.nextEntry();
+            entry != null;
+            entry = cursor.nextEntry()) {
+        consume(entry.key, entry.columns[0]);
+    }
+}
+```
+
+```java
 try (DirectScanCursor cursor = db.scanDirectWithOptions(0, startBuf, startLen, endBuf, endLen, null)) {
     for (DirectScanEntry e : cursor) {
         ByteBuffer k = e.getKey();
@@ -167,27 +177,38 @@ try (DirectScanCursor cursor = db.scanDirectWithOptions(0, startBuf, startLen, e
 ```
 
 ```java
-try (io.cobble.structured.DirectScanCursor cursor =
-        sdb.scanDirectWithOptions(0, startBuf, startLen, endBuf, endLen, null)) {
-    while (true) {
-        try (io.cobble.structured.DirectEncodedScanBatch batch = cursor.nextEncodedBatch()) {
-            if (batch.size() == 0) {
-                break;
-            }
-            for (io.cobble.structured.DirectEncodedScanRow row = batch.nextRow();
-                    row != null;
-                    row = batch.nextRow()) {
-                consume(row.getKey(), row.decodeBytesColumn(0, MyCodec::decode));
-            }
-        }
+try (io.cobble.structured.ScanCursor cursor =
+        sdb.scanWithOptions(0, start, end, io.cobble.structured.ScanOptions.forColumns(0))) {
+    for (io.cobble.structured.Row row = cursor.nextRow();
+            row != null;
+            row = cursor.nextRow()) {
+        consume(row.getKey(), row.getBytes(0));
     }
 }
 ```
 
 ```java
+try (io.cobble.structured.DirectScanCursor cursor =
+        sdb.scanDirectWithOptions(0, startBuf, startLen, endBuf, endLen, null)) {
+    for (io.cobble.structured.DirectScanRow row = cursor.nextRow();
+            row != null;
+            row = cursor.nextRow()) {
+        consume(row.getKey(), row.decodeBytesColumn(0, MyCodec::decode));
+    }
+}
+```
+
+Structured `DirectScanRow` exposes the key as a direct `ByteBuffer`; column values are decoded on
+demand from the encoded row payload.
+
+```java
 ScanPlan plan = ScanPlan.fromGlobalSnapshot(manifest);
 for (ScanSplit split : plan.splits()) {
-    try (ScanCursor c = split.openScannerWithOptions("config.yaml", ScanOptions.forColumns(0))) {}
+    try (ScanCursor c = split.openScannerWithOptions("config.yaml", ScanOptions.forColumns(0))) {
+        for (ScanCursor.Entry entry : c) {
+            consume(entry.key, entry.columns[0]);
+        }
+    }
 }
 ```
 

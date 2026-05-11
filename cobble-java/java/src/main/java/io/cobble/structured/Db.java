@@ -734,8 +734,9 @@ public final class Db extends NativeObject {
     /**
      * Open a structured direct scan cursor with caller-owned direct range buffers.
      *
-     * <p>The direct cursor keeps batch payloads in pooled direct buffers so scan results can be
-     * consumed without JNI byte[] materialization.
+     * <p>The direct cursor reuses a pooled direct buffer and returns one row at a time without JNI
+     * byte[] materialization. Each returned row stays valid only until the cursor advances again or
+     * closes.
      */
     public DirectScanCursor scanDirectWithOptions(
             int bucket,
@@ -802,7 +803,7 @@ public final class Db extends NativeObject {
             }
             ByteBuffer resultBuffer =
                     DirectIoUtils.resolveEncodedBuffer(
-                            ioBuffer, encodedLength, getLastDirectOverflowBuffer());
+                            ioBuffer, encodedLength, Db::getLastDirectOverflowBuffer);
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
                 usingPooledForResult = true;
@@ -867,7 +868,7 @@ public final class Db extends NativeObject {
             }
             ByteBuffer resultBuffer =
                     DirectIoUtils.resolveEncodedBuffer(
-                            ioBuffer, encodedLength, getLastDirectOverflowBuffer());
+                            ioBuffer, encodedLength, Db::getLastDirectOverflowBuffer);
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
                 usingPooledForResult = true;

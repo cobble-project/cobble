@@ -2,6 +2,7 @@ package io.cobble;
 
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
+import java.util.function.Supplier;
 
 /** Shared helpers for direct-memory Cobble Java APIs. */
 public final class DirectIoUtils {
@@ -15,10 +16,11 @@ public final class DirectIoUtils {
     }
 
     public static ByteBuffer resolveEncodedBuffer(
-            ByteBuffer ioBuffer, int encodedLength, ByteBuffer overflowBuffer) {
+            ByteBuffer ioBuffer, int encodedLength, Supplier<ByteBuffer> overflowBufferSupplier) {
         if (encodedLength > 0) {
             return ioBuffer;
         }
+        ByteBuffer overflowBuffer = overflowBufferSupplier.get();
         if (overflowBuffer == null) {
             throw new IllegalStateException("missing overflow direct buffer from JNI");
         }

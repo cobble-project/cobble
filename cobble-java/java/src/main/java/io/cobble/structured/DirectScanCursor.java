@@ -1,125 +1,50 @@
 package io.cobble.structured;
 
-import io.cobble.BatchIterator;
 import io.cobble.DirectIoUtils;
 import io.cobble.NativeObject;
 
 import java.nio.ByteBuffer;
 import java.util.Iterator;
+import java.util.NoSuchElementException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * A native-backed structured scan cursor that delivers direct-buffer-backed scan rows.
+ * A native-backed structured scan cursor that reuses one direct io buffer for row-at-a-time
+ * traversal.
  *
- * <p>Each batch remains valid until the cursor advances to the next batch or closes.
+ * <p>Each returned row remains valid only until the cursor advances again or closes.
  */
 public final class DirectScanCursor extends NativeObject implements Iterable<DirectScanRow> {
     private final DirectBufferPool pool;
+    private final ByteBuffer ioBuffer;
+    private final AtomicBoolean ioBufferReleased = new AtomicBoolean(false);
     private boolean iteratorCreated = false;
-    private Runnable currentBatchCloser = () -> {};
 
     DirectScanCursor(long nativeHandle, DirectBufferPool pool) {
         super(nativeHandle);
         this.pool = pool;
+        this.ioBuffer = pool.acquire();
     }
 
-    public DirectScanBatch nextBatch() {
-        closeCurrentBatch();
+    /**
+     * Returns the next structured direct scan row, or {@code null} when the cursor is exhausted.
+     *
+     * <p>The returned row remains valid only until the next cursor advance or close.
+     */
+    public DirectScanRow nextRow() {
         if (nativeHandle == 0L) {
             throw new IllegalStateException("direct scan cursor is disposed");
         }
-        ByteBuffer pooled = pool.acquire();
-        boolean pooledReleased = false;
-        try {
-            int encodedLength =
-                    nextBatchDirectInternal(
-                            nativeHandle, DirectIoUtils.directAddress(pooled), pooled.capacity());
-            if (encodedLength == 0) {
-                pool.release(pooled);
-                pooledReleased = true;
-                DirectScanBatch batch = DirectScanBatch.empty();
-                currentBatchCloser = batch::close;
-                return batch;
-            }
-            ByteBuffer resultBuffer =
-                    DirectIoUtils.resolveEncodedBuffer(
-                            pooled, encodedLength, Db.getLastDirectOverflowBuffer());
-            int decodedLength = Math.abs(encodedLength);
-            if (resultBuffer == pooled) {
-                AtomicBoolean released = new AtomicBoolean(false);
-                DirectScanBatch batch =
-                        DirectScanBatch.decode(
-                                resultBuffer,
-                                decodedLength,
-                                () -> {
-                                    if (released.compareAndSet(false, true)) {
-                                        pool.release(pooled);
-                                    }
-                                });
-                currentBatchCloser = batch::close;
-                return batch;
-            }
-            pool.release(pooled);
-            pooledReleased = true;
-            DirectScanBatch batch = DirectScanBatch.decode(resultBuffer, decodedLength, null);
-            currentBatchCloser = batch::close;
-            return batch;
-        } catch (RuntimeException e) {
-            if (!pooledReleased) {
-                pool.release(pooled);
-            }
-            throw e;
+        int encodedLength =
+                nextRowDirectInternal(
+                        nativeHandle, DirectIoUtils.directAddress(ioBuffer), ioBuffer.capacity());
+        if (encodedLength == 0) {
+            return null;
         }
-    }
-
-    public DirectEncodedScanBatch nextEncodedBatch() {
-        closeCurrentBatch();
-        if (nativeHandle == 0L) {
-            throw new IllegalStateException("direct scan cursor is disposed");
-        }
-        ByteBuffer pooled = pool.acquire();
-        boolean pooledReleased = false;
-        try {
-            int encodedLength =
-                    nextBatchDirectInternal(
-                            nativeHandle, DirectIoUtils.directAddress(pooled), pooled.capacity());
-            if (encodedLength == 0) {
-                pool.release(pooled);
-                pooledReleased = true;
-                DirectEncodedScanBatch batch = DirectEncodedScanBatch.empty();
-                currentBatchCloser = batch::close;
-                return batch;
-            }
-            ByteBuffer resultBuffer =
-                    DirectIoUtils.resolveEncodedBuffer(
-                            pooled, encodedLength, Db.getLastDirectOverflowBuffer());
-            int decodedLength = Math.abs(encodedLength);
-            if (resultBuffer == pooled) {
-                AtomicBoolean released = new AtomicBoolean(false);
-                DirectEncodedScanBatch batch =
-                        DirectEncodedScanBatch.decode(
-                                resultBuffer,
-                                decodedLength,
-                                () -> {
-                                    if (released.compareAndSet(false, true)) {
-                                        pool.release(pooled);
-                                    }
-                                });
-                currentBatchCloser = batch::close;
-                return batch;
-            }
-            pool.release(pooled);
-            pooledReleased = true;
-            DirectEncodedScanBatch batch =
-                    DirectEncodedScanBatch.decode(resultBuffer, decodedLength, null);
-            currentBatchCloser = batch::close;
-            return batch;
-        } catch (RuntimeException e) {
-            if (!pooledReleased) {
-                pool.release(pooled);
-            }
-            throw e;
-        }
+        ByteBuffer resultBuffer =
+                DirectIoUtils.resolveEncodedBuffer(
+                        ioBuffer, encodedLength, Db::getLastDirectOverflowBuffer);
+        return DirectScanRow.decode(resultBuffer, Math.abs(encodedLength));
     }
 
     @Override
@@ -128,43 +53,46 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
             throw new IllegalStateException("DirectScanCursor supports only a single traversal");
         }
         iteratorCreated = true;
-        return new BatchIterator<>(
-                () -> {
-                    DirectScanBatch batch = nextBatch();
-                    return new BatchIterator.Batch<DirectScanRow>() {
-                        @Override
-                        public int size() {
-                            return batch.size();
-                        }
+        return new Iterator<DirectScanRow>() {
+            private DirectScanRow nextRow;
+            private boolean loaded;
 
-                        @Override
-                        public DirectScanRow get(int index) {
-                            return batch.getRow(index);
-                        }
+            @Override
+            public boolean hasNext() {
+                if (!loaded) {
+                    nextRow = DirectScanCursor.this.nextRow();
+                    loaded = true;
+                }
+                return nextRow != null;
+            }
 
-                        @Override
-                        public boolean hasMore() {
-                            return batch.hasMore;
-                        }
-                    };
-                });
+            @Override
+            public DirectScanRow next() {
+                if (!hasNext()) {
+                    throw new NoSuchElementException("No more direct scan rows.");
+                }
+                DirectScanRow result = nextRow;
+                nextRow = null;
+                loaded = false;
+                return result;
+            }
+        };
     }
 
     @Override
     public void close() {
-        closeCurrentBatch();
-        super.close();
-    }
-
-    private void closeCurrentBatch() {
-        Runnable closer = currentBatchCloser;
-        currentBatchCloser = () -> {};
-        closer.run();
+        try {
+            super.close();
+        } finally {
+            if (ioBufferReleased.compareAndSet(false, true)) {
+                pool.release(ioBuffer);
+            }
+        }
     }
 
     @Override
     protected native void disposeInternal(long nativeHandle);
 
-    private static native int nextBatchDirectInternal(
+    private static native int nextRowDirectInternal(
             long nativeHandle, long ioAddress, int ioCapacity);
 }

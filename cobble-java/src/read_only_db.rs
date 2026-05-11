@@ -215,10 +215,7 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openScanCursor(
             }
         },
     };
-    Box::into_raw(Box::new(ScanCursorHandle::from_static_iter(
-        iter,
-        args.batch_size,
-    ))) as jlong
+    Box::into_raw(Box::new(ScanCursorHandle::from_static_iter(iter))) as jlong
 }
 
 #[unsafe(no_mangle)]

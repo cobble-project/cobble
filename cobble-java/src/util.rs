@@ -333,42 +333,6 @@ fn allocate_direct_byte_buffer<'local>(
     Ok(JByteBuffer::from(obj))
 }
 
-pub(crate) fn new_scan_batch<'local>(
-    env: &mut JNIEnv<'local>,
-    keys_obj: &JObject<'local>,
-    values_obj: &JObject<'local>,
-    next_obj: &JObject<'local>,
-    has_more: bool,
-) -> Result<JObject<'local>, String> {
-    let args = [
-        JValue::Object(keys_obj).as_jni(),
-        JValue::Object(values_obj).as_jni(),
-        JValue::Object(next_obj).as_jni(),
-        JValue::Bool(if has_more { 1 } else { 0 }).as_jni(),
-    ];
-    let class = scan_batch_class(env)?;
-    let ctor = scan_batch_ctor(env)?;
-    unsafe { env.new_object_unchecked(class, ctor, &args) }.map_err(|err| err.to_string())
-}
-
-pub(crate) fn new_structured_scan_batch<'local>(
-    env: &mut JNIEnv<'local>,
-    keys_obj: &JObject<'local>,
-    rows_obj: &JObject<'local>,
-    next_obj: &JObject<'local>,
-    has_more: bool,
-) -> Result<JObject<'local>, String> {
-    let args = [
-        JValue::Object(keys_obj).as_jni(),
-        JValue::Object(rows_obj).as_jni(),
-        JValue::Object(next_obj).as_jni(),
-        JValue::Bool(if has_more { 1 } else { 0 }).as_jni(),
-    ];
-    let class = structured_scan_batch_class(env)?;
-    let ctor = structured_scan_batch_ctor(env)?;
-    unsafe { env.new_object_unchecked(class, ctor, &args) }.map_err(|err| err.to_string())
-}
-
 pub(crate) fn object_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
     static CLASS: OnceLock<GlobalRef> = OnceLock::new();
     cached_class(env, &CLASS, "java/lang/Object")
@@ -399,16 +363,6 @@ fn illegal_argument_exception_class(env: &mut JNIEnv) -> Result<&'static GlobalR
     cached_class(env, &CLASS, "java/lang/IllegalArgumentException")
 }
 
-fn scan_batch_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
-    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
-    cached_class(env, &CLASS, "io/cobble/ScanBatch")
-}
-
-fn structured_scan_batch_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
-    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
-    cached_class(env, &CLASS, "io/cobble/structured/ScanBatch")
-}
-
 fn completable_future_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
     static CLASS: OnceLock<GlobalRef> = OnceLock::new();
     cached_class(env, &CLASS, "java/util/concurrent/CompletableFuture")
@@ -424,18 +378,6 @@ fn illegal_argument_exception_ctor(env: &mut JNIEnv) -> Result<JMethodID, String
     static METHOD: OnceLock<JMethodID> = OnceLock::new();
     let class = illegal_argument_exception_class(env)?;
     cached_constructor_id(env, &METHOD, class, "(Ljava/lang/String;)V")
-}
-
-fn scan_batch_ctor(env: &mut JNIEnv) -> Result<JMethodID, String> {
-    static METHOD: OnceLock<JMethodID> = OnceLock::new();
-    let class = scan_batch_class(env)?;
-    cached_constructor_id(env, &METHOD, class, "([[B[[[B[BZ)V")
-}
-
-fn structured_scan_batch_ctor(env: &mut JNIEnv) -> Result<JMethodID, String> {
-    static METHOD: OnceLock<JMethodID> = OnceLock::new();
-    let class = structured_scan_batch_class(env)?;
-    cached_constructor_id(env, &METHOD, class, "([[B[[Ljava/lang/Object;[BZ)V")
 }
 
 fn completable_future_complete_method(env: &mut JNIEnv) -> Result<JMethodID, String> {

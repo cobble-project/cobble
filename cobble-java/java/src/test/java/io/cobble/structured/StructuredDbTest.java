@@ -142,15 +142,8 @@ class StructuredDbTest {
                             "metrics-".getBytes(StandardCharsets.UTF_8),
                             "metrics.~".getBytes(StandardCharsets.UTF_8),
                             "metrics")) {
-                ScanBatch batch = cursor.nextBatch();
-                for (int i = 0; i < batch.size(); i++) {
-                    rows.add(batch.getRow(i));
-                }
-                while (batch.hasMore) {
-                    batch = cursor.nextBatch();
-                    for (int i = 0; i < batch.size(); i++) {
-                        rows.add(batch.getRow(i));
-                    }
+                for (Row scannedRow : cursor) {
+                    rows.add(scannedRow);
                 }
             }
             assertEquals(1, rows.size());
@@ -323,35 +316,23 @@ class StructuredDbTest {
 
             List<Row> allRows = new ArrayList<Row>();
             try (ScanCursor cursor = db.scan(0, start, end)) {
-                ScanBatch batch = cursor.nextBatch();
-                // Check raw batch structure
-                assertTrue(batch.size() > 0, "batch should have at least one row");
+                Row firstScanned = cursor.nextRow();
+                assertNotNull(firstScanned, "scan should have at least one row");
                 assertEquals(
-                        2,
-                        batch.rawColumns[0].length,
-                        "raw columns for first row should have 2 entries");
-                for (int i = 0; i < batch.size(); i++) {
-                    allRows.add(batch.getRow(i));
-                }
-                while (batch.hasMore) {
-                    batch = cursor.nextBatch();
-                    for (int i = 0; i < batch.size(); i++) {
-                        allRows.add(batch.getRow(i));
-                    }
+                        2, firstScanned.getColumnCount(), "first scan row should have 2 entries");
+                allRows.add(firstScanned);
+                for (Row row = cursor.nextRow(); row != null; row = cursor.nextRow()) {
+                    allRows.add(row);
                 }
             }
 
             assertEquals(count, allRows.size());
 
-            try (ScanOptions scanOptions = new ScanOptions().batchSize(4).maxRows(3)) {
+            try (ScanOptions scanOptions = new ScanOptions().maxRows(3)) {
                 int limitedRows = 0;
                 try (ScanCursor cursor = db.scanWithOptions(0, start, end, scanOptions)) {
-                    while (true) {
-                        ScanBatch batch = cursor.nextBatch();
-                        limitedRows += batch.size();
-                        if (!batch.hasMore) {
-                            break;
-                        }
+                    for (Row ignored : cursor) {
+                        limitedRows++;
                     }
                 }
                 assertTrue(limitedRows > 0 && limitedRows <= 3);
@@ -592,7 +573,7 @@ class StructuredDbTest {
             assertEquals(1, splits.size());
 
             StructuredScanSplit split = StructuredScanSplit.fromJson(splits.get(0).toJson());
-            try (ScanOptions options = new ScanOptions().batchSize(7).columns(1);
+            try (ScanOptions options = new ScanOptions().columns(1);
                     ScanCursor cursor = split.openScannerWithOptions(config, options)) {
                 java.util.List<Row> rows = new ArrayList<Row>();
                 for (Row row : cursor) {
@@ -825,7 +806,7 @@ class StructuredDbTest {
             ((Buffer) endBuffer).clear();
             endBuffer.put(end);
 
-            try (ScanOptions options = new ScanOptions().batchSize(2).columns(0);
+            try (ScanOptions options = new ScanOptions().columns(0);
                     DirectScanCursor cursor =
                             db.scanDirectWithOptions(
                                     0, startBuffer, start.length, endBuffer, end.length, options)) {
@@ -833,7 +814,8 @@ class StructuredDbTest {
                 java.util.List<byte[]> seenValues = new ArrayList<>();
                 for (DirectScanRow row : cursor) {
                     seenKeys.add(readDirectBytes(row.getKey()));
-                    seenValues.add(readDirectBytes(row.getBytes(0)));
+                    seenValues.add(
+                            row.decodeBytesColumn(0, StructuredDbTest::readInputStreamBytes));
                 }
 
                 assertEquals(5, seenKeys.size());
@@ -855,7 +837,7 @@ class StructuredDbTest {
     }
 
     @Test
-    void structuredDirectEncodedScanBatchSupportsNextRowTraversal() throws IOException {
+    void structuredDirectScanCursorSupportsNextRowTraversal() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-direct-encoded-scan-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
 
@@ -875,37 +857,24 @@ class StructuredDbTest {
             ((Buffer) endBuffer).clear();
             endBuffer.put(end);
 
-            try (ScanOptions options = new ScanOptions().batchSize(2).columns(0);
+            try (ScanOptions options = new ScanOptions().columns(0);
                     DirectScanCursor cursor =
                             db.scanDirectWithOptions(
                                     0, startBuffer, start.length, endBuffer, end.length, options)) {
                 java.util.List<String> seen = new ArrayList<>();
                 while (true) {
-                    DirectEncodedScanBatch batch = cursor.nextEncodedBatch();
-                    if (batch.size() == 0) {
-                        assertFalse(batch.hasMore);
+                    DirectScanRow row = cursor.nextRow();
+                    if (row == null) {
                         break;
                     }
-                    try {
-                        while (true) {
-                            DirectEncodedScanRow row = batch.nextRow();
-                            if (row == null) {
-                                break;
-                            }
-                            String keyString =
-                                    new String(
-                                            readDirectBytes(row.getKey()), StandardCharsets.UTF_8);
-                            String valueString =
-                                    new String(
-                                            row.decodeBytesColumn(
-                                                    0, StructuredDbTest::readInputStreamBytes),
-                                            StandardCharsets.UTF_8);
-                            seen.add(keyString + "=" + valueString);
-                        }
-                        assertNull(batch.nextRow());
-                    } finally {
-                        batch.close();
-                    }
+                    String keyString =
+                            new String(readDirectBytes(row.getKey()), StandardCharsets.UTF_8);
+                    String valueString =
+                            new String(
+                                    row.decodeBytesColumn(
+                                            0, StructuredDbTest::readInputStreamBytes),
+                                    StandardCharsets.UTF_8);
+                    seen.add(keyString + "=" + valueString);
                 }
 
                 assertEquals(5, seen.size());
@@ -916,7 +885,7 @@ class StructuredDbTest {
     }
 
     @Test
-    void structuredDirectScanSupportsNullOptionsAndBatchTraversal() throws IOException {
+    void structuredDirectScanSupportsNullOptionsAndNextRowTraversal() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-direct-scan-null-opt-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
 
@@ -943,17 +912,27 @@ class StructuredDbTest {
             try (DirectScanCursor cursor =
                     db.scanDirectWithOptions(
                             0, startBuffer, start.length, endBuffer, end.length, null)) {
-                DirectScanBatch batch1 = cursor.nextBatch();
-                assertEquals(3, batch1.size());
-                assertFalse(batch1.hasMore);
-                assertArrayEquals(start, readDirectBytes(batch1.getRow(0).getKey()));
+                DirectScanRow row1 = cursor.nextRow();
+                assertNotNull(row1);
+                assertEquals(1, row1.getColumnCount());
+                assertArrayEquals(start, readDirectBytes(row1.getKey()));
+                assertArrayEquals(
+                        "st-value-0".getBytes(StandardCharsets.UTF_8),
+                        row1.decodeBytesColumn(0, StructuredDbTest::readInputStreamBytes));
+
+                DirectScanRow row2 = cursor.nextRow();
+                assertNotNull(row2);
+                assertArrayEquals(
+                        "st-direct-null-01".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(row2.getKey()));
+
+                DirectScanRow row3 = cursor.nextRow();
+                assertNotNull(row3);
                 assertArrayEquals(
                         "st-value-2".getBytes(StandardCharsets.UTF_8),
-                        readDirectBytes(batch1.getRow(2).getBytes(0)));
+                        row3.decodeBytesColumn(0, StructuredDbTest::readInputStreamBytes));
 
-                DirectScanBatch batch2 = cursor.nextBatch();
-                assertEquals(0, batch2.size());
-                assertFalse(batch2.hasMore);
+                assertNull(cursor.nextRow());
             }
         }
     }

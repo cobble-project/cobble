@@ -584,7 +584,7 @@ public final class Db extends NativeObject {
         }
         ByteBuffer encoded =
                 DirectIoUtils.resolveEncodedBuffer(
-                        ioBuffer, encodedLength, getLastDirectOverflowBuffer());
+                        ioBuffer, encodedLength, Db::getLastDirectOverflowBuffer);
         int length = Math.abs(encodedLength);
         ByteBuffer view = encoded.duplicate();
         ((Buffer) view).clear();
@@ -625,8 +625,7 @@ public final class Db extends NativeObject {
     /**
      * Open a direct scan cursor with caller-owned direct range buffers.
      *
-     * <p>The direct cursor keeps each batch payload in pooled direct buffers and exposes zero-copy
-     * key/value slices.
+     * <p>The direct cursor reuses one pooled direct buffer and exposes zero-copy entry views.
      */
     public DirectScanCursor scanDirectWithOptions(
             int bucket,
@@ -693,7 +692,7 @@ public final class Db extends NativeObject {
             }
             ByteBuffer resultBuffer =
                     DirectIoUtils.resolveEncodedBuffer(
-                            ioBuffer, encodedLength, getLastDirectOverflowBuffer());
+                            ioBuffer, encodedLength, Db::getLastDirectOverflowBuffer);
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
                 usingPooledForResult = true;
@@ -758,7 +757,7 @@ public final class Db extends NativeObject {
             }
             ByteBuffer resultBuffer =
                     DirectIoUtils.resolveEncodedBuffer(
-                            ioBuffer, encodedLength, getLastDirectOverflowBuffer());
+                            ioBuffer, encodedLength, Db::getLastDirectOverflowBuffer);
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
                 usingPooledForResult = true;

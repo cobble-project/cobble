@@ -595,7 +595,6 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_openStructuredScanCurs
     ) else {
         return 0;
     };
-    let batch_size = args.batch_size;
     let range = args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice();
     let iter = if let Some(scan_options_handle) = args.scan_options_handle {
         match db.scan_with_options(args.bucket, range, scan_options_handle.scan_options()) {
@@ -622,7 +621,7 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_openStructuredScanCurs
             cobble_data_structure::StructuredDbIterator<'static>,
         >(iter)
     };
-    let cursor = StructuredScanCursorHandle::new(iter, batch_size);
+    let cursor = StructuredScanCursorHandle::new(iter);
     Box::into_raw(Box::new(cursor)) as jlong
 }
 

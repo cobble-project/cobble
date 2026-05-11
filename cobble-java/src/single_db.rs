@@ -702,10 +702,7 @@ pub extern "system" fn Java_io_cobble_SingleDb_openScanCursor(
             }
         },
     };
-    Box::into_raw(Box::new(ScanCursorHandle::from_static_iter(
-        iter,
-        args.batch_size,
-    ))) as jlong
+    Box::into_raw(Box::new(ScanCursorHandle::from_static_iter(iter))) as jlong
 }
 
 fn single_db_from_handle_or_throw(

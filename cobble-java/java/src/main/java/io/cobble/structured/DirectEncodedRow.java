@@ -58,6 +58,10 @@ public final class DirectEncodedRow implements AutoCloseable {
 
     /** Returns whether the target column is NULL. */
     public boolean isNull(int column) {
+        return columnTag(column) == TAG_NULL;
+    }
+
+    byte columnTag(int column) {
         int offset = 0;
         int columnCount =
                 DirectIoUtils.readLength(address, length, offset, "column count", PAYLOAD_NAME);
@@ -69,7 +73,7 @@ public final class DirectEncodedRow implements AutoCloseable {
             switch (tag) {
                 case TAG_NULL:
                     if (i == column) {
-                        return true;
+                        return TAG_NULL;
                     }
                     break;
                 case TAG_BYTES:
@@ -78,7 +82,7 @@ public final class DirectEncodedRow implements AutoCloseable {
                                     address, length, offset, "bytes length", PAYLOAD_NAME);
                     offset += Integer.BYTES;
                     if (i == column) {
-                        return false;
+                        return TAG_BYTES;
                     }
                     offset = skipBytes(offset, bytesLength);
                     break;
@@ -88,7 +92,7 @@ public final class DirectEncodedRow implements AutoCloseable {
                                     address, length, offset, "list element count", PAYLOAD_NAME);
                     offset += Integer.BYTES;
                     if (i == column) {
-                        return false;
+                        return TAG_LIST;
                     }
                     offset = skipList(offset, elementCount);
                     break;

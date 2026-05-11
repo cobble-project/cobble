@@ -44,7 +44,6 @@ class NativeLoaderTest {
         assertNotNull(ReadOptions.class);
         assertNotNull(WriteOptions.class);
         assertNotNull(ScanCursor.class);
-        assertNotNull(ScanBatch.class);
     }
 
     @Test

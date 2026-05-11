@@ -23,14 +23,6 @@ public final class ScanOptions extends NativeObject {
         return this;
     }
 
-    public ScanOptions batchSize(int value) {
-        if (value <= 0) {
-            throw new IllegalArgumentException("batchSize must be > 0");
-        }
-        setBatchSize(nativeHandle, value);
-        return this;
-    }
-
     public ScanOptions maxRows(int value) {
         if (value <= 0) {
             throw new IllegalArgumentException("maxRows must be > 0");
@@ -91,8 +83,6 @@ public final class ScanOptions extends NativeObject {
     }
 
     private static native void setReadAheadBytes(long nativeHandle, int readAheadBytes);
-
-    private static native void setBatchSize(long nativeHandle, int batchSize);
 
     private static native void setMaxRows(long nativeHandle, int maxRows);
 

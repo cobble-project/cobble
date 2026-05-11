@@ -9,27 +9,19 @@ use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString};
 use jni::sys::{jint, jlong};
 use size::Size;
 
-pub(crate) const DEFAULT_SCAN_BATCH_SIZE: usize = 256;
-
 pub(crate) struct StructuredScanOptionsHandle {
     scan_options: StructuredScanOptions,
-    batch_size: usize,
 }
 
 impl StructuredScanOptionsHandle {
     fn new() -> StructuredScanOptionsHandle {
         StructuredScanOptionsHandle {
             scan_options: StructuredScanOptions::default(),
-            batch_size: DEFAULT_SCAN_BATCH_SIZE,
         }
     }
 
     pub(crate) fn scan_options(&self) -> &StructuredScanOptions {
         &self.scan_options
-    }
-
-    pub(crate) fn batch_size(&self) -> usize {
-        self.batch_size
     }
 }
 
@@ -63,7 +55,6 @@ pub(crate) struct StructuredScanOpenArgs {
     pub(crate) start_key_inclusive: Vec<u8>,
     pub(crate) end_key_exclusive: Vec<u8>,
     pub(crate) scan_options_handle: Option<&'static StructuredScanOptionsHandle>,
-    pub(crate) batch_size: usize,
 }
 
 pub(crate) fn decode_structured_scan_open_args(
@@ -94,18 +85,19 @@ pub(crate) fn decode_structured_scan_open_args(
             return None;
         }
     };
-    let (scan_options_handle, batch_size) = if scan_options_handle == 0 {
-        (None, DEFAULT_SCAN_BATCH_SIZE)
+    let scan_options_handle = if scan_options_handle == 0 {
+        None
     } else {
-        let handle = structured_scan_options_from_handle_or_throw(env, scan_options_handle)?;
-        (Some(handle), handle.batch_size())
+        Some(structured_scan_options_from_handle_or_throw(
+            env,
+            scan_options_handle,
+        )?)
     };
     Some(StructuredScanOpenArgs {
         bucket,
         start_key_inclusive,
         end_key_exclusive,
         scan_options_handle,
-        batch_size,
     })
 }
 
@@ -133,18 +125,19 @@ pub(crate) fn decode_structured_scan_open_direct_args(
     )?;
     let end_key_exclusive =
         decode_direct_bytes(env, "endKeyExclusive", end_key_address, end_key_length)?;
-    let (scan_options_handle, batch_size) = if scan_options_handle == 0 {
-        (None, DEFAULT_SCAN_BATCH_SIZE)
+    let scan_options_handle = if scan_options_handle == 0 {
+        None
     } else {
-        let handle = structured_scan_options_from_handle_or_throw(env, scan_options_handle)?;
-        (Some(handle), handle.batch_size())
+        Some(structured_scan_options_from_handle_or_throw(
+            env,
+            scan_options_handle,
+        )?)
     };
     Some(StructuredScanOpenArgs {
         bucket,
         start_key_inclusive,
         end_key_exclusive,
         scan_options_handle,
-        batch_size,
     })
 }
 
@@ -235,25 +228,6 @@ pub extern "system" fn Java_io_cobble_structured_ScanOptions_setReadAheadBytes(
     let mut raw = scan_options.scan_options.clone().into_cobble();
     raw.read_ahead_bytes = Size::from_const(read_ahead_bytes as i64);
     scan_options.scan_options = StructuredScanOptions::from(raw);
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_structured_ScanOptions_setBatchSize(
-    mut env: JNIEnv,
-    _class: JClass,
-    native_handle: jlong,
-    batch_size: jint,
-) {
-    let Some(scan_options) =
-        structured_scan_options_from_handle_mut_or_throw(&mut env, native_handle)
-    else {
-        return;
-    };
-    if batch_size <= 0 {
-        throw_illegal_argument(&mut env, format!("batchSize must be > 0: {}", batch_size));
-        return;
-    }
-    scan_options.batch_size = batch_size as usize;
 }
 
 #[unsafe(no_mangle)]

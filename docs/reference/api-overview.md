@@ -184,7 +184,7 @@ On the Java side, restore flows are exposed as `Db.restore(..., boolean newDbId)
 | `io.cobble.ScanCursor` | Raw scan iterator cursor |
 | `io.cobble.DirectColumns` | Zero-copy raw direct read view |
 | `io.cobble.DirectEncodedRow` | Raw encoded direct row view with InputStream-based column decoder |
-| `io.cobble.DirectScanCursor` / `DirectScanBatch` / `DirectScanEntry` | Raw direct scan cursor and batch/row views |
+| `io.cobble.DirectScanCursor` / `DirectScanEntry` | Raw direct scan cursor and row view |
 | `io.cobble.structured.SingleDb` | Structured `SingleDb` |
 | `io.cobble.structured.Db` | Structured `Db` |
 | `io.cobble.structured.Schema` / `StructuredSchemaBuilder` | Structured family-aware schema API |
@@ -193,4 +193,4 @@ On the Java side, restore flows are exposed as `Db.restore(..., boolean newDbId)
 | `io.cobble.structured.ScanCursor` | Structured scan iterator cursor |
 | `io.cobble.structured.DirectRow` | Structured zero-copy direct read view, including direct list-element accessors |
 | `io.cobble.structured.DirectEncodedRow` | Structured encoded direct row view with InputStream-based BYTES/LIST decoders |
-| `io.cobble.structured.DirectScanCursor` / `DirectScanBatch` / `DirectEncodedScanBatch` / `DirectScanRow` / `DirectEncodedScanRow` | Structured direct scan cursor and batch/row views |
+| `io.cobble.structured.DirectScanCursor` / `DirectScanRow` | Structured direct scan cursor and row view |

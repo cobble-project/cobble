@@ -6,17 +6,16 @@
 
 use crate::structured_read_options::structured_read_options_from_handle_or_throw;
 use crate::structured_scan_options::{
-    DEFAULT_SCAN_BATCH_SIZE, decode_structured_scan_open_args,
-    decode_structured_scan_open_direct_args, structured_scan_options_from_handle_or_throw,
+    decode_structured_scan_open_args, decode_structured_scan_open_direct_args,
+    structured_scan_options_from_handle_or_throw,
 };
 use crate::structured_write_options::structured_write_options_from_handle_or_throw;
 use crate::util::{
     byte_array_class, complete_future_exceptionally, complete_future_with_string,
     decode_bucket_ranges, decode_java_bytes, decode_java_bytes_ref, decode_java_string,
-    decode_optional_java_string, decode_u16, decode_u64_from_jlong, new_object_array,
-    new_structured_scan_batch, object_array_class, object_class, parse_config_json,
-    take_last_overflow_direct_buffer, throw_illegal_argument, throw_illegal_state,
-    to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
+    decode_optional_java_string, decode_u16, decode_u64_from_jlong, new_object_array, object_class,
+    parse_config_json, take_last_overflow_direct_buffer, throw_illegal_argument,
+    throw_illegal_state, to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
 };
 use bytes::Bytes;
 use cobble::Config;
@@ -1643,7 +1642,6 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredScanCursor(
     ) else {
         return 0;
     };
-    let batch_size = args.batch_size;
     let range = args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice();
     let iter = if let Some(scan_options_handle) = args.scan_options_handle {
         match db.scan_with_options(args.bucket, range, scan_options_handle.scan_options()) {
@@ -1667,7 +1665,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredScanCursor(
     let iter = unsafe {
         std::mem::transmute::<StructuredDbIterator<'_>, StructuredDbIterator<'static>>(iter)
     };
-    let cursor = StructuredScanCursorHandle::new(iter, batch_size);
+    let cursor = StructuredScanCursorHandle::new(iter);
     Box::into_raw(Box::new(cursor)) as jlong
 }
 
@@ -1697,7 +1695,6 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredDirectScanCurs
     ) else {
         return 0;
     };
-    let batch_size = args.batch_size;
     let range = args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice();
     let iter = if let Some(scan_options_handle) = args.scan_options_handle {
         match db.scan_with_options(args.bucket, range, scan_options_handle.scan_options()) {
@@ -1719,7 +1716,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredDirectScanCurs
     let iter = unsafe {
         std::mem::transmute::<StructuredDbIterator<'_>, StructuredDbIterator<'static>>(iter)
     };
-    let cursor = StructuredScanCursorHandle::new(iter, batch_size);
+    let cursor = StructuredScanCursorHandle::new(iter);
     Box::into_raw(Box::new(cursor)) as jlong
 }
 
@@ -1789,9 +1786,9 @@ fn open_structured_split_scan_cursor(
             return 0;
         }
     };
-    let (scanner, batch_size) = if scan_options_handle == 0 {
+    let scanner = if scan_options_handle == 0 {
         match split.create_scanner_without_options(config) {
-            Ok(v) => (v, DEFAULT_SCAN_BATCH_SIZE),
+            Ok(v) => v,
             Err(err) => {
                 throw_illegal_state(env, err.to_string());
                 return 0;
@@ -1804,14 +1801,14 @@ fn open_structured_split_scan_cursor(
             return 0;
         };
         match split.create_scanner(config, options_handle.scan_options()) {
-            Ok(v) => (v, options_handle.batch_size()),
+            Ok(v) => v,
             Err(err) => {
                 throw_illegal_state(env, err.to_string());
                 return 0;
             }
         }
     };
-    let cursor = StructuredScanCursorHandle::new_from_split_scanner(scanner, batch_size);
+    let cursor = StructuredScanCursorHandle::new_from_split_scanner(scanner);
     Box::into_raw(Box::new(cursor)) as jlong
 }
 
@@ -2066,8 +2063,6 @@ pub extern "system" fn Java_io_cobble_structured_Db_shrinkBucket(
 
 pub(crate) struct StructuredScanCursorHandle {
     iter: StructuredScanCursorIter,
-    batch_size: usize,
-    pending: Option<(Bytes, Vec<Option<StructuredColumnValue>>)>,
     exhausted: bool,
 }
 
@@ -2077,77 +2072,21 @@ pub(crate) enum StructuredScanCursorIter {
 }
 
 impl StructuredScanCursorHandle {
-    pub(crate) fn new(iter: StructuredDbIterator<'static>, batch_size: usize) -> Self {
+    pub(crate) fn new(iter: StructuredDbIterator<'static>) -> Self {
         Self {
             iter: StructuredScanCursorIter::Db(Box::new(iter)),
-            batch_size,
-            pending: None,
             exhausted: false,
         }
     }
 
-    pub(crate) fn new_from_split_scanner(
-        scanner: StructuredScanSplitScanner,
-        batch_size: usize,
-    ) -> Self {
+    pub(crate) fn new_from_split_scanner(scanner: StructuredScanSplitScanner) -> Self {
         Self {
             iter: StructuredScanCursorIter::Split(Box::new(scanner)),
-            batch_size,
-            pending: None,
             exhausted: false,
         }
     }
 
-    fn next_batch(&mut self) -> cobble::Result<StructuredScanBatch> {
-        if self.exhausted {
-            return Ok(StructuredScanBatch::empty());
-        }
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(self.batch_size);
-        let mut rows: Vec<Vec<Option<StructuredColumnValue>>> = Vec::with_capacity(self.batch_size);
-
-        if let Some((key, cols)) = self.pending.take() {
-            keys.push(key.to_vec());
-            rows.push(cols);
-        }
-        while keys.len() < self.batch_size {
-            match self.next_row() {
-                Some(Ok((key, cols))) => {
-                    keys.push(key.to_vec());
-                    rows.push(cols);
-                }
-                Some(Err(err)) => return Err(err),
-                None => {
-                    self.exhausted = true;
-                    break;
-                }
-            }
-        }
-        if keys.is_empty() {
-            self.exhausted = true;
-            return Ok(StructuredScanBatch::empty());
-        }
-        let mut has_more = false;
-        if !self.exhausted {
-            match self.next_row() {
-                Some(Ok((key, cols))) => {
-                    self.pending = Some((key, cols));
-                    has_more = true;
-                }
-                Some(Err(err)) => return Err(err),
-                None => {
-                    self.exhausted = true;
-                }
-            }
-        }
-        Ok(StructuredScanBatch {
-            next_start_after_exclusive: keys.last().cloned(),
-            keys,
-            rows,
-            has_more,
-        })
-    }
-
-    fn next_batch_direct<'local>(
+    fn next_row_direct<'local>(
         &mut self,
         env: &mut JNIEnv<'local>,
         io_addr: *mut u8,
@@ -2156,64 +2095,19 @@ impl StructuredScanCursorHandle {
         if self.exhausted {
             return 0;
         }
-        let mut encoded = Vec::new();
-        encoded.extend_from_slice(&0u32.to_be_bytes());
-        encoded.push(0);
-        let mut row_count = 0usize;
-
-        if let Some((key, cols)) = self.pending.take() {
-            if let Err(err) = append_direct_scan_row_payload(&mut encoded, &key, &cols) {
-                throw_illegal_state(env, err);
+        let row = match self.next_row() {
+            Some(Ok(row)) => Some(row),
+            Some(Err(err)) => {
+                throw_illegal_state(env, err.to_string());
                 return 0;
             }
-            row_count += 1;
-        }
-
-        while row_count < self.batch_size {
-            match self.next_row() {
-                Some(Ok((key, cols))) => {
-                    if let Err(err) = append_direct_scan_row_payload(&mut encoded, &key, &cols) {
-                        throw_illegal_state(env, err);
-                        return 0;
-                    }
-                    row_count += 1;
-                }
-                Some(Err(err)) => {
-                    throw_illegal_state(env, err.to_string());
-                    return 0;
-                }
-                None => {
-                    self.exhausted = true;
-                    break;
-                }
-            }
-        }
-
-        if row_count == 0 {
+            None => None,
+        };
+        let Some((key, cols)) = row else {
             self.exhausted = true;
             return 0;
-        }
-
-        let mut has_more = false;
-        if !self.exhausted {
-            match self.next_row() {
-                Some(Ok((key, cols))) => {
-                    self.pending = Some((key, cols));
-                    has_more = true;
-                }
-                Some(Err(err)) => {
-                    throw_illegal_state(env, err.to_string());
-                    return 0;
-                }
-                None => {
-                    self.exhausted = true;
-                }
-            }
-        }
-
-        encoded[0..4].copy_from_slice(&(row_count as u32).to_be_bytes());
-        encoded[4] = if has_more { 1 } else { 0 };
-        match write_payload_to_io_or_cached_overflow(env, io_addr, io_capacity, &encoded) {
+        };
+        match write_direct_scan_row_payload(env, io_addr, io_capacity, &key, &cols) {
             Ok(v) => v,
             Err(err) => {
                 throw_illegal_state(env, err);
@@ -2230,47 +2124,56 @@ impl StructuredScanCursorHandle {
     }
 }
 
-struct StructuredScanBatch {
-    keys: Vec<Vec<u8>>,
-    rows: Vec<Vec<Option<StructuredColumnValue>>>,
-    next_start_after_exclusive: Option<Vec<u8>>,
-    has_more: bool,
-}
-
-impl StructuredScanBatch {
-    fn empty() -> Self {
-        Self {
-            keys: Vec::new(),
-            rows: Vec::new(),
-            next_start_after_exclusive: None,
-            has_more: false,
-        }
-    }
-}
-
-fn append_direct_scan_row_payload(
-    encoded: &mut Vec<u8>,
+fn encoded_direct_scan_row_payload_size(
     key: &[u8],
     columns: &[Option<StructuredColumnValue>],
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let row_size = encoded_row_size(columns)?;
-    let needed = encoded
-        .len()
-        .checked_add(4)
-        .and_then(|v| v.checked_add(key.len()))
+    4usize
+        .checked_add(key.len())
         .and_then(|v| v.checked_add(4))
         .and_then(|v| v.checked_add(row_size))
-        .ok_or_else(|| "encoded direct scan batch size overflow".to_string())?;
-    let previous_len = encoded.len();
-    encoded.resize(needed, 0);
-    encoded[previous_len..previous_len + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
-    let mut cursor = previous_len + 4;
-    encoded[cursor..cursor + key.len()].copy_from_slice(key);
-    cursor += key.len();
-    encoded[cursor..cursor + 4].copy_from_slice(&(row_size as u32).to_be_bytes());
-    cursor += 4;
-    encode_row_payload(columns, &mut encoded[cursor..cursor + row_size])?;
+        .ok_or_else(|| "encoded direct scan row size overflow".to_string())
+}
+
+fn encode_direct_scan_row_payload_into(
+    key: &[u8],
+    columns: &[Option<StructuredColumnValue>],
+    dst: &mut [u8],
+) -> Result<(), String> {
+    let row_size = encoded_row_size(columns)?;
+    let expected_len = encoded_direct_scan_row_payload_size(key, columns)?;
+    if dst.len() != expected_len {
+        return Err(format!(
+            "structured direct scan row payload size mismatch: expected {}, got {}",
+            expected_len,
+            dst.len()
+        ));
+    }
+    dst[0..4].copy_from_slice(&(key.len() as u32).to_be_bytes());
+    let key_end = 4 + key.len();
+    dst[4..key_end].copy_from_slice(key);
+    dst[key_end..key_end + 4].copy_from_slice(&(row_size as u32).to_be_bytes());
+    encode_row_payload(columns, &mut dst[key_end + 4..])?;
     Ok(())
+}
+
+fn write_direct_scan_row_payload<'local>(
+    env: &mut JNIEnv<'local>,
+    io_addr: *mut u8,
+    io_capacity: usize,
+    key: &[u8],
+    columns: &[Option<StructuredColumnValue>],
+) -> Result<jint, String> {
+    let payload_len = encoded_direct_scan_row_payload_size(key, columns)?;
+    if payload_len <= io_capacity {
+        let dst = unsafe { std::slice::from_raw_parts_mut(io_addr, payload_len) };
+        encode_direct_scan_row_payload_into(key, columns, dst)?;
+        return Ok(payload_len as jint);
+    }
+    let mut encoded = vec![0; payload_len];
+    encode_direct_scan_row_payload_into(key, columns, &mut encoded)?;
+    write_payload_to_io_or_cached_overflow(env, io_addr, io_capacity, &encoded)
 }
 
 #[unsafe(no_mangle)]
@@ -2299,32 +2202,24 @@ pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_disposeInterna
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_structured_ScanCursor_nextBatchInternal(
-    mut env: JNIEnv,
-    _class: JClass,
+pub extern "system" fn Java_io_cobble_structured_ScanCursor_nextRowDirectInternal(
+    env: JNIEnv,
+    class: JClass,
     native_handle: jlong,
-) -> jobject {
-    let Some(cursor) = structured_scan_cursor_from_handle(&mut env, native_handle) else {
-        return std::ptr::null_mut();
-    };
-    let batch = match cursor.next_batch() {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
-            return std::ptr::null_mut();
-        }
-    };
-    match to_java_structured_scan_batch(&mut env, batch) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_state(&mut env, err);
-            std::ptr::null_mut()
-        }
-    }
+    io_address: jlong,
+    io_capacity: jint,
+) -> jint {
+    Java_io_cobble_structured_DirectScanCursor_nextRowDirectInternal(
+        env,
+        class,
+        native_handle,
+        io_address,
+        io_capacity,
+    )
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_nextBatchDirectInternal(
+pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_nextRowDirectInternal(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
@@ -2348,7 +2243,7 @@ pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_nextBatchDirec
             return 0;
         }
     };
-    cursor.next_batch_direct(&mut env, io_address, io_capacity)
+    cursor.next_row_direct(&mut env, io_address, io_capacity)
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -2756,72 +2651,6 @@ pub(crate) fn to_java_typed_columns(
         }
     }
     Ok(array.into_raw() as jobject)
-}
-
-fn to_java_structured_scan_batch(
-    env: &mut JNIEnv,
-    batch: StructuredScanBatch,
-) -> std::result::Result<jobject, String> {
-    // keys: byte[][]
-    let byte_array_class = byte_array_class(env)?;
-    let object_array_class = object_array_class(env)?;
-    let object_class = object_class(env)?;
-    let keys_array = new_object_array(env, batch.keys.len() as i32, byte_array_class)?;
-    for (i, key) in batch.keys.iter().enumerate() {
-        let arr = env
-            .byte_array_from_slice(key)
-            .map_err(|err| err.to_string())?;
-        env.set_object_array_element(&keys_array, i as i32, arr)
-            .map_err(|err| err.to_string())?;
-    }
-
-    // rawColumns: Object[][] where each row is Object[] with null | byte[] | byte[][]
-    let rows_array = new_object_array(env, batch.rows.len() as i32, object_array_class)?;
-    for (i, row) in batch.rows.into_iter().enumerate() {
-        let col_array = new_object_array(env, row.len() as i32, object_class)?;
-        for (j, col) in row.into_iter().enumerate() {
-            match col {
-                None => {} // null already
-                Some(StructuredColumnValue::Bytes(b)) => {
-                    let arr = env
-                        .byte_array_from_slice(&b)
-                        .map_err(|err| err.to_string())?;
-                    env.set_object_array_element(&col_array, j as i32, arr)
-                        .map_err(|err| err.to_string())?;
-                }
-                Some(StructuredColumnValue::List(elements)) => {
-                    let inner = new_object_array(env, elements.len() as i32, byte_array_class)?;
-                    for (k, elem) in elements.into_iter().enumerate() {
-                        let elem_arr = env
-                            .byte_array_from_slice(&elem)
-                            .map_err(|err| err.to_string())?;
-                        env.set_object_array_element(&inner, k as i32, elem_arr)
-                            .map_err(|err| err.to_string())?;
-                    }
-                    env.set_object_array_element(&col_array, j as i32, inner)
-                        .map_err(|err| err.to_string())?;
-                }
-            }
-        }
-        env.set_object_array_element(&rows_array, i as i32, col_array)
-            .map_err(|err| err.to_string())?;
-    }
-
-    // next_start_after_exclusive: byte[]
-    let next_raw = match batch.next_start_after_exclusive {
-        Some(v) => env
-            .byte_array_from_slice(&v)
-            .map(|arr| arr.into_raw() as jobject)
-            .map_err(|err| err.to_string())?,
-        None => std::ptr::null_mut(),
-    };
-
-    let keys_obj = unsafe { JObject::from_raw(keys_array.into_raw() as jobject) };
-    let rows_obj = unsafe { JObject::from_raw(rows_array.into_raw() as jobject) };
-    let next_obj = unsafe { JObject::from_raw(next_raw) };
-
-    let result = new_structured_scan_batch(env, &keys_obj, &rows_obj, &next_obj, batch.has_more)?;
-    Ok(result.into_raw())
 }
 
 fn build_shard_snapshot_payload(

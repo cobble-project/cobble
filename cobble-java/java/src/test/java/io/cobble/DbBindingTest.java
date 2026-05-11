@@ -137,12 +137,8 @@ class DbBindingTest {
             byte[] scanEnd = new byte[] {(byte) 0xFF};
             int scannedRows = 0;
             try (ScanCursor cursor = db.scan(0, scanStart, scanEnd)) {
-                while (true) {
-                    ScanBatch batch = cursor.nextBatch();
-                    scannedRows += batch.keys.length;
-                    if (!batch.hasMore) {
-                        break;
-                    }
+                for (ScanCursor.Entry ignored : cursor) {
+                    scannedRows++;
                 }
             }
             int expectedAlive = count - ((count - 1) / 4 + (1 < count ? 0 : -1));
@@ -152,29 +148,19 @@ class DbBindingTest {
             try (ScanOptions scanOptions = new ScanOptions().columns(0)) {
                 try (ScanCursor cursor = db.scanWithOptions(0, scanStart, scanEnd, scanOptions)) {
                     int rows = 0;
-                    while (true) {
-                        ScanBatch batch = cursor.nextBatch();
-                        rows += batch.keys.length;
-                        for (int i = 0; i < batch.values.length; i++) {
-                            assertEquals(1, batch.values[i].length);
-                        }
-                        if (!batch.hasMore) {
-                            break;
-                        }
+                    for (ScanCursor.Entry entry : cursor) {
+                        rows++;
+                        assertEquals(1, entry.columns.length);
                     }
                     assertEquals(210, rows);
                 }
             }
 
-            try (ScanOptions scanOptions = new ScanOptions().columns(0).batchSize(4).maxRows(3)) {
+            try (ScanOptions scanOptions = new ScanOptions().columns(0).maxRows(3)) {
                 try (ScanCursor cursor = db.scanWithOptions(0, scanStart, scanEnd, scanOptions)) {
                     int rows = 0;
-                    while (true) {
-                        ScanBatch batch = cursor.nextBatch();
-                        rows += batch.keys.length;
-                        if (!batch.hasMore) {
-                            break;
-                        }
+                    for (ScanCursor.Entry ignored : cursor) {
+                        rows++;
                     }
                     assertTrue(rows > 0 && rows <= 3);
                 }
@@ -262,8 +248,7 @@ class DbBindingTest {
 
             try (ScanCursor cursor =
                     db.scanWithOptions(0, key, "zz".getBytes(StandardCharsets.UTF_8), null)) {
-                ScanBatch batch = cursor.nextBatch();
-                assertTrue(batch.keys.length >= 1);
+                assertNotNull(cursor.nextEntry());
             }
 
             db.deleteWithOptions(0, key, 0, null);
@@ -287,8 +272,7 @@ class DbBindingTest {
 
             try (io.cobble.structured.ScanCursor cursor =
                     db.scanWithOptions(0, key, "zz".getBytes(StandardCharsets.UTF_8), null)) {
-                io.cobble.structured.ScanBatch batch = cursor.nextBatch();
-                assertTrue(batch.size() >= 1);
+                assertNotNull(cursor.nextRow());
             }
 
             db.deleteWithOptions(0, key, 0, null);
@@ -324,7 +308,7 @@ class DbBindingTest {
 
             // scan with options
             try (io.cobble.structured.ScanOptions scanOpts =
-                            new io.cobble.structured.ScanOptions().batchSize(64).columns(0);
+                            new io.cobble.structured.ScanOptions().columns(0);
                     io.cobble.structured.ScanCursor cursor =
                             db.scanWithOptions(
                                     0,
@@ -332,13 +316,8 @@ class DbBindingTest {
                                     scanKeyBytes("st-scan", 300),
                                     scanOpts)) {
                 int rows = 0;
-                while (true) {
-                    io.cobble.structured.ScanBatch batch = cursor.nextBatch();
-                    assertNotNull(batch);
-                    rows += batch.size();
-                    if (!batch.hasMore) {
-                        break;
-                    }
+                for (Row ignored : cursor) {
+                    rows++;
                 }
                 assertEquals(200, rows);
             }
@@ -347,12 +326,8 @@ class DbBindingTest {
             try (io.cobble.structured.ScanCursor cursor =
                     db.scan(0, scanKeyBytes("st-scan", 0), scanKeyBytes("st-scan", count))) {
                 int rows = 0;
-                while (true) {
-                    io.cobble.structured.ScanBatch batch = cursor.nextBatch();
-                    rows += batch.size();
-                    if (!batch.hasMore) {
-                        break;
-                    }
+                for (Row ignored : cursor) {
+                    rows++;
                 }
                 assertEquals(count, rows);
             }
@@ -666,11 +641,7 @@ class DbBindingTest {
                 db.put(0, key, 0, valueBytes("scan-db-v0", i));
                 db.put(0, key, 1, valueBytes("scan-db-v1", i));
             }
-            try (ScanOptions options =
-                            new ScanOptions()
-                                    .readAheadBytes(256 * 1024)
-                                    .batchSize(128)
-                                    .columns(0, 1);
+            try (ScanOptions options = new ScanOptions().readAheadBytes(256 * 1024).columns(0, 1);
                     ScanCursor cursor =
                             db.scanWithOptions(
                                     0,
@@ -680,20 +651,11 @@ class DbBindingTest {
                 List<String> keys = new ArrayList<String>();
                 List<String> value0 = new ArrayList<String>();
                 List<String> value1 = new ArrayList<String>();
-                while (true) {
-                    ScanBatch batch = cursor.nextBatch();
-                    assertNotNull(batch);
-                    assertEquals(batch.keys.length, batch.values.length);
-                    for (int i = 0; i < batch.keys.length; i++) {
-                        keys.add(new String(batch.keys[i], StandardCharsets.UTF_8));
-                        assertEquals(2, batch.values[i].length);
-                        value0.add(new String(batch.values[i][0], StandardCharsets.UTF_8));
-                        value1.add(new String(batch.values[i][1], StandardCharsets.UTF_8));
-                    }
-                    if (!batch.hasMore) {
-                        break;
-                    }
-                    assertNotNull(batch.nextStartAfterExclusive);
+                for (ScanCursor.Entry entry : cursor) {
+                    keys.add(new String(entry.key, StandardCharsets.UTF_8));
+                    assertEquals(2, entry.columns.length);
+                    value0.add(new String(entry.columns[0], StandardCharsets.UTF_8));
+                    value1.add(new String(entry.columns[1], StandardCharsets.UTF_8));
                 }
                 assertFalse(keys.isEmpty());
                 for (int i = 0; i < keys.size(); i++) {
@@ -707,15 +669,9 @@ class DbBindingTest {
             try (ScanCursor cursor =
                     db.scan(0, scanKeyBytes("scan-db", 100), scanKeyBytes("scan-db", 900))) {
                 int rows = 0;
-                while (true) {
-                    ScanBatch batch = cursor.nextBatch();
-                    rows += batch.keys.length;
-                    for (int i = 0; i < batch.values.length; i++) {
-                        assertEquals(2, batch.values[i].length);
-                    }
-                    if (!batch.hasMore) {
-                        break;
-                    }
+                for (ScanCursor.Entry entry : cursor) {
+                    rows++;
+                    assertEquals(2, entry.columns.length);
                 }
                 assertTrue(rows > 0);
             }
@@ -733,7 +689,7 @@ class DbBindingTest {
                 db.put(0, key, 0, valueBytes("scan-reuse-v0", i));
                 db.put(0, key, 1, valueBytes("scan-reuse-v1", i));
             }
-            try (ScanOptions options = new ScanOptions().batchSize(64).columns(0, 1)) {
+            try (ScanOptions options = new ScanOptions().columns(0, 1)) {
                 int firstRows = 0;
                 try (ScanCursor first =
                         db.scanWithOptions(
@@ -741,20 +697,14 @@ class DbBindingTest {
                                 scanKeyBytes("scan-reuse", 0),
                                 scanKeyBytes("scan-reuse", 220),
                                 options)) {
-                    while (true) {
-                        ScanBatch batch = first.nextBatch();
-                        for (int i = 0; i < batch.values.length; i++) {
-                            assertEquals(2, batch.values[i].length);
-                        }
-                        firstRows += batch.keys.length;
-                        if (!batch.hasMore) {
-                            break;
-                        }
+                    for (ScanCursor.Entry entry : first) {
+                        assertEquals(2, entry.columns.length);
+                        firstRows++;
                     }
                 }
                 assertTrue(firstRows > 0);
 
-                options.readAheadBytes(64 * 1024).batchSize(32);
+                options.readAheadBytes(64 * 1024);
                 int secondRows = 0;
                 try (ScanCursor second =
                         db.scanWithOptions(
@@ -762,15 +712,9 @@ class DbBindingTest {
                                 scanKeyBytes("scan-reuse", 0),
                                 scanKeyBytes("scan-reuse", 220),
                                 options)) {
-                    while (true) {
-                        ScanBatch batch = second.nextBatch();
-                        for (int i = 0; i < batch.values.length; i++) {
-                            assertEquals(2, batch.values[i].length);
-                        }
-                        secondRows += batch.keys.length;
-                        if (!batch.hasMore) {
-                            break;
-                        }
+                    for (ScanCursor.Entry entry : second) {
+                        assertEquals(2, entry.columns.length);
+                        secondRows++;
                     }
                 }
                 assertEquals(firstRows, secondRows);
@@ -796,28 +740,19 @@ class DbBindingTest {
 
             long scannedBytes = 0L;
             int scannedRows = 0;
-            try (ScanOptions options = new ScanOptions().batchSize(256).columns(0, 2);
+            try (ScanOptions options = new ScanOptions().columns(0, 2);
                     ScanCursor cursor =
                             db.scanWithOptions(
                                     0,
                                     scanKeyBytes("scan-large", 0),
                                     scanKeyBytes("scan-large", rowCount + 1),
                                     options)) {
-                while (true) {
-                    ScanBatch batch = cursor.nextBatch();
-                    assertEquals(batch.keys.length, batch.values.length);
-                    for (int i = 0; i < batch.values.length; i++) {
-                        assertEquals(
-                                2,
-                                batch.values[i].length,
-                                "only selected columns should be returned");
-                        scannedBytes += batch.values[i][0].length;
-                        scannedBytes += batch.values[i][1].length;
-                        scannedRows++;
-                    }
-                    if (!batch.hasMore) {
-                        break;
-                    }
+                for (ScanCursor.Entry entry : cursor) {
+                    assertEquals(
+                            2, entry.columns.length, "only selected columns should be returned");
+                    scannedBytes += entry.columns[0].length;
+                    scannedBytes += entry.columns[1].length;
+                    scannedRows++;
                 }
             }
 
@@ -954,7 +889,7 @@ class DbBindingTest {
                     assertArrayEquals(valueBytes("scan-ro-v0", 10), columns[0]);
                     assertArrayEquals(valueBytes("scan-ro-v1", 10), columns[1]);
                 }
-                try (ScanOptions options = new ScanOptions().batchSize(96).columns(0, 1);
+                try (ScanOptions options = new ScanOptions().columns(0, 1);
                         ScanCursor cursor =
                                 readOnlyDb.scanWithOptions(
                                         0,
@@ -964,22 +899,16 @@ class DbBindingTest {
                     int rows = 0;
                     String first = null;
                     String last = null;
-                    while (true) {
-                        ScanBatch batch = cursor.nextBatch();
-                        for (int i = 0; i < batch.keys.length; i++) {
-                            String key = new String(batch.keys[i], StandardCharsets.UTF_8);
-                            assertEquals(2, batch.values[i].length);
-                            String value0 = new String(batch.values[i][0], StandardCharsets.UTF_8);
-                            String value1 = new String(batch.values[i][1], StandardCharsets.UTF_8);
-                            if (first == null) {
-                                first = key + "|" + value0 + "|" + value1;
-                            }
-                            last = key + "|" + value0 + "|" + value1;
-                            rows++;
+                    for (ScanCursor.Entry entry : cursor) {
+                        String key = new String(entry.key, StandardCharsets.UTF_8);
+                        assertEquals(2, entry.columns.length);
+                        String value0 = new String(entry.columns[0], StandardCharsets.UTF_8);
+                        String value1 = new String(entry.columns[1], StandardCharsets.UTF_8);
+                        if (first == null) {
+                            first = key + "|" + value0 + "|" + value1;
                         }
-                        if (!batch.hasMore) {
-                            break;
-                        }
+                        last = key + "|" + value0 + "|" + value1;
+                        rows++;
                     }
                     assertEquals(500, rows);
                     assertEquals(
@@ -1016,10 +945,7 @@ class DbBindingTest {
                     assertArrayEquals(valueBytes("scan-ro-v1", 400), columns[1]);
                 }
                 try (ScanOptions options =
-                                new ScanOptions()
-                                        .batchSize(80)
-                                        .readAheadBytes(128 * 1024)
-                                        .columns(0, 1);
+                                new ScanOptions().readAheadBytes(128 * 1024).columns(0, 1);
                         ScanCursor cursor =
                                 reader.scanWithOptions(
                                         0,
@@ -1029,22 +955,16 @@ class DbBindingTest {
                     int rows = 0;
                     String first = null;
                     String last = null;
-                    while (true) {
-                        ScanBatch batch = cursor.nextBatch();
-                        for (int i = 0; i < batch.keys.length; i++) {
-                            String key = new String(batch.keys[i], StandardCharsets.UTF_8);
-                            assertEquals(2, batch.values[i].length);
-                            String value0 = new String(batch.values[i][0], StandardCharsets.UTF_8);
-                            String value1 = new String(batch.values[i][1], StandardCharsets.UTF_8);
-                            if (first == null) {
-                                first = key + "|" + value0 + "|" + value1;
-                            }
-                            last = key + "|" + value0 + "|" + value1;
-                            rows++;
+                    for (ScanCursor.Entry entry : cursor) {
+                        String key = new String(entry.key, StandardCharsets.UTF_8);
+                        assertEquals(2, entry.columns.length);
+                        String value0 = new String(entry.columns[0], StandardCharsets.UTF_8);
+                        String value1 = new String(entry.columns[1], StandardCharsets.UTF_8);
+                        if (first == null) {
+                            first = key + "|" + value0 + "|" + value1;
                         }
-                        if (!batch.hasMore) {
-                            break;
-                        }
+                        last = key + "|" + value0 + "|" + value1;
+                        rows++;
                     }
                     assertEquals(500, rows);
                     assertEquals(
@@ -1095,8 +1015,7 @@ class DbBindingTest {
                         requiredSingleColumn(
                                 db.getWithOptions(0, scanKeyBytes("raw-cf", 4), options)));
             }
-            try (ScanOptions options =
-                            ScanOptions.forColumns(0).columnFamily("metrics").batchSize(3);
+            try (ScanOptions options = ScanOptions.forColumns(0).columnFamily("metrics");
                     ScanCursor cursor =
                             db.scanWithOptions(
                                     0,
@@ -1104,16 +1023,10 @@ class DbBindingTest {
                                     scanKeyBytes("raw-cf", 7),
                                     options)) {
                 int rows = 0;
-                while (true) {
-                    ScanBatch batch = cursor.nextBatch();
-                    for (int i = 0; i < batch.keys.length; i++) {
-                        assertEquals(1, batch.values[i].length);
-                        assertArrayEquals(valueBytes("raw-cf-v", rows), batch.values[i][0]);
-                        rows++;
-                    }
-                    if (!batch.hasMore) {
-                        break;
-                    }
+                for (ScanCursor.Entry entry : cursor) {
+                    assertEquals(1, entry.columns.length);
+                    assertArrayEquals(valueBytes("raw-cf-v", rows), entry.columns[0]);
+                    rows++;
                 }
                 assertEquals(7, rows);
             }
@@ -1140,12 +1053,8 @@ class DbBindingTest {
                         valueBytes("raw-cf-v", 2),
                         readOnlyDb.get(0, scanKeyBytes("raw-cf", 2), "metrics", 0));
                 int rows = 0;
-                while (true) {
-                    ScanBatch batch = cursor.nextBatch();
-                    rows += batch.keys.length;
-                    if (!batch.hasMore) {
-                        break;
-                    }
+                for (ScanCursor.Entry ignored : cursor) {
+                    rows++;
                 }
                 assertEquals(5, rows);
             }
@@ -1166,12 +1075,8 @@ class DbBindingTest {
                         valueBytes("raw-cf-v", 6),
                         reader.get(0, scanKeyBytes("raw-cf", 6), "metrics", 0));
                 int rows = 0;
-                while (true) {
-                    ScanBatch batch = cursor.nextBatch();
-                    rows += batch.keys.length;
-                    if (!batch.hasMore) {
-                        break;
-                    }
+                for (ScanCursor.Entry ignored : cursor) {
+                    rows++;
                 }
                 assertEquals(5, rows);
             }
@@ -1350,7 +1255,7 @@ class DbBindingTest {
             ((Buffer) endBuffer).clear();
             endBuffer.put(end);
 
-            try (ScanOptions options = new ScanOptions().batchSize(2).columns(0, 1);
+            try (ScanOptions options = new ScanOptions().columns(0, 1);
                     DirectScanCursor cursor =
                             db.scanDirectWithOptions(
                                     0, startBuffer, start.length, endBuffer, end.length, options)) {
@@ -1359,8 +1264,8 @@ class DbBindingTest {
                 List<byte[]> seenValue1 = new ArrayList<>();
                 for (DirectScanEntry entry : cursor) {
                     seenKeys.add(readDirectBytes(entry.getKey()));
-                    seenValue0.add(readDirectBytes(entry.getColumn(0)));
-                    seenValue1.add(readDirectBytes(entry.getColumn(1)));
+                    seenValue0.add(entry.decodeColumn(0, DbBindingTest::readInputStreamBytes));
+                    seenValue1.add(entry.decodeColumn(1, DbBindingTest::readInputStreamBytes));
                 }
 
                 assertEquals(5, seenKeys.size());
@@ -1385,7 +1290,7 @@ class DbBindingTest {
     }
 
     @Test
-    void rawDirectApisNullOptionsAndBatchSemantics() throws IOException {
+    void rawDirectApisNullOptionsAndEntryTraversal() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-direct-raw-null-opt-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
 
@@ -1422,26 +1327,32 @@ class DbBindingTest {
             try (DirectScanCursor cursor =
                     db.scanDirectWithOptions(
                             0, startBuffer, start.length, endBuffer, end.length, null)) {
-                DirectScanBatch batch1 = cursor.nextBatch();
-                assertEquals(3, batch1.size());
-                assertFalse(batch1.hasMore);
-                assertArrayEquals(start, readDirectBytes(batch1.getEntry(0).getKey()));
+                DirectScanEntry entry0 = cursor.nextEntry();
+                assertNotNull(entry0);
+                assertArrayEquals(start, readDirectBytes(entry0.getKey()));
                 assertArrayEquals(
                         "value-a-0".getBytes(StandardCharsets.UTF_8),
-                        readDirectBytes(batch1.getEntry(0).getColumn(0)));
+                        entry0.decodeColumn(0, DbBindingTest::readInputStreamBytes));
+
+                DirectScanEntry entry1 = cursor.nextEntry();
+                assertNotNull(entry1);
+                assertArrayEquals(
+                        "value-b-1".getBytes(StandardCharsets.UTF_8),
+                        entry1.decodeColumn(1, DbBindingTest::readInputStreamBytes));
+
+                DirectScanEntry entry2 = cursor.nextEntry();
+                assertNotNull(entry2);
                 assertArrayEquals(
                         "value-b-2".getBytes(StandardCharsets.UTF_8),
-                        readDirectBytes(batch1.getEntry(2).getColumn(1)));
+                        entry2.decodeColumn(1, DbBindingTest::readInputStreamBytes));
 
-                DirectScanBatch batch2 = cursor.nextBatch();
-                assertEquals(0, batch2.size());
-                assertFalse(batch2.hasMore);
+                assertNull(cursor.nextEntry());
             }
         }
     }
 
     @Test
-    void rawDirectEncodedScanBatchSupportsNextEntryTraversal() throws IOException {
+    void rawDirectScanEntrySupportsNextEntryTraversal() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-direct-raw-encoded-scan-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
 
@@ -1462,40 +1373,27 @@ class DbBindingTest {
             ((Buffer) endBuffer).clear();
             endBuffer.put(end);
 
-            try (ScanOptions options = new ScanOptions().batchSize(2).columns(0, 1);
+            try (ScanOptions options = new ScanOptions().columns(0, 1);
                     DirectScanCursor cursor =
                             db.scanDirectWithOptions(
                                     0, startBuffer, start.length, endBuffer, end.length, options)) {
                 List<String> seen = new ArrayList<>();
                 while (true) {
-                    try (DirectEncodedScanBatch batch = cursor.nextEncodedBatch()) {
-                        if (batch.size() == 0) {
-                            assertFalse(batch.hasMore);
-                            break;
-                        }
-                        while (true) {
-                            DirectEncodedScanEntry entry = batch.nextEntry();
-                            if (entry == null) {
-                                break;
-                            }
-                            String keyString =
-                                    new String(
-                                            readDirectBytes(entry.getKey()),
-                                            StandardCharsets.UTF_8);
-                            String valueA =
-                                    new String(
-                                            entry.decodeColumn(
-                                                    0, DbBindingTest::readInputStreamBytes),
-                                            StandardCharsets.UTF_8);
-                            String valueB =
-                                    new String(
-                                            entry.decodeColumn(
-                                                    1, DbBindingTest::readInputStreamBytes),
-                                            StandardCharsets.UTF_8);
-                            seen.add(keyString + "=" + valueA + "/" + valueB);
-                        }
-                        assertNull(batch.nextEntry());
+                    DirectScanEntry entry = cursor.nextEntry();
+                    if (entry == null) {
+                        break;
                     }
+                    String keyString =
+                            new String(readDirectBytes(entry.getKey()), StandardCharsets.UTF_8);
+                    String valueA =
+                            new String(
+                                    entry.decodeColumn(0, DbBindingTest::readInputStreamBytes),
+                                    StandardCharsets.UTF_8);
+                    String valueB =
+                            new String(
+                                    entry.decodeColumn(1, DbBindingTest::readInputStreamBytes),
+                                    StandardCharsets.UTF_8);
+                    seen.add(keyString + "=" + valueA + "/" + valueB);
                 }
 
                 assertEquals(5, seen.size());
@@ -1718,15 +1616,10 @@ class DbBindingTest {
             byte[] scanEnd = scanKeyBytes("single-struct", 10);
             try (io.cobble.structured.ScanCursor cursor = db.scan(0, scanStart, scanEnd)) {
                 int scanned = 0;
-                io.cobble.structured.ScanBatch batch;
-                do {
-                    batch = cursor.nextBatch();
-                    for (int b = 0; b < batch.size(); b++) {
-                        Row r = batch.getRow(b);
-                        assertNotNull(r.getKey());
-                        scanned++;
-                    }
-                } while (batch.hasMore);
+                for (Row row : cursor) {
+                    assertNotNull(row.getKey());
+                    scanned++;
+                }
                 assertEquals(9, scanned);
             }
 
@@ -1807,7 +1700,7 @@ class DbBindingTest {
             assertEquals(1, splits.size());
 
             ScanSplit split = ScanSplit.fromJson(splits.get(0).toJson());
-            try (ScanOptions options = new ScanOptions().batchSize(9).columns(1);
+            try (ScanOptions options = new ScanOptions().columns(1);
                     ScanCursor cursor = split.openScannerWithOptions(config, options)) {
                 List<ScanCursor.Entry> entries = new ArrayList<ScanCursor.Entry>();
                 for (ScanCursor.Entry entry : cursor) {
