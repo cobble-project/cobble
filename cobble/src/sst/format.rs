@@ -195,6 +195,10 @@ impl Block {
         self.block_id
     }
 
+    pub(crate) fn is_prefix_compressed(&self) -> bool {
+        self.prefix_compressed
+    }
+
     pub(crate) fn get(&self, idx: usize) -> Result<(Bytes, Bytes)> {
         if idx >= self.offsets.len() {
             return Err(Error::IoError(format!(
@@ -608,41 +612,57 @@ impl Block {
     }
 
     fn decode_prefix_key(&self, idx: usize) -> Result<Bytes> {
+        let mut key = Vec::<u8>::new();
+        self.decode_prefix_key_into(idx, &mut key)?;
+        Ok(Bytes::from(key))
+    }
+
+    pub(crate) fn advance_prefix_key(&self, idx: usize, key: &mut Vec<u8>) -> Result<()> {
+        if !self.prefix_compressed {
+            return Err(Error::IoError(
+                "advance_prefix_key requires prefix-compressed block".to_string(),
+            ));
+        }
         let interval = self.restart_interval.max(1) as usize;
         let restart_idx = idx - (idx % interval);
-        let data = self.data.as_ref();
-        let mut key = Vec::<u8>::new();
-        let mut key_len = 0usize;
+        self.apply_prefix_entry(idx, restart_idx, key)
+    }
+
+    pub(crate) fn decode_prefix_key_into(&self, idx: usize, key: &mut Vec<u8>) -> Result<()> {
+        let interval = self.restart_interval.max(1) as usize;
+        let restart_idx = idx - (idx % interval);
+        key.clear();
         for entry_idx in restart_idx..=idx {
-            let offset = self.offsets[entry_idx] as usize;
-            if offset + 10 > data.len() {
-                return Err(Error::IoError("Corrupted prefix entry header".to_string()));
-            }
-            let shared = u16::from_le_bytes(
-                data[offset..offset + 2]
-                    .try_into()
-                    .expect("slice length checked"),
-            ) as usize;
-            let (suffix_start, suffix_end) = self.decode_prefix_suffix_bounds(entry_idx)?;
-            if entry_idx == restart_idx && shared != 0 {
-                return Err(Error::IoError(
-                    "Corrupted prefix restart entry (shared != 0)".to_string(),
-                ));
-            }
-            if shared > key_len {
-                return Err(Error::IoError(
-                    "Corrupted prefix key (shared prefix out of bounds)".to_string(),
-                ));
-            }
-            let next_key_len = shared + (suffix_end - suffix_start);
-            if key.len() < next_key_len {
-                key.resize(next_key_len, 0);
-            }
-            key[shared..next_key_len].copy_from_slice(&data[suffix_start..suffix_end]);
-            key_len = next_key_len;
+            self.apply_prefix_entry(entry_idx, restart_idx, key)?;
         }
-        key.truncate(key_len);
-        Ok(Bytes::from(key))
+        Ok(())
+    }
+
+    fn apply_prefix_entry(&self, entry_idx: usize, restart_idx: usize, key: &mut Vec<u8>) -> Result<()> {
+        let data = self.data.as_ref();
+        let offset = self.offsets[entry_idx] as usize;
+        if offset + 10 > data.len() {
+            return Err(Error::IoError("Corrupted prefix entry header".to_string()));
+        }
+        let shared = u16::from_le_bytes(
+            data[offset..offset + 2]
+                .try_into()
+                .expect("slice length checked"),
+        ) as usize;
+        let (suffix_start, suffix_end) = self.decode_prefix_suffix_bounds(entry_idx)?;
+        if entry_idx == restart_idx && shared != 0 {
+            return Err(Error::IoError(
+                "Corrupted prefix restart entry (shared != 0)".to_string(),
+            ));
+        }
+        if shared > key.len() {
+            return Err(Error::IoError(
+                "Corrupted prefix key (shared prefix out of bounds)".to_string(),
+            ));
+        }
+        key.truncate(shared);
+        key.extend_from_slice(&data[suffix_start..suffix_end]);
+        Ok(())
     }
 }
 

@@ -115,9 +115,11 @@ pub(crate) struct SSTIterator {
     options: SSTIteratorOptions,
     block_cache: Option<BlockCache>,
     metrics: Arc<SSTIteratorMetrics>,
-    cache_valid: Cell<bool>,
-    cached_entry_idx: Cell<Option<usize>>,
-    // Use RefCell to allow interior mutability for cached bytes, which can be shared as slices.
+    cached_key_entry_idx: Cell<Option<usize>>,
+    cached_value_entry_idx: Cell<Option<usize>>,
+    cached_prefix_key_block_id: Cell<Option<u32>>,
+    cached_prefix_key_entry_idx: Cell<Option<usize>>,
+    cached_prefix_key_bytes: RefCell<Vec<u8>>,
     cached_key_bytes: RefCell<Option<Bytes>>,
     cached_value_bytes: RefCell<Option<Bytes>>,
 }
@@ -284,8 +286,11 @@ impl SSTIterator {
                 options,
                 block_cache,
                 metrics,
-                cache_valid: Cell::new(false),
-                cached_entry_idx: Cell::new(None),
+                cached_key_entry_idx: Cell::new(None),
+                cached_value_entry_idx: Cell::new(None),
+                cached_prefix_key_block_id: Cell::new(None),
+                cached_prefix_key_entry_idx: Cell::new(None),
+                cached_prefix_key_bytes: RefCell::new(Vec::new()),
                 cached_key_bytes: RefCell::new(None),
                 cached_value_bytes: RefCell::new(None),
             },
@@ -625,35 +630,152 @@ impl SSTIterator {
     }
 
     fn clear_cached_entry(&self) {
-        self.cache_valid.set(false);
-        self.cached_entry_idx.set(None);
+        self.clear_materialized_entry();
+        self.clear_prefix_key_cache();
+    }
+
+    fn clear_materialized_entry(&self) {
+        self.cached_key_entry_idx.set(None);
+        self.cached_value_entry_idx.set(None);
         *self.cached_key_bytes.borrow_mut() = None;
         *self.cached_value_bytes.borrow_mut() = None;
     }
 
-    fn ensure_cached_bytes(&self) -> Result<()> {
-        if self.cache_valid.get() {
+    fn clear_prefix_key_cache(&self) {
+        self.cached_prefix_key_block_id.set(None);
+        self.cached_prefix_key_entry_idx.set(None);
+        self.cached_prefix_key_bytes.borrow_mut().clear();
+    }
+
+    fn ensure_cached_key_view(&self) -> Result<()> {
+        let Some(block) = &self.current_data_block else {
+            self.clear_cached_entry();
+            return Ok(());
+        };
+        if self.current_entry_idx >= block.offsets_len() {
+            self.clear_cached_entry();
             return Ok(());
         }
-        if let Some(block) = &self.current_data_block
-            && self.current_entry_idx < block.offsets_len()
+        if !block.is_prefix_compressed() {
+            if self.cached_key_entry_idx.get() != Some(self.current_entry_idx) {
+                *self.cached_key_bytes.borrow_mut() = Some(block.key(self.current_entry_idx)?);
+                self.cached_key_entry_idx.set(Some(self.current_entry_idx));
+            }
+            return Ok(());
+        }
+
+        let block_id = block.block_id();
+        if self.cached_prefix_key_block_id.get() == Some(block_id)
+            && self.cached_prefix_key_entry_idx.get() == Some(self.current_entry_idx)
         {
-            let (key, value) = block.get(self.current_entry_idx)?;
-            self.cached_entry_idx.set(Some(self.current_entry_idx));
-            *self.cached_key_bytes.borrow_mut() = Some(key);
-            *self.cached_value_bytes.borrow_mut() = Some(value);
-            self.cache_valid.set(true);
             return Ok(());
         }
-        self.clear_cached_entry();
+
+        let previous_entry = self.current_entry_idx.checked_sub(1);
+        let mut key = self.cached_prefix_key_bytes.borrow_mut();
+        if self.cached_prefix_key_block_id.get() == Some(block_id)
+            && self.cached_prefix_key_entry_idx.get() == previous_entry
+        {
+            block.advance_prefix_key(self.current_entry_idx, &mut key)?;
+        } else {
+            block.decode_prefix_key_into(self.current_entry_idx, &mut key)?;
+        }
+        self.cached_prefix_key_block_id.set(Some(block_id));
+        self.cached_prefix_key_entry_idx.set(Some(self.current_entry_idx));
         Ok(())
+    }
+
+    fn materialize_current_key(&self) -> Result<Option<Bytes>> {
+        self.ensure_cached_key_view()?;
+        let Some(block) = &self.current_data_block else {
+            return Ok(None);
+        };
+        if self.current_entry_idx >= block.offsets_len() {
+            return Ok(None);
+        }
+        if self.cached_key_entry_idx.get() == Some(self.current_entry_idx) {
+            return Ok(self.cached_key_bytes.borrow().clone());
+        }
+        let key = if block.is_prefix_compressed() {
+            let key = self.cached_prefix_key_bytes.borrow();
+            Bytes::copy_from_slice(key.as_slice())
+        } else {
+            self.cached_key_bytes
+                .borrow()
+                .clone()
+                .expect("non-prefix key cache populated")
+        };
+        *self.cached_key_bytes.borrow_mut() = Some(key.clone());
+        self.cached_key_entry_idx.set(Some(self.current_entry_idx));
+        Ok(Some(key))
+    }
+
+    fn materialize_current_value(&self) -> Result<Option<Bytes>> {
+        let Some(block) = &self.current_data_block else {
+            self.clear_cached_entry();
+            return Ok(None);
+        };
+        if self.current_entry_idx >= block.offsets_len() {
+            self.clear_cached_entry();
+            return Ok(None);
+        }
+        if self.cached_value_entry_idx.get() == Some(self.current_entry_idx) {
+            return Ok(self.cached_value_bytes.borrow().clone());
+        }
+        let value = block.value(self.current_entry_idx)?;
+        *self.cached_value_bytes.borrow_mut() = Some(value.clone());
+        self.cached_value_entry_idx.set(Some(self.current_entry_idx));
+        Ok(Some(value))
+    }
+
+    fn current_key_slice(&self) -> Result<Option<(*const u8, usize)>> {
+        self.ensure_cached_key_view()?;
+        let Some(block) = &self.current_data_block else {
+            return Ok(None);
+        };
+        if self.current_entry_idx >= block.offsets_len() {
+            return Ok(None);
+        }
+        if block.is_prefix_compressed() {
+            let key = self.cached_prefix_key_bytes.borrow();
+            return Ok(Some((key.as_ptr(), key.len())));
+        }
+        let cached = self.cached_key_bytes.borrow();
+        Ok(cached.as_ref().map(|bytes| (bytes.as_ptr(), bytes.len())))
+    }
+
+    fn invalidate_current_entry_cache(&self) {
+        self.clear_materialized_entry();
+        if self
+            .current_data_block
+            .as_ref()
+            .is_some_and(|block| !block.is_prefix_compressed())
+        {
+            self.clear_prefix_key_cache();
+        }
+    }
+
+    fn position_at_current_entry(&self) {
+        self.invalidate_current_entry_cache();
+    }
+
+    fn position_after_sequential_next(&self) {
+        self.invalidate_current_entry_cache();
+    }
+
+    fn position_after_random_access(&self) {
+        self.clear_cached_entry();
+    }
+
+    fn position_after_block_change(&self) {
+        self.clear_cached_entry();
     }
 
     fn seek_in_current_block(&mut self, target: &Bytes) -> Result<()> {
         if let Some(block) = &self.current_data_block {
             self.current_entry_idx = block.find_equal_or_greater_idx(target)?;
         }
-        self.clear_cached_entry();
+        self.position_after_random_access();
         Ok(())
     }
 
@@ -677,6 +799,7 @@ impl SSTIterator {
             let partition = self.index_block.clone();
             self.load_data_block_from_partition(&partition, 0)?;
             self.current_entry_idx = 0;
+            self.position_at_current_entry();
             return Ok(());
         }
 
@@ -684,40 +807,31 @@ impl SSTIterator {
         self.current_block_idx = 0;
         self.load_data_block_from_partition(&partition, 0)?;
         self.current_entry_idx = 0;
+        self.position_at_current_entry();
         Ok(())
     }
 
     /// Get the current key-value pair
     pub fn current(&self) -> Result<Option<(Bytes, Bytes)>> {
-        if let Some(block) = &self.current_data_block
-            && self.current_entry_idx < block.offsets_len()
-        {
-            let (key, value) = block.get(self.current_entry_idx)?;
-            return Ok(Some((key, self.normalized_encoded_value(value))));
-        }
-        Ok(None)
+        let Some(key) = self.materialize_current_key()? else {
+            return Ok(None);
+        };
+        let Some(value) = self.materialize_current_value()? else {
+            return Ok(None);
+        };
+        Ok(Some((key, self.normalized_encoded_value(value))))
     }
 
     /// Get the current key only
     pub fn key(&self) -> Result<Option<Bytes>> {
-        if let Some(block) = &self.current_data_block
-            && self.current_entry_idx < block.offsets_len()
-        {
-            let key = block.key(self.current_entry_idx)?;
-            return Ok(Some(key));
-        }
-        Ok(None)
+        self.materialize_current_key()
     }
 
     /// Get the current value only
     pub fn value(&self) -> Result<Option<Bytes>> {
-        if let Some(block) = &self.current_data_block
-            && self.current_entry_idx < block.offsets_len()
-        {
-            let value = block.value(self.current_entry_idx)?;
-            return Ok(Some(self.normalized_encoded_value(value)));
-        }
-        Ok(None)
+        Ok(self
+            .materialize_current_value()?
+            .map(|value| self.normalized_encoded_value(value)))
     }
 
     /// Move to the next entry
@@ -739,12 +853,12 @@ impl SSTIterator {
                     let partition = self.current_index_partition.clone().unwrap();
                     self.load_data_block_from_partition(&partition, self.current_block_idx)?;
                     self.current_entry_idx = 0;
-                    self.clear_cached_entry();
+                    self.position_after_block_change();
                     return Ok(true);
                 }
                 if !self.footer.partitioned_index {
                     self.current_data_block = None;
-                    self.clear_cached_entry();
+                    self.position_after_block_change();
                     return Ok(false);
                 }
                 let next_partition_idx = self.current_index_partition_idx + 1;
@@ -753,16 +867,16 @@ impl SSTIterator {
                     self.current_block_idx = 0;
                     self.load_data_block_from_partition(&partition, 0)?;
                     self.current_entry_idx = 0;
-                    self.clear_cached_entry();
+                    self.position_after_block_change();
                     return Ok(true);
                 }
                 // No more blocks
                 self.current_data_block = None;
-                self.clear_cached_entry();
+                self.position_after_block_change();
                 return Ok(false);
             }
 
-            self.clear_cached_entry();
+            self.position_after_sequential_next();
             Ok(true)
         } else {
             Ok(false)
@@ -833,12 +947,7 @@ impl<'a> KvIterator<'a> for SSTIterator {
     }
 
     fn key(&self) -> Result<Option<&[u8]>> {
-        self.ensure_cached_bytes()?;
-        let cached = self.cached_key_bytes.borrow();
-        if let Some(bytes) = cached.as_ref() {
-            let ptr = bytes.as_ptr();
-            let len = bytes.len();
-            drop(cached);
+        if let Some((ptr, len)) = self.current_key_slice()? {
             // SAFETY: cached bytes live as long as the iterator entry remains unchanged.
             return Ok(Some(unsafe { std::slice::from_raw_parts(ptr, len) }));
         }
@@ -1199,6 +1308,66 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all("/tmp/sst_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_iterator_prefix_scan_reuses_current_key_across_next() {
+        let _ = std::fs::remove_dir_all("/tmp/sst_prefix_scan_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/sst_prefix_scan_test")
+            .unwrap();
+
+        {
+            let writer_file = fs.open_write("prefix_scan.sst").unwrap();
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    data_block_restart_interval: 3,
+                    ..SSTWriterOptions::default()
+                },
+            );
+            for idx in 0..6 {
+                let key = format!("map:key:{idx:04}");
+                let value = format!("value:{idx:04}");
+                writer.add(key.as_bytes(), value.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        {
+            let reader_file = fs.open_read("prefix_scan.sst").unwrap();
+            let mut iter = SSTIterator::with_cache(
+                reader_file,
+                0,
+                SSTIteratorOptions::default(),
+                None,
+                None,
+            )
+            .unwrap();
+
+            iter.seek_to_first().unwrap();
+            for idx in 0..6 {
+                let expected_key = format!("map:key:{idx:04}");
+                let expected_value = format!("value:{idx:04}");
+                let borrowed_key = <SSTIterator as KvIterator>::key(&iter)
+                    .unwrap()
+                    .unwrap()
+                    .to_vec();
+                assert_eq!(borrowed_key, expected_key.as_bytes());
+                let (current_key, current_value) = iter.current().unwrap().unwrap();
+                assert_eq!(current_key.as_ref(), expected_key.as_bytes());
+                assert_eq!(current_value.as_ref(), expected_value.as_bytes());
+                if idx < 5 {
+                    assert!(iter.next().unwrap());
+                } else {
+                    assert!(!iter.next().unwrap());
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_prefix_scan_test");
     }
 
     #[test]
