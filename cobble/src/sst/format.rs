@@ -354,6 +354,9 @@ impl Block {
     }
 
     pub(crate) fn find_lower_or_equal_idx(&self, target: &Bytes) -> Result<usize> {
+        if self.prefix_compressed {
+            return self.find_lower_or_equal_idx_prefix(target);
+        }
         let mut left = 0;
         let mut right = self.offsets_len() - 1;
         while left < right {
@@ -372,7 +375,7 @@ impl Block {
         self.size_in_bytes
     }
 
-    fn decode_prefix_entry_bounds(&self, idx: usize) -> Result<(usize, usize, usize, usize)> {
+    fn decode_prefix_suffix_bounds(&self, idx: usize) -> Result<(usize, usize)> {
         let offset = self.offsets[idx] as usize;
         let data = self.data.as_ref();
         if offset + 10 > data.len() {
@@ -383,16 +386,22 @@ impl Block {
                 .try_into()
                 .expect("slice length checked"),
         ) as usize;
-        let value_len = u32::from_le_bytes(
-            data[offset + 6..offset + 10]
-                .try_into()
-                .expect("slice length checked"),
-        ) as usize;
         let suffix_start = offset + 10;
         let suffix_end = suffix_start + suffix_len;
         if suffix_end > data.len() {
             return Err(Error::IoError("Corrupted prefix key suffix".to_string()));
         }
+        Ok((suffix_start, suffix_end))
+    }
+
+    fn decode_prefix_entry_bounds(&self, idx: usize) -> Result<(usize, usize, usize, usize)> {
+        let (suffix_start, suffix_end) = self.decode_prefix_suffix_bounds(idx)?;
+        let data = self.data.as_ref();
+        let value_len = u32::from_le_bytes(
+            data[suffix_start - 4..suffix_start]
+                .try_into()
+                .expect("slice length checked"),
+        ) as usize;
         let value_start = suffix_end;
         let value_end = value_start + value_len;
         if value_end > data.len() {
@@ -440,35 +449,59 @@ impl Block {
         }
     }
 
-    fn find_equal_or_greater_idx_prefix(&self, target: &Bytes) -> Result<usize> {
+    fn prefix_restart_search_window(&self, target: &[u8]) -> Result<(usize, usize)> {
         let entry_count = self.offsets_len();
         if entry_count == 0 {
-            return Ok(0);
+            return Ok((0, 0));
         }
-
         let interval = self.restart_interval.max(1) as usize;
         let restart_count = entry_count.div_ceil(interval);
-        let target_bytes = target.as_ref();
-        let target_len = target_bytes.len();
 
-        // Binary-search restart keys first, then linearly scan only the chosen restart interval.
         let mut left = -1isize;
         let mut right = restart_count as isize - 1;
         while left != right {
             let mid = left + (right - left + 1) / 2;
             let restart_idx = mid as usize * interval;
-            match self.compare_prefix_restart_key_with_target(restart_idx, target_bytes)? {
-                std::cmp::Ordering::Less => left = mid,
+            match self.compare_prefix_restart_key_with_target(restart_idx, target)? {
+                std::cmp::Ordering::Less | std::cmp::Ordering::Equal => left = mid,
                 std::cmp::Ordering::Greater => right = mid - 1,
-                std::cmp::Ordering::Equal => return Ok(restart_idx),
             }
         }
 
         let start_restart = if left < 0 { 0 } else { left as usize };
         let start_idx = start_restart * interval;
         let end_idx = (start_idx + interval).min(entry_count);
+        Ok((start_idx, end_idx))
+    }
+
+    #[inline]
+    fn update_prefix_search_buffer(
+        key_prefix: &mut [u8],
+        target_len: usize,
+        key_len: &mut usize,
+        shared: usize,
+        suffix: &[u8],
+    ) -> usize {
+        let next_key_len = shared + suffix.len();
+        let compare_len = next_key_len.min(target_len);
+        let compare_shared = shared.min(target_len);
+        if compare_len > compare_shared {
+            key_prefix[compare_shared..compare_len]
+                .copy_from_slice(&suffix[..compare_len - compare_shared]);
+        }
+        *key_len = next_key_len;
+        compare_len
+    }
+
+    fn find_equal_or_greater_idx_prefix(&self, target: &Bytes) -> Result<usize> {
+        let target_bytes = target.as_ref();
+        let target_len = target_bytes.len();
+        let (start_idx, end_idx) = self.prefix_restart_search_window(target_bytes)?;
+        if start_idx == end_idx {
+            return Ok(0);
+        }
         let data = self.data.as_ref();
-        let mut key_prefix = Vec::<u8>::with_capacity(target_len);
+        let mut key_prefix = vec![0u8; target_len];
         let mut key_len = 0usize;
 
         for entry_idx in start_idx..end_idx {
@@ -481,7 +514,7 @@ impl Block {
                     .try_into()
                     .expect("slice length checked"),
             ) as usize;
-            let (suffix_start, suffix_end, _, _) = self.decode_prefix_entry_bounds(entry_idx)?;
+            let (suffix_start, suffix_end) = self.decode_prefix_suffix_bounds(entry_idx)?;
             if entry_idx == start_idx && shared != 0 {
                 return Err(Error::IoError(
                     "Corrupted prefix restart entry (shared != 0)".to_string(),
@@ -492,19 +525,15 @@ impl Block {
                     "Corrupted prefix key (shared prefix out of bounds)".to_string(),
                 ));
             }
-            let suffix_len = suffix_end - suffix_start;
-            key_len = shared + suffix_len;
+            let compare_len = Self::update_prefix_search_buffer(
+                &mut key_prefix,
+                target_len,
+                &mut key_len,
+                shared,
+                &data[suffix_start..suffix_end],
+            );
 
-            let prefix_shared = shared.min(target_len);
-            if key_prefix.len() > prefix_shared {
-                key_prefix.truncate(prefix_shared);
-            }
-            let prefix_needed = key_len.min(target_len).saturating_sub(prefix_shared);
-            if prefix_needed > 0 {
-                key_prefix.extend_from_slice(&data[suffix_start..suffix_start + prefix_needed]);
-            }
-
-            match key_prefix.as_slice().cmp(&target_bytes[..key_prefix.len()]) {
+            match key_prefix[..compare_len].cmp(&target_bytes[..compare_len]) {
                 std::cmp::Ordering::Less => {}
                 std::cmp::Ordering::Greater => return Ok(entry_idx),
                 std::cmp::Ordering::Equal if key_len >= target_len => return Ok(entry_idx),
@@ -515,11 +544,75 @@ impl Block {
         Ok(end_idx)
     }
 
+    fn find_lower_or_equal_idx_prefix(&self, target: &Bytes) -> Result<usize> {
+        let target_bytes = target.as_ref();
+        let target_len = target_bytes.len();
+        let (start_idx, end_idx) = self.prefix_restart_search_window(target_bytes)?;
+        if start_idx == end_idx {
+            return Ok(0);
+        }
+        let data = self.data.as_ref();
+        let mut key_prefix = vec![0u8; target_len];
+        let mut key_len = 0usize;
+
+        for entry_idx in start_idx..end_idx {
+            let offset = self.offsets[entry_idx] as usize;
+            if offset + 10 > data.len() {
+                return Err(Error::IoError("Corrupted prefix entry header".to_string()));
+            }
+            let shared = u16::from_le_bytes(
+                data[offset..offset + 2]
+                    .try_into()
+                    .expect("slice length checked"),
+            ) as usize;
+            let (suffix_start, suffix_end) = self.decode_prefix_suffix_bounds(entry_idx)?;
+            if entry_idx == start_idx && shared != 0 {
+                return Err(Error::IoError(
+                    "Corrupted prefix restart entry (shared != 0)".to_string(),
+                ));
+            }
+            if shared > key_len {
+                return Err(Error::IoError(
+                    "Corrupted prefix key (shared prefix out of bounds)".to_string(),
+                ));
+            }
+            let compare_len = Self::update_prefix_search_buffer(
+                &mut key_prefix,
+                target_len,
+                &mut key_len,
+                shared,
+                &data[suffix_start..suffix_end],
+            );
+
+            match key_prefix[..compare_len].cmp(&target_bytes[..compare_len]) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Greater => {
+                    return Ok(if entry_idx == start_idx {
+                        start_idx
+                    } else {
+                        entry_idx - 1
+                    });
+                }
+                std::cmp::Ordering::Equal if key_len > target_len => {
+                    return Ok(if entry_idx == start_idx {
+                        start_idx
+                    } else {
+                        entry_idx - 1
+                    });
+                }
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+
+        Ok(end_idx - 1)
+    }
+
     fn decode_prefix_key(&self, idx: usize) -> Result<Bytes> {
         let interval = self.restart_interval.max(1) as usize;
         let restart_idx = idx - (idx % interval);
         let data = self.data.as_ref();
         let mut key = Vec::<u8>::new();
+        let mut key_len = 0usize;
         for entry_idx in restart_idx..=idx {
             let offset = self.offsets[entry_idx] as usize;
             if offset + 10 > data.len() {
@@ -530,20 +623,25 @@ impl Block {
                     .try_into()
                     .expect("slice length checked"),
             ) as usize;
-            let (suffix_start, suffix_end, _, _) = self.decode_prefix_entry_bounds(entry_idx)?;
+            let (suffix_start, suffix_end) = self.decode_prefix_suffix_bounds(entry_idx)?;
             if entry_idx == restart_idx && shared != 0 {
                 return Err(Error::IoError(
                     "Corrupted prefix restart entry (shared != 0)".to_string(),
                 ));
             }
-            if shared > key.len() {
+            if shared > key_len {
                 return Err(Error::IoError(
                     "Corrupted prefix key (shared prefix out of bounds)".to_string(),
                 ));
             }
-            key.truncate(shared);
-            key.extend_from_slice(&data[suffix_start..suffix_end]);
+            let next_key_len = shared + (suffix_end - suffix_start);
+            if key.len() < next_key_len {
+                key.resize(next_key_len, 0);
+            }
+            key[shared..next_key_len].copy_from_slice(&data[suffix_start..suffix_end]);
+            key_len = next_key_len;
         }
+        key.truncate(key_len);
         Ok(Bytes::from(key))
     }
 }
@@ -826,6 +924,36 @@ mod tests {
                 .unwrap(),
             decoded.offsets_len()
         );
+        assert_eq!(
+            decoded
+                .find_lower_or_equal_idx(&Bytes::from("map:key:0000"))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            decoded
+                .find_lower_or_equal_idx(&Bytes::from("map:key:0004"))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            decoded
+                .find_lower_or_equal_idx(&Bytes::from("map:key:0004a"))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            decoded
+                .find_lower_or_equal_idx(&Bytes::from("map:key:0005"))
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            decoded
+                .find_lower_or_equal_idx(&Bytes::from("map:key:9999"))
+                .unwrap(),
+            7
+        );
     }
 
     #[test]
@@ -854,6 +982,24 @@ mod tests {
                 .find_equal_or_greater_idx(&Bytes::from("abcxz"))
                 .unwrap(),
             3
+        );
+        assert_eq!(
+            decoded
+                .find_lower_or_equal_idx(&Bytes::from("abc"))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            decoded
+                .find_lower_or_equal_idx(&Bytes::from("abcd"))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            decoded
+                .find_lower_or_equal_idx(&Bytes::from("abcxz"))
+                .unwrap(),
+            2
         );
     }
 }
