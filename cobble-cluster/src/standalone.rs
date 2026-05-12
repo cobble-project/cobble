@@ -73,6 +73,10 @@ struct StandaloneShardSnapshot {
     pub manifest_path: String,
     /// Timestamp (seconds) when the shard snapshot was initiated.
     pub timestamp_seconds: u32,
+    /// Total logical snapshot data bytes referenced by this shard snapshot.
+    pub data_size_bytes: u64,
+    /// Incremental data bytes newly contributed by this shard snapshot.
+    pub incremental_data_size_bytes: u64,
 }
 
 impl From<ShardSnapshotInput> for StandaloneShardSnapshot {
@@ -84,6 +88,8 @@ impl From<ShardSnapshotInput> for StandaloneShardSnapshot {
             snapshot_id: input.snapshot_id,
             manifest_path: input.manifest_path,
             timestamp_seconds: input.timestamp_seconds,
+            data_size_bytes: input.data_size_bytes,
+            incremental_data_size_bytes: input.incremental_data_size_bytes,
         }
     }
 }
@@ -97,6 +103,8 @@ impl From<StandaloneShardSnapshot> for ShardSnapshotInput {
             snapshot_id: snapshot.snapshot_id,
             manifest_path: snapshot.manifest_path,
             timestamp_seconds: snapshot.timestamp_seconds,
+            data_size_bytes: 0,
+            incremental_data_size_bytes: 0,
         }
     }
 }
@@ -848,6 +856,10 @@ impl DbGovernance for StandaloneGovernance {
         total_buckets: u32,
     ) -> Result<()> {
         self.client.register_db(db_id, ranges, total_buckets)
+    }
+
+    fn unregister_db(&self, _db_id: &str) -> Result<()> {
+        Ok(())
     }
 }
 

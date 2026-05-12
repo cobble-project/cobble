@@ -22,7 +22,7 @@ use crate::write_batch::{WriteBatch, WriteOp};
 use crate::writer_options::WriterOptions;
 use crate::{Config, ReadOptions, ScanOptions, TimeProvider, WriteOptions};
 use bytes::{Bytes, BytesMut};
-use log::{error, info};
+use log::{error, info, warn};
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +42,7 @@ mod restore;
 /// Public database interface.
 pub struct Db {
     id: String,
+    db_governance: Option<Arc<dyn crate::governance::DbGovernance>>,
     db_lifecycle: Arc<DbLifecycle>,
     db_state: Arc<DbStateHandle>,
     config: Config,
@@ -257,12 +258,11 @@ impl Db {
         let file_manager_config =
             config.apply_hybrid_cache_primary_partition_with_plan(hybrid_cache_plan.as_ref())?;
 
-        if let Some(governance) = governance {
-            governance.register_db(&id, &bucket_ranges, config.total_buckets)?;
-        } else {
-            let local_governance = create_default_db_governance(&config)?;
-            local_governance.register_db(&id, &bucket_ranges, config.total_buckets)?;
-        }
+        let db_governance = match governance {
+            Some(governance) => governance,
+            None => create_default_db_governance(&config)?,
+        };
+        db_governance.register_db(&id, &bucket_ranges, config.total_buckets)?;
 
         let file_manager =
             FileManager::from_config(&file_manager_config, &id, Arc::clone(&metrics_manager))?;
@@ -278,6 +278,7 @@ impl Db {
             db_state,
             Arc::clone(&db_lifecycle),
             id,
+            Some(db_governance),
             bucket_ranges,
             0,
             hybrid_cache_plan,
@@ -661,6 +662,12 @@ impl Db {
         self.memtable_manager.force_close();
         self.lsm_tree.shutdown_compaction();
         self.snapshot_manager.force_close();
+        if let Err(err) = self.unregister_governance() {
+            warn!(
+                "failed to unregister db {} during force close: {}",
+                self.id, err
+            );
+        }
         self.db_lifecycle.mark_closed();
     }
 
@@ -693,6 +700,10 @@ impl Db {
             return Err(err);
         }
         if let Some(err) = self.lifecycle_error() {
+            self.force_close();
+            return Err(err);
+        }
+        if let Err(err) = self.unregister_governance() {
             self.force_close();
             return Err(err);
         }
@@ -730,6 +741,8 @@ impl Db {
                     snapshot_id: info.id,
                     manifest_path: info.manifest_path,
                     timestamp_seconds,
+                    data_size_bytes: info.data_size_bytes,
+                    incremental_data_size_bytes: info.incremental_data_size_bytes,
                 })
             }));
         });
@@ -778,6 +791,8 @@ impl Db {
             snapshot_id,
             manifest_path,
             timestamp_seconds: 0,
+            data_size_bytes: manifest.data_size_bytes,
+            incremental_data_size_bytes: manifest.incremental_data_size_bytes,
         })
     }
 
@@ -805,6 +820,7 @@ impl Db {
         db_state: Arc<DbStateHandle>,
         db_lifecycle: Arc<DbLifecycle>,
         id: String,
+        db_governance: Option<Arc<dyn crate::governance::DbGovernance>>,
         bucket_ranges: Vec<RangeInclusive<u16>>,
         initial_vlog_file_seq: u32,
         hybrid_cache_plan: Option<crate::config::HybridCacheVolumePlan>,
@@ -932,6 +948,7 @@ impl Db {
 
         Ok(Self {
             id,
+            db_governance,
             db_lifecycle,
             db_state,
             config,
@@ -948,6 +965,13 @@ impl Db {
             time_provider,
             ttl_provider,
         })
+    }
+
+    fn unregister_governance(&self) -> Result<()> {
+        if let Some(governance) = &self.db_governance {
+            governance.unregister_db(&self.id)?;
+        }
+        Ok(())
     }
 
     fn take_over_snapshot_chain(&self, chain: &[LoadedManifest]) -> Result<()> {
@@ -1307,7 +1331,8 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingGovernance {
-        calls: Mutex<Vec<GovernanceCall>>,
+        register_calls: Mutex<Vec<GovernanceCall>>,
+        unregister_calls: Mutex<Vec<String>>,
     }
 
     impl DbGovernance for RecordingGovernance {
@@ -1317,11 +1342,18 @@ mod tests {
             ranges: &[RangeInclusive<u16>],
             total_buckets: u32,
         ) -> Result<()> {
-            self.calls.lock().expect("recording governance lock").push((
-                db_id.to_string(),
-                ranges.to_vec(),
-                total_buckets,
-            ));
+            self.register_calls
+                .lock()
+                .expect("recording governance register lock")
+                .push((db_id.to_string(), ranges.to_vec(), total_buckets));
+            Ok(())
+        }
+
+        fn unregister_db(&self, db_id: &str) -> Result<()> {
+            self.unregister_calls
+                .lock()
+                .expect("recording governance unregister lock")
+                .push(db_id.to_string());
             Ok(())
         }
     }
@@ -1365,12 +1397,25 @@ mod tests {
             .unwrap();
         db.close().unwrap();
 
-        let calls = governance.calls.lock().expect("recording governance lock");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "db-builder-governed");
-        assert_eq!(calls[0].1, ranges);
-        assert_eq!(calls[0].2, total_buckets);
-        drop(calls);
+        let register_calls = governance
+            .register_calls
+            .lock()
+            .expect("recording governance register lock");
+        assert_eq!(register_calls.len(), 1);
+        assert_eq!(register_calls[0].0, "db-builder-governed");
+        assert_eq!(register_calls[0].1, ranges);
+        assert_eq!(register_calls[0].2, total_buckets);
+        drop(register_calls);
+
+        let unregister_calls = governance
+            .unregister_calls
+            .lock()
+            .expect("recording governance unregister lock");
+        assert_eq!(
+            unregister_calls.as_slice(),
+            &["db-builder-governed".to_string()]
+        );
+        drop(unregister_calls);
         cleanup_test_root(root);
     }
 

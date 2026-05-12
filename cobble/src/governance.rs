@@ -25,6 +25,8 @@ pub trait DbGovernance: Send + Sync {
         ranges: &[RangeInclusive<u16>],
         total_buckets: u32,
     ) -> Result<()>;
+
+    fn unregister_db(&self, db_id: &str) -> Result<()>;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -168,6 +170,11 @@ impl DbGovernance for FileSystemDbGovernance {
             .insert_and_publish(db_id, ranges.to_vec(), total_buckets)?;
         Ok(())
     }
+
+    fn unregister_db(&self, db_id: &str) -> Result<()> {
+        self.manager.remove_and_publish(db_id)?;
+        Ok(())
+    }
 }
 
 pub(crate) fn create_default_db_governance(config: &Config) -> Result<Arc<dyn DbGovernance>> {
@@ -260,6 +267,22 @@ impl GovernanceManager {
             ranges,
         });
         self.publish(&current_manifest)
+    }
+
+    pub(crate) fn remove_and_publish(&self, id: &str) -> Result<bool> {
+        let _guard = self.lock_provider.lock()?;
+        let Some(mut current_manifest) = self.load_current()? else {
+            return Ok(false);
+        };
+        let previous_len = current_manifest.assignments.len();
+        current_manifest
+            .assignments
+            .retain(|entry| entry.db_id != id);
+        if current_manifest.assignments.len() == previous_len {
+            return Ok(false);
+        }
+        self.publish(&current_manifest)?;
+        Ok(true)
     }
 
     fn publish(&self, manifest: &GovernanceManifest) -> Result<String> {
