@@ -134,8 +134,8 @@ mod writer_options;
 
 pub use compaction::RemoteCompactionServer;
 pub use config::{
-    CompactionPolicyKind, Config, MemtableType, PrimaryVolumeOffloadPolicyKind, ReadOptions,
-    ScanOptions, VolumeDescriptor, VolumeUsageKind, WriteOptions,
+    CompactionPolicyKind, Config, GovernanceMode, MemtableType, PrimaryVolumeOffloadPolicyKind,
+    ReadOptions, ScanOptions, VolumeDescriptor, VolumeUsageKind, WriteOptions,
 };
 pub use coordinator::{
     CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef,
@@ -144,7 +144,7 @@ pub use db::Db;
 pub use db_builder::DbBuilder;
 pub use db_iter::DbIterator;
 pub use error::{Error, Result};
-pub use governance::{DbGovernance, FileSystemDbGovernance};
+pub use governance::{DbGovernance, FileSystemDbGovernance, NoopDbGovernance};
 pub use merge_operator::{
     BytesMergeOperator, MergeOperator, MergeOperatorResolver, U32CounterMergeOperator,
     U64CounterMergeOperator, merge_operator_by_id,

@@ -257,6 +257,17 @@ class DbBindingTest {
     }
 
     @Test
+    void configJsonCanExplicitlyUseNoopGovernance() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-noop-governance-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        config.governanceMode = Config.GovernanceMode.NOOP;
+
+        try (Db ignored = Db.open(config)) {
+            assertFalse(Files.exists(dataDir.resolve("MANIFEST")));
+        }
+    }
+
+    @Test
     void structuredWithOptionsNullFallsBackToKernelNoOptions() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-structured-null-options-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);

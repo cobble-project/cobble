@@ -177,8 +177,31 @@ impl DbGovernance for FileSystemDbGovernance {
     }
 }
 
+#[derive(Default)]
+pub struct NoopDbGovernance;
+
+impl DbGovernance for NoopDbGovernance {
+    fn register_db(
+        &self,
+        _db_id: &str,
+        _ranges: &[RangeInclusive<u16>],
+        _total_buckets: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn unregister_db(&self, _db_id: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) fn create_default_db_governance(config: &Config) -> Result<Arc<dyn DbGovernance>> {
-    Ok(Arc::new(FileSystemDbGovernance::from_config(config)?))
+    match config.governance_mode {
+        crate::config::GovernanceMode::Filesystem => {
+            Ok(Arc::new(FileSystemDbGovernance::from_config(config)?))
+        }
+        crate::config::GovernanceMode::Noop => Ok(Arc::new(NoopDbGovernance)),
+    }
 }
 
 /// Manager for governance manifests with lock coordination.

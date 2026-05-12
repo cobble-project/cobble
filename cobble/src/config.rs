@@ -113,6 +113,15 @@ pub enum MemtableType {
     Vec,
 }
 
+/// Governance coordination mode used during writable DB open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceMode {
+    #[default]
+    Filesystem,
+    Noop,
+}
+
 /// Volume usage classification.
 /// Used to indicate which volumes support which kinds of data.
 #[repr(u8)]
@@ -683,6 +692,8 @@ pub struct Config {
     /// Auto-expire snapshots after this many newer snapshots are completed.
     /// None disables auto-expiration.
     pub snapshot_retention: Option<usize>,
+    /// Governance coordination mode for writable DB registration.
+    pub governance_mode: GovernanceMode,
 }
 
 impl Default for Config {
@@ -740,6 +751,7 @@ impl Default for Config {
             primary_volume_offload_trigger_watermark: 0.85,
             primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::Priority,
             snapshot_retention: None,
+            governance_mode: GovernanceMode::Filesystem,
         }
     }
 }
@@ -1185,7 +1197,7 @@ fn collect_unrecognized_entry_paths(
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, Error, MemtableType, PrimaryVolumeOffloadPolicyKind, ReadOptions,
+        Config, Error, GovernanceMode, MemtableType, PrimaryVolumeOffloadPolicyKind, ReadOptions,
         ReaderConfigEntry, ScanOptions, VolumeDescriptor, VolumeUsageKind, WriteOptions,
     };
     use crate::SstCompressionAlgorithm;
@@ -1265,6 +1277,7 @@ mod tests {
             primary_volume_offload_trigger_watermark: 0.82,
             primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::LargestFile,
             snapshot_retention: Some(3),
+            governance_mode: GovernanceMode::Noop,
             compaction_read_ahead_enabled: false,
             compaction_remote_addr: Some("127.0.0.1:9999".to_string()),
             compaction_threads: 6,
@@ -1608,6 +1621,17 @@ mod tests {
         assert_eq!(decoded.memtable_capacity, Size::from_kib(2));
         assert_eq!(decoded.num_columns, Config::default().num_columns);
         assert_eq!(decoded.data_file_type, Config::default().data_file_type);
+        assert_eq!(decoded.governance_mode, Config::default().governance_mode);
+    }
+
+    #[test]
+    fn test_config_from_json_str_parses_noop_governance_mode() {
+        let json = r#"{
+            "volumes": [{"base_dir":"file:///tmp/cobble","kinds":["meta","primary_data_priority_high"]}],
+            "governance_mode": "noop"
+        }"#;
+        let decoded = Config::from_json_str(json).expect("Cannot deserialize noop governance json");
+        assert_eq!(decoded.governance_mode, GovernanceMode::Noop);
     }
 
     #[test]

@@ -1294,8 +1294,9 @@ mod tests {
     use super::*;
     use crate::MergeOperator;
     use crate::db_state::full_bucket_range;
+    use crate::paths::GOVERNANCE_MANIFEST_POINTER_NAME;
     use crate::{
-        DbBuilder, DbGovernance, ReadOptions, ScanOptions, U32CounterMergeOperator,
+        DbBuilder, DbGovernance, GovernanceMode, ReadOptions, ScanOptions, U32CounterMergeOperator,
         U64CounterMergeOperator, VolumeDescriptor, WriteOptions,
     };
     use serial_test::serial;
@@ -1416,6 +1417,25 @@ mod tests {
             &["db-builder-governed".to_string()]
         );
         drop(unregister_calls);
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_uses_noop_governance_when_explicitly_configured() {
+        let root = "/tmp/db_noop_governance";
+        cleanup_test_root(root);
+        let mut config = config_with_small_memtable(root);
+        config.governance_mode = GovernanceMode::Noop;
+
+        let db = open_db(config);
+        db.close().unwrap();
+
+        assert!(
+            !std::path::Path::new(root)
+                .join(GOVERNANCE_MANIFEST_POINTER_NAME)
+                .exists()
+        );
         cleanup_test_root(root);
     }
 

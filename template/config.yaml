@@ -108,6 +108,12 @@ snapshot_on_flush: false
 active_memtable_incremental_snapshot_ratio: 0.0
 snapshot_retention: null                 # keep newest N snapshots; null disables auto-expire
 
+# Writable DB governance mode.
+# filesystem: maintain MANIFEST-based bucket-ownership coordination in the Meta volume.
+# noop: skip Cobble-side governance entirely; only use this when another runtime already
+# guarantees non-overlapping writable bucket ownership (for example, an embedding layer).
+governance_mode: filesystem              # filesystem | noop
+
 # Optional LSM split trigger (null disables split logic).
 lsm_split_trigger_level: null
 

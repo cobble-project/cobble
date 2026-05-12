@@ -138,6 +138,17 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 | `snapshot_retention` | `Option<usize>` | `None` | Keep only N most recent snapshots |
 | `active_memtable_incremental_snapshot_ratio` | `f64` | 0.0 | Ratio for incremental memtable snapshots (0 = disabled) |
 
+### Governance
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `governance_mode` | `GovernanceMode` | `Filesystem` | Writable DB governance mode: `Filesystem` uses the manifest-backed ownership registry, `Noop` disables Cobble-side registration |
+
+`governance_mode` accepts:
+
+- `filesystem` - default mode. Writable `Db` opens register their bucket ranges into the governance manifest stored in the `Meta` volume and reject overlaps with other registered shards.
+- `noop` - skip governance registration and unregistration entirely. Choose this only when exclusive bucket ownership is already enforced by the embedding runtime or deployment orchestration.
+
 ### Schema
 
 | Parameter | Type | Default | Description |

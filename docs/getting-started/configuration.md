@@ -163,6 +163,20 @@ All capacity/size fields in `Config` (such as `memtable_capacity`, `l1_base_byte
 | `snapshot_retention` | `None` | Keep only the N most recent snapshots |
 | `active_memtable_incremental_snapshot_ratio` | 0.0 | Ratio for incremental memtable snapshots (0 = disabled) |
 
+### Governance
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `governance_mode` | `Filesystem` | Bucket-ownership coordination mode for writable `Db` opens: `Filesystem` keeps the manifest-based overlap check, `Noop` disables that coordination |
+
+`governance_mode` controls how Cobble coordinates writable shard ownership when a `Db` opens.
+
+- `filesystem` is the default and the safe choice for normal distributed deployments. Cobble writes a governance manifest in the `Meta` volume and rejects overlapping bucket-range ownership across writable shards.
+- `noop` disables that manifest registration entirely. Use it only when another system already guarantees exclusive bucket ownership, or when you intentionally want to skip Cobble-side governance.
+
+{: .warning }
+> `noop` is intentionally **not** the default. If you enable it, Cobble will no longer protect you from accidentally opening overlapping writable shards against the same storage root.
+
 ### Schema
 
 | Parameter | Default | Description |

@@ -156,6 +156,9 @@ public final class Config {
     /** Keep at most this many recent snapshots (null disables auto-expire). */
     public Integer snapshotRetention;
 
+    /** Governance coordination mode for writable DB registration. */
+    public GovernanceMode governanceMode;
+
     public Config addVolume(String baseDir) {
         if (baseDir == null || baseDir.trim().isEmpty()) {
             throw new IllegalArgumentException("baseDir must not be empty");
@@ -254,6 +257,13 @@ public final class Config {
         LARGEST_FILE,
         @SerializedName("priority")
         PRIORITY
+    }
+
+    public enum GovernanceMode {
+        @SerializedName("filesystem")
+        FILESYSTEM,
+        @SerializedName("noop")
+        NOOP
     }
 
     public enum DataFileType {
