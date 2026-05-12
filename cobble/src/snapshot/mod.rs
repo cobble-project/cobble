@@ -40,6 +40,9 @@ pub(crate) struct DbSnapshot {
     pub lsm_tree_bucket_ranges: Vec<RangeInclusive<u16>>,
     pub tree_scopes: Vec<LSMTreeScope>,
     pub bucket_ranges: Vec<RangeInclusive<u16>>,
+    pub data_size_bytes: u64,
+    pub incremental_data_size_bytes: u64,
+    pub active_memtable_total_size_bytes: u64,
     pub finished: bool,
     pub callback: Option<SnapshotCallback>,
 }
@@ -51,6 +54,8 @@ pub(crate) struct SnapshotManifestInfo {
     pub manifest_path: String,
     pub bucket_ranges: Vec<RangeInclusive<u16>>,
     pub latest_schema_id: u64,
+    pub data_size_bytes: u64,
+    pub incremental_data_size_bytes: u64,
 }
 
 pub(crate) type SnapshotCallback =
@@ -72,6 +77,9 @@ impl DbSnapshot {
             lsm_tree_bucket_ranges: Vec::new(),
             tree_scopes: Vec::new(),
             bucket_ranges: Vec::new(),
+            data_size_bytes: 0,
+            incremental_data_size_bytes: 0,
+            active_memtable_total_size_bytes: 0,
             finished: false,
             callback,
         }

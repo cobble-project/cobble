@@ -1558,6 +1558,8 @@ fn shard_snapshot_json(input: &cobble::ShardSnapshotInput) -> String {
         "snapshot_id": input.snapshot_id,
         "manifest_path": &input.manifest_path,
         "timestamp_seconds": input.timestamp_seconds,
+        "data_size_bytes": input.data_size_bytes,
+        "incremental_data_size_bytes": input.incremental_data_size_bytes,
     })
     .to_string()
 }

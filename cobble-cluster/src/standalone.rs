@@ -1174,6 +1174,8 @@ mod tests {
             snapshot_id: 7,
             manifest_path: "file:///tmp/db-a".to_string(),
             timestamp_seconds: 11,
+            data_size_bytes: 0,
+            incremental_data_size_bytes: 0,
         };
         let snapshot = StandaloneShardSnapshot::from(input.clone());
         assert_eq!(snapshot.column_family_ids, input.column_family_ids);

@@ -19,7 +19,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) const GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT: u32 = 2;
+pub(crate) const GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT: u32 = 1;
 
 /// Bucket snapshot reference input.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +31,8 @@ pub struct ShardSnapshotInput {
     pub manifest_path: String,
     /// Timestamp (seconds) when the shard snapshot was initiated.
     pub timestamp_seconds: u32,
+    pub data_size_bytes: u64,
+    pub incremental_data_size_bytes: u64,
 }
 
 /// Bucket snapshot reference stored in a global manifest.
@@ -43,6 +45,8 @@ pub struct ShardSnapshotRef {
     pub manifest_path: String,
     /// Timestamp (seconds) when the shard snapshot was initiated.
     pub timestamp_seconds: u32,
+    pub data_size_bytes: u64,
+    pub incremental_data_size_bytes: u64,
 }
 
 /// Global snapshot manifest referencing bucket-level snapshots.
@@ -166,6 +170,8 @@ impl DbCoordinator {
                 snapshot_id: bucket.snapshot_id,
                 manifest_path: bucket.manifest_path,
                 timestamp_seconds: bucket.timestamp_seconds,
+                data_size_bytes: bucket.data_size_bytes,
+                incremental_data_size_bytes: bucket.incremental_data_size_bytes,
             });
         }
         Ok(GlobalSnapshotManifest {
@@ -446,6 +452,8 @@ mod tests {
                         snapshot_id: 1,
                         manifest_path: path_a.clone(),
                         timestamp_seconds: 0,
+                        data_size_bytes: 0,
+                        incremental_data_size_bytes: 0,
                     },
                     ShardSnapshotInput {
                         ranges: vec![2u16..=3u16],
@@ -454,6 +462,8 @@ mod tests {
                         snapshot_id: 2,
                         manifest_path: path_b.clone(),
                         timestamp_seconds: 0,
+                        data_size_bytes: 0,
+                        incremental_data_size_bytes: 0,
                     },
                 ],
             )
@@ -516,6 +526,8 @@ mod tests {
                     snapshot_id: 1,
                     manifest_path: path_a.clone(),
                     timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
                 }],
                 2,
             )
@@ -532,6 +544,8 @@ mod tests {
                     snapshot_id: 2,
                     manifest_path: path_b.clone(),
                     timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
                 }],
                 1,
             )
@@ -579,6 +593,8 @@ mod tests {
                     snapshot_id: 1,
                     manifest_path: path.clone(),
                     timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
                 }],
                 1,
             )
@@ -595,6 +611,8 @@ mod tests {
                     snapshot_id: 1,
                     manifest_path: path,
                     timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
                 }],
                 2,
             )
@@ -641,6 +659,8 @@ mod tests {
                     snapshot_id: 1,
                     manifest_path: path.clone(),
                     timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
                 }],
                 1,
             )
@@ -658,6 +678,8 @@ mod tests {
                     snapshot_id: 1,
                     manifest_path: path,
                     timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
                 }],
                 2,
             )
@@ -713,6 +735,8 @@ mod tests {
                     snapshot_id: 1,
                     manifest_path: "file:///tmp/db-a".to_string(),
                     timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
                 },
                 ShardSnapshotInput {
                     ranges: vec![2u16..=3u16],
@@ -724,6 +748,8 @@ mod tests {
                     snapshot_id: 2,
                     manifest_path: "file:///tmp/db-b".to_string(),
                     timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
                 },
             ],
             7,
@@ -748,6 +774,8 @@ mod tests {
                     snapshot_id: 1,
                     manifest_path: "file:///tmp/db-a".to_string(),
                     timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
                 },
                 ShardSnapshotInput {
                     ranges: vec![2u16..=3u16],
@@ -759,6 +787,8 @@ mod tests {
                     snapshot_id: 2,
                     manifest_path: "file:///tmp/db-b".to_string(),
                     timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
                 },
             ],
             8,
@@ -802,6 +832,8 @@ mod tests {
                         snapshot_id: 1,
                         manifest_path: path.clone(),
                         timestamp_seconds: 0,
+                        data_size_bytes: 0,
+                        incremental_data_size_bytes: 0,
                     }],
                     id,
                 )

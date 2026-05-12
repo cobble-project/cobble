@@ -411,6 +411,8 @@ class DbBindingTest {
             assertFalse(shardSnapshot.ranges.isEmpty());
             assertNotNull(shardSnapshot.columnFamilyIds);
             assertEquals(Integer.valueOf(0), shardSnapshot.columnFamilyIds.get("default"));
+            assertTrue(shardSnapshot.dataSizeBytes > 0L);
+            assertTrue(shardSnapshot.incrementalDataSizeBytes > 0L);
             assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
 
             try (ReadOnlyDb readOnlyDb =
@@ -561,6 +563,8 @@ class DbBindingTest {
             assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
             assertNotNull(shardSnapshot.manifestPath);
             assertFalse(shardSnapshot.manifestPath.isEmpty());
+            assertTrue(shardSnapshot.dataSizeBytes > 0L);
+            assertTrue(shardSnapshot.incrementalDataSizeBytes > 0L);
             try (Db restored = Db.restore(configPath.toString(), shardSnapshot.snapshotId, dbId)) {
                 for (int i = 0; i < 180; i++) {
                     assertArrayEquals(

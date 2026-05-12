@@ -448,6 +448,8 @@ mod tests {
                 snapshot_id: 7,
                 manifest_path: "test-db/snapshot/SNAPSHOT-7".to_string(),
                 timestamp_seconds: 42,
+                data_size_bytes: 0,
+                incremental_data_size_bytes: 0,
             },
             start: Some(b"a".to_vec()),
             end: Some(b"z".to_vec()),

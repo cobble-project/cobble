@@ -23,6 +23,8 @@ pub(crate) struct ManifestSnapshot {
     pub(crate) id: u64,
     pub(crate) seq_id: u64,
     pub(crate) latest_schema_id: u64,
+    pub(crate) data_size_bytes: u64,
+    pub(crate) incremental_data_size_bytes: u64,
     pub(crate) bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) lsm_tree_bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) tree_scopes: Vec<LSMTreeScope>,
@@ -38,6 +40,8 @@ pub(crate) struct ManifestIncrementalSnapshot {
     pub(crate) seq_id: u64,
     pub(crate) base_snapshot_id: u64,
     pub(crate) latest_schema_id: u64,
+    pub(crate) data_size_bytes: u64,
+    pub(crate) incremental_data_size_bytes: u64,
     pub(crate) bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) lsm_tree_bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) tree_scopes: Vec<LSMTreeScope>,
@@ -179,6 +183,8 @@ pub(crate) fn load_manifest_entry(
                 resolved.id = incremental.id;
                 resolved.seq_id = incremental.seq_id;
                 resolved.latest_schema_id = incremental.latest_schema_id;
+                resolved.data_size_bytes = incremental.data_size_bytes;
+                resolved.incremental_data_size_bytes = incremental.incremental_data_size_bytes;
                 resolved.active_memtable_data = incremental.active_memtable_data;
                 resolved.bucket_ranges = incremental.bucket_ranges;
                 resolved.lsm_tree_bucket_ranges = incremental.lsm_tree_bucket_ranges;
@@ -247,6 +253,8 @@ pub(crate) fn load_manifest_chain(
                 resolved_base.id = manifest.id;
                 resolved_base.seq_id = manifest.seq_id;
                 resolved_base.latest_schema_id = manifest.latest_schema_id;
+                resolved_base.data_size_bytes = manifest.data_size_bytes;
+                resolved_base.incremental_data_size_bytes = manifest.incremental_data_size_bytes;
                 resolved_base.active_memtable_data = manifest.active_memtable_data;
                 resolved_base.bucket_ranges = manifest.bucket_ranges;
                 resolved_base.lsm_tree_bucket_ranges = manifest.lsm_tree_bucket_ranges;
@@ -462,38 +470,53 @@ pub(crate) fn snapshot_manifest_name(id: u64) -> String {
 }
 
 /// Encode a snapshot manifest as JSON.
+pub(crate) struct ManifestEncodeResult {
+    pub(crate) incremental_base_id: Option<u64>,
+    pub(crate) data_size_bytes: u64,
+    pub(crate) incremental_data_size_bytes: u64,
+    pub(crate) active_memtable_total_size_bytes: u64,
+}
+
 pub(crate) fn encode_manifest<W: SequentialWriteFile>(
     writer: &mut BufferedWriter<W>,
     snapshot: &DbSnapshot,
     base_snapshot: Option<&DbSnapshot>,
     file_manager: &FileManager,
-) -> Result<Option<u64>> {
-    let full_manifest = || {
-        ManifestPayload::Snapshot(ManifestSnapshot {
-            version: MANIFEST_VERSION_CURRENT,
-            id: snapshot.id,
-            seq_id: snapshot.seq_id,
-            latest_schema_id: snapshot.latest_schema_id,
-            bucket_ranges: snapshot.bucket_ranges.clone(),
-            lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
-            tree_scopes: snapshot.tree_scopes.clone(),
-            tree_levels: manifest_tree_levels_from_snapshot(snapshot, file_manager),
-            vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
-            active_memtable_data: snapshot.active_memtable_data.clone(),
-        })
+) -> Result<ManifestEncodeResult> {
+    let base_file_paths = base_snapshot.map(snapshot_file_sizes).unwrap_or_default();
+    let current_files = snapshot_file_sizes(snapshot);
+    let file_data_size_bytes = current_files.values().copied().sum::<u64>();
+    let current_active_memtable_bytes = snapshot
+        .active_memtable_data
+        .iter()
+        .map(|segment| segment.end_offset.saturating_sub(segment.start_offset))
+        .sum::<u64>();
+    let incremental_data_size_bytes = if base_snapshot.is_some() {
+        current_files
+            .iter()
+            .filter(|(path, _)| !base_file_paths.contains_key(*path))
+            .map(|(_, size)| *size)
+            .sum::<u64>()
+            + current_active_memtable_bytes
+    } else {
+        file_data_size_bytes + current_active_memtable_bytes
     };
-    let mut incremental_base_id = None;
+
     let manifest = if let Some(base) = base_snapshot {
         if let Some(tree_level_edits) =
             build_incremental_tree_level_edits(base, snapshot, file_manager)
         {
-            incremental_base_id = Some(base.id);
+            let active_memtable_total_size_bytes =
+                base.active_memtable_total_size_bytes + current_active_memtable_bytes;
+            let data_size_bytes = file_data_size_bytes + active_memtable_total_size_bytes;
             ManifestPayload::IncrementalSnapshot(ManifestIncrementalSnapshot {
                 version: MANIFEST_VERSION_CURRENT,
                 id: snapshot.id,
                 seq_id: snapshot.seq_id,
                 base_snapshot_id: base.id,
                 latest_schema_id: snapshot.latest_schema_id,
+                data_size_bytes,
+                incremental_data_size_bytes,
                 bucket_ranges: snapshot.bucket_ranges.clone(),
                 lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
                 tree_scopes: snapshot.tree_scopes.clone(),
@@ -502,15 +525,71 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 active_memtable_data: snapshot.active_memtable_data.clone(),
             })
         } else {
-            full_manifest()
+            ManifestPayload::Snapshot(ManifestSnapshot {
+                version: MANIFEST_VERSION_CURRENT,
+                id: snapshot.id,
+                seq_id: snapshot.seq_id,
+                latest_schema_id: snapshot.latest_schema_id,
+                data_size_bytes: file_data_size_bytes + current_active_memtable_bytes,
+                incremental_data_size_bytes,
+                bucket_ranges: snapshot.bucket_ranges.clone(),
+                lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
+                tree_scopes: snapshot.tree_scopes.clone(),
+                tree_levels: manifest_tree_levels_from_snapshot(snapshot, file_manager),
+                vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
+                active_memtable_data: snapshot.active_memtable_data.clone(),
+            })
         }
     } else {
-        full_manifest()
+        ManifestPayload::Snapshot(ManifestSnapshot {
+            version: MANIFEST_VERSION_CURRENT,
+            id: snapshot.id,
+            seq_id: snapshot.seq_id,
+            latest_schema_id: snapshot.latest_schema_id,
+            data_size_bytes: file_data_size_bytes + current_active_memtable_bytes,
+            incremental_data_size_bytes,
+            bucket_ranges: snapshot.bucket_ranges.clone(),
+            lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
+            tree_scopes: snapshot.tree_scopes.clone(),
+            tree_levels: manifest_tree_levels_from_snapshot(snapshot, file_manager),
+            vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
+            active_memtable_data: snapshot.active_memtable_data.clone(),
+        })
     };
     let json = serde_json::to_vec(&manifest)
         .map_err(|err| Error::IoError(format!("Failed to encode manifest: {}", err)))?;
     writer.write(&json)?;
-    Ok(incremental_base_id)
+    let (incremental_base_id, data_size_bytes, active_memtable_total_size_bytes) = match &manifest {
+        ManifestPayload::Snapshot(snapshot_manifest) => (
+            None,
+            snapshot_manifest.data_size_bytes,
+            current_active_memtable_bytes,
+        ),
+        ManifestPayload::IncrementalSnapshot(incremental_manifest) => (
+            Some(incremental_manifest.base_snapshot_id),
+            incremental_manifest.data_size_bytes,
+            base_snapshot
+                .map(|base| base.active_memtable_total_size_bytes)
+                .unwrap_or(0)
+                + current_active_memtable_bytes,
+        ),
+    };
+    Ok(ManifestEncodeResult {
+        incremental_base_id,
+        data_size_bytes,
+        incremental_data_size_bytes,
+        active_memtable_total_size_bytes,
+    })
+}
+
+fn snapshot_file_sizes(snapshot: &DbSnapshot) -> BTreeMap<String, u64> {
+    let mut sizes = BTreeMap::new();
+    for tracked in snapshot.tracked_data_files.values() {
+        sizes
+            .entry(tracked.absolute_path())
+            .or_insert_with(|| tracked.size_bytes());
+    }
+    sizes
 }
 
 fn manifest_tree_levels_from_snapshot(
@@ -880,6 +959,8 @@ mod tests {
                 "id": 1,
                 "seq_id": 2,
                 "latest_schema_id": 3,
+                "data_size_bytes": 0,
+                "incremental_data_size_bytes": 0,
                 "bucket_ranges": [],
                 "lsm_tree_bucket_ranges": [],
                 "tree_scopes": [],

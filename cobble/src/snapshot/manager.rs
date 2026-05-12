@@ -371,6 +371,13 @@ impl SnapshotManager {
             lsm_tree_bucket_ranges: manifest.lsm_tree_bucket_ranges.clone(),
             tree_scopes: manifest.tree_scopes.clone(),
             bucket_ranges: manifest.bucket_ranges.clone(),
+            data_size_bytes: manifest.data_size_bytes,
+            incremental_data_size_bytes: manifest.incremental_data_size_bytes,
+            active_memtable_total_size_bytes: manifest
+                .active_memtable_data
+                .iter()
+                .map(|segment| segment.end_offset.saturating_sub(segment.start_offset))
+                .sum(),
             finished: true,
             callback: None,
         });
@@ -457,7 +464,7 @@ impl SnapshotManager {
                 let prepared_result =
                     self.prepare_snapshot_for_materialization(snapshot.as_ref(), &resources);
                 match prepared_result {
-                    Ok(prepared) => {
+                    Ok(mut prepared) => {
                         let materialize_result = (|| {
                             self.schema_manager.persist_schemas_up_to(
                                 &self.file_manager,
@@ -467,13 +474,19 @@ impl SnapshotManager {
                                 .file_manager
                                 .create_metadata_file(&snapshot_manifest_name(id))?;
                             let mut buffered = BufferedWriter::new(writer, 8192);
-                            incremental_base_id = encode_manifest(
+                            let encode_result = encode_manifest(
                                 &mut buffered,
                                 &prepared.snapshot,
                                 base_snapshot.as_deref(),
                                 &self.file_manager,
                             )?;
+                            incremental_base_id = encode_result.incremental_base_id;
                             buffered.close()?;
+                            prepared.snapshot.data_size_bytes = encode_result.data_size_bytes;
+                            prepared.snapshot.incremental_data_size_bytes =
+                                encode_result.incremental_data_size_bytes;
+                            prepared.snapshot.active_memtable_total_size_bytes =
+                                encode_result.active_memtable_total_size_bytes;
                             Ok(())
                         })();
                         match materialize_result {
@@ -494,22 +507,26 @@ impl SnapshotManager {
             }
             None => Err(Error::IoError(format!("Snapshot {} not found", id))),
         };
-        let manifest_info = snapshot.as_ref().and_then(|s| {
-            if result.is_err() {
-                return None;
-            }
-            let manifest_name = snapshot_manifest_name(s.id);
-            let manifest_path = self
-                .file_manager
-                .get_metadata_file_full_path(&manifest_name)
-                .unwrap_or_else(|| s.manifest_path.clone());
-            Some(SnapshotManifestInfo {
-                id: s.id,
-                manifest_path,
-                bucket_ranges: s.bucket_ranges.clone(),
-                latest_schema_id: s.latest_schema_id,
+        let manifest_info = if result.is_err() {
+            None
+        } else {
+            let state = self.state.lock().unwrap();
+            state.snapshots.get(&id).map(|s| {
+                let manifest_name = snapshot_manifest_name(s.id);
+                let manifest_path = self
+                    .file_manager
+                    .get_metadata_file_full_path(&manifest_name)
+                    .unwrap_or_else(|| s.manifest_path.clone());
+                SnapshotManifestInfo {
+                    id: s.id,
+                    manifest_path,
+                    bucket_ranges: s.bucket_ranges.clone(),
+                    latest_schema_id: s.latest_schema_id,
+                    data_size_bytes: s.data_size_bytes,
+                    incremental_data_size_bytes: s.incremental_data_size_bytes,
+                }
             })
-        });
+        };
         if let Some(callback) = callback {
             callback(
                 result

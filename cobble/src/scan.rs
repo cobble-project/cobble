@@ -628,6 +628,8 @@ mod tests {
                 snapshot_id: 42,
                 manifest_path: "file:///tmp/manifest".to_string(),
                 timestamp_seconds: 100,
+                data_size_bytes: 1234,
+                incremental_data_size_bytes: 567,
             },
             start: Some(b"start".to_vec()),
             end: Some(b"end".to_vec()),

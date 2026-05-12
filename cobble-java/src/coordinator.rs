@@ -98,6 +98,8 @@ struct JavaShardSnapshot {
     snapshot_id: u64,
     manifest_path: String,
     timestamp_seconds: u32,
+    data_size_bytes: u64,
+    incremental_data_size_bytes: u64,
 }
 
 #[unsafe(no_mangle)]
@@ -169,6 +171,8 @@ pub extern "system" fn Java_io_cobble_DbCoordinator_materializeGlobalSnapshot(
             snapshot_id: input.snapshot_id,
             manifest_path: input.manifest_path,
             timestamp_seconds: input.timestamp_seconds,
+            data_size_bytes: input.data_size_bytes,
+            incremental_data_size_bytes: input.incremental_data_size_bytes,
         });
     }
     let global =

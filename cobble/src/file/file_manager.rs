@@ -374,6 +374,10 @@ impl TrackedFile {
         }
     }
 
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn set_priority(&self, priority: u8) {
         self.priority.store(priority, Ordering::SeqCst);
     }

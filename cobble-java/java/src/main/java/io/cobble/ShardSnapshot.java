@@ -45,6 +45,14 @@ public final class ShardSnapshot implements Serializable {
     @SerializedName("timestamp_seconds")
     public long timestampSeconds;
 
+    /** Total logical snapshot data bytes referenced by this shard snapshot. */
+    @SerializedName("data_size_bytes")
+    public long dataSizeBytes;
+
+    /** Incremental data bytes newly contributed by this shard snapshot. */
+    @SerializedName("incremental_data_size_bytes")
+    public long incrementalDataSizeBytes;
+
     public static ShardSnapshot fromJson(String json) {
         return GSON.fromJson(json, ShardSnapshot.class);
     }
