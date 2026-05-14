@@ -4,7 +4,8 @@ use super::manifest::{
     snapshot_manifest_name,
 };
 use super::{
-    ActiveMemtableSnapshotData, DbSnapshot, SnapshotCallback, SnapshotManifestInfo, memtable,
+    ActiveMemtableSnapshotData, DbSnapshot, SnapshotCallback, SnapshotLifecycleState,
+    SnapshotManifestInfo, memtable,
 };
 use crate::config::MemtableType;
 use crate::data_file::DataFile;
@@ -18,8 +19,10 @@ use crate::lsm::{LSMTreeVersion, Level};
 use crate::paths::schema_file_relative_path;
 use crate::schema::SchemaManager;
 use crate::vlog::VlogVersion;
+use log::warn;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::RangeInclusive;
+use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -73,6 +76,24 @@ struct SnapshotManagerState {
     // Reference counts for schema files used by live snapshots.
     schema_ref_counts: HashMap<u64, usize>,
     in_flight: usize,
+}
+
+fn suggested_base_fallback_id(
+    snapshots: &BTreeMap<u64, Arc<DbSnapshot>>,
+    snapshot_id: u64,
+) -> Option<u64> {
+    let mut candidate_id = snapshots
+        .get(&snapshot_id)
+        .and_then(|snapshot| snapshot.base_snapshot_id);
+    while let Some(id) = candidate_id {
+        let snapshot = snapshots.get(&id)?;
+        if snapshot.is_cancelled() {
+            candidate_id = snapshot.base_snapshot_id;
+            continue;
+        }
+        return Some(id);
+    }
+    None
 }
 
 struct PreparedSnapshotMaterialization {
@@ -146,6 +167,12 @@ impl SnapshotCopyResourceRegistry for MaterializeTempResourceRegistry {
 }
 
 impl SnapshotManager {
+    fn cleanup_cancelled_snapshot(&self, id: u64) {
+        if let Err(err) = self.expire_snapshot(id) {
+            warn!("failed to cleanup cancelled snapshot {}: {}", id, err);
+        }
+    }
+
     pub(crate) fn new(
         file_manager: Arc<FileManager>,
         schema_manager: Arc<SchemaManager>,
@@ -221,6 +248,36 @@ impl SnapshotManager {
         snapshot
     }
 
+    pub(crate) fn cancel_snapshot(&self, id: u64) -> Result<bool> {
+        let callback = {
+            let mut state = self.state.lock().unwrap();
+            let Some(current) = state.snapshots.get(&id).cloned() else {
+                return Ok(false);
+            };
+            if !current.try_cancel() {
+                return Ok(false);
+            }
+
+            let mut updated = (*current).clone();
+            let callback = updated.callback.take();
+            state.snapshots.insert(id, Arc::new(updated));
+            callback
+        };
+
+        if let Some(callback) = callback {
+            callback(Err(Error::CancelledError(format!(
+                "Snapshot {} was cancelled",
+                id
+            ))));
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn suggested_base_fallback(&self, snapshot_id: u64) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        suggested_base_fallback_id(&state.snapshots, snapshot_id)
+    }
+
     pub(crate) fn set_bucket_ranges(&self, bucket_ranges: Vec<RangeInclusive<u16>>) {
         *self.bucket_ranges.write().unwrap() = bucket_ranges;
     }
@@ -294,11 +351,17 @@ impl SnapshotManager {
         snapshot.vlog_version = clone_vlog_version_untracked(&db_state.vlog_version);
         snapshot.base_snapshot_id = db_state.suggested_base_snapshot_id;
         snapshot.active_memtable_data = active_memtable_data;
+        let snapshot = Arc::new(snapshot);
+        state.snapshots.insert(id, Arc::clone(&snapshot));
+        if snapshot.is_cancelled() {
+            drop(state);
+            self.cleanup_cancelled_snapshot(id);
+            return false;
+        }
         increment_schema_ref_counts(
             &mut state.schema_ref_counts,
             &snapshot.referenced_schema_ids,
         );
-        state.snapshots.insert(id, Arc::new(snapshot));
         state.completed.insert(id);
         drop(state);
         db_state_handle.update_suggested_snapshot(db_state.seq_id, id);
@@ -378,8 +441,8 @@ impl SnapshotManager {
                 .iter()
                 .map(|segment| segment.end_offset.saturating_sub(segment.start_offset))
                 .sum(),
-            finished: true,
             callback: None,
+            lifecycle_state: Arc::new(AtomicU8::new(SnapshotLifecycleState::Published as u8)),
         });
 
         let mut state = self.state.lock().unwrap();
@@ -446,67 +509,110 @@ impl SnapshotManager {
             } else {
                 None
             };
-            // base snapshot must be finished to be used as incremental base, otherwise treat as no base
+            // base snapshot must already be published to be used as an incremental base.
             let base_snapshot = snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.base_snapshot_id)
                 .and_then(|base_id| state.snapshots.get(&base_id))
-                .filter(|snapshot| snapshot.finished)
+                .filter(|snapshot| snapshot.is_published())
                 .cloned();
             (snapshot, callback, base_snapshot)
         };
         let mut incremental_base_id = None;
         let result = match snapshot {
             Some(ref snapshot) => {
-                let resources = Arc::new(MaterializeTempResourceRegistry::new(Arc::clone(
-                    &self.file_manager,
-                )));
-                let prepared_result =
-                    self.prepare_snapshot_for_materialization(snapshot.as_ref(), &resources);
-                match prepared_result {
-                    Ok(mut prepared) => {
-                        let materialize_result = (|| {
-                            self.schema_manager.persist_schemas_up_to(
-                                &self.file_manager,
-                                prepared.snapshot.latest_schema_id,
-                            )?;
-                            let writer = self
-                                .file_manager
-                                .create_metadata_file(&snapshot_manifest_name(id))?;
-                            let mut buffered = BufferedWriter::new(writer, 8192);
-                            let encode_result = encode_manifest(
-                                &mut buffered,
-                                &prepared.snapshot,
-                                base_snapshot.as_deref(),
-                                &self.file_manager,
-                            )?;
-                            incremental_base_id = encode_result.incremental_base_id;
-                            buffered.close()?;
-                            prepared.snapshot.data_size_bytes = encode_result.data_size_bytes;
-                            prepared.snapshot.incremental_data_size_bytes =
-                                encode_result.incremental_data_size_bytes;
-                            prepared.snapshot.active_memtable_total_size_bytes =
-                                encode_result.active_memtable_total_size_bytes;
-                            Ok(())
-                        })();
-                        match materialize_result {
-                            Ok(()) => {
-                                self.commit_prepared_materialization(
-                                    id,
-                                    incremental_base_id,
-                                    prepared,
-                                );
-                                resources.finalize();
+                if snapshot.is_cancelled() {
+                    Err(Error::CancelledError(format!(
+                        "Snapshot {} was cancelled before materialization",
+                        id
+                    )))
+                } else {
+                    let resources = Arc::new(MaterializeTempResourceRegistry::new(Arc::clone(
+                        &self.file_manager,
+                    )));
+                    let prepared_result =
+                        self.prepare_snapshot_for_materialization(snapshot.as_ref(), &resources);
+                    match prepared_result {
+                        Ok(mut prepared) => {
+                            let materialize_result = (|| {
+                                if snapshot.is_cancelled() {
+                                    return Err(Error::CancelledError(format!(
+                                        "Snapshot {} was cancelled during materialization",
+                                        id
+                                    )));
+                                }
+                                self.schema_manager.persist_schemas_up_to(
+                                    &self.file_manager,
+                                    prepared.snapshot.latest_schema_id,
+                                )?;
+                                let writer = self
+                                    .file_manager
+                                    .create_metadata_file(&snapshot_manifest_name(id))?;
+                                let mut buffered = BufferedWriter::new(writer, 8192);
+                                let encode_result = encode_manifest(
+                                    &mut buffered,
+                                    &prepared.snapshot,
+                                    base_snapshot.as_deref(),
+                                    &self.file_manager,
+                                )?;
+                                incremental_base_id = encode_result.incremental_base_id;
+                                buffered.close()?;
+                                prepared.snapshot.data_size_bytes = encode_result.data_size_bytes;
+                                prepared.snapshot.incremental_data_size_bytes =
+                                    encode_result.incremental_data_size_bytes;
+                                prepared.snapshot.active_memtable_total_size_bytes =
+                                    encode_result.active_memtable_total_size_bytes;
+                                if snapshot.is_cancelled() {
+                                    return Err(Error::CancelledError(format!(
+                                        "Snapshot {} was cancelled after manifest encoding",
+                                        id
+                                    )));
+                                }
                                 Ok(())
+                            })();
+                            match materialize_result {
+                                Ok(()) => match snapshot.try_begin_publication() {
+                                    Ok(()) => {
+                                        let expire_requested = self
+                                            .commit_prepared_materialization(
+                                                id,
+                                                incremental_base_id,
+                                                prepared,
+                                            );
+                                        resources.finalize();
+                                        if expire_requested {
+                                            let _ = self.expire_snapshot(id)?;
+                                            Err(Error::CancelledError(format!(
+                                                "Snapshot {} expired during publication",
+                                                id
+                                            )))
+                                        } else {
+                                            Ok(())
+                                        }
+                                    }
+                                    Err(SnapshotLifecycleState::Cancelled) => {
+                                        Err(Error::CancelledError(format!(
+                                            "Snapshot {} was cancelled before publication",
+                                            id
+                                        )))
+                                    }
+                                    Err(state) => Err(Error::InvalidState(format!(
+                                        "Snapshot {} entered unexpected publication state {:?}",
+                                        id, state
+                                    ))),
+                                },
+                                Err(err) => Err(err),
                             }
-                            Err(err) => Err(err),
                         }
+                        Err(err) => Err(err),
                     }
-                    Err(err) => Err(err),
                 }
             }
             None => Err(Error::IoError(format!("Snapshot {} not found", id))),
         };
+        if matches!(result, Err(Error::CancelledError(_))) {
+            self.cleanup_cancelled_snapshot(id);
+        }
         let manifest_info = if result.is_err() {
             None
         } else {
@@ -589,8 +695,11 @@ impl SnapshotManager {
             }
             copy_candidates.push(source_file_id);
         }
-        let copied_file_id_map = self
-            .copy_data_files_to_snapshot_volume_parallel(copy_candidates, Arc::clone(resources))?;
+        let copied_file_id_map = self.copy_data_files_to_snapshot_volume_parallel(
+            copy_candidates,
+            Arc::clone(resources),
+            Arc::clone(&snapshot.lifecycle_state),
+        )?;
         file_id_map.extend(copied_file_id_map);
         let mut source_snapshot_links = Vec::new();
         for (source_file_id, source_data_file) in source_data_files.drain() {
@@ -629,6 +738,7 @@ impl SnapshotManager {
         &self,
         source_file_ids: Vec<u64>,
         resources: Arc<MaterializeTempResourceRegistry>,
+        lifecycle_state: Arc<AtomicU8>,
     ) -> Result<HashMap<u64, u64>> {
         if source_file_ids.is_empty() {
             return Ok(HashMap::new());
@@ -640,19 +750,32 @@ impl SnapshotManager {
             for source_file_id in source_file_ids {
                 let file_manager = Arc::clone(&file_manager);
                 let copy_resource_registry = Arc::clone(&copy_resource_registry);
+                let lifecycle_state = Arc::clone(&lifecycle_state);
                 join_set.spawn_blocking(move || {
                     file_manager
-                        .copy_data_file_to_snapshot_volume_with_result(
+                        .copy_data_file_to_snapshot_volume_with_result_and_cancel(
                             source_file_id,
                             Some(copy_resource_registry),
+                            Some(lifecycle_state.as_ref()),
                         )
                         .map(|(copied_id, _)| (source_file_id, copied_id))
                 });
             }
             let mut file_id_map = HashMap::new();
             while let Some(result) = join_set.join_next().await {
+                if SnapshotLifecycleState::is_cancelled_raw(lifecycle_state.as_ref()) {
+                    join_set.abort_all();
+                }
                 let (source_file_id, copied_id) = result.map_err(|err| {
-                    Error::IoError(format!("Snapshot upload task failed to join: {}", err))
+                    if SnapshotLifecycleState::is_cancelled_raw(lifecycle_state.as_ref())
+                        && err.is_cancelled()
+                    {
+                        Error::CancelledError(
+                            "Snapshot upload cancelled while joining copy tasks".to_string(),
+                        )
+                    } else {
+                        Error::IoError(format!("Snapshot upload task failed to join: {}", err))
+                    }
                 })??;
                 file_id_map.insert(source_file_id, copied_id);
             }
@@ -665,7 +788,7 @@ impl SnapshotManager {
         id: u64,
         incremental_base_id: Option<u64>,
         mut prepared: PreparedSnapshotMaterialization,
-    ) {
+    ) -> bool {
         for (source_data_file, snapshot_data_file) in &prepared.source_snapshot_links {
             source_data_file.set_snapshot_data_file(Arc::clone(snapshot_data_file));
             self.file_manager.register_snapshot_replica_hint(
@@ -680,8 +803,8 @@ impl SnapshotManager {
                 .values()
                 .for_each(|tracked| tracked.dereference());
         }
-        prepared.snapshot.finished = true;
         prepared.snapshot.base_snapshot_id = incremental_base_id;
+        let expire_requested = prepared.snapshot.mark_published();
         state.snapshots.insert(id, Arc::new(prepared.snapshot));
         // if there is an incremental base, add reference from the new snapshot to the base;
         if let Some(base_id) = incremental_base_id {
@@ -694,6 +817,7 @@ impl SnapshotManager {
                 *state.incremental_ref_counts.entry(base_id).or_insert(0) += 1;
             }
         }
+        expire_requested
     }
 
     pub(crate) fn expire_snapshot(&self, id: u64) -> Result<bool> {
@@ -705,8 +829,11 @@ impl SnapshotManager {
             live_active_data_paths,
         ) = {
             let mut state = self.state.lock().unwrap();
-            if !state.snapshots.contains_key(&id) {
+            let Some(snapshot) = state.snapshots.get(&id).cloned() else {
                 return Ok(false);
+            };
+            if snapshot.request_expire_after_publication_start() {
+                return Ok(true);
             }
             let mut removed_schema_ids = BTreeSet::new();
             let mut removed_requested_snapshot = false;
@@ -1090,4 +1217,42 @@ fn clone_vlog_version_untracked(vlog_version: &VlogVersion) -> VlogVersion {
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot_with_base(id: u64, base_snapshot_id: Option<u64>) -> Arc<DbSnapshot> {
+        let mut snapshot = DbSnapshot::new(id, &format!("SNAPSHOT-{id}"), None);
+        snapshot.base_snapshot_id = base_snapshot_id;
+        Arc::new(snapshot)
+    }
+
+    #[test]
+    fn suggested_base_fallback_skips_cancelled_ancestors() {
+        let grandparent = snapshot_with_base(1, None);
+        let parent = snapshot_with_base(2, Some(1));
+        assert!(parent.try_cancel());
+        let child = snapshot_with_base(3, Some(2));
+
+        let snapshots = BTreeMap::from([
+            (1, Arc::clone(&grandparent)),
+            (2, Arc::clone(&parent)),
+            (3, Arc::clone(&child)),
+        ]);
+
+        assert_eq!(suggested_base_fallback_id(&snapshots, 3), Some(1));
+    }
+
+    #[test]
+    fn suggested_base_fallback_clears_on_broken_chain() {
+        let parent = snapshot_with_base(2, Some(99));
+        assert!(parent.try_cancel());
+        let child = snapshot_with_base(3, Some(2));
+
+        let snapshots = BTreeMap::from([(2, Arc::clone(&parent)), (3, Arc::clone(&child))]);
+
+        assert_eq!(suggested_base_fallback_id(&snapshots, 3), None);
+    }
 }

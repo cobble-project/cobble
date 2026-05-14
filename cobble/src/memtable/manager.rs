@@ -1032,13 +1032,14 @@ impl MemtableManager {
         active_data: Vec<ActiveMemtableSnapshotData>,
         db_state: &Arc<DbStateHandle>,
     ) {
-        if let Some(snapshot_job) = snapshot_completion {
-            snapshot_job.manager.finish_snapshot(
+        if let Some(snapshot_job) = snapshot_completion
+            && snapshot_job.manager.finish_snapshot(
                 snapshot_job.snapshot_id,
                 snapshot,
                 active_data,
                 db_state.as_ref(),
-            );
+            )
+        {
             let _ = snapshot_job
                 .manager
                 .schedule_materialize(snapshot_job.snapshot_id);

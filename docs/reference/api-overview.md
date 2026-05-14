@@ -100,6 +100,10 @@ db.update_schema() -> SchemaBuilder
 db.put(bucket, key, column, value) -> Result<()>
 db.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Bytes>>>>
 db.snapshot() -> Result<u64>
+db.snapshot_with_callback(callback) -> Result<u64>
+db.cancel_snapshot(snapshot_id) -> Result<bool>
+db.expire_snapshot(snapshot_id) -> Result<bool>
+db.retain_snapshot(snapshot_id) -> bool
 db.shard_snapshot_input(snapshot_id) -> Result<ShardSnapshotInput>
 ```
 
@@ -107,6 +111,14 @@ db.shard_snapshot_input(snapshot_id) -> Result<ShardSnapshotInput>
 restores from the source snapshot but assigns a fresh db id and starts a new snapshot chain.
 `open_new_with_manifest_path` does the same thing when your checkpoint metadata already stores the
 exact source manifest path.
+
+Snapshot lifecycle notes:
+
+- `db.snapshot()` returns a snapshot id after the async materialization flow has been scheduled.
+- `db.snapshot_with_callback(...)` delivers a `ShardSnapshotInput` once manifest publication finishes.
+- `db.cancel_snapshot(snapshot_id)` only succeeds before manifest publication completes.
+- `db.expire_snapshot(snapshot_id)` releases snapshot ownership and file references.
+- `db.retain_snapshot(snapshot_id)` keeps a completed snapshot alive across retention passes.
 
 #### Reader
 

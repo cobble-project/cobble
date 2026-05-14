@@ -721,6 +721,8 @@ impl Db {
         Ok(db_snapshot.id)
     }
 
+    /// Flush the active memtable, schedule manifest materialization, and invoke the callback with
+    /// a [`crate::coordinator::ShardSnapshotInput`] once publication completes.
     pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
     where
         F: Fn(Result<crate::coordinator::ShardSnapshotInput>) + Send + Sync + 'static,
@@ -752,13 +754,30 @@ impl Db {
         Ok(snapshot.id)
     }
 
+    /// Cancel an in-flight snapshot before manifest publication completes.
+    pub fn cancel_snapshot(&self, snapshot_id: u64) -> Result<bool> {
+        let cancelled = self.snapshot_manager.cancel_snapshot(snapshot_id)?;
+        if cancelled {
+            let fallback = self.snapshot_manager.suggested_base_fallback(snapshot_id);
+            self.db_state
+                .rebase_suggested_snapshot(snapshot_id, fallback);
+        }
+        Ok(cancelled)
+    }
+
     /// Expire a snapshot and release its file references.
     pub fn expire_snapshot(&self, snapshot_id: u64) -> Result<bool> {
         let _access = self.begin_access()?;
-        self.snapshot_manager.expire_snapshot(snapshot_id)
+        let fallback = self.snapshot_manager.suggested_base_fallback(snapshot_id);
+        let expired = self.snapshot_manager.expire_snapshot(snapshot_id)?;
+        if expired {
+            self.db_state
+                .rebase_suggested_snapshot(snapshot_id, fallback);
+        }
+        Ok(expired)
     }
 
-    /// Retain a snapshot to avoid auto-expiration.
+    /// Retain a completed snapshot to avoid auto-expiration by retention processing.
     pub fn retain_snapshot(&self, snapshot_id: u64) -> bool {
         let Ok(_access) = self.begin_access() else {
             return false;
@@ -1294,7 +1313,8 @@ mod tests {
     use super::*;
     use crate::MergeOperator;
     use crate::db_state::full_bucket_range;
-    use crate::paths::GOVERNANCE_MANIFEST_POINTER_NAME;
+    use crate::paths::{GOVERNANCE_MANIFEST_POINTER_NAME, snapshot_active_data_relative_path};
+    use crate::snapshot::SnapshotLifecycleState;
     use crate::{
         DbBuilder, DbGovernance, GovernanceMode, ReadOptions, ScanOptions, U32CounterMergeOperator,
         U64CounterMergeOperator, VolumeDescriptor, WriteOptions,
@@ -1378,6 +1398,91 @@ mod tests {
         assert!(matches!(snapshot_err, Error::InvalidState(_)));
         assert!(!db.retain_snapshot(0));
 
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_cancel_snapshot_returns_cancelled_error_and_consumes_snapshot_id() {
+        let root = "/tmp/db_cancel_snapshot";
+        cleanup_test_root(root);
+        let config = config_with_small_memtable(root);
+        let db = open_db(config);
+        for i in 0..256 {
+            let key = format!("k-{i}");
+            let value = format!("value-{i}");
+            db.put(0, key.as_bytes(), 0, value.as_bytes()).unwrap();
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let snapshot_id = db
+            .snapshot_with_callback(move |result| {
+                tx.send(result).expect("send cancelled snapshot result");
+            })
+            .unwrap();
+
+        assert!(db.cancel_snapshot(snapshot_id).unwrap());
+        let callback_result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("receive cancelled snapshot result");
+        assert!(matches!(callback_result, Err(Error::CancelledError(_))));
+        let _ = db.memtable_manager.wait_for_flushes();
+        assert!(
+            db.snapshot_manager
+                .wait_for_materialization(Duration::from_secs(10))
+        );
+        assert!(!db.expire_snapshot(snapshot_id).unwrap());
+        let manifest_path = db
+            .file_manager
+            .metadata_path(&snapshot_manifest_name(snapshot_id));
+        let active_data_path = db
+            .file_manager
+            .metadata_path(&snapshot_active_data_relative_path(snapshot_id));
+        assert!(
+            !db.file_manager
+                .has_metadata_file(&snapshot_manifest_name(snapshot_id))
+        );
+        assert!(
+            !db.file_manager
+                .meta_volume
+                .fs()
+                .exists(&manifest_path)
+                .expect("check cancelled snapshot manifest")
+        );
+        assert!(
+            !db.file_manager
+                .meta_volume
+                .fs()
+                .exists(&active_data_path)
+                .expect("check cancelled active snapshot data")
+        );
+
+        let next_snapshot_id = db.snapshot().unwrap();
+        assert_eq!(snapshot_id + 1, next_snapshot_id);
+
+        db.close().unwrap();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_cancel_snapshot_returns_false_once_publication_starts() {
+        let root = "/tmp/db_cancel_snapshot_after_publication_start";
+        cleanup_test_root(root);
+        let config = config_with_small_memtable(root);
+        let db = open_db(config);
+
+        let snapshot = db.snapshot_manager.create_snapshot(None);
+        assert_eq!(snapshot.try_begin_publication(), Ok(()));
+
+        assert!(!db.cancel_snapshot(snapshot.id).unwrap());
+        assert!(db.expire_snapshot(snapshot.id).unwrap());
+        assert_eq!(
+            snapshot.lifecycle_state(),
+            SnapshotLifecycleState::CommitStartedExpireRequested
+        );
+
+        db.close().unwrap();
         cleanup_test_root(root);
     }
 

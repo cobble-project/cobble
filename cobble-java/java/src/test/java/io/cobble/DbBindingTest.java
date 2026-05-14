@@ -468,6 +468,26 @@ class DbBindingTest {
     }
 
     @Test
+    void asyncSnapshotCanBeCancelledBeforePublication() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-cancel-snapshot-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 2048; i++) {
+                db.put(0, keyBytes("cancel-snapshot", i), 0, valueBytes("cancel-snapshot-v", i));
+            }
+
+            PendingSnapshot<ShardSnapshot> pendingSnapshot = db.startAsyncSnapshot();
+            assertTrue(db.cancelSnapshot(pendingSnapshot.snapshotId()));
+
+            ExecutionException exception =
+                    assertThrows(ExecutionException.class, () -> pendingSnapshot.future().get());
+            assertInstanceOf(CancelledError.class, exception.getCause());
+            assertTrue(db.expireSnapshot(pendingSnapshot.snapshotId()));
+        }
+    }
+
+    @Test
     void coordinatorRetentionAndRetainExpireFlow() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-coordinator-retention-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);

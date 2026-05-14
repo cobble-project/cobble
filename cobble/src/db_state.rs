@@ -402,6 +402,28 @@ impl DbStateHandle {
         })
     }
 
+    pub(crate) fn rebase_suggested_snapshot(
+        &self,
+        snapshot_id: u64,
+        replacement: Option<u64>,
+    ) -> bool {
+        let _guard = self.lock();
+        let current = self.load();
+        if current.suggested_base_snapshot_id != Some(snapshot_id) {
+            return true;
+        }
+        self.store(DbState {
+            seq_id: current.seq_id,
+            bucket_ranges: current.bucket_ranges.clone(),
+            multi_lsm_version: current.multi_lsm_version.clone(),
+            vlog_version: current.vlog_version.clone(),
+            active: current.active.clone(),
+            immutables: current.immutables.clone(),
+            suggested_base_snapshot_id: replacement,
+        });
+        true
+    }
+
     pub(crate) fn configure_multi_lsm(
         &self,
         total_buckets: u32,

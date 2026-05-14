@@ -1334,6 +1334,10 @@ impl StructuredDb {
         self.db.snapshot_with_callback(callback)
     }
 
+    pub fn cancel_snapshot(&self, snapshot_id: u64) -> Result<bool> {
+        self.db.cancel_snapshot(snapshot_id)
+    }
+
     pub fn expire_snapshot(&self, snapshot_id: u64) -> Result<bool> {
         self.db.expire_snapshot(snapshot_id)
     }

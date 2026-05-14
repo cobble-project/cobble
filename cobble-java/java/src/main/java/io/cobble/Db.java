@@ -878,9 +878,15 @@ public final class Db extends NativeObject {
 
     /** Trigger snapshot creation asynchronously and return a future of shard snapshot payload. */
     public CompletableFuture<ShardSnapshot> asyncSnapshot() {
+        return startAsyncSnapshot().future();
+    }
+
+    /** Trigger snapshot creation asynchronously and return both snapshot id and future. */
+    public PendingSnapshot<ShardSnapshot> startAsyncSnapshot() {
         CompletableFuture<String> snapshotJsonFuture = new CompletableFuture<>();
-        asyncSnapshot(nativeHandle, snapshotJsonFuture);
-        return snapshotJsonFuture.thenApply(ShardSnapshot::fromJson);
+        long snapshotId = asyncSnapshot(nativeHandle, snapshotJsonFuture);
+        return new PendingSnapshot<>(
+                snapshotId, snapshotJsonFuture.thenApply(ShardSnapshot::fromJson));
     }
 
     /**
@@ -896,8 +902,16 @@ public final class Db extends NativeObject {
             throw new IllegalStateException("snapshot interrupted", e);
         } catch (ExecutionException e) {
             Throwable cause = e.getCause() == null ? e : e.getCause();
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
             throw new IllegalStateException("snapshot failed: " + cause.getMessage(), cause);
         }
+    }
+
+    /** Cancel an in-flight snapshot before manifest publication completes. */
+    public boolean cancelSnapshot(long snapshotId) {
+        return cancelSnapshot(nativeHandle, snapshotId);
     }
 
     /**
@@ -1074,8 +1088,10 @@ public final class Db extends NativeObject {
 
     private static native int nowSeconds(long nativeHandle);
 
-    private static native void asyncSnapshot(
+    private static native long asyncSnapshot(
             long nativeHandle, CompletableFuture<String> snapshotJsonFuture);
+
+    private static native boolean cancelSnapshot(long nativeHandle, long snapshotId);
 
     private static native boolean expireSnapshot(long nativeHandle, long snapshotId);
 

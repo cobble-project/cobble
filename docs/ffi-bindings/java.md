@@ -51,6 +51,7 @@ For multi-shard deployments. See [Distributed Deployment](../getting-started/dis
 
 ```java
 import io.cobble.Db;
+import io.cobble.PendingSnapshot;
 import io.cobble.ShardSnapshot;
 
 Db db = Db.open("config.yaml");
@@ -221,6 +222,30 @@ For hot paths, prefer direct buffer APIs.
 | `byte[]` | Most JNI copy/allocation | Good for simplicity |
 | Direct view (`DirectColumns`/`DirectRow`) | Lower copy, lower allocation | Good default for performance |
 | `DirectEncodedRow` | Lowest decode overhead, best control | **Best performance path** |
+
+## Snapshot Lifecycle APIs
+
+Distributed `Db` also exposes asynchronous snapshot lifecycle control for checkpoint-style integrations:
+
+```java
+PendingSnapshot<ShardSnapshot> pending = db.startAsyncSnapshot();
+long snapshotId = pending.snapshotId();
+
+// Cancel while the snapshot is still in flight.
+boolean cancelled = db.cancelSnapshot(snapshotId);
+
+// Or wait for the materialized shard snapshot payload.
+ShardSnapshot snapshot = pending.future().get();
+
+// Later, retain/expire the completed snapshot explicitly if needed.
+db.retainSnapshot(snapshot.snapshotId);
+db.expireSnapshot(snapshot.snapshotId);
+```
+
+- `asyncSnapshot()` returns only the `CompletableFuture<ShardSnapshot>`.
+- `startAsyncSnapshot()` returns both the snapshot id and the future via `PendingSnapshot`.
+- `cancelSnapshot(snapshotId)` only succeeds before manifest publication completes.
+- The same snapshot lifecycle APIs are also available on `io.cobble.structured.Db`.
 
 ## Memory Management
 

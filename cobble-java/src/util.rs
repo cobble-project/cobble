@@ -231,8 +231,36 @@ pub(crate) fn complete_future_exceptionally(
     future: &JObject,
     message: &str,
 ) -> Result<(), String> {
-    let class = illegal_state_exception_class(env)?;
-    let ctor = illegal_state_exception_ctor(env)?;
+    complete_future_exceptionally_with_throwable(env, future, message, false)
+}
+
+pub(crate) fn complete_future_with_cobble_error(
+    env: &mut JNIEnv,
+    future: &JObject,
+    err: &cobble::Error,
+) -> Result<(), String> {
+    complete_future_exceptionally_with_throwable(
+        env,
+        future,
+        &err.to_string(),
+        matches!(err, cobble::Error::CancelledError(_)),
+    )
+}
+
+fn complete_future_exceptionally_with_throwable(
+    env: &mut JNIEnv,
+    future: &JObject,
+    message: &str,
+    cancelled: bool,
+) -> Result<(), String> {
+    let (class, ctor) = if cancelled {
+        (cancelled_error_class(env)?, cancelled_error_ctor(env)?)
+    } else {
+        (
+            illegal_state_exception_class(env)?,
+            illegal_state_exception_ctor(env)?,
+        )
+    };
     let exception = new_exception(env, class, ctor, message.to_string())?;
     let throwable = JThrowable::from(exception);
     let args = [JValue::Object(&throwable).as_jni()];
@@ -363,6 +391,11 @@ fn illegal_argument_exception_class(env: &mut JNIEnv) -> Result<&'static GlobalR
     cached_class(env, &CLASS, "java/lang/IllegalArgumentException")
 }
 
+fn cancelled_error_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
+    static CLASS: OnceLock<GlobalRef> = OnceLock::new();
+    cached_class(env, &CLASS, "io/cobble/CancelledError")
+}
+
 fn completable_future_class(env: &mut JNIEnv) -> Result<&'static GlobalRef, String> {
     static CLASS: OnceLock<GlobalRef> = OnceLock::new();
     cached_class(env, &CLASS, "java/util/concurrent/CompletableFuture")
@@ -377,6 +410,12 @@ fn illegal_state_exception_ctor(env: &mut JNIEnv) -> Result<JMethodID, String> {
 fn illegal_argument_exception_ctor(env: &mut JNIEnv) -> Result<JMethodID, String> {
     static METHOD: OnceLock<JMethodID> = OnceLock::new();
     let class = illegal_argument_exception_class(env)?;
+    cached_constructor_id(env, &METHOD, class, "(Ljava/lang/String;)V")
+}
+
+fn cancelled_error_ctor(env: &mut JNIEnv) -> Result<JMethodID, String> {
+    static METHOD: OnceLock<JMethodID> = OnceLock::new();
+    let class = cancelled_error_class(env)?;
     cached_constructor_id(env, &METHOD, class, "(Ljava/lang/String;)V")
 }
 

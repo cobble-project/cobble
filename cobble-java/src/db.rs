@@ -1,11 +1,11 @@
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{ScanCursorHandle, decode_scan_open_args};
 use crate::util::{
-    complete_future_exceptionally, complete_future_with_string, decode_bucket_ranges,
-    decode_java_bytes, decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong,
-    parse_config_json, take_last_overflow_direct_buffer, throw_illegal_argument,
-    throw_illegal_state, to_java_optional_bytes_2d, to_java_string_or_throw,
-    write_payload_to_io_or_cached_overflow,
+    complete_future_exceptionally, complete_future_with_cobble_error, complete_future_with_string,
+    decode_bucket_ranges, decode_java_bytes, decode_java_string, decode_u16, decode_u32,
+    decode_u64_from_jlong, parse_config_json, take_last_overflow_direct_buffer,
+    throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
+    to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use cobble::{Config, Db};
@@ -1283,36 +1283,67 @@ pub extern "system" fn Java_io_cobble_Db_asyncSnapshot(
     _class: JClass,
     native_handle: jlong,
     snapshot_future_json: JObject,
-) {
+) -> jlong {
     let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
-        return;
+        return 0;
     };
     if snapshot_future_json.is_null() {
         throw_illegal_argument(&mut env, "snapshotFutureJson must not be null".to_string());
-        return;
+        return 0;
     }
     let future = match env.new_global_ref(snapshot_future_json) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
-            return;
+            return 0;
         }
     };
     let vm = match env.get_java_vm() {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
-            return;
+            return 0;
         }
     };
-    if let Err(err) = db.snapshot_with_callback(move |result| {
+    match db.snapshot_with_callback(move |result| {
         complete_snapshot_json_future(
             &vm,
             &future,
             result.map(|input| shard_snapshot_json(&input)),
         );
     }) {
-        throw_illegal_state(&mut env, err.to_string());
+        Ok(snapshot_id) => snapshot_id as jlong,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_cancelSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    snapshot_id: jlong,
+) -> jboolean {
+    let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
+        return JNI_FALSE;
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return JNI_FALSE;
+        }
+    };
+    match db.cancel_snapshot(snapshot_id) {
+        Ok(true) => JNI_TRUE,
+        Ok(false) => JNI_FALSE,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            JNI_FALSE
+        }
     }
 }
 
@@ -1580,7 +1611,7 @@ fn complete_snapshot_json_future(vm: &JavaVM, future: &GlobalRef, result: cobble
             });
         }
         Err(err) => {
-            let _ = complete_future_exceptionally(&mut env, future.as_obj(), &err.to_string());
+            let _ = complete_future_with_cobble_error(&mut env, future.as_obj(), &err);
         }
     }
 }

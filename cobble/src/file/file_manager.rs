@@ -19,6 +19,7 @@ use crate::file::metadata_io::MetadataWriter;
 use crate::file::offload::OffloadRuntime;
 use crate::lru::LruCache;
 use crate::metrics_manager::MetricsManager;
+use crate::snapshot::SnapshotLifecycleState;
 use crate::util::normalize_storage_path_to_url;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -1118,9 +1119,23 @@ impl FileManager {
         source: &dyn RandomAccessFile,
         writer: &mut TrackedWriter,
     ) -> Result<()> {
+        self.copy_reader_to_tracked_writer_with_cancel(source, writer, None)
+    }
+
+    pub(crate) fn copy_reader_to_tracked_writer_with_cancel(
+        &self,
+        source: &dyn RandomAccessFile,
+        writer: &mut TrackedWriter,
+        lifecycle_state: Option<&AtomicU8>,
+    ) -> Result<()> {
         let source_size = source.size();
         let mut offset = 0usize;
         while offset < source_size {
+            if lifecycle_state.is_some_and(SnapshotLifecycleState::is_cancelled_raw) {
+                return Err(Error::CancelledError(
+                    "Snapshot upload cancelled while copying data files".to_string(),
+                ));
+            }
             let chunk = SNAPSHOT_COPY_CHUNK_BYTES.min(source_size - offset);
             let bytes = source.read_at(offset, chunk)?;
             writer.write(bytes.as_ref())?;
@@ -1363,6 +1378,19 @@ impl FileManager {
         source_file_id: FileId,
         resource_registry: Option<Arc<dyn SnapshotCopyResourceRegistry + Send + Sync>>,
     ) -> Result<(FileId, bool)> {
+        self.copy_data_file_to_snapshot_volume_with_result_and_cancel(
+            source_file_id,
+            resource_registry,
+            None,
+        )
+    }
+
+    pub(crate) fn copy_data_file_to_snapshot_volume_with_result_and_cancel(
+        &self,
+        source_file_id: FileId,
+        resource_registry: Option<Arc<dyn SnapshotCopyResourceRegistry + Send + Sync>>,
+        lifecycle_state: Option<&AtomicU8>,
+    ) -> Result<(FileId, bool)> {
         if self.is_data_file_persistable_for_snapshot(source_file_id) {
             return Ok((source_file_id, false));
         }
@@ -1384,7 +1412,11 @@ impl FileManager {
         let target_file_id = self.allocate_file_id();
         let mut writer = self.create_data_file_writer_on_volume(target_file_id, snapshot_volume)?;
 
-        let copy_result = self.copy_reader_to_tracked_writer(source_reader.as_ref(), &mut writer);
+        let copy_result = self.copy_reader_to_tracked_writer_with_cancel(
+            source_reader.as_ref(),
+            &mut writer,
+            lifecycle_state,
+        );
 
         if let Err(err) = copy_result {
             let _ = self.remove_data_file(target_file_id);
