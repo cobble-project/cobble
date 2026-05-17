@@ -240,11 +240,15 @@ ShardSnapshot snapshot = pending.future().get();
 // Later, retain/expire the completed snapshot explicitly if needed.
 db.retainSnapshot(snapshot.snapshotId);
 db.expireSnapshot(snapshot.snapshotId);
+
+// Out-of-band prune tool (no Db instance required):
+SnapshotTools.pruneShardSnapshot(config, snapshot.dbId, snapshot.snapshotId);
 ```
 
 - `asyncSnapshot()` returns only the `CompletableFuture<ShardSnapshot>`.
 - `startAsyncSnapshot()` returns both the snapshot id and the future via `PendingSnapshot`.
 - `cancelSnapshot(snapshotId)` only succeeds before manifest publication completes.
+- `SnapshotTools.pruneShardSnapshot(config, dbId, snapshotId)` is the explicit out-of-band shard cleanup API.
 - The same snapshot lifecycle APIs are also available on `io.cobble.structured.Db`.
 
 ## Memory Management

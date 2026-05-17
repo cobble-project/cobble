@@ -937,6 +937,8 @@ impl Db {
             Arc::clone(&schema_manager),
             Arc::clone(&db_lifecycle),
             config.snapshot_retention,
+            config.snapshot_only_track,
+            config.snapshot_disable_incremental_base_link,
             bucket_ranges.clone(),
         );
 

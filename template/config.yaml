@@ -107,6 +107,8 @@ log_level: INFO                          # OFF | ERROR | WARN | INFO | DEBUG | T
 snapshot_on_flush: false
 active_memtable_incremental_snapshot_ratio: 0.0
 snapshot_retention: null                 # keep newest N snapshots; null disables auto-expire
+snapshot_only_track: false               # true: track snapshots only, disable DB-side retention expiration
+snapshot_disable_incremental_base_link: false  # true: disable incremental manifest base linking
 
 # Writable DB governance mode.
 # filesystem: maintain MANIFEST-based bucket-ownership coordination in the Meta volume.

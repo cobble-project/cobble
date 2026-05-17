@@ -2721,6 +2721,8 @@ mod tests {
             Arc::clone(&schema_manager),
             Arc::new(DbLifecycle::new_open()),
             None,
+            false,
+            false,
             vec![0u16..=0u16],
         );
         let snapshot_write = MemtableManager::write_active_memtable_snapshot_data(
@@ -2868,6 +2870,8 @@ mod tests {
             Arc::clone(&schema_manager),
             Arc::new(DbLifecycle::new_open()),
             None,
+            false,
+            false,
             vec![0u16..=0u16],
         );
         let snapshot_write = MemtableManager::write_active_memtable_snapshot_data(

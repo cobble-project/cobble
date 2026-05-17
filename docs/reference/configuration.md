@@ -136,6 +136,8 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 |-----------|------|---------|-------------|
 | `snapshot_on_flush` | `bool` | `false` | Auto-snapshot after each memtable flush |
 | `snapshot_retention` | `Option<usize>` | `None` | Keep only N most recent snapshots |
+| `snapshot_only_track` | `bool` | `false` | Track snapshots only; disable DB-side retention expiration |
+| `snapshot_disable_incremental_base_link` | `bool` | `false` | Disable incremental manifest base linking |
 | `active_memtable_incremental_snapshot_ratio` | `f64` | 0.0 | Ratio for incremental memtable snapshots (0 = disabled) |
 
 ### Governance

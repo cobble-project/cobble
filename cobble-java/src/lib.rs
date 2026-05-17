@@ -15,6 +15,7 @@ mod reader;
 mod scan;
 mod schema;
 mod single_db;
+mod snapshot_tools;
 mod structured;
 mod structured_read_options;
 mod structured_scan_options;

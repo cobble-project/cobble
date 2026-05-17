@@ -12,4 +12,5 @@ Complete reference documentation for Cobble configuration, APIs, and operational
 |------|-------------|
 | [Configuration Reference](configuration) | All configuration parameters with types, defaults, and descriptions |
 | [API Overview](api-overview) | Public Rust API surface and module structure |
+| [Tools](tools) | Maintenance tools and snapshot pruning usage |
 | [Monitoring](monitoring) | Web monitor dashboard and metrics |

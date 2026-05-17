@@ -692,6 +692,12 @@ pub struct Config {
     /// Auto-expire snapshots after this many newer snapshots are completed.
     /// None disables auto-expiration.
     pub snapshot_retention: Option<usize>,
+    /// Track snapshot lifecycle metadata only.
+    /// When true, DB does not auto-expire snapshots by retention.
+    pub snapshot_only_track: bool,
+    /// Disable incremental manifest base linking.
+    /// When true, each new snapshot is materialized without referencing a base snapshot.
+    pub snapshot_disable_incremental_base_link: bool,
     /// Governance coordination mode for writable DB registration.
     pub governance_mode: GovernanceMode,
 }
@@ -751,6 +757,8 @@ impl Default for Config {
             primary_volume_offload_trigger_watermark: 0.85,
             primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::Priority,
             snapshot_retention: None,
+            snapshot_only_track: false,
+            snapshot_disable_incremental_base_link: false,
             governance_mode: GovernanceMode::Filesystem,
         }
     }
@@ -1277,6 +1285,8 @@ mod tests {
             primary_volume_offload_trigger_watermark: 0.82,
             primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::LargestFile,
             snapshot_retention: Some(3),
+            snapshot_only_track: false,
+            snapshot_disable_incremental_base_link: false,
             governance_mode: GovernanceMode::Noop,
             compaction_read_ahead_enabled: false,
             compaction_remote_addr: Some("127.0.0.1:9999".to_string()),

@@ -156,6 +156,12 @@ public final class Config {
     /** Keep at most this many recent snapshots (null disables auto-expire). */
     public Integer snapshotRetention;
 
+    /** Track snapshots only and disable DB-side retention expiration. */
+    public Boolean snapshotOnlyTrack;
+
+    /** Disable incremental manifest base linking for new snapshots. */
+    public Boolean snapshotDisableIncrementalBaseLink;
+
     /** Governance coordination mode for writable DB registration. */
     public GovernanceMode governanceMode;
 

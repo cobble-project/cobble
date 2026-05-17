@@ -38,6 +38,8 @@ pub(crate) struct SnapshotManager {
     bucket_ranges: Arc<RwLock<Vec<RangeInclusive<u16>>>>,
     state: Arc<Mutex<SnapshotManagerState>>,
     retention: Option<usize>,
+    snapshot_only_track: bool,
+    snapshot_disable_incremental_base_link: bool,
     /// Background worker for manifest materialization.
     materialize_tx: Arc<Mutex<Option<mpsc::Sender<u64>>>>,
     materialize_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -54,6 +56,8 @@ impl Clone for SnapshotManager {
             bucket_ranges: Arc::clone(&self.bucket_ranges),
             state: Arc::clone(&self.state),
             retention: self.retention,
+            snapshot_only_track: self.snapshot_only_track,
+            snapshot_disable_incremental_base_link: self.snapshot_disable_incremental_base_link,
             materialize_tx: Arc::clone(&self.materialize_tx),
             materialize_worker: Arc::clone(&self.materialize_worker),
             materialize_done: Arc::clone(&self.materialize_done),
@@ -178,12 +182,62 @@ impl SnapshotManager {
         schema_manager: Arc<SchemaManager>,
         db_lifecycle: Arc<DbLifecycle>,
         retention: Option<usize>,
+        snapshot_only_track: bool,
+        snapshot_disable_incremental_base_link: bool,
         bucket_ranges: Vec<RangeInclusive<u16>>,
     ) -> Self {
         let upload_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("failed to build snapshot upload runtime");
+        Self::new_with_runtime(
+            file_manager,
+            schema_manager,
+            db_lifecycle,
+            retention,
+            snapshot_only_track,
+            snapshot_disable_incremental_base_link,
+            bucket_ranges,
+            upload_runtime,
+        )
+    }
+
+    pub(crate) fn new_for_maintenance(
+        file_manager: Arc<FileManager>,
+        schema_manager: Arc<SchemaManager>,
+        db_lifecycle: Arc<DbLifecycle>,
+        retention: Option<usize>,
+        snapshot_only_track: bool,
+        snapshot_disable_incremental_base_link: bool,
+        bucket_ranges: Vec<RangeInclusive<u16>>,
+    ) -> Self {
+        let upload_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build maintenance snapshot runtime");
+        Self::new_with_runtime(
+            file_manager,
+            schema_manager,
+            db_lifecycle,
+            retention,
+            snapshot_only_track,
+            snapshot_disable_incremental_base_link,
+            bucket_ranges,
+            upload_runtime,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_runtime(
+        file_manager: Arc<FileManager>,
+        schema_manager: Arc<SchemaManager>,
+        db_lifecycle: Arc<DbLifecycle>,
+        retention: Option<usize>,
+        snapshot_only_track: bool,
+        snapshot_disable_incremental_base_link: bool,
+        bucket_ranges: Vec<RangeInclusive<u16>>,
+        upload_runtime: Runtime,
+    ) -> Self {
         Self {
             file_manager,
             schema_manager,
@@ -200,6 +254,8 @@ impl SnapshotManager {
                 in_flight: 0,
             })),
             retention,
+            snapshot_only_track,
+            snapshot_disable_incremental_base_link,
             materialize_tx: Arc::new(Mutex::new(None)),
             materialize_worker: Arc::new(Mutex::new(None)),
             materialize_done: Arc::new(Condvar::new()),
@@ -349,7 +405,11 @@ impl SnapshotManager {
             })
             .collect();
         snapshot.vlog_version = clone_vlog_version_untracked(&db_state.vlog_version);
-        snapshot.base_snapshot_id = db_state.suggested_base_snapshot_id;
+        snapshot.base_snapshot_id = if self.snapshot_disable_incremental_base_link {
+            None
+        } else {
+            db_state.suggested_base_snapshot_id
+        };
         snapshot.active_memtable_data = active_memtable_data;
         let snapshot = Arc::new(snapshot);
         state.snapshots.insert(id, Arc::clone(&snapshot));
@@ -474,6 +534,9 @@ impl SnapshotManager {
     }
 
     pub(crate) fn process_retention(&self) -> Result<()> {
+        if self.snapshot_only_track {
+            return Ok(());
+        }
         let mut to_expire = Vec::new();
         {
             let state = self.state.lock().unwrap();
