@@ -1,7 +1,7 @@
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{ScanCursorHandle, decode_scan_open_args};
 use crate::util::{
-    decode_java_bytes, decode_java_string, decode_u16, decode_u32, parse_config_json,
+    decode_java_bytes, decode_java_string, decode_u16, decode_u64_from_jlong, parse_config_json,
     throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
     to_java_string_or_throw,
 };
@@ -73,7 +73,7 @@ pub extern "system" fn Java_io_cobble_Reader_openHandle(
     mut env: JNIEnv,
     _class: JClass,
     config_path: JString,
-    global_snapshot_id: jint,
+    global_snapshot_id: jlong,
 ) -> jlong {
     let path = match decode_java_string(&mut env, config_path) {
         Ok(path) => path,
@@ -82,8 +82,8 @@ pub extern "system" fn Java_io_cobble_Reader_openHandle(
             return 0;
         }
     };
-    let snapshot_id = match decode_u32("globalSnapshotId", global_snapshot_id) {
-        Ok(v) => v as u64,
+    let snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return 0;
@@ -112,7 +112,7 @@ pub extern "system" fn Java_io_cobble_Reader_openHandleFromJson(
     mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
-    global_snapshot_id: jint,
+    global_snapshot_id: jlong,
 ) -> jlong {
     let json = match decode_java_string(&mut env, config_json) {
         Ok(json) => json,
@@ -121,8 +121,8 @@ pub extern "system" fn Java_io_cobble_Reader_openHandleFromJson(
             return 0;
         }
     };
-    let snapshot_id = match decode_u32("globalSnapshotId", global_snapshot_id) {
-        Ok(v) => v as u64,
+    let snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return 0;

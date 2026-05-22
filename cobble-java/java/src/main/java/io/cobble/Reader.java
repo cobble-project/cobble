@@ -52,7 +52,7 @@ public final class Reader extends NativeObject {
      * @param globalSnapshotId global snapshot id
      * @return snapshot-pinned reader
      */
-    public static Reader open(String configPath, int globalSnapshotId) {
+    public static Reader open(String configPath, long globalSnapshotId) {
         NativeLoader.load();
         long nativeHandle = openHandle(configPath, globalSnapshotId);
         if (nativeHandle == 0L) {
@@ -68,7 +68,7 @@ public final class Reader extends NativeObject {
      * @param globalSnapshotId global snapshot id
      * @return snapshot-pinned reader
      */
-    public static Reader open(Config config, int globalSnapshotId) {
+    public static Reader open(Config config, long globalSnapshotId) {
         if (config == null) {
             throw new IllegalArgumentException("config must not be null");
         }
@@ -173,9 +173,9 @@ public final class Reader extends NativeObject {
 
     private static native long openCurrentHandleFromJson(String configJson);
 
-    private static native long openHandle(String configPath, int globalSnapshotId);
+    private static native long openHandle(String configPath, long globalSnapshotId);
 
-    private static native long openHandleFromJson(String configJson, int globalSnapshotId);
+    private static native long openHandleFromJson(String configJson, long globalSnapshotId);
 
     private static native void refresh(long nativeHandle);
 
