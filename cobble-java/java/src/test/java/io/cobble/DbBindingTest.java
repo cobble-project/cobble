@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -1782,5 +1783,59 @@ class DbBindingTest {
                 }
             }
         }
+    }
+
+    @Test
+    void scanPlanPreservesShardRanges() {
+        ShardSnapshot shardSnapshot = new ShardSnapshot();
+        shardSnapshot.dbId = "db-1";
+        shardSnapshot.snapshotId = 17L;
+        shardSnapshot.manifestPath = "file:///tmp/manifest";
+        ShardSnapshot.Range first = new ShardSnapshot.Range();
+        first.start = 2;
+        first.end = 3;
+        ShardSnapshot.Range second = new ShardSnapshot.Range();
+        second.start = 6;
+        second.end = 6;
+        shardSnapshot.ranges = Arrays.asList(first, second);
+
+        GlobalSnapshot snapshot = new GlobalSnapshot();
+        snapshot.shardSnapshots = Collections.singletonList(shardSnapshot);
+
+        List<ScanSplit> splits =
+                ScanPlan.fromGlobalSnapshot(snapshot)
+                        .withStart(new byte[] {1})
+                        .withEnd(new byte[] {9})
+                        .splits();
+
+        assertEquals(1, splits.size());
+        assertArrayEquals(new byte[] {1}, splits.get(0).start);
+        assertArrayEquals(new byte[] {9}, splits.get(0).end);
+        assertEquals(2, splits.get(0).shard.ranges.get(0).start);
+        assertEquals(3, splits.get(0).shard.ranges.get(0).end);
+        assertEquals(6, splits.get(0).shard.ranges.get(1).start);
+        assertEquals(6, splits.get(0).shard.ranges.get(1).end);
+        assertEquals("file:///tmp/manifest", splits.get(0).shard.manifestPath);
+    }
+
+    @Test
+    void scanSplitConstructorPreservesShardAndBounds() {
+        ShardSnapshot shardSnapshot = new ShardSnapshot();
+        shardSnapshot.dbId = "db-1";
+        shardSnapshot.snapshotId = 17L;
+        ShardSnapshot.Range range = new ShardSnapshot.Range();
+        range.start = 2;
+        range.end = 4;
+        shardSnapshot.ranges = Collections.singletonList(range);
+
+        ScanSplit split = new ScanSplit(shardSnapshot, new byte[] {1}, new byte[] {9});
+        ScanSplit rebound = new ScanSplit(shardSnapshot, new byte[] {2, 3}, new byte[] {7});
+
+        assertSame(shardSnapshot, split.shard);
+        assertArrayEquals(new byte[] {1}, split.start);
+        assertArrayEquals(new byte[] {9}, split.end);
+        assertSame(shardSnapshot, rebound.shard);
+        assertArrayEquals(new byte[] {2, 3}, rebound.start);
+        assertArrayEquals(new byte[] {7}, rebound.end);
     }
 }

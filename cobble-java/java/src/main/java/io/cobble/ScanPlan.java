@@ -39,7 +39,7 @@ public final class ScanPlan {
 
     /** Generates one split per shard snapshot in the global snapshot manifest. */
     public List<ScanSplit> splits() {
-        List<ScanSplit> out = new ArrayList<ScanSplit>();
+        List<ScanSplit> out = new ArrayList<>();
         if (manifest.shardSnapshots == null) {
             return out;
         }

@@ -62,7 +62,9 @@ public final class ShardSnapshot implements Serializable {
     }
 
     /** Inclusive bucket range. */
-    public static final class Range {
+    public static final class Range implements Serializable {
+        private static final long serialVersionUID = 1L;
+
         /** Range start bucket. */
         @SerializedName("start")
         public int start;
