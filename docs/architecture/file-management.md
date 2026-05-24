@@ -33,6 +33,18 @@ This abstraction means the same `Db` instance can read files from local disk and
 
 For details on configuring multiple volumes with different backends, see [Multi-Volume Storage](multi-volume).
 
+## Process-Level Filesystem Fallback
+
+Besides built-in backends, Cobble also supports a process-level custom filesystem registry.
+
+At runtime, Cobble resolves filesystem access in this order:
+
+1. Try built-in backend resolution from the volume URI/scheme.
+2. If built-in resolution fails (including URI normalization/parse/init failures), try the process custom registry.
+3. If a custom registry is configured, and built-in resolution succeeds but initial access probe fails, also fall back to the custom registry.
+
+This design lets host frameworks (for example, Flink) bridge their own filesystem ecosystem into Cobble without changing Cobble core backend implementations.
+
 ## Reader Cache
 
 The file manager maintains an LRU cache of open file readers (capacity: 512). This avoids repeatedly opening and closing files for sequential reads, which is especially important during point lookups.

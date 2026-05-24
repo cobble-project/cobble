@@ -19,7 +19,10 @@ pub(crate) use self::file_manager::test_utils;
 pub use self::file_manager::{
     FileId, FileManager, FileManagerOptions, TrackedFile, TrackedFileId, TrackedWriter,
 };
-pub use self::file_system::{FileSystem, FileSystemRegistry};
+pub use self::file_system::{
+    FileSystem, FileSystemRegistry, ProcessFileSystemRegistry, ProcessFileSystemRequest,
+    clear_process_custom_file_system_registry, register_process_custom_file_system_registry,
+};
 pub use self::files::{
     BufferedReader, BufferedWriter, File, RandomAccessFile, ReadAheadBufferedReader,
     SequentialWriteFile,

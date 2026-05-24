@@ -77,6 +77,12 @@ public final class NativeLoader {
         }
     }
 
+    static boolean isLoaded() {
+        synchronized (LOCK) {
+            return loadedProfile != null;
+        }
+    }
+
     static String resolveLibraryResourcePath(NativeProfile profile) {
         String os = detectOs();
         String arch = detectArch();

@@ -82,6 +82,46 @@ byte[] value = reader.get(0, "key".getBytes(), 0);
 reader.refresh();
 ```
 
+## Process-Level Filesystem Fallback APIs
+
+Java bindings expose process-level filesystem extension APIs so host frameworks can plug in their
+own filesystem stack for Cobble volume access.
+
+### Key Interfaces
+
+- `ProcessFileSystems`: process-scoped register/clear entrypoints.
+- `CustomFileSystemRegistry`: resolves `ProcessFileSystemRequest` into a `CustomFileSystem`.
+- `CustomFileSystem`: filesystem operations used by Cobble native runtime.
+- `CustomRandomAccessFile` / `CustomSequentialWriteFile`: file handles for read/write operations.
+
+### Direct I/O Capability Contract
+
+- `supportDirect()` declares whether the file handle supports direct `ByteBuffer` paths.
+- If `supportDirect()` is `false`, JNI uses `byte[]` methods only.
+- If `supportDirect()` is `true`, JNI may call `readAtDirect(...)` / `writeDirect(...)`.
+
+### Minimal Registration Example
+
+```java
+ProcessFileSystems.registerCustomRegistry(
+        request -> {
+            String baseDir =
+                    request.normalizedBaseDir() != null
+                            ? request.normalizedBaseDir()
+                            : request.baseDir();
+            if (baseDir == null || baseDir.isBlank()) {
+                return null;
+            }
+            return new MyCustomFileSystem(baseDir);
+        });
+```
+
+Clear the process fallback registry when your process no longer needs it:
+
+```java
+ProcessFileSystems.clearCustomRegistry();
+```
+
 ## Write APIs
 
 Column family can be passed either by `String columnFamily` overloads or via options objects

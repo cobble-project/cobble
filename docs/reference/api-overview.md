@@ -41,6 +41,19 @@ This page summarizes the public Rust API surface of the Cobble crates.
 | `ScanOptions` | Scan/iteration options |
 | `WriteOptions` | Write operation options |
 
+### Filesystem Extension Types
+
+| Type / Function | Description |
+|------|-------------|
+| `ProcessFileSystemRequest` | Request context passed to process-level custom filesystem resolution (original and normalized base dir, parsed URL, credentials, custom options). |
+| `ProcessFileSystemRegistry` | Trait for host-side custom filesystem resolution (`try_init`). |
+| `register_process_custom_file_system_registry(...)` | Registers one process-level custom filesystem registry used as fallback when built-in resolution/access fails. |
+| `clear_process_custom_file_system_registry()` | Clears the current process-level custom filesystem registry. |
+
+Resolution order is built-in first, then process-level fallback. If a custom registry is configured,
+Cobble also falls back when built-in filesystem initialization succeeds but the initial access probe
+fails.
+
 ### Metadata & Schema Types
 
 | Type | Description |
@@ -199,6 +212,12 @@ On the Java side, restore flows are exposed as `Db.restore(..., boolean newDbId)
 | `io.cobble.DirectColumns` | Zero-copy raw direct read view |
 | `io.cobble.DirectEncodedRow` | Raw encoded direct row view with InputStream-based column decoder |
 | `io.cobble.DirectScanCursor` / `DirectScanEntry` | Raw direct scan cursor and row view |
+| `io.cobble.ProcessFileSystems` | Process-level custom filesystem registration entrypoint |
+| `io.cobble.ProcessFileSystemRequest` | Java DTO for fallback filesystem resolution context |
+| `io.cobble.CustomFileSystemRegistry` | Java callback interface for resolving custom filesystems |
+| `io.cobble.CustomFileSystem` | Java filesystem abstraction consumed by Cobble JNI |
+| `io.cobble.CustomRandomAccessFile` | Random-read file abstraction; supports optional direct read path via `supportDirect()` / `readAtDirect(...)` |
+| `io.cobble.CustomSequentialWriteFile` | Sequential-write file abstraction; supports optional direct write path via `supportDirect()` / `writeDirect(...)` |
 | `io.cobble.structured.SingleDb` | Structured `SingleDb` |
 | `io.cobble.structured.Db` | Structured `Db` |
 | `io.cobble.structured.Schema` / `StructuredSchemaBuilder` | Structured family-aware schema API |

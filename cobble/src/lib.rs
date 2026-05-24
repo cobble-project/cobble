@@ -145,6 +145,11 @@ pub use db::Db;
 pub use db_builder::DbBuilder;
 pub use db_iter::DbIterator;
 pub use error::{Error, Result};
+pub use file::{
+    File, FileSystem, ProcessFileSystemRegistry, ProcessFileSystemRequest, RandomAccessFile,
+    SequentialWriteFile, clear_process_custom_file_system_registry,
+    register_process_custom_file_system_registry,
+};
 pub use governance::{DbGovernance, FileSystemDbGovernance, NoopDbGovernance};
 pub use merge_operator::{
     BytesMergeOperator, MergeOperator, MergeOperatorResolver, U32CounterMergeOperator,
@@ -161,6 +166,7 @@ pub use snapshot_tool::prune_shard_snapshot;
 pub use sst::SstCompressionAlgorithm;
 pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProviderKind};
 pub use r#type::ValueType;
+pub use url::Url;
 pub use write_batch::WriteBatch;
 
 #[doc(hidden)]

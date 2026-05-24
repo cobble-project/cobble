@@ -9,6 +9,7 @@
 
 mod coordinator;
 mod db;
+mod process_file_systems;
 mod read_only_db;
 mod read_options;
 mod reader;
