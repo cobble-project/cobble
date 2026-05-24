@@ -1299,6 +1299,7 @@ class DbBindingTest {
                 List<byte[]> seenValue0 = new ArrayList<>();
                 List<byte[]> seenValue1 = new ArrayList<>();
                 for (DirectScanEntry entry : cursor) {
+                    assertEquals(0, entry.getBucket());
                     seenKeys.add(readDirectBytes(entry.getKey()));
                     seenValue0.add(entry.decodeColumn(0, DbBindingTest::readInputStreamBytes));
                     seenValue1.add(entry.decodeColumn(1, DbBindingTest::readInputStreamBytes));
@@ -1365,6 +1366,7 @@ class DbBindingTest {
                             0, startBuffer, start.length, endBuffer, end.length, null)) {
                 DirectScanEntry entry0 = cursor.nextEntry();
                 assertNotNull(entry0);
+                assertEquals(0, entry0.getBucket());
                 assertArrayEquals(start, readDirectBytes(entry0.getKey()));
                 assertArrayEquals(
                         "value-a-0".getBytes(StandardCharsets.UTF_8),
@@ -1372,12 +1374,14 @@ class DbBindingTest {
 
                 DirectScanEntry entry1 = cursor.nextEntry();
                 assertNotNull(entry1);
+                assertEquals(0, entry1.getBucket());
                 assertArrayEquals(
                         "value-b-1".getBytes(StandardCharsets.UTF_8),
                         entry1.decodeColumn(1, DbBindingTest::readInputStreamBytes));
 
                 DirectScanEntry entry2 = cursor.nextEntry();
                 assertNotNull(entry2);
+                assertEquals(0, entry2.getBucket());
                 assertArrayEquals(
                         "value-b-2".getBytes(StandardCharsets.UTF_8),
                         entry2.decodeColumn(1, DbBindingTest::readInputStreamBytes));
@@ -1419,6 +1423,7 @@ class DbBindingTest {
                     if (entry == null) {
                         break;
                     }
+                    assertEquals(0, entry.getBucket());
                     String keyString =
                             new String(readDirectBytes(entry.getKey()), StandardCharsets.UTF_8);
                     String valueA =
@@ -1746,6 +1751,7 @@ class DbBindingTest {
                 for (int i = 0; i < entries.size(); i++) {
                     int expected = 10 + i;
                     ScanCursor.Entry entry = entries.get(i);
+                    assertEquals(0, entry.bucket);
                     assertArrayEquals(scanKeyBytes("dscan", expected), entry.key);
                     assertEquals(1, entry.columns.length);
                     assertArrayEquals(valueBytes("dscan-v1", expected), entry.columns[0]);
@@ -1819,7 +1825,7 @@ class DbBindingTest {
     }
 
     @Test
-    void scanSplitConstructorPreservesShardAndBounds() {
+    void scanSplitConstructorPreservesBoundsAndPartitionMetadata() {
         ShardSnapshot shardSnapshot = new ShardSnapshot();
         shardSnapshot.dbId = "db-1";
         shardSnapshot.snapshotId = 17L;
@@ -1830,12 +1836,65 @@ class DbBindingTest {
 
         ScanSplit split = new ScanSplit(shardSnapshot, new byte[] {1}, new byte[] {9});
         ScanSplit rebound = new ScanSplit(shardSnapshot, new byte[] {2, 3}, new byte[] {7});
+        ScanSplit.Partition partition = rebound.splitAfter(3, new byte[] {5, 6});
 
         assertSame(shardSnapshot, split.shard);
         assertArrayEquals(new byte[] {1}, split.start);
         assertArrayEquals(new byte[] {9}, split.end);
+        assertNull(split.startBucket);
+        assertNull(split.startKeyExclusive);
+        assertNull(split.endBucket);
+        assertNull(split.endKeyInclusive);
         assertSame(shardSnapshot, rebound.shard);
         assertArrayEquals(new byte[] {2, 3}, rebound.start);
         assertArrayEquals(new byte[] {7}, rebound.end);
+        assertNull(rebound.startBucket);
+        assertNull(rebound.startKeyExclusive);
+        assertNull(rebound.endBucket);
+        assertNull(rebound.endKeyInclusive);
+        assertSame(shardSnapshot, partition.before.shard);
+        assertArrayEquals(new byte[] {2, 3}, partition.before.start);
+        assertArrayEquals(new byte[] {7}, partition.before.end);
+        assertNull(partition.before.startBucket);
+        assertNull(partition.before.startKeyExclusive);
+        assertEquals(Integer.valueOf(3), partition.before.endBucket);
+        assertArrayEquals(new byte[] {5, 6}, partition.before.endKeyInclusive);
+        assertSame(shardSnapshot, partition.after.shard);
+        assertArrayEquals(new byte[] {2, 3}, partition.after.start);
+        assertArrayEquals(new byte[] {7}, partition.after.end);
+        assertEquals(Integer.valueOf(3), partition.after.startBucket);
+        assertArrayEquals(new byte[] {5, 6}, partition.after.startKeyExclusive);
+        assertNull(partition.after.endBucket);
+        assertNull(partition.after.endKeyInclusive);
+    }
+
+    @Test
+    void scanSplitJsonRoundTripsUnsignedBoundaryBytes() {
+        ShardSnapshot shardSnapshot = new ShardSnapshot();
+        shardSnapshot.dbId = "db-1";
+        shardSnapshot.snapshotId = 17L;
+        ShardSnapshot.Range range = new ShardSnapshot.Range();
+        range.start = 2;
+        range.end = 4;
+        shardSnapshot.ranges = Collections.singletonList(range);
+
+        ScanSplit split =
+                new ScanSplit(
+                        shardSnapshot,
+                        new byte[] {(byte) 0xFC, 0x01},
+                        new byte[] {(byte) 0xFE, 0x02},
+                        Integer.valueOf(3),
+                        new byte[] {(byte) 0xFF, 0x05},
+                        Integer.valueOf(4),
+                        new byte[] {(byte) 0xF8, 0x07});
+
+        ScanSplit rebound = ScanSplit.fromJson(split.toJson());
+
+        assertArrayEquals(new byte[] {(byte) 0xFC, 0x01}, rebound.start);
+        assertArrayEquals(new byte[] {(byte) 0xFE, 0x02}, rebound.end);
+        assertEquals(Integer.valueOf(3), rebound.startBucket);
+        assertArrayEquals(new byte[] {(byte) 0xFF, 0x05}, rebound.startKeyExclusive);
+        assertEquals(Integer.valueOf(4), rebound.endBucket);
+        assertArrayEquals(new byte[] {(byte) 0xF8, 0x07}, rebound.endKeyInclusive);
     }
 }

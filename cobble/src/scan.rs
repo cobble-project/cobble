@@ -8,10 +8,12 @@
 
 use crate::config::{Config, ScanOptions};
 use crate::coordinator::{GlobalSnapshotManifest, ShardSnapshotRef};
-use crate::db_iter::DbIterator;
+use crate::db_iter::{BucketedRow, DbIterator};
 use crate::error::Result;
 use crate::merge_operator::MergeOperatorResolver;
 use crate::read_only_db::ReadOnlyDb;
+use crate::sst::row_codec::encode_key;
+use crate::r#type::Key;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -57,6 +59,10 @@ impl ScanPlan {
                 shard: shard.clone(),
                 start: self.start.clone(),
                 end: self.end.clone(),
+                start_bucket: None,
+                start_key_exclusive: None,
+                end_bucket: None,
+                end_key_inclusive: None,
             })
             .collect()
     }
@@ -73,9 +79,50 @@ pub struct ScanSplit {
     pub start: Option<Vec<u8>>,
     /// Optional scan end key (exclusive).
     pub end: Option<Vec<u8>>,
+    /// Optional split-local start bucket.
+    pub start_bucket: Option<u16>,
+    /// Optional split-local start key skipped once in `start_bucket`.
+    pub start_key_exclusive: Option<Vec<u8>>,
+    /// Optional split-local end bucket.
+    pub end_bucket: Option<u16>,
+    /// Optional split-local end key included once in `end_bucket`.
+    pub end_key_inclusive: Option<Vec<u8>>,
+}
+
+/// A pair of scan splits partitioned around one bucket/key boundary.
+pub struct ScanSplitPartition {
+    pub before: ScanSplit,
+    pub after: ScanSplit,
 }
 
 impl ScanSplit {
+    /// Splits this scan into the rows up to `key_inclusive` and the rows after it.
+    pub fn split_after(&self, bucket: u16, key_inclusive: Vec<u8>) -> Result<ScanSplitPartition> {
+        let (first_bucket, last_bucket) = self.single_range_bucket_bounds()?;
+        if bucket < first_bucket || bucket > last_bucket {
+            return Err(crate::Error::InputError(format!(
+                "split boundary bucket {bucket} is outside [{first_bucket}, {last_bucket}]"
+            )));
+        }
+        let mut before = self.clone();
+        before.end_bucket = Some(bucket);
+        before.end_key_inclusive = Some(key_inclusive.clone());
+        let mut after = self.clone();
+        after.start_bucket = Some(bucket);
+        after.start_key_exclusive = Some(key_inclusive);
+        Ok(ScanSplitPartition { before, after })
+    }
+
+    fn single_range_bucket_bounds(&self) -> Result<(u16, u16)> {
+        if self.shard.ranges.len() != 1 {
+            return Err(crate::Error::InputError(
+                "scan split bucket partitioning requires exactly one shard range".to_string(),
+            ));
+        }
+        let range = &self.shard.ranges[0];
+        Ok((*range.start(), *range.end()))
+    }
+
     /// Create a scanner with the given config and scan options.
     pub fn create_scanner(
         &self,
@@ -137,8 +184,14 @@ impl ScanSplit {
         ScanSplitScanner::new(
             db,
             buckets,
-            self.start.clone(),
-            self.end.clone(),
+            ScanSplitScannerBounds {
+                start: self.start.clone(),
+                end: self.end.clone(),
+                start_bucket: self.start_bucket,
+                start_key_exclusive: self.start_key_exclusive.clone(),
+                end_bucket: self.end_bucket,
+                end_key_inclusive: self.end_key_inclusive.clone(),
+            },
             options.cloned(),
         )
     }
@@ -147,33 +200,48 @@ impl ScanSplit {
 /// Scanner that iterates over all key-value pairs in a scan split.
 ///
 /// Iterates bucket by bucket through the shard's bucket ranges,
-/// producing `(key, columns)` pairs in key order within each bucket.
+/// producing `(bucket, key, columns)` rows in key order within each bucket.
 pub struct ScanSplitScanner {
     db: ReadOnlyDb,
     buckets: Vec<u16>,
     current_bucket_index: usize,
     current_iter: Option<DbIterator<'static>>,
+    bounds: ScanSplitScannerBounds,
+    scan_options: Option<ScanOptions>,
+    skip_start_key_once: bool,
+}
+
+struct ScanSplitScannerBounds {
     start: Option<Vec<u8>>,
     end: Option<Vec<u8>>,
-    scan_options: Option<ScanOptions>,
+    start_bucket: Option<u16>,
+    start_key_exclusive: Option<Vec<u8>>,
+    end_bucket: Option<u16>,
+    end_key_inclusive: Option<Vec<u8>>,
 }
 
 impl ScanSplitScanner {
     fn new(
         db: ReadOnlyDb,
         buckets: Vec<u16>,
-        start: Option<Vec<u8>>,
-        end: Option<Vec<u8>>,
+        bounds: ScanSplitScannerBounds,
         scan_options: Option<ScanOptions>,
     ) -> Result<Self> {
+        let current_bucket_index = match bounds.start_bucket {
+            Some(bucket) => buckets
+                .iter()
+                .position(|candidate| *candidate >= bucket)
+                .unwrap_or(buckets.len()),
+            None => 0,
+        };
         let mut scanner = Self {
             db,
             buckets,
-            current_bucket_index: 0,
+            current_bucket_index,
             current_iter: None,
-            start,
-            end,
+            bounds,
             scan_options,
+            skip_start_key_once: false,
         };
         scanner.advance_to_next_bucket()?;
         Ok(scanner)
@@ -182,15 +250,35 @@ impl ScanSplitScanner {
     fn advance_to_next_bucket(&mut self) -> Result<()> {
         if self.current_bucket_index < self.buckets.len() {
             let bucket = self.buckets[self.current_bucket_index];
-            let start = self.start.as_deref();
-            let end = self.end.as_deref();
-            let iter = match self.scan_options.as_ref() {
+            if self
+                .bounds
+                .end_bucket
+                .is_some_and(|end_bucket| bucket > end_bucket)
+            {
+                self.current_iter = None;
+                return Ok(());
+            }
+            let start = self.bounds.start.as_deref();
+            let end = self.bounds.end.as_deref();
+            let mut seek_target = None;
+            self.skip_start_key_once = false;
+            if self.should_apply_start_to_bucket(bucket)
+                && let Some(start_key_exclusive) = self.bounds.start_key_exclusive.as_deref()
+                && start.is_none_or(|current_start| current_start <= start_key_exclusive)
+            {
+                seek_target = Some(encode_key(&Key::new(bucket, start_key_exclusive.to_vec())));
+                self.skip_start_key_once = true;
+            }
+            let mut iter = match self.scan_options.as_ref() {
                 Some(scan_options) => {
                     self.db
                         .scan_with_options_bounds(bucket, start, end, scan_options)?
                 }
                 None => self.db.scan_bounds(bucket, start, end)?,
             };
+            if let Some(target) = seek_target.as_deref() {
+                iter.seek(target)?;
+            }
             self.current_iter = Some(iter);
         } else {
             self.current_iter = None;
@@ -198,11 +286,63 @@ impl ScanSplitScanner {
         Ok(())
     }
 
-    fn next_row(&mut self) -> Result<Option<(Bytes, Vec<Option<Bytes>>)>> {
+    fn should_apply_start_to_bucket(&self, bucket: u16) -> bool {
+        matches!(self.bounds.start_bucket, Some(start_bucket) if start_bucket == bucket)
+            && self.bounds.start_key_exclusive.is_some()
+    }
+
+    fn should_skip_start_key(&mut self, bucket: u16, key: &[u8]) -> bool {
+        if !self.skip_start_key_once {
+            return false;
+        }
+        if self.bounds.start_bucket != Some(bucket) {
+            self.skip_start_key_once = false;
+            return false;
+        }
+        match self.bounds.start_key_exclusive.as_deref() {
+            Some(start_key) if key <= start_key => true,
+            _ => {
+                self.skip_start_key_once = false;
+                false
+            }
+        }
+    }
+
+    fn advance_bucket_index_to(&mut self, bucket: u16) -> bool {
+        while self.current_bucket_index < self.buckets.len()
+            && self.buckets[self.current_bucket_index] < bucket
+        {
+            self.current_bucket_index += 1;
+        }
+        self.current_bucket_index < self.buckets.len()
+            && self.buckets[self.current_bucket_index] == bucket
+    }
+
+    fn is_past_split_end(&self, bucket: u16, key: &[u8]) -> bool {
+        matches!(
+            (self.bounds.end_bucket, self.bounds.end_key_inclusive.as_deref()),
+            (Some(end_bucket), Some(end_key))
+                if bucket > end_bucket || (bucket == end_bucket && key > end_key)
+        )
+    }
+
+    fn next_row(&mut self) -> Result<Option<BucketedRow>> {
         loop {
             if let Some(iter) = &mut self.current_iter {
-                if let Some(result) = iter.next() {
-                    return result.map(Some);
+                if let Some((bucket, key, columns)) = iter.next_row_with_bucket()? {
+                    if !self.advance_bucket_index_to(bucket) {
+                        self.current_iter = None;
+                        return Ok(None);
+                    }
+                    if self.should_skip_start_key(bucket, key.as_ref()) {
+                        continue;
+                    }
+                    if self.is_past_split_end(bucket, key.as_ref()) {
+                        self.current_iter = None;
+                        self.current_bucket_index = self.buckets.len();
+                        return Ok(None);
+                    }
+                    return Ok(Some((bucket, key, columns)));
                 }
                 // Current bucket exhausted, move to next.
                 self.current_bucket_index += 1;
@@ -218,25 +358,25 @@ impl ScanSplitScanner {
     where
         F: FnMut(&Bytes, &[Option<Bytes>]) -> Result<T>,
     {
-        loop {
-            if let Some(iter) = &mut self.current_iter {
-                if let Some(result) =
-                    iter.consume_next_row(|key, columns| consumer(key, columns))?
-                {
-                    return Ok(Some(result));
-                }
-                self.current_bucket_index += 1;
-                self.current_iter = None;
-                self.advance_to_next_bucket()?;
-            } else {
-                return Ok(None);
-            }
-        }
+        let Some((_bucket, key, columns)) = self.next_row()? else {
+            return Ok(None);
+        };
+        consumer(&key, &columns).map(Some)
+    }
+
+    pub fn consume_next_row_with_bucket<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
+    where
+        F: FnMut(u16, &Bytes, &[Option<Bytes>]) -> Result<T>,
+    {
+        let Some((bucket, key, columns)) = self.next_row()? else {
+            return Ok(None);
+        };
+        consumer(bucket, &key, &columns).map(Some)
     }
 }
 
 impl Iterator for ScanSplitScanner {
-    type Item = Result<(Bytes, Vec<Option<Bytes>>)>;
+    type Item = Result<(u16, Bytes, Vec<Option<Bytes>>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_row().transpose()
@@ -327,9 +467,9 @@ mod tests {
             .unwrap();
         let results: Vec<_> = scanner.map(|r| r.unwrap()).collect();
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].0.as_ref(), b"key1");
-        assert_eq!(results[1].0.as_ref(), b"key2");
-        assert_eq!(results[2].0.as_ref(), b"key3");
+        assert_eq!(results[0].1.as_ref(), b"key1");
+        assert_eq!(results[1].1.as_ref(), b"key2");
+        assert_eq!(results[2].1.as_ref(), b"key3");
 
         cleanup_root(root);
     }
@@ -380,8 +520,8 @@ mod tests {
             .unwrap();
         let results: Vec<_> = scanner.map(|r| r.unwrap()).collect();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0.as_ref(), b"bbb");
-        assert_eq!(results[1].0.as_ref(), b"ccc");
+        assert_eq!(results[0].1.as_ref(), b"bbb");
+        assert_eq!(results[1].1.as_ref(), b"ccc");
 
         cleanup_root(root);
     }
@@ -448,6 +588,61 @@ mod tests {
 
     #[test]
     #[serial_test::serial(file)]
+    fn test_scan_split_scanner_resume_after_bucket_key() {
+        let root = "/tmp/cobble_scan_plan_resume_after_bucket_key";
+        cleanup_root(root);
+
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}/db", root)),
+            num_columns: 1,
+            total_buckets: 4,
+            ..Config::default()
+        };
+        let (_db, shard_input) = write_and_snapshot(&config, |db| {
+            let mut batch = WriteBatch::new();
+            batch.put(0, b"z0", 0, b"v0");
+            batch.put(1, b"z1", 0, b"v1");
+            batch.put(2, b"m2a", 0, b"v2a");
+            batch.put(2, b"m2b", 0, b"v2b");
+            batch.put(3, b"a3", 0, b"v3");
+            db.write_batch(batch).unwrap();
+        });
+
+        let coordinator = DbCoordinator::open(CoordinatorConfig {
+            volumes: vec![crate::config::VolumeDescriptor::new(
+                format!("file://{}/coordinator", root),
+                vec![
+                    crate::config::VolumeUsageKind::PrimaryDataPriorityHigh,
+                    crate::config::VolumeUsageKind::Meta,
+                ],
+            )],
+            snapshot_retention: None,
+        })
+        .unwrap();
+        let global = coordinator
+            .take_global_snapshot(4, vec![shard_input])
+            .unwrap();
+        coordinator.materialize_global_snapshot(&global).unwrap();
+
+        let scanner = ScanPlan::new(global)
+            .splits()
+            .remove(0)
+            .split_after(2, b"m2a".to_vec())
+            .unwrap()
+            .after
+            .create_scanner(config, &ScanOptions::default())
+            .unwrap();
+        let results: Vec<_> = scanner.map(|r| r.unwrap()).collect();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].1.as_ref(), b"m2b");
+        assert_eq!(results[1].1.as_ref(), b"a3");
+
+        cleanup_root(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
     fn test_scan_plan_column_projection() {
         let root = "/tmp/cobble_scan_plan_col_proj";
         cleanup_root(root);
@@ -489,8 +684,8 @@ mod tests {
         let results: Vec<_> = scanner.map(|r| r.unwrap()).collect();
         assert_eq!(results.len(), 1);
         // Column projection returns only the selected columns (compact array).
-        assert_eq!(results[0].1.len(), 1);
-        assert_eq!(results[0].1[0].as_deref(), Some(b"a1".as_slice()));
+        assert_eq!(results[0].2.len(), 1);
+        assert_eq!(results[0].2[0].as_deref(), Some(b"a1".as_slice()));
 
         cleanup_root(root);
     }
@@ -560,10 +755,10 @@ mod tests {
         let scanner = splits[0].create_scanner(config, &opts).unwrap();
         let results: Vec<_> = scanner.map(|r| r.unwrap()).collect();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0.as_ref(), b"key1");
-        assert_eq!(results[0].1[0].as_deref(), Some(b"metrics-1".as_slice()));
-        assert_eq!(results[1].0.as_ref(), b"key2");
-        assert_eq!(results[1].1[0].as_deref(), Some(b"metrics-2".as_slice()));
+        assert_eq!(results[0].1.as_ref(), b"key1");
+        assert_eq!(results[0].2[0].as_deref(), Some(b"metrics-1".as_slice()));
+        assert_eq!(results[1].1.as_ref(), b"key2");
+        assert_eq!(results[1].2[0].as_deref(), Some(b"metrics-2".as_slice()));
 
         cleanup_root(root);
     }
@@ -611,9 +806,9 @@ mod tests {
             .unwrap();
         let results: Vec<_> = scanner.map(|r| r.unwrap()).collect();
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].0.as_ref(), b"\xff");
-        assert_eq!(results[1].0.as_ref(), b"\xff\x01");
-        assert_eq!(results[2].0.as_ref(), b"\xff\xff");
+        assert_eq!(results[0].1.as_ref(), b"\xff");
+        assert_eq!(results[1].1.as_ref(), b"\xff\x01");
+        assert_eq!(results[2].1.as_ref(), b"\xff\xff");
 
         cleanup_root(root);
     }
@@ -633,6 +828,10 @@ mod tests {
             },
             start: Some(b"start".to_vec()),
             end: Some(b"end".to_vec()),
+            start_bucket: Some(2),
+            start_key_exclusive: Some(b"resume".to_vec()),
+            end_bucket: Some(3),
+            end_key_inclusive: Some(b"tail".to_vec()),
         };
 
         let json = serde_json::to_string(&split).unwrap();
@@ -642,5 +841,9 @@ mod tests {
         assert_eq!(deserialized.shard.timestamp_seconds, 100);
         assert_eq!(deserialized.start, Some(b"start".to_vec()));
         assert_eq!(deserialized.end, Some(b"end".to_vec()));
+        assert_eq!(deserialized.start_bucket, Some(2));
+        assert_eq!(deserialized.start_key_exclusive, Some(b"resume".to_vec()));
+        assert_eq!(deserialized.end_bucket, Some(3));
+        assert_eq!(deserialized.end_key_inclusive, Some(b"tail".to_vec()));
     }
 }

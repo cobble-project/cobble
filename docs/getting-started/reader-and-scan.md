@@ -135,13 +135,17 @@ for split in splits {
     let scanner = split.create_scanner(config.clone(), &scan_options)?;
 
     for row in scanner {
-        let (key, columns) = row?;
+        let (bucket, key, columns) = row?;
         // process...
     }
 }
 ```
 
 If you want a non-default family, this is the step where you must specify it. `create_scanner(...)` clones the full `ScanOptions` into the `ScanSplitScanner`, so the chosen `column_family` keeps taking effect inside each worker-side scanner.
+
+Raw distributed scan rows include the owning `bucket` together with `key` and `columns`. When a
+worker needs to resume or repartition one split around a concrete row boundary, call
+`split.split_after(bucket, key)` and use the returned `before` / `after` splits.
 
 ### Scan Options
 

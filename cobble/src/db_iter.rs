@@ -15,6 +15,8 @@ use crate::vlog::VlogStore;
 use bytes::Bytes;
 use std::sync::Arc;
 
+pub(crate) type BucketedRow = (u16, Bytes, Vec<Option<Bytes>>);
+
 pub(crate) struct DbIteratorOptions<'a> {
     pub(crate) end_bound: Option<(Bytes, bool)>,
     pub(crate) max_rows: Option<usize>,
@@ -135,14 +137,33 @@ impl<'a> DbIterator<'a> {
         Ok(Some(consumed))
     }
 
-    fn next_row(&mut self) -> Result<Option<(Bytes, Vec<Option<Bytes>>)>> {
+    pub fn consume_next_row_with_bucket<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
+    where
+        F: FnMut(u16, &Bytes, &[Option<Bytes>]) -> Result<T>,
+    {
+        let Some((bucket, key, columns)) = self.next_row_with_bucket()? else {
+            return Ok(None);
+        };
+        let consumed = consumer(bucket, &key, &columns)?;
+        Ok(Some(consumed))
+    }
+
+    pub(crate) fn next_row_with_bucket(&mut self) -> Result<Option<BucketedRow>> {
         let Some((mut key, columns)) = self.decode_next_row()? else {
             return Ok(None);
         };
+        let bucket = key.bucket();
         if let Some(remaining_rows) = self.remaining_rows.as_mut() {
             *remaining_rows -= 1;
         }
-        Ok(Some((key.take_data(), columns)))
+        Ok(Some((bucket, key.take_data(), columns)))
+    }
+
+    fn next_row(&mut self) -> Result<Option<(Bytes, Vec<Option<Bytes>>)>> {
+        let Some((_, key, columns)) = self.next_row_with_bucket()? else {
+            return Ok(None);
+        };
+        Ok(Some((key, columns)))
     }
 }
 

@@ -164,7 +164,7 @@ try (ScanCursor cursor = db.scanWithOptions(0, start, end, ScanOptions.forColumn
     for (ScanCursor.Entry entry = cursor.nextEntry();
             entry != null;
             entry = cursor.nextEntry()) {
-        consume(entry.key, entry.columns[0]);
+        consume(entry.bucket, entry.key, entry.columns[0]);
     }
 }
 ```
@@ -172,6 +172,7 @@ try (ScanCursor cursor = db.scanWithOptions(0, start, end, ScanOptions.forColumn
 ```java
 try (DirectScanCursor cursor = db.scanDirectWithOptions(0, startBuf, startLen, endBuf, endLen, null)) {
     for (DirectScanEntry e : cursor) {
+        int bucket = e.getBucket();
         ByteBuffer k = e.getKey();
     }
 }
@@ -183,7 +184,7 @@ try (io.cobble.structured.ScanCursor cursor =
     for (io.cobble.structured.Row row = cursor.nextRow();
             row != null;
             row = cursor.nextRow()) {
-        consume(row.getKey(), row.getBytes(0));
+        consume(row.getBucket(), row.getKey(), row.getBytes(0));
     }
 }
 ```
@@ -194,24 +195,28 @@ try (io.cobble.structured.DirectScanCursor cursor =
     for (io.cobble.structured.DirectScanRow row = cursor.nextRow();
             row != null;
             row = cursor.nextRow()) {
-        consume(row.getKey(), row.decodeBytesColumn(0, MyCodec::decode));
+        consume(row.getBucket(), row.getKey(), row.decodeBytesColumn(0, MyCodec::decode));
     }
 }
 ```
 
-Structured `DirectScanRow` exposes the key as a direct `ByteBuffer`; column values are decoded on
-demand from the encoded row payload.
+Structured `DirectScanRow` exposes both the split bucket and the key as direct metadata; column
+values are decoded on demand from the encoded row payload.
 
 ```java
 ScanPlan plan = ScanPlan.fromGlobalSnapshot(manifest);
 for (ScanSplit split : plan.splits()) {
     try (ScanCursor c = split.openScannerWithOptions("config.yaml", ScanOptions.forColumns(0))) {
         for (ScanCursor.Entry entry : c) {
-            consume(entry.key, entry.columns[0]);
+            consume(entry.bucket, entry.key, entry.columns[0]);
         }
     }
 }
 ```
+
+Structured distributed scan behaves the same way: `StructuredScanSplit` is serializable, preserves
+optional boundary metadata, and `splitAfter(bucket, keyInclusive)` returns `before` / `after`
+halves around that row boundary.
 
 ## Performance Guidance
 

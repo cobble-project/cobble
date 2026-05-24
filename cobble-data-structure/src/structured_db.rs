@@ -1436,6 +1436,19 @@ impl<'a> StructuredDbIterator<'a> {
             consumer(key, &decoded)
         })
     }
+
+    pub fn consume_next_row_with_bucket<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
+    where
+        F: FnMut(u16, &Bytes, &[Option<StructuredColumnValue>]) -> Result<T>,
+    {
+        let structured_schema = Arc::clone(&self.structured_schema);
+        let now_seconds = self.now_seconds;
+        self.inner
+            .consume_next_row_with_bucket(|bucket, key, columns| {
+                let decoded = decode_row(&structured_schema, now_seconds, columns.to_vec())?;
+                consumer(bucket, key, &decoded)
+            })
+    }
 }
 
 impl Iterator for StructuredDbIterator<'_> {
@@ -2068,24 +2081,28 @@ mod tests {
             .unwrap();
         let mut rows = Vec::new();
         while let Some(row) = iter
-            .consume_next_row(|key, columns| Ok((key.clone(), columns.to_vec())))
+            .consume_next_row_with_bucket(|bucket, key, columns| {
+                Ok((bucket, key.clone(), columns.to_vec()))
+            })
             .unwrap()
         {
             rows.push(row);
         }
 
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0.as_ref(), b"k1");
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1.as_ref(), b"k1");
         assert_eq!(
-            rows[0].1[1],
+            rows[0].2[1],
             Some(StructuredColumnValue::List(vec![
                 Bytes::from_static(b"a"),
                 Bytes::from_static(b"b"),
             ]))
         );
-        assert_eq!(rows[1].0.as_ref(), b"k2");
+        assert_eq!(rows[1].0, 0);
+        assert_eq!(rows[1].1.as_ref(), b"k2");
         assert_eq!(
-            rows[1].1[0],
+            rows[1].2[0],
             Some(StructuredColumnValue::Bytes(Bytes::from_static(b"v2")))
         );
 

@@ -16,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -318,6 +319,7 @@ class StructuredDbTest {
             try (ScanCursor cursor = db.scan(0, start, end)) {
                 Row firstScanned = cursor.nextRow();
                 assertNotNull(firstScanned, "scan should have at least one row");
+                assertEquals(0, firstScanned.getBucket());
                 assertEquals(
                         2, firstScanned.getColumnCount(), "first scan row should have 2 entries");
                 allRows.add(firstScanned);
@@ -346,6 +348,7 @@ class StructuredDbTest {
             // Verify typed content
             for (int i = 0; i < count; i++) {
                 Row row = allRows.get(i);
+                assertEquals(0, row.getBucket());
                 String expectedKey = String.format("scan-%04d", i);
                 assertArrayEquals(expectedKey.getBytes(StandardCharsets.UTF_8), row.getKey());
 
@@ -583,6 +586,7 @@ class StructuredDbTest {
                 for (int i = 0; i < rows.size(); i++) {
                     int expected = 10 + i;
                     Row row = rows.get(i);
+                    assertEquals(0, row.getBucket());
                     assertArrayEquals(
                             String.format("dscan-%04d", expected).getBytes(StandardCharsets.UTF_8),
                             row.getKey());
@@ -595,6 +599,37 @@ class StructuredDbTest {
                 }
             }
         }
+    }
+
+    @Test
+    void structuredScanSplitPreservesBoundaryMetadata() {
+        ShardSnapshot shardSnapshot = new ShardSnapshot();
+        shardSnapshot.dbId = "db-1";
+        shardSnapshot.snapshotId = 17L;
+        ShardSnapshot.Range range = new ShardSnapshot.Range();
+        range.start = 2;
+        range.end = 4;
+        shardSnapshot.ranges = Collections.singletonList(range);
+
+        StructuredScanSplit split =
+                new StructuredScanSplit(shardSnapshot, new byte[] {1}, new byte[] {9});
+        StructuredScanSplit rebound =
+                new StructuredScanSplit(shardSnapshot, new byte[] {2, 3}, new byte[] {7});
+        StructuredScanSplit.Partition partition = rebound.splitAfter(3, new byte[] {5, 6});
+
+        assertSame(shardSnapshot, split.shard);
+        assertArrayEquals(new byte[] {1}, split.start);
+        assertArrayEquals(new byte[] {9}, split.end);
+        assertNull(split.startBucket);
+        assertNull(split.startKeyExclusive);
+        assertNull(split.endBucket);
+        assertNull(split.endKeyInclusive);
+        assertSame(shardSnapshot, partition.before.shard);
+        assertEquals(Integer.valueOf(3), partition.before.endBucket);
+        assertArrayEquals(new byte[] {5, 6}, partition.before.endKeyInclusive);
+        assertSame(shardSnapshot, partition.after.shard);
+        assertEquals(Integer.valueOf(3), partition.after.startBucket);
+        assertArrayEquals(new byte[] {5, 6}, partition.after.startKeyExclusive);
     }
 
     @Test
@@ -813,6 +848,7 @@ class StructuredDbTest {
                 java.util.List<byte[]> seenKeys = new ArrayList<>();
                 java.util.List<byte[]> seenValues = new ArrayList<>();
                 for (DirectScanRow row : cursor) {
+                    assertEquals(0, row.getBucket());
                     seenKeys.add(readDirectBytes(row.getKey()));
                     seenValues.add(
                             row.decodeBytesColumn(0, StructuredDbTest::readInputStreamBytes));
@@ -867,6 +903,7 @@ class StructuredDbTest {
                     if (row == null) {
                         break;
                     }
+                    assertEquals(0, row.getBucket());
                     String keyString =
                             new String(readDirectBytes(row.getKey()), StandardCharsets.UTF_8);
                     String valueString =
@@ -914,6 +951,7 @@ class StructuredDbTest {
                             0, startBuffer, start.length, endBuffer, end.length, null)) {
                 DirectScanRow row1 = cursor.nextRow();
                 assertNotNull(row1);
+                assertEquals(0, row1.getBucket());
                 assertEquals(1, row1.getColumnCount());
                 assertArrayEquals(start, readDirectBytes(row1.getKey()));
                 assertArrayEquals(
@@ -922,12 +960,14 @@ class StructuredDbTest {
 
                 DirectScanRow row2 = cursor.nextRow();
                 assertNotNull(row2);
+                assertEquals(0, row2.getBucket());
                 assertArrayEquals(
                         "st-direct-null-01".getBytes(StandardCharsets.UTF_8),
                         readDirectBytes(row2.getKey()));
 
                 DirectScanRow row3 = cursor.nextRow();
                 assertNotNull(row3);
+                assertEquals(0, row3.getBucket());
                 assertArrayEquals(
                         "st-value-2".getBytes(StandardCharsets.UTF_8),
                         row3.decodeBytesColumn(0, StructuredDbTest::readInputStreamBytes));

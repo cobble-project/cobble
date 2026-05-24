@@ -61,7 +61,7 @@ public final class ScanCursor extends NativeObject implements Iterable<Row> {
                     throw new IllegalStateException("unknown structured scan column tag");
             }
         }
-        return new Row(copyBytes(row.getKey()), values);
+        return new Row(row.getBucket(), copyBytes(row.getKey()), values);
     }
 
     @Override

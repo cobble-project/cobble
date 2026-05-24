@@ -180,18 +180,22 @@ use cobble_data_structure::{StructuredScanOptions, StructuredScanPlan};
 
 let plan = StructuredScanPlan::new(global_manifest); // still bucket-only
 for split in plan.splits() {
+    let split = split.split_after(3, b"boundary")?.after;
     let scanner = split.create_scanner(
         config.clone(),
         &StructuredScanOptions::for_column(0).with_column_family("metrics"),
     )?;
     for row in scanner {
-        let (key, columns) = row?;
+        let (bucket, key, columns) = row?;
         // columns: Vec<Option<StructuredColumnValue>>
     }
 }
 ```
 
-As with raw scans, the family is chosen when creating the scanner. If you omit `with_column_family(...)`, the scanner reads the default family.
+As with raw scans, the family is chosen when creating the scanner. If you omit
+`with_column_family(...)`, the scanner reads the default family. Structured distributed scan rows
+also carry their `bucket`, and `StructuredScanSplit::split_after(...)` returns `before` / `after`
+halves around a concrete `(bucket, key)` boundary for checkpointing or repartitioning work.
 
 ## Projection Notes
 

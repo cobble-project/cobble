@@ -2124,8 +2124,8 @@ impl StructuredScanCursorHandle {
         if self.exhausted {
             return 0;
         }
-        let encoded = match self.consume_next_row(|key, cols| {
-            write_direct_scan_row_payload(env, io_addr, io_capacity, key.as_ref(), cols)
+        let encoded = match self.consume_next_row_with_bucket(|bucket, key, cols| {
+            write_direct_scan_row_payload(env, io_addr, io_capacity, bucket, key.as_ref(), cols)
                 .map_err(cobble::Error::IoError)
         }) {
             Ok(row) => row,
@@ -2141,22 +2141,29 @@ impl StructuredScanCursorHandle {
         encoded
     }
 
-    fn consume_next_row<T, F>(&mut self, mut consumer: F) -> cobble::Result<Option<T>>
+    fn consume_next_row_with_bucket<T, F>(&mut self, mut consumer: F) -> cobble::Result<Option<T>>
     where
-        F: FnMut(&Bytes, &[Option<StructuredColumnValue>]) -> cobble::Result<T>,
+        F: FnMut(u16, &Bytes, &[Option<StructuredColumnValue>]) -> cobble::Result<T>,
     {
         match &mut self.iter {
-            StructuredScanCursorIter::Db(iter) => iter
-                .as_mut()
-                .consume_next_row(|key, columns| consumer(key, columns)),
-            StructuredScanCursorIter::Split(iter) => iter
-                .as_mut()
-                .consume_next_row(|key, columns| consumer(key, columns)),
+            StructuredScanCursorIter::Db(iter) => {
+                iter.as_mut()
+                    .consume_next_row_with_bucket(|bucket, key, columns| {
+                        consumer(bucket, key, columns)
+                    })
+            }
+            StructuredScanCursorIter::Split(iter) => {
+                iter.as_mut()
+                    .consume_next_row_with_bucket(|bucket, key, columns| {
+                        consumer(bucket, key, columns)
+                    })
+            }
         }
     }
 }
 
 fn encoded_direct_scan_row_payload_size(
+    _bucket: u16,
     key: &[u8],
     columns: &[Option<StructuredColumnValue>],
 ) -> Result<usize, String> {
@@ -2165,16 +2172,18 @@ fn encoded_direct_scan_row_payload_size(
         .checked_add(key.len())
         .and_then(|v| v.checked_add(4))
         .and_then(|v| v.checked_add(row_size))
+        .and_then(|v| v.checked_add(4))
         .ok_or_else(|| "encoded direct scan row size overflow".to_string())
 }
 
 fn encode_direct_scan_row_payload_into(
+    bucket: u16,
     key: &[u8],
     columns: &[Option<StructuredColumnValue>],
     dst: &mut [u8],
 ) -> Result<(), String> {
     let row_size = encoded_row_size(columns)?;
-    let expected_len = encoded_direct_scan_row_payload_size(key, columns)?;
+    let expected_len = encoded_direct_scan_row_payload_size(bucket, key, columns)?;
     if dst.len() != expected_len {
         return Err(format!(
             "structured direct scan row payload size mismatch: expected {}, got {}",
@@ -2186,7 +2195,9 @@ fn encode_direct_scan_row_payload_into(
     let key_end = 4 + key.len();
     dst[4..key_end].copy_from_slice(key);
     dst[key_end..key_end + 4].copy_from_slice(&(row_size as u32).to_be_bytes());
-    encode_row_payload(columns, &mut dst[key_end + 4..])?;
+    let row_end = key_end + 4 + row_size;
+    encode_row_payload(columns, &mut dst[key_end + 4..row_end])?;
+    dst[row_end..row_end + 4].copy_from_slice(&(bucket as u32).to_be_bytes());
     Ok(())
 }
 
@@ -2194,17 +2205,18 @@ fn write_direct_scan_row_payload<'local>(
     env: &mut JNIEnv<'local>,
     io_addr: *mut u8,
     io_capacity: usize,
+    bucket: u16,
     key: &[u8],
     columns: &[Option<StructuredColumnValue>],
 ) -> Result<jint, String> {
-    let payload_len = encoded_direct_scan_row_payload_size(key, columns)?;
+    let payload_len = encoded_direct_scan_row_payload_size(bucket, key, columns)?;
     if payload_len <= io_capacity {
         let dst = unsafe { std::slice::from_raw_parts_mut(io_addr, payload_len) };
-        encode_direct_scan_row_payload_into(key, columns, dst)?;
+        encode_direct_scan_row_payload_into(bucket, key, columns, dst)?;
         return Ok(payload_len as jint);
     }
     let mut encoded = vec![0; payload_len];
-    encode_direct_scan_row_payload_into(key, columns, &mut encoded)?;
+    encode_direct_scan_row_payload_into(bucket, key, columns, &mut encoded)?;
     write_payload_to_io_or_cached_overflow(env, io_addr, io_capacity, &encoded)
 }
 

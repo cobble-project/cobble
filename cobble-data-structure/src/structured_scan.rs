@@ -45,6 +45,15 @@ pub struct StructuredScanSplit {
     pub shard: ShardSnapshotRef,
     pub start: Option<Vec<u8>>,
     pub end: Option<Vec<u8>>,
+    pub start_bucket: Option<u16>,
+    pub start_key_exclusive: Option<Vec<u8>>,
+    pub end_bucket: Option<u16>,
+    pub end_key_inclusive: Option<Vec<u8>>,
+}
+
+pub struct StructuredScanSplitPartition {
+    pub before: StructuredScanSplit,
+    pub after: StructuredScanSplit,
 }
 
 impl From<ScanSplit> for StructuredScanSplit {
@@ -53,6 +62,10 @@ impl From<ScanSplit> for StructuredScanSplit {
             shard: value.shard,
             start: value.start,
             end: value.end,
+            start_bucket: value.start_bucket,
+            start_key_exclusive: value.start_key_exclusive,
+            end_bucket: value.end_bucket,
+            end_key_inclusive: value.end_key_inclusive,
         }
     }
 }
@@ -63,11 +76,27 @@ impl From<StructuredScanSplit> for ScanSplit {
             shard: value.shard,
             start: value.start,
             end: value.end,
+            start_bucket: value.start_bucket,
+            start_key_exclusive: value.start_key_exclusive,
+            end_bucket: value.end_bucket,
+            end_key_inclusive: value.end_key_inclusive,
         }
     }
 }
 
 impl StructuredScanSplit {
+    pub fn split_after(
+        &self,
+        bucket: u16,
+        key_inclusive: Vec<u8>,
+    ) -> Result<StructuredScanSplitPartition> {
+        let partition = ScanSplit::from(self.clone()).split_after(bucket, key_inclusive)?;
+        Ok(StructuredScanSplitPartition {
+            before: partition.before.into(),
+            after: partition.after.into(),
+        })
+    }
+
     pub fn create_scanner_without_options(
         &self,
         config: Config,
@@ -169,16 +198,28 @@ impl StructuredScanSplitScanner {
             consumer(key, &decoded)
         })
     }
+
+    pub fn consume_next_row_with_bucket<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
+    where
+        F: FnMut(u16, &Bytes, &[Option<StructuredColumnValue>]) -> Result<T>,
+    {
+        let structured_schema = Arc::clone(&self.structured_schema);
+        self.inner
+            .consume_next_row_with_bucket(|bucket, key, columns| {
+                let decoded = decode_row(&structured_schema, 0, columns.to_vec())?;
+                consumer(bucket, key, &decoded)
+            })
+    }
 }
 
 impl Iterator for StructuredScanSplitScanner {
-    type Item = Result<(Bytes, Vec<Option<StructuredColumnValue>>)>;
+    type Item = Result<(u16, Bytes, Vec<Option<StructuredColumnValue>>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|item| {
-            let (key, columns) = item?;
+            let (bucket, key, columns) = item?;
             let decoded = decode_row(&self.structured_schema, 0, columns)?;
-            Ok((key, decoded))
+            Ok((bucket, key, decoded))
         })
     }
 }
@@ -301,15 +342,17 @@ mod tests {
             .unwrap();
         let results: Vec<_> = scanner.map(|r| r.unwrap()).collect();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0.as_ref(), b"k1");
+        assert_eq!(results[0].0, 0);
+        assert_eq!(results[0].1.as_ref(), b"k1");
         assert_eq!(
-            results[0].1[1],
+            results[0].2[1],
             Some(StructuredColumnValue::List(vec![
                 Bytes::from_static(b"a"),
                 Bytes::from_static(b"b"),
             ]))
         );
-        assert_eq!(results[1].0.as_ref(), b"k2");
+        assert_eq!(results[1].0, 0);
+        assert_eq!(results[1].1.as_ref(), b"k2");
 
         cleanup_root(root);
     }
@@ -350,24 +393,28 @@ mod tests {
             .unwrap();
         let mut rows = Vec::new();
         while let Some(row) = scanner
-            .consume_next_row(|key, columns| Ok((key.clone(), columns.to_vec())))
+            .consume_next_row_with_bucket(|bucket, key, columns| {
+                Ok((bucket, key.clone(), columns.to_vec()))
+            })
             .unwrap()
         {
             rows.push(row);
         }
 
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0.as_ref(), b"k1");
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1.as_ref(), b"k1");
         assert_eq!(
-            rows[0].1[1],
+            rows[0].2[1],
             Some(StructuredColumnValue::List(vec![
                 Bytes::from_static(b"a"),
                 Bytes::from_static(b"b"),
             ]))
         );
-        assert_eq!(rows[1].0.as_ref(), b"k2");
+        assert_eq!(rows[1].0, 0);
+        assert_eq!(rows[1].1.as_ref(), b"k2");
         assert_eq!(
-            rows[1].1[0],
+            rows[1].2[0],
             Some(StructuredColumnValue::Bytes(Bytes::from_static(b"v2")))
         );
 
@@ -426,9 +473,10 @@ mod tests {
             .unwrap();
         let rows: Vec<_> = scanner.map(|r| r.unwrap()).collect();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0.as_ref(), b"k1");
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1.as_ref(), b"k1");
         assert_eq!(
-            rows[0].1[0],
+            rows[0].2[0],
             Some(StructuredColumnValue::List(vec![
                 Bytes::from_static(b"a"),
                 Bytes::from_static(b"b"),
@@ -453,6 +501,10 @@ mod tests {
             },
             start: Some(b"a".to_vec()),
             end: Some(b"z".to_vec()),
+            start_bucket: Some(1),
+            start_key_exclusive: Some(b"m".to_vec()),
+            end_bucket: Some(3),
+            end_key_inclusive: Some(b"t".to_vec()),
         };
         let json = serde_json::to_string(&split).unwrap();
         let decoded: StructuredScanSplit = serde_json::from_str(&json).unwrap();
@@ -460,6 +512,41 @@ mod tests {
         assert_eq!(decoded.shard.snapshot_id, 7);
         assert_eq!(decoded.start, Some(b"a".to_vec()));
         assert_eq!(decoded.end, Some(b"z".to_vec()));
+        assert_eq!(decoded.start_bucket, Some(1));
+        assert_eq!(decoded.start_key_exclusive, Some(b"m".to_vec()));
+        assert_eq!(decoded.end_bucket, Some(3));
+        assert_eq!(decoded.end_key_inclusive, Some(b"t".to_vec()));
+    }
+
+    #[test]
+    fn test_structured_scan_split_partition_preserves_bucket_boundaries() {
+        let split = StructuredScanSplit {
+            shard: ShardSnapshotRef {
+                ranges: vec![2u16..=4u16],
+                column_family_ids: BTreeMap::from([("default".to_string(), 0)]),
+                db_id: "test-db".to_string(),
+                snapshot_id: 11,
+                manifest_path: "test-db/snapshot/SNAPSHOT-11".to_string(),
+                timestamp_seconds: 0,
+                data_size_bytes: 0,
+                incremental_data_size_bytes: 0,
+            },
+            start: Some(b"a".to_vec()),
+            end: Some(b"z".to_vec()),
+            start_bucket: None,
+            start_key_exclusive: None,
+            end_bucket: None,
+            end_key_inclusive: None,
+        };
+
+        let partition = split.split_after(3, b"resume".to_vec()).unwrap();
+        assert_eq!(partition.before.end_bucket, Some(3));
+        assert_eq!(partition.before.end_key_inclusive, Some(b"resume".to_vec()));
+        assert_eq!(partition.after.start_bucket, Some(3));
+        assert_eq!(
+            partition.after.start_key_exclusive,
+            Some(b"resume".to_vec())
+        );
     }
 
     #[test]
@@ -496,10 +583,11 @@ mod tests {
             .unwrap();
         let rows: Vec<_> = scanner.map(|r| r.unwrap()).collect();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0.as_ref(), b"k1");
-        assert_eq!(rows[0].1.len(), 1);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1.as_ref(), b"k1");
+        assert_eq!(rows[0].2.len(), 1);
         assert_eq!(
-            rows[0].1[0],
+            rows[0].2[0],
             Some(StructuredColumnValue::List(vec![
                 Bytes::from_static(b"a"),
                 Bytes::from_static(b"b"),

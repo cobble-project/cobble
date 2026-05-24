@@ -22,10 +22,12 @@ public final class ScanCursor extends NativeObject implements Iterable<ScanCurso
 
     /** A single row from a scan: key + column values. */
     public static final class Entry {
+        public final int bucket;
         public final byte[] key;
         public final byte[][] columns;
 
-        Entry(byte[] key, byte[][] columns) {
+        Entry(int bucket, byte[] key, byte[][] columns) {
+            this.bucket = bucket;
             this.key = key;
             this.columns = columns;
         }
@@ -51,10 +53,12 @@ public final class ScanCursor extends NativeObject implements Iterable<ScanCurso
         if (encodedLength == 0) {
             return null;
         }
+        int payloadLength = Math.abs(encodedLength);
         ByteBuffer resultBuffer =
                 DirectIoUtils.resolveEncodedBuffer(
                         ioBuffer, encodedLength, Db::getLastDirectOverflowBuffer);
-        DirectScanEntry entry = DirectScanEntry.decode(resultBuffer, Math.abs(encodedLength));
+        int bucket = resultBuffer.getInt(payloadLength - Integer.BYTES);
+        DirectScanEntry entry = DirectScanEntry.decode(resultBuffer, payloadLength - Integer.BYTES);
         byte[] key = copyBytes(entry.getKey());
         byte[][] columns = new byte[entry.size()][];
         for (int i = 0; i < columns.length; i++) {
@@ -66,7 +70,7 @@ public final class ScanCursor extends NativeObject implements Iterable<ScanCurso
                 }
             }
         }
-        return new Entry(key, columns);
+        return new Entry(bucket, key, columns);
     }
 
     @Override

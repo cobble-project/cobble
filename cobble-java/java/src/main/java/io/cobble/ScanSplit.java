@@ -2,9 +2,18 @@ package io.cobble;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonDeserializationContext;
+import com.google.gson.JsonDeserializer;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonSerializationContext;
+import com.google.gson.JsonSerializer;
 import com.google.gson.annotations.SerializedName;
 
 import java.io.Serializable;
+import java.lang.reflect.Type;
 
 /**
  * Serializable distributed scan split for raw Db scanning.
@@ -13,7 +22,10 @@ import java.io.Serializable;
  * any node that can access snapshot storage.
  */
 public final class ScanSplit implements Serializable {
-    private static final Gson GSON = new GsonBuilder().create();
+    private static final Gson GSON =
+            new GsonBuilder()
+                    .registerTypeHierarchyAdapter(byte[].class, new UnsignedByteArrayAdapter())
+                    .create();
 
     @SerializedName("shard")
     public final ShardSnapshot shard;
@@ -24,13 +36,86 @@ public final class ScanSplit implements Serializable {
     @SerializedName("end")
     public final byte[] end;
 
+    @SerializedName("start_bucket")
+    public final Integer startBucket;
+
+    @SerializedName("start_key_exclusive")
+    public final byte[] startKeyExclusive;
+
+    @SerializedName("end_bucket")
+    public final Integer endBucket;
+
+    @SerializedName("end_key_inclusive")
+    public final byte[] endKeyInclusive;
+
     ScanSplit(ShardSnapshot shard, byte[] start, byte[] end) {
+        this(shard, start, end, null, null, null, null);
+    }
+
+    ScanSplit(
+            ShardSnapshot shard,
+            byte[] start,
+            byte[] end,
+            Integer startBucket,
+            byte[] startKeyExclusive,
+            Integer endBucket,
+            byte[] endKeyInclusive) {
         if (shard == null) {
             throw new IllegalArgumentException("shard must not be null");
+        }
+        if ((startBucket == null) != (startKeyExclusive == null)) {
+            throw new IllegalArgumentException(
+                    "startBucket and startKeyExclusive must be set together");
+        }
+        if ((endBucket == null) != (endKeyInclusive == null)) {
+            throw new IllegalArgumentException(
+                    "endBucket and endKeyInclusive must be set together");
         }
         this.shard = shard;
         this.start = copyOrNull(start);
         this.end = copyOrNull(end);
+        this.startBucket = startBucket;
+        this.startKeyExclusive = copyOrNull(startKeyExclusive);
+        this.endBucket = endBucket;
+        this.endKeyInclusive = copyOrNull(endKeyInclusive);
+    }
+
+    /** Result of partitioning one split into the rows before and after a bucket/key boundary. */
+    public static final class Partition {
+        public final ScanSplit before;
+        public final ScanSplit after;
+
+        Partition(ScanSplit before, ScanSplit after) {
+            this.before = before;
+            this.after = after;
+        }
+    }
+
+    /** Splits this scan into the rows up to {@code keyInclusive} and the rows after it. */
+    public Partition splitAfter(int bucket, byte[] keyInclusive) {
+        if (bucket < 0) {
+            throw new IllegalArgumentException("bucket must be >= 0");
+        }
+        if (keyInclusive == null || keyInclusive.length == 0) {
+            throw new IllegalArgumentException("keyInclusive must not be empty");
+        }
+        return new Partition(
+                new ScanSplit(
+                        shard,
+                        start,
+                        end,
+                        startBucket,
+                        startKeyExclusive,
+                        Integer.valueOf(bucket),
+                        keyInclusive),
+                new ScanSplit(
+                        shard,
+                        start,
+                        end,
+                        Integer.valueOf(bucket),
+                        keyInclusive,
+                        endBucket,
+                        endKeyInclusive));
     }
 
     public String toJson() {
@@ -96,4 +181,42 @@ public final class ScanSplit implements Serializable {
 
     private static native long openSplitScanCursorFromJson(
             String configJson, String splitJson, long scanOptionsHandle);
+
+    private static final class UnsignedByteArrayAdapter
+            implements JsonSerializer<byte[]>, JsonDeserializer<byte[]> {
+
+        @Override
+        public JsonElement serialize(
+                byte[] src, Type typeOfSrc, JsonSerializationContext jsonSerializationContext) {
+            if (src == null) {
+                return JsonNull.INSTANCE;
+            }
+            JsonArray array = new JsonArray(src.length);
+            for (byte value : src) {
+                array.add(Integer.valueOf(value & 0xFF));
+            }
+            return array;
+        }
+
+        @Override
+        public byte[] deserialize(
+                JsonElement json,
+                Type typeOfT,
+                JsonDeserializationContext jsonDeserializationContext)
+                throws JsonParseException {
+            if (json == null || json.isJsonNull()) {
+                return null;
+            }
+            JsonArray array = json.getAsJsonArray();
+            byte[] value = new byte[array.size()];
+            for (int i = 0; i < array.size(); i++) {
+                int current = array.get(i).getAsInt();
+                if (current < 0 || current > 255) {
+                    throw new JsonParseException("byte value out of range: " + current);
+                }
+                value[i] = (byte) current;
+            }
+            return value;
+        }
+    }
 }

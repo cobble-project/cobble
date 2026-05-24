@@ -26,6 +26,7 @@ This page summarizes the public Rust API surface of the Cobble crates.
 |------|-------------|
 | `ScanPlan` | Distributed scan plan from a global snapshot |
 | `ScanSplit` | Serializable unit of scan work (one per shard) |
+| `ScanSplitPartition` | Pair of `before` / `after` splits around one bucket/key boundary |
 | `ScanSplitScanner` | Iterator over key-value pairs within a split |
 
 ### Configuration Types
@@ -134,8 +135,9 @@ reader.refresh() -> Result<()>
 ```rust
 ScanPlan::new(manifest) -> ScanPlan // bucket-only
 plan.splits() -> Vec<ScanSplit>
+split.split_after(bucket, key) -> Result<ScanSplitPartition>
 split.create_scanner(config, &scan_options) -> Result<ScanSplitScanner> // choose non-default family here via ScanOptions
-for row in scanner { let (key, columns) = row?; }
+for row in scanner { let (bucket, key, columns) = row?; }
 ```
 
 ---
@@ -151,8 +153,8 @@ for row in scanner { let (key, columns) = row?; }
 | `StructuredReadOnlyDb` | Structured ReadOnlyDb wrapper |
 | `StructuredReader` | Structured Reader wrapper |
 | `StructuredScanPlan` | Structured scan plan |
-| `StructuredScanSplit` | Structured scan split |
-| `StructuredScanSplitScanner` | Structured scan scanner |
+| `StructuredScanSplit` | Structured scan split with optional resume/end boundary metadata |
+| `StructuredScanSplitScanner` | Structured scan scanner yielding `(bucket, key, columns)` rows |
 | `StructuredRemoteCompactionServer` | Remote compaction with structured merge ops |
 
 Structured values are represented with `StructuredColumnValue` and configured by `StructuredSchema` (`Bytes` / `List` column types).

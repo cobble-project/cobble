@@ -8,10 +8,16 @@ package io.cobble.structured;
  */
 public class Row {
 
+    private final int bucket;
     private final byte[] key;
     private final ColumnValue[] columns;
 
     Row(byte[] key, ColumnValue[] columns) {
+        this(-1, key, columns);
+    }
+
+    Row(int bucket, byte[] key, ColumnValue[] columns) {
+        this.bucket = bucket;
         this.key = key;
         this.columns = columns;
     }
@@ -37,7 +43,12 @@ public class Row {
                 columns[i] = ColumnValue.ofList((byte[][]) raw[i]);
             }
         }
-        return new Row(key, columns);
+        return new Row(-1, key, columns);
+    }
+
+    /** Returns the scanned bucket id, or {@code -1} when this row came from a point read. */
+    public int getBucket() {
+        return bucket;
     }
 
     /** Returns the row key. */

@@ -17,10 +17,12 @@ import java.util.List;
 public final class DirectScanRow {
     private static final String PAYLOAD_NAME = "structured direct scan row";
 
+    private final int bucket;
     private final ByteBuffer key;
     private final DirectEncodedRow row;
 
-    DirectScanRow(ByteBuffer key, DirectEncodedRow row) {
+    DirectScanRow(int bucket, ByteBuffer key, DirectEncodedRow row) {
+        this.bucket = bucket;
         this.key = key;
         this.row = row;
     }
@@ -37,12 +39,20 @@ public final class DirectScanRow {
                         address, encodedLength, rowLengthOffset, "row length", PAYLOAD_NAME);
         int rowOffset = rowLengthOffset + Integer.BYTES;
         DirectIoUtils.ensureRemaining(encodedLength, rowOffset, rowLength, PAYLOAD_NAME);
-        if (rowOffset + rowLength != encodedLength) {
+        int rowEnd = rowOffset + rowLength;
+        if (rowEnd != encodedLength && rowEnd + Integer.BYTES != encodedLength) {
             throw new IllegalStateException("malformed structured direct scan row");
         }
+        int bucket = rowEnd == encodedLength ? -1 : encoded.getInt(rowEnd);
         return new DirectScanRow(
+                bucket,
                 DirectIoUtils.slice(encoded, keyOffset, keyLength, PAYLOAD_NAME),
                 new DirectEncodedRow(address + rowOffset, rowLength, null));
+    }
+
+    /** Returns the scanned bucket id, or {@code -1} when unavailable. */
+    public int getBucket() {
+        return bucket;
     }
 
     public ByteBuffer getKey() {

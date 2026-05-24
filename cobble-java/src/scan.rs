@@ -212,9 +212,16 @@ impl StaticScanCursorInner {
         if self.exhausted {
             return 0;
         }
-        let encoded = match self.consume_next_live_row(|key, columns| {
-            write_direct_scan_entry_payload(env, io_addr, io_capacity, key.as_ref(), columns)
-                .map_err(cobble::Error::IoError)
+        let encoded = match self.consume_next_live_row(|bucket, key, columns| {
+            write_direct_scan_entry_payload(
+                env,
+                io_addr,
+                io_capacity,
+                bucket,
+                key.as_ref(),
+                columns,
+            )
+            .map_err(cobble::Error::IoError)
         }) {
             Ok(row) => row,
             Err(err) => {
@@ -231,20 +238,27 @@ impl StaticScanCursorInner {
 
     fn consume_next_live_row<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
     where
-        F: FnMut(&Bytes, &[Option<Bytes>]) -> Result<T>,
+        F: FnMut(u16, &Bytes, &[Option<Bytes>]) -> Result<T>,
     {
         match &mut self.iter {
-            ScanCursorIter::Db(iter) => iter
-                .as_mut()
-                .consume_next_row(|key, columns| consumer(key, columns)),
-            ScanCursorIter::Split(iter) => iter
-                .as_mut()
-                .consume_next_row(|key, columns| consumer(key, columns)),
+            ScanCursorIter::Db(iter) => {
+                iter.as_mut()
+                    .consume_next_row_with_bucket(|bucket, key, columns| {
+                        consumer(bucket, key, columns)
+                    })
+            }
+            ScanCursorIter::Split(iter) => {
+                iter.as_mut()
+                    .consume_next_row_with_bucket(|bucket, key, columns| {
+                        consumer(bucket, key, columns)
+                    })
+            }
         }
     }
 }
 
 fn encoded_direct_scan_entry_payload_size<T: AsRef<[u8]>>(
+    _bucket: u16,
     key: &[u8],
     columns: &[Option<T>],
 ) -> Result<usize, String> {
@@ -253,16 +267,18 @@ fn encoded_direct_scan_entry_payload_size<T: AsRef<[u8]>>(
         .checked_add(key.len())
         .and_then(|v| v.checked_add(4))
         .and_then(|v| v.checked_add(columns_len))
+        .and_then(|v| v.checked_add(4))
         .ok_or_else(|| "encoded direct scan entry size overflow".to_string())
 }
 
 fn encode_direct_scan_entry_payload_into<T: AsRef<[u8]>>(
+    bucket: u16,
     key: &[u8],
     columns: &[Option<T>],
     dst: &mut [u8],
 ) -> Result<(), String> {
     let columns_len = encoded_optional_columns_payload_size(columns)?;
-    let expected_len = encoded_direct_scan_entry_payload_size(key, columns)?;
+    let expected_len = encoded_direct_scan_entry_payload_size(bucket, key, columns)?;
     if dst.len() != expected_len {
         return Err(format!(
             "direct scan entry payload size mismatch: expected {}, got {}",
@@ -274,7 +290,9 @@ fn encode_direct_scan_entry_payload_into<T: AsRef<[u8]>>(
     let key_end = 4 + key.len();
     dst[4..key_end].copy_from_slice(key);
     dst[key_end..key_end + 4].copy_from_slice(&(columns_len as u32).to_be_bytes());
-    encode_optional_columns_payload_into(columns, &mut dst[key_end + 4..])?;
+    let row_end = key_end + 4 + columns_len;
+    encode_optional_columns_payload_into(columns, &mut dst[key_end + 4..row_end])?;
+    dst[row_end..row_end + 4].copy_from_slice(&(bucket as u32).to_be_bytes());
     Ok(())
 }
 
@@ -282,17 +300,18 @@ fn write_direct_scan_entry_payload<'local, T: AsRef<[u8]>>(
     env: &mut JNIEnv<'local>,
     io_addr: *mut u8,
     io_capacity: usize,
+    bucket: u16,
     key: &[u8],
     columns: &[Option<T>],
 ) -> Result<jint, String> {
-    let payload_len = encoded_direct_scan_entry_payload_size(key, columns)?;
+    let payload_len = encoded_direct_scan_entry_payload_size(bucket, key, columns)?;
     if payload_len <= io_capacity {
         let dst = unsafe { std::slice::from_raw_parts_mut(io_addr, payload_len) };
-        encode_direct_scan_entry_payload_into(key, columns, dst)?;
+        encode_direct_scan_entry_payload_into(bucket, key, columns, dst)?;
         return Ok(payload_len as jint);
     }
     let mut encoded = vec![0; payload_len];
-    encode_direct_scan_entry_payload_into(key, columns, &mut encoded)?;
+    encode_direct_scan_entry_payload_into(bucket, key, columns, &mut encoded)?;
     write_payload_to_io_or_cached_overflow(env, io_addr, io_capacity, &encoded)
 }
 
