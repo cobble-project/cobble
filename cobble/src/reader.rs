@@ -348,8 +348,10 @@ impl Reader {
         if let Some(db) = self.cache.get(key) {
             return Ok(Arc::clone(db));
         }
-        let shard_metrics_manager =
-            Arc::new(MetricsManager::new(format!("{}-{}", key.db_id, key.snapshot_id)));
+        let shard_metrics_manager = Arc::new(MetricsManager::new(format!(
+            "{}-{}",
+            key.db_id, key.snapshot_id
+        )));
         let db = Arc::new(
             ReadOnlyDb::open_with_db_id_and_cache_with_metrics_and_resolver(
                 self.config.clone(),
