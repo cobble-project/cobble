@@ -26,6 +26,8 @@ pub(crate) struct SSTIteratorOptions {
     pub num_columns: usize,
     /// Whether to use bloom filter for point lookups.
     pub bloom_filter_enabled: bool,
+    /// Namespace used to isolate block-cache keys across shards/dbs.
+    pub cache_namespace: u64,
 }
 
 #[derive(Clone)]
@@ -94,6 +96,7 @@ impl Default for SSTIteratorOptions {
             num_columns: 1,
             metrics: None,
             bloom_filter_enabled: false,
+            cache_namespace: 0,
         }
     }
 }
@@ -210,6 +213,7 @@ impl SSTIterator {
         // Read index block
         let index_block = if let Some(cache) = &block_cache {
             let cache_key = BlockCacheKey {
+                namespace: options.cache_namespace,
                 file_id,
                 block_id: footer.index_block_offset,
                 kind: BlockCacheKind::IndexTop,
@@ -407,6 +411,7 @@ impl SSTIterator {
         }
         let (offset, size) = self.index_partitions[partition_idx];
         let cache_key = BlockCacheKey {
+            namespace: self.options.cache_namespace,
             file_id: self.file_id,
             block_id: offset,
             kind: if self.footer.partitioned_index {
@@ -471,6 +476,7 @@ impl SSTIterator {
         }
 
         let cache_key = BlockCacheKey {
+            namespace: self.options.cache_namespace,
             file_id: self.file_id,
             block_id: offset as u64,
             kind: BlockCacheKind::Data,
@@ -515,6 +521,7 @@ impl SSTIterator {
     /// Used for partitioned filter index.
     fn load_filter_index(&mut self) -> Result<Arc<Block>> {
         let cache_key = BlockCacheKey {
+            namespace: self.options.cache_namespace,
             file_id: self.file_id,
             block_id: self.footer.filter_block_offset,
             kind: BlockCacheKind::FilterIndex,
@@ -576,6 +583,7 @@ impl SSTIterator {
                 return Err(Error::IoError("Filter partition size is zero".to_string()));
             }
             let cache_key = BlockCacheKey {
+                namespace: self.options.cache_namespace,
                 file_id: self.file_id,
                 block_id: offset as u64,
                 kind: BlockCacheKind::FilterPartition,
@@ -589,6 +597,7 @@ impl SSTIterator {
             return Err(Error::IoError("Filter block size is zero".to_string()));
         }
         let cache_key = BlockCacheKey {
+            namespace: self.options.cache_namespace,
             file_id: self.file_id,
             block_id: self.footer.filter_block_offset,
             kind: BlockCacheKind::FilterPartition,

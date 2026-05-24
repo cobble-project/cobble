@@ -96,6 +96,7 @@ impl Code for BlockCacheKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct BlockCacheKey {
+    pub namespace: u64,
     pub file_id: u64,
     pub block_id: u64,
     pub kind: BlockCacheKind,
@@ -103,6 +104,9 @@ pub struct BlockCacheKey {
 
 impl Code for BlockCacheKey {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
+        writer
+            .write_all(&self.namespace.to_le_bytes())
+            .map_err(FoyerError::io_error)?;
         writer
             .write_all(&self.file_id.to_le_bytes())
             .map_err(FoyerError::io_error)?;
@@ -116,8 +120,12 @@ impl Code for BlockCacheKey {
     where
         Self: Sized,
     {
+        let mut namespace = [0u8; 8];
         let mut file_id = [0u8; 8];
         let mut block_id = [0u8; 8];
+        reader
+            .read_exact(&mut namespace)
+            .map_err(FoyerError::io_error)?;
         reader
             .read_exact(&mut file_id)
             .map_err(FoyerError::io_error)?;
@@ -126,6 +134,7 @@ impl Code for BlockCacheKey {
             .map_err(FoyerError::io_error)?;
         let kind = BlockCacheKind::decode(reader)?;
         Ok(Self {
+            namespace: u64::from_le_bytes(namespace),
             file_id: u64::from_le_bytes(file_id),
             block_id: u64::from_le_bytes(block_id),
             kind,
@@ -133,7 +142,7 @@ impl Code for BlockCacheKey {
     }
 
     fn estimated_size(&self) -> usize {
-        8 + 8 + self.kind.estimated_size()
+        8 + 8 + 8 + self.kind.estimated_size()
     }
 }
 
@@ -307,6 +316,7 @@ mod tests {
                 block_cache_size: 0,
                 num_columns: 1,
                 bloom_filter_enabled: true,
+                cache_namespace: 0,
             },
             cache,
         )
@@ -326,6 +336,7 @@ mod tests {
     #[test]
     fn test_parquet_cache_key_and_value_codec() {
         let key = BlockCacheKey {
+            namespace: 0,
             file_id: 42,
             block_id: 1024,
             kind: BlockCacheKind::ParquetData(4096),

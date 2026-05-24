@@ -117,6 +117,7 @@ impl Reader {
         let config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
+            block_cache_size: read_config.block_cache_size,
             block_cache_hybrid_enabled: read_config.block_cache_hybrid_enabled,
             block_cache_hybrid_disk_size: read_config.block_cache_hybrid_disk_size,
             ..Config::default()
@@ -186,6 +187,7 @@ impl Reader {
         let config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
+            block_cache_size: read_config.block_cache_size,
             block_cache_hybrid_enabled: read_config.block_cache_hybrid_enabled,
             block_cache_hybrid_disk_size: read_config.block_cache_hybrid_disk_size,
             ..Config::default()
@@ -346,13 +348,15 @@ impl Reader {
         if let Some(db) = self.cache.get(key) {
             return Ok(Arc::clone(db));
         }
+        let shard_metrics_manager =
+            Arc::new(MetricsManager::new(format!("{}-{}", key.db_id, key.snapshot_id)));
         let db = Arc::new(
             ReadOnlyDb::open_with_db_id_and_cache_with_metrics_and_resolver(
                 self.config.clone(),
                 key.snapshot_id,
                 key.db_id.clone(),
                 self.block_cache.clone(),
-                Arc::clone(&self.metrics_manager),
+                shard_metrics_manager,
                 self.resolver.clone(),
             )?,
         );

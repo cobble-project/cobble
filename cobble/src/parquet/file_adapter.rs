@@ -119,6 +119,7 @@ impl RandomAccessChunkReaderInner {
         let file_id = self.file_id?;
         let length = u32::try_from(length).ok()?;
         Some(BlockCacheKey {
+            namespace: 0,
             file_id,
             block_id: offset as u64,
             kind: BlockCacheKind::ParquetData(length),

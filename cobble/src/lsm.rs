@@ -19,6 +19,7 @@ use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 use crate::r#type::{Value, key_bucket, key_column_family};
 use log::{debug, warn};
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -52,6 +53,11 @@ pub(crate) struct LSMTree {
     state: Mutex<LSMTreeState>,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     sst_metrics: Arc<SSTIteratorMetrics>,
+    cache_namespace: u64,
+}
+
+fn bucket_scoped_cache_namespace(base_namespace: u64, bucket: u16) -> u64 {
+    base_namespace ^ ((bucket as u64) << 48)
 }
 
 struct LSMTreeState {
@@ -126,6 +132,9 @@ impl LSMTree {
         db_lifecycle: Arc<DbLifecycle>,
         metrics_manager: Arc<MetricsManager>,
     ) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        metrics_manager.db_id().hash(&mut hasher);
+        let cache_namespace = hasher.finish();
         Self {
             db_state,
             db_lifecycle,
@@ -143,6 +152,7 @@ impl LSMTree {
             }),
             ttl_provider,
             sst_metrics: metrics_manager.sst_iterator_metrics(),
+            cache_namespace,
         }
     }
 
@@ -997,6 +1007,7 @@ impl LSMTree {
             let file_manager = Arc::clone(file_manager);
             let block_cache = self.block_cache.clone();
             let sst_metrics = Arc::clone(&self.sst_metrics);
+            let cache_namespace = bucket_scoped_cache_namespace(self.cache_namespace, bucket);
             let target_schema = Arc::clone(&target_schema);
             let schema_manager = Arc::clone(&schema_manager);
             let selected_columns = selected_columns.clone();
@@ -1017,6 +1028,7 @@ impl LSMTree {
                             metrics: Some(Arc::clone(&sst_metrics)),
                             num_columns: source_num_columns,
                             bloom_filter_enabled: true,
+                            cache_namespace,
                             ..SSTIteratorOptions::default()
                         };
                         Box::new(SSTIterator::with_cache_and_file(
@@ -1116,6 +1128,9 @@ impl LSMTree {
             return Ok(true);
         }
         let reader = file_manager.open_data_file_reader(file.file_id)?;
+        let cache_namespace = key_bucket(encoded_key)
+            .map(|bucket| bucket_scoped_cache_namespace(self.cache_namespace, bucket))
+            .unwrap_or(self.cache_namespace);
         let value_bytes_opt = match file.file_type {
             DataFileType::SSTable => {
                 let mut iter = SSTIterator::with_cache_and_file(
@@ -1125,6 +1140,7 @@ impl LSMTree {
                         num_columns: source_num_columns,
                         metrics: Some(Arc::clone(&self.sst_metrics)),
                         bloom_filter_enabled: true,
+                        cache_namespace,
                         ..SSTIteratorOptions::default()
                     },
                     self.block_cache.clone(),
