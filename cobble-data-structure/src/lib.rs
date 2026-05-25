@@ -53,6 +53,7 @@
 #![crate_type = "lib"]
 
 mod list;
+mod priority_queue;
 mod structured_db;
 mod structured_read_only_db;
 mod structured_reader;
@@ -61,6 +62,7 @@ mod structured_scan;
 mod structured_single_db;
 
 pub use list::{ListConfig, ListRetainMode};
+pub use priority_queue::PriorityQueue;
 pub use structured_db::{
     DataStructureDb, StructuredColumnFamilySchema, StructuredColumnType, StructuredColumnValue,
     StructuredDb, StructuredDbIterator, StructuredReadOptions, StructuredScanOptions,

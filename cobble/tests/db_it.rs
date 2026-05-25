@@ -816,6 +816,7 @@ fn test_db_ttl_is_ignored_when_column_family_ttl_disabled() {
             None,
             ColumnFamilyOptions {
                 value_has_ttl: false,
+                ..ColumnFamilyOptions::default()
             },
         )
         .unwrap();
@@ -874,6 +875,7 @@ fn test_db_merge_keeps_old_ttl_behavior_when_family_ttl_disabled() {
             None,
             ColumnFamilyOptions {
                 value_has_ttl: false,
+                ..ColumnFamilyOptions::default()
             },
         )
         .unwrap();
@@ -938,6 +940,7 @@ fn test_db_merge_respects_ttl_after_family_ttl_reenabled() {
             None,
             ColumnFamilyOptions {
                 value_has_ttl: false,
+                ..ColumnFamilyOptions::default()
             },
         )
         .unwrap();
@@ -958,6 +961,7 @@ fn test_db_merge_respects_ttl_after_family_ttl_reenabled() {
             None,
             ColumnFamilyOptions {
                 value_has_ttl: true,
+                ..ColumnFamilyOptions::default()
             },
         )
         .unwrap();
@@ -1022,6 +1026,7 @@ fn test_db_merge_operator_still_receives_time_provider_when_family_ttl_disabled(
             None,
             ColumnFamilyOptions {
                 value_has_ttl: false,
+                ..ColumnFamilyOptions::default()
             },
         )
         .unwrap();

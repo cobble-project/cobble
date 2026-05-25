@@ -2,6 +2,9 @@ use crate::list::{
     LIST_OPERATOR_ID, ListConfig, decode_list_for_read, encode_list_for_write, list_operator,
     list_operator_from_metadata,
 };
+use crate::priority_queue::{
+    PriorityQueue, priority_queue_column_family_options, validate_priority_queue_column_family,
+};
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use cobble::{
@@ -970,6 +973,16 @@ fn normalize_structured_column_family_name(
     Ok((normalized, core_column_family))
 }
 
+fn priority_queue_column_family_name(name: String) -> Result<String> {
+    let (normalized, core_column_family) = normalize_structured_column_family_name(Some(name))?;
+    if core_column_family.is_none() {
+        return Err(Error::InputError(
+            "priority queue cannot use the default column family".to_string(),
+        ));
+    }
+    Ok(normalized)
+}
+
 impl StructuredDb {
     fn from_db(db: Db) -> Result<Self> {
         let structured_schema = Arc::new(load_structured_schema_from_cobble_schema(
@@ -1097,6 +1110,71 @@ impl StructuredDb {
 
     pub fn update_schema(&mut self) -> StructuredSchemaBuilder<'_, Self> {
         StructuredSchemaBuilder::new(self)
+    }
+
+    pub fn new_priority_queue<'a>(
+        &'a mut self,
+        name: impl Into<String>,
+    ) -> Result<PriorityQueue<'a>> {
+        let normalized_name = priority_queue_column_family_name(name.into())?;
+        if self
+            .db
+            .current_schema()
+            .column_family_ids()
+            .contains_key(normalized_name.as_str())
+        {
+            return Err(Error::InvalidState(format!(
+                "priority queue '{}' already exists",
+                normalized_name
+            )));
+        }
+
+        let mut builder = self.update_schema();
+        builder.add_bytes_column(Some(normalized_name.clone()), 0);
+        builder.set_column_family_options(
+            Some(normalized_name.clone()),
+            priority_queue_column_family_options(),
+        );
+        builder.commit()?;
+
+        Ok(PriorityQueue::from_column_family(self, normalized_name))
+    }
+
+    pub fn get_priority_queue<'a>(&'a self, name: impl Into<String>) -> Result<PriorityQueue<'a>> {
+        let normalized_name = priority_queue_column_family_name(name.into())?;
+        validate_priority_queue_column_family(
+            self.db.current_schema().as_ref(),
+            normalized_name.as_str(),
+        )?;
+        Ok(PriorityQueue::from_column_family(self, normalized_name))
+    }
+
+    pub fn get_or_new_priority_queue<'a>(
+        &'a mut self,
+        name: impl Into<String>,
+    ) -> Result<PriorityQueue<'a>> {
+        let normalized_name = priority_queue_column_family_name(name.into())?;
+        if self
+            .db
+            .current_schema()
+            .column_family_ids()
+            .contains_key(normalized_name.as_str())
+        {
+            validate_priority_queue_column_family(
+                self.db.current_schema().as_ref(),
+                normalized_name.as_str(),
+            )?;
+        } else {
+            let mut builder = self.update_schema();
+            builder.add_bytes_column(Some(normalized_name.clone()), 0);
+            builder.set_column_family_options(
+                Some(normalized_name.clone()),
+                priority_queue_column_family_options(),
+            );
+            builder.commit()?;
+        }
+
+        Ok(PriorityQueue::from_column_family(self, normalized_name))
     }
 
     pub fn reload_schema(&mut self) -> Result<()> {
@@ -1375,6 +1453,21 @@ impl StructuredDb {
     ) -> Result<DbIterator<'a>> {
         self.db
             .scan_with_options(bucket, range, options.as_cobble())
+    }
+
+    pub fn scan_raw_bounds<'a>(
+        &'a self,
+        bucket: u16,
+        start_key_inclusive: Option<&[u8]>,
+        end_key_exclusive: Option<&[u8]>,
+        options: &StructuredScanOptions,
+    ) -> Result<DbIterator<'a>> {
+        self.db.scan_with_options_bounds(
+            bucket,
+            start_key_inclusive,
+            end_key_exclusive,
+            options.as_cobble(),
+        )
     }
 
     pub fn close(&self) -> Result<()> {

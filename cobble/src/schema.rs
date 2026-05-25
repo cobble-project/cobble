@@ -35,12 +35,15 @@ pub struct ColumnFamilyOptions {
     /// - `true`: write options TTL may set `expired_at`.
     /// - `false`: write options TTL is ignored and values are written without expiration.
     pub value_has_ttl: bool,
+    /// Optional column-family metadata for higher-level structured wrappers.
+    pub metadata: Option<JsonValue>,
 }
 
 impl Default for ColumnFamilyOptions {
     fn default() -> Self {
         Self {
             value_has_ttl: true,
+            metadata: None,
         }
     }
 }
@@ -1292,7 +1295,13 @@ impl SchemaBuilder {
         column_family: Option<String>,
         value_has_ttl: bool,
     ) -> Result<()> {
-        self.set_column_family_options(column_family, ColumnFamilyOptions { value_has_ttl })
+        self.set_column_family_options(
+            column_family,
+            ColumnFamilyOptions {
+                value_has_ttl,
+                ..ColumnFamilyOptions::default()
+            },
+        )
     }
 
     /// Set all persisted options for one column family.
@@ -1697,6 +1706,7 @@ mod tests {
                 Some("metrics".to_string()),
                 ColumnFamilyOptions {
                     value_has_ttl: false,
+                    ..ColumnFamilyOptions::default()
                 },
             )
             .unwrap();
@@ -1715,6 +1725,7 @@ mod tests {
                 Some("metrics".to_string()),
                 ColumnFamilyOptions {
                     value_has_ttl: false,
+                    ..ColumnFamilyOptions::default()
                 },
             )
             .unwrap();
