@@ -1401,6 +1401,37 @@ impl StructuredDb {
         Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
+    pub fn scan_bounds<'a>(
+        &'a self,
+        bucket: u16,
+        start_key_inclusive: Option<&[u8]>,
+        end_key_exclusive: Option<&[u8]>,
+    ) -> Result<StructuredDbIterator<'a>> {
+        self.scan_with_options_bounds(
+            bucket,
+            start_key_inclusive,
+            end_key_exclusive,
+            &self.default_scan_options,
+        )
+    }
+
+    pub fn scan_with_options_bounds<'a>(
+        &'a self,
+        bucket: u16,
+        start_key_inclusive: Option<&[u8]>,
+        end_key_exclusive: Option<&[u8]>,
+        options: &StructuredScanOptions,
+    ) -> Result<StructuredDbIterator<'a>> {
+        let inner = self.db.scan_with_options_bounds(
+            bucket,
+            start_key_inclusive,
+            end_key_exclusive,
+            options.as_cobble(),
+        )?;
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
+        Ok(StructuredDbIterator::new(inner, projected_schema, 0))
+    }
+
     pub fn snapshot(&self) -> Result<u64> {
         self.db.snapshot()
     }

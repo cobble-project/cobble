@@ -344,7 +344,7 @@ impl ReadOnlyDb {
         self.scan_with_options_bounds(bucket, Some(range.start), Some(range.end), options)
     }
 
-    pub(crate) fn scan_with_options_bounds(
+    pub fn scan_with_options_bounds(
         &self,
         bucket: u16,
         start: Option<&[u8]>,

@@ -120,6 +120,7 @@ db.scan_with_options_bounds(bucket, start_key_inclusive, end_key_exclusive, &sca
 read_only.scan(bucket, range) -> Result<DbIterator<'static>>
 read_only.scan_bounds(bucket, start_key_inclusive, end_key_exclusive) -> Result<DbIterator<'static>>
 read_only.scan_with_options(bucket, range, &scan_options) -> Result<DbIterator<'static>>
+read_only.scan_with_options_bounds(bucket, start_key_inclusive, end_key_exclusive, &scan_options) -> Result<DbIterator<'static>>
 db.snapshot() -> Result<u64>
 db.snapshot_with_callback(callback) -> Result<u64>
 db.cancel_snapshot(snapshot_id) -> Result<bool>
@@ -180,6 +181,10 @@ for row in scanner { let (bucket, key, columns) = row?; }
 Structured values are represented with `StructuredColumnValue` and configured by `StructuredSchema` (`Bytes` / `List` column types).
 
 `StructuredSchema` is also family-aware: `column_families()` returns per-family typed columns keyed by family name and always includes `default`, while `StructuredSchemaBuilder` methods accept `Option<String>` family arguments. Structured wrappers use `StructuredWriteOptions` / `StructuredReadOptions` / `StructuredScanOptions` for family selection.
+
+`StructuredDb` also mirrors the new bounds-scan entrypoints:
+`scan_bounds(...)` and `scan_with_options_bounds(...)` use the same inclusive-start /
+exclusive-end semantics as raw `Db`.
 
 ---
 
