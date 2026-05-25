@@ -113,6 +113,13 @@ db.current_schema() -> Arc<Schema>
 db.update_schema() -> SchemaBuilder
 db.put(bucket, key, column, value) -> Result<()>
 db.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Bytes>>>>
+db.scan(bucket, range) -> Result<DbIterator<'_>>
+db.scan_bounds(bucket, start_key_inclusive, end_key_exclusive) -> Result<DbIterator<'_>>
+db.scan_with_options(bucket, range, &scan_options) -> Result<DbIterator<'_>>
+db.scan_with_options_bounds(bucket, start_key_inclusive, end_key_exclusive, &scan_options) -> Result<DbIterator<'_>>
+read_only.scan(bucket, range) -> Result<DbIterator<'static>>
+read_only.scan_bounds(bucket, start_key_inclusive, end_key_exclusive) -> Result<DbIterator<'static>>
+read_only.scan_with_options(bucket, range, &scan_options) -> Result<DbIterator<'static>>
 db.snapshot() -> Result<u64>
 db.snapshot_with_callback(callback) -> Result<u64>
 db.cancel_snapshot(snapshot_id) -> Result<bool>

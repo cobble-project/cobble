@@ -6,6 +6,7 @@ use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::FileManager;
+use crate::key_codec::{encode_key, encode_next_column_family_scan_key, encode_scan_key};
 use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
@@ -14,9 +15,8 @@ use crate::snapshot::{
     build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
     build_vlog_version_from_manifest, load_manifest_for_snapshot,
 };
-use crate::sst::row_codec::encode_key_ref_into;
 use crate::ttl::{TTLProvider, TtlConfig};
-use crate::r#type::{RefKey, Value};
+use crate::r#type::Value;
 use crate::util::{build_commit_short_id, build_version_string};
 use crate::vlog::VlogStore;
 use crate::{Config, MergeOperatorResolver, ReadOptions, ScanOptions};
@@ -263,12 +263,7 @@ impl ReadOnlyDb {
                 max_index, num_columns
             )));
         }
-        let mut encoded_key = bytes::BytesMut::with_capacity(3 + key.len());
-        encode_key_ref_into(
-            &RefKey::new_with_column_family(bucket, column_family_id, key),
-            &mut encoded_key,
-        );
-        let encoded_key = encoded_key.freeze();
+        let encoded_key = encode_key(bucket, column_family_id, key);
         let masks = options.masks(num_columns);
         let selected_mask = masks.selected_mask.as_deref();
         let lsm_values = self.lsm_tree.get(
@@ -379,16 +374,15 @@ impl ReadOnlyDb {
             bucket,
             column_family_id,
         )?;
-        let encode_scan_key = |key: &[u8]| {
-            let mut encoded = bytes::BytesMut::with_capacity(4 + key.len());
-            encode_key_ref_into(
-                &RefKey::new_with_column_family(bucket, column_family_id, key),
-                &mut encoded,
-            );
-            encoded.freeze()
+        let start_key = encode_scan_key(bucket, column_family_id, start.unwrap_or(&[]));
+        let end_bound = if let Some(end) = end {
+            Some((encode_scan_key(bucket, column_family_id, end), false))
+        } else {
+            Some((
+                encode_next_column_family_scan_key(bucket, column_family_id)?,
+                false,
+            ))
         };
-        let start_key = encode_scan_key(start.unwrap_or(&[]));
-        let end_bound = end.map(|key| (encode_scan_key(key), false));
         let mut iter: DbIterator<'static> = DbIterator::new(
             Vec::new(),
             lsm_iters,

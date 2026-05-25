@@ -109,6 +109,7 @@ mod file;
 mod format;
 mod governance;
 mod iterator;
+mod key_codec;
 mod lru;
 mod lsm;
 mod memtable;

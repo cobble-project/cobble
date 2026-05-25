@@ -2182,13 +2182,14 @@ mod tests {
     use crate::db_iter::{DbIterator, DbIteratorOptions};
     use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
     use crate::file::{FileManager, FileSystemRegistry};
+    use crate::key_codec::encode_scan_key;
     use crate::lsm::LSMTreeVersion;
-    use crate::sst::row_codec::{decode_value, encode_key_ref_into};
+    use crate::sst::row_codec::decode_value;
     use crate::sst::{SSTIterator, SSTIteratorOptions, SSTWriterOptions};
     use crate::r#type::ValueType;
     use crate::r#type::{RefColumn, RefKey, RefValue};
     use crate::vlog::VlogStore;
-    use bytes::{Bytes, BytesMut};
+    use bytes::Bytes;
     use std::collections::VecDeque;
     use uuid::Uuid;
 
@@ -2217,12 +2218,6 @@ mod tests {
             memtable.put_ref(&key, &value, 1).unwrap();
         }
         memtable
-    }
-
-    fn encode_scan_key(key: &[u8]) -> Bytes {
-        let mut encoded = BytesMut::with_capacity(3 + key.len());
-        encode_key_ref_into(&RefKey::new(0, key), &mut encoded);
-        encoded.freeze()
     }
 
     #[test]
@@ -2305,8 +2300,8 @@ mod tests {
             suggested_base_snapshot_id: None,
         });
 
-        let start_key = encode_scan_key(b"");
-        let end_key = encode_scan_key(b"\xff");
+        let start_key = encode_scan_key(0, 0, b"");
+        let end_key = encode_scan_key(0, 0, b"\xff");
         let memtable_iters = manager
             .scan_memtable_iterators_with_snapshot(
                 Arc::clone(&snapshot),

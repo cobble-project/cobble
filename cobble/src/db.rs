@@ -5,6 +5,7 @@ use crate::db_state::{DbStateHandle, LSMTreeScope, bucket_range_fits_total};
 use crate::db_status::{CloseTransition, DbAccessGuard, DbLifecycle};
 use crate::error::{Error, Result};
 use crate::file::FileManager;
+use crate::key_codec::{encode_key, encode_next_column_family_scan_key, encode_scan_key};
 use crate::lsm::{LSMTree, LSMTreeVersion};
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::merge_operator::MergeOperator;
@@ -14,14 +15,14 @@ use crate::snapshot::{
     ActiveMemtableSnapshotData, LoadedManifest, SnapshotCallback, SnapshotManager,
     SnapshotManifestInfo, load_manifest_for_snapshot, snapshot_manifest_name,
 };
-use crate::sst::row_codec::{decode_value, decode_value_masked, encode_key_ref_into};
+use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::r#type::decode_merge_separated_array;
 use crate::r#type::{Column, RefColumn, RefKey, RefValue, Value, ValueType};
 use crate::vlog::{VlogPointer, VlogStore};
 use crate::write_batch::{WriteBatch, WriteOp};
 use crate::writer_options::WriterOptions;
 use crate::{Config, ReadOptions, ScanOptions, TimeProvider, WriteOptions};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use log::{error, info, warn};
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
@@ -1066,12 +1067,7 @@ impl Db {
                 max_index, num_columns
             )));
         }
-        let mut encoded_key = BytesMut::with_capacity(3 + key.len());
-        encode_key_ref_into(
-            &RefKey::new_with_column_family(bucket, column_family_id, key),
-            &mut encoded_key,
-        );
-        let encoded_key = encoded_key.freeze();
+        let encoded_key = encode_key(bucket, column_family_id, key);
         let selected_columns = options.columns();
         let masks = options.masks(num_columns);
         let selected_mask = masks.selected_mask.as_deref();
@@ -1209,10 +1205,34 @@ impl Db {
         self.scan_with_options(bucket, range, &self.default_scan_options)
     }
 
+    pub fn scan_bounds<'a>(
+        &'a self,
+        bucket: u16,
+        start_key_inclusive: Option<&[u8]>,
+        end_key_exclusive: Option<&[u8]>,
+    ) -> Result<DbIterator<'a>> {
+        self.scan_with_options_bounds(
+            bucket,
+            start_key_inclusive,
+            end_key_exclusive,
+            &self.default_scan_options,
+        )
+    }
+
     pub fn scan_with_options<'a>(
         &'a self,
         bucket: u16,
         range: Range<&[u8]>,
+        options: &ScanOptions,
+    ) -> Result<DbIterator<'a>> {
+        self.scan_with_options_bounds(bucket, Some(range.start), Some(range.end), options)
+    }
+
+    pub fn scan_with_options_bounds<'a>(
+        &'a self,
+        bucket: u16,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
         options: &ScanOptions,
     ) -> Result<DbIterator<'a>> {
         let access_guard = self.begin_access()?;
@@ -1229,16 +1249,15 @@ impl Db {
                 max_index, num_columns
             )));
         }
-        let encode_scan_key = |key: &[u8]| {
-            let mut encoded = BytesMut::with_capacity(4 + key.len());
-            encode_key_ref_into(
-                &RefKey::new_with_column_family(bucket, column_family_id, key),
-                &mut encoded,
-            );
-            encoded.freeze()
+        let start_key = encode_scan_key(bucket, column_family_id, start.unwrap_or(&[]));
+        let end_key = if let Some(end) = end {
+            Some(encode_scan_key(bucket, column_family_id, end))
+        } else {
+            Some(encode_next_column_family_scan_key(
+                bucket,
+                column_family_id,
+            )?)
         };
-        let start_key = encode_scan_key(range.start);
-        let end_key = encode_scan_key(range.end);
         let memtable_iters = self
             .memtable_manager
             .scan_memtable_iterators_with_snapshot(
@@ -1247,7 +1266,7 @@ impl Db {
                 column_family_id,
                 options.columns(),
                 Some(start_key.clone()),
-                Some(end_key.clone()),
+                end_key.clone(),
                 options.max_rows(),
             )?;
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
@@ -1267,7 +1286,7 @@ impl Db {
                 return Err(err);
             }
         };
-        let end_bound = Some((end_key, false));
+        let end_bound = end_key.map(|end_key| (end_key, false));
         let mut iter = DbIterator::new(
             memtable_iters,
             lsm_iters,
@@ -1321,6 +1340,7 @@ mod tests {
         DbBuilder, DbGovernance, GovernanceMode, ReadOptions, ScanOptions, U32CounterMergeOperator,
         U64CounterMergeOperator, VolumeDescriptor, WriteOptions,
     };
+    use bytes::BytesMut;
     use serial_test::serial;
     use size::Size;
     use std::sync::{Arc, Mutex, mpsc};
@@ -2467,7 +2487,7 @@ mod tests {
             let mut options = ScanOptions::default();
             options.read_ahead_bytes = Size::from_const(128);
             let iter = db
-                .scan_with_options(0, b"".as_slice()..b"\xff".as_slice(), &options)
+                .scan_with_options_bounds(0, None, None, &options)
                 .unwrap();
             let mut keys = Vec::new();
             for row in iter {
