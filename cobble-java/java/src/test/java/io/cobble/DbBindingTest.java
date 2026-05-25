@@ -1017,6 +1017,51 @@ class DbBindingTest {
     }
 
     @Test
+    void rawScanApisSupportOpenEndedBounds() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-open-scan-bounds-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        Path configPath = writeConfigFile(dataDir, config);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 6; i++) {
+                db.put(0, scanKeyBytes("open-bound", i), 0, valueBytes("open-bound-v", i));
+            }
+
+            try (ScanOptions options = ScanOptions.forColumns(0);
+                    ScanCursor cursor =
+                            db.scanWithOptions(0, scanKeyBytes("open-bound", 2), null, options)) {
+                List<String> keys = new ArrayList<>();
+                for (ScanCursor.Entry entry : cursor) {
+                    keys.add(new String(entry.key, StandardCharsets.UTF_8));
+                    assertEquals(1, entry.columns.length);
+                }
+                assertEquals(4, keys.size());
+                assertEquals(scanKeyString("open-bound", 2), keys.get(0));
+                assertEquals(scanKeyString("open-bound", 5), keys.get(3));
+            }
+
+            ShardSnapshot shardSnapshot = db.snapshot();
+            assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
+            try (ReadOnlyDb readOnlyDb =
+                            ReadOnlyDb.open(
+                                    configPath.toString(), shardSnapshot.snapshotId, db.id());
+                    ScanOptions options = ScanOptions.forColumns(0);
+                    ScanCursor cursor =
+                            readOnlyDb.scanWithOptions(
+                                    0, null, scanKeyBytes("open-bound", 3), options)) {
+                List<String> keys = new ArrayList<>();
+                for (ScanCursor.Entry entry : cursor) {
+                    keys.add(new String(entry.key, StandardCharsets.UTF_8));
+                    assertEquals(1, entry.columns.length);
+                }
+                assertEquals(3, keys.size());
+                assertEquals(scanKeyString("open-bound", 0), keys.get(0));
+                assertEquals(scanKeyString("open-bound", 2), keys.get(2));
+            }
+        }
+    }
+
+    @Test
     void rawColumnFamilyApisAcrossDbReadOnlyAndReader() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-raw-cf-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
@@ -1322,6 +1367,42 @@ class DbBindingTest {
                             ("direct-raw-scan-side-" + expected).getBytes(StandardCharsets.UTF_8),
                             seenValue1.get(i));
                 }
+            }
+        }
+    }
+
+    @Test
+    void dbDirectScanCursorSupportsOpenEndedBounds() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-direct-open-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 5; i++) {
+                byte[] key =
+                        String.format("direct-open-scan-%02d", i).getBytes(StandardCharsets.UTF_8);
+                db.put(0, key, 0, ("direct-open-value-" + i).getBytes(StandardCharsets.UTF_8));
+            }
+
+            byte[] start = "direct-open-scan-02".getBytes(StandardCharsets.UTF_8);
+            ByteBuffer startBuffer = ByteBuffer.allocateDirect(start.length + 8);
+            ((Buffer) startBuffer).clear();
+            startBuffer.put(start);
+
+            try (ScanOptions options = new ScanOptions().columns(0);
+                    DirectScanCursor cursor =
+                            db.scanDirectWithOptions(
+                                    0, startBuffer, start.length, null, 0, options)) {
+                List<String> keys = new ArrayList<>();
+                for (DirectScanEntry entry : cursor) {
+                    keys.add(new String(readDirectBytes(entry.getKey()), StandardCharsets.UTF_8));
+                    int expectedIndex = keys.size() + 1;
+                    assertArrayEquals(
+                            ("direct-open-value-" + expectedIndex).getBytes(StandardCharsets.UTF_8),
+                            entry.decodeColumn(0, DbBindingTest::readInputStreamBytes));
+                }
+                assertEquals(3, keys.size());
+                assertEquals("direct-open-scan-02", keys.get(0));
+                assertEquals("direct-open-scan-04", keys.get(2));
             }
         }
     }

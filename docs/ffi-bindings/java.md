@@ -240,6 +240,13 @@ try (io.cobble.structured.DirectScanCursor cursor =
 }
 ```
 
+The Java scan methods can accept open bounds:
+
+- `byte[]` scan APIs (`Db` / `ReadOnlyDb` / structured `Db`) treat `null` `start` or `end` as an
+  unbounded side.
+- direct scan APIs treat `null` `ByteBuffer` plus length `0` as an unbounded side; JNI forwards
+  that missing bound as native address `-1`.
+
 Structured `DirectScanRow` exposes both the split bucket and the key as direct metadata; column
 values are decoded on demand from the encoded row payload.
 

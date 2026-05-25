@@ -1,6 +1,6 @@
 use crate::util::{
-    decode_column_index, decode_java_bytes, decode_java_string, decode_u16, throw_illegal_argument,
-    throw_illegal_state,
+    decode_column_index, decode_java_bytes, decode_java_string, decode_optional_java_bytes,
+    decode_u16, throw_illegal_argument, throw_illegal_state,
 };
 use cobble::ScanOptions;
 use cobble_data_structure::StructuredScanOptions;
@@ -57,6 +57,13 @@ pub(crate) struct StructuredScanOpenArgs {
     pub(crate) scan_options_handle: Option<&'static StructuredScanOptionsHandle>,
 }
 
+pub(crate) struct StructuredScanOpenBoundsArgs {
+    pub(crate) bucket: u16,
+    pub(crate) start_key_inclusive: Option<Vec<u8>>,
+    pub(crate) end_key_exclusive: Option<Vec<u8>>,
+    pub(crate) scan_options_handle: Option<&'static StructuredScanOptionsHandle>,
+}
+
 pub(crate) fn decode_structured_scan_open_args(
     env: &mut JNIEnv,
     bucket: jint,
@@ -94,6 +101,50 @@ pub(crate) fn decode_structured_scan_open_args(
         )?)
     };
     Some(StructuredScanOpenArgs {
+        bucket,
+        start_key_inclusive,
+        end_key_exclusive,
+        scan_options_handle,
+    })
+}
+
+pub(crate) fn decode_structured_scan_open_bounds_args(
+    env: &mut JNIEnv,
+    bucket: jint,
+    start_key_inclusive: JByteArray,
+    end_key_exclusive: JByteArray,
+    scan_options_handle: jlong,
+) -> Option<StructuredScanOpenBoundsArgs> {
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return None;
+        }
+    };
+    let start_key_inclusive = match decode_optional_java_bytes(env, start_key_inclusive) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return None;
+        }
+    };
+    let end_key_exclusive = match decode_optional_java_bytes(env, end_key_exclusive) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return None;
+        }
+    };
+    let scan_options_handle = if scan_options_handle == 0 {
+        None
+    } else {
+        Some(structured_scan_options_from_handle_or_throw(
+            env,
+            scan_options_handle,
+        )?)
+    };
+    Some(StructuredScanOpenBoundsArgs {
         bucket,
         start_key_inclusive,
         end_key_exclusive,
@@ -141,6 +192,46 @@ pub(crate) fn decode_structured_scan_open_direct_args(
     })
 }
 
+pub(crate) fn decode_structured_scan_open_direct_bounds_args(
+    env: &mut JNIEnv,
+    bucket: jint,
+    start_key_address: jlong,
+    start_key_length: jint,
+    end_key_address: jlong,
+    end_key_length: jint,
+    scan_options_handle: jlong,
+) -> Option<StructuredScanOpenBoundsArgs> {
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return None;
+        }
+    };
+    let start_key_inclusive = decode_optional_direct_bytes(
+        env,
+        "startKeyInclusive",
+        start_key_address,
+        start_key_length,
+    )?;
+    let end_key_exclusive =
+        decode_optional_direct_bytes(env, "endKeyExclusive", end_key_address, end_key_length)?;
+    let scan_options_handle = if scan_options_handle == 0 {
+        None
+    } else {
+        Some(structured_scan_options_from_handle_or_throw(
+            env,
+            scan_options_handle,
+        )?)
+    };
+    Some(StructuredScanOpenBoundsArgs {
+        bucket,
+        start_key_inclusive,
+        end_key_exclusive,
+        scan_options_handle,
+    })
+}
+
 fn decode_direct_bytes(
     env: &mut JNIEnv,
     name: &str,
@@ -163,6 +254,40 @@ fn decode_direct_bytes(
     };
     let bytes = unsafe { std::slice::from_raw_parts(address, length) };
     Some(bytes.to_vec())
+}
+
+fn decode_optional_direct_bytes(
+    env: &mut JNIEnv,
+    name: &str,
+    address: jlong,
+    length: jint,
+) -> Option<Option<Vec<u8>>> {
+    let length = match usize::try_from(length) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(env, format!("{name} length must be >= 0"));
+            return None;
+        }
+    };
+    if address == -1 {
+        if length != 0 {
+            throw_illegal_argument(
+                env,
+                format!("{name} length must be 0 when {name} address is -1"),
+            );
+            return None;
+        }
+        return Some(None);
+    }
+    let address = match usize::try_from(address) {
+        Ok(v) if v != 0 => v as *const u8,
+        _ => {
+            throw_illegal_argument(env, format!("{name} address must be > 0 or -1"));
+            return None;
+        }
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(address, length) };
+    Some(Some(bytes.to_vec()))
 }
 
 pub(crate) fn structured_scan_options_from_handle_or_throw(

@@ -379,6 +379,44 @@ class StructuredDbTest {
     }
 
     @Test
+    void structuredScanSupportsOpenEndedBounds() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-open-scan-bounds-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 6; i++) {
+                db.put(
+                        0,
+                        String.format("st-open-%04d", i).getBytes(StandardCharsets.UTF_8),
+                        0,
+                        ColumnValue.ofBytes(
+                                String.format("st-open-v-value-%d-payload", i)
+                                        .getBytes(StandardCharsets.UTF_8)));
+            }
+
+            try (ScanOptions options = new ScanOptions().columns(0);
+                    ScanCursor cursor =
+                            db.scanWithOptions(
+                                    0,
+                                    "st-open-0002".getBytes(StandardCharsets.UTF_8),
+                                    null,
+                                    options)) {
+                List<String> keys = new ArrayList<>();
+                for (Row row : cursor) {
+                    keys.add(new String(row.getKey(), StandardCharsets.UTF_8));
+                    assertArrayEquals(
+                            String.format("st-open-v-value-%d-payload", keys.size() + 1)
+                                    .getBytes(StandardCharsets.UTF_8),
+                            row.getBytes(0));
+                }
+                assertEquals(4, keys.size());
+                assertEquals("st-open-0002", keys.get(0));
+                assertEquals("st-open-0005", keys.get(3));
+            }
+        }
+    }
+
+    @Test
     void mixedSchemaWithDefaultBytesColumns() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-default-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
@@ -917,6 +955,47 @@ class StructuredDbTest {
                 assertEquals(5, seen.size());
                 assertEquals("encoded-scan-00=encoded-scan-value-0", seen.get(0));
                 assertEquals("encoded-scan-04=encoded-scan-value-4", seen.get(4));
+            }
+        }
+    }
+
+    @Test
+    void structuredDirectScanSupportsOpenEndedBounds() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-direct-open-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 5; i++) {
+                byte[] key =
+                        String.format("st-direct-open-%02d", i).getBytes(StandardCharsets.UTF_8);
+                db.put(
+                        0,
+                        key,
+                        0,
+                        ColumnValue.ofBytes(
+                                ("st-direct-value-" + i).getBytes(StandardCharsets.UTF_8)));
+            }
+
+            byte[] start = "st-direct-open-02".getBytes(StandardCharsets.UTF_8);
+            ByteBuffer startBuffer = ByteBuffer.allocateDirect(start.length + 8);
+            ((Buffer) startBuffer).clear();
+            startBuffer.put(start);
+
+            try (ScanOptions options = new ScanOptions().columns(0);
+                    DirectScanCursor cursor =
+                            db.scanDirectWithOptions(
+                                    0, startBuffer, start.length, null, 0, options)) {
+                List<String> keys = new ArrayList<>();
+                for (DirectScanRow row : cursor) {
+                    keys.add(new String(readDirectBytes(row.getKey()), StandardCharsets.UTF_8));
+                    int expectedIndex = keys.size() + 1;
+                    assertArrayEquals(
+                            ("st-direct-value-" + expectedIndex).getBytes(StandardCharsets.UTF_8),
+                            row.decodeBytesColumn(0, StructuredDbTest::readInputStreamBytes));
+                }
+                assertEquals(3, keys.size());
+                assertEquals("st-direct-open-02", keys.get(0));
+                assertEquals("st-direct-open-04", keys.get(2));
             }
         }
     }

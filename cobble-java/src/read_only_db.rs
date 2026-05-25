@@ -1,5 +1,5 @@
 use crate::read_options::read_options_from_handle_or_throw;
-use crate::scan::{ScanCursorHandle, decode_scan_open_args};
+use crate::scan::{ScanCursorHandle, decode_scan_open_bounds_args};
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_u16, decode_u64_from_jlong, parse_config_json,
     throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
@@ -183,7 +183,7 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openScanCursor(
     let Some(db) = read_only_db_from_handle_or_throw(&mut env, native_handle) else {
         return 0;
     };
-    let Some(args) = decode_scan_open_args(
+    let Some(args) = decode_scan_open_bounds_args(
         &mut env,
         bucket,
         start_key_inclusive,
@@ -193,9 +193,10 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openScanCursor(
         return 0;
     };
     let iter = match args.scan_options_handle {
-        Some(scan_options_handle) => match db.scan_with_options(
+        Some(scan_options_handle) => match db.scan_with_options_bounds(
             args.bucket,
-            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+            args.start_key_inclusive.as_deref(),
+            args.end_key_exclusive.as_deref(),
             scan_options_handle.scan_options(),
         ) {
             Ok(v) => v,
@@ -204,9 +205,10 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openScanCursor(
                 return 0;
             }
         },
-        None => match db.scan(
+        None => match db.scan_bounds(
             args.bucket,
-            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+            args.start_key_inclusive.as_deref(),
+            args.end_key_exclusive.as_deref(),
         ) {
             Ok(v) => v,
             Err(err) => {

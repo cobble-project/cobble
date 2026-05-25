@@ -6,7 +6,7 @@
 
 use crate::structured_read_options::structured_read_options_from_handle_or_throw;
 use crate::structured_scan_options::{
-    decode_structured_scan_open_args, decode_structured_scan_open_direct_args,
+    decode_structured_scan_open_bounds_args, decode_structured_scan_open_direct_bounds_args,
     structured_scan_options_from_handle_or_throw,
 };
 use crate::structured_write_options::structured_write_options_from_handle_or_throw;
@@ -1634,7 +1634,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredScanCursor(
     let Some(db) = db_from_handle(&mut env, handle) else {
         return 0;
     };
-    let Some(args) = decode_structured_scan_open_args(
+    let Some(args) = decode_structured_scan_open_bounds_args(
         &mut env,
         bucket,
         start_key_inclusive,
@@ -1643,9 +1643,13 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredScanCursor(
     ) else {
         return 0;
     };
-    let range = args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice();
     let iter = if let Some(scan_options_handle) = args.scan_options_handle {
-        match db.scan_with_options(args.bucket, range, scan_options_handle.scan_options()) {
+        match db.scan_with_options_bounds(
+            args.bucket,
+            args.start_key_inclusive.as_deref(),
+            args.end_key_exclusive.as_deref(),
+            scan_options_handle.scan_options(),
+        ) {
             Ok(iter) => iter,
             Err(err) => {
                 throw_illegal_state(&mut env, err.to_string());
@@ -1653,7 +1657,11 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredScanCursor(
             }
         }
     } else {
-        match db.scan(args.bucket, range) {
+        match db.scan_bounds(
+            args.bucket,
+            args.start_key_inclusive.as_deref(),
+            args.end_key_exclusive.as_deref(),
+        ) {
             Ok(iter) => iter,
             Err(err) => {
                 throw_illegal_state(&mut env, err.to_string());
@@ -1685,7 +1693,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredDirectScanCurs
     let Some(db) = db_from_handle(&mut env, handle) else {
         return 0;
     };
-    let Some(args) = decode_structured_scan_open_direct_args(
+    let Some(args) = decode_structured_scan_open_direct_bounds_args(
         &mut env,
         bucket,
         start_key_address,
@@ -1696,9 +1704,13 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredDirectScanCurs
     ) else {
         return 0;
     };
-    let range = args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice();
     let iter = if let Some(scan_options_handle) = args.scan_options_handle {
-        match db.scan_with_options(args.bucket, range, scan_options_handle.scan_options()) {
+        match db.scan_with_options_bounds(
+            args.bucket,
+            args.start_key_inclusive.as_deref(),
+            args.end_key_exclusive.as_deref(),
+            scan_options_handle.scan_options(),
+        ) {
             Ok(iter) => iter,
             Err(err) => {
                 throw_illegal_state(&mut env, err.to_string());
@@ -1706,7 +1718,11 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredDirectScanCurs
             }
         }
     } else {
-        match db.scan(args.bucket, range) {
+        match db.scan_bounds(
+            args.bucket,
+            args.start_key_inclusive.as_deref(),
+            args.end_key_exclusive.as_deref(),
+        ) {
             Ok(iter) => iter,
             Err(err) => {
                 throw_illegal_state(&mut env, err.to_string());

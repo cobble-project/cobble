@@ -705,13 +705,18 @@ public final class Db extends NativeObject {
     /**
      * Open a structured scan cursor within [startKeyInclusive, endKeyExclusive).
      *
-     * <p>Each batch from the cursor yields typed {@link Row} objects.
+     * <p>Each batch from the cursor yields typed {@link Row} objects. Passing {@code null} for
+     * either bound leaves that side open.
      */
     public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
         return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
     }
 
-    /** Open a structured scan cursor in a specific column family. */
+    /**
+     * Open a structured scan cursor in a specific column family.
+     *
+     * <p>Passing {@code null} for either bound leaves that side open.
+     */
     public ScanCursor scan(
             int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, String columnFamily) {
         try (ScanOptions options = new ScanOptions().columnFamily(columnFamily)) {
@@ -719,7 +724,11 @@ public final class Db extends NativeObject {
         }
     }
 
-    /** Open a structured scan cursor with explicit scan options. */
+    /**
+     * Open a structured scan cursor with explicit scan options.
+     *
+     * <p>Passing {@code null} for either bound leaves that side open.
+     */
     public ScanCursor scanWithOptions(
             int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, ScanOptions options) {
         long soh = options == null ? 0L : options.getNativeHandle();
@@ -737,7 +746,8 @@ public final class Db extends NativeObject {
      *
      * <p>The direct cursor reuses a pooled direct buffer and returns one row at a time without JNI
      * byte[] materialization. Each returned row stays valid only until the cursor advances again or
-     * closes.
+     * closes. Passing {@code null} for either bound leaves that side open; when absent, the
+     * matching length must be {@code 0}.
      */
     public DirectScanCursor scanDirectWithOptions(
             int bucket,
@@ -746,32 +756,43 @@ public final class Db extends NativeObject {
             ByteBuffer endKeyExclusive,
             int endKeyLength,
             ScanOptions options) {
-        if (startKeyInclusive == null || !startKeyInclusive.isDirect()) {
-            throw new IllegalArgumentException("startKeyInclusive must be a direct ByteBuffer");
-        }
-        if (endKeyExclusive == null || !endKeyExclusive.isDirect()) {
-            throw new IllegalArgumentException("endKeyExclusive must be a direct ByteBuffer");
-        }
-        if (startKeyLength < 0 || startKeyLength > startKeyInclusive.capacity()) {
-            throw new IllegalArgumentException("startKeyLength out of range: " + startKeyLength);
-        }
-        if (endKeyLength < 0 || endKeyLength > endKeyExclusive.capacity()) {
-            throw new IllegalArgumentException("endKeyLength out of range: " + endKeyLength);
-        }
+        validateOptionalDirectScanBound("startKeyInclusive", startKeyInclusive, startKeyLength);
+        validateOptionalDirectScanBound("endKeyExclusive", endKeyExclusive, endKeyLength);
         long soh = options == null ? 0L : options.getNativeHandle();
         long h =
                 openStructuredDirectScanCursor(
                         nativeHandle,
                         bucket,
-                        DirectIoUtils.directAddress(startKeyInclusive),
+                        directAddressOrMissing(startKeyInclusive),
                         startKeyLength,
-                        DirectIoUtils.directAddress(endKeyExclusive),
+                        directAddressOrMissing(endKeyExclusive),
                         endKeyLength,
                         soh);
         if (h == 0L) {
             throw new IllegalStateException("failed to open structured direct scan cursor");
         }
         return new DirectScanCursor(h, directBufferPool);
+    }
+
+    private static void validateOptionalDirectScanBound(
+            String name, ByteBuffer key, int keyLength) {
+        if (key == null) {
+            if (keyLength != 0) {
+                throw new IllegalArgumentException(
+                        name + "Length must be 0 when " + name + " is null");
+            }
+            return;
+        }
+        if (!key.isDirect()) {
+            throw new IllegalArgumentException(name + " must be a direct ByteBuffer");
+        }
+        if (keyLength < 0 || keyLength > key.capacity()) {
+            throw new IllegalArgumentException(name + "Length out of range: " + keyLength);
+        }
+    }
+
+    private static long directAddressOrMissing(ByteBuffer key) {
+        return key == null ? -1L : DirectIoUtils.directAddress(key);
     }
 
     private EncodedDirectResult readEncodedDirectResult(

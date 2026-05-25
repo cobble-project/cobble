@@ -50,6 +50,16 @@ pub(crate) fn decode_java_bytes(env: &mut JNIEnv, value: JByteArray) -> Result<V
         .map_err(|err| format!("invalid java byte array: {}", err))
 }
 
+pub(crate) fn decode_optional_java_bytes(
+    env: &mut JNIEnv,
+    value: JByteArray,
+) -> Result<Option<Vec<u8>>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    decode_java_bytes(env, value).map(Some)
+}
+
 pub(crate) fn decode_java_bytes_ref(
     env: &mut JNIEnv,
     value: &JByteArray,

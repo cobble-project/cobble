@@ -1,6 +1,7 @@
 use crate::util::{
-    decode_column_index, decode_java_bytes, decode_java_string, decode_u16, parse_config_json,
-    throw_illegal_argument, throw_illegal_state, write_payload_to_io_or_cached_overflow,
+    decode_column_index, decode_java_bytes, decode_java_string, decode_optional_java_bytes,
+    decode_u16, parse_config_json, throw_illegal_argument, throw_illegal_state,
+    write_payload_to_io_or_cached_overflow,
 };
 use bytes::Bytes;
 use cobble::{Config, DbIterator, Result, ScanOptions, ScanSplit, ScanSplitScanner};
@@ -57,6 +58,13 @@ pub(crate) struct ScanOpenArgs {
     pub(crate) scan_options_handle: Option<&'static ScanOptionsHandle>,
 }
 
+pub(crate) struct ScanOpenBoundsArgs {
+    pub(crate) bucket: u16,
+    pub(crate) start_key_inclusive: Option<Vec<u8>>,
+    pub(crate) end_key_exclusive: Option<Vec<u8>>,
+    pub(crate) scan_options_handle: Option<&'static ScanOptionsHandle>,
+}
+
 pub(crate) fn decode_scan_open_args(
     env: &mut JNIEnv,
     bucket: jint,
@@ -98,15 +106,13 @@ pub(crate) fn decode_scan_open_args(
     })
 }
 
-pub(crate) fn decode_scan_open_direct_args(
+pub(crate) fn decode_scan_open_bounds_args(
     env: &mut JNIEnv,
     bucket: jint,
-    start_key_address: jlong,
-    start_key_length: jint,
-    end_key_address: jlong,
-    end_key_length: jint,
+    start_key_inclusive: JByteArray,
+    end_key_exclusive: JByteArray,
     scan_options_handle: jlong,
-) -> Option<ScanOpenArgs> {
+) -> Option<ScanOpenBoundsArgs> {
     let bucket = match decode_u16("bucket", bucket) {
         Ok(v) => v,
         Err(err) => {
@@ -114,20 +120,26 @@ pub(crate) fn decode_scan_open_direct_args(
             return None;
         }
     };
-    let start_key_inclusive = decode_direct_bytes(
-        env,
-        "startKeyInclusive",
-        start_key_address,
-        start_key_length,
-    )?;
-    let end_key_exclusive =
-        decode_direct_bytes(env, "endKeyExclusive", end_key_address, end_key_length)?;
+    let start_key_inclusive = match decode_optional_java_bytes(env, start_key_inclusive) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return None;
+        }
+    };
+    let end_key_exclusive = match decode_optional_java_bytes(env, end_key_exclusive) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return None;
+        }
+    };
     let scan_options_handle = if scan_options_handle == 0 {
         None
     } else {
         Some(scan_options_from_handle_or_throw(env, scan_options_handle)?)
     };
-    Some(ScanOpenArgs {
+    Some(ScanOpenBoundsArgs {
         bucket,
         start_key_inclusive,
         end_key_exclusive,
@@ -135,12 +147,49 @@ pub(crate) fn decode_scan_open_direct_args(
     })
 }
 
-fn decode_direct_bytes(
+pub(crate) fn decode_scan_open_direct_bounds_args(
+    env: &mut JNIEnv,
+    bucket: jint,
+    start_key_address: jlong,
+    start_key_length: jint,
+    end_key_address: jlong,
+    end_key_length: jint,
+    scan_options_handle: jlong,
+) -> Option<ScanOpenBoundsArgs> {
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return None;
+        }
+    };
+    let start_key_inclusive = decode_optional_direct_bytes(
+        env,
+        "startKeyInclusive",
+        start_key_address,
+        start_key_length,
+    )?;
+    let end_key_exclusive =
+        decode_optional_direct_bytes(env, "endKeyExclusive", end_key_address, end_key_length)?;
+    let scan_options_handle = if scan_options_handle == 0 {
+        None
+    } else {
+        Some(scan_options_from_handle_or_throw(env, scan_options_handle)?)
+    };
+    Some(ScanOpenBoundsArgs {
+        bucket,
+        start_key_inclusive,
+        end_key_exclusive,
+        scan_options_handle,
+    })
+}
+
+fn decode_optional_direct_bytes(
     env: &mut JNIEnv,
     name: &str,
     address: jlong,
     length: jint,
-) -> Option<Vec<u8>> {
+) -> Option<Option<Vec<u8>>> {
     let length = match usize::try_from(length) {
         Ok(v) => v,
         Err(_) => {
@@ -148,15 +197,25 @@ fn decode_direct_bytes(
             return None;
         }
     };
+    if address == -1 {
+        if length != 0 {
+            throw_illegal_argument(
+                env,
+                format!("{name} length must be 0 when {name} address is -1"),
+            );
+            return None;
+        }
+        return Some(None);
+    }
     let address = match usize::try_from(address) {
         Ok(v) if v != 0 => v as *const u8,
         _ => {
-            throw_illegal_argument(env, format!("{name} address must be > 0"));
+            throw_illegal_argument(env, format!("{name} address must be > 0 or -1"));
             return None;
         }
     };
     let bytes = unsafe { std::slice::from_raw_parts(address, length) };
-    Some(bytes.to_vec())
+    Some(Some(bytes.to_vec()))
 }
 
 pub(crate) struct ScanCursorHandle {
@@ -603,7 +662,7 @@ pub extern "system" fn Java_io_cobble_Db_openDirectScanCursor(
     let Some(db) = super::db::db_from_handle_or_throw(&mut env, native_handle) else {
         return 0;
     };
-    let Some(args) = decode_scan_open_direct_args(
+    let Some(args) = decode_scan_open_direct_bounds_args(
         &mut env,
         bucket,
         start_key_address,
@@ -615,9 +674,10 @@ pub extern "system" fn Java_io_cobble_Db_openDirectScanCursor(
         return 0;
     };
     let iter = match args.scan_options_handle {
-        Some(scan_options_handle) => match db.scan_with_options(
+        Some(scan_options_handle) => match db.scan_with_options_bounds(
             args.bucket,
-            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+            args.start_key_inclusive.as_deref(),
+            args.end_key_exclusive.as_deref(),
             scan_options_handle.scan_options(),
         ) {
             Ok(v) => v,
@@ -626,9 +686,10 @@ pub extern "system" fn Java_io_cobble_Db_openDirectScanCursor(
                 return 0;
             }
         },
-        None => match db.scan(
+        None => match db.scan_bounds(
             args.bucket,
-            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+            args.start_key_inclusive.as_deref(),
+            args.end_key_exclusive.as_deref(),
         ) {
             Ok(v) => v,
             Err(err) => {

@@ -72,11 +72,20 @@ public final class ReadOnlyDb extends NativeObject {
         return get(nativeHandle, bucket, key, readOptionsHandle);
     }
 
-    /** Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive). */
+    /**
+     * Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive).
+     *
+     * <p>Passing {@code null} for either bound leaves that side open.
+     */
     public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
         return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
     }
 
+    /**
+     * Open a high-throughput native scan cursor in a specific column family.
+     *
+     * <p>Passing {@code null} for either bound leaves that side open.
+     */
     public ScanCursor scan(
             int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, String columnFamily) {
         try (ScanOptions options = new ScanOptions().columnFamily(columnFamily)) {
@@ -84,6 +93,11 @@ public final class ReadOnlyDb extends NativeObject {
         }
     }
 
+    /**
+     * Open a high-throughput native scan cursor with explicit options handle mode.
+     *
+     * <p>Passing {@code null} for either bound leaves that side open.
+     */
     public ScanCursor scanWithOptions(
             int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, ScanOptions options) {
         long scanOptionsHandle = options == null ? 0L : options.nativeHandle;
