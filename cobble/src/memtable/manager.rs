@@ -7,7 +7,8 @@ use std::thread::JoinHandle;
 use crate::config::MemtableType;
 use crate::data_file::DataFile;
 use crate::db_state::{
-    DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion, TruncationCursorSnapshot,
+    DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion, TruncationCursorId,
+    TruncationCursorMap, TruncationCursorSnapshot,
 };
 use crate::db_status::DbLifecycle;
 use crate::error::Error::InvalidState;
@@ -134,6 +135,7 @@ struct FlushJob {
     memtable_id: Option<Uuid>,
     memtable: Option<Arc<MemtableImpl>>,
     schema: Option<Arc<Schema>>,
+    truncation_cursors: Option<TruncationCursorSnapshot>,
     snapshot: Option<SnapshotCompletion>,
     active_memtable_snapshot: Option<ActiveMemtableSnapshotJob>,
 }
@@ -913,6 +915,7 @@ impl MemtableManager {
                             Arc::clone(&ttl_provider_clone),
                             Arc::clone(&vlog_store_clone),
                             multi_lsm_version,
+                            job.truncation_cursors.as_ref(),
                         );
                         let mut state = state_clone.lock().unwrap();
                         state.in_flight = state.in_flight.saturating_sub(1);
@@ -932,6 +935,21 @@ impl MemtableManager {
                                     .map(|(_, file)| file.size as u64)
                                     .sum();
                                 metrics.flush_bytes_total.increment(flushed_bytes);
+                                if res.data_files_by_scope.is_empty() {
+                                    state.flush_results.push(Ok(res));
+                                    flush_done_clone.notify_all();
+                                    drop(state);
+                                    db_state_clone.remove_immutable(memtable_id);
+                                    let snapshot = db_state_clone.load();
+                                    Self::finish_and_materialize_snapshot(
+                                        &job.snapshot,
+                                        &snapshot,
+                                        Vec::new(),
+                                        &db_state_clone,
+                                    );
+                                    drop(keep_memtable_alive);
+                                    continue;
+                                }
                                 let vlog_edit = res.vlog_edit.clone();
                                 let snapshot = match lsm_tree_clone.add_level0_files(
                                     memtable_id,
@@ -1602,8 +1620,9 @@ impl MemtableManager {
         let mut guard = self.db_state.lock();
         guard = self.wait_for_write_stall_under_guard(guard)?;
         let snapshot_state = self.db_state.load();
+        let truncation_cursors = snapshot_state.truncation_cursors.capture();
         if let Some(snapshot) = snapshot.as_mut() {
-            snapshot.truncation_cursors = Some(snapshot_state.truncation_cursors.capture());
+            snapshot.truncation_cursors = Some(truncation_cursors.clone());
         }
         let mut to_flush = None;
         let mut active_memtable_snapshot = None;
@@ -1678,6 +1697,7 @@ impl MemtableManager {
                 memtable_id: Some(to_flush.id),
                 memtable: Some(to_flush.memtable),
                 schema: Some(to_flush.schema),
+                truncation_cursors: Some(truncation_cursors),
                 snapshot,
                 active_memtable_snapshot: None,
             }
@@ -1687,6 +1707,7 @@ impl MemtableManager {
                 memtable_id: None,
                 memtable: None,
                 schema: None,
+                truncation_cursors: None,
                 snapshot,
                 active_memtable_snapshot: Some(active_memtable_snapshot),
             }
@@ -1696,6 +1717,7 @@ impl MemtableManager {
                 memtable_id: None,
                 memtable: None,
                 schema: None,
+                truncation_cursors: None,
                 snapshot,
                 active_memtable_snapshot: None,
             }
@@ -1757,6 +1779,7 @@ impl MemtableManager {
                 return Ok(false);
             }
             let multi_lsm_version = self.db_state.load().multi_lsm_version.clone();
+            let truncation_cursors = self.db_state.load().truncation_cursors.capture();
             let result = flush_memtable(
                 &memtable,
                 self.schema_manager.latest_schema(),
@@ -1765,7 +1788,11 @@ impl MemtableManager {
                 self.lsm_tree.ttl_provider(),
                 Arc::clone(&self.vlog_store),
                 multi_lsm_version,
+                Some(&truncation_cursors),
             )?;
+            if result.data_files_by_scope.is_empty() {
+                return Ok(false);
+            }
             self.metrics.flushes_total.increment(1);
             let flushed_bytes: u64 = result
                 .data_files_by_scope
@@ -1887,11 +1914,15 @@ fn flush_memtable(
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     vlog_store: Arc<VlogStore>,
     multi_lsm_version: MultiLSMTreeVersion,
+    truncation_cursors: Option<&TruncationCursorSnapshot>,
 ) -> Result<MemtableFlushResult> {
     let mut vlog_edit = None;
     let mut flush_vlog_writer = None;
     let mut flush_separated_entries = 0usize;
     let mut builders: BTreeMap<usize, FlushTreeBuilder> = BTreeMap::new();
+    let truncation_cursors = truncation_cursors
+        .map(TruncationCursorSnapshot::to_map)
+        .unwrap_or_default();
     let mut dedup_iter = DeduplicatingIterator::new(
         PrimedIterator::new(memtable.iter()),
         None,
@@ -1906,6 +1937,10 @@ fn flush_memtable(
                 .ok_or_else(|| InvalidState("encoded key missing bucket/cf prefix".to_string()))?;
             let column_family_id = key_column_family(&key)
                 .ok_or_else(|| InvalidState("encoded key missing bucket/cf prefix".to_string()))?;
+            if key_is_truncated_by_cursor_map(&truncation_cursors, bucket, column_family_id, &key) {
+                dedup_iter.next()?;
+                continue;
+            }
             let tree_idx = multi_lsm_version
                 .tree_index_for_bucket_and_column_family(bucket, column_family_id)
                 .ok_or_else(|| {
@@ -1997,15 +2032,24 @@ fn flush_memtable(
         data_file.set_meta_bytes(footer_bytes);
         data_files_by_scope.push((tree_scope, Arc::new(data_file)));
     }
-    if data_files_by_scope.is_empty() {
-        return Err(Error::InvalidState(
-            "flush produced no sst entries".to_string(),
-        ));
-    }
     Ok(MemtableFlushResult {
         data_files_by_scope,
         vlog_edit,
     })
+}
+
+fn key_is_truncated_by_cursor_map(
+    cursors: &TruncationCursorMap,
+    bucket: u16,
+    column_family_id: u8,
+    encoded_key: &[u8],
+) -> bool {
+    if cursors.is_empty() || encoded_key.len() < 3 {
+        return false;
+    }
+    cursors
+        .get(&TruncationCursorId::new(bucket, column_family_id))
+        .is_some_and(|cursor| &encoded_key[3..] <= cursor.as_slice())
 }
 
 fn decode_active_snapshot_segments_into_memtable(
@@ -2443,6 +2487,143 @@ mod tests {
                 (Bytes::from_static(b"\0\0\0b"), Bytes::from("v1"))
             ]
         );
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_memtable_flush_prunes_truncated_keys() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_test")
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-truncation-test"));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::new(DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
+        let manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 256,
+                buffer_count: 2,
+                writer_options: WriterOptions::Sst(SSTWriterOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTWriterOptions::default()
+                }),
+                num_columns: 1,
+                write_stall_limit: 8,
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        manager.open().unwrap();
+
+        manager
+            .put(
+                &RefKey::new(0, b"a"),
+                &RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"va"))]),
+            )
+            .unwrap();
+        manager
+            .put(
+                &RefKey::new(0, b"b"),
+                &RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"vb"))]),
+            )
+            .unwrap();
+        manager
+            .put(
+                &RefKey::new(0, b"c"),
+                &RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"vc"))]),
+            )
+            .unwrap();
+        manager.db_state.advance_truncation_cursor(0, 0, b"a");
+
+        manager.flush_active().unwrap();
+        let results = manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        let flush_result = results[0].as_ref().unwrap();
+        assert_eq!(flush_result.data_files_by_scope.len(), 1);
+
+        let data_file = Arc::clone(&flush_result.data_files_by_scope[0].1);
+        let reader = file_manager
+            .open_data_file_reader(data_file.file_id)
+            .unwrap();
+        let mut iter = SSTIterator::with_cache_and_file(
+            Box::new(reader),
+            data_file.as_ref(),
+            SSTIteratorOptions {
+                bloom_filter_enabled: true,
+                ..SSTIteratorOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        iter.seek_to_first().unwrap();
+        let mut keys = Vec::new();
+        while iter.valid() {
+            let (key, _) = iter.current().unwrap().unwrap();
+            keys.push(key);
+            iter.next().unwrap();
+        }
+        assert_eq!(
+            keys,
+            vec![
+                Bytes::from_static(b"\0\0\0b"),
+                Bytes::from_static(b"\0\0\0c")
+            ]
+        );
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_memtable_flush_all_truncated_keys_produces_no_l0_file() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_test")
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-truncation-empty-test"));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::new(DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
+        let manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 256,
+                buffer_count: 2,
+                num_columns: 1,
+                write_stall_limit: 8,
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        manager.open().unwrap();
+
+        manager
+            .put(
+                &RefKey::new(0, b"a"),
+                &RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"va"))]),
+            )
+            .unwrap();
+        manager.db_state.advance_truncation_cursor(0, 0, b"a");
+
+        manager.flush_active().unwrap();
+        let results = manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].as_ref().unwrap().data_files_by_scope.is_empty());
+        assert!(lsm_tree.level_files(0).is_empty());
+        assert!(manager.db_state.load().immutables.is_empty());
+
         cleanup_test_root();
     }
 
