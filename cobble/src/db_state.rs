@@ -5,10 +5,10 @@ use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, MAX_COLUMN_FAMILY_COUNT};
 use crate::vlog::VlogVersion;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ops::RangeInclusive;
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -30,6 +30,136 @@ impl LSMTreeScope {
             column_family_id,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct TruncationCursorId {
+    pub(crate) bucket: u16,
+    pub(crate) column_family_id: u8,
+}
+
+impl TruncationCursorId {
+    pub(crate) fn new(bucket: u16, column_family_id: u8) -> Self {
+        Self {
+            bucket,
+            column_family_id,
+        }
+    }
+}
+
+pub(crate) type TruncationCursorMap = HashMap<TruncationCursorId, Vec<u8>>;
+
+#[derive(Clone)]
+pub(crate) struct TruncationCursorStore {
+    inner: Arc<TruncationCursorStoreInner>,
+}
+
+struct TruncationCursorStoreInner {
+    current: RwLock<Arc<TruncationCursorMap>>,
+    has_any: AtomicBool,
+}
+
+#[derive(Clone)]
+pub(crate) struct TruncationCursorSnapshot {
+    cursors: Arc<TruncationCursorMap>,
+    has_any: bool,
+}
+
+impl TruncationCursorStore {
+    fn new(cursors: TruncationCursorMap) -> Self {
+        let has_any = !cursors.is_empty();
+        Self {
+            inner: Arc::new(TruncationCursorStoreInner {
+                current: RwLock::new(Arc::new(cursors)),
+                has_any: AtomicBool::new(has_any),
+            }),
+        }
+    }
+
+    pub(crate) fn get(&self, bucket: u16, column_family_id: u8) -> Option<Vec<u8>> {
+        if !self.inner.has_any.load(Ordering::Acquire) {
+            return None;
+        }
+        let id = TruncationCursorId::new(bucket, column_family_id);
+        self.inner.current.read().unwrap().get(&id).cloned()
+    }
+
+    pub(crate) fn key_is_truncated(&self, bucket: u16, column_family_id: u8, key: &[u8]) -> bool {
+        if !self.inner.has_any.load(Ordering::Acquire) {
+            return false;
+        }
+        let id = TruncationCursorId::new(bucket, column_family_id);
+        self.inner
+            .current
+            .read()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|cursor| key <= cursor.as_slice())
+    }
+
+    /// Captures a stable cursor view for snapshot materialization.
+    ///
+    /// Short readers only hold the read lock long enough to copy one cursor. Snapshot capture is
+    /// the intentionally long-lived reader: it clones the current `Arc<HashMap<...>>` and then can
+    /// outlive the lock. Writers use `Arc::get_mut` while holding the write lock. If no captured
+    /// snapshot owns the map, the update is in-place; if a snapshot still references it, the writer
+    /// clones the map and swaps in the updated copy. The `RwLock` is therefore just pointer
+    /// protection, while the map `Arc` is what keeps stale snapshot views immutable without forcing
+    /// every poll to clone the cursor map.
+    pub(crate) fn capture(&self) -> TruncationCursorSnapshot {
+        if !self.inner.has_any.load(Ordering::Acquire) {
+            return TruncationCursorSnapshot {
+                cursors: Arc::new(TruncationCursorMap::new()),
+                has_any: false,
+            };
+        }
+        TruncationCursorSnapshot {
+            cursors: Arc::clone(&self.inner.current.read().unwrap()),
+            has_any: true,
+        }
+    }
+
+    pub(crate) fn to_map(&self) -> TruncationCursorMap {
+        self.capture().to_map()
+    }
+
+    pub(crate) fn advance(&self, bucket: u16, column_family_id: u8, key: &[u8]) -> bool {
+        let id = TruncationCursorId::new(bucket, column_family_id);
+        let mut current = self.inner.current.write().unwrap();
+        if current
+            .get(&id)
+            .is_some_and(|cursor| key <= cursor.as_slice())
+        {
+            return true;
+        }
+
+        if let Some(cursors) = Arc::get_mut(&mut *current) {
+            cursors.insert(id, key.to_vec());
+        } else {
+            let mut next = (**current).clone();
+            next.insert(id, key.to_vec());
+            *current = Arc::new(next);
+        }
+        self.inner.has_any.store(true, Ordering::Release);
+        true
+    }
+}
+
+impl TruncationCursorSnapshot {
+    pub(crate) fn to_map(&self) -> TruncationCursorMap {
+        if !self.has_any {
+            return TruncationCursorMap::new();
+        }
+        (*self.cursors).clone()
+    }
+}
+
+pub(crate) fn new_truncation_cursors() -> TruncationCursorStore {
+    new_truncation_cursors_with(HashMap::new())
+}
+
+pub(crate) fn new_truncation_cursors_with(cursors: TruncationCursorMap) -> TruncationCursorStore {
+    TruncationCursorStore::new(cursors)
 }
 
 pub(crate) fn default_column_family_scopes(
@@ -307,8 +437,24 @@ pub(crate) struct DbState {
     pub(crate) vlog_version: VlogVersion,
     pub(crate) active: Option<Arc<Mutex<ActiveMemtable>>>,
     pub(crate) immutables: VecDeque<ImmutableMemtable>,
+    pub(crate) truncation_cursors: TruncationCursorStore,
     // This is used to suggest a base snapshot ID for new snapshots
     pub(crate) suggested_base_snapshot_id: Option<u64>,
+}
+
+impl DbState {
+    pub(crate) fn truncation_cursor(&self, bucket: u16, column_family_id: u8) -> Option<Vec<u8>> {
+        self.truncation_cursors.get(bucket, column_family_id)
+    }
+
+    pub(crate) fn key_is_truncated(&self, bucket: u16, column_family_id: u8, key: &[u8]) -> bool {
+        self.truncation_cursors
+            .key_is_truncated(bucket, column_family_id, key)
+    }
+
+    pub(crate) fn truncation_cursors_snapshot(&self) -> TruncationCursorMap {
+        self.truncation_cursors.to_map()
+    }
 }
 
 /// Thread-safe handle for reading and mutating DbState.
@@ -331,6 +477,7 @@ impl DbStateHandle {
                 vlog_version: VlogVersion::new(),
                 active: None,
                 immutables: VecDeque::new(),
+                truncation_cursors: new_truncation_cursors(),
                 suggested_base_snapshot_id: None,
             }),
             lock: Mutex::new(()),
@@ -397,6 +544,7 @@ impl DbStateHandle {
                 vlog_version: snapshot.vlog_version.clone(),
                 active: snapshot.active.clone(),
                 immutables: snapshot.immutables.clone(),
+                truncation_cursors: snapshot.truncation_cursors.clone(),
                 suggested_base_snapshot_id: Some(snapshot_id),
             })
         })
@@ -419,6 +567,7 @@ impl DbStateHandle {
             vlog_version: current.vlog_version.clone(),
             active: current.active.clone(),
             immutables: current.immutables.clone(),
+            truncation_cursors: current.truncation_cursors.clone(),
             suggested_base_snapshot_id: replacement,
         });
         true
@@ -459,9 +608,25 @@ impl DbStateHandle {
             vlog_version: snapshot.vlog_version.clone(),
             active: snapshot.active.clone(),
             immutables: snapshot.immutables.clone(),
+            truncation_cursors: snapshot.truncation_cursors.clone(),
             suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
         });
         Ok(())
+    }
+
+    pub(crate) fn advance_truncation_cursor(
+        &self,
+        bucket: u16,
+        column_family_id: u8,
+        key: &[u8],
+    ) -> bool {
+        let _guard = self.lock();
+        let snapshot = self.load();
+        snapshot
+            .truncation_cursors
+            .advance(bucket, column_family_id, key);
+        self.changed.notify_all();
+        true
     }
 
     pub(crate) fn store(&self, new_version: DbState) {
@@ -488,6 +653,7 @@ impl DbStateHandle {
             vlog_version: snapshot.vlog_version.clone(),
             active: snapshot.active.clone(),
             immutables,
+            truncation_cursors: snapshot.truncation_cursors.clone(),
             suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
         });
     }
@@ -548,6 +714,49 @@ mod tests {
 
     fn empty_version() -> Arc<LSMTreeVersion> {
         Arc::new(LSMTreeVersion { levels: Vec::new() })
+    }
+
+    fn cursor_map_ptr(store: &TruncationCursorStore) -> usize {
+        let cursors = store.inner.current.read().unwrap();
+        Arc::as_ptr(&*cursors) as usize
+    }
+
+    #[test]
+    fn test_truncation_cursor_store_updates_in_place_without_snapshot_reader() {
+        let store = new_truncation_cursors();
+        let id = TruncationCursorId::new(7, 3);
+        let before = cursor_map_ptr(&store);
+
+        store.advance(id.bucket, id.column_family_id, b"k1");
+
+        let after = cursor_map_ptr(&store);
+        assert_eq!(before, after);
+        assert_eq!(
+            store.get(id.bucket, id.column_family_id),
+            Some(b"k1".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_truncation_cursor_store_copies_only_when_snapshot_holds_map() {
+        let store = new_truncation_cursors();
+        let id = TruncationCursorId::new(7, 3);
+        store.advance(id.bucket, id.column_family_id, b"k1");
+        let before = cursor_map_ptr(&store);
+
+        let captured = store.capture();
+        store.advance(id.bucket, id.column_family_id, b"k2");
+
+        let after = cursor_map_ptr(&store);
+        assert_ne!(before, after);
+        assert_eq!(
+            captured.to_map().get(&id).map(std::vec::Vec::as_slice),
+            Some(b"k1".as_slice())
+        );
+        assert_eq!(
+            store.get(id.bucket, id.column_family_id),
+            Some(b"k2".to_vec())
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use super::Db;
 use crate::Config;
 use crate::config::PrimaryVolumeOffloadPolicyKind;
-use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
+use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, new_truncation_cursors_with};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::{
@@ -15,8 +15,9 @@ use crate::metrics_registry;
 use crate::paths::bucket_snapshot_manifest_path;
 use crate::snapshot::{
     ManifestSnapshot, build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
-    build_vlog_version_from_manifest, list_snapshot_manifest_ids, load_manifest_chain_from_path,
-    load_manifest_entry, load_manifest_for_snapshot,
+    build_truncation_cursors_from_manifest, build_vlog_version_from_manifest,
+    list_snapshot_manifest_ids, load_manifest_chain_from_path, load_manifest_entry,
+    load_manifest_for_snapshot,
 };
 use crate::util::{build_commit_short_id, build_version_string, init_logging};
 use std::collections::{HashMap, VecDeque};
@@ -284,6 +285,7 @@ fn open_restored_db_from_manifest(
     }
     let bucket_ranges = manifest.bucket_ranges.clone();
     let active_memtable_data = manifest.active_memtable_data.clone();
+    let truncation_cursors = build_truncation_cursors_from_manifest(&manifest)?;
     let tree_versions = build_tree_versions_from_manifest(&file_manager, &manifest, false)?;
     apply_restore_snapshot_links(&tree_versions, &file_manager, &restored_snapshot_links);
     let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
@@ -305,6 +307,7 @@ fn open_restored_db_from_manifest(
         vlog_version,
         active: None,
         immutables: VecDeque::new(),
+        truncation_cursors: new_truncation_cursors_with(truncation_cursors),
         suggested_base_snapshot_id: suggested_base_snapshot_id.filter(|_| can_incremental_base),
     });
     let db = Db::open_with_state(
@@ -527,6 +530,7 @@ impl Db {
             manifest.lsm_tree_bucket_ranges.clone()
         };
         let active_memtable_data = manifest.active_memtable_data.clone();
+        let truncation_cursors = build_truncation_cursors_from_manifest(&manifest)?;
         let schema_manager = Arc::new(crate::schema::SchemaManager::from_manifests(
             &file_manager,
             loaded.iter().map(|entry| &entry.manifest),
@@ -559,6 +563,7 @@ impl Db {
             vlog_version,
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: new_truncation_cursors_with(truncation_cursors),
             suggested_base_snapshot_id: can_incremental_base.then_some(latest.snapshot_id),
         });
         let db = Self::open_with_state(

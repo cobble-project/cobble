@@ -70,8 +70,11 @@ impl<'a> PriorityQueue<'a> {
             Error::IoError("priority queue poll returned no value for projected column".to_string())
         })?;
         let value = Bytes::copy_from_slice(value.as_ref());
-        self.db
-            .delete_with_options(bucket, key.as_ref(), 0, &self.write_options)?;
+        self.db.advance_column_family_truncation_cursor(
+            bucket,
+            self.column_family.as_str(),
+            key.as_ref(),
+        )?;
         Ok(Some((key, value)))
     }
 }
@@ -136,7 +139,7 @@ fn priority_queue_family_kind(metadata: &JsonValue) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::StructuredDb;
+    use crate::{StructuredDb, StructuredReadOptions};
     use bytes::Bytes;
     use cobble::{Config, Error, Result, VolumeDescriptor};
     use std::thread;
@@ -235,6 +238,57 @@ mod tests {
             second,
             (Bytes::from_static(b"k2"), Bytes::from_static(b"v2"))
         );
+        resumed.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_priority_queue_poll_persists_truncation_cursor() {
+        let root = format!("/tmp/ds_priority_queue_truncation_{}", Uuid::new_v4());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            num_columns: 1,
+            snapshot_on_flush: true,
+            ..Config::default()
+        };
+        let db_id = {
+            let mut db = StructuredDb::open(config.clone(), vec![0u16..=0u16]).unwrap();
+            let queue = db.get_or_new_priority_queue("jobs").unwrap();
+            queue.offer(0, b"k1", b"v1").unwrap();
+            queue.offer(0, b"k2", b"v2").unwrap();
+
+            let first = queue.poll(0).unwrap().expect("first poll");
+            assert_eq!(
+                first,
+                (Bytes::from_static(b"k1"), Bytes::from_static(b"v1"))
+            );
+            let read_options = StructuredReadOptions::for_column(0).with_column_family("jobs");
+            assert!(
+                db.get_raw_with_options(0, b"k1", &read_options)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                db.get_raw_with_options(0, b"k2", &read_options)
+                    .unwrap()
+                    .is_some()
+            );
+
+            let _ = db.snapshot().unwrap();
+            thread::sleep(Duration::from_millis(250));
+            let db_id = db.id().to_string();
+            db.close().unwrap();
+            db_id
+        };
+
+        let resumed = StructuredDb::resume(config, db_id).unwrap();
+        let queue = resumed.get_priority_queue("jobs").unwrap();
+        let remaining = queue.poll(0).unwrap().expect("remaining poll");
+        assert_eq!(
+            remaining,
+            (Bytes::from_static(b"k2"), Bytes::from_static(b"v2"))
+        );
+        assert!(queue.poll(0).unwrap().is_none());
         resumed.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }

@@ -18,6 +18,17 @@ pub(crate) fn encode_scan_key(bucket: u16, column_family_id: u8, key: &[u8]) -> 
     encode_key(bucket, column_family_id, key)
 }
 
+#[inline]
+pub(crate) fn encode_scan_key_after(bucket: u16, column_family_id: u8, key: &[u8]) -> Bytes {
+    let mut encoded = BytesMut::with_capacity(4 + key.len());
+    encode_key_ref_into(
+        &RefKey::new_with_column_family(bucket, column_family_id, key),
+        &mut encoded,
+    );
+    encoded.extend_from_slice(&[0]);
+    encoded.freeze()
+}
+
 pub(crate) fn encode_next_column_family_scan_key(
     bucket: u16,
     column_family_id: u8,
@@ -49,5 +60,12 @@ mod tests {
             encode_next_column_family_scan_key(7, u8::MAX),
             Err(Error::InvalidState(_))
         ));
+    }
+
+    #[test]
+    fn scan_key_after_is_strictly_after_original_key() {
+        let base = encode_scan_key(7, 3, b"abc");
+        let after = encode_scan_key_after(7, 3, b"abc");
+        assert!(after.as_ref() > base.as_ref());
     }
 }

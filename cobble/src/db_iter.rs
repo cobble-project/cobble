@@ -4,7 +4,7 @@ use crate::db_state::DbState;
 use crate::db_status::DbAccessGuard;
 use crate::error::Result;
 use crate::iterator::KvIterator;
-use crate::iterator::{DeduplicatingIterator, MergingIterator};
+use crate::iterator::{DeduplicatingIterator, MergingIterator, TruncationFilterIterator};
 use crate::lsm::DynKvIterator;
 use crate::memtable::MemtableManager;
 use crate::schema::Schema;
@@ -19,6 +19,7 @@ pub(crate) type BucketedRow = (u16, Bytes, Vec<Option<Bytes>>);
 
 pub(crate) struct DbIteratorOptions<'a> {
     pub(crate) end_bound: Option<(Bytes, bool)>,
+    pub(crate) lower_bound_exclusive: Option<Bytes>,
     pub(crate) max_rows: Option<usize>,
     pub(crate) snapshot: Arc<DbState>,
     pub(crate) memtable_manager: Option<&'a MemtableManager>,
@@ -33,7 +34,7 @@ pub(crate) struct DbIteratorOptions<'a> {
 }
 
 pub struct DbIterator<'a> {
-    inner: DeduplicatingIterator<MergingIterator<DynKvIterator>>,
+    inner: DeduplicatingIterator<TruncationFilterIterator<MergingIterator<DynKvIterator>>>,
     end_bound: Option<(Bytes, bool)>,
     snapshot: Arc<DbState>,
     memtable_manager: Option<&'a MemtableManager>,
@@ -57,8 +58,9 @@ impl<'a> DbIterator<'a> {
             .num_columns_in_family(options.column_family_id)
             .unwrap_or_else(|| schema.num_columns());
         memtable_iters.append(&mut lsm_iters);
+        let merged = MergingIterator::new(memtable_iters);
         let inner = DeduplicatingIterator::new(
-            MergingIterator::new(memtable_iters),
+            TruncationFilterIterator::new(merged, options.lower_bound_exclusive),
             Some(num_columns),
             Arc::clone(&options.ttl_provider),
             None,
@@ -226,6 +228,7 @@ mod tests {
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
 
@@ -234,6 +237,7 @@ mod tests {
             Vec::new(),
             DbIteratorOptions {
                 end_bound: None,
+                lower_bound_exclusive: None,
                 max_rows: None,
                 snapshot,
                 memtable_manager: None,

@@ -6,7 +6,9 @@ use std::thread::JoinHandle;
 
 use crate::config::MemtableType;
 use crate::data_file::DataFile;
-use crate::db_state::{DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion};
+use crate::db_state::{
+    DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion, TruncationCursorSnapshot,
+};
 use crate::db_status::DbLifecycle;
 use crate::error::Error::InvalidState;
 use crate::error::{Error, Result};
@@ -175,6 +177,7 @@ struct FlushTreeBuilder {
 pub(crate) struct SnapshotCompletion {
     pub(crate) snapshot_id: u64,
     pub(crate) manager: SnapshotManager,
+    pub(crate) truncation_cursors: Option<TruncationCursorSnapshot>,
 }
 
 pub(crate) struct ActiveMemtable {
@@ -1038,6 +1041,7 @@ impl MemtableManager {
                 snapshot,
                 active_data,
                 db_state.as_ref(),
+                snapshot_job.truncation_cursors.as_ref(),
             )
         {
             let _ = snapshot_job
@@ -1156,6 +1160,7 @@ impl MemtableManager {
                     vlog_version: snapshot.vlog_version.clone(),
                     active: Some(Arc::clone(&active)),
                     immutables: snapshot.immutables.clone(),
+                    truncation_cursors: snapshot.truncation_cursors.clone(),
                     suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
                 })
             });
@@ -1321,6 +1326,7 @@ impl MemtableManager {
                         vlog_version: snapshot.vlog_version.clone(),
                         active: None,
                         immutables: snapshot.immutables.clone(),
+                        truncation_cursors: snapshot.truncation_cursors.clone(),
                         suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
                     })
                 });
@@ -1569,6 +1575,7 @@ impl MemtableManager {
             .map(|manager| SnapshotCompletion {
                 snapshot_id: manager.create_snapshot(None).id,
                 manager: manager.clone(),
+                truncation_cursors: None,
             });
         self.flush_active_internal(auto_snapshot)
     }
@@ -1577,12 +1584,16 @@ impl MemtableManager {
         let snapshot = SnapshotCompletion {
             snapshot_id,
             manager,
+            truncation_cursors: None,
         };
         let _ = self.flush_active_internal(Some(snapshot))?;
         Ok(())
     }
 
-    fn flush_active_internal(&self, snapshot: Option<SnapshotCompletion>) -> Result<Option<Uuid>> {
+    fn flush_active_internal(
+        &self,
+        mut snapshot: Option<SnapshotCompletion>,
+    ) -> Result<Option<Uuid>> {
         self.db_lifecycle.ensure_open()?;
         let mut state = self.state.lock().unwrap();
         while state.restore_in_progress {
@@ -1591,6 +1602,9 @@ impl MemtableManager {
         let mut guard = self.db_state.lock();
         guard = self.wait_for_write_stall_under_guard(guard)?;
         let snapshot_state = self.db_state.load();
+        if let Some(snapshot) = snapshot.as_mut() {
+            snapshot.truncation_cursors = Some(snapshot_state.truncation_cursors.capture());
+        }
         let mut to_flush = None;
         let mut active_memtable_snapshot = None;
         let mut flushed_id = None;
@@ -1641,6 +1655,7 @@ impl MemtableManager {
                         vlog_version: snapshot_state.vlog_version.clone(),
                         active: None,
                         immutables,
+                        truncation_cursors: snapshot_state.truncation_cursors.clone(),
                         suggested_base_snapshot_id: snapshot_state.suggested_base_snapshot_id,
                     })
                 });
@@ -2297,6 +2312,7 @@ mod tests {
             vlog_version: crate::vlog::VlogVersion::new(),
             active: Some(active),
             immutables,
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
 
@@ -2318,6 +2334,7 @@ mod tests {
             Vec::new(),
             DbIteratorOptions {
                 end_bound: Some((end_key.clone(), false)),
+                lower_bound_exclusive: None,
                 max_rows: Some(1),
                 snapshot,
                 memtable_manager: Some(&manager),
@@ -2573,6 +2590,7 @@ mod tests {
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: std::collections::VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = Arc::new(LSMTree::with_state(
@@ -2678,6 +2696,7 @@ mod tests {
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: std::collections::VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let source_lsm_tree = Arc::new(LSMTree::with_state(
@@ -2737,6 +2756,7 @@ mod tests {
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: std::collections::VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let target_lsm_tree = Arc::new(LSMTree::with_state(
@@ -2822,6 +2842,7 @@ mod tests {
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: std::collections::VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let source_lsm_tree = Arc::new(LSMTree::with_state(
@@ -2886,6 +2907,7 @@ mod tests {
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: std::collections::VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let target_lsm_tree = Arc::new(LSMTree::with_state(

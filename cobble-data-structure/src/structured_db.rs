@@ -1501,6 +1501,25 @@ impl StructuredDb {
         )
     }
 
+    pub(crate) fn advance_column_family_truncation_cursor(
+        &self,
+        bucket: u16,
+        column_family: &str,
+        key: &[u8],
+    ) -> Result<()> {
+        let column_family_id = self
+            .db
+            .current_schema()
+            .column_family_ids()
+            .get(column_family)
+            .copied()
+            .ok_or_else(|| {
+                Error::InvalidState(format!("unknown column family '{}'", column_family))
+            })?;
+        self.db
+            .advance_truncation_cursor(bucket, column_family_id, key)
+    }
+
     pub fn close(&self) -> Result<()> {
         self.db.close()
     }

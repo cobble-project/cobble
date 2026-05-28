@@ -2,18 +2,21 @@ use crate::block_cache::{BlockCache, new_block_cache_with_config};
 use crate::db::select_projected_columns;
 use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
-use crate::db_state::{DbStateHandle, MultiLSMTreeVersion};
+use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, new_truncation_cursors_with};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::FileManager;
-use crate::key_codec::{encode_key, encode_next_column_family_scan_key, encode_scan_key};
+use crate::key_codec::{
+    encode_key, encode_next_column_family_scan_key, encode_scan_key, encode_scan_key_after,
+};
 use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
 use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::{
     build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
-    build_vlog_version_from_manifest, load_manifest_for_snapshot,
+    build_truncation_cursors_from_manifest, build_vlog_version_from_manifest,
+    load_manifest_for_snapshot,
 };
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::r#type::Value;
@@ -171,6 +174,7 @@ impl ReadOnlyDb {
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let tree_versions = build_tree_versions_from_manifest(&file_manager, &manifest, true)?;
         let tree_scopes = build_tree_scopes_from_manifest(&manifest);
+        let truncation_cursors = build_truncation_cursors_from_manifest(&manifest)?;
         let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
             config.total_buckets,
             &tree_scopes,
@@ -196,6 +200,7 @@ impl ReadOnlyDb {
             vlog_version,
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: new_truncation_cursors_with(truncation_cursors),
             suggested_base_snapshot_id: Some(snapshot_id),
         });
         let mut lsm_tree = LSMTree::with_state_and_ttl(
@@ -263,6 +268,10 @@ impl ReadOnlyDb {
                 max_index, num_columns
             )));
         }
+        let snapshot = self.lsm_tree.db_state().load();
+        if snapshot.key_is_truncated(bucket, column_family_id, key) {
+            return Ok(None);
+        }
         let encoded_key = encode_key(bucket, column_family_id, key);
         let masks = options.masks(num_columns);
         let selected_mask = masks.selected_mask.as_deref();
@@ -295,7 +304,6 @@ impl ReadOnlyDb {
                 Some(self.ttl_provider.time_provider()),
             )?;
         }
-        let snapshot = self.lsm_tree.db_state().load();
         value_to_vec_of_columns_with_vlog(
             merged,
             |pointer| {
@@ -364,6 +372,7 @@ impl ReadOnlyDb {
                 max_index, num_columns
             )));
         }
+        let truncation_cursor = snapshot.truncation_cursor(bucket, column_family_id);
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
@@ -374,7 +383,12 @@ impl ReadOnlyDb {
             bucket,
             column_family_id,
         )?;
-        let start_key = encode_scan_key(bucket, column_family_id, start.unwrap_or(&[]));
+        let start_key = match truncation_cursor {
+            Some(ref cursor) if start.is_none_or(|candidate| candidate <= cursor.as_slice()) => {
+                encode_scan_key_after(bucket, column_family_id, cursor.as_slice())
+            }
+            _ => encode_scan_key(bucket, column_family_id, start.unwrap_or(&[])),
+        };
         let end_bound = if let Some(end) = end {
             Some((encode_scan_key(bucket, column_family_id, end), false))
         } else {
@@ -388,6 +402,9 @@ impl ReadOnlyDb {
             lsm_iters,
             DbIteratorOptions {
                 end_bound,
+                lower_bound_exclusive: truncation_cursor
+                    .as_deref()
+                    .map(|cursor| encode_scan_key(bucket, column_family_id, cursor)),
                 max_rows: options.max_rows(),
                 snapshot,
                 memtable_manager: None,

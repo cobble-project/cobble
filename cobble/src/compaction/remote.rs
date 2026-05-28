@@ -1336,6 +1336,7 @@ mod tests {
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = Arc::new(LSMTree::with_state(
@@ -1502,6 +1503,7 @@ mod tests {
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = Arc::new(LSMTree::with_state(
@@ -1641,6 +1643,7 @@ mod tests {
             vlog_version: crate::vlog::VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = Arc::new(LSMTree::with_state(

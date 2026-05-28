@@ -1,6 +1,6 @@
 use super::{ActiveMemtableSnapshotData, DbSnapshot};
 use crate::data_file::{DataFile, DataFileType};
-use crate::db_state::LSMTreeScope;
+use crate::db_state::{LSMTreeScope, TruncationCursorId, TruncationCursorMap};
 use crate::error::{Error, Result};
 use crate::file::{
     BufferedWriter, FileManager, MetadataReader, SequentialWriteFile, TrackedFile, TrackedFileId,
@@ -31,6 +31,8 @@ pub(crate) struct ManifestSnapshot {
     pub(crate) tree_levels: Vec<Vec<ManifestLevel>>,
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
     pub(crate) active_memtable_data: Vec<ActiveMemtableSnapshotData>,
+    #[serde(default)]
+    pub(crate) truncation_cursors: Vec<ManifestTruncationCursor>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -49,6 +51,15 @@ pub(crate) struct ManifestIncrementalSnapshot {
     // always include vlog file info in incremental manifests since vlog files are more likely to have changes
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
     pub(crate) active_memtable_data: Vec<ActiveMemtableSnapshotData>,
+    #[serde(default)]
+    pub(crate) truncation_cursors: Vec<ManifestTruncationCursor>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct ManifestTruncationCursor {
+    pub(crate) bucket: u16,
+    pub(crate) column_family_id: u8,
+    pub(crate) key: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -189,6 +200,7 @@ pub(crate) fn load_manifest_entry(
                 resolved.bucket_ranges = incremental.bucket_ranges;
                 resolved.lsm_tree_bucket_ranges = incremental.lsm_tree_bucket_ranges;
                 resolved.tree_scopes = incremental.tree_scopes;
+                resolved.truncation_cursors = incremental.truncation_cursors;
                 resolved
             } else {
                 load_manifest_for_snapshot(file_manager, snapshot_id)?
@@ -259,6 +271,7 @@ pub(crate) fn load_manifest_chain(
                 resolved_base.bucket_ranges = manifest.bucket_ranges;
                 resolved_base.lsm_tree_bucket_ranges = manifest.lsm_tree_bucket_ranges;
                 resolved_base.tree_scopes = manifest.tree_scopes;
+                resolved_base.truncation_cursors = manifest.truncation_cursors;
                 (Some(manifest.base_snapshot_id), resolved_base)
             }
         };
@@ -332,6 +345,7 @@ pub(crate) fn load_manifest_chain_from_path(
                 resolved_base.bucket_ranges = manifest.bucket_ranges;
                 resolved_base.lsm_tree_bucket_ranges = manifest.lsm_tree_bucket_ranges;
                 resolved_base.tree_scopes = manifest.tree_scopes;
+                resolved_base.truncation_cursors = manifest.truncation_cursors;
                 (Some(manifest.base_snapshot_id), resolved_base)
             }
         };
@@ -453,6 +467,21 @@ pub(crate) fn from_hex(hex: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub(crate) fn build_truncation_cursors_from_manifest(
+    manifest: &ManifestSnapshot,
+) -> Result<TruncationCursorMap> {
+    manifest
+        .truncation_cursors
+        .iter()
+        .map(|cursor| {
+            Ok((
+                TruncationCursorId::new(cursor.bucket, cursor.column_family_id),
+                from_hex(&cursor.key)?,
+            ))
+        })
+        .collect()
+}
+
 fn hex_value(byte: u8) -> Result<u8> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -523,6 +552,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 tree_level_edits,
                 vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
                 active_memtable_data: snapshot.active_memtable_data.clone(),
+                truncation_cursors: manifest_truncation_cursors_from_snapshot(snapshot),
             })
         } else {
             ManifestPayload::Snapshot(ManifestSnapshot {
@@ -538,6 +568,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 tree_levels: manifest_tree_levels_from_snapshot(snapshot, file_manager),
                 vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
                 active_memtable_data: snapshot.active_memtable_data.clone(),
+                truncation_cursors: manifest_truncation_cursors_from_snapshot(snapshot),
             })
         }
     } else {
@@ -554,6 +585,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             tree_levels: manifest_tree_levels_from_snapshot(snapshot, file_manager),
             vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
             active_memtable_data: snapshot.active_memtable_data.clone(),
+            truncation_cursors: manifest_truncation_cursors_from_snapshot(snapshot),
         })
     };
     let json = serde_json::to_vec(&manifest)
@@ -665,6 +697,21 @@ fn manifest_vlog_files_from_snapshot(
                 .get_data_file_full_path(tracked_id.file_id())
                 .expect("Unknown file ID"),
             valid_entries,
+        })
+        .collect()
+}
+
+fn manifest_truncation_cursors_from_snapshot(
+    snapshot: &DbSnapshot,
+) -> Vec<ManifestTruncationCursor> {
+    let mut cursors: Vec<_> = snapshot.truncation_cursors.iter().collect();
+    cursors.sort_by_key(|(id, _)| (id.bucket, id.column_family_id));
+    cursors
+        .into_iter()
+        .map(|(id, key)| ManifestTruncationCursor {
+            bucket: id.bucket,
+            column_family_id: id.column_family_id,
+            key: to_hex(key),
         })
         .collect()
 }

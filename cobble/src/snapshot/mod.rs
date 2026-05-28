@@ -4,6 +4,7 @@ mod manifest;
 mod memtable;
 
 use crate::db_state::LSMTreeScope;
+use crate::db_state::TruncationCursorMap;
 use crate::error::Result;
 use crate::file::TrackedFile;
 use crate::lsm::LSMTreeVersion;
@@ -16,9 +17,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 pub(crate) use manager::SnapshotManager;
 pub(crate) use manifest::{
     LoadedManifest, ManifestSnapshot, build_tree_scopes_from_manifest,
-    build_tree_versions_from_manifest, build_vlog_version_from_manifest,
-    list_snapshot_manifest_ids, load_manifest_chain_from_path, load_manifest_entry,
-    load_manifest_for_snapshot, snapshot_manifest_name,
+    build_tree_versions_from_manifest, build_truncation_cursors_from_manifest,
+    build_vlog_version_from_manifest, list_snapshot_manifest_ids, load_manifest_chain_from_path,
+    load_manifest_entry, load_manifest_for_snapshot, snapshot_manifest_name,
 };
 pub(crate) use memtable::ActiveMemtableSnapshotData;
 
@@ -68,6 +69,7 @@ pub(crate) struct DbSnapshot {
     pub lsm_tree_bucket_ranges: Vec<RangeInclusive<u16>>,
     pub tree_scopes: Vec<LSMTreeScope>,
     pub bucket_ranges: Vec<RangeInclusive<u16>>,
+    pub truncation_cursors: TruncationCursorMap,
     pub data_size_bytes: u64,
     pub incremental_data_size_bytes: u64,
     pub active_memtable_total_size_bytes: u64,
@@ -105,6 +107,7 @@ impl DbSnapshot {
             lsm_tree_bucket_ranges: Vec::new(),
             tree_scopes: Vec::new(),
             bucket_ranges: Vec::new(),
+            truncation_cursors: TruncationCursorMap::new(),
             data_size_bytes: 0,
             incremental_data_size_bytes: 0,
             active_memtable_total_size_bytes: 0,

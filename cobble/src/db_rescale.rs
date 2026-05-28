@@ -1,7 +1,9 @@
 //! Functionality for expanding owned buckets by importing snapshot data from another db.
 use super::Db;
 use crate::data_file::intersect_bucket_ranges;
-use crate::db_state::{DbState, LSMTreeScope, MultiLSMTreeVersion, bucket_range_fits_total};
+use crate::db_state::{
+    DbState, LSMTreeScope, MultiLSMTreeVersion, TruncationCursorMap, bucket_range_fits_total,
+};
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager, MetadataReader, SequentialWriteFile};
 use crate::lsm::LSMTree;
@@ -9,7 +11,8 @@ use crate::metrics_manager::MetricsManager;
 use crate::paths::schema_file_relative_path;
 use crate::snapshot::{
     build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
-    build_vlog_version_from_manifest, list_snapshot_manifest_ids, load_manifest_entry,
+    build_truncation_cursors_from_manifest, build_vlog_version_from_manifest,
+    list_snapshot_manifest_ids, load_manifest_entry,
 };
 use crate::util::{
     normalize_bucket_ranges, range_is_covered_by_ranges, ranges_overlap, subtract_range_by_cuts,
@@ -18,6 +21,17 @@ use crate::util::{
 use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+
+fn filter_truncation_cursors(
+    cursors: &TruncationCursorMap,
+    ranges: &[RangeInclusive<u16>],
+) -> TruncationCursorMap {
+    cursors
+        .iter()
+        .filter(|(id, _)| ranges.iter().any(|range| range.contains(&id.bucket)))
+        .map(|(id, key)| (id.clone(), key.clone()))
+        .collect()
+}
 
 impl Db {
     /// Expands owned bucket ranges by importing LSM tree and VLOG state from a snapshot of another db, while
@@ -308,6 +322,11 @@ impl Db {
         let mut updated_ranges = current.bucket_ranges.clone();
         updated_ranges.extend(expand_ranges);
         let updated_ranges = normalize_bucket_ranges(updated_ranges);
+        let mut truncation_cursors = current.truncation_cursors_snapshot();
+        truncation_cursors.extend(filter_truncation_cursors(
+            &build_truncation_cursors_from_manifest(&source_manifest)?,
+            &updated_ranges,
+        ));
         self.db_state.store(DbState {
             seq_id: current.seq_id,
             bucket_ranges: updated_ranges.clone(),
@@ -315,6 +334,7 @@ impl Db {
             vlog_version: merged_vlog,
             active: current.active.clone(),
             immutables: current.immutables.clone(),
+            truncation_cursors: crate::db_state::new_truncation_cursors_with(truncation_cursors),
             suggested_base_snapshot_id: None,
         });
         drop(guard);
@@ -436,6 +456,8 @@ impl Db {
             &updated_scopes,
             updated_tree_versions,
         )?;
+        let truncation_cursors =
+            filter_truncation_cursors(&current.truncation_cursors_snapshot(), &updated_ranges);
         self.db_state.store(DbState {
             seq_id: current.seq_id,
             bucket_ranges: updated_ranges.clone(),
@@ -443,6 +465,7 @@ impl Db {
             vlog_version: current.vlog_version.clone(),
             active: current.active.clone(),
             immutables: current.immutables.clone(),
+            truncation_cursors: crate::db_state::new_truncation_cursors_with(truncation_cursors),
             suggested_base_snapshot_id: None,
         });
         drop(guard);

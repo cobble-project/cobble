@@ -9,7 +9,7 @@ use super::{
 };
 use crate::config::MemtableType;
 use crate::data_file::DataFile;
-use crate::db_state::{DbState, DbStateHandle};
+use crate::db_state::{DbState, DbStateHandle, TruncationCursorSnapshot};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::{
@@ -358,6 +358,7 @@ impl SnapshotManager {
         db_state: &Arc<DbState>,
         active_memtable_data: Vec<ActiveMemtableSnapshotData>,
         db_state_handle: &DbStateHandle,
+        truncation_cursors: Option<&TruncationCursorSnapshot>,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
         let Some(snapshot) = state.snapshots.get(&id).cloned() else {
@@ -384,6 +385,9 @@ impl SnapshotManager {
             tracked_file_ids.insert(tracked.file_id());
         }
         snapshot.seq_id = db_state.seq_id;
+        snapshot.truncation_cursors = truncation_cursors
+            .map(TruncationCursorSnapshot::to_map)
+            .unwrap_or_else(|| db_state.truncation_cursors_snapshot());
         snapshot.latest_schema_id = db_state
             .multi_lsm_version
             .tree_versions_cloned()
@@ -494,6 +498,9 @@ impl SnapshotManager {
             lsm_tree_bucket_ranges: manifest.lsm_tree_bucket_ranges.clone(),
             tree_scopes: manifest.tree_scopes.clone(),
             bucket_ranges: manifest.bucket_ranges.clone(),
+            truncation_cursors: crate::snapshot::manifest::build_truncation_cursors_from_manifest(
+                manifest,
+            )?,
             data_size_bytes: manifest.data_size_bytes,
             incremental_data_size_bytes: manifest.incremental_data_size_bytes,
             active_memtable_total_size_bytes: manifest

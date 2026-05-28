@@ -5,7 +5,9 @@ use crate::db_state::{DbStateHandle, LSMTreeScope, bucket_range_fits_total};
 use crate::db_status::{CloseTransition, DbAccessGuard, DbLifecycle};
 use crate::error::{Error, Result};
 use crate::file::FileManager;
-use crate::key_codec::{encode_key, encode_next_column_family_scan_key, encode_scan_key};
+use crate::key_codec::{
+    encode_key, encode_next_column_family_scan_key, encode_scan_key, encode_scan_key_after,
+};
 use crate::lsm::{LSMTree, LSMTreeVersion};
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::merge_operator::MergeOperator;
@@ -397,6 +399,7 @@ impl Db {
                 vlog_version: snapshot.vlog_version.clone(),
                 active: snapshot.active.clone(),
                 immutables: snapshot.immutables.clone(),
+                truncation_cursors: snapshot.truncation_cursors.clone(),
                 suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
             });
             return Ok(());
@@ -435,6 +438,7 @@ impl Db {
             vlog_version: snapshot.vlog_version.clone(),
             active: snapshot.active.clone(),
             immutables: snapshot.immutables.clone(),
+            truncation_cursors: snapshot.truncation_cursors.clone(),
             suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
         });
         Ok(())
@@ -1067,6 +1071,10 @@ impl Db {
                 max_index, num_columns
             )));
         }
+        let snapshot = self.db_state.load();
+        if snapshot.key_is_truncated(bucket, column_family_id, key) {
+            return Ok(None);
+        }
         let encoded_key = encode_key(bucket, column_family_id, key);
         let selected_columns = options.columns();
         let masks = options.masks(num_columns);
@@ -1079,7 +1087,6 @@ impl Db {
         } else {
             Some(vec![0u8; mask_size])
         };
-        let snapshot = self.db_state.load();
         let mut values: Vec<Value> = Vec::new();
         self.memtable_manager.get_all_with_snapshot(
             Arc::clone(&snapshot),
@@ -1249,7 +1256,13 @@ impl Db {
                 max_index, num_columns
             )));
         }
-        let start_key = encode_scan_key(bucket, column_family_id, start.unwrap_or(&[]));
+        let truncation_cursor = snapshot.truncation_cursor(bucket, column_family_id);
+        let start_key = match truncation_cursor {
+            Some(ref cursor) if start.is_none_or(|candidate| candidate <= cursor.as_slice()) => {
+                encode_scan_key_after(bucket, column_family_id, cursor.as_slice())
+            }
+            _ => encode_scan_key(bucket, column_family_id, start.unwrap_or(&[])),
+        };
         let end_key = if let Some(end) = end {
             Some(encode_scan_key(bucket, column_family_id, end))
         } else {
@@ -1292,6 +1305,9 @@ impl Db {
             lsm_iters,
             DbIteratorOptions {
                 end_bound,
+                lower_bound_exclusive: truncation_cursor
+                    .as_deref()
+                    .map(|cursor| encode_scan_key(bucket, column_family_id, cursor)),
                 max_rows: options.max_rows(),
                 snapshot,
                 memtable_manager: Some(&self.memtable_manager),
@@ -1307,6 +1323,18 @@ impl Db {
             return Err(err);
         }
         Ok(iter)
+    }
+
+    pub fn advance_truncation_cursor(
+        &self,
+        bucket: u16,
+        column_family_id: u8,
+        key: &[u8],
+    ) -> Result<()> {
+        let _access = self.begin_access()?;
+        self.db_state
+            .advance_truncation_cursor(bucket, column_family_id, key);
+        Ok(())
     }
 
     /// Set the current time for TTL evaluation (manual time provider only).

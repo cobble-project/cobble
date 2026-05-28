@@ -285,6 +285,7 @@ impl LSMTree {
                     vlog_version: snapshot.vlog_version.clone(),
                     active: snapshot.active.clone(),
                     immutables: snapshot.immutables.clone(),
+                    truncation_cursors: snapshot.truncation_cursors.clone(),
                     suggested_base_snapshot_id: if inherit_suggested_base_snapshot_id {
                         snapshot.suggested_base_snapshot_id
                     } else {
@@ -647,6 +648,7 @@ impl LSMTree {
                     vlog_version: current.vlog_version.clone(),
                     active: current.active.clone(),
                     immutables: current.immutables.clone(),
+                    truncation_cursors: current.truncation_cursors.clone(),
                     suggested_base_snapshot_id: None,
                 })
             })
@@ -1423,6 +1425,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -1507,6 +1510,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
@@ -1587,6 +1591,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = Arc::new(LSMTree::with_state(
@@ -1692,6 +1697,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
@@ -1794,6 +1800,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -1845,6 +1852,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -1896,6 +1904,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -1951,6 +1960,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -2033,6 +2043,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -2079,6 +2090,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -2104,6 +2116,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
 
@@ -2135,6 +2148,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -2188,6 +2202,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
@@ -2238,6 +2253,7 @@ mod tests {
             vlog_version: VlogVersion::new(),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
@@ -2278,6 +2294,7 @@ mod tests {
             vlog_version: VlogVersion::from_files_with_entries(vec![(7, tracked_vlog, 0)]),
             active: None,
             immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
         let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
