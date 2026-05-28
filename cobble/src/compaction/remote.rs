@@ -5,6 +5,7 @@
 use super::{CompactionExecutor, CompactionResult, CompactionTask, CompactionWorker};
 use crate::Config;
 use crate::data_file::{DataFile, DataFileType};
+use crate::db_state::{TruncationCursorId, TruncationCursorMap};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::{DataVolume, FileId, FileManager, FileManagerOptions, TrackedFileId};
@@ -400,6 +401,39 @@ struct RemoteCompactionRequest {
     runs: Vec<RemoteSortedRun>,
     merge_operator_ids: Vec<String>,
     merge_operator_metadata: Vec<Option<serde_json::Value>>,
+    truncation_cursors: Vec<RemoteTruncationCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RemoteTruncationCursor {
+    bucket: u16,
+    column_family_id: u8,
+    key: Vec<u8>,
+}
+
+impl RemoteTruncationCursor {
+    fn from_map(cursors: &TruncationCursorMap) -> Vec<Self> {
+        cursors
+            .iter()
+            .map(|(id, key)| Self {
+                bucket: id.bucket,
+                column_family_id: id.column_family_id,
+                key: key.clone(),
+            })
+            .collect()
+    }
+
+    fn into_map(cursors: Vec<Self>) -> TruncationCursorMap {
+        cursors
+            .into_iter()
+            .map(|cursor| {
+                (
+                    TruncationCursorId::new(cursor.bucket, cursor.column_family_id),
+                    cursor.key,
+                )
+            })
+            .collect()
+    }
 }
 
 impl RemoteCompactionRequest {
@@ -441,7 +475,7 @@ struct RemoteCompactionResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 enum RemoteCompactionCommand {
-    Execute(RemoteCompactionRequest),
+    Execute(Box<RemoteCompactionRequest>),
     SupportedMergeOperators,
 }
 
@@ -560,6 +594,7 @@ impl RemoteCompactionWorker {
         let lsm_tree = self.lsm_tree.upgrade().ok_or_else(|| {
             Error::IoError("lsm tree dropped during remote compaction".to_string())
         })?;
+        let truncation_cursors = lsm_tree.db_state().load().truncation_cursors_snapshot();
         let tree_scope = lsm_tree.tree_scope_of_tree(lsm_tree_idx).ok_or_else(|| {
             Error::InvalidState(format!(
                 "missing tree scope for remote compaction tree {}",
@@ -609,6 +644,7 @@ impl RemoteCompactionWorker {
             runs,
             merge_operator_ids,
             merge_operator_metadata,
+            truncation_cursors: RemoteTruncationCursor::from_map(&truncation_cursors),
         })
     }
 }
@@ -897,7 +933,7 @@ impl RemoteCompactionServer {
                         Arc::clone(&metrics_manager),
                         Arc::clone(&merge_operator_map),
                         merge_operator_resolver.clone(),
-                        request,
+                        *request,
                     ) {
                         Ok((files, vlog_entry_deltas)) => {
                             RemoteCompactionResponse::ok(files, vlog_entry_deltas)
@@ -993,6 +1029,7 @@ impl RemoteCompactionServer {
         )
         .with_writer_options_factory(writer_options_factory)
         .with_column_family(request.column_family_id, num_columns)
+        .with_truncation_cursors(RemoteTruncationCursor::into_map(request.truncation_cursors))
         .with_readonly_outputs();
         let result = executor.execute_blocking(task, None);
         if let Err(e) = &result {
@@ -1162,7 +1199,11 @@ fn send_compaction_request_to(
     request: RemoteCompactionRequest,
     timeout: Duration,
 ) -> Result<RemoteCompactionResponse> {
-    match send_command_to(address, RemoteCompactionCommand::Execute(request), timeout)? {
+    match send_command_to(
+        address,
+        RemoteCompactionCommand::Execute(Box::new(request)),
+        timeout,
+    )? {
         RemoteCompactionReply::Execute(response) => {
             response.validate_protocol_compatibility()?;
             Ok(response)

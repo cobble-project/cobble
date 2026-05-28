@@ -110,6 +110,7 @@ impl LocalCompactionWorker {
         if self.db_lifecycle.ensure_open().is_err() {
             return None;
         }
+        let truncation_cursors = tree.db_state().load().truncation_cursors_snapshot();
         let sst_metrics = tree.sst_metrics();
         let Some(tree_scope) = tree.tree_scope_of_tree(lsm_tree_idx) else {
             error!(
@@ -161,7 +162,8 @@ impl LocalCompactionWorker {
             Arc::clone(&self.schema_manager),
         )
         .with_writer_options_factory(writer_options_factory)
-        .with_column_family(tree_scope.column_family_id, runtime_num_columns);
+        .with_column_family(tree_scope.column_family_id, runtime_num_columns)
+        .with_truncation_cursors(truncation_cursors);
         Some(self.submit(task))
     }
 

@@ -7,6 +7,7 @@
 
 use crate::compaction::CompactionConfig;
 use crate::data_file::{DataFile, DataFileType};
+use crate::db_state::{TruncationCursorId, TruncationCursorMap};
 use crate::db_status::DbLifecycle;
 use crate::error::Result;
 use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId};
@@ -18,6 +19,7 @@ use crate::iterator::{
 use crate::lsm::{LevelEdit, VersionEdit};
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, SchemaManager};
 use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions};
+use crate::r#type::{key_bucket, key_column_family};
 use crate::vlog::{VlogEdit, VlogMergeCollector};
 use crate::writer_options::WriterOptionsFactory;
 use log::trace;
@@ -50,6 +52,7 @@ pub struct CompactionTask {
     schema_manager: Arc<SchemaManager>,
     column_family_id: u8,
     num_columns: usize,
+    truncation_cursors: TruncationCursorMap,
 }
 
 #[derive(Clone)]
@@ -105,6 +108,7 @@ impl CompactionTask {
             schema_manager,
             column_family_id: DEFAULT_COLUMN_FAMILY_ID,
             num_columns: default_num_columns,
+            truncation_cursors: TruncationCursorMap::new(),
         }
     }
 
@@ -124,6 +128,14 @@ impl CompactionTask {
     pub(crate) fn with_column_family(mut self, column_family_id: u8, num_columns: usize) -> Self {
         self.column_family_id = column_family_id;
         self.num_columns = num_columns;
+        self
+    }
+
+    pub(crate) fn with_truncation_cursors(
+        mut self,
+        truncation_cursors: TruncationCursorMap,
+    ) -> Self {
+        self.truncation_cursors = truncation_cursors;
         self
     }
 
@@ -452,6 +464,17 @@ impl CompactionExecutor {
                 Some(kv) => kv,
                 None => break,
             };
+            if key_is_truncated_by_cursor_map(&task.truncation_cursors, &key) {
+                if let Some(collector) = merge_collector.as_ref() {
+                    let value = kv_value.into_decoded(num_columns)?;
+                    collector
+                        .borrow_mut()
+                        .collect_removed_entries_from_value(&value)?;
+                    collector.borrow_mut().check_error()?;
+                }
+                dedup_iter.next()?;
+                continue;
+            }
 
             // Check if we need to start a new file
             if current_builder.is_none() {
@@ -617,6 +640,21 @@ impl CompactionExecutor {
     }
 }
 
+fn key_is_truncated_by_cursor_map(cursors: &TruncationCursorMap, encoded_key: &[u8]) -> bool {
+    if cursors.is_empty() || encoded_key.len() < 3 {
+        return false;
+    }
+    let Some(bucket) = key_bucket(encoded_key) else {
+        return false;
+    };
+    let Some(column_family_id) = key_column_family(encoded_key) else {
+        return false;
+    };
+    cursors
+        .get(&TruncationCursorId::new(bucket, column_family_id))
+        .is_some_and(|cursor| &encoded_key[3..] <= cursor.as_slice())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,11 +663,12 @@ mod tests {
     use crate::parquet::ParquetWriterOptions;
     use crate::parquet::{ParquetIterator, ParquetWriter};
     use crate::schema::Schema;
-    use crate::sst::row_codec::encode_value;
+    use crate::sst::row_codec::{encode_key, encode_value};
     use crate::sst::{SSTWriter, SSTWriterOptions};
-    use crate::r#type::Value;
     use crate::r#type::{Column, ValueType, decode_merge_separated_array};
+    use crate::r#type::{Key, Value};
     use crate::writer_options::{WriterOptions, WriterOptionsFactory};
+    use bytes::Bytes;
 
     fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {
         let value = Value::new(vec![Some(Column::new(ValueType::Put, data.to_vec()))]);
@@ -855,6 +894,99 @@ mod tests {
                 b"f".to_vec()
             ]
         );
+
+        cleanup_test_dir(test_dir);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_compaction_prunes_truncated_keys() {
+        let test_dir = "/tmp/compaction_truncation_test";
+        cleanup_test_dir(test_dir);
+
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", test_dir))
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-truncation-test"));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
+        let num_columns = 1;
+        let encoded_a = encode_key(&Key::new(0, Bytes::from_static(b"a")));
+        let encoded_b = encode_key(&Key::new(0, Bytes::from_static(b"b")));
+        let encoded_c = encode_key(&Key::new(0, Bytes::from_static(b"c")));
+        let file = create_test_sst(
+            &file_manager,
+            vec![
+                (encoded_a.as_ref(), &make_value_bytes(b"va", num_columns)),
+                (encoded_b.as_ref(), &make_value_bytes(b"vb", num_columns)),
+                (encoded_c.as_ref(), &make_value_bytes(b"vc", num_columns)),
+            ],
+        )
+        .unwrap();
+        let run = SortedRun::new(0, vec![file]);
+        let mut truncation_cursors = TruncationCursorMap::new();
+        truncation_cursors.insert(TruncationCursorId::new(0, 0), b"a".to_vec());
+        let options = CompactionConfig {
+            num_columns,
+            target_file_size: 1024 * 1024,
+            bloom_filter_enabled: true,
+            bloom_bits_per_key: 10,
+            ..Default::default()
+        };
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+            metrics: None,
+            block_size: options.block_size,
+            buffer_size: options.buffer_size,
+            num_columns: options.num_columns,
+            bloom_filter_enabled: options.bloom_filter_enabled,
+            bloom_bits_per_key: options.bloom_bits_per_key,
+            partitioned_index: options.partitioned_index,
+            data_block_restart_interval: 16,
+            compression: crate::SstCompressionAlgorithm::None,
+            value_has_ttl: true,
+        });
+        let task = CompactionTask::new(
+            Arc::new(CompactionTaskMetrics::new("test")),
+            Arc::new(crate::sst::SSTIteratorMetrics::new("test")),
+            0,
+            vec![run],
+            1,
+            Arc::clone(&file_manager),
+            factory,
+            DataFileType::SSTable,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
+            schema_manager_for(num_columns),
+        )
+        .with_truncation_cursors(truncation_cursors);
+        let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+
+        assert_eq!(result.new_files().len(), 1);
+        let output = &result.new_files()[0];
+        assert_eq!(output.start_key, encoded_b.to_vec());
+        assert_eq!(output.end_key, encoded_c.to_vec());
+
+        let reader = file_manager.open_data_file_reader(output.file_id).unwrap();
+        let mut iter = crate::sst::SSTIterator::with_cache_and_file(
+            Box::new(reader),
+            output,
+            crate::sst::SSTIteratorOptions {
+                bloom_filter_enabled: true,
+                ..crate::sst::SSTIteratorOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        iter.seek_to_first().unwrap();
+        let mut keys = Vec::new();
+        while iter.valid() {
+            let (key, _) = iter.current().unwrap().unwrap();
+            keys.push(key);
+            iter.next().unwrap();
+        }
+        assert_eq!(keys, vec![encoded_b, encoded_c]);
 
         cleanup_test_dir(test_dir);
     }

@@ -315,6 +315,13 @@ impl VlogMergeCollector {
             .collect()
     }
 
+    pub(crate) fn collect_removed_entries_from_value(&mut self, value: &Value) -> Result<()> {
+        for column in value.columns().iter().flatten() {
+            self.collect_removed_entries_from_column(column)?;
+        }
+        Ok(())
+    }
+
     fn update_entry_delta(&mut self, file_seq: VlogFileSeq, delta: i64) {
         if delta == 0 {
             return;
