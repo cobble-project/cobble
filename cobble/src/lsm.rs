@@ -1,7 +1,8 @@
 use crate::block_cache::BlockCache;
 use crate::compaction::{
-    CompactionConfig, CompactionPlan, CompactionPolicy, CompactionWorker, MinOverlapPolicy,
-    RoundRobinPolicy, ScorePriorityPolicy, build_runs_for_plan, level_threshold,
+    CompactionConfig, CompactionPlan, CompactionPolicy, CompactionPolicyContext, CompactionWorker,
+    MinOverlapPolicy, RoundRobinPolicy, ScorePriorityPolicy, build_runs_for_plan,
+    file_fully_covered_by_truncation_cursor, level_threshold,
 };
 use crate::data_file::{DataFile, DataFileType, intersect_bucket_ranges};
 use crate::db_status::DbLifecycle;
@@ -760,14 +761,35 @@ impl LSMTree {
         let expected_scope = levels_snapshot
             .multi_lsm_version
             .tree_scope_of_tree(tree_idx);
-        let plan = state
-            .compaction_policy
-            .pick(&tree_version.levels, state.compaction_config);
+        let truncation_cursors = levels_snapshot.truncation_cursors.capture();
+        let policy_context = CompactionPolicyContext {
+            truncation_cursors: Some(truncation_cursors.as_map()),
+            tree_scope: expected_scope.as_ref(),
+        };
+        let plan = state.compaction_policy.pick_with_context(
+            &tree_version.levels,
+            state.compaction_config,
+            policy_context,
+        );
         let Some(plan) = plan else {
             return;
         };
+        if plan.drop_truncated {
+            if let Some(file) = Self::find_plan_base_file(&tree_version.levels, &plan)
+                && file_fully_covered_by_truncation_cursor(&file, policy_context)
+            {
+                let edit = Self::build_truncated_drop_edit(file, &plan);
+                debug!(
+                    "compaction drop truncated file tree={} L{} file_id={}",
+                    tree_idx, plan.input_level, plan.base_file_id
+                );
+                self.apply_edit_locked(state, vec![(tree_idx, edit)], |_db_state| {});
+            }
+            return;
+        }
         if plan.trivial_move {
-            if let Some(edit) = self.build_trivial_move_edit(&tree_version.levels, &plan) {
+            if let Some(file) = Self::find_plan_base_file(&tree_version.levels, &plan) {
+                let edit = Self::build_trivial_move_edit(file, &plan);
                 debug!(
                     "compaction trivial move tree={} L{}->L{} file_id={}",
                     tree_idx, plan.input_level, plan.output_level, plan.base_file_id
@@ -790,12 +812,8 @@ impl LSMTree {
         }
     }
 
-    fn build_trivial_move_edit(
-        &self,
-        levels: &[Level],
-        plan: &CompactionPlan,
-    ) -> Option<VersionEdit> {
-        let file = levels
+    fn find_plan_base_file(levels: &[Level], plan: &CompactionPlan) -> Option<Arc<DataFile>> {
+        levels
             .iter()
             .find(|level| level.ordinal == plan.input_level)
             .and_then(|level| {
@@ -804,8 +822,21 @@ impl LSMTree {
                     .iter()
                     .find(|file| file.file_id == plan.base_file_id)
             })
-            .cloned()?;
-        Some(VersionEdit {
+            .cloned()
+    }
+
+    fn build_truncated_drop_edit(file: Arc<DataFile>, plan: &CompactionPlan) -> VersionEdit {
+        VersionEdit {
+            level_edits: vec![LevelEdit {
+                level: plan.input_level,
+                removed_files: vec![file],
+                new_files: Vec::new(),
+            }],
+        }
+    }
+
+    fn build_trivial_move_edit(file: Arc<DataFile>, plan: &CompactionPlan) -> VersionEdit {
+        VersionEdit {
             level_edits: vec![
                 LevelEdit {
                     level: plan.input_level,
@@ -818,7 +849,7 @@ impl LSMTree {
                     new_files: vec![file],
                 },
             ],
-        })
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1641,6 +1672,64 @@ mod tests {
         assert_eq!(level2.len(), 1);
         assert!(level2.iter().any(|file| file.start_key == b"e"));
         cleanup_test_root(root);
+    }
+
+    #[test]
+    fn test_lsm_compaction_drops_fully_truncated_file_without_worker_submit() {
+        let db_state = Arc::new(DbStateHandle::new());
+        let file = create_data_file_with_bucket(0, 10);
+        let lsm_version = LSMTreeVersion {
+            levels: vec![
+                Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: Vec::new(),
+                },
+                Level {
+                    ordinal: 1,
+                    tiered: false,
+                    files: vec![Arc::clone(&file)],
+                },
+                Level {
+                    ordinal: 2,
+                    tiered: false,
+                    files: Vec::new(),
+                },
+            ],
+        };
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
+            suggested_base_snapshot_id: None,
+        });
+        db_state
+            .load()
+            .truncation_cursors
+            .advance(0, DEFAULT_COLUMN_FAMILY_ID, b"z");
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+        let worker = Arc::new(RecordingCompactionWorker::default());
+        let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
+        lsm_tree.configure_compaction(
+            crate::compaction::CompactionConfig::default(),
+            Some(worker_dyn),
+        );
+
+        lsm_tree.apply_edit(
+            0,
+            VersionEdit {
+                level_edits: Vec::new(),
+            },
+            None,
+        );
+
+        assert!(lsm_tree.level_files(1).is_empty());
+        assert!(worker.submitted_tree_idxs.lock().unwrap().is_empty());
     }
 
     #[test]

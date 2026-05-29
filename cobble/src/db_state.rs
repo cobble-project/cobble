@@ -146,6 +146,10 @@ impl TruncationCursorStore {
 }
 
 impl TruncationCursorSnapshot {
+    pub(crate) fn as_map(&self) -> &TruncationCursorMap {
+        self.cursors.as_ref()
+    }
+
     pub(crate) fn to_map(&self) -> TruncationCursorMap {
         if !self.has_any {
             return TruncationCursorMap::new();

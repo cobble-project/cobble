@@ -1,9 +1,11 @@
 use crate::config::CompactionPolicyKind;
 use crate::data_file::DataFile;
 use crate::data_file::DataFileType;
+use crate::db_state::{LSMTreeScope, TruncationCursorMap};
 use crate::file::FileId;
 use crate::iterator::SortedRun;
 use crate::lsm::Level;
+use crate::r#type::{key_bucket, key_column_family};
 use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
@@ -59,25 +61,58 @@ pub(crate) struct CompactionPlan {
     pub(crate) output_level: u8,
     pub(crate) base_file_id: u64,
     pub(crate) trivial_move: bool,
+    pub(crate) drop_truncated: bool,
 }
 
 impl fmt::Display for CompactionPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "L{}->L{} base_file_id={} trivial_move={}",
-            self.input_level, self.output_level, self.base_file_id, self.trivial_move
+            "L{}->L{} base_file_id={} trivial_move={} drop_truncated={}",
+            self.input_level,
+            self.output_level,
+            self.base_file_id,
+            self.trivial_move,
+            self.drop_truncated
         )
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CompactionPolicyContext<'a> {
+    pub(crate) truncation_cursors: Option<&'a TruncationCursorMap>,
+    pub(crate) tree_scope: Option<&'a LSMTreeScope>,
+}
+
 pub(crate) trait CompactionPolicy: Send {
-    fn pick(&mut self, levels: &[Level], config: CompactionConfig) -> Option<CompactionPlan>;
+    fn pick(&mut self, levels: &[Level], config: CompactionConfig) -> Option<CompactionPlan> {
+        self.pick_with_context(levels, config, CompactionPolicyContext::default())
+    }
+
+    fn pick_with_context(
+        &mut self,
+        levels: &[Level],
+        config: CompactionConfig,
+        context: CompactionPolicyContext<'_>,
+    ) -> Option<CompactionPlan>;
 }
 
 /// Picks compaction from level 0 if it exceeds the file limit.
-fn pick_first_level(levels: &[Level], config: &CompactionConfig) -> Option<CompactionPlan> {
+fn pick_first_level(
+    levels: &[Level],
+    config: &CompactionConfig,
+    context: CompactionPolicyContext<'_>,
+) -> Option<CompactionPlan> {
     let level0 = levels.iter().find(|level| level.ordinal == 0)?;
+    if let Some((level, file_id)) = pick_fully_truncated_file(levels, context) {
+        return Some(CompactionPlan {
+            input_level: level,
+            output_level: level.saturating_add(1),
+            base_file_id: file_id,
+            trivial_move: true,
+            drop_truncated: true,
+        });
+    }
     if level0.files.len() > config.l0_file_limit {
         let base_file_id = level0
             .files
@@ -90,9 +125,74 @@ fn pick_first_level(levels: &[Level], config: &CompactionConfig) -> Option<Compa
             output_level: 1,
             base_file_id,
             trivial_move: false,
+            drop_truncated: false,
         });
     }
     None
+}
+
+fn pick_fully_truncated_file(
+    levels: &[Level],
+    context: CompactionPolicyContext<'_>,
+) -> Option<(u8, FileId)> {
+    levels
+        .iter()
+        .flat_map(|level| {
+            level
+                .files
+                .iter()
+                .map(move |file| (level.ordinal, file.as_ref()))
+        })
+        .filter(|(_, file)| file_fully_covered_by_truncation_cursor(file, context))
+        .min_by_key(|(level, file)| (*level, file.file_id))
+        .map(|(level, file)| (level, file.file_id))
+}
+
+pub(crate) fn file_fully_covered_by_truncation_cursor(
+    file: &DataFile,
+    context: CompactionPolicyContext<'_>,
+) -> bool {
+    let Some(cursors) = context
+        .truncation_cursors
+        .filter(|cursors| !cursors.is_empty())
+    else {
+        return false;
+    };
+    let Some(start_bucket) = key_bucket(&file.start_key) else {
+        return false;
+    };
+    let Some(end_bucket) = key_bucket(&file.end_key) else {
+        return false;
+    };
+    let Some(start_cf) = key_column_family(&file.start_key) else {
+        return false;
+    };
+    let Some(end_cf) = key_column_family(&file.end_key) else {
+        return false;
+    };
+    if start_bucket != end_bucket || start_cf != end_cf {
+        return false;
+    }
+
+    cursors.iter().any(|(cursor_id, cursor)| {
+        if cursor_id.bucket != start_bucket || cursor_id.column_family_id != start_cf {
+            return false;
+        }
+        if let Some(scope) = context.tree_scope
+            && (scope.column_family_id != cursor_id.column_family_id
+                || !scope.bucket_range.contains(&cursor_id.bucket))
+        {
+            return false;
+        }
+        if !file.effective_bucket_range.contains(&cursor_id.bucket) {
+            return false;
+        }
+        let mut encoded_cursor = Vec::with_capacity(3 + cursor.len());
+        encoded_cursor.extend_from_slice(&cursor_id.bucket.to_le_bytes());
+        encoded_cursor.push(cursor_id.column_family_id);
+        encoded_cursor.extend_from_slice(cursor);
+        encoded_cursor.as_slice() >= file.end_key.as_slice()
+    })
 }
 
 /// A compaction policy that picks files in a round-robin fashion.
@@ -110,9 +210,23 @@ impl RoundRobinPolicy {
 }
 
 impl CompactionPolicy for RoundRobinPolicy {
-    fn pick(&mut self, levels: &[Level], config: CompactionConfig) -> Option<CompactionPlan> {
+    fn pick_with_context(
+        &mut self,
+        levels: &[Level],
+        config: CompactionConfig,
+        context: CompactionPolicyContext<'_>,
+    ) -> Option<CompactionPlan> {
         if levels.is_empty() {
             return None;
+        }
+        if let Some((level, file_id)) = pick_fully_truncated_file(levels, context) {
+            return Some(CompactionPlan {
+                input_level: level,
+                output_level: level.saturating_add(1),
+                base_file_id: file_id,
+                trivial_move: true,
+                drop_truncated: true,
+            });
         }
         let input_level = levels
             .iter()
@@ -134,7 +248,7 @@ impl CompactionPolicy for RoundRobinPolicy {
         let level = if let Some(input_level) = input_level {
             input_level
         } else {
-            let first_level = pick_first_level(levels, &config);
+            let first_level = pick_first_level(levels, &config, context);
             if first_level.is_some() {
                 return first_level;
             }
@@ -173,6 +287,7 @@ impl CompactionPolicy for RoundRobinPolicy {
             output_level: selected + 1,
             base_file_id,
             trivial_move,
+            drop_truncated: false,
         })
     }
 }
@@ -336,14 +451,29 @@ impl ScorePriorityPolicy {
             output_level: selected_level + 1,
             base_file_id: file.file_id,
             trivial_move: Self::rocksdb_trivial_move(levels, selected_level, file, config),
+            drop_truncated: false,
         })
     }
 }
 
 impl CompactionPolicy for ScorePriorityPolicy {
-    fn pick(&mut self, levels: &[Level], config: CompactionConfig) -> Option<CompactionPlan> {
+    fn pick_with_context(
+        &mut self,
+        levels: &[Level],
+        config: CompactionConfig,
+        context: CompactionPolicyContext<'_>,
+    ) -> Option<CompactionPlan> {
         if levels.is_empty() {
             return None;
+        }
+        if let Some((level, file_id)) = pick_fully_truncated_file(levels, context) {
+            return Some(CompactionPlan {
+                input_level: level,
+                output_level: level.saturating_add(1),
+                base_file_id: file_id,
+                trivial_move: true,
+                drop_truncated: true,
+            });
         }
         for (level_ordinal, score) in Self::scored_levels(levels, &config) {
             if score < 1.0 {
@@ -362,6 +492,7 @@ impl CompactionPolicy for ScorePriorityPolicy {
                     output_level: 1,
                     base_file_id,
                     trivial_move: false,
+                    drop_truncated: false,
                 });
             }
             if let Some(plan) = self.pick_level_plan(levels, level_ordinal, &config) {
@@ -373,9 +504,23 @@ impl CompactionPolicy for ScorePriorityPolicy {
 }
 
 impl CompactionPolicy for MinOverlapPolicy {
-    fn pick(&mut self, levels: &[Level], config: CompactionConfig) -> Option<CompactionPlan> {
+    fn pick_with_context(
+        &mut self,
+        levels: &[Level],
+        config: CompactionConfig,
+        context: CompactionPolicyContext<'_>,
+    ) -> Option<CompactionPlan> {
         if levels.is_empty() {
             return None;
+        }
+        if let Some((level, file_id)) = pick_fully_truncated_file(levels, context) {
+            return Some(CompactionPlan {
+                input_level: level,
+                output_level: level.saturating_add(1),
+                base_file_id: file_id,
+                trivial_move: true,
+                drop_truncated: true,
+            });
         }
 
         let input_level = levels
@@ -398,7 +543,7 @@ impl CompactionPolicy for MinOverlapPolicy {
         let input_level = if let Some(input_level) = input_level {
             input_level
         } else {
-            let first_level = pick_first_level(levels, &config);
+            let first_level = pick_first_level(levels, &config, context);
             if first_level.is_some() {
                 return first_level;
             }
@@ -442,6 +587,7 @@ impl CompactionPolicy for MinOverlapPolicy {
             output_level: level as u8 + 1,
             base_file_id,
             trivial_move,
+            drop_truncated: false,
         })
     }
 }
@@ -722,6 +868,11 @@ fn compare_overlap(candidate: (usize, u64, usize), current: (usize, u64, usize))
 mod tests {
     use super::*;
     use crate::data_file::DataFileType;
+    use crate::db_state::TruncationCursorId;
+    use crate::schema::DEFAULT_COLUMN_FAMILY_ID;
+    use crate::sst::row_codec::encode_key;
+    use crate::r#type::Key;
+    use std::collections::HashMap;
 
     fn make_file(id: FileId, start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
         let bucket_range = DataFile::bucket_range_from_keys(start, end);
@@ -735,6 +886,24 @@ mod tests {
             bucket_range.clone(),
             bucket_range,
         ))
+    }
+
+    fn make_encoded_file(id: FileId, start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
+        let start_key = encode_key(&Key::new(0, start.to_vec()));
+        let end_key = encode_key(&Key::new(0, end.to_vec()));
+        make_file(id, start_key.as_ref(), end_key.as_ref(), size)
+    }
+
+    fn cursor_context(cursor: &[u8]) -> (TruncationCursorMap, LSMTreeScope) {
+        let mut cursors = HashMap::new();
+        cursors.insert(
+            TruncationCursorId::new(0, DEFAULT_COLUMN_FAMILY_ID),
+            cursor.to_vec(),
+        );
+        (
+            cursors,
+            LSMTreeScope::new(0u16..=0u16, DEFAULT_COLUMN_FAMILY_ID),
+        )
     }
 
     #[test]
@@ -840,6 +1009,7 @@ mod tests {
             output_level: 2,
             base_file_id: 1,
             trivial_move: false,
+            drop_truncated: false,
         };
         let runs = build_runs_for_plan(&[level1, level2], &plan, &config);
         assert_eq!(runs.len(), 1);
@@ -876,6 +1046,7 @@ mod tests {
             output_level: 2,
             base_file_id: 2,
             trivial_move: false,
+            drop_truncated: false,
         };
         let runs = build_runs_for_plan(&[level1, level2], &plan, &config);
         assert_eq!(runs.len(), 2);
@@ -1137,6 +1308,48 @@ mod tests {
             .expect("plan");
         assert_eq!(plan.input_level, 1);
         assert_eq!(plan.base_file_id, 2);
+    }
+
+    #[test]
+    fn test_score_priority_drops_fully_truncated_file_first() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 100,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![
+                make_encoded_file(1, b"a", b"m", 10),
+                make_encoded_file(2, b"n", b"z", 10),
+            ],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let (cursors, scope) = cursor_context(b"m");
+        let context = CompactionPolicyContext {
+            truncation_cursors: Some(&cursors),
+            tree_scope: Some(&scope),
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy
+            .pick_with_context(&[level0, level1, level2], config, context)
+            .expect("plan");
+
+        assert_eq!(plan.input_level, 1);
+        assert_eq!(plan.base_file_id, 1);
+        assert!(plan.drop_truncated);
     }
 
     #[test]

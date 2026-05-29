@@ -13,8 +13,9 @@ pub(crate) use executor::{
     CompactionExecutor, CompactionResult, CompactionTask, CompactionTaskMetrics,
 };
 pub(crate) use policy::{
-    CompactionConfig, CompactionPlan, CompactionPolicy, MinOverlapPolicy, RoundRobinPolicy,
-    ScorePriorityPolicy, build_runs_for_plan, level_threshold,
+    CompactionConfig, CompactionPlan, CompactionPolicy, CompactionPolicyContext, MinOverlapPolicy,
+    RoundRobinPolicy, ScorePriorityPolicy, build_runs_for_plan,
+    file_fully_covered_by_truncation_cursor, level_threshold,
 };
 pub use remote::RemoteCompactionServer;
 #[allow(unused_imports)]
