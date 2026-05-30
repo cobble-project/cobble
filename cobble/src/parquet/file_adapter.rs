@@ -1,4 +1,4 @@
-use crate::block_cache::{BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock};
+use crate::cache::{BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock};
 use crate::error::{Error, Result};
 use crate::file::{
     BufferedReader, BufferedWriter, File, FileId, RandomAccessFile, SequentialWriteFile,
@@ -225,8 +225,8 @@ impl ChunkReader for RandomAccessChunkReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_cache::{BlockCache, BlockCacheKey, CachedBlock};
     use crate::cache::MockCache;
+    use crate::cache::{BlockCache, BlockCacheKey, CachedBlock};
     use crate::file::FileSystemRegistry;
     use crate::parquet::ParquetWriter;
     use crate::sst::row_codec::encode_value;

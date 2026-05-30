@@ -1,4 +1,4 @@
-use crate::block_cache::{BlockCache, new_block_cache_with_config};
+use crate::cache::{BlockCache, new_block_cache_with_config};
 use crate::config::VolumeUsageKind;
 use crate::coordinator::GlobalSnapshotManifest;
 use crate::db_state::{bucket_range_fits_total, bucket_range_last, bucket_slots_for_total};

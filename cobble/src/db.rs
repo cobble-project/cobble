@@ -1,4 +1,4 @@
-use crate::block_cache::new_block_cache_with_config;
+use crate::cache::new_block_cache_with_config;
 use crate::db_builder::DbBuilder;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::{DbStateHandle, LSMTreeScope, bucket_range_fits_total};

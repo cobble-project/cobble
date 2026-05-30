@@ -4,7 +4,7 @@
 //! executes them using a local `CompactionExecutor`, and returns the results back to the worker.
 use super::{CompactionExecutor, CompactionResult, CompactionTask, CompactionWorker};
 use crate::Config;
-use crate::block_cache::{
+use crate::cache::{
     BlockCacheKey, BlockCachePreload, ScanHotBlockRegistry, cache_namespace_for_db_id,
 };
 use crate::data_file::{DataFile, DataFileType};

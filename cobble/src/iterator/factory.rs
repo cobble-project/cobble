@@ -1,6 +1,6 @@
 //! Factory for creating iterators from data files based on their type.
 
-use crate::block_cache::BlockCache;
+use crate::cache::BlockCache;
 use crate::data_file::{DataFile, DataFileType};
 use crate::error::Result;
 use crate::file::FileManager;

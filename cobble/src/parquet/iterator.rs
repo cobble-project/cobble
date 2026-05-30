@@ -1,4 +1,4 @@
-use crate::block_cache::BlockCache;
+use crate::cache::BlockCache;
 use crate::data_file::DataFile;
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;

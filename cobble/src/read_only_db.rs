@@ -1,4 +1,4 @@
-use crate::block_cache::{BlockCache, new_block_cache_with_config};
+use crate::cache::{BlockCache, new_block_cache_with_config};
 use crate::db::select_projected_columns;
 use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_iter::{DbIterator, DbIteratorOptions};

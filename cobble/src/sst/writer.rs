@@ -1,4 +1,4 @@
-use crate::block_cache::{
+use crate::cache::{
     BlockCachePreload, ScanHotBlockRegistry, bucket_scoped_cache_namespace, data_block_cache_key,
 };
 use crate::error::{Error, Result};
@@ -66,7 +66,7 @@ pub struct SSTWriterOptions {
 pub(crate) struct SSTWriterHotBlockCache {
     pub(crate) base_cache_namespace: u64,
     pub(crate) output_file_id: u64,
-    /// Shared registry described in `block_cache::ScanHotBlockRegistry`.
+    /// Shared registry described in `cache::ScanHotBlockRegistry`.
     ///
     /// Compaction input iterators bump the registry counter when they read a
     /// scan-hot block. This writer watches that counter and records the output

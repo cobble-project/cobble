@@ -1,4 +1,4 @@
-use crate::block_cache::{
+use crate::cache::{
     BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock, ScanHotBlockHandle,
     ScanHotBlockRegistry, data_block_cache_key,
 };

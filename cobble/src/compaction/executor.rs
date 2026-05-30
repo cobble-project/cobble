@@ -5,7 +5,7 @@
 //! - `CompactionResult`: Output of a compaction operation
 //! - `CompactionExecutor`: Manages compaction execution in a thread pool
 
-use crate::block_cache::{
+use crate::cache::{
     BlockCache, BlockCachePreload, ScanHotBlockRegistry, bucket_scoped_cache_namespace,
 };
 use crate::compaction::CompactionConfig;
@@ -200,7 +200,7 @@ pub struct CompactionResult {
     vlog_edit: Option<VlogEdit>,
     /// Output SST data blocks that should be warmed in the local block cache.
     ///
-    /// See the full hot-block handoff in `block_cache::ScanHotBlockRegistry`:
+    /// See the full hot-block handoff in `cache::ScanHotBlockRegistry`:
     /// scan iterators register current/next input block keys, compaction input
     /// iterators observe those keys, SST writers record output block preload
     /// requests here, and local/remote completion paths asynchronously load them.

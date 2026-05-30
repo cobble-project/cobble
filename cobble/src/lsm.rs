@@ -1,4 +1,4 @@
-use crate::block_cache::{
+use crate::cache::{
     BlockCache, BlockCachePreload, BlockCachePreloadWorker, ScanHotBlockRegistry,
     bucket_scoped_cache_namespace, cache_namespace_for_db_id,
 };
