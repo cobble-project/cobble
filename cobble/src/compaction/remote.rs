@@ -4,6 +4,9 @@
 //! executes them using a local `CompactionExecutor`, and returns the results back to the worker.
 use super::{CompactionExecutor, CompactionResult, CompactionTask, CompactionWorker};
 use crate::Config;
+use crate::block_cache::{
+    BlockCacheKey, BlockCachePreload, ScanHotBlockRegistry, cache_namespace_for_db_id,
+};
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{TruncationCursorId, TruncationCursorMap};
 use crate::db_status::DbLifecycle;
@@ -39,9 +42,9 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 const REMOTE_FILE_ID_START: u64 = u64::MAX / 2;
-const REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT: u32 = 1;
-const REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION: u32 = 1;
-type RemoteCompactionOutput = (Vec<RemoteDataFile>, Vec<(u32, i64)>);
+const REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT: u32 = 2;
+const REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION: u32 = 2;
+type RemoteCompactionOutput = (Vec<RemoteDataFile>, Vec<(u32, i64)>, Vec<BlockCachePreload>);
 
 fn validate_protocol_compatibility(
     role: &str,
@@ -402,6 +405,12 @@ struct RemoteCompactionRequest {
     merge_operator_ids: Vec<String>,
     merge_operator_metadata: Vec<Option<serde_json::Value>>,
     truncation_cursors: Vec<RemoteTruncationCursor>,
+    /// Snapshot of local scan-hot input block keys.
+    ///
+    /// The remote server seeds its `ScanHotBlockRegistry` from this list, so its
+    /// compaction input iterators can produce the same output preload requests as
+    /// local compaction. The client remaps returned file ids before async loading.
+    scan_hot_block_keys: Vec<BlockCacheKey>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -469,6 +478,11 @@ struct RemoteCompactionResponse {
     compatible_version: u32,
     output_files: Vec<RemoteDataFile>,
     vlog_entry_deltas: Vec<(u32, i64)>,
+    /// Output block preload requests produced by the server-side compaction writer.
+    ///
+    /// These keys use remote output file ids. The client remaps them to locally
+    /// reserved file ids before submitting them to the dedicated preload worker.
+    preload_block_keys: Vec<BlockCachePreload>,
     error: Option<String>,
 }
 
@@ -488,12 +502,17 @@ enum RemoteCompactionReply {
 }
 
 impl RemoteCompactionResponse {
-    fn ok(output_files: Vec<RemoteDataFile>, vlog_entry_deltas: Vec<(u32, i64)>) -> Self {
+    fn ok(
+        output_files: Vec<RemoteDataFile>,
+        vlog_entry_deltas: Vec<(u32, i64)>,
+        preload_block_keys: Vec<BlockCachePreload>,
+    ) -> Self {
         Self {
             version: REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT,
             compatible_version: REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
             output_files,
             vlog_entry_deltas,
+            preload_block_keys,
             error: None,
         }
     }
@@ -504,6 +523,7 @@ impl RemoteCompactionResponse {
             compatible_version: REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
             output_files: Vec::new(),
             vlog_entry_deltas: Vec::new(),
+            preload_block_keys: Vec::new(),
             error: Some(message.into()),
         }
     }
@@ -611,6 +631,11 @@ impl RemoteCompactionWorker {
             .unwrap_or_else(|| schema.num_columns());
         let writer_options =
             super::build_writer_options(&self.config, output_level, data_file_type, num_columns)?;
+        let scan_hot_block_keys = if lsm_tree.block_cache().is_some() {
+            lsm_tree.scan_hot_blocks().snapshot_keys()
+        } else {
+            Vec::new()
+        };
         let merge_operator_ids =
             schema.operator_ids_for_column_family_id(tree_scope.column_family_id);
         let merge_operator_metadata = schema
@@ -645,6 +670,7 @@ impl RemoteCompactionWorker {
             merge_operator_ids,
             merge_operator_metadata,
             truncation_cursors: RemoteTruncationCursor::from_map(&truncation_cursors),
+            scan_hot_block_keys,
         })
     }
 }
@@ -699,6 +725,14 @@ impl CompactionWorker for RemoteCompactionWorker {
                     return Err(Error::IoError(error));
                 }
                 let output_ids = file_manager.reserve_data_file_ids(response.output_files.len());
+                let remote_to_local_file_ids = response
+                    .output_files
+                    .iter()
+                    .zip(output_ids.iter().copied())
+                    .map(|(file, local_id)| (file.file_id, local_id))
+                    .collect::<HashMap<_, _>>();
+                let preload_block_keys =
+                    remap_preload_file_ids(response.preload_block_keys, &remote_to_local_file_ids);
                 let output_files = response
                     .output_files
                     .into_iter()
@@ -716,13 +750,17 @@ impl CompactionWorker for RemoteCompactionWorker {
                 let apply_tree_idx = lsm_tree.on_compaction_complete(lsm_tree_idx);
                 if let Some(apply_tree_idx) = apply_tree_idx {
                     lsm_tree.apply_edit(apply_tree_idx, edit.clone(), vlog_edit.clone());
+                    lsm_tree.submit_block_cache_preload(
+                        Arc::clone(&file_manager),
+                        preload_block_keys.clone(),
+                    );
                 }
                 Ok(CompactionResult::new(
                     lsm_tree_idx,
                     output_files,
                     edit,
                     vlog_edit,
-                    Vec::new(),
+                    preload_block_keys,
                 ))
             })();
             if result.is_err()
@@ -936,8 +974,12 @@ impl RemoteCompactionServer {
                         merge_operator_resolver.clone(),
                         *request,
                     ) {
-                        Ok((files, vlog_entry_deltas)) => {
-                            RemoteCompactionResponse::ok(files, vlog_entry_deltas)
+                        Ok((files, vlog_entry_deltas, preload_block_keys)) => {
+                            RemoteCompactionResponse::ok(
+                                files,
+                                vlog_entry_deltas,
+                                preload_block_keys,
+                            )
                         }
                         Err(err) => RemoteCompactionResponse::err(err.to_string()),
                     };
@@ -1016,6 +1058,9 @@ impl RemoteCompactionServer {
             )],
             num_columns,
         ));
+        let cache_namespace = cache_namespace_for_db_id(&request.db_id);
+        let scan_hot_blocks = ScanHotBlockRegistry::from_keys(request.scan_hot_block_keys);
+        let truncation_cursors = RemoteTruncationCursor::into_map(request.truncation_cursors);
         let task = CompactionTask::new(
             compaction_metrics,
             sst_metrics,
@@ -1030,7 +1075,8 @@ impl RemoteCompactionServer {
         )
         .with_writer_options_factory(writer_options_factory)
         .with_column_family(request.column_family_id, num_columns)
-        .with_truncation_cursors(RemoteTruncationCursor::into_map(request.truncation_cursors))
+        .with_truncation_cursors(truncation_cursors)
+        .with_scan_hot_blocks(cache_namespace, scan_hot_blocks)
         .with_readonly_outputs();
         let result = executor.execute_blocking(task, None);
         if let Err(e) = &result {
@@ -1046,7 +1092,11 @@ impl RemoteCompactionServer {
             .vlog_edit()
             .map(|edit| edit.entry_deltas())
             .unwrap_or_default();
-        Ok((output_files, vlog_entry_deltas))
+        Ok((
+            output_files,
+            vlog_entry_deltas,
+            result.preload_block_keys().to_vec(),
+        ))
     }
 
     fn resolve_merge_operators(
@@ -1129,6 +1179,18 @@ fn build_version_edit(
     VersionEdit {
         level_edits: level_edits.into_values().collect(),
     }
+}
+
+fn remap_preload_file_ids(
+    mut preloads: Vec<BlockCachePreload>,
+    remote_to_local_file_ids: &HashMap<FileId, FileId>,
+) -> Vec<BlockCachePreload> {
+    for preload in &mut preloads {
+        if let Some(local_id) = remote_to_local_file_ids.get(&preload.key.file_id) {
+            preload.key.file_id = *local_id;
+        }
+    }
+    preloads
 }
 
 fn read_message<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream) -> Result<T> {
