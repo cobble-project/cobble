@@ -1,3 +1,6 @@
+use crate::block_cache::{
+    BlockCachePreload, ScanHotBlockRegistry, bucket_scoped_cache_namespace, data_block_cache_key,
+};
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, SequentialWriteFile};
 use crate::format::FileBuilder;
@@ -5,9 +8,11 @@ use crate::sst::bloom::BloomFilterBuilder;
 use crate::sst::compression::{SstCompressionAlgorithm, write_block};
 use crate::sst::format::{BlockBuilder, Footer};
 use crate::sst::row_codec::{encode_key, encode_value};
-use crate::r#type::{Key, KvValue, Value};
+use crate::r#type::{Key, KvValue, Value, key_bucket};
 use bytes::{BufMut, Bytes, BytesMut};
 use metrics::{Histogram, histogram};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 struct DataBlockMeta {
@@ -57,6 +62,21 @@ pub struct SSTWriterOptions {
     pub value_has_ttl: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct SSTWriterHotBlockCache {
+    pub(crate) base_cache_namespace: u64,
+    pub(crate) output_file_id: u64,
+    /// Shared registry described in `block_cache::ScanHotBlockRegistry`.
+    ///
+    /// Compaction input iterators bump the registry counter when they read a
+    /// scan-hot block. This writer watches that counter and records the output
+    /// data block key that should be asynchronously loaded after compaction
+    /// completes, including remote compaction responses.
+    pub(crate) hot_blocks: Arc<ScanHotBlockRegistry>,
+    pub(crate) observed_cursor: Arc<AtomicU64>,
+    pub(crate) preloads: Arc<Mutex<Vec<BlockCachePreload>>>,
+}
+
 impl Default for SSTWriterOptions {
     fn default() -> Self {
         Self {
@@ -85,10 +105,20 @@ pub struct SSTWriter<W: SequentialWriteFile> {
     last_key: Vec<u8>,
     current_block_first_key: Option<Vec<u8>>,
     pending_data_blocks: Vec<DataBlockMeta>,
+    cache_current_data_block: bool,
+    hot_block_cache: Option<SSTWriterHotBlockCache>,
 }
 
 impl<W: SequentialWriteFile> SSTWriter<W> {
     pub fn new(writer: W, options: SSTWriterOptions) -> Self {
+        Self::new_with_hot_block_cache(writer, options, None)
+    }
+
+    pub(crate) fn new_with_hot_block_cache(
+        writer: W,
+        options: SSTWriterOptions,
+        hot_block_cache: Option<SSTWriterHotBlockCache>,
+    ) -> Self {
         let buffered_writer = BufferedWriter::new(writer, options.buffer_size);
         let data_block_builder = BlockBuilder::new_with_prefix(
             options.block_size,
@@ -115,12 +145,16 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             last_key: Vec::new(),
             current_block_first_key: None,
             pending_data_blocks: Vec::new(),
+            cache_current_data_block: false,
+            hot_block_cache,
         }
     }
 
     /// Add a key-value pair to the SST file
     /// Keys must be added in sorted order
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.refresh_hot_block_observation();
+
         // Ensure keys are added in sorted order
         if !self.last_key.is_empty() && key <= self.last_key.as_slice() {
             return Err(Error::IoError(format!(
@@ -203,7 +237,9 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
 
         // Write the block
         let size = write_block(&mut self.writer, encoded, self.options.compression)?;
+        self.record_block_cache_preload_if_hot(&first_key, offset as u64, size);
         self.record_compression_ratio(raw_len, size);
+        self.cache_current_data_block = false;
 
         // Remember block info for index
         let mut key_hashes = Vec::new();
@@ -221,6 +257,38 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         });
 
         Ok(())
+    }
+
+    fn refresh_hot_block_observation(&mut self) {
+        let Some(cache) = &self.hot_block_cache else {
+            return;
+        };
+        // This is the writer half of the registry handoff. The reader side lives
+        // in `SSTIterator::read_data_block_from_partition`; when it observes a
+        // scan-hot input block, this counter changes and the current output block
+        // is marked for preload in `record_block_cache_preload_if_hot`.
+        let observed = cache.hot_blocks.observed_count();
+        let cursor = cache.observed_cursor.load(Ordering::Acquire);
+        if observed != cursor {
+            cache.observed_cursor.store(observed, Ordering::Release);
+            self.cache_current_data_block = true;
+        }
+    }
+
+    fn record_block_cache_preload_if_hot(&self, first_key: &[u8], offset: u64, size: usize) {
+        if !self.cache_current_data_block {
+            return;
+        }
+        let Some(cache) = &self.hot_block_cache else {
+            return;
+        };
+        let namespace = key_bucket(first_key)
+            .map(|bucket| bucket_scoped_cache_namespace(cache.base_cache_namespace, bucket))
+            .unwrap_or(cache.base_cache_namespace);
+        cache.preloads.lock().unwrap().push(BlockCachePreload {
+            key: data_block_cache_key(namespace, cache.output_file_id, offset),
+            size,
+        });
     }
 
     fn record_compression_ratio(&self, raw_len: usize, compressed_len: usize) {

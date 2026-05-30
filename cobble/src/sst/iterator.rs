@@ -1,4 +1,7 @@
-use crate::block_cache::{BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock};
+use crate::block_cache::{
+    BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock, ScanHotBlockHandle,
+    ScanHotBlockRegistry, data_block_cache_key,
+};
 use crate::data_file::DataFile;
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
@@ -28,6 +31,12 @@ pub(crate) struct SSTIteratorOptions {
     pub bloom_filter_enabled: bool,
     /// Namespace used to isolate block-cache keys across shards/dbs.
     pub cache_namespace: u64,
+    /// Preload the data block after the current one during scan iteration.
+    pub preload_next_data_block: bool,
+    /// Shared physical-block tracker for cursor-adjacent scan blocks.
+    pub hot_block_registry: Option<Arc<ScanHotBlockRegistry>>,
+    /// Mark registry hits when this iterator is used as compaction input.
+    pub observe_hot_blocks: bool,
 }
 
 #[derive(Clone)]
@@ -97,6 +106,9 @@ impl Default for SSTIteratorOptions {
             metrics: None,
             bloom_filter_enabled: false,
             cache_namespace: 0,
+            preload_next_data_block: false,
+            hot_block_registry: None,
+            observe_hot_blocks: false,
         }
     }
 }
@@ -117,6 +129,7 @@ pub(crate) struct SSTIterator {
     current_entry_idx: usize,
     options: SSTIteratorOptions,
     block_cache: Option<BlockCache>,
+    hot_block_handle: Option<ScanHotBlockHandle>,
     metrics: Arc<SSTIteratorMetrics>,
     cached_key_entry_idx: Cell<Option<usize>>,
     cached_value_entry_idx: Cell<Option<usize>>,
@@ -273,6 +286,11 @@ impl SSTIterator {
         } else {
             return Err(Error::IoError("Index block size is zero".to_string()));
         }
+        let hot_block_handle = options
+            .preload_next_data_block
+            .then(|| options.hot_block_registry.as_ref().map(Arc::clone))
+            .flatten()
+            .map(|registry| registry.handle());
         Ok((
             Self {
                 file,
@@ -289,6 +307,7 @@ impl SSTIterator {
                 current_entry_idx: 0,
                 options,
                 block_cache,
+                hot_block_handle,
                 metrics,
                 cached_key_entry_idx: Cell::new(None),
                 cached_value_entry_idx: Cell::new(None),
@@ -334,12 +353,14 @@ impl SSTIterator {
         if self.index_partitions.is_empty() {
             self.current_data_block = None;
             self.clear_cached_entry();
+            self.clear_scan_hot_blocks();
             return Ok(());
         }
         if !self.footer.partitioned_index {
             if self.index_block.is_empty() {
                 self.current_data_block = None;
                 self.clear_cached_entry();
+                self.clear_scan_hot_blocks();
                 return Ok(());
             }
             self.current_index_partition_idx = 0;
@@ -349,6 +370,7 @@ impl SSTIterator {
             let partition = self.index_block.clone();
             self.load_data_block_from_partition(&partition, block_idx)?;
             self.seek_in_current_block(&target)?;
+            self.after_data_block_positioned()?;
             return Ok(());
         }
 
@@ -358,6 +380,7 @@ impl SSTIterator {
         self.current_block_idx = block_idx;
         self.load_data_block_from_partition(&partition, block_idx)?;
         self.seek_in_current_block(&target)?;
+        self.after_data_block_positioned()?;
         Ok(())
     }
 
@@ -457,6 +480,15 @@ impl SSTIterator {
         partition: &Arc<Block>,
         block_idx: usize,
     ) -> Result<()> {
+        let block = self.read_data_block_from_partition(partition, block_idx)?;
+        self.current_data_block = Some(block);
+        self.current_entry_idx = 0;
+        self.clear_cached_entry();
+
+        Ok(())
+    }
+
+    fn data_block_location(&self, partition: &Block, block_idx: usize) -> Result<(usize, usize)> {
         if block_idx >= partition.offsets_len() {
             return Err(Error::IoError(format!(
                 "Block index out of bounds: {}",
@@ -474,13 +506,30 @@ impl SSTIterator {
         if size == 0 {
             return Err(Error::IoError("Data block size is zero".to_string()));
         }
+        Ok((offset, size))
+    }
 
+    fn read_data_block_from_partition(
+        &self,
+        partition: &Arc<Block>,
+        block_idx: usize,
+    ) -> Result<Arc<Block>> {
+        let (offset, size) = self.data_block_location(partition, block_idx)?;
         let cache_key = BlockCacheKey {
             namespace: self.options.cache_namespace,
             file_id: self.file_id,
             block_id: offset as u64,
             kind: BlockCacheKind::Data,
         };
+        if self.options.observe_hot_blocks
+            && let Some(registry) = &self.options.hot_block_registry
+        {
+            // Compaction input iterators set `observe_hot_blocks`. When they read
+            // a block that a scan iterator registered as current/next, the registry
+            // counter drives `SSTWriterHotBlockCache` to record the output block
+            // key for asynchronous warming after compaction.
+            registry.observe_if_hot(cache_key);
+        }
         let block = if let Some(cache) = &self.block_cache {
             if let Some(cached) = cache.get(&cache_key) {
                 self.metrics.data_hits.increment(1);
@@ -510,10 +559,57 @@ impl SSTIterator {
             block.set_block_id(block_idx as u32);
             Arc::new(block)
         };
-        self.current_data_block = Some(block);
-        self.current_entry_idx = 0;
-        self.clear_cached_entry();
+        Ok(block)
+    }
 
+    fn data_block_key_from_partition(
+        &self,
+        partition: &Block,
+        block_idx: usize,
+    ) -> Result<BlockCacheKey> {
+        let (offset, _) = self.data_block_location(partition, block_idx)?;
+        Ok(data_block_cache_key(
+            self.options.cache_namespace,
+            self.file_id,
+            offset as u64,
+        ))
+    }
+
+    fn clear_scan_hot_blocks(&mut self) {
+        if let Some(handle) = &mut self.hot_block_handle {
+            handle.replace(Vec::new());
+        }
+    }
+
+    fn after_data_block_positioned(&mut self) -> Result<()> {
+        if !self.options.preload_next_data_block {
+            return Ok(());
+        }
+        if !self.valid() {
+            self.clear_scan_hot_blocks();
+            return Ok(());
+        }
+        let Some(partition) = self.current_index_partition.clone() else {
+            self.clear_scan_hot_blocks();
+            return Ok(());
+        };
+
+        let mut hot_blocks =
+            vec![self.data_block_key_from_partition(partition.as_ref(), self.current_block_idx)?];
+        let next_block_idx = self.current_block_idx + 1;
+        if next_block_idx < partition.offsets_len() {
+            hot_blocks
+                .push(self.data_block_key_from_partition(partition.as_ref(), next_block_idx)?);
+            // The scan path already needs the current block. Pulling the next block
+            // through the normal cache path keeps cursor-driven scans warm without
+            // changing iterator position or duplicating decode/cache-key logic.
+            if self.block_cache.is_some() {
+                let _ = self.read_data_block_from_partition(&partition, next_block_idx)?;
+            }
+        }
+        if let Some(handle) = &mut self.hot_block_handle {
+            handle.replace(hot_blocks);
+        }
         Ok(())
     }
 
@@ -795,6 +891,7 @@ impl SSTIterator {
         if self.index_partitions.is_empty() {
             self.current_data_block = None;
             self.clear_cached_entry();
+            self.clear_scan_hot_blocks();
             return Ok(());
         }
 
@@ -802,6 +899,7 @@ impl SSTIterator {
             if self.index_block.is_empty() {
                 self.current_data_block = None;
                 self.clear_cached_entry();
+                self.clear_scan_hot_blocks();
                 return Ok(());
             }
             self.current_index_partition_idx = 0;
@@ -811,6 +909,7 @@ impl SSTIterator {
             self.load_data_block_from_partition(&partition, 0)?;
             self.current_entry_idx = 0;
             self.position_at_current_entry();
+            self.after_data_block_positioned()?;
             return Ok(());
         }
 
@@ -819,6 +918,7 @@ impl SSTIterator {
         self.load_data_block_from_partition(&partition, 0)?;
         self.current_entry_idx = 0;
         self.position_at_current_entry();
+        self.after_data_block_positioned()?;
         Ok(())
     }
 
@@ -865,11 +965,13 @@ impl SSTIterator {
                     self.load_data_block_from_partition(&partition, self.current_block_idx)?;
                     self.current_entry_idx = 0;
                     self.position_after_block_change();
+                    self.after_data_block_positioned()?;
                     return Ok(true);
                 }
                 if !self.footer.partitioned_index {
                     self.current_data_block = None;
                     self.position_after_block_change();
+                    self.clear_scan_hot_blocks();
                     return Ok(false);
                 }
                 let next_partition_idx = self.current_index_partition_idx + 1;
@@ -879,11 +981,13 @@ impl SSTIterator {
                     self.load_data_block_from_partition(&partition, 0)?;
                     self.current_entry_idx = 0;
                     self.position_after_block_change();
+                    self.after_data_block_positioned()?;
                     return Ok(true);
                 }
                 // No more blocks
                 self.current_data_block = None;
                 self.position_after_block_change();
+                self.clear_scan_hot_blocks();
                 return Ok(false);
             }
 

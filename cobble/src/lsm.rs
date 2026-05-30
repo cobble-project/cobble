@@ -1,4 +1,7 @@
-use crate::block_cache::BlockCache;
+use crate::block_cache::{
+    BlockCache, BlockCachePreload, BlockCachePreloadWorker, ScanHotBlockRegistry,
+    bucket_scoped_cache_namespace, cache_namespace_for_db_id,
+};
 use crate::compaction::{
     CompactionConfig, CompactionPlan, CompactionPolicy, CompactionPolicyContext, CompactionWorker,
     MinOverlapPolicy, RoundRobinPolicy, ScorePriorityPolicy, build_runs_for_plan,
@@ -20,7 +23,6 @@ use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 use crate::r#type::{Value, key_bucket, key_column_family};
 use log::{debug, warn};
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{Hash, Hasher};
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -55,10 +57,8 @@ pub(crate) struct LSMTree {
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     sst_metrics: Arc<SSTIteratorMetrics>,
     cache_namespace: u64,
-}
-
-fn bucket_scoped_cache_namespace(base_namespace: u64, bucket: u16) -> u64 {
-    base_namespace ^ ((bucket as u64) << 48)
+    scan_hot_blocks: Arc<ScanHotBlockRegistry>,
+    block_cache_preload_worker: Arc<BlockCachePreloadWorker>,
 }
 
 struct LSMTreeState {
@@ -133,9 +133,9 @@ impl LSMTree {
         db_lifecycle: Arc<DbLifecycle>,
         metrics_manager: Arc<MetricsManager>,
     ) -> Self {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        metrics_manager.db_id().hash(&mut hasher);
-        let cache_namespace = hasher.finish();
+        let cache_namespace = cache_namespace_for_db_id(metrics_manager.db_id());
+        let block_cache_preload_worker =
+            Arc::new(BlockCachePreloadWorker::new(Arc::clone(&db_lifecycle)));
         Self {
             db_state,
             db_lifecycle,
@@ -154,6 +154,8 @@ impl LSMTree {
             ttl_provider,
             sst_metrics: metrics_manager.sst_iterator_metrics(),
             cache_namespace,
+            scan_hot_blocks: Arc::new(ScanHotBlockRegistry::new()),
+            block_cache_preload_worker,
         }
     }
 
@@ -446,7 +448,31 @@ impl LSMTree {
         Arc::clone(&self.sst_metrics)
     }
 
+    pub(crate) fn block_cache(&self) -> Option<BlockCache> {
+        self.block_cache.clone()
+    }
+
+    pub(crate) fn cache_namespace(&self) -> u64 {
+        self.cache_namespace
+    }
+
+    pub(crate) fn scan_hot_blocks(&self) -> Arc<ScanHotBlockRegistry> {
+        Arc::clone(&self.scan_hot_blocks)
+    }
+
+    pub(crate) fn submit_block_cache_preload(
+        &self,
+        file_manager: Arc<FileManager>,
+        preloads: Vec<BlockCachePreload>,
+    ) {
+        if let Some(block_cache) = self.block_cache() {
+            self.block_cache_preload_worker
+                .submit(file_manager, block_cache, preloads);
+        }
+    }
+
     pub(crate) fn shutdown_compaction(&self) {
+        self.block_cache_preload_worker.shutdown();
         let mut state = self.state.lock().unwrap();
         if let Some(worker) = state.compaction_worker.take() {
             worker.shutdown();
@@ -1011,8 +1037,10 @@ impl LSMTree {
         selected_columns: Option<&[usize]>,
         bucket: u16,
         column_family_id: u8,
+        preload_scan_cursor_block: bool,
     ) -> Result<Vec<DynKvIterator>> {
         let selected_columns = selected_columns.map(|columns| columns.to_vec());
+        let preload_scan_cursor_block = preload_scan_cursor_block && self.block_cache.is_some();
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let use_read_ahead = read_ahead_bytes > 0 && tokio::runtime::Handle::try_current().is_ok();
         let mut runs: Vec<SortedRun> = Vec::new();
@@ -1044,6 +1072,7 @@ impl LSMTree {
             let target_schema = Arc::clone(&target_schema);
             let schema_manager = Arc::clone(&schema_manager);
             let selected_columns = selected_columns.clone();
+            let scan_hot_blocks = Arc::clone(&self.scan_hot_blocks);
             let run_iter = run.iter(move |file| {
                 let source_schema = schema_manager.schema(file.schema_id)?;
                 let source_num_columns = source_schema
@@ -1062,6 +1091,9 @@ impl LSMTree {
                             num_columns: source_num_columns,
                             bloom_filter_enabled: true,
                             cache_namespace,
+                            preload_next_data_block: preload_scan_cursor_block,
+                            hot_block_registry: preload_scan_cursor_block
+                                .then(|| Arc::clone(&scan_hot_blocks)),
                             ..SSTIteratorOptions::default()
                         };
                         Box::new(SSTIterator::with_cache_and_file(

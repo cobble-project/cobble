@@ -5,6 +5,9 @@
 //! - `CompactionResult`: Output of a compaction operation
 //! - `CompactionExecutor`: Manages compaction execution in a thread pool
 
+use crate::block_cache::{
+    BlockCache, BlockCachePreload, ScanHotBlockRegistry, bucket_scoped_cache_namespace,
+};
 use crate::compaction::CompactionConfig;
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{TruncationCursorId, TruncationCursorMap};
@@ -18,16 +21,23 @@ use crate::iterator::{
 };
 use crate::lsm::{LevelEdit, VersionEdit};
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, SchemaManager};
-use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions};
+use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions, SSTWriter, SSTWriterHotBlockCache};
 use crate::r#type::{key_bucket, key_column_family};
 use crate::vlog::{VlogEdit, VlogMergeCollector};
-use crate::writer_options::WriterOptionsFactory;
+use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::trace;
 use metrics::{Counter, counter};
-use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
-type CompactionCompleteCallback = Arc<dyn Fn(usize, VersionEdit, Option<VlogEdit>) + Send + Sync>;
+type CompactionCompleteCallback =
+    Arc<dyn Fn(usize, VersionEdit, Option<VlogEdit>, Vec<BlockCachePreload>) + Send + Sync>;
+
+fn single_bucket_in_range(range: &std::ops::RangeInclusive<u16>) -> Option<u16> {
+    let start = *range.start();
+    (start == *range.end()).then_some(start)
+}
 
 /// A compaction task describes the input and output parameters for a compaction.
 pub struct CompactionTask {
@@ -53,6 +63,8 @@ pub struct CompactionTask {
     column_family_id: u8,
     num_columns: usize,
     truncation_cursors: TruncationCursorMap,
+    cache_namespace: u64,
+    scan_hot_blocks: Option<Arc<ScanHotBlockRegistry>>,
 }
 
 #[derive(Clone)]
@@ -109,6 +121,8 @@ impl CompactionTask {
             column_family_id: DEFAULT_COLUMN_FAMILY_ID,
             num_columns: default_num_columns,
             truncation_cursors: TruncationCursorMap::new(),
+            cache_namespace: 0,
+            scan_hot_blocks: None,
         }
     }
 
@@ -139,6 +153,29 @@ impl CompactionTask {
         self
     }
 
+    pub(crate) fn with_scan_hot_block_cache(
+        mut self,
+        block_cache: Option<BlockCache>,
+        cache_namespace: u64,
+        scan_hot_blocks: Arc<ScanHotBlockRegistry>,
+    ) -> Self {
+        if block_cache.is_some() {
+            self.cache_namespace = cache_namespace;
+            self.scan_hot_blocks = Some(scan_hot_blocks);
+        }
+        self
+    }
+
+    pub(crate) fn with_scan_hot_blocks(
+        mut self,
+        cache_namespace: u64,
+        scan_hot_blocks: Arc<ScanHotBlockRegistry>,
+    ) -> Self {
+        self.cache_namespace = cache_namespace;
+        self.scan_hot_blocks = Some(scan_hot_blocks);
+        self
+    }
+
     /// Returns the sorted runs in this task.
     pub fn sorted_runs(&self) -> &[SortedRun] {
         &self.sorted_runs
@@ -161,6 +198,13 @@ pub struct CompactionResult {
     new_files: Vec<Arc<DataFile>>,
     edit: VersionEdit,
     vlog_edit: Option<VlogEdit>,
+    /// Output SST data blocks that should be warmed in the local block cache.
+    ///
+    /// See the full hot-block handoff in `block_cache::ScanHotBlockRegistry`:
+    /// scan iterators register current/next input block keys, compaction input
+    /// iterators observe those keys, SST writers record output block preload
+    /// requests here, and local/remote completion paths asynchronously load them.
+    preload_block_keys: Vec<BlockCachePreload>,
 }
 
 impl CompactionResult {
@@ -170,12 +214,14 @@ impl CompactionResult {
         new_files: Vec<Arc<DataFile>>,
         edit: VersionEdit,
         vlog_edit: Option<VlogEdit>,
+        preload_block_keys: Vec<BlockCachePreload>,
     ) -> Self {
         Self {
             lsm_tree_idx,
             new_files,
             edit,
             vlog_edit,
+            preload_block_keys,
         }
     }
 
@@ -191,6 +237,10 @@ impl CompactionResult {
 
     pub fn vlog_edit(&self) -> Option<&VlogEdit> {
         self.vlog_edit.as_ref()
+    }
+
+    pub(crate) fn preload_block_keys(&self) -> &[BlockCachePreload] {
+        &self.preload_block_keys
     }
 }
 
@@ -289,6 +339,7 @@ impl CompactionExecutor {
                             result.lsm_tree_idx,
                             result.edit.clone(),
                             result.vlog_edit.clone(),
+                            result.preload_block_keys.clone(),
                         );
                     }
                     Ok(result)
@@ -321,6 +372,7 @@ impl CompactionExecutor {
                 result.lsm_tree_idx,
                 result.edit.clone(),
                 result.vlog_edit.clone(),
+                result.preload_block_keys.clone(),
             );
         }
         Ok(result)
@@ -345,6 +397,14 @@ impl CompactionExecutor {
             .num_columns_in_family(column_family_id)
             .unwrap_or(task.num_columns);
         let value_has_ttl = target_schema.value_has_ttl_in_family(column_family_id);
+        let hot_observed_cursor = task
+            .scan_hot_blocks
+            .as_ref()
+            .map(|registry| Arc::new(AtomicU64::new(registry.observed_count())));
+        let preload_block_keys = task
+            .scan_hot_blocks
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(Vec::<BlockCachePreload>::new())));
         for run in &task.sorted_runs {
             for file in run.files() {
                 read_bytes = read_bytes.saturating_add(file.size as u64);
@@ -353,6 +413,8 @@ impl CompactionExecutor {
             let sst_metrics = Arc::clone(&task.sst_metrics);
             let schema_manager = Arc::clone(&task.schema_manager);
             let target_schema = Arc::clone(&target_schema);
+            let scan_hot_blocks = task.scan_hot_blocks.as_ref().map(Arc::clone);
+            let base_cache_namespace = task.cache_namespace;
             let run_iter = run.iter(move |file| {
                 let source_schema = schema_manager.schema(file.schema_id)?;
                 let source_num_columns = source_schema
@@ -373,6 +435,18 @@ impl CompactionExecutor {
                             metrics: Some(Arc::clone(&sst_metrics)),
                             num_columns: source_num_columns,
                             bloom_filter_enabled: options.bloom_filter_enabled,
+                            cache_namespace: single_bucket_in_range(&file.effective_bucket_range)
+                                .map(|bucket| {
+                                    bucket_scoped_cache_namespace(base_cache_namespace, bucket)
+                                })
+                                .unwrap_or(base_cache_namespace),
+                            // This is the compaction-reader half of the hot-block handoff
+                            // documented on `ScanHotBlockRegistry`. It does not change
+                            // compaction selection; it only increments the registry counter
+                            // when this input iterator reads a block that an active scan
+                            // marked as current/next.
+                            hot_block_registry: scan_hot_blocks.as_ref().map(Arc::clone),
+                            observe_hot_blocks: scan_hot_blocks.is_some(),
                             ..SSTIteratorOptions::default()
                         };
                         let iter = crate::sst::SSTIterator::with_cache_and_file(
@@ -486,10 +560,41 @@ impl CompactionExecutor {
                 current_file_id = Some(file_id);
                 current_builder = Some(
                     if let Some(writer_options_factory) = task.writer_options_factory.as_ref() {
-                        let factory = crate::compaction::make_data_file_builder_factory(
-                            writer_options_factory.build(num_columns, value_has_ttl),
-                        );
-                        factory(Box::new(writer))
+                        match writer_options_factory.build(num_columns, value_has_ttl) {
+                            WriterOptions::Sst(options) => {
+                                // The writer side consumes observations from the same registry.
+                                // When the compaction reader above touches a scan-hot input block,
+                                // `SSTWriter` records the output block key in `preload_block_keys`;
+                                // the completion path later loads those keys asynchronously.
+                                let hot_block_cache = task
+                                    .scan_hot_blocks
+                                    .as_ref()
+                                    .zip(hot_observed_cursor.as_ref())
+                                    .zip(preload_block_keys.as_ref())
+                                    .map(|((hot_blocks, observed_cursor), preloads)| {
+                                        SSTWriterHotBlockCache {
+                                            base_cache_namespace: task.cache_namespace,
+                                            output_file_id: file_id,
+                                            hot_blocks: Arc::clone(hot_blocks),
+                                            observed_cursor: Arc::clone(observed_cursor),
+                                            preloads: Arc::clone(preloads),
+                                        }
+                                    });
+                                let writer: Box<dyn crate::file::SequentialWriteFile> =
+                                    Box::new(writer);
+                                Box::new(SSTWriter::new_with_hot_block_cache(
+                                    writer,
+                                    options,
+                                    hot_block_cache,
+                                )) as Box<dyn FileBuilder>
+                            }
+                            writer_options => {
+                                let factory = crate::compaction::make_data_file_builder_factory(
+                                    writer_options,
+                                );
+                                factory(Box::new(writer))
+                            }
+                        }
                     } else {
                         (task.file_builder_factory)(Box::new(writer))
                     },
@@ -636,6 +741,9 @@ impl CompactionExecutor {
             output_files,
             edit,
             vlog_edit,
+            preload_block_keys
+                .map(|keys| keys.lock().unwrap().clone())
+                .unwrap_or_default(),
         ))
     }
 }

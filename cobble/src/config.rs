@@ -254,6 +254,7 @@ pub struct ScanOptions {
     pub read_ahead_bytes: Size,
     pub column_indices: Option<Vec<usize>>,
     pub column_family: Option<String>,
+    preload_scan_cursor_block: bool,
     max_index: Option<usize>,
     max_rows: Option<usize>,
     cached_resolution: Arc<ArcSwapOption<ScanOptionsCacheEntry>>,
@@ -347,6 +348,7 @@ impl Default for ScanOptions {
             read_ahead_bytes: Size::from_const(0),
             column_indices: None,
             column_family: None,
+            preload_scan_cursor_block: false,
             max_index: None,
             max_rows: None,
             cached_resolution: Arc::new(ArcSwapOption::empty()),
@@ -360,6 +362,7 @@ impl std::fmt::Debug for ScanOptions {
             .field("read_ahead_bytes", &self.read_ahead_bytes)
             .field("column_indices", &self.column_indices)
             .field("column_family", &self.column_family)
+            .field("preload_scan_cursor_block", &self.preload_scan_cursor_block)
             .field("max_index", &self.max_index)
             .field("max_rows", &self.max_rows)
             .finish()
@@ -393,6 +396,7 @@ impl ScanOptions {
             read_ahead_bytes: Size::from_const(0),
             column_indices,
             column_family: None,
+            preload_scan_cursor_block: false,
             max_index,
             max_rows: None,
             cached_resolution: Arc::new(ArcSwapOption::empty()),
@@ -408,6 +412,16 @@ impl ScanOptions {
     pub fn with_max_rows(mut self, max_rows: usize) -> Self {
         assert!(max_rows > 0, "max_rows must be > 0");
         self.max_rows = Some(max_rows);
+        self
+    }
+
+    /// Preload the next SST data block while a scan advances.
+    ///
+    /// This is intentionally opt-in: short cursor-driven scans such as priority-queue
+    /// polling benefit from keeping the block after the cursor warm, while broad scans
+    /// should avoid the extra synchronous cache lookup by default.
+    pub fn with_preload_scan_cursor_block(mut self, enabled: bool) -> Self {
+        self.preload_scan_cursor_block = enabled;
         self
     }
 
@@ -427,6 +441,10 @@ impl ScanOptions {
         self.max_rows
     }
 
+    pub fn preload_scan_cursor_block(&self) -> bool {
+        self.preload_scan_cursor_block
+    }
+
     pub fn set_max_rows(&mut self, max_rows: usize) {
         assert!(max_rows > 0, "max_rows must be > 0");
         self.max_rows = Some(max_rows);
@@ -434,6 +452,10 @@ impl ScanOptions {
 
     pub fn clear_max_rows(&mut self) {
         self.max_rows = None;
+    }
+
+    pub fn set_preload_scan_cursor_block(&mut self, enabled: bool) {
+        self.preload_scan_cursor_block = enabled;
     }
 
     pub(crate) fn read_ahead_bytes(&self) -> Result<usize> {
@@ -1420,10 +1442,14 @@ mod tests {
         let options = ScanOptions::for_columns(vec![2, 0]).with_column_family("metrics");
         assert_eq!(options.column_family(), Some("metrics"));
         assert_eq!(options.columns(), Some(&[2, 0][..]));
+        assert!(!options.preload_scan_cursor_block());
 
-        let options = ScanOptions::for_column(1).with_column_family("default");
+        let options = ScanOptions::for_column(1)
+            .with_column_family("default")
+            .with_preload_scan_cursor_block(true);
         assert_eq!(options.column_family(), Some("default"));
         assert_eq!(options.columns(), Some(&[1][..]));
+        assert!(options.preload_scan_cursor_block());
     }
 
     #[test]

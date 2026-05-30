@@ -85,13 +85,23 @@ impl LocalCompactionWorker {
 
     fn submit(&self, task: CompactionTask) -> tokio::task::JoinHandle<Result<CompactionResult>> {
         let lsm_tree = self.lsm_tree.clone();
-        let on_complete = Arc::new(move |lsm_tree_idx: usize, edit: VersionEdit, vlog_edit| {
-            if let Some(lsm_tree) = lsm_tree.upgrade()
-                && let Some(apply_tree_idx) = lsm_tree.on_compaction_complete(lsm_tree_idx)
-            {
-                lsm_tree.apply_edit(apply_tree_idx, edit, vlog_edit);
-            }
-        });
+        let file_manager = Arc::clone(&self.file_manager);
+        let on_complete = Arc::new(
+            move |lsm_tree_idx: usize, edit: VersionEdit, vlog_edit, preload_block_keys| {
+                if let Some(lsm_tree) = lsm_tree.upgrade()
+                    && let Some(apply_tree_idx) = lsm_tree.on_compaction_complete(lsm_tree_idx)
+                {
+                    lsm_tree.apply_edit(apply_tree_idx, edit, vlog_edit);
+                    // Final local handoff for the hot-block flow documented on
+                    // `ScanHotBlockRegistry`: after new files are visible in the
+                    // local FileManager, load the writer-produced output block keys
+                    // on the dedicated preload runtime. Remote compaction uses the
+                    // same worker after remapping remote output file ids.
+                    lsm_tree
+                        .submit_block_cache_preload(Arc::clone(&file_manager), preload_block_keys);
+                }
+            },
+        );
         let executor = self.executor.lock().unwrap();
         executor.execute(task, Some(on_complete))
     }
@@ -164,7 +174,12 @@ impl LocalCompactionWorker {
         )
         .with_writer_options_factory(writer_options_factory)
         .with_column_family(tree_scope.column_family_id, runtime_num_columns)
-        .with_truncation_cursors(truncation_cursors);
+        .with_truncation_cursors(truncation_cursors)
+        .with_scan_hot_block_cache(
+            tree.block_cache(),
+            tree.cache_namespace(),
+            tree.scan_hot_blocks(),
+        );
         Some(self.submit(task))
     }
 

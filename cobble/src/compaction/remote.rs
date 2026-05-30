@@ -722,6 +722,7 @@ impl CompactionWorker for RemoteCompactionWorker {
                     output_files,
                     edit,
                     vlog_edit,
+                    Vec::new(),
                 ))
             })();
             if result.is_err()

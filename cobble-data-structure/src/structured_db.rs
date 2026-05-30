@@ -682,6 +682,11 @@ impl StructuredScanOptions {
         self
     }
 
+    pub fn with_preload_scan_cursor_block(mut self, enabled: bool) -> Self {
+        self.inner = self.inner.with_preload_scan_cursor_block(enabled);
+        self
+    }
+
     pub fn as_cobble(&self) -> &ScanOptions {
         &self.inner
     }

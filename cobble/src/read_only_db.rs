@@ -382,6 +382,7 @@ impl ReadOnlyDb {
             options.columns(),
             bucket,
             column_family_id,
+            options.preload_scan_cursor_block(),
         )?;
         let start_key = match truncation_cursor {
             Some(ref cursor) if start.is_none_or(|candidate| candidate <= cursor.as_slice()) => {

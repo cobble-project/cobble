@@ -1291,6 +1291,7 @@ impl Db {
             options.columns(),
             bucket,
             column_family_id,
+            options.preload_scan_cursor_block(),
         );
         let lsm_iters = match lsm_iters {
             Ok(result) => result,

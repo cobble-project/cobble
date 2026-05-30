@@ -24,7 +24,8 @@ impl<'a> PriorityQueue<'a> {
             db,
             write_options: StructuredWriteOptions::with_column_family(column_family.clone()),
             scan_options: StructuredScanOptions::for_column(0)
-                .with_column_family(column_family.clone()),
+                .with_column_family(column_family.clone())
+                .with_preload_scan_cursor_block(true),
             column_family,
         }
     }
@@ -164,6 +165,7 @@ mod tests {
         let mut db = open_test_db(&root).unwrap();
         db.new_priority_queue("jobs").unwrap();
         let queue = db.get_priority_queue("jobs").unwrap();
+        assert!(queue.scan_options.as_cobble().preload_scan_cursor_block());
 
         queue.offer(0, b"k2", b"v2").unwrap();
         queue.offer(0, b"k1", b"left").unwrap();
