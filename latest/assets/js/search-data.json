@@ -211,7 +211,7 @@
   },"30": {
     "doc": "All Configuration",
     "title": "ScanOptions",
-    "content": "Options for scan operations. | Field | Type | Default | Description | . | read_ahead_bytes | Size | 0 | Read-ahead buffer size (0 disables read-ahead) | . | column_indices | Option&lt;Vec&lt;usize&gt;&gt; | None | Column projection | . ",
+    "content": "Options for scan operations. | Field | Type | Default | Description | . | read_ahead_bytes | Size | 0 | Read-ahead buffer size (0 disables read-ahead) | . | column_indices | Option&lt;Vec&lt;usize&gt;&gt; | None | Column projection | . | column_family | Option&lt;String&gt; | None | Column family name; omitted means the default family | . | max_rows | Option&lt;usize&gt; | None | Optional soft cap for rows returned by one scan batch | . | preload_scan_cursor_block | bool | false | Preload the next SST block while a scan cursor advances | . | should_stop_at_block_boundary | bool | false | Pause after crossing the next physical SST block or Parquet row group boundary | . should_stop_at_block_boundary is an opt-in batching control. When enabled, scan iterators may stop after they have crossed the next physical storage boundary and report that pause through stopped_at_block_boundary(). Callers can return the rows already collected, call clear_stop_at_block_boundary(), and then continue from the same logical scan position on the next poll. ",
     "url": "/cobble/latest/reference/configuration.html#scanoptions",
     
     "relUrl": "/reference/configuration.html#scanoptions"
@@ -426,26 +426,26 @@
     
     "relUrl": "/architecture/#module-map"
   },"61": {
-    "doc": "Tools",
-    "title": "Tools",
-    "content": "Operational tools that ship with Cobble. | Page | Description | . | CLI | cobble-cli command entries for tools, now includes remote compactor and web UI startup | . | Web Monitor | Read-only monitoring UI and HTTP APIs for snapshot inspection | . ",
-    "url": "/cobble/latest/tools/",
-    
-    "relUrl": "/tools/"
-  },"62": {
     "doc": "FFI Bindings",
     "title": "FFI Bindings",
     "content": "Cobble’s core engine is written in Rust, but its functionality is accessible from other languages through foreign function interface (FFI) bindings. | Binding | Language | Crate | . | Java | JVM (Java, Kotlin, Scala, …) | cobble-java | . ",
     "url": "/cobble/latest/ffi-bindings/",
     
     "relUrl": "/ffi-bindings/"
-  },"63": {
+  },"62": {
     "doc": "Getting Started",
     "title": "Getting Started",
     "content": "This section guides you through setting up and using Cobble for different use cases — from a single-machine embedded store to a distributed cluster with snapshot-following reads and parallel scans. Start with Basic Concepts for an overview of the key components, then Configuration to understand how Cobble organizes storage, and finally choose the deployment model that fits your application: . | Guide | When to use | . | Basic Concepts | Core components — Db, Coordinator, Reader, Scanner, snapshots | . | Configuration | Every deployment starts here — volumes, tuning, and storage layout | . | Single-Machine Embedded DB | Simple embedded key-value store on a single machine | . | Distributed DB | Multiple writer shards coordinated by a global snapshot system | . | Reader &amp; Distributed Scan | Serve snapshot-following reads or run parallel analytical scans across shards | . | Remote Compaction | Offload background compaction to dedicated worker nodes | . | Structured DB | Type-safe row-oriented wrappers for all of the above | . ",
     "url": "/cobble/latest/getting-started/",
     
     "relUrl": "/getting-started/"
+  },"63": {
+    "doc": "Tools",
+    "title": "Tools",
+    "content": "Operational tools that ship with Cobble. | Page | Description | . | CLI | cobble-cli command entries for tools, now includes remote compactor and web UI startup | . | Web Monitor | Read-only monitoring UI and HTTP APIs for snapshot inspection | . ",
+    "url": "/cobble/latest/tools/",
+    
+    "relUrl": "/tools/"
   },"64": {
     "doc": "Home",
     "title": "Cobble Project",
