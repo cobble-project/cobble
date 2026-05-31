@@ -917,8 +917,6 @@ impl MemtableManager {
                             multi_lsm_version,
                             job.truncation_cursors.as_ref(),
                         );
-                        let mut state = state_clone.lock().unwrap();
-                        state.in_flight = state.in_flight.saturating_sub(1);
                         match result {
                             Ok(res) => {
                                 let memtable_id =
@@ -936,9 +934,6 @@ impl MemtableManager {
                                     .sum();
                                 metrics.flush_bytes_total.increment(flushed_bytes);
                                 if res.data_files_by_scope.is_empty() {
-                                    state.flush_results.push(Ok(res));
-                                    flush_done_clone.notify_all();
-                                    drop(state);
                                     db_state_clone.remove_immutable(memtable_id);
                                     let snapshot = db_state_clone.load();
                                     Self::finish_and_materialize_snapshot(
@@ -947,6 +942,11 @@ impl MemtableManager {
                                         Vec::new(),
                                         &db_state_clone,
                                     );
+                                    let mut state = state_clone.lock().unwrap();
+                                    state.in_flight = state.in_flight.saturating_sub(1);
+                                    state.flush_results.push(Ok(res));
+                                    flush_done_clone.notify_all();
+                                    drop(state);
                                     drop(keep_memtable_alive);
                                     continue;
                                 }
@@ -959,36 +959,42 @@ impl MemtableManager {
                                     Ok(snapshot) => snapshot,
                                     Err(err) => {
                                         db_lifecycle.mark_error(err.clone());
-                                        state.flush_results.push(Err(err));
-                                        flush_done_clone.notify_all();
-                                        drop(state);
                                         // Remove immutable from state so the
                                         // memtable drop triggers the reclaimer.
                                         db_state_clone.remove_immutable(memtable_id);
+                                        let mut state = state_clone.lock().unwrap();
+                                        state.in_flight = state.in_flight.saturating_sub(1);
+                                        state.flush_results.push(Err(err));
+                                        flush_done_clone.notify_all();
+                                        drop(state);
                                         drop(keep_memtable_alive);
                                         continue;
                                     }
                                 };
-                                state.flush_results.push(Ok(res));
-                                flush_done_clone.notify_all();
-                                drop(state);
                                 Self::finish_and_materialize_snapshot(
                                     &job.snapshot,
                                     &snapshot,
                                     Vec::new(),
                                     &db_state_clone,
                                 );
+                                let mut state = state_clone.lock().unwrap();
+                                state.in_flight = state.in_flight.saturating_sub(1);
+                                state.flush_results.push(Ok(res));
+                                flush_done_clone.notify_all();
+                                drop(state);
                             }
                             Err(err) => {
                                 db_lifecycle.mark_error(err.clone());
-                                state.flush_results.push(Err(err));
-                                flush_done_clone.notify_all();
-                                drop(state);
                                 // Remove immutable from state so the
                                 // memtable drop triggers the reclaimer.
                                 if let Some(id) = job.memtable_id {
                                     db_state_clone.remove_immutable(id);
                                 }
+                                let mut state = state_clone.lock().unwrap();
+                                state.in_flight = state.in_flight.saturating_sub(1);
+                                state.flush_results.push(Err(err));
+                                flush_done_clone.notify_all();
+                                drop(state);
                             }
                         }
                         drop(keep_memtable_alive);
