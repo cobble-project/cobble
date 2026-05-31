@@ -16,6 +16,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 pub(crate) type BucketedRow = (u16, Bytes, Vec<Option<Bytes>>);
+type DecodedRow = (Key, Vec<Option<Bytes>>);
 
 pub(crate) struct DbIteratorOptions<'a> {
     pub(crate) end_bound: Option<(Bytes, bool)>,
@@ -31,6 +32,7 @@ pub(crate) struct DbIteratorOptions<'a> {
     /// with remapped operators matching the selected column indices.
     pub(crate) schema: Arc<Schema>,
     pub(crate) column_family_id: u8,
+    pub(crate) should_stop_at_block_boundary: bool,
 }
 
 pub struct DbIterator<'a> {
@@ -45,6 +47,13 @@ pub struct DbIterator<'a> {
     num_columns: usize,
     column_family_id: u8,
     remaining_rows: Option<usize>,
+    /// Whether block-boundary stops are enabled for the iterator chain that
+    /// feeds this row decoder.
+    should_stop_at_block_boundary: bool,
+    /// Whether the row-level iterator has already surfaced a stop to callers.
+    /// After `clear_stop_at_block_boundary()`, the next decode attempt will ask
+    /// the inner iterator chain to resume from the boundary.
+    stopped_at_block_boundary: bool,
 }
 
 impl<'a> DbIterator<'a> {
@@ -59,13 +68,14 @@ impl<'a> DbIterator<'a> {
             .unwrap_or_else(|| schema.num_columns());
         memtable_iters.append(&mut lsm_iters);
         let merged = MergingIterator::new(memtable_iters);
-        let inner = DeduplicatingIterator::new(
+        let mut inner = DeduplicatingIterator::new(
             TruncationFilterIterator::new(merged, options.lower_bound_exclusive),
             Some(num_columns),
             Arc::clone(&options.ttl_provider),
             None,
             schema.clone(),
         );
+        inner.set_stop_at_block_boundary(options.should_stop_at_block_boundary);
         Self {
             inner,
             end_bound: options.end_bound,
@@ -78,11 +88,29 @@ impl<'a> DbIterator<'a> {
             num_columns,
             column_family_id: options.column_family_id,
             remaining_rows: options.max_rows,
+            should_stop_at_block_boundary: options.should_stop_at_block_boundary,
+            stopped_at_block_boundary: false,
         }
     }
 
     pub(crate) fn seek(&mut self, target: &[u8]) -> Result<()> {
+        self.stopped_at_block_boundary = false;
         self.inner.seek(target)
+    }
+
+    /// Clear a previously surfaced block-boundary stop and allow scanning to
+    /// resume from the same iterator position.
+    pub fn clear_stop_at_block_boundary(&mut self) {
+        self.stopped_at_block_boundary = false;
+        if self.should_stop_at_block_boundary {
+            self.inner.clear_stop_at_block_boundary();
+        }
+    }
+
+    /// Returns `true` when the last scan attempt paused at a physical block
+    /// boundary instead of exhausting the iterator.
+    pub fn stopped_at_block_boundary(&self) -> bool {
+        self.stopped_at_block_boundary
     }
 
     fn is_past_end(&self, encoded_key: &[u8]) -> bool {
@@ -93,13 +121,30 @@ impl<'a> DbIterator<'a> {
         }
     }
 
-    fn decode_next_row(&mut self) -> Result<Option<(Key, Vec<Option<Bytes>>)>> {
+    fn decode_next_row(&mut self) -> Result<Option<DecodedRow>> {
         if self.remaining_rows == Some(0) {
             return Ok(None);
         }
-        while self.inner.valid() {
+        if self.stopped_at_block_boundary {
+            return Ok(None);
+        }
+        loop {
+            if !self.inner.valid() {
+                if !self.inner.next()? {
+                    if self.inner.stopped_at_block_boundary() {
+                        self.stopped_at_block_boundary = true;
+                    }
+                    return Ok(None);
+                }
+                continue;
+            }
             let Some((mut encoded_key, kv_value)) = self.inner.take_current()? else {
-                self.inner.next()?;
+                if !self.inner.next()? {
+                    if self.inner.stopped_at_block_boundary() {
+                        self.stopped_at_block_boundary = true;
+                    }
+                    return Ok(None);
+                }
                 continue;
             };
             self.inner.next()?;
@@ -122,7 +167,6 @@ impl<'a> DbIterator<'a> {
                 return Ok(Some((key, columns)));
             }
         }
-        Ok(None)
     }
 
     pub fn consume_next_row<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
@@ -246,6 +290,7 @@ mod tests {
                 ttl_provider: Arc::new(TTLProvider::disabled()),
                 schema: projected_schema,
                 column_family_id: 1,
+                should_stop_at_block_boundary: false,
             },
         );
 

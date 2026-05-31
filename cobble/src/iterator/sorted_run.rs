@@ -108,6 +108,16 @@ where
     current_iter: Option<I>,
     /// Function to create an iterator for a file.
     create_iterator: F,
+    /// Runtime configuration that decides whether crossing a file boundary or
+    /// an inner physical boundary should be surfaced as a stop.
+    should_stop_at_block_boundary: bool,
+    /// The next file to open after callers clear a surfaced file-boundary stop.
+    pending_file_boundary: Option<usize>,
+    /// Whether the current child iterator already surfaced a stop and needs one
+    /// resume `next()` after callers clear it.
+    pending_inner_boundary_resume: bool,
+    /// Whether this sorted-run wrapper has already surfaced a stop to callers.
+    stopped_at_block_boundary: bool,
 }
 
 impl<I, F> SortedRunIterator<I, F>
@@ -121,6 +131,10 @@ where
             current_file_idx: 0,
             current_iter: None,
             create_iterator,
+            should_stop_at_block_boundary: false,
+            pending_file_boundary: None,
+            pending_inner_boundary_resume: false,
+            stopped_at_block_boundary: false,
         }
     }
 
@@ -131,6 +145,7 @@ where
         }
 
         let mut iter = (self.create_iterator)(&self.files[idx])?;
+        iter.set_stop_at_block_boundary(self.should_stop_at_block_boundary);
         iter.seek_to_first()?;
         self.current_file_idx = idx;
         self.current_iter = Some(iter);
@@ -144,6 +159,9 @@ where
     F: Fn(&DataFile) -> Result<I> + 'a,
 {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
+        self.stopped_at_block_boundary = false;
+        self.pending_file_boundary = None;
+        self.pending_inner_boundary_resume = false;
         // Binary search for the first file whose end_key >= target
         let mut left = 0;
         let mut right = self.files.len();
@@ -179,6 +197,9 @@ where
     }
 
     fn seek_to_first(&mut self) -> Result<()> {
+        self.stopped_at_block_boundary = false;
+        self.pending_file_boundary = None;
+        self.pending_inner_boundary_resume = false;
         if self.files.is_empty() {
             self.current_iter = None;
             return Ok(());
@@ -188,14 +209,45 @@ where
     }
 
     fn next(&mut self) -> Result<bool> {
+        if self.stopped_at_block_boundary {
+            return Ok(false);
+        }
+        if self.pending_inner_boundary_resume {
+            self.pending_inner_boundary_resume = false;
+            if let Some(iter) = &mut self.current_iter {
+                if iter.next()? {
+                    return Ok(true);
+                }
+                if iter.stopped_at_block_boundary() {
+                    self.pending_inner_boundary_resume = true;
+                    self.stopped_at_block_boundary = true;
+                    return Ok(false);
+                }
+            }
+        }
+        if let Some(next_idx) = self.pending_file_boundary.take() {
+            self.load_file(next_idx)?;
+            return Ok(self.current_iter.as_ref().is_some_and(|i| i.valid()));
+        }
         if let Some(iter) = &mut self.current_iter {
             if iter.next()? {
                 return Ok(true);
+            }
+            if iter.stopped_at_block_boundary() {
+                self.pending_inner_boundary_resume = true;
+                self.stopped_at_block_boundary = true;
+                return Ok(false);
             }
 
             // Current file exhausted, move to next file
             let next_idx = self.current_file_idx + 1;
             if next_idx < self.files.len() {
+                if self.should_stop_at_block_boundary {
+                    self.current_iter = None;
+                    self.pending_file_boundary = Some(next_idx);
+                    self.stopped_at_block_boundary = true;
+                    return Ok(false);
+                }
                 self.load_file(next_idx)?;
                 return Ok(self.current_iter.as_ref().is_some_and(|i| i.valid()));
             } else {
@@ -232,6 +284,27 @@ where
         } else {
             Ok(None)
         }
+    }
+
+    fn set_stop_at_block_boundary(&mut self, enabled: bool) {
+        self.should_stop_at_block_boundary = enabled;
+        self.pending_file_boundary = None;
+        self.pending_inner_boundary_resume = false;
+        self.stopped_at_block_boundary = false;
+        if let Some(iter) = &mut self.current_iter {
+            iter.set_stop_at_block_boundary(enabled);
+        }
+    }
+
+    fn clear_stop_at_block_boundary(&mut self) {
+        self.stopped_at_block_boundary = false;
+        if let Some(iter) = &mut self.current_iter {
+            iter.clear_stop_at_block_boundary();
+        }
+    }
+
+    fn stopped_at_block_boundary(&self) -> bool {
+        self.stopped_at_block_boundary
     }
 }
 

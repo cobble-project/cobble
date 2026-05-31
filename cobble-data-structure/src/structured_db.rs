@@ -687,6 +687,18 @@ impl StructuredScanOptions {
         self
     }
 
+    /// Structured wrapper around `ScanOptions::with_stop_at_block_boundary`.
+    ///
+    /// When enabled, scans pause after crossing the next physical storage
+    /// boundary and expose that pause through the underlying iterator's
+    /// `stopped_at_block_boundary()` signal. Callers can then return the
+    /// partial batch, clear the stop, and continue scanning from the same
+    /// position.
+    pub fn with_stop_at_block_boundary(mut self, enabled: bool) -> Self {
+        self.inner = self.inner.with_stop_at_block_boundary(enabled);
+        self
+    }
+
     pub fn as_cobble(&self) -> &ScanOptions {
         &self.inner
     }

@@ -18,6 +18,28 @@ use std::sync::Arc;
 /// newer column is merged.
 type MergeCallback = Box<dyn FnMut(Option<&Column>, Option<&Column>)>;
 
+/// Boundary handling for the deduplicating wrapper.
+///
+/// This iterator has to preserve two separate phases around a physical block boundary:
+/// 1. We may discover the boundary while we are still finishing the merged row for the current key.
+///    In that case we must return that row first, then surface the stop on the next `next()`.
+/// 2. After the stop has been surfaced, callers must explicitly clear it. Only after that clear
+///    should the next `next()` advance the inner iterator once to resume from the boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundaryState {
+    /// No pending boundary work.
+    None,
+    /// A boundary was discovered while building the current merged row. The current row should be
+    /// returned now, and the next `next()` must report a stop before any resume happens.
+    PendingStop,
+    /// The stop has already been surfaced to callers. The iterator must keep returning `false`
+    /// until callers explicitly clear the stop.
+    Stopped,
+    /// Callers cleared the surfaced stop. The next `next()` should advance the inner iterator once
+    /// to move past the saved boundary and resume normal iteration.
+    ReadyToResume,
+}
+
 /// A deduplicating iterator that wraps another iterator and merges
 /// values with the same key.
 ///
@@ -39,6 +61,10 @@ pub struct DeduplicatingIterator<I> {
     current_key: Option<Bytes>,
     /// Current merged value (if valid).
     current_value: Option<KvValue>,
+    /// Boundary lifecycle for the current merged-key position.
+    /// This lets us defer surfacing a stop until after the current merged row
+    /// has been returned, and then require an explicit clear before resuming.
+    boundary_state: BoundaryState,
     /// TTL provider to evaluate expiration.
     ttl_provider: Arc<TTLProvider>,
     /// Callback invoked for every merged column pair (older, newer).
@@ -97,6 +123,7 @@ impl<I> DeduplicatingIterator<I> {
             num_columns,
             current_key: None,
             current_value: None,
+            boundary_state: BoundaryState::None,
             ttl_provider,
             on_merge,
             allow_terminal_shortcut,
@@ -132,6 +159,9 @@ impl<I> DeduplicatingIterator<I> {
             if !self.inner.valid() {
                 self.current_key = None;
                 self.current_value = None;
+                if self.inner.stopped_at_block_boundary() {
+                    self.boundary_state = BoundaryState::Stopped;
+                }
                 return Ok(());
             }
 
@@ -139,6 +169,9 @@ impl<I> DeduplicatingIterator<I> {
             let Some((current_key, first_value)) = self.inner.take_current()? else {
                 self.current_key = None;
                 self.current_value = None;
+                if self.inner.stopped_at_block_boundary() {
+                    self.boundary_state = BoundaryState::Stopped;
+                }
                 return Ok(());
             };
 
@@ -158,7 +191,13 @@ impl<I> DeduplicatingIterator<I> {
             )?;
 
             // Advance to next entry and check for same key
-            while self.inner.next()? {
+            while {
+                let advanced = self.inner.next()?;
+                if !advanced && self.inner.stopped_at_block_boundary() {
+                    self.boundary_state = BoundaryState::PendingStop;
+                }
+                advanced
+            } {
                 let Some(next_key) = self.inner.key()? else {
                     break;
                 };
@@ -191,6 +230,12 @@ impl<I> DeduplicatingIterator<I> {
             }
 
             if values.is_empty() {
+                if self.boundary_state == BoundaryState::PendingStop {
+                    self.boundary_state = BoundaryState::Stopped;
+                    self.current_key = None;
+                    self.current_value = None;
+                    return Ok(());
+                }
                 // All versions for this key are expired; continue to the next key.
                 continue;
             }
@@ -247,21 +292,47 @@ where
     I: KvIterator<'a>,
 {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
+        self.boundary_state = BoundaryState::None;
         self.inner.seek(target)?;
         self.collect_and_merge()
     }
 
     fn seek_to_first(&mut self) -> Result<()> {
+        self.boundary_state = BoundaryState::None;
         self.inner.seek_to_first()?;
         self.collect_and_merge()
     }
 
     fn next(&mut self) -> Result<bool> {
+        match self.boundary_state {
+            BoundaryState::Stopped => return Ok(false),
+            BoundaryState::PendingStop => {
+                self.boundary_state = BoundaryState::Stopped;
+                self.current_key = None;
+                self.current_value = None;
+                return Ok(false);
+            }
+            BoundaryState::ReadyToResume => {
+                self.boundary_state = BoundaryState::None;
+                if !self.inner.next()? {
+                    self.current_key = None;
+                    self.current_value = None;
+                    if self.inner.stopped_at_block_boundary() {
+                        self.boundary_state = BoundaryState::Stopped;
+                    }
+                    return Ok(false);
+                }
+            }
+            BoundaryState::None => {}
+        }
         // The inner iterator is already positioned at the next different key
         // (or invalid if no more entries)
         if !self.inner.valid() {
             self.current_key = None;
             self.current_value = None;
+            if self.inner.stopped_at_block_boundary() {
+                self.boundary_state = BoundaryState::Stopped;
+            }
             return Ok(false);
         }
 
@@ -283,6 +354,22 @@ where
 
     fn take_value(&mut self) -> Result<Option<KvValue>> {
         Ok(self.current_value.take())
+    }
+
+    fn set_stop_at_block_boundary(&mut self, enabled: bool) {
+        self.boundary_state = BoundaryState::None;
+        self.inner.set_stop_at_block_boundary(enabled);
+    }
+
+    fn clear_stop_at_block_boundary(&mut self) {
+        if self.boundary_state == BoundaryState::Stopped {
+            self.boundary_state = BoundaryState::ReadyToResume;
+        }
+        self.inner.clear_stop_at_block_boundary();
+    }
+
+    fn stopped_at_block_boundary(&self) -> bool {
+        self.boundary_state == BoundaryState::Stopped
     }
 }
 

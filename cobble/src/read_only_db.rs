@@ -414,6 +414,7 @@ impl ReadOnlyDb {
                 ttl_provider: Arc::clone(&self.ttl_provider),
                 schema: resolved_scan_options.effective_schema,
                 column_family_id,
+                should_stop_at_block_boundary: options.should_stop_at_block_boundary(),
             },
         );
         iter.seek(start_key.as_ref())?;

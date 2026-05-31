@@ -255,6 +255,7 @@ pub struct ScanOptions {
     pub column_indices: Option<Vec<usize>>,
     pub column_family: Option<String>,
     preload_scan_cursor_block: bool,
+    should_stop_at_block_boundary: bool,
     max_index: Option<usize>,
     max_rows: Option<usize>,
     cached_resolution: Arc<ArcSwapOption<ScanOptionsCacheEntry>>,
@@ -349,6 +350,7 @@ impl Default for ScanOptions {
             column_indices: None,
             column_family: None,
             preload_scan_cursor_block: false,
+            should_stop_at_block_boundary: false,
             max_index: None,
             max_rows: None,
             cached_resolution: Arc::new(ArcSwapOption::empty()),
@@ -363,6 +365,10 @@ impl std::fmt::Debug for ScanOptions {
             .field("column_indices", &self.column_indices)
             .field("column_family", &self.column_family)
             .field("preload_scan_cursor_block", &self.preload_scan_cursor_block)
+            .field(
+                "should_stop_at_block_boundary",
+                &self.should_stop_at_block_boundary,
+            )
             .field("max_index", &self.max_index)
             .field("max_rows", &self.max_rows)
             .finish()
@@ -397,6 +403,7 @@ impl ScanOptions {
             column_indices,
             column_family: None,
             preload_scan_cursor_block: false,
+            should_stop_at_block_boundary: false,
             max_index,
             max_rows: None,
             cached_resolution: Arc::new(ArcSwapOption::empty()),
@@ -425,6 +432,22 @@ impl ScanOptions {
         self
     }
 
+    /// Stop scanning after crossing the next physical block boundary.
+    ///
+    /// This is primarily useful for batch-oriented consumers such as priority
+    /// queues that want each poll to stay close to the storage layout instead of
+    /// reading arbitrarily far ahead. A stop is surfaced through the iterator's
+    /// `stopped_at_block_boundary()` signal, and callers must clear that signal
+    /// before resuming iteration.
+    ///
+    /// The exact boundary depends on the underlying reader: SST scans stop at
+    /// data-block boundaries, Parquet scans stop at row-group boundaries, and
+    /// wrapper iterators propagate that event upward.
+    pub fn with_stop_at_block_boundary(mut self, enabled: bool) -> Self {
+        self.should_stop_at_block_boundary = enabled;
+        self
+    }
+
     pub(crate) fn column_family(&self) -> Option<&str> {
         self.column_family.as_deref()
     }
@@ -443,6 +466,16 @@ impl ScanOptions {
 
     pub fn preload_scan_cursor_block(&self) -> bool {
         self.preload_scan_cursor_block
+    }
+
+    /// Whether boundary-aware stopping is enabled for scans created from these
+    /// options.
+    ///
+    /// When this returns `true`, the scan iterator may pause after a physical
+    /// storage boundary and report that pause through
+    /// `KvIterator::stopped_at_block_boundary()`.
+    pub fn should_stop_at_block_boundary(&self) -> bool {
+        self.should_stop_at_block_boundary
     }
 
     pub fn set_max_rows(&mut self, max_rows: usize) {

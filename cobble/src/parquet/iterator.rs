@@ -35,8 +35,28 @@ pub(crate) struct ParquetIterator {
     column_readers: Vec<Option<ByteArrayColumnReader>>,
     batch_keys: Vec<ByteArray>,
     batch_values: Vec<Value>,
+    current_batch_row_group_idx: Option<usize>,
     current_idx: Option<usize>,
     previous_key: Option<Bytes>,
+    /// Runtime configuration for whether crossing into a new Parquet row group
+    /// should be surfaced as a stop instead of continuing immediately.
+    should_stop_at_block_boundary: bool,
+    /// Row-group boundary lifecycle for the leaf Parquet iterator.
+    boundary_state: BoundaryState,
+}
+
+/// Row-group boundary state for a Parquet iterator.
+///
+/// Unlike higher-level wrappers, a Parquet iterator does not need a delayed
+/// "report stop after yielding the current row" phase. Once we detect that the
+/// next batch would cross into a different row group, we can surface the stop
+/// immediately. After callers clear that stop, the next `next()` loads the next
+/// batch and resumes scanning from the new row group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundaryState {
+    None,
+    Stopped,
+    ReadyToResume,
 }
 
 impl ParquetIterator {
@@ -104,8 +124,11 @@ impl ParquetIterator {
             column_readers: (0..num_columns).map(|_| None).collect(),
             batch_keys: Vec::new(),
             batch_values: Vec::new(),
+            current_batch_row_group_idx: None,
             current_idx: None,
             previous_key: None,
+            should_stop_at_block_boundary: false,
+            boundary_state: BoundaryState::None,
         })
     }
 
@@ -243,6 +266,7 @@ impl ParquetIterator {
         self.column_readers = (0..self.num_columns).map(|_| None).collect();
         self.batch_keys.clear();
         self.batch_values.clear();
+        self.current_batch_row_group_idx = None;
         self.current_idx = None;
         self.previous_key = None;
     }
@@ -294,9 +318,11 @@ impl ParquetIterator {
             if !self.ensure_active_row_group()? {
                 self.batch_keys.clear();
                 self.batch_values.clear();
+                self.current_batch_row_group_idx = None;
                 self.current_idx = None;
                 return Ok(false);
             }
+            let batch_row_group_idx = self.current_row_group_idx;
             let to_read = (self.current_group_rows - self.current_group_rows_loaded)
                 .min(PARQUET_ITERATOR_BATCH_ROWS);
             self.batch_keys.clear();
@@ -316,6 +342,7 @@ impl ParquetIterator {
                 self.key_reader = None;
                 self.expired_at_reader = None;
                 self.column_readers = (0..self.num_columns).map(|_| None).collect();
+                self.current_batch_row_group_idx = None;
                 continue;
             }
 
@@ -481,12 +508,14 @@ impl ParquetIterator {
             if self.current_group_rows_loaded >= self.current_group_rows {
                 self.current_row_group_idx += 1;
             }
+            self.current_batch_row_group_idx = Some(batch_row_group_idx);
             self.current_idx = (!self.batch_keys.is_empty()).then_some(0);
             return Ok(self.current_idx.is_some());
         }
     }
 
     pub(crate) fn seek(&mut self, target: &[u8]) -> Result<()> {
+        self.boundary_state = BoundaryState::None;
         let start_group = self
             .row_group_ranges
             .as_ref()
@@ -511,12 +540,21 @@ impl ParquetIterator {
     }
 
     pub(crate) fn seek_to_first(&mut self) -> Result<()> {
+        self.boundary_state = BoundaryState::None;
         self.reset_readers_from_group(0);
         let _ = self.load_next_batch()?;
         Ok(())
     }
 
     pub(crate) fn next(&mut self) -> Result<bool> {
+        match self.boundary_state {
+            BoundaryState::Stopped => return Ok(false),
+            BoundaryState::ReadyToResume => {
+                self.boundary_state = BoundaryState::None;
+                return self.load_next_batch();
+            }
+            BoundaryState::None => {}
+        }
         let Some(current) = self.current_idx else {
             return Ok(false);
         };
@@ -527,6 +565,16 @@ impl ParquetIterator {
         }
         if let Some(last_key) = self.batch_keys.last() {
             self.previous_key = Some(Bytes::copy_from_slice(last_key.data()));
+        }
+        if self.should_stop_at_block_boundary
+            && self
+                .current_batch_row_group_idx
+                .is_some_and(|row_group_idx| row_group_idx != self.current_row_group_idx)
+        {
+            self.current_idx = None;
+            self.current_batch_row_group_idx = None;
+            self.boundary_state = BoundaryState::Stopped;
+            return Ok(false);
         }
         self.load_next_batch()
     }
@@ -582,5 +630,20 @@ impl<'a> KvIterator<'a> for ParquetIterator {
         Ok(self
             .current_idx
             .map(|idx| KvValue::Decoded(self.batch_values[idx].clone())))
+    }
+
+    fn set_stop_at_block_boundary(&mut self, enabled: bool) {
+        self.should_stop_at_block_boundary = enabled;
+        self.boundary_state = BoundaryState::None;
+    }
+
+    fn clear_stop_at_block_boundary(&mut self) {
+        if self.boundary_state == BoundaryState::Stopped {
+            self.boundary_state = BoundaryState::ReadyToResume;
+        }
+    }
+
+    fn stopped_at_block_boundary(&self) -> bool {
+        self.boundary_state == BoundaryState::Stopped
     }
 }

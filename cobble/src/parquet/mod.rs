@@ -14,6 +14,7 @@ pub(crate) use writer::{ParquetWriter, ParquetWriterOptions};
 mod tests {
     use super::*;
     use crate::file::{FileSystemRegistry, RandomAccessFile};
+    use crate::iterator::KvIterator;
     use crate::parquet::meta::decode_meta_row_group_ranges;
     use crate::sst::row_codec::{decode_value, encode_value};
     use crate::r#type::{Column, Value, ValueType};
@@ -257,5 +258,104 @@ mod tests {
         assert_eq!(groups.first().unwrap().start_key, b"a1".to_vec());
         assert_eq!(groups.last().unwrap().end_key, b"d1".to_vec());
         cleanup_test_root("/tmp/parquet_row_group_meta_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_parquet_iterator_stops_at_row_group_boundary() {
+        let root = "file:///tmp/parquet_row_group_boundary_test";
+        cleanup_test_root("/tmp/parquet_row_group_boundary_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(root).unwrap();
+        let writer_file = fs.open_write("test.parquet").unwrap();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            ParquetWriterOptions {
+                row_group_size_bytes: 6,
+                buffer_size: 8192,
+                num_columns: 1,
+            },
+        )
+        .unwrap();
+        let encoded = encode_value(
+            &Value::new(vec![Some(Column::new(ValueType::Put, b"v".to_vec()))]),
+            1,
+        );
+        writer.add(b"a1", &encoded).unwrap();
+        writer.add(b"b1", &encoded).unwrap();
+        writer.add(b"c1", &encoded).unwrap();
+        writer.add(b"d1", &encoded).unwrap();
+        let (_, _, _, meta) = writer.finish().unwrap();
+        let groups = decode_meta_row_group_ranges(Some(meta.clone()))
+            .unwrap()
+            .unwrap();
+        assert!(groups.len() >= 2);
+
+        let mut iter = ParquetIterator::new(build_reader(root)).expect("parquet iterator");
+        iter.seek_to_first().unwrap();
+        iter.set_stop_at_block_boundary(true);
+
+        let mut saw = 1;
+        while iter.next().unwrap() {
+            saw += 1;
+        }
+        assert!(saw < 4);
+        assert!(iter.stopped_at_block_boundary());
+        cleanup_test_root("/tmp/parquet_row_group_boundary_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_parquet_iterator_can_resume_after_row_group_boundary_stop() {
+        let root = "file:///tmp/parquet_row_group_resume_test";
+        cleanup_test_root("/tmp/parquet_row_group_resume_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(root).unwrap();
+        let writer_file = fs.open_write("test.parquet").unwrap();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            ParquetWriterOptions {
+                row_group_size_bytes: 6,
+                buffer_size: 8192,
+                num_columns: 1,
+            },
+        )
+        .unwrap();
+        let encoded = encode_value(
+            &Value::new(vec![Some(Column::new(ValueType::Put, b"v".to_vec()))]),
+            1,
+        );
+        for key in [b"a1", b"b1", b"c1", b"d1"] {
+            writer.add(key.as_slice(), &encoded).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let mut iter = ParquetIterator::new(build_reader(root)).expect("parquet iterator");
+        iter.seek_to_first().unwrap();
+        iter.set_stop_at_block_boundary(true);
+
+        let mut keys = vec![iter.key().unwrap().unwrap().to_vec()];
+        loop {
+            if iter.next().unwrap() {
+                keys.push(iter.key().unwrap().unwrap().to_vec());
+                continue;
+            }
+            if iter.stopped_at_block_boundary() {
+                iter.clear_stop_at_block_boundary();
+                continue;
+            }
+            break;
+        }
+
+        assert_eq!(
+            keys,
+            vec![
+                b"a1".to_vec(),
+                b"b1".to_vec(),
+                b"c1".to_vec(),
+                b"d1".to_vec()
+            ]
+        );
+        cleanup_test_root("/tmp/parquet_row_group_resume_test");
     }
 }

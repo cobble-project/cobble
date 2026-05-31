@@ -87,4 +87,16 @@ where
         };
         Ok(Some(self.mask_value(value)?))
     }
+
+    fn set_stop_at_block_boundary(&mut self, enabled: bool) {
+        self.inner.set_stop_at_block_boundary(enabled);
+    }
+
+    fn clear_stop_at_block_boundary(&mut self) {
+        self.inner.clear_stop_at_block_boundary();
+    }
+
+    fn stopped_at_block_boundary(&self) -> bool {
+        self.inner.stopped_at_block_boundary()
+    }
 }

@@ -260,6 +260,16 @@ Options for scan operations.
 |-------|------|---------|-------------|
 | `read_ahead_bytes` | `Size` | `0` | Read-ahead buffer size (`0` disables read-ahead) |
 | `column_indices` | `Option<Vec<usize>>` | `None` | Column projection |
+| `column_family` | `Option<String>` | `None` | Column family name; omitted means the default family |
+| `max_rows` | `Option<usize>` | `None` | Optional soft cap for rows returned by one scan batch |
+| `preload_scan_cursor_block` | `bool` | `false` | Preload the next SST block while a scan cursor advances |
+| `should_stop_at_block_boundary` | `bool` | `false` | Pause after crossing the next physical SST block or Parquet row group boundary |
+
+`should_stop_at_block_boundary` is an opt-in batching control. When enabled, scan
+iterators may stop after they have crossed the next physical storage boundary and
+report that pause through `stopped_at_block_boundary()`. Callers can return the
+rows already collected, call `clear_stop_at_block_boundary()`, and then continue
+from the same logical scan position on the next poll.
 
 ---
 

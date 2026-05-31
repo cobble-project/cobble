@@ -138,6 +138,23 @@ pub(crate) struct SSTIterator {
     cached_prefix_key_bytes: RefCell<Vec<u8>>,
     cached_key_bytes: RefCell<Option<Bytes>>,
     cached_value_bytes: RefCell<Option<Bytes>>,
+    /// Runtime configuration for whether crossing into a new SST data block
+    /// should be surfaced as a stop instead of continuing immediately.
+    should_stop_at_block_boundary: bool,
+    /// Data-block boundary lifecycle for the leaf SST iterator.
+    boundary_state: BoundaryState,
+}
+
+/// Data-block boundary state for the SST iterator.
+///
+/// The SST iterator can surface a stop immediately when it moves past the last
+/// entry in the current data block. After callers clear that stop, the next
+/// `next()` resumes by loading the next physical block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundaryState {
+    None,
+    Stopped,
+    ReadyToResume,
 }
 
 impl SSTIterator {
@@ -316,6 +333,8 @@ impl SSTIterator {
                 cached_prefix_key_bytes: RefCell::new(Vec::new()),
                 cached_key_bytes: RefCell::new(None),
                 cached_value_bytes: RefCell::new(None),
+                should_stop_at_block_boundary: false,
+                boundary_state: BoundaryState::None,
             },
             cached_footer,
         ))
@@ -349,6 +368,7 @@ impl SSTIterator {
 
     /// Seek to the first key >= target
     pub fn seek(&mut self, target: &[u8]) -> Result<()> {
+        self.boundary_state = BoundaryState::None;
         let target = unsafe_bytes(target);
         if self.index_partitions.is_empty() {
             self.current_data_block = None;
@@ -515,10 +535,11 @@ impl SSTIterator {
         block_idx: usize,
     ) -> Result<Arc<Block>> {
         let (offset, size) = self.data_block_location(partition, block_idx)?;
+        let offset = offset as u64;
         let cache_key = BlockCacheKey {
             namespace: self.options.cache_namespace,
             file_id: self.file_id,
-            block_id: offset as u64,
+            block_id: offset,
             kind: BlockCacheKind::Data,
         };
         if self.options.observe_hot_blocks
@@ -544,7 +565,7 @@ impl SSTIterator {
                 }
             } else {
                 self.metrics.data_misses.increment(1);
-                let data = self.file.read_at(offset, size)?;
+                let data = self.file.read_at(offset as usize, size)?;
                 let decoded = decode_block_bytes(data)?;
                 let mut block = Block::decode(decoded)?;
                 block.set_block_id(block_idx as u32);
@@ -553,7 +574,7 @@ impl SSTIterator {
                 block
             }
         } else {
-            let data = self.file.read_at(offset, size)?;
+            let data = self.file.read_at(offset as usize, size)?;
             let decoded = decode_block_bytes(data)?;
             let mut block = Block::decode(decoded)?;
             block.set_block_id(block_idx as u32);
@@ -888,6 +909,7 @@ impl SSTIterator {
 
     /// Move to the first entry
     pub fn seek_to_first(&mut self) -> Result<()> {
+        self.boundary_state = BoundaryState::None;
         if self.index_partitions.is_empty() {
             self.current_data_block = None;
             self.clear_cached_entry();
@@ -922,6 +944,44 @@ impl SSTIterator {
         Ok(())
     }
 
+    fn load_next_position(&mut self) -> Result<bool> {
+        let reuse_partition = self.current_index_partition.is_some()
+            && self.current_block_idx
+                < self
+                    .current_index_partition
+                    .as_ref()
+                    .map(|partition| partition.offsets_len())
+                    .unwrap_or(0);
+        if reuse_partition {
+            let partition = self.current_index_partition.clone().unwrap();
+            self.load_data_block_from_partition(&partition, self.current_block_idx)?;
+            self.current_entry_idx = 0;
+            self.position_after_block_change();
+            self.after_data_block_positioned()?;
+            return Ok(true);
+        }
+        if !self.footer.partitioned_index {
+            self.current_data_block = None;
+            self.position_after_block_change();
+            self.clear_scan_hot_blocks();
+            return Ok(false);
+        }
+        let next_partition_idx = self.current_index_partition_idx + 1;
+        if next_partition_idx < self.index_partitions.len() {
+            let partition = self.load_index_partition(next_partition_idx)?;
+            self.current_block_idx = 0;
+            self.load_data_block_from_partition(&partition, 0)?;
+            self.current_entry_idx = 0;
+            self.position_after_block_change();
+            self.after_data_block_positioned()?;
+            return Ok(true);
+        }
+        self.current_data_block = None;
+        self.position_after_block_change();
+        self.clear_scan_hot_blocks();
+        Ok(false)
+    }
+
     /// Get the current key-value pair
     pub fn current(&self) -> Result<Option<(Bytes, Bytes)>> {
         let Some(key) = self.materialize_current_key()? else {
@@ -947,48 +1007,28 @@ impl SSTIterator {
 
     /// Move to the next entry
     pub fn next(&mut self) -> Result<bool> {
+        match self.boundary_state {
+            BoundaryState::Stopped => return Ok(false),
+            BoundaryState::ReadyToResume => {
+                self.boundary_state = BoundaryState::None;
+                return self.load_next_position();
+            }
+            BoundaryState::None => {}
+        }
         if let Some(block) = &self.current_data_block {
             self.current_entry_idx += 1;
 
             if self.current_entry_idx >= block.offsets_len() {
                 // Move to next block
                 self.current_block_idx += 1;
-                let reuse_partition = self.current_index_partition.is_some()
-                    && self.current_block_idx
-                        < self
-                            .current_index_partition
-                            .as_ref()
-                            .map(|partition| partition.offsets_len())
-                            .unwrap_or(0);
-                if reuse_partition {
-                    let partition = self.current_index_partition.clone().unwrap();
-                    self.load_data_block_from_partition(&partition, self.current_block_idx)?;
-                    self.current_entry_idx = 0;
-                    self.position_after_block_change();
-                    self.after_data_block_positioned()?;
-                    return Ok(true);
-                }
-                if !self.footer.partitioned_index {
+                if self.should_stop_at_block_boundary {
                     self.current_data_block = None;
                     self.position_after_block_change();
                     self.clear_scan_hot_blocks();
+                    self.boundary_state = BoundaryState::Stopped;
                     return Ok(false);
                 }
-                let next_partition_idx = self.current_index_partition_idx + 1;
-                if next_partition_idx < self.index_partitions.len() {
-                    let partition = self.load_index_partition(next_partition_idx)?;
-                    self.current_block_idx = 0;
-                    self.load_data_block_from_partition(&partition, 0)?;
-                    self.current_entry_idx = 0;
-                    self.position_after_block_change();
-                    self.after_data_block_positioned()?;
-                    return Ok(true);
-                }
-                // No more blocks
-                self.current_data_block = None;
-                self.position_after_block_change();
-                self.clear_scan_hot_blocks();
-                return Ok(false);
+                return self.load_next_position();
             }
 
             self.position_after_sequential_next();
@@ -1079,6 +1119,21 @@ impl<'a> KvIterator<'a> for SSTIterator {
 
     fn take_current(&mut self) -> Result<Option<(Bytes, KvValue)>> {
         Ok(SSTIterator::current(self)?.map(|(k, v)| (k, KvValue::Encoded(v))))
+    }
+
+    fn set_stop_at_block_boundary(&mut self, enabled: bool) {
+        self.should_stop_at_block_boundary = enabled;
+        self.boundary_state = BoundaryState::None;
+    }
+
+    fn clear_stop_at_block_boundary(&mut self) {
+        if self.boundary_state == BoundaryState::Stopped {
+            self.boundary_state = BoundaryState::ReadyToResume;
+        }
+    }
+
+    fn stopped_at_block_boundary(&self) -> bool {
+        self.boundary_state == BoundaryState::Stopped
     }
 }
 
@@ -1478,6 +1533,66 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all("/tmp/sst_prefix_scan_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_iterator_can_resume_after_block_boundary_stop() {
+        let _ = std::fs::remove_dir_all("/tmp/sst_block_boundary_resume_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/sst_block_boundary_resume_test")
+            .unwrap();
+
+        {
+            let writer_file = fs.open_write("resume.sst").unwrap();
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    block_size: 32,
+                    data_block_restart_interval: 1,
+                    ..SSTWriterOptions::default()
+                },
+            );
+            for key in [b"a1", b"b1", b"c1", b"d1"] {
+                writer.add(key.as_slice(), b"value").unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        {
+            let reader_file = fs.open_read("resume.sst").unwrap();
+            let mut iter =
+                SSTIterator::with_cache(reader_file, 0, SSTIteratorOptions::default(), None, None)
+                    .unwrap();
+            iter.seek_to_first().unwrap();
+            iter.set_stop_at_block_boundary(true);
+
+            let mut keys = vec![iter.key().unwrap().unwrap().to_vec()];
+            loop {
+                if iter.next().unwrap() {
+                    keys.push(iter.key().unwrap().unwrap().to_vec());
+                    continue;
+                }
+                if iter.stopped_at_block_boundary() {
+                    iter.clear_stop_at_block_boundary();
+                    continue;
+                }
+                break;
+            }
+
+            assert_eq!(
+                keys,
+                vec![
+                    b"a1".to_vec(),
+                    b"b1".to_vec(),
+                    b"c1".to_vec(),
+                    b"d1".to_vec()
+                ]
+            );
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_block_boundary_resume_test");
     }
 
     #[test]

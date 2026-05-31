@@ -2393,6 +2393,7 @@ mod tests {
                 ttl_provider: manager.lsm_tree.ttl_provider(),
                 schema,
                 column_family_id: 0,
+                should_stop_at_block_boundary: false,
             },
         );
         iter.seek(start_key.as_ref()).unwrap();

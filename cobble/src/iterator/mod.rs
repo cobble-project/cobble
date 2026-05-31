@@ -69,6 +69,29 @@ pub(crate) trait KvIterator<'a>: 'a {
     /// Consumes from internal cache; should be called at most once per position.
     fn take_value(&mut self) -> Result<Option<KvValue>>;
 
+    /// Enable or disable boundary-aware stopping for this iterator.
+    ///
+    /// When enabled, leaf iterators stop after crossing the next physical read
+    /// boundary they expose, such as an SST data block or Parquet row group.
+    /// Wrapper iterators surface the same stop upward so callers can return a
+    /// partial batch without forcing every child to stop in lockstep.
+    fn set_stop_at_block_boundary(&mut self, _enabled: bool) {}
+
+    /// Clear a previously reported boundary stop so iteration can continue.
+    ///
+    /// Callers should invoke this after observing `stopped_at_block_boundary()`
+    /// and consuming any rows already produced for the current batch.
+    fn clear_stop_at_block_boundary(&mut self) {}
+
+    /// Returns `true` when the iterator paused at a physical block boundary.
+    ///
+    /// This is a sticky signal until `clear_stop_at_block_boundary()` is
+    /// called, which lets upper layers return a batch first and then resume
+    /// from the same iterator state on the next poll.
+    fn stopped_at_block_boundary(&self) -> bool {
+        false
+    }
+
     /// Take ownership of both key and value.
     /// Consumes from internal cache; should be called at most once per position.
     fn take_current(&mut self) -> Result<Option<(Bytes, KvValue)>> {
@@ -112,5 +135,17 @@ impl<'a> KvIterator<'a> for Box<dyn for<'b> KvIterator<'b>> {
 
     fn take_value(&mut self) -> Result<Option<KvValue>> {
         (**self).take_value()
+    }
+
+    fn set_stop_at_block_boundary(&mut self, enabled: bool) {
+        (**self).set_stop_at_block_boundary(enabled);
+    }
+
+    fn clear_stop_at_block_boundary(&mut self) {
+        (**self).clear_stop_at_block_boundary();
+    }
+
+    fn stopped_at_block_boundary(&self) -> bool {
+        (**self).stopped_at_block_boundary()
     }
 }
