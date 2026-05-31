@@ -6,7 +6,8 @@
 //! - `CompactionExecutor`: Manages compaction execution in a thread pool
 
 use crate::cache::{
-    BlockCache, BlockCachePreload, ScanHotBlockRegistry, bucket_scoped_cache_namespace,
+    BlockCache, BlockCachePreload, ScanHotBlockRegistry, WriterHotBlockCache,
+    bucket_scoped_cache_namespace,
 };
 use crate::compaction::CompactionConfig;
 use crate::data_file::{DataFile, DataFileType};
@@ -21,7 +22,7 @@ use crate::iterator::{
 };
 use crate::lsm::{LevelEdit, VersionEdit};
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, SchemaManager};
-use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions, SSTWriter, SSTWriterHotBlockCache};
+use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions, SSTWriter};
 use crate::r#type::{key_bucket, key_column_family};
 use crate::vlog::{VlogEdit, VlogMergeCollector};
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
@@ -465,8 +466,23 @@ impl CompactionExecutor {
                         }
                     }
                     DataFileType::Parquet => {
-                        let iter =
-                            crate::parquet::ParquetIterator::from_data_file(reader, file, None)?;
+                        let cache_namespace = single_bucket_in_range(&file.effective_bucket_range)
+                            .map(|bucket| {
+                                bucket_scoped_cache_namespace(base_cache_namespace, bucket)
+                            })
+                            .unwrap_or(base_cache_namespace);
+                        let iter = crate::parquet::ParquetIterator::from_data_file_with_options(
+                            reader,
+                            file,
+                            None,
+                            None,
+                            crate::parquet::ParquetIteratorOptions {
+                                cache_namespace,
+                                hot_block_registry: scan_hot_blocks.as_ref().map(Arc::clone),
+                                observe_hot_blocks: scan_hot_blocks.is_some(),
+                                ..Default::default()
+                            },
+                        )?;
                         if file.needs_bucket_filter() {
                             Box::new(BucketFilterIterator::new(
                                 iter,
@@ -572,9 +588,7 @@ impl CompactionExecutor {
                                     .zip(hot_observed_cursor.as_ref())
                                     .zip(preload_block_keys.as_ref())
                                     .map(|((hot_blocks, observed_cursor), preloads)| {
-                                        SSTWriterHotBlockCache {
-                                            base_cache_namespace: task.cache_namespace,
-                                            output_file_id: file_id,
+                                        WriterHotBlockCache {
                                             hot_blocks: Arc::clone(hot_blocks),
                                             observed_cursor: Arc::clone(observed_cursor),
                                             preloads: Arc::clone(preloads),
@@ -586,13 +600,30 @@ impl CompactionExecutor {
                                     writer,
                                     options,
                                     hot_block_cache,
+                                    Some(task.cache_namespace),
+                                    Some(file_id),
                                 )) as Box<dyn FileBuilder>
                             }
-                            writer_options => {
-                                let factory = crate::compaction::make_data_file_builder_factory(
-                                    writer_options,
-                                );
-                                factory(Box::new(writer))
+                            WriterOptions::Parquet(options) => {
+                                let hot_block_cache = task
+                                    .scan_hot_blocks
+                                    .as_ref()
+                                    .zip(hot_observed_cursor.as_ref())
+                                    .zip(preload_block_keys.as_ref())
+                                    .map(|((hot_blocks, observed_cursor), preloads)| {
+                                        WriterHotBlockCache {
+                                            hot_blocks: Arc::clone(hot_blocks),
+                                            observed_cursor: Arc::clone(observed_cursor),
+                                            preloads: Arc::clone(preloads),
+                                        }
+                                    });
+                                Box::new(crate::parquet::ParquetWriter::with_options_and_hot_block_cache(
+                                    writer,
+                                    options,
+                                    hot_block_cache,
+                                    Some(task.cache_namespace),
+                                    Some(file_id),
+                                )?) as Box<dyn FileBuilder>
                             }
                         }
                     } else {
@@ -766,10 +797,13 @@ fn key_is_truncated_by_cursor_map(cursors: &TruncationCursorMap, encoded_key: &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::ScanHotBlockRegistry;
     use crate::file::{FileSystemRegistry, TrackedFileId};
     use crate::metrics_manager::MetricsManager;
     use crate::parquet::ParquetWriterOptions;
-    use crate::parquet::{ParquetIterator, ParquetWriter};
+    use crate::parquet::{
+        ParquetIterator, ParquetWriter, RandomAccessChunkReader, parquet_row_group_cache_keys,
+    };
     use crate::schema::Schema;
     use crate::sst::row_codec::{encode_key, encode_value};
     use crate::sst::{SSTWriter, SSTWriterOptions};
@@ -777,6 +811,8 @@ mod tests {
     use crate::r#type::{Key, Value};
     use crate::writer_options::{WriterOptions, WriterOptionsFactory};
     use bytes::Bytes;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
 
     fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {
         let value = Value::new(vec![Some(Column::new(ValueType::Put, data.to_vec()))]);
@@ -865,6 +901,26 @@ mod tests {
         );
         data_file.set_meta_bytes(meta_bytes);
         Ok(Arc::new(data_file))
+    }
+
+    fn parquet_hot_keys_for_first_row_group(
+        file_manager: &Arc<FileManager>,
+        file: &DataFile,
+        cache_namespace: u64,
+        num_columns: usize,
+    ) -> Vec<crate::cache::BlockCacheKey> {
+        let reader = file_manager.open_data_file_reader(file.file_id).unwrap();
+        let reader: Arc<dyn crate::file::RandomAccessFile> = Arc::new(reader);
+        let parquet_reader =
+            SerializedFileReader::new(RandomAccessChunkReader::from_arc(reader)).unwrap();
+        parquet_row_group_cache_keys(
+            parquet_reader.metadata().row_group(0),
+            cache_namespace,
+            file.file_id,
+            None,
+            num_columns,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1985,6 +2041,78 @@ mod tests {
         assert_eq!(rows[0].0, b"a".to_vec());
         assert_eq!(rows[1].0, b"b".to_vec());
         assert_eq!(rows[2].0, b"c".to_vec());
+        cleanup_test_dir(test_dir);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_compaction_input_parquet_output_parquet_records_hot_row_group_preloads() {
+        let test_dir = "/tmp/compaction_parquet_hot_preload_test";
+        cleanup_test_dir(test_dir);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", test_dir))
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-hot-parquet-test"));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
+        let num_columns = 1;
+        let input = create_test_parquet(
+            &file_manager,
+            vec![
+                (b"a", &make_value_bytes(b"va", num_columns)),
+                (b"b", &make_value_bytes(b"vb", num_columns)),
+                (b"c", &make_value_bytes(b"vc", num_columns)),
+            ],
+        )
+        .unwrap();
+        let options = CompactionConfig {
+            num_columns,
+            target_file_size: 1024 * 1024,
+            ..Default::default()
+        };
+        let factory = crate::compaction::make_data_file_builder_factory(WriterOptions::Parquet(
+            ParquetWriterOptions {
+                row_group_size_bytes: 16,
+                buffer_size: options.buffer_size,
+                num_columns,
+            },
+        ));
+        let writer_options = WriterOptions::Parquet(ParquetWriterOptions {
+            row_group_size_bytes: 16,
+            buffer_size: options.buffer_size,
+            num_columns,
+        });
+        let hot_cache_namespace = 1234u64;
+        let scan_hot_blocks =
+            ScanHotBlockRegistry::from_keys(parquet_hot_keys_for_first_row_group(
+                &file_manager,
+                input.as_ref(),
+                hot_cache_namespace,
+                num_columns,
+            ));
+        let task = CompactionTask::new(
+            Arc::new(CompactionTaskMetrics::new("test")),
+            Arc::new(crate::sst::SSTIteratorMetrics::new("test")),
+            0,
+            vec![SortedRun::new(0, vec![input])],
+            1,
+            Arc::clone(&file_manager),
+            factory,
+            DataFileType::Parquet,
+            Arc::new(crate::ttl::TTLProvider::disabled()),
+            schema_manager_for(num_columns),
+        )
+        .with_writer_options_factory(WriterOptionsFactory::from(&writer_options))
+        .with_scan_hot_blocks(hot_cache_namespace, scan_hot_blocks);
+        let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+        assert!(!result.preload_block_keys().is_empty());
+        assert!(result.preload_block_keys().iter().all(|preload| matches!(
+            preload.key.kind,
+            crate::cache::BlockCacheKind::ParquetData(_)
+        )));
         cleanup_test_dir(test_dir);
     }
 }

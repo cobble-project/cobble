@@ -4,11 +4,90 @@ use crate::file::{
     BufferedReader, BufferedWriter, File, FileId, RandomAccessFile, SequentialWriteFile,
 };
 use bytes::Bytes;
+use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::reader::{ChunkReader, Length};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
 pub(crate) const PARQUET_READER_BUFFER_SIZE: usize = 8192;
+
+pub(crate) fn parquet_data_cache_key(
+    namespace: u64,
+    file_id: FileId,
+    offset: u64,
+    length: usize,
+) -> Result<BlockCacheKey> {
+    let length = u32::try_from(length).map_err(|_| {
+        Error::IoError(format!(
+            "Parquet cache length {} exceeds u32 cache-key limit",
+            length
+        ))
+    })?;
+    Ok(BlockCacheKey {
+        namespace,
+        file_id,
+        block_id: offset,
+        kind: BlockCacheKind::ParquetData(length),
+    })
+}
+
+pub(crate) fn parquet_row_group_cache_keys(
+    row_group: &RowGroupMetaData,
+    namespace: u64,
+    file_id: FileId,
+    read_column_indices: Option<&[usize]>,
+    num_columns: usize,
+) -> Result<Vec<BlockCacheKey>> {
+    let mut column_indices =
+        Vec::with_capacity(2 + read_column_indices.map_or(num_columns, <[usize]>::len));
+    column_indices.push(0usize);
+    column_indices.push(1usize);
+    match read_column_indices {
+        Some(indices) => {
+            for &idx in indices {
+                column_indices.push(idx + 2);
+            }
+        }
+        None => {
+            for idx in 0..num_columns {
+                column_indices.push(idx + 2);
+            }
+        }
+    }
+    let mut keys = Vec::with_capacity(column_indices.len());
+    for column_idx in column_indices {
+        let column = row_group.column(column_idx);
+        let (offset, length) = column.byte_range();
+        keys.push(parquet_data_cache_key(
+            namespace,
+            file_id,
+            offset,
+            length as usize,
+        )?);
+    }
+    Ok(keys)
+}
+
+pub(crate) fn cache_parquet_data_block(
+    file: &dyn RandomAccessFile,
+    block_cache: &BlockCache,
+    key: BlockCacheKey,
+) -> Result<()> {
+    let length = match key.kind {
+        BlockCacheKind::ParquetData(length) => length as usize,
+        _ => {
+            return Err(Error::IoError(
+                "Expected parquet data block cache key".to_string(),
+            ));
+        }
+    };
+    if block_cache.get(&key).is_some() {
+        return Ok(());
+    }
+    let bytes = file.read_at(key.block_id as usize, length)?;
+    block_cache.insert(key, CachedBlock::ParquetBlock(bytes));
+    Ok(())
+}
 
 pub(crate) struct SequentialWriteFileAdapter<W: SequentialWriteFile> {
     inner: BufferedWriter<W>,
@@ -112,18 +191,13 @@ struct RandomAccessChunkReaderInner {
     file_size: usize,
     block_cache: Option<BlockCache>,
     file_id: Option<FileId>,
+    cache_namespace: u64,
 }
 
 impl RandomAccessChunkReaderInner {
     fn cache_key(&self, offset: usize, length: usize) -> Option<BlockCacheKey> {
         let file_id = self.file_id?;
-        let length = u32::try_from(length).ok()?;
-        Some(BlockCacheKey {
-            namespace: 0,
-            file_id,
-            block_id: offset as u64,
-            kind: BlockCacheKind::ParquetData(length),
-        })
+        parquet_data_cache_key(self.cache_namespace, file_id, offset as u64, length).ok()
     }
 
     fn read_from_buffered(&self, offset: usize, length: usize) -> Result<Bytes> {
@@ -159,13 +233,22 @@ pub(crate) struct RandomAccessChunkReader {
 
 impl RandomAccessChunkReader {
     pub(crate) fn from_arc(file: Arc<dyn RandomAccessFile>) -> Self {
-        Self::from_arc_with_cache(file, None, None)
+        Self::from_arc_with_cache_and_namespace(file, None, None, 0)
     }
 
     pub(crate) fn from_arc_with_cache(
         file: Arc<dyn RandomAccessFile>,
         file_id: Option<FileId>,
         block_cache: Option<BlockCache>,
+    ) -> Self {
+        Self::from_arc_with_cache_and_namespace(file, file_id, block_cache, 0)
+    }
+
+    pub(crate) fn from_arc_with_cache_and_namespace(
+        file: Arc<dyn RandomAccessFile>,
+        file_id: Option<FileId>,
+        block_cache: Option<BlockCache>,
+        cache_namespace: u64,
     ) -> Self {
         let file_size = file.size();
         let shared = SharedRandomAccessFile { inner: file };
@@ -178,6 +261,7 @@ impl RandomAccessChunkReader {
                 file_size,
                 block_cache,
                 file_id,
+                cache_namespace,
             }),
         }
     }

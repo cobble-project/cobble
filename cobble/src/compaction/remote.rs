@@ -1283,13 +1283,19 @@ fn send_compaction_request_to(
 mod tests {
     use super::*;
     use crate::VolumeDescriptor;
+    use crate::cache::{
+        BlockCache, BlockCacheKind, CachedBlock, MockCache, bucket_scoped_cache_namespace,
+    };
     use crate::compaction::{build_sst_writer_options, make_data_file_builder_factory};
     use crate::db_state::{DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion};
+    use crate::file::RandomAccessFile;
     use crate::lsm::{LSMTree, LSMTreeVersion, Level};
-    use crate::parquet::ParquetIterator;
+    use crate::parquet::{ParquetIterator, RandomAccessChunkReader, parquet_row_group_cache_keys};
     use crate::sst::row_codec::{decode_value, encode_key, encode_value};
     use crate::r#type::{Column, Key, KvValue, Value, ValueType};
     use crate::writer_options::WriterOptions;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
     use serial_test::serial;
     use size::Size;
     use std::collections::{HashMap, VecDeque};
@@ -1378,6 +1384,26 @@ mod tests {
         Ok(Arc::new(data_file))
     }
 
+    fn parquet_hot_keys_for_first_row_group(
+        file_manager: &Arc<FileManager>,
+        file: &DataFile,
+        cache_namespace: u64,
+        num_columns: usize,
+    ) -> Vec<BlockCacheKey> {
+        let reader = file_manager.open_data_file_reader(file.file_id).unwrap();
+        let reader: Arc<dyn RandomAccessFile> = Arc::new(reader);
+        let parquet_reader =
+            SerializedFileReader::new(RandomAccessChunkReader::from_arc(reader)).unwrap();
+        parquet_row_group_cache_keys(
+            parquet_reader.metadata().row_group(0),
+            cache_namespace,
+            file.file_id,
+            None,
+            num_columns,
+        )
+        .unwrap()
+    }
+
     #[test]
     #[serial(file)]
     fn test_remote_compaction_roundtrip_multiple_files() {
@@ -1443,10 +1469,10 @@ mod tests {
             truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
-        let lsm_tree = Arc::new(LSMTree::with_state(
-            Arc::clone(&db_state),
-            Arc::clone(&metrics_manager),
-        ));
+        let mut lsm_tree = LSMTree::with_state(Arc::clone(&db_state), Arc::clone(&metrics_manager));
+        let block_cache: BlockCache = Arc::new(MockCache::<BlockCacheKey, CachedBlock>::default());
+        lsm_tree.set_block_cache(Some(block_cache));
+        let lsm_tree = Arc::new(lsm_tree);
 
         let remote_timeout = Duration::from_millis(config.compaction_remote_timeout_ms);
         let server = Arc::new(RemoteCompactionServer::new(config.clone()).unwrap());
@@ -1610,10 +1636,10 @@ mod tests {
             truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
-        let lsm_tree = Arc::new(LSMTree::with_state(
-            Arc::clone(&db_state),
-            Arc::clone(&metrics_manager),
-        ));
+        let mut lsm_tree = LSMTree::with_state(Arc::clone(&db_state), Arc::clone(&metrics_manager));
+        let block_cache: BlockCache = Arc::new(MockCache::<BlockCacheKey, CachedBlock>::default());
+        lsm_tree.set_block_cache(Some(block_cache));
+        let lsm_tree = Arc::new(lsm_tree);
 
         let remote_timeout = Duration::from_millis(config.compaction_remote_timeout_ms);
         let server = Arc::new(RemoteCompactionServer::new(config.clone()).unwrap());
@@ -1750,10 +1776,10 @@ mod tests {
             truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
         });
-        let lsm_tree = Arc::new(LSMTree::with_state(
-            Arc::clone(&db_state),
-            Arc::clone(&metrics_manager),
-        ));
+        let mut lsm_tree = LSMTree::with_state(Arc::clone(&db_state), Arc::clone(&metrics_manager));
+        let block_cache: BlockCache = Arc::new(MockCache::<BlockCacheKey, CachedBlock>::default());
+        lsm_tree.set_block_cache(Some(block_cache));
+        let lsm_tree = Arc::new(lsm_tree);
 
         let remote_timeout = Duration::from_millis(config.compaction_remote_timeout_ms);
         let server = Arc::new(RemoteCompactionServer::new(config.clone()).unwrap());
@@ -1785,6 +1811,24 @@ mod tests {
         )
         .unwrap();
 
+        let base_cache_namespace = lsm_tree.cache_namespace();
+        let hot_cache_namespace =
+            if file_a.effective_bucket_range.start() == file_a.effective_bucket_range.end() {
+                bucket_scoped_cache_namespace(
+                    base_cache_namespace,
+                    *file_a.effective_bucket_range.start(),
+                )
+            } else {
+                base_cache_namespace
+            };
+        let mut hot_handle = lsm_tree.scan_hot_blocks().handle();
+        hot_handle.replace(parquet_hot_keys_for_first_row_group(
+            &file_manager,
+            file_a.as_ref(),
+            hot_cache_namespace,
+            num_columns,
+        ));
+
         let runs = vec![
             SortedRun::new(0, vec![file_a]),
             SortedRun::new(0, vec![file_b]),
@@ -1799,8 +1843,16 @@ mod tests {
             )
             .expect("compaction handle");
         let runtime = Runtime::new().unwrap();
-        runtime.block_on(handle).unwrap().unwrap();
+        let result = runtime.block_on(handle).unwrap().unwrap();
         let _ = server_thread.join();
+
+        assert!(!result.preload_block_keys().is_empty());
+        assert!(
+            result
+                .preload_block_keys()
+                .iter()
+                .all(|preload| matches!(preload.key.kind, BlockCacheKind::ParquetData(_)))
+        );
 
         let level1 = lsm_tree.level_files(1);
         assert!(!level1.is_empty());

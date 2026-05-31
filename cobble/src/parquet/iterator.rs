@@ -1,10 +1,12 @@
-use crate::cache::BlockCache;
+use crate::cache::{BlockCache, BlockCacheKey, ScanHotBlockHandle, ScanHotBlockRegistry};
 use crate::data_file::DataFile;
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
 use crate::iterator::KvIterator;
-use crate::parquet::file_adapter::RandomAccessChunkReader;
 use crate::parquet::meta::{ParquetRowGroupRange, decode_meta_row_group_ranges};
+use crate::parquet::{
+    RandomAccessChunkReader, cache_parquet_data_block, parquet_row_group_cache_keys,
+};
 use crate::sst::row_codec::encode_value;
 use crate::r#type::{Column, KvValue, Value, ValueType};
 use bytes::Bytes;
@@ -18,6 +20,19 @@ const PARQUET_ITERATOR_BATCH_ROWS: usize = 256;
 
 type ByteArrayColumnReader = ColumnReaderImpl<ByteArrayType>;
 type Int64ColumnReader = ColumnReaderImpl<Int64Type>;
+type RowGroupCacheKeys = Vec<Vec<BlockCacheKey>>;
+
+#[derive(Clone, Default)]
+pub(crate) struct ParquetIteratorOptions {
+    /// Namespace used to isolate parquet cache keys across shards/dbs.
+    pub cache_namespace: u64,
+    /// Preload the next row group's parquet column chunks during scan iteration.
+    pub preload_next_row_group: bool,
+    /// Shared physical-block tracker for cursor-adjacent scan row groups.
+    pub hot_block_registry: Option<Arc<ScanHotBlockRegistry>>,
+    /// Mark registry hits when this iterator is used as compaction input.
+    pub observe_hot_blocks: bool,
+}
 
 pub(crate) struct ParquetIterator {
     file: Arc<dyn RandomAccessFile>,
@@ -38,6 +53,15 @@ pub(crate) struct ParquetIterator {
     current_batch_row_group_idx: Option<usize>,
     current_idx: Option<usize>,
     previous_key: Option<Bytes>,
+    /// Shared scan/compaction knobs for row-group preloading and hot-key observation.
+    options: ParquetIteratorOptions,
+    /// Handle that keeps the current and next row group's chunk keys live in the
+    /// shared `ScanHotBlockRegistry` while this iterator is positioned on a row.
+    hot_block_handle: Option<ScanHotBlockHandle>,
+    /// Cache keys for the parquet chunks that belong to each row group. We reuse
+    /// the exact keys that `RandomAccessChunkReader` uses so scan preloading,
+    /// compaction input observation, and async output warming all share one path.
+    row_group_cache_keys: Option<RowGroupCacheKeys>,
     /// Runtime configuration for whether crossing into a new Parquet row group
     /// should be surfaced as a stop instead of continuing immediately.
     should_stop_at_block_boundary: bool,
@@ -61,7 +85,14 @@ enum BoundaryState {
 
 impl ParquetIterator {
     pub(crate) fn new(file: Box<dyn RandomAccessFile>) -> Result<Self> {
-        Self::new_with_ranges(file, None, None, None, None)
+        Self::new_with_ranges(
+            file,
+            None,
+            None,
+            None,
+            ParquetIteratorOptions::default(),
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -69,7 +100,14 @@ impl ParquetIterator {
         file: Box<dyn RandomAccessFile>,
         column_indices: Option<&[usize]>,
     ) -> Result<Self> {
-        Self::new_with_ranges(file, None, None, None, column_indices)
+        Self::new_with_ranges(
+            file,
+            None,
+            None,
+            None,
+            ParquetIteratorOptions::default(),
+            column_indices,
+        )
     }
 
     pub(crate) fn from_data_file(
@@ -77,7 +115,25 @@ impl ParquetIterator {
         data_file: &DataFile,
         block_cache: Option<BlockCache>,
     ) -> Result<Self> {
-        Self::from_data_file_with_columns(file, data_file, block_cache, None)
+        Self::from_data_file_with_options(file, data_file, block_cache, None, Default::default())
+    }
+
+    pub(crate) fn from_data_file_with_options(
+        file: Box<dyn RandomAccessFile>,
+        data_file: &DataFile,
+        block_cache: Option<BlockCache>,
+        column_indices: Option<&[usize]>,
+        options: ParquetIteratorOptions,
+    ) -> Result<Self> {
+        let row_group_ranges = decode_meta_row_group_ranges(data_file.meta_bytes())?;
+        Self::new_with_ranges(
+            file,
+            row_group_ranges,
+            Some(data_file.file_id),
+            block_cache,
+            options,
+            column_indices,
+        )
     }
 
     pub(crate) fn from_data_file_with_columns(
@@ -86,13 +142,12 @@ impl ParquetIterator {
         block_cache: Option<BlockCache>,
         column_indices: Option<&[usize]>,
     ) -> Result<Self> {
-        let row_group_ranges = decode_meta_row_group_ranges(data_file.meta_bytes())?;
-        Self::new_with_ranges(
+        Self::from_data_file_with_options(
             file,
-            row_group_ranges,
-            Some(data_file.file_id),
+            data_file,
             block_cache,
             column_indices,
+            Default::default(),
         )
     }
 
@@ -101,13 +156,27 @@ impl ParquetIterator {
         row_group_ranges: Option<Vec<ParquetRowGroupRange>>,
         file_id: Option<u64>,
         block_cache: Option<BlockCache>,
+        options: ParquetIteratorOptions,
         column_indices: Option<&[usize]>,
     ) -> Result<Self> {
         let file = Arc::from(file);
-        let total_row_groups = Self::row_group_count(&file, file_id, block_cache.clone())?;
-        let row_group_ranges = row_group_ranges.filter(|ranges| ranges.len() == total_row_groups);
-        let num_columns = Self::num_columns(&file, file_id, block_cache.clone())?;
         let read_column_indices = column_indices.map(|v| v.to_vec());
+        let needs_row_group_cache_keys =
+            file_id.is_some() && (options.preload_next_row_group || options.observe_hot_blocks);
+        let (total_row_groups, num_columns, row_group_cache_keys) = Self::inspect_file_layout(
+            &file,
+            file_id,
+            block_cache.clone(),
+            options.cache_namespace,
+            read_column_indices.as_deref(),
+            needs_row_group_cache_keys,
+        )?;
+        let row_group_ranges = row_group_ranges.filter(|ranges| ranges.len() == total_row_groups);
+        let hot_block_handle = options
+            .preload_next_row_group
+            .then(|| options.hot_block_registry.as_ref().map(Arc::clone))
+            .flatten()
+            .map(|registry| registry.handle());
         Ok(Self {
             file,
             file_id,
@@ -127,23 +196,35 @@ impl ParquetIterator {
             current_batch_row_group_idx: None,
             current_idx: None,
             previous_key: None,
+            options,
+            hot_block_handle,
+            row_group_cache_keys,
             should_stop_at_block_boundary: false,
             boundary_state: BoundaryState::None,
         })
     }
 
-    fn num_columns(
+    fn inspect_file_layout(
         file: &Arc<dyn RandomAccessFile>,
         file_id: Option<u64>,
         block_cache: Option<BlockCache>,
-    ) -> Result<usize> {
-        let chunk_reader =
-            RandomAccessChunkReader::from_arc_with_cache(Arc::clone(file), file_id, block_cache);
+        cache_namespace: u64,
+        read_column_indices: Option<&[usize]>,
+        collect_row_group_cache_keys: bool,
+    ) -> Result<(usize, usize, Option<RowGroupCacheKeys>)> {
+        let chunk_reader = RandomAccessChunkReader::from_arc_with_cache_and_namespace(
+            Arc::clone(file),
+            file_id,
+            block_cache,
+            cache_namespace,
+        );
         let reader = SerializedFileReader::new(chunk_reader)
             .map_err(|err| Error::IoError(format!("Failed to open parquet reader: {}", err)))?;
         let metadata = reader.metadata();
-        if metadata.num_row_groups() == 0 {
-            return Ok(1);
+        let total_row_groups = metadata.num_row_groups();
+        let mut row_group_cache_keys = collect_row_group_cache_keys.then(Vec::new);
+        if total_row_groups == 0 {
+            return Ok((0, 1, row_group_cache_keys));
         }
         let schema_descr = metadata.file_metadata().schema_descr();
         let num_fields = schema_descr.num_columns();
@@ -153,35 +234,26 @@ impl ParquetIterator {
                 num_fields
             )));
         }
-        Ok(num_fields - 2)
-    }
-
-    fn row_group_count(
-        file: &Arc<dyn RandomAccessFile>,
-        file_id: Option<u64>,
-        block_cache: Option<BlockCache>,
-    ) -> Result<usize> {
-        let chunk_reader =
-            RandomAccessChunkReader::from_arc_with_cache(Arc::clone(file), file_id, block_cache);
-        let reader = SerializedFileReader::new(chunk_reader)
-            .map_err(|err| Error::IoError(format!("Failed to open parquet reader: {}", err)))?;
-        let metadata = reader.metadata();
-        let count = metadata.num_row_groups();
-        if count == 0 {
-            return Ok(0);
-        }
-        for idx in 0..count {
-            let row_group = reader.get_row_group(idx).map_err(|err| {
-                Error::IoError(format!("Failed to get parquet row group {}: {}", idx, err))
-            })?;
-            if row_group.num_columns() < 3 {
+        let num_columns = num_fields - 2;
+        for idx in 0..total_row_groups {
+            let row_group = metadata.row_group(idx);
+            if row_group.columns().len() < 3 {
                 return Err(Error::IoError(format!(
                     "Unsupported parquet kv column count: {}",
-                    row_group.num_columns()
+                    row_group.columns().len()
                 )));
             }
+            if let (Some(file_id), Some(cache_keys)) = (file_id, row_group_cache_keys.as_mut()) {
+                cache_keys.push(parquet_row_group_cache_keys(
+                    row_group,
+                    cache_namespace,
+                    file_id,
+                    read_column_indices,
+                    num_columns,
+                )?);
+            }
         }
-        Ok(count)
+        Ok((total_row_groups, num_columns, row_group_cache_keys))
     }
 
     fn open_row_group_readers(
@@ -191,14 +263,19 @@ impl ParquetIterator {
         read_column_indices: Option<&[usize]>,
         file_id: Option<u64>,
         block_cache: Option<BlockCache>,
+        cache_namespace: u64,
     ) -> Result<(
         usize,
         ByteArrayColumnReader,
         Int64ColumnReader,
         Vec<Option<ByteArrayColumnReader>>,
     )> {
-        let chunk_reader =
-            RandomAccessChunkReader::from_arc_with_cache(Arc::clone(file), file_id, block_cache);
+        let chunk_reader = RandomAccessChunkReader::from_arc_with_cache_and_namespace(
+            Arc::clone(file),
+            file_id,
+            block_cache,
+            cache_namespace,
+        );
         let reader = SerializedFileReader::new(chunk_reader)
             .map_err(|err| Error::IoError(format!("Failed to open parquet reader: {}", err)))?;
         let row_group = reader.get_row_group(row_group_idx).map_err(|err| {
@@ -269,6 +346,72 @@ impl ParquetIterator {
         self.current_batch_row_group_idx = None;
         self.current_idx = None;
         self.previous_key = None;
+        self.clear_scan_hot_blocks();
+    }
+
+    fn clear_scan_hot_blocks(&mut self) {
+        if let Some(handle) = &mut self.hot_block_handle {
+            handle.replace(Vec::new());
+        }
+    }
+
+    fn observe_row_group_hot_blocks(&self, row_group_idx: usize) {
+        if !self.options.observe_hot_blocks {
+            return;
+        }
+        let Some(registry) = &self.options.hot_block_registry else {
+            return;
+        };
+        let Some(keys) = self
+            .row_group_cache_keys
+            .as_ref()
+            .and_then(|groups| groups.get(row_group_idx))
+        else {
+            return;
+        };
+        for key in keys {
+            registry.observe_if_hot(*key);
+        }
+    }
+
+    fn after_row_group_positioned(&mut self) -> Result<()> {
+        if !self.options.preload_next_row_group {
+            return Ok(());
+        }
+        if !self.valid() {
+            self.clear_scan_hot_blocks();
+            return Ok(());
+        }
+        let Some(row_group_keys) = self.row_group_cache_keys.as_ref() else {
+            self.clear_scan_hot_blocks();
+            return Ok(());
+        };
+        let Some(current_row_group_idx) = self.current_batch_row_group_idx else {
+            self.clear_scan_hot_blocks();
+            return Ok(());
+        };
+
+        let mut hot_blocks = row_group_keys
+            .get(current_row_group_idx)
+            .cloned()
+            .unwrap_or_default();
+        let next_row_group_idx = if self.current_row_group_idx == current_row_group_idx {
+            current_row_group_idx + 1
+        } else {
+            self.current_row_group_idx
+        };
+        if let Some(next_keys) = row_group_keys.get(next_row_group_idx) {
+            hot_blocks.extend(next_keys.iter().copied());
+            if let Some(cache) = &self.block_cache {
+                for key in next_keys {
+                    cache_parquet_data_block(self.file.as_ref(), cache, *key)?;
+                }
+            }
+        }
+        if let Some(handle) = &mut self.hot_block_handle {
+            handle.replace(hot_blocks);
+        }
+        Ok(())
     }
 
     fn ensure_active_row_group(&mut self) -> Result<bool> {
@@ -288,6 +431,7 @@ impl ParquetIterator {
             {
                 return Ok(true);
             }
+            self.observe_row_group_hot_blocks(self.current_row_group_idx);
             let (rows, key_reader, expired_at_reader, column_readers) =
                 Self::open_row_group_readers(
                     &self.file,
@@ -296,6 +440,7 @@ impl ParquetIterator {
                     self.read_column_indices.as_deref(),
                     self.file_id,
                     self.block_cache.clone(),
+                    self.options.cache_namespace,
                 )?;
             self.current_group_rows = rows;
             self.current_group_rows_loaded = 0;
@@ -320,6 +465,7 @@ impl ParquetIterator {
                 self.batch_values.clear();
                 self.current_batch_row_group_idx = None;
                 self.current_idx = None;
+                self.clear_scan_hot_blocks();
                 return Ok(false);
             }
             let batch_row_group_idx = self.current_row_group_idx;
@@ -510,6 +656,7 @@ impl ParquetIterator {
             }
             self.current_batch_row_group_idx = Some(batch_row_group_idx);
             self.current_idx = (!self.batch_keys.is_empty()).then_some(0);
+            self.after_row_group_positioned()?;
             return Ok(self.current_idx.is_some());
         }
     }

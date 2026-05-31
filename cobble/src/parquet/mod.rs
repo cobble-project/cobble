@@ -3,8 +3,11 @@ mod iterator;
 mod meta;
 mod writer;
 
+pub(crate) use file_adapter::{
+    RandomAccessChunkReader, cache_parquet_data_block, parquet_row_group_cache_keys,
+};
 #[allow(unused_imports)]
-pub(crate) use iterator::ParquetIterator;
+pub(crate) use iterator::{ParquetIterator, ParquetIteratorOptions};
 #[allow(unused_imports)]
 pub(crate) use meta::{decode_meta_row_count, decode_meta_row_group_ranges};
 #[allow(unused_imports)]
@@ -13,11 +16,16 @@ pub(crate) use writer::{ParquetWriter, ParquetWriterOptions};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{FileSystemRegistry, RandomAccessFile};
+    use crate::cache::{BlockCache, BlockCacheKey, CachedBlock, MockCache};
+    use crate::data_file::{DataFile, DataFileType};
+    use crate::file::{FileSystemRegistry, RandomAccessFile, TrackedFileId};
     use crate::iterator::KvIterator;
     use crate::parquet::meta::decode_meta_row_group_ranges;
     use crate::sst::row_codec::{decode_value, encode_value};
     use crate::r#type::{Column, Value, ValueType};
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+    use std::sync::Arc;
 
     fn cleanup_test_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
@@ -27,6 +35,93 @@ mod tests {
         let registry = FileSystemRegistry::new();
         let fs = registry.get_or_register(path).unwrap();
         fs.open_read("test.parquet").unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_parquet_iterator_preloads_next_row_group_into_cache() {
+        let root = "file:///tmp/parquet_row_group_preload_test";
+        cleanup_test_root("/tmp/parquet_row_group_preload_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(root).unwrap();
+        let writer_file = fs.open_write("test.parquet").unwrap();
+        let file_id = 91u64;
+        let cache_namespace = 77u64;
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            ParquetWriterOptions {
+                row_group_size_bytes: 6,
+                num_columns: 1,
+                ..ParquetWriterOptions::default()
+            },
+        )
+        .unwrap();
+        for (key, value) in [
+            (b"a1".as_slice(), b"v1".as_slice()),
+            (b"a2".as_slice(), b"v2".as_slice()),
+            (b"b1".as_slice(), b"v3".as_slice()),
+            (b"b2".as_slice(), b"v4".as_slice()),
+        ] {
+            let encoded = encode_value(
+                &Value::new(vec![Some(Column::new(ValueType::Put, value.to_vec()))]),
+                1,
+            );
+            writer.add(key, &encoded).unwrap();
+        }
+        let (start_key, end_key, file_size, meta) = writer.finish().unwrap();
+        let data_file = DataFile::new(
+            DataFileType::Parquet,
+            start_key,
+            end_key,
+            file_id,
+            TrackedFileId::detached(file_id),
+            0,
+            file_size,
+            0..=0,
+            0..=0,
+        );
+        data_file.set_meta_bytes(meta);
+
+        let mock = Arc::new(MockCache::<BlockCacheKey, CachedBlock>::default());
+        let cache: BlockCache = mock.clone();
+        let reader = fs.open_read("test.parquet").unwrap();
+        let mut iter = ParquetIterator::from_data_file_with_options(
+            Box::new(reader),
+            &data_file,
+            Some(cache.clone()),
+            None,
+            ParquetIteratorOptions {
+                cache_namespace,
+                preload_next_row_group: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        iter.seek_to_first().unwrap();
+        assert!(iter.valid());
+
+        let meta_reader: Arc<dyn RandomAccessFile> =
+            Arc::new(fs.open_read("test.parquet").unwrap());
+        let parquet_reader =
+            SerializedFileReader::new(RandomAccessChunkReader::from_arc(meta_reader)).unwrap();
+        let expected_next_row_group_keys = parquet_row_group_cache_keys(
+            parquet_reader.metadata().row_group(1),
+            cache_namespace,
+            file_id,
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(!expected_next_row_group_keys.is_empty());
+        for key in expected_next_row_group_keys {
+            assert!(
+                cache.get(&key).is_some(),
+                "expected next row-group cache key {:?} to be warmed",
+                key
+            );
+        }
+
+        cleanup_test_root("/tmp/parquet_row_group_preload_test");
     }
 
     #[test]

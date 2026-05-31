@@ -1,6 +1,4 @@
-use crate::cache::{
-    BlockCachePreload, ScanHotBlockRegistry, bucket_scoped_cache_namespace, data_block_cache_key,
-};
+use crate::cache::{WriterHotBlockCache, bucket_scoped_cache_namespace, data_block_cache_key};
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, SequentialWriteFile};
 use crate::format::FileBuilder;
@@ -11,9 +9,6 @@ use crate::sst::row_codec::{encode_key, encode_value};
 use crate::r#type::{Key, KvValue, Value, key_bucket};
 use bytes::{BufMut, Bytes, BytesMut};
 use metrics::{Histogram, histogram};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-
 #[derive(Clone)]
 struct DataBlockMeta {
     first_key: Vec<u8>,
@@ -62,21 +57,6 @@ pub struct SSTWriterOptions {
     pub value_has_ttl: bool,
 }
 
-#[derive(Clone)]
-pub(crate) struct SSTWriterHotBlockCache {
-    pub(crate) base_cache_namespace: u64,
-    pub(crate) output_file_id: u64,
-    /// Shared registry described in `cache::ScanHotBlockRegistry`.
-    ///
-    /// Compaction input iterators bump the registry counter when they read a
-    /// scan-hot block. This writer watches that counter and records the output
-    /// data block key that should be asynchronously loaded after compaction
-    /// completes, including remote compaction responses.
-    pub(crate) hot_blocks: Arc<ScanHotBlockRegistry>,
-    pub(crate) observed_cursor: Arc<AtomicU64>,
-    pub(crate) preloads: Arc<Mutex<Vec<BlockCachePreload>>>,
-}
-
 impl Default for SSTWriterOptions {
     fn default() -> Self {
         Self {
@@ -106,18 +86,22 @@ pub struct SSTWriter<W: SequentialWriteFile> {
     current_block_first_key: Option<Vec<u8>>,
     pending_data_blocks: Vec<DataBlockMeta>,
     cache_current_data_block: bool,
-    hot_block_cache: Option<SSTWriterHotBlockCache>,
+    hot_block_cache: Option<WriterHotBlockCache>,
+    hot_block_cache_namespace: Option<u64>,
+    hot_block_output_file_id: Option<u64>,
 }
 
 impl<W: SequentialWriteFile> SSTWriter<W> {
     pub fn new(writer: W, options: SSTWriterOptions) -> Self {
-        Self::new_with_hot_block_cache(writer, options, None)
+        Self::new_with_hot_block_cache(writer, options, None, None, None)
     }
 
     pub(crate) fn new_with_hot_block_cache(
         writer: W,
         options: SSTWriterOptions,
-        hot_block_cache: Option<SSTWriterHotBlockCache>,
+        hot_block_cache: Option<WriterHotBlockCache>,
+        hot_block_cache_namespace: Option<u64>,
+        hot_block_output_file_id: Option<u64>,
     ) -> Self {
         let buffered_writer = BufferedWriter::new(writer, options.buffer_size);
         let data_block_builder = BlockBuilder::new_with_prefix(
@@ -147,6 +131,8 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             pending_data_blocks: Vec::new(),
             cache_current_data_block: false,
             hot_block_cache,
+            hot_block_cache_namespace,
+            hot_block_output_file_id,
         }
     }
 
@@ -267,28 +253,27 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         // in `SSTIterator::read_data_block_from_partition`; when it observes a
         // scan-hot input block, this counter changes and the current output block
         // is marked for preload in `record_block_cache_preload_if_hot`.
-        let observed = cache.hot_blocks.observed_count();
-        let cursor = cache.observed_cursor.load(Ordering::Acquire);
-        if observed != cursor {
-            cache.observed_cursor.store(observed, Ordering::Release);
-            self.cache_current_data_block = true;
-        }
+        cache.refresh_observation(&mut self.cache_current_data_block);
     }
 
     fn record_block_cache_preload_if_hot(&self, first_key: &[u8], offset: u64, size: usize) {
-        if !self.cache_current_data_block {
-            return;
-        }
         let Some(cache) = &self.hot_block_cache else {
             return;
         };
+        let Some(base_cache_namespace) = self.hot_block_cache_namespace else {
+            return;
+        };
+        let Some(output_file_id) = self.hot_block_output_file_id else {
+            return;
+        };
         let namespace = key_bucket(first_key)
-            .map(|bucket| bucket_scoped_cache_namespace(cache.base_cache_namespace, bucket))
-            .unwrap_or(cache.base_cache_namespace);
-        cache.preloads.lock().unwrap().push(BlockCachePreload {
-            key: data_block_cache_key(namespace, cache.output_file_id, offset),
+            .map(|bucket| bucket_scoped_cache_namespace(base_cache_namespace, bucket))
+            .unwrap_or(base_cache_namespace);
+        cache.push_preload(
+            data_block_cache_key(namespace, output_file_id, offset),
             size,
-        });
+            self.cache_current_data_block,
+        );
     }
 
     fn record_compression_ratio(&self, raw_len: usize, compressed_len: usize) {

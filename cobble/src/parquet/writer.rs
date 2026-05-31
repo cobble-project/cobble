@@ -1,10 +1,11 @@
+use crate::cache::{WriterHotBlockCache, bucket_scoped_cache_namespace};
 use crate::error::{Error, Result};
 use crate::file::{File, SequentialWriteFile};
 use crate::format::FileBuilder;
-use crate::parquet::file_adapter::SequentialWriteFileAdapter;
+use crate::parquet::file_adapter::{SequentialWriteFileAdapter, parquet_row_group_cache_keys};
 use crate::parquet::meta::{ParquetMeta, ParquetRowGroupRange};
 use crate::sst::row_codec::decode_value;
-use crate::r#type::{KvValue, Value};
+use crate::r#type::{KvValue, Value, key_bucket};
 use bytes::Bytes;
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::writer::SerializedFileWriter;
@@ -55,6 +56,13 @@ pub(crate) struct ParquetWriter<W: SequentialWriteFile> {
     column_payload_values: Vec<Vec<ByteArray>>,
     column_payload_def_levels: Vec<Vec<i16>>,
     row_group_ranges: Vec<ParquetRowGroupRange>,
+    /// Armed when compaction input observed a scan-hot parquet chunk while rows
+    /// for the current output row group were being written.
+    cache_current_row_group: bool,
+    hot_block_cache: Option<WriterHotBlockCache>,
+    /// Output-cache addressing shared with scan iterators and async preload.
+    hot_block_cache_namespace: Option<u64>,
+    hot_block_output_file_id: Option<u64>,
 }
 
 impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
@@ -63,6 +71,16 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
     }
 
     pub(crate) fn with_options(writer: W, options: ParquetWriterOptions) -> Result<Self> {
+        Self::with_options_and_hot_block_cache(writer, options, None, None, None)
+    }
+
+    pub(crate) fn with_options_and_hot_block_cache(
+        writer: W,
+        options: ParquetWriterOptions,
+        hot_block_cache: Option<WriterHotBlockCache>,
+        hot_block_cache_namespace: Option<u64>,
+        hot_block_output_file_id: Option<u64>,
+    ) -> Result<Self> {
         let num_columns = options.num_columns.max(1);
         let row_group_size_bytes = options.row_group_size_bytes.max(1);
         let schema = Arc::new(
@@ -94,6 +112,10 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
             column_payload_values: vec![Vec::new(); num_columns],
             column_payload_def_levels: vec![Vec::new(); num_columns],
             row_group_ranges: Vec::new(),
+            cache_current_row_group: false,
+            hot_block_cache,
+            hot_block_cache_namespace,
+            hot_block_output_file_id,
         })
     }
 
@@ -158,13 +180,17 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
                 ))
             })?;
         }
-        row_group
+        let row_group_metadata = row_group
             .close()
             .map_err(|err| Error::IoError(format!("Failed to close row group: {}", err)))?;
 
         let start_key = self.current_group_start_key.take().ok_or_else(|| {
             Error::IoError("Parquet row group missing start key during flush".to_string())
         })?;
+        self.record_row_group_cache_preloads_if_hot(
+            start_key.as_slice(),
+            row_group_metadata.as_ref(),
+        )?;
         let end_key = mem::take(&mut self.current_group_end_key);
         self.row_group_ranges
             .push(ParquetRowGroupRange { start_key, end_key });
@@ -177,6 +203,7 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
             col_levels.clear();
         }
         self.current_group_bytes = 0;
+        self.cache_current_row_group = false;
         Ok(())
     }
 
@@ -198,6 +225,7 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
         entry_bytes: usize,
         num_columns: usize,
     ) -> Result<()> {
+        self.refresh_hot_block_observation();
         if !self.last_key.is_empty() && key <= self.last_key.as_slice() {
             return Err(Error::IoError(format!(
                 "Keys must be added in sorted order: {:?} <= {:?}",
@@ -234,6 +262,46 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
             } else {
                 self.column_payload_def_levels[idx].push(0);
             }
+        }
+        Ok(())
+    }
+
+    fn refresh_hot_block_observation(&mut self) {
+        let Some(cache) = &self.hot_block_cache else {
+            return;
+        };
+        cache.refresh_observation(&mut self.cache_current_row_group);
+    }
+
+    fn record_row_group_cache_preloads_if_hot(
+        &self,
+        start_key: &[u8],
+        row_group_metadata: &parquet::file::metadata::RowGroupMetaData,
+    ) -> Result<()> {
+        let Some(cache) = &self.hot_block_cache else {
+            return Ok(());
+        };
+        let Some(base_cache_namespace) = self.hot_block_cache_namespace else {
+            return Ok(());
+        };
+        let Some(output_file_id) = self.hot_block_output_file_id else {
+            return Ok(());
+        };
+        let namespace = key_bucket(start_key)
+            .map(|bucket| bucket_scoped_cache_namespace(base_cache_namespace, bucket))
+            .unwrap_or(base_cache_namespace);
+        for key in parquet_row_group_cache_keys(
+            row_group_metadata,
+            namespace,
+            output_file_id,
+            None,
+            self.options.num_columns,
+        )? {
+            let size = match key.kind {
+                crate::cache::BlockCacheKind::ParquetData(length) => length as usize,
+                _ => continue,
+            };
+            cache.push_preload(key, size, self.cache_current_row_group);
         }
         Ok(())
     }

@@ -10,4 +10,4 @@ pub(crate) use block::{
 #[cfg(test)]
 pub use handle::MockCache;
 pub use handle::{CacheHandle, FoyerCache};
-pub(crate) use preload::{BlockCachePreload, BlockCachePreloadWorker};
+pub(crate) use preload::{BlockCachePreload, BlockCachePreloadWorker, WriterHotBlockCache};

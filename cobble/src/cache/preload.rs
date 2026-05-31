@@ -1,6 +1,7 @@
-use super::{BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock};
+use super::{BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock, ScanHotBlockRegistry};
 use crate::db_status::{DbLifecycle, DbLifecycleState};
 use crate::file::{FileManager, RandomAccessFile};
+use crate::parquet::cache_parquet_data_block;
 use crate::sst::compression::decode_block_bytes;
 use crate::sst::format::Block;
 use dashmap::DashMap;
@@ -18,12 +19,70 @@ pub(crate) struct BlockCachePreload {
     pub(crate) size: usize,
 }
 
+/// Writer-side bridge between `ScanHotBlockRegistry` and deferred cache preload.
+///
+/// `ScanHotBlockRegistry` lives on the scan / compaction-input side and answers
+/// one question: "did this compaction read touch a block that is currently hot
+/// for some foreground scan?" `WriterHotBlockCache` is the writer-side handoff
+/// for that signal:
+/// - `refresh_observation()` notices when the reader side observed a hot input
+///   block and arms the writer's current output block / row group.
+/// - `push_preload()` records the output cache key that should be preloaded once
+///   compaction finishes and the new file is safely readable through
+///   `BlockCachePreloadWorker`.
+///
+/// It does not hold cached block bytes itself and it is not the `BlockCache`.
+/// It only carries the observation counter plus the shared `preloads` vector
+/// that later drives actual cache population.
+#[derive(Clone)]
+pub(crate) struct WriterHotBlockCache {
+    /// Shared registry that tracks which physical input blocks are adjacent to
+    /// active scans.
+    pub(crate) hot_blocks: Arc<ScanHotBlockRegistry>,
+    /// Last `observed_count()` value consumed by this writer. When the count
+    /// advances, the current output block / row group should be marked hot.
+    pub(crate) observed_cursor: Arc<std::sync::atomic::AtomicU64>,
+    /// Deferred output cache entries collected during compaction. The preload
+    /// worker consumes these after the result files are registered locally.
+    pub(crate) preloads: Arc<Mutex<Vec<BlockCachePreload>>>,
+}
+
+impl WriterHotBlockCache {
+    /// Arms the caller's current output unit when the reader side has observed
+    /// a newly hot input block since the last writer check.
+    pub(crate) fn refresh_observation(&self, should_preload_current_block: &mut bool) {
+        let observed = self.hot_blocks.observed_count();
+        let cursor = self.observed_cursor.load(Ordering::Acquire);
+        if observed != cursor {
+            self.observed_cursor.store(observed, Ordering::Release);
+            *should_preload_current_block = true;
+        }
+    }
+
+    /// Records an output cache entry for later background preload if the caller
+    /// has already armed the current output block / row group.
+    pub(crate) fn push_preload(&self, key: BlockCacheKey, size: usize, armed: bool) {
+        if !armed {
+            return;
+        }
+        self.preloads
+            .lock()
+            .unwrap()
+            .push(BlockCachePreload { key, size });
+    }
+}
+
 /// Loads compaction-produced blocks into the local block cache in the background.
 ///
 /// The hot-block flow spans four files:
-/// - `sst/iterator.rs` registers scan current/next input block keys and lets
-///   compaction input iterators call `ScanHotBlockRegistry::observe_if_hot`.
-/// - `sst/writer.rs` converts those observations into output `BlockCacheKey`s.
+/// - `ScanHotBlockRegistry` in `cache/block.rs` tracks the physical cache keys
+///   currently adjacent to foreground scans.
+/// - scan iterators register current/next SST data blocks or current/next
+///   Parquet row-group chunk keys there, and compaction input iterators call
+///   `ScanHotBlockRegistry::observe_if_hot`.
+/// - `WriterHotBlockCache` in this file bridges those observations to the file
+///   writers, which convert them into output `BlockCacheKey`s.
+/// - file writers convert those observations into output `BlockCacheKey`s.
 /// - `compaction/executor.rs` returns those keys in `CompactionResult`.
 /// - local and remote completion paths submit the keys here after the new files
 ///   are registered locally, so remote compaction can warm cache entries too.
@@ -186,7 +245,10 @@ fn reserve_block_cache_preloads(
 ) -> Vec<BlockCachePreload> {
     let mut reserved = Vec::new();
     for preload in preloads {
-        if !matches!(preload.key.kind, BlockCacheKind::Data) {
+        if !matches!(
+            preload.key.kind,
+            BlockCacheKind::Data | BlockCacheKind::ParquetData(_)
+        ) {
             continue;
         }
         match in_flight.entry(preload.key) {
@@ -211,7 +273,10 @@ fn preload_block_cache_keys(
     let mut by_file: std::collections::BTreeMap<u64, Vec<BlockCachePreload>> =
         std::collections::BTreeMap::new();
     for preload in preloads {
-        if matches!(preload.key.kind, BlockCacheKind::Data) {
+        if matches!(
+            preload.key.kind,
+            BlockCacheKind::Data | BlockCacheKind::ParquetData(_)
+        ) {
             by_file
                 .entry(preload.key.file_id)
                 .or_default()
@@ -240,24 +305,35 @@ fn preload_block_cache_keys(
             if block_cache.get(&key).is_some() {
                 continue;
             }
-            match reader
-                .read_at(key.block_id as usize, preload.size)
-                .and_then(decode_block_bytes)
-                .and_then(Block::decode)
-            {
-                Ok(mut block) => {
-                    if !should_continue_preload(&lifecycle, &cancelled) {
-                        return;
+            match key.kind {
+                BlockCacheKind::Data => match reader
+                    .read_at(key.block_id as usize, preload.size)
+                    .and_then(decode_block_bytes)
+                    .and_then(Block::decode)
+                {
+                    Ok(mut block) => {
+                        if !should_continue_preload(&lifecycle, &cancelled) {
+                            return;
+                        }
+                        block.set_block_id(key.block_id as u32);
+                        block_cache.insert(key, CachedBlock::Block(Arc::new(block)));
                     }
-                    block.set_block_id(key.block_id as u32);
-                    block_cache.insert(key, CachedBlock::Block(Arc::new(block)));
+                    Err(err) => {
+                        warn!(
+                            "failed to preload compaction block cache entry file_id={} block_id={}: {}",
+                            key.file_id, key.block_id, err
+                        );
+                    }
+                },
+                BlockCacheKind::ParquetData(_) => {
+                    if let Err(err) = cache_parquet_data_block(&reader, &block_cache, key) {
+                        warn!(
+                            "failed to preload compaction parquet cache entry file_id={} block_id={}: {}",
+                            key.file_id, key.block_id, err
+                        );
+                    }
                 }
-                Err(err) => {
-                    warn!(
-                        "failed to preload compaction block cache entry file_id={} block_id={}: {}",
-                        key.file_id, key.block_id, err
-                    );
-                }
+                _ => {}
             }
         }
     }

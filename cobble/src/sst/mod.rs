@@ -8,4 +8,4 @@ pub(crate) mod writer;
 pub use compression::SstCompressionAlgorithm;
 pub(crate) use iterator::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 #[allow(unused_imports)]
-pub(crate) use writer::{SSTWriter, SSTWriterHotBlockCache, SSTWriterMetrics, SSTWriterOptions};
+pub(crate) use writer::{SSTWriter, SSTWriterMetrics, SSTWriterOptions};

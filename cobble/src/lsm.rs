@@ -1109,11 +1109,18 @@ impl LSMTree {
                         } else {
                             None
                         };
-                        Box::new(ParquetIterator::from_data_file_with_columns(
+                        Box::new(ParquetIterator::from_data_file_with_options(
                             reader,
                             file,
                             block_cache.clone(),
                             parquet_read_columns,
+                            crate::parquet::ParquetIteratorOptions {
+                                cache_namespace,
+                                preload_next_row_group: preload_scan_cursor_block,
+                                hot_block_registry: preload_scan_cursor_block
+                                    .then(|| Arc::clone(&scan_hot_blocks)),
+                                ..Default::default()
+                            },
                         )?)
                     }
                 };

@@ -33,14 +33,15 @@ impl CachedBlock {
 
 pub type BlockCache = Arc<dyn CacheHandle<BlockCacheKey, CachedBlock>>;
 
-/// Tracks data blocks currently adjacent to cursor-driven scans.
+/// Tracks physical cache entries currently adjacent to cursor-driven scans.
 ///
-/// Scan iterators keep only their current and next SST data block in this map.
+/// SST scans register the current and next data block, while Parquet scans
+/// register the column-chunk cache keys for the current and next row group.
 /// Compaction iterators check the same block-cache keys when reading input; if
 /// they touch one, the compaction writer can directly seed the output block cache
-/// for the block that receives those hot keys. Values are reference counts so
-/// overlapping scans do not clear each other's hot blocks when one iterator
-/// advances or drops.
+/// for the block or row group that receives those hot keys. Values are reference
+/// counts so overlapping scans do not clear each other's hot entries when one
+/// iterator advances or drops.
 pub(crate) struct ScanHotBlockRegistry {
     hot_blocks: DashMap<BlockCacheKey, usize>,
     observed_hot_blocks: AtomicU64,
