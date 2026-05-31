@@ -60,7 +60,12 @@ impl<'a> PriorityQueue<'a> {
 
     /// Returns and removes the smallest key in the queue.
     pub fn poll(&self, bucket: u16) -> Result<Option<(Bytes, Bytes)>> {
-        Ok(self.poll_batch(bucket, Some(1))?.into_iter().next())
+        Ok(self.scan_batch(bucket, Some(1), true)?.into_iter().next())
+    }
+
+    /// Returns the smallest key in the queue without advancing the queue cursor.
+    pub fn peek(&self, bucket: u16) -> Result<Option<(Bytes, Bytes)>> {
+        Ok(self.scan_batch(bucket, Some(1), false)?.into_iter().next())
     }
 
     /// Returns and removes a batch of the smallest keys in the queue.
@@ -75,6 +80,41 @@ impl<'a> PriorityQueue<'a> {
         &self,
         bucket: u16,
         batch_size: Option<usize>,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        self.scan_batch(bucket, batch_size, true)
+    }
+
+    /// Returns a batch of the smallest keys in the queue without advancing the queue cursor.
+    ///
+    /// When `batch_size` is `Some(n)`, up to `n` rows are returned. When it is
+    /// `None`, the scan asks the underlying iterators to stop at the next
+    /// physical boundary: SST data block, Parquet row group, or file boundary.
+    /// Sources without physical boundary semantics keep producing rows normally.
+    pub fn peek_batch(
+        &self,
+        bucket: u16,
+        batch_size: Option<usize>,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        self.scan_batch(bucket, batch_size, false)
+    }
+
+    /// Advances the queue cursor to `key`, making `key` and earlier items invisible.
+    pub fn advance_to<K>(&self, bucket: u16, key: K) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.db.advance_column_family_truncation_cursor(
+            bucket,
+            self.column_family.as_str(),
+            key.as_ref(),
+        )
+    }
+
+    fn scan_batch(
+        &self,
+        bucket: u16,
+        batch_size: Option<usize>,
+        advance_cursor: bool,
     ) -> Result<Vec<(Bytes, Bytes)>> {
         if batch_size == Some(0) {
             return Ok(Vec::new());
@@ -98,7 +138,7 @@ impl<'a> PriorityQueue<'a> {
             let (key, columns) = row?;
             let value = columns.into_iter().next().flatten().ok_or_else(|| {
                 Error::IoError(
-                    "priority queue poll returned no value for projected column".to_string(),
+                    "priority queue scan returned no value for projected column".to_string(),
                 )
             })?;
             let value = Bytes::copy_from_slice(value.as_ref());
@@ -108,11 +148,13 @@ impl<'a> PriorityQueue<'a> {
         let Some(last_key) = last_key else {
             return Ok(rows);
         };
-        self.db.advance_column_family_truncation_cursor(
-            bucket,
-            self.column_family.as_str(),
-            last_key.as_ref(),
-        )?;
+        if advance_cursor {
+            self.db.advance_column_family_truncation_cursor(
+                bucket,
+                self.column_family.as_str(),
+                last_key.as_ref(),
+            )?;
+        }
         Ok(rows)
     }
 }
@@ -378,6 +420,93 @@ mod tests {
     }
 
     #[test]
+    fn test_priority_queue_peek_and_peek_batch_do_not_advance_cursor() {
+        let root = format!("/tmp/ds_priority_queue_peek_{}", Uuid::new_v4());
+        let mut db = open_test_db(&root).unwrap();
+        db.new_priority_queue("jobs").unwrap();
+        let queue = db.get_priority_queue("jobs").unwrap();
+        queue.offer(0, b"k1", b"v1").unwrap();
+        queue.offer(0, b"k2", b"v2").unwrap();
+
+        let first = queue.peek(0).unwrap().expect("peek");
+        assert_eq!(
+            first,
+            (Bytes::from_static(b"k1"), Bytes::from_static(b"v1"))
+        );
+
+        let batch = queue.peek_batch(0, Some(2)).unwrap();
+        assert_eq!(
+            batch,
+            vec![
+                (Bytes::from_static(b"k1"), Bytes::from_static(b"v1")),
+                (Bytes::from_static(b"k2"), Bytes::from_static(b"v2")),
+            ]
+        );
+
+        let read_options = StructuredReadOptions::for_column(0).with_column_family("jobs");
+        assert!(
+            db.get_raw_with_options(0, b"k1", &read_options)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_raw_with_options(0, b"k2", &read_options)
+                .unwrap()
+                .is_some()
+        );
+
+        let first_polled = queue.poll(0).unwrap().expect("poll after peek");
+        assert_eq!(
+            first_polled,
+            (Bytes::from_static(b"k1"), Bytes::from_static(b"v1"))
+        );
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_priority_queue_advance_to_skips_entries_monotonically() {
+        let root = format!("/tmp/ds_priority_queue_advance_{}", Uuid::new_v4());
+        let mut db = open_test_db(&root).unwrap();
+        db.new_priority_queue("jobs").unwrap();
+        let queue = db.get_priority_queue("jobs").unwrap();
+        queue.offer(0, b"k1", b"v1").unwrap();
+        queue.offer(0, b"k2", b"v2").unwrap();
+        queue.offer(0, b"k3", b"v3").unwrap();
+
+        queue.advance_to(0, b"k2").unwrap();
+        queue.advance_to(0, b"k1").unwrap();
+
+        let read_options = StructuredReadOptions::for_column(0).with_column_family("jobs");
+        assert!(
+            db.get_raw_with_options(0, b"k1", &read_options)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_raw_with_options(0, b"k2", &read_options)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_raw_with_options(0, b"k3", &read_options)
+                .unwrap()
+                .is_some()
+        );
+
+        let remaining = queue.poll(0).unwrap().expect("poll after advance");
+        assert_eq!(
+            remaining,
+            (Bytes::from_static(b"k3"), Bytes::from_static(b"v3"))
+        );
+        assert!(queue.poll(0).unwrap().is_none());
+
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn test_priority_queue_poll_batch_without_size_keeps_unbounded_sources_unlimited() {
         let root = format!("/tmp/ds_priority_queue_dynamic_batch_{}", Uuid::new_v4());
         let mut db = open_test_db(&root).unwrap();
@@ -396,6 +525,51 @@ mod tests {
         );
         assert!(queue.poll(0).unwrap().is_none());
         db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_priority_queue_peek_batch_without_size_reads_one_sst_block_without_advancing() {
+        let root = format!(
+            "/tmp/ds_priority_queue_dynamic_sst_peek_batch_{}",
+            Uuid::new_v4()
+        );
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            num_columns: 1,
+            snapshot_on_flush: true,
+            ..Config::default()
+        };
+        let db_id = {
+            let mut db = StructuredDb::open(config.clone(), vec![0u16..=0u16]).unwrap();
+            let queue = db.get_or_new_priority_queue("jobs").unwrap();
+            queue.offer(0, b"k1", b"v1").unwrap();
+            queue.offer(0, b"k2", b"v2").unwrap();
+            queue.offer(0, b"k3", b"v3").unwrap();
+            let _ = db.snapshot().unwrap();
+            thread::sleep(Duration::from_millis(250));
+            let db_id = db.id().to_string();
+            db.close().unwrap();
+            db_id
+        };
+
+        let resumed = StructuredDb::resume(config, db_id).unwrap();
+        let queue = resumed.get_priority_queue("jobs").unwrap();
+        let batch = queue.peek_batch(0, None).unwrap();
+        assert_eq!(
+            batch,
+            vec![
+                (Bytes::from_static(b"k1"), Bytes::from_static(b"v1")),
+                (Bytes::from_static(b"k2"), Bytes::from_static(b"v2")),
+                (Bytes::from_static(b"k3"), Bytes::from_static(b"v3")),
+            ]
+        );
+        let first = queue.poll(0).unwrap().expect("poll after peek batch");
+        assert_eq!(
+            first,
+            (Bytes::from_static(b"k1"), Bytes::from_static(b"v1"))
+        );
+        resumed.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 
