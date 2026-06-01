@@ -745,10 +745,19 @@ impl SnapshotManager {
                 .map(|(_, tracked_id, _)| tracked_id.file_id()),
         );
         for source_file_id in source_file_ids {
-            if self
-                .file_manager
-                .is_data_file_persistable_for_snapshot(source_file_id)
-            {
+            // Capture retains the physical file even if compaction removes its id from the active
+            // FileManager index before this asynchronous materialization step runs.
+            let source_tracked = snapshot
+                .tracked_data_files
+                .get(&source_file_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidState(format!(
+                        "Snapshot {} did not retain data file {}",
+                        snapshot.id, source_file_id
+                    ))
+                })?;
+            if source_tracked.is_snapshot_persistable() {
                 file_id_map.insert(source_file_id, source_file_id);
                 continue;
             }
@@ -763,7 +772,7 @@ impl SnapshotManager {
                 file_id_map.insert(source_file_id, mapped_file_id);
                 continue;
             }
-            copy_candidates.push(source_file_id);
+            copy_candidates.push((source_file_id, source_tracked));
         }
         let copied_file_id_map = self.copy_data_files_to_snapshot_volume_parallel(
             copy_candidates,
@@ -785,7 +794,22 @@ impl SnapshotManager {
 
         let mut tracked_data_files = BTreeMap::new();
         for (source_file_id, mapped_file_id) in &file_id_map {
-            let tracked = self.file_manager.data_file_ref(*mapped_file_id)?;
+            let tracked = if source_file_id == mapped_file_id {
+                let tracked = snapshot
+                    .tracked_data_files
+                    .get(source_file_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::InvalidState(format!(
+                            "Snapshot {} did not retain data file {}",
+                            snapshot.id, source_file_id
+                        ))
+                    })?;
+                tracked.reference();
+                tracked
+            } else {
+                self.file_manager.data_file_ref(*mapped_file_id)?
+            };
             resources.register_reference(Arc::clone(&tracked));
             tracked_data_files.insert(*source_file_id, tracked);
         }
@@ -806,25 +830,26 @@ impl SnapshotManager {
     /// ids to copied file ids. Only files that are not already present in the snapshot volume will be copied.
     fn copy_data_files_to_snapshot_volume_parallel(
         &self,
-        source_file_ids: Vec<u64>,
+        source_files: Vec<(u64, Arc<TrackedFile>)>,
         resources: Arc<MaterializeTempResourceRegistry>,
         lifecycle_state: Arc<AtomicU8>,
     ) -> Result<HashMap<u64, u64>> {
-        if source_file_ids.is_empty() {
+        if source_files.is_empty() {
             return Ok(HashMap::new());
         }
         let file_manager = Arc::clone(&self.file_manager);
         let copy_resource_registry: Arc<dyn SnapshotCopyResourceRegistry + Send + Sync> = resources;
         self.upload_runtime.block_on(async {
             let mut join_set = JoinSet::new();
-            for source_file_id in source_file_ids {
+            for (source_file_id, source_tracked) in source_files {
                 let file_manager = Arc::clone(&file_manager);
                 let copy_resource_registry = Arc::clone(&copy_resource_registry);
                 let lifecycle_state = Arc::clone(&lifecycle_state);
                 join_set.spawn_blocking(move || {
                     file_manager
-                        .copy_data_file_to_snapshot_volume_with_result_and_cancel(
+                        .copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
                             source_file_id,
+                            &source_tracked,
                             Some(copy_resource_registry),
                             Some(lifecycle_state.as_ref()),
                         )

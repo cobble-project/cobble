@@ -386,6 +386,12 @@ impl TrackedFile {
     pub(crate) fn priority(&self) -> u8 {
         self.priority.load(Ordering::SeqCst)
     }
+
+    pub(crate) fn is_snapshot_persistable(&self) -> bool {
+        self.volume
+            .as_ref()
+            .is_some_and(|volume| volume.snapshot_persistable)
+    }
 }
 
 /// Handle that keeps a data file id tracked by the FileManager.
@@ -1301,10 +1307,7 @@ impl FileManager {
         let Some(tracked) = self.data_files.get(&file_id) else {
             return false;
         };
-        let Some(tracked_volume) = &tracked.volume else {
-            return false;
-        };
-        tracked_volume.snapshot_persistable
+        tracked.is_snapshot_persistable()
     }
 
     pub(crate) fn is_data_file_on_primary_volume(&self, file_id: FileId) -> bool {
@@ -1391,24 +1394,42 @@ impl FileManager {
         resource_registry: Option<Arc<dyn SnapshotCopyResourceRegistry + Send + Sync>>,
         lifecycle_state: Option<&AtomicU8>,
     ) -> Result<(FileId, bool)> {
-        if self.is_data_file_persistable_for_snapshot(source_file_id) {
-            return Ok((source_file_id, false));
-        }
-        let snapshot_volume = self.select_snapshot_persistable_volume()?;
         // Extract needed data from DashMap Ref and drop it before insert to
         // avoid self-deadlock when source and target IDs hash to the same shard.
-        let (source_reader, source_priority) = {
-            let source_tracked = self.data_files.get(&source_file_id).ok_or_else(|| {
+        let source_tracked = {
+            let tracked = self.data_files.get(&source_file_id).ok_or_else(|| {
                 Error::IoError(format!(
                     "Data file {} is not tracked by FileManager",
                     source_file_id
                 ))
             })?;
-            let reader = source_tracked.fs().open_read(source_tracked.path())?;
-            let priority = source_tracked.priority();
-            (reader, priority)
-            // drop source_tracked here to release the lock shard before we insert the new tracked file
+            Arc::clone(&tracked)
         };
+        self.copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
+            source_file_id,
+            &source_tracked,
+            resource_registry,
+            lifecycle_state,
+        )
+    }
+
+    /// Copies a retained data file reference to snapshot storage.
+    ///
+    /// Snapshot capture keeps this reference alive so asynchronous materialization can continue
+    /// after compaction removes the file id from the active FileManager index.
+    pub(crate) fn copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
+        &self,
+        source_file_id: FileId,
+        source_tracked: &Arc<TrackedFile>,
+        resource_registry: Option<Arc<dyn SnapshotCopyResourceRegistry + Send + Sync>>,
+        lifecycle_state: Option<&AtomicU8>,
+    ) -> Result<(FileId, bool)> {
+        if source_tracked.is_snapshot_persistable() {
+            return Ok((source_file_id, false));
+        }
+        let snapshot_volume = self.select_snapshot_persistable_volume()?;
+        let source_reader = source_tracked.fs().open_read(source_tracked.path())?;
+        let source_priority = source_tracked.priority();
         let target_file_id = self.allocate_file_id();
         let mut writer = self.create_data_file_writer_on_volume(target_file_id, snapshot_volume)?;
 
@@ -2069,6 +2090,108 @@ pub(crate) mod tests {
         assert!(snapshot_fs.exists(&copied_path).unwrap());
         let copied_reader = fm.open_data_file_reader(copied_file_id).unwrap();
         assert_eq!(&copied_reader.read_at(0, 12).unwrap()[..], b"source-bytes");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_snapshot_copy_uses_retained_file_after_active_tracking_is_removed() {
+        let root = "/tmp/file_manager_retained_snapshot_copy";
+        let _ = std::fs::remove_dir_all(root);
+        let primary_url = format!("file://{}/primary", root);
+        let snapshot_url = format!("file://{}/snapshot", root);
+        let registry = FileSystemRegistry::new();
+        let snapshot_fs = registry.get_or_register(snapshot_url.clone()).unwrap();
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    primary_url,
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    snapshot_url,
+                    vec![VolumeUsageKind::Snapshot, VolumeUsageKind::Meta],
+                ),
+            ],
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-retained-snapshot-copy"));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+
+        let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
+        source_writer.write(b"retained-source").unwrap();
+        source_writer.close().unwrap();
+        drop(source_writer);
+
+        let retained = fm.data_file_ref(source_file_id).unwrap();
+        fm.remove_data_file(source_file_id).unwrap();
+        assert!(!fm.has_data_file(source_file_id));
+
+        let (copied_file_id, copied) = fm
+            .copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
+                source_file_id,
+                &retained,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(copied);
+        assert_ne!(copied_file_id, source_file_id);
+        let copied_path = fm.get_data_file_path(copied_file_id).unwrap();
+        assert!(snapshot_fs.exists(&copied_path).unwrap());
+        let copied_reader = fm.open_data_file_reader(copied_file_id).unwrap();
+        assert_eq!(
+            &copied_reader.read_at(0, 15).unwrap()[..],
+            b"retained-source"
+        );
+
+        retained.dereference();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_snapshot_copy_reuses_retained_persistable_file_after_active_tracking_is_removed() {
+        let root = "/tmp/file_manager_retained_persistable_snapshot";
+        let _ = std::fs::remove_dir_all(root);
+        let shared_url = format!("file://{}/shared", root);
+        let config = Config {
+            volumes: vec![crate::VolumeDescriptor::new(
+                shared_url,
+                vec![
+                    VolumeUsageKind::PrimaryDataPriorityHigh,
+                    VolumeUsageKind::Snapshot,
+                    VolumeUsageKind::Meta,
+                ],
+            )],
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new(
+            "file-manager-retained-persistable-snapshot",
+        ));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+
+        let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
+        source_writer.write(b"retained-source").unwrap();
+        source_writer.close().unwrap();
+        drop(source_writer);
+
+        let retained = fm.data_file_ref(source_file_id).unwrap();
+        fm.remove_data_file(source_file_id).unwrap();
+        assert!(!fm.has_data_file(source_file_id));
+
+        let (copied_file_id, copied) = fm
+            .copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
+                source_file_id,
+                &retained,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!copied);
+        assert_eq!(copied_file_id, source_file_id);
+
+        retained.dereference();
         let _ = std::fs::remove_dir_all(root);
     }
 
