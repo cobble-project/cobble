@@ -390,7 +390,7 @@ impl SSTIterator {
             let partition = self.index_block.clone();
             self.load_data_block_from_partition(&partition, block_idx)?;
             self.seek_in_current_block(&target)?;
-            self.after_data_block_positioned()?;
+            self.finish_seek_positioning()?;
             return Ok(());
         }
 
@@ -400,7 +400,7 @@ impl SSTIterator {
         self.current_block_idx = block_idx;
         self.load_data_block_from_partition(&partition, block_idx)?;
         self.seek_in_current_block(&target)?;
-        self.after_data_block_positioned()?;
+        self.finish_seek_positioning()?;
         Ok(())
     }
 
@@ -905,6 +905,22 @@ impl SSTIterator {
         }
         self.position_after_random_access();
         Ok(())
+    }
+
+    fn finish_seek_positioning(&mut self) -> Result<()> {
+        if self.valid() {
+            return self.after_data_block_positioned();
+        }
+
+        // The index stores the first key of each data block. A target between two blocks
+        // initially selects the preceding block, whose in-block seek lands just past its end.
+        // Continue with the next block so callers observe the first key >= target.
+        loop {
+            self.current_block_idx += 1;
+            if !self.load_next_position()? || self.valid() {
+                return Ok(());
+            }
+        }
     }
 
     /// Move to the first entry
@@ -1478,6 +1494,43 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all("/tmp/sst_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_iterator_seek_advances_across_data_block_gap() {
+        let _ = std::fs::remove_dir_all("/tmp/sst_seek_data_block_gap_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/sst_seek_data_block_gap_test")
+            .unwrap();
+
+        {
+            let writer_file = fs.open_write("seek_gap.sst").unwrap();
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    block_size: 32,
+                    ..SSTWriterOptions::default()
+                },
+            );
+            writer.add(b"a", &[b'a'; 64]).unwrap();
+            writer.add(b"c", &[b'c'; 64]).unwrap();
+            writer.finish().unwrap();
+        }
+
+        {
+            let reader_file = fs.open_read("seek_gap.sst").unwrap();
+            let mut iter =
+                SSTIterator::with_cache(reader_file, 0, SSTIteratorOptions::default(), None, None)
+                    .unwrap();
+
+            iter.seek(b"b").unwrap();
+            assert!(iter.valid());
+            assert_eq!(iter.key().unwrap().unwrap().as_ref(), b"c");
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/sst_seek_data_block_gap_test");
     }
 
     #[test]
