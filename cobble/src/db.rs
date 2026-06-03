@@ -1330,6 +1330,22 @@ impl Db {
     pub fn advance_truncation_cursor(
         &self,
         bucket: u16,
+        column_family: &str,
+        key: &[u8],
+    ) -> Result<()> {
+        let _access = self.begin_access()?;
+        let column_family_id = self
+            .schema_manager
+            .latest_schema()
+            .resolve_column_family_id(Some(column_family))?;
+        self.db_state
+            .advance_truncation_cursor(bucket, column_family_id, key);
+        Ok(())
+    }
+
+    pub fn advance_truncation_cursor_by_id(
+        &self,
+        bucket: u16,
         column_family_id: u8,
         key: &[u8],
     ) -> Result<()> {
@@ -1337,6 +1353,26 @@ impl Db {
         self.db_state
             .advance_truncation_cursor(bucket, column_family_id, key);
         Ok(())
+    }
+
+    pub fn truncation_cursor(&self, bucket: u16, column_family: &str) -> Result<Option<Vec<u8>>> {
+        let _access = self.begin_access()?;
+        let column_family_id = self
+            .schema_manager
+            .latest_schema()
+            .resolve_column_family_id(Some(column_family))?;
+        let snapshot = self.db_state.load();
+        Ok(snapshot.truncation_cursor(bucket, column_family_id))
+    }
+
+    pub fn truncation_cursor_by_id(
+        &self,
+        bucket: u16,
+        column_family_id: u8,
+    ) -> Result<Option<Vec<u8>>> {
+        let _access = self.begin_access()?;
+        let snapshot = self.db_state.load();
+        Ok(snapshot.truncation_cursor(bucket, column_family_id))
     }
 
     /// Set the current time for TTL evaluation (manual time provider only).

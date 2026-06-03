@@ -1153,17 +1153,28 @@ impl StructuredDb {
             priority_queue_column_family_options(),
         );
         builder.commit()?;
+        let column_family_id = self
+            .current_schema()
+            .resolve_column_family_id(Some(normalized_name.as_str()))?;
 
-        Ok(PriorityQueue::from_column_family(self, normalized_name))
+        Ok(PriorityQueue::from_column_family(
+            self,
+            normalized_name,
+            column_family_id,
+        ))
     }
 
     pub fn get_priority_queue<'a>(&'a self, name: impl Into<String>) -> Result<PriorityQueue<'a>> {
         let normalized_name = priority_queue_column_family_name(name.into())?;
-        validate_priority_queue_column_family(
+        let column_family_id = validate_priority_queue_column_family(
             self.db.current_schema().as_ref(),
             normalized_name.as_str(),
         )?;
-        Ok(PriorityQueue::from_column_family(self, normalized_name))
+        Ok(PriorityQueue::from_column_family(
+            self,
+            normalized_name,
+            column_family_id,
+        ))
     }
 
     pub fn get_or_new_priority_queue<'a>(
@@ -1177,10 +1188,15 @@ impl StructuredDb {
             .column_family_ids()
             .contains_key(normalized_name.as_str())
         {
-            validate_priority_queue_column_family(
+            let column_family_id = validate_priority_queue_column_family(
                 self.db.current_schema().as_ref(),
                 normalized_name.as_str(),
             )?;
+            return Ok(PriorityQueue::from_column_family(
+                self,
+                normalized_name,
+                column_family_id,
+            ));
         } else {
             let mut builder = self.update_schema();
             builder.add_bytes_column(Some(normalized_name.clone()), 0);
@@ -1190,8 +1206,15 @@ impl StructuredDb {
             );
             builder.commit()?;
         }
+        let column_family_id = self
+            .current_schema()
+            .resolve_column_family_id(Some(normalized_name.as_str()))?;
 
-        Ok(PriorityQueue::from_column_family(self, normalized_name))
+        Ok(PriorityQueue::from_column_family(
+            self,
+            normalized_name,
+            column_family_id,
+        ))
     }
 
     pub fn reload_schema(&mut self) -> Result<()> {
@@ -1518,23 +1541,22 @@ impl StructuredDb {
         )
     }
 
-    pub(crate) fn advance_column_family_truncation_cursor(
+    pub(crate) fn advance_column_family_truncation_cursor_by_id(
         &self,
         bucket: u16,
-        column_family: &str,
+        column_family_id: u8,
         key: &[u8],
     ) -> Result<()> {
-        let column_family_id = self
-            .db
-            .current_schema()
-            .column_family_ids()
-            .get(column_family)
-            .copied()
-            .ok_or_else(|| {
-                Error::InvalidState(format!("unknown column family '{}'", column_family))
-            })?;
         self.db
-            .advance_truncation_cursor(bucket, column_family_id, key)
+            .advance_truncation_cursor_by_id(bucket, column_family_id, key)
+    }
+
+    pub(crate) fn column_family_truncation_cursor_by_id(
+        &self,
+        bucket: u16,
+        column_family_id: u8,
+    ) -> Result<Option<Vec<u8>>> {
+        self.db.truncation_cursor_by_id(bucket, column_family_id)
     }
 
     pub fn close(&self) -> Result<()> {

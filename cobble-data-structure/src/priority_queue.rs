@@ -14,14 +14,20 @@ const PRIORITY_QUEUE_FAMILY_KIND: &str = "priority_queue";
 pub struct PriorityQueue<'a> {
     db: &'a StructuredDb,
     column_family: String,
+    column_family_id: u8,
     write_options: StructuredWriteOptions,
     scan_options: StructuredScanOptions,
 }
 
 impl<'a> PriorityQueue<'a> {
-    pub(crate) fn from_column_family(db: &'a StructuredDb, column_family: String) -> Self {
+    pub(crate) fn from_column_family(
+        db: &'a StructuredDb,
+        column_family: String,
+        column_family_id: u8,
+    ) -> Self {
         Self {
             db,
+            column_family_id,
             write_options: StructuredWriteOptions::with_column_family(column_family.clone()),
             scan_options: StructuredScanOptions::for_column(0)
                 .with_column_family(column_family.clone())
@@ -99,15 +105,24 @@ impl<'a> PriorityQueue<'a> {
     }
 
     /// Advances the queue cursor to `key`, making `key` and earlier items invisible.
+    ///
+    /// This is a monotonic-consumption API. Items subsequently offered at or
+    /// before the cursor remain invisible.
     pub fn advance_to<K>(&self, bucket: u16, key: K) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
-        self.db.advance_column_family_truncation_cursor(
+        self.db.advance_column_family_truncation_cursor_by_id(
             bucket,
-            self.column_family.as_str(),
+            self.column_family_id,
             key.as_ref(),
         )
+    }
+
+    /// Returns the current queue cursor, if this bucket has consumed any items.
+    pub fn cursor(&self, bucket: u16) -> Result<Option<Vec<u8>>> {
+        self.db
+            .column_family_truncation_cursor_by_id(bucket, self.column_family_id)
     }
 
     fn scan_batch(
@@ -149,9 +164,9 @@ impl<'a> PriorityQueue<'a> {
             return Ok(rows);
         };
         if advance_cursor {
-            self.db.advance_column_family_truncation_cursor(
+            self.db.advance_column_family_truncation_cursor_by_id(
                 bucket,
-                self.column_family.as_str(),
+                self.column_family_id,
                 last_key.as_ref(),
             )?;
         }
@@ -169,7 +184,7 @@ pub(crate) fn priority_queue_column_family_options() -> ColumnFamilyOptions {
 pub(crate) fn validate_priority_queue_column_family(
     schema: &Schema,
     column_family: &str,
-) -> Result<()> {
+) -> Result<u8> {
     let column_family_id = schema
         .column_family_ids()
         .get(column_family)
@@ -204,7 +219,7 @@ pub(crate) fn validate_priority_queue_column_family(
             column_family
         )));
     }
-    Ok(())
+    Ok(column_family_id)
 }
 
 fn priority_queue_column_family_metadata() -> JsonValue {
@@ -343,6 +358,7 @@ mod tests {
                 first,
                 (Bytes::from_static(b"k1"), Bytes::from_static(b"v1"))
             );
+            assert_eq!(queue.cursor(0).unwrap(), Some(b"k1".to_vec()));
             let read_options = StructuredReadOptions::for_column(0).with_column_family("jobs");
             assert!(
                 db.get_raw_with_options(0, b"k1", &read_options)
@@ -364,6 +380,7 @@ mod tests {
 
         let resumed = StructuredDb::resume(config, db_id).unwrap();
         let queue = resumed.get_priority_queue("jobs").unwrap();
+        assert_eq!(queue.cursor(0).unwrap(), Some(b"k1".to_vec()));
         let remaining = queue.poll(0).unwrap().expect("remaining poll");
         assert_eq!(
             remaining,
