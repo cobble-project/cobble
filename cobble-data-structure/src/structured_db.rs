@@ -3,7 +3,8 @@ use crate::list::{
     list_operator_from_metadata,
 };
 use crate::priority_queue::{
-    PriorityQueue, priority_queue_column_family_options, validate_priority_queue_column_family,
+    PriorityQueue, priority_queue_column_family_name, priority_queue_column_family_options,
+    validate_priority_queue_column_family,
 };
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
@@ -988,16 +989,6 @@ fn normalize_structured_column_family_name(
         Some(normalized.clone())
     };
     Ok((normalized, core_column_family))
-}
-
-fn priority_queue_column_family_name(name: String) -> Result<String> {
-    let (normalized, core_column_family) = normalize_structured_column_family_name(Some(name))?;
-    if core_column_family.is_none() {
-        return Err(Error::InputError(
-            "priority queue cannot use the default column family".to_string(),
-        ));
-    }
-    Ok(normalized)
 }
 
 impl StructuredDb {

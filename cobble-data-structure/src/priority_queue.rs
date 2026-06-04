@@ -1,18 +1,27 @@
 use crate::structured_db::{
     StructuredColumnValue, StructuredDb, StructuredScanOptions, StructuredWriteOptions,
 };
+use crate::structured_single_db::StructuredSingleDb;
 use bytes::Bytes;
-use cobble::{ColumnFamilyOptions, Error, Result, Schema};
+use cobble::{ColumnFamilyOptions, DbIterator, Error, Result, Schema};
 use serde_json::{Value as JsonValue, json};
 
 const PRIORITY_QUEUE_FAMILY_KIND: &str = "priority_queue";
+const DEFAULT_COLUMN_FAMILY_NAME: &str = "default";
 
-/// Column-family-scoped priority queue built on top of existing `StructuredDb` operations.
+/// Column-family-scoped priority queue built on top of structured DB operations.
 ///
 /// Each queue owns one dedicated column family. Queue operations map directly onto structured
-/// merge/delete/scan calls in that family.
+/// merge/delete/scan calls in that family. This type is the abstraction boundary for the embedded
+/// and sharded structured backends: callers above `cobble-data-structure` get one queue API, while
+/// this layer chooses the appropriate `StructuredDb` or `StructuredSingleDb` implementation.
+enum PriorityQueueBackend<'a> {
+    StructuredDb(&'a StructuredDb),
+    StructuredSingleDb(&'a StructuredSingleDb),
+}
+
 pub struct PriorityQueue<'a> {
-    db: &'a StructuredDb,
+    backend: PriorityQueueBackend<'a>,
     column_family: String,
     column_family_id: u8,
     write_options: StructuredWriteOptions,
@@ -25,8 +34,32 @@ impl<'a> PriorityQueue<'a> {
         column_family: String,
         column_family_id: u8,
     ) -> Self {
+        Self::from_backend(
+            PriorityQueueBackend::StructuredDb(db),
+            column_family,
+            column_family_id,
+        )
+    }
+
+    pub(crate) fn from_single_column_family(
+        db: &'a StructuredSingleDb,
+        column_family: String,
+        column_family_id: u8,
+    ) -> Self {
+        Self::from_backend(
+            PriorityQueueBackend::StructuredSingleDb(db),
+            column_family,
+            column_family_id,
+        )
+    }
+
+    fn from_backend(
+        backend: PriorityQueueBackend<'a>,
+        column_family: String,
+        column_family_id: u8,
+    ) -> Self {
         Self {
-            db,
+            backend,
             column_family_id,
             write_options: StructuredWriteOptions::with_column_family(column_family.clone()),
             scan_options: StructuredScanOptions::for_column(0)
@@ -46,13 +79,22 @@ impl<'a> PriorityQueue<'a> {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.db.merge_with_options(
-            bucket,
-            key.as_ref(),
-            0,
-            StructuredColumnValue::Bytes(Bytes::copy_from_slice(value.as_ref())),
-            &self.write_options,
-        )
+        match self.backend {
+            PriorityQueueBackend::StructuredDb(db) => db.merge_with_options(
+                bucket,
+                key.as_ref(),
+                0,
+                StructuredColumnValue::Bytes(Bytes::copy_from_slice(value.as_ref())),
+                &self.write_options,
+            ),
+            PriorityQueueBackend::StructuredSingleDb(db) => db.merge_with_options(
+                bucket,
+                key.as_ref(),
+                0,
+                StructuredColumnValue::Bytes(Bytes::copy_from_slice(value.as_ref())),
+                &self.write_options,
+            ),
+        }
     }
 
     /// Deletes one queue key if it exists.
@@ -60,8 +102,14 @@ impl<'a> PriorityQueue<'a> {
     where
         K: AsRef<[u8]>,
     {
-        self.db
-            .delete_with_options(bucket, key.as_ref(), 0, &self.write_options)
+        match self.backend {
+            PriorityQueueBackend::StructuredDb(db) => {
+                db.delete_with_options(bucket, key.as_ref(), 0, &self.write_options)
+            }
+            PriorityQueueBackend::StructuredSingleDb(db) => {
+                db.delete_with_options(bucket, key.as_ref(), 0, &self.write_options)
+            }
+        }
     }
 
     /// Returns and removes the smallest key in the queue.
@@ -112,17 +160,19 @@ impl<'a> PriorityQueue<'a> {
     where
         K: AsRef<[u8]>,
     {
-        self.db.advance_column_family_truncation_cursor_by_id(
-            bucket,
-            self.column_family_id,
-            key.as_ref(),
-        )
+        self.advance_cursor_by_id(bucket, key.as_ref())
     }
 
     /// Returns the current queue cursor, if this bucket has consumed any items.
     pub fn cursor(&self, bucket: u16) -> Result<Option<Vec<u8>>> {
-        self.db
-            .column_family_truncation_cursor_by_id(bucket, self.column_family_id)
+        match self.backend {
+            PriorityQueueBackend::StructuredDb(db) => {
+                db.column_family_truncation_cursor_by_id(bucket, self.column_family_id)
+            }
+            PriorityQueueBackend::StructuredSingleDb(db) => {
+                db.column_family_truncation_cursor_by_id(bucket, self.column_family_id)
+            }
+        }
     }
 
     fn scan_batch(
@@ -139,7 +189,7 @@ impl<'a> PriorityQueue<'a> {
         } else {
             self.scan_options.clone()
         };
-        let mut iter = self.db.scan_raw_bounds(bucket, None, None, &scan_options)?;
+        let mut iter = self.scan_raw_bounds(bucket, &scan_options)?;
         let mut rows = Vec::with_capacity(batch_size.unwrap_or(1));
         let mut last_key = None;
         while batch_size.is_none_or(|limit| rows.len() < limit) {
@@ -164,13 +214,35 @@ impl<'a> PriorityQueue<'a> {
             return Ok(rows);
         };
         if advance_cursor {
-            self.db.advance_column_family_truncation_cursor_by_id(
-                bucket,
-                self.column_family_id,
-                last_key.as_ref(),
-            )?;
+            self.advance_cursor_by_id(bucket, last_key.as_ref())?;
         }
         Ok(rows)
+    }
+
+    fn scan_raw_bounds<'b>(
+        &'b self,
+        bucket: u16,
+        scan_options: &StructuredScanOptions,
+    ) -> Result<DbIterator<'b>> {
+        match self.backend {
+            PriorityQueueBackend::StructuredDb(db) => {
+                db.scan_raw_bounds(bucket, None, None, scan_options)
+            }
+            PriorityQueueBackend::StructuredSingleDb(db) => {
+                db.scan_raw_bounds(bucket, None, None, scan_options)
+            }
+        }
+    }
+
+    fn advance_cursor_by_id(&self, bucket: u16, key: &[u8]) -> Result<()> {
+        match self.backend {
+            PriorityQueueBackend::StructuredDb(db) => {
+                db.advance_column_family_truncation_cursor_by_id(bucket, self.column_family_id, key)
+            }
+            PriorityQueueBackend::StructuredSingleDb(db) => {
+                db.advance_column_family_truncation_cursor_by_id(bucket, self.column_family_id, key)
+            }
+        }
     }
 }
 
@@ -179,6 +251,21 @@ pub(crate) fn priority_queue_column_family_options() -> ColumnFamilyOptions {
         metadata: Some(priority_queue_column_family_metadata()),
         ..ColumnFamilyOptions::default()
     }
+}
+
+pub(crate) fn priority_queue_column_family_name(name: String) -> Result<String> {
+    let normalized = name.trim().to_string();
+    if normalized.is_empty() {
+        return Err(Error::InvalidState(
+            "column family name cannot be empty".to_string(),
+        ));
+    }
+    if normalized == DEFAULT_COLUMN_FAMILY_NAME {
+        return Err(Error::InputError(
+            "priority queue cannot use the default column family".to_string(),
+        ));
+    }
+    Ok(normalized)
 }
 
 pub(crate) fn validate_priority_queue_column_family(
@@ -234,7 +321,7 @@ fn priority_queue_family_kind(metadata: &JsonValue) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{StructuredDb, StructuredReadOptions};
+    use crate::{StructuredDb, StructuredReadOptions, StructuredSingleDb};
     use bytes::Bytes;
     use cobble::{Config, Error, Result, VolumeDescriptor};
     use std::thread;
@@ -251,6 +338,16 @@ mod tests {
             },
             vec![0u16..=0u16],
         )
+    }
+
+    fn open_test_single_db(root: &str) -> Result<StructuredSingleDb> {
+        StructuredSingleDb::open(Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            num_columns: 1,
+            total_buckets: 1,
+            snapshot_on_flush: true,
+            ..Config::default()
+        })
     }
 
     #[test]
@@ -274,6 +371,40 @@ mod tests {
         assert_eq!(second.1.as_ref(), b"v2");
 
         assert!(queue.poll(0).unwrap().is_none());
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_priority_queue_structured_single_db_offer_peek_poll_and_cursor() {
+        let root = format!("/tmp/ds_priority_queue_single_{}", Uuid::new_v4());
+        let mut db = open_test_single_db(&root).unwrap();
+        db.new_priority_queue("jobs").unwrap();
+        let queue = db.get_priority_queue("jobs").unwrap();
+
+        queue.offer(0, b"k2", b"v2").unwrap();
+        queue.offer(0, b"k1", b"left").unwrap();
+        queue.offer(0, b"k1", b"right").unwrap();
+
+        let peeked = queue.peek(0).unwrap().expect("peek");
+        assert_eq!(
+            peeked,
+            (Bytes::from_static(b"k1"), Bytes::from_static(b"leftright"))
+        );
+        assert_eq!(queue.cursor(0).unwrap(), None);
+
+        let batch = queue.poll_batch(0, Some(2)).unwrap();
+        assert_eq!(
+            batch,
+            vec![
+                (Bytes::from_static(b"k1"), Bytes::from_static(b"leftright")),
+                (Bytes::from_static(b"k2"), Bytes::from_static(b"v2")),
+            ]
+        );
+        assert_eq!(queue.cursor(0).unwrap(), Some(b"k2".to_vec()));
+        assert!(queue.poll(0).unwrap().is_none());
+
+        drop(queue);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }

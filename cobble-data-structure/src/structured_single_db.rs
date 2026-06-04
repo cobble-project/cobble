@@ -1,10 +1,14 @@
+use crate::priority_queue::{
+    PriorityQueue, priority_queue_column_family_name, priority_queue_column_family_options,
+    validate_priority_queue_column_family,
+};
 use crate::structured_db::{
     StructuredColumnValue, StructuredDbIterator, StructuredReadOptions, StructuredScanOptions,
     StructuredSchema, StructuredSchemaBuilder, StructuredSchemaOwner, StructuredWriteBatch,
     StructuredWriteOptions, decode_row, encode_for_write,
     load_structured_schema_from_cobble_schema, persist_structured_schema_on_db,
 };
-use cobble::{Config, Result, SingleDb};
+use cobble::{Config, DbIterator, Error, Result, SingleDb};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -34,12 +38,119 @@ impl StructuredSingleDb {
         &self.db
     }
 
+    pub fn jni_direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
+        self.db.db().jni_direct_buffer_pool_config()
+    }
+
     pub fn current_schema(&self) -> StructuredSchema {
         self.structured_schema.as_ref().clone()
     }
 
     pub fn update_schema(&mut self) -> StructuredSchemaBuilder<'_, Self> {
         StructuredSchemaBuilder::new(self)
+    }
+
+    /// Creates a structured priority queue backed by a dedicated column family.
+    ///
+    /// The returned queue uses the same `PriorityQueue` API as sharded `StructuredDb`, and the
+    /// queue itself owns the backend-specific dispatch. This keeps upper layers from having to
+    /// special-case `StructuredSingleDb` when offering, scanning, or advancing queue items.
+    pub fn new_priority_queue<'a>(
+        &'a mut self,
+        name: impl Into<String>,
+    ) -> Result<PriorityQueue<'a>> {
+        let normalized_name = priority_queue_column_family_name(name.into())?;
+        if self
+            .db
+            .db()
+            .current_schema()
+            .column_family_ids()
+            .contains_key(normalized_name.as_str())
+        {
+            return Err(Error::InvalidState(format!(
+                "priority queue '{}' already exists",
+                normalized_name
+            )));
+        }
+
+        let mut builder = self.update_schema();
+        builder.add_bytes_column(Some(normalized_name.clone()), 0);
+        builder.set_column_family_options(
+            Some(normalized_name.clone()),
+            priority_queue_column_family_options(),
+        );
+        builder.commit()?;
+        let column_family_id = self
+            .current_schema()
+            .resolve_column_family_id(Some(normalized_name.as_str()))?;
+
+        Ok(PriorityQueue::from_single_column_family(
+            self,
+            normalized_name,
+            column_family_id,
+        ))
+    }
+
+    /// Opens an existing structured priority queue by name.
+    ///
+    /// The target column family must exist, be marked as a priority queue, and contain exactly one
+    /// bytes column.
+    pub fn get_priority_queue<'a>(&'a self, name: impl Into<String>) -> Result<PriorityQueue<'a>> {
+        let normalized_name = priority_queue_column_family_name(name.into())?;
+        let column_family_id = validate_priority_queue_column_family(
+            self.db.db().current_schema().as_ref(),
+            normalized_name.as_str(),
+        )?;
+        Ok(PriorityQueue::from_single_column_family(
+            self,
+            normalized_name,
+            column_family_id,
+        ))
+    }
+
+    /// Opens an existing structured priority queue or creates it on first use.
+    ///
+    /// If a same-named column family already exists, it must already be a valid priority queue
+    /// family.
+    pub fn get_or_new_priority_queue<'a>(
+        &'a mut self,
+        name: impl Into<String>,
+    ) -> Result<PriorityQueue<'a>> {
+        let normalized_name = priority_queue_column_family_name(name.into())?;
+        if self
+            .db
+            .db()
+            .current_schema()
+            .column_family_ids()
+            .contains_key(normalized_name.as_str())
+        {
+            let column_family_id = validate_priority_queue_column_family(
+                self.db.db().current_schema().as_ref(),
+                normalized_name.as_str(),
+            )?;
+            return Ok(PriorityQueue::from_single_column_family(
+                self,
+                normalized_name,
+                column_family_id,
+            ));
+        }
+
+        let mut builder = self.update_schema();
+        builder.add_bytes_column(Some(normalized_name.clone()), 0);
+        builder.set_column_family_options(
+            Some(normalized_name.clone()),
+            priority_queue_column_family_options(),
+        );
+        builder.commit()?;
+        let column_family_id = self
+            .current_schema()
+            .resolve_column_family_id(Some(normalized_name.as_str()))?;
+
+        Ok(PriorityQueue::from_single_column_family(
+            self,
+            normalized_name,
+            column_family_id,
+        ))
     }
 }
 
@@ -213,6 +324,21 @@ impl StructuredSingleDb {
         Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
+    pub fn scan_raw_bounds<'a>(
+        &'a self,
+        bucket: u16,
+        start_key_inclusive: Option<&[u8]>,
+        end_key_exclusive: Option<&[u8]>,
+        options: &StructuredScanOptions,
+    ) -> Result<DbIterator<'a>> {
+        self.db.db().scan_with_options_bounds(
+            bucket,
+            start_key_inclusive,
+            end_key_exclusive,
+            options.as_cobble(),
+        )
+    }
+
     // ── Snapshot lifecycle ───────────────────────────────────────────────
 
     pub fn snapshot(&self) -> Result<u64> {
@@ -244,6 +370,27 @@ impl StructuredSingleDb {
 
     pub fn close(&self) -> Result<()> {
         self.db.close()
+    }
+
+    pub(crate) fn advance_column_family_truncation_cursor_by_id(
+        &self,
+        bucket: u16,
+        column_family_id: u8,
+        key: &[u8],
+    ) -> Result<()> {
+        self.db
+            .db()
+            .advance_truncation_cursor_by_id(bucket, column_family_id, key)
+    }
+
+    pub(crate) fn column_family_truncation_cursor_by_id(
+        &self,
+        bucket: u16,
+        column_family_id: u8,
+    ) -> Result<Option<Vec<u8>>> {
+        self.db
+            .db()
+            .truncation_cursor_by_id(bucket, column_family_id)
     }
 }
 
