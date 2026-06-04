@@ -6,7 +6,8 @@
 
 use crate::structured::{
     StructuredScanCursorHandle, StructuredSchemaBuilderHandle, decode_write_bytes_args,
-    decode_write_list_args, to_java_typed_columns,
+    decode_write_list_args, direct_buffer_pool_config_array, new_priority_queue_handle,
+    to_java_typed_columns,
 };
 use crate::structured_read_options::structured_read_options_from_handle_or_throw;
 use crate::structured_scan_options::decode_structured_scan_open_args;
@@ -22,7 +23,7 @@ use cobble_data_structure::{StructuredColumnValue, StructuredSingleDb};
 use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JObjectArray, JString};
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jintArray, jlong, jobject, jstring};
 
 // ── open ────────────────────────────────────────────────────────────────────
 
@@ -69,6 +70,25 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_openHandleFromJson(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_directBufferPoolConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jintArray {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let (buffer_size_bytes, pool_size) = match db.jni_direct_buffer_pool_config() {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    direct_buffer_pool_config_array(&mut env, buffer_size_bytes, pool_size)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_structured_SingleDb_currentSchemaJson(
     mut env: JNIEnv,
     _class: JClass,
@@ -112,6 +132,107 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_createSchemaBuilder(
     };
     let handle = StructuredSchemaBuilderHandle::SingleDb(builder);
     Box::into_raw(Box::new(handle)) as jlong
+}
+
+// ── priority queue ─────────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_newPriorityQueue(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+) -> jlong {
+    let Some(db) = single_db_from_handle_mut(&mut env, handle) else {
+        return 0;
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    match db.new_priority_queue(name) {
+        Ok(queue) => new_priority_queue_handle(queue, direct_buffer_pool_config),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_getPriorityQueue(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+) -> jlong {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    match db.get_priority_queue(name) {
+        Ok(queue) => new_priority_queue_handle(queue, direct_buffer_pool_config),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_getOrNewPriorityQueue(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+) -> jlong {
+    let Some(db) = single_db_from_handle_mut(&mut env, handle) else {
+        return 0;
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    match db.get_or_new_priority_queue(name) {
+        Ok(queue) => new_priority_queue_handle(queue, direct_buffer_pool_config),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
 }
 
 fn open_structured_single_db(env: &mut JNIEnv, config: Config) -> jlong {

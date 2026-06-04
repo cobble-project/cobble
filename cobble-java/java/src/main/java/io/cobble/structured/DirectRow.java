@@ -34,43 +34,53 @@ public final class DirectRow implements AutoCloseable {
     }
 
     static DirectRow decode(ByteBuffer encoded, int encodedLength, Runnable onClose) {
-        ByteBuffer view = encoded.duplicate();
-        ((Buffer) view).clear();
-        if (encodedLength < 4 || encodedLength > view.capacity()) {
-            throw new IllegalStateException("invalid encoded direct row length: " + encodedLength);
-        }
-        ((Buffer) view).limit(encodedLength);
+        Runnable releaser = onClose == null ? () -> {} : onClose;
+        try {
+            ByteBuffer view = encoded.duplicate();
+            ((Buffer) view).clear();
+            if (encodedLength < 4 || encodedLength > view.capacity()) {
+                throw new IllegalStateException(
+                        "invalid encoded direct row length: " + encodedLength);
+            }
+            ((Buffer) view).limit(encodedLength);
 
-        int columnCount = view.getInt();
-        if (columnCount < 0) {
-            throw new IllegalStateException("invalid column count: " + columnCount);
-        }
-        ColumnValue[] values = new ColumnValue[columnCount];
-        for (int i = 0; i < columnCount; i++) {
-            ensureRemaining(view, 1);
-            byte tag = view.get();
-            if (tag == TAG_NULL) {
-                values[i] = null;
-                continue;
+            int columnCount = view.getInt();
+            if (columnCount < 0 || columnCount > view.remaining()) {
+                throw new IllegalStateException("invalid column count: " + columnCount);
             }
-            if (tag == TAG_BYTES) {
-                int len = readLength(view, "bytes length");
-                values[i] = ColumnValue.bytes(sliceCurrent(view, len));
-                continue;
-            }
-            if (tag == TAG_LIST) {
-                int count = readLength(view, "list count");
-                List<ByteBuffer> list = new ArrayList<>(count);
-                for (int j = 0; j < count; j++) {
-                    int len = readLength(view, "list element length");
-                    list.add(sliceCurrent(view, len));
+            ColumnValue[] values = new ColumnValue[columnCount];
+            for (int i = 0; i < columnCount; i++) {
+                ensureRemaining(view, 1);
+                byte tag = view.get();
+                if (tag == TAG_NULL) {
+                    values[i] = null;
+                    continue;
                 }
-                values[i] = ColumnValue.list(Collections.unmodifiableList(list));
-                continue;
+                if (tag == TAG_BYTES) {
+                    int len = readLength(view, "bytes length");
+                    values[i] = ColumnValue.bytes(sliceCurrent(view, len));
+                    continue;
+                }
+                if (tag == TAG_LIST) {
+                    int count = readLength(view, "list count");
+                    if (count > view.remaining() / Integer.BYTES) {
+                        throw new IllegalStateException("invalid list count: " + count);
+                    }
+                    List<ByteBuffer> list = new ArrayList<>(count);
+                    for (int j = 0; j < count; j++) {
+                        int len = readLength(view, "list element length");
+                        list.add(sliceCurrent(view, len));
+                    }
+                    values[i] = ColumnValue.list(Collections.unmodifiableList(list));
+                    continue;
+                }
+                throw new IllegalStateException("unknown direct row column tag: " + tag);
             }
-            throw new IllegalStateException("unknown direct row column tag: " + tag);
+            return new DirectRow(values, releaser);
+        } catch (RuntimeException e) {
+            releaseAfterDecodeFailure(releaser, e);
+            throw e;
         }
-        return new DirectRow(values, onClose == null ? () -> {} : onClose);
     }
 
     public int size() {
@@ -136,6 +146,14 @@ public final class DirectRow implements AutoCloseable {
     public void close() {
         if (closed.compareAndSet(false, true)) {
             onClose.run();
+        }
+    }
+
+    private static void releaseAfterDecodeFailure(Runnable releaser, RuntimeException failure) {
+        try {
+            releaser.run();
+        } catch (RuntimeException releaseFailure) {
+            failure.addSuppressed(releaseFailure);
         }
     }
 

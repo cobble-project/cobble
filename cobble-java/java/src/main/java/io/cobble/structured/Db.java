@@ -164,6 +164,29 @@ public final class Db extends NativeObject {
         return new StructuredSchemaBuilder(h);
     }
 
+    /**
+     * Create one structured priority queue backed by its own dedicated column family.
+     *
+     * <p>The queue stores one bytes column and orders items by key within each bucket.
+     */
+    public PriorityQueue newPriorityQueue(String name) {
+        return new PriorityQueue(this, newPriorityQueue(nativeHandle, name));
+    }
+
+    /** Open one existing structured priority queue by name. */
+    public PriorityQueue getPriorityQueue(String name) {
+        return new PriorityQueue(this, getPriorityQueue(nativeHandle, name));
+    }
+
+    /**
+     * Open one existing priority queue or create it on first use.
+     *
+     * <p>If the column family already exists, it must already be marked as a priority queue.
+     */
+    public PriorityQueue getOrNewPriorityQueue(String name) {
+        return new PriorityQueue(this, getOrNewPriorityQueue(nativeHandle, name));
+    }
+
     /** Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot. */
     public static Db restore(String configPath, long snapshotId, String dbId) {
         return restore(configPath, snapshotId, dbId, false);
@@ -596,8 +619,8 @@ public final class Db extends NativeObject {
      * Get one encoded structured row through key bytes.
      *
      * <p>The input key and encoded row payload share one IO buffer. The binding keeps a reusable
-     * direct buffer pool (default 2KB) for this path, and returns a temporary larger direct buffer
-     * when the encoded row does not fit in the pooled one.
+     * direct buffer pool (default 2KB) for this path, and returns a stable larger direct-buffer
+     * copy when the encoded row does not fit in the pooled one.
      */
     public DirectEncodedRow getDirectEncodedRowWithOptions(
             int bucket, byte[] key, ReadOptions options) {
@@ -619,12 +642,7 @@ public final class Db extends NativeObject {
         if (encoded == null) {
             return null;
         }
-        try {
-            return DirectRow.decode(encoded.buffer, encoded.length, encoded.releaser);
-        } catch (RuntimeException e) {
-            encoded.releaser.run();
-            throw e;
-        }
+        return DirectRow.decode(encoded.buffer, encoded.length, encoded.releaser);
     }
 
     /**
@@ -694,12 +712,7 @@ public final class Db extends NativeObject {
         if (encoded == null) {
             return null;
         }
-        try {
-            return DirectRow.decode(encoded.buffer, encoded.length, encoded.releaser);
-        } catch (RuntimeException e) {
-            encoded.releaser.run();
-            throw e;
-        }
+        return DirectRow.decode(encoded.buffer, encoded.length, encoded.releaser);
     }
 
     /**
@@ -842,6 +855,11 @@ public final class Db extends NativeObject {
                         decodedLength,
                         releaser);
             }
+            // JNI overflow buffers are thread-local scratch space. Copy before returning a
+            // close-scoped Java view that may outlive the next JNI call on this thread.
+            if (encodedLength < 0) {
+                resultBuffer = DirectIoUtils.copyDirectPrefix(resultBuffer, decodedLength);
+            }
             pool.release(pooled);
             pooledReleased = true;
             return new EncodedDirectResult(
@@ -906,6 +924,11 @@ public final class Db extends NativeObject {
                         DirectIoUtils.directAddress(resultBuffer),
                         decodedLength,
                         releaser);
+            }
+            // JNI overflow buffers are thread-local scratch space. Copy before returning a
+            // close-scoped Java view that may outlive the next JNI call on this thread.
+            if (encodedLength < 0) {
+                resultBuffer = DirectIoUtils.copyDirectPrefix(resultBuffer, decodedLength);
             }
             pool.release(pooled);
             pooledReleased = true;
@@ -1028,6 +1051,12 @@ public final class Db extends NativeObject {
     private static native String currentSchemaJson(long nativeHandle);
 
     private static native long createSchemaBuilder(long nativeHandle);
+
+    private static native long newPriorityQueue(long nativeHandle, String name);
+
+    private static native long getPriorityQueue(long nativeHandle, String name);
+
+    private static native long getOrNewPriorityQueue(long nativeHandle, String name);
 
     private static native long restoreHandle(
             String configPath, long snapshotId, String dbId, boolean newDbId);

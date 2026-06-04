@@ -33,6 +33,7 @@ import java.util.concurrent.ExecutionException;
  * }</pre>
  */
 public final class SingleDb extends NativeObject {
+    private static volatile DirectBufferPool directBufferPool = DirectBufferPool.defaults();
 
     private SingleDb(long nativeHandle) {
         super(nativeHandle);
@@ -47,7 +48,7 @@ public final class SingleDb extends NativeObject {
         if (h == 0L) {
             throw new IllegalStateException("failed to open structured single db");
         }
-        return new SingleDb(h);
+        return wrapOpenedSingleDb(h);
     }
 
     /** Open a structured single DB from Java {@link Config}. */
@@ -60,7 +61,54 @@ public final class SingleDb extends NativeObject {
         if (h == 0L) {
             throw new IllegalStateException("failed to open structured single db from config json");
         }
-        return new SingleDb(h);
+        return wrapOpenedSingleDb(h);
+    }
+
+    private static synchronized boolean configureDirectBufferPool(
+            int bufferSizeBytes, int maxPoolSize) {
+        DirectBufferPool current = directBufferPool;
+        if (bufferSizeBytes < current.bufferSizeBytes() || maxPoolSize < current.maxPoolSize()) {
+            return false;
+        }
+        if (bufferSizeBytes == current.bufferSizeBytes() && maxPoolSize == current.maxPoolSize()) {
+            return true;
+        }
+        directBufferPool = new DirectBufferPool(bufferSizeBytes, maxPoolSize);
+        return true;
+    }
+
+    private static void initializeDirectBufferPool(long nativeHandle) {
+        int[] resolved = directBufferPoolConfig(nativeHandle);
+        if (resolved == null || resolved.length != 2) {
+            throw new IllegalStateException(
+                    "failed to load direct buffer pool config from structured single db");
+        }
+        if (!configureDirectBufferPool(resolved[0], resolved[1])) {
+            throw new IllegalStateException(
+                    "direct buffer pool config can only grow: requested "
+                            + resolved[0]
+                            + " / "
+                            + resolved[1]
+                            + ", current "
+                            + directBufferPool.bufferSizeBytes()
+                            + " / "
+                            + directBufferPool.maxPoolSize());
+        }
+    }
+
+    private static SingleDb wrapOpenedSingleDb(long nativeHandle) {
+        SingleDb db = new SingleDb(nativeHandle);
+        try {
+            initializeDirectBufferPool(nativeHandle);
+            return db;
+        } catch (RuntimeException e) {
+            try {
+                db.close();
+            } catch (RuntimeException closeError) {
+                e.addSuppressed(closeError);
+            }
+            throw e;
+        }
     }
 
     public Schema currentSchema() {
@@ -73,6 +121,29 @@ public final class SingleDb extends NativeObject {
             throw new IllegalStateException("failed to create structured schema builder");
         }
         return new StructuredSchemaBuilder(h);
+    }
+
+    /**
+     * Create one structured priority queue backed by its own dedicated column family.
+     *
+     * <p>The queue stores one bytes column and orders items by key within each bucket.
+     */
+    public PriorityQueue newPriorityQueue(String name) {
+        return new PriorityQueue(this, newPriorityQueue(nativeHandle, name));
+    }
+
+    /** Open one existing structured priority queue by name. */
+    public PriorityQueue getPriorityQueue(String name) {
+        return new PriorityQueue(this, getPriorityQueue(nativeHandle, name));
+    }
+
+    /**
+     * Open one existing priority queue or create it on first use.
+     *
+     * <p>If the column family already exists, it must already be marked as a priority queue.
+     */
+    public PriorityQueue getOrNewPriorityQueue(String name) {
+        return new PriorityQueue(this, getOrNewPriorityQueue(nativeHandle, name));
     }
 
     // ── typed write operations ────────────────────────────────────────────────
@@ -288,11 +359,19 @@ public final class SingleDb extends NativeObject {
 
     private static native long openHandle(String configPath);
 
+    private static native int[] directBufferPoolConfig(long nativeHandle);
+
     private static native long openHandleFromJson(String configJson);
 
     private static native String currentSchemaJson(long nativeHandle);
 
     private static native long createSchemaBuilder(long nativeHandle);
+
+    private static native long newPriorityQueue(long nativeHandle, String name);
+
+    private static native long getPriorityQueue(long nativeHandle, String name);
+
+    private static native long getOrNewPriorityQueue(long nativeHandle, String name);
 
     // bytes put/merge
     private static native void putBytes(

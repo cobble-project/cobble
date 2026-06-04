@@ -21,8 +21,8 @@ use crate::util::{
 use bytes::Bytes;
 use cobble::Config;
 use cobble_data_structure::{
-    DataStructureDb, StructuredColumnValue, StructuredDbIterator, StructuredScanSplit,
-    StructuredScanSplitScanner,
+    DataStructureDb, PriorityQueue as CobblePriorityQueue, StructuredColumnValue,
+    StructuredDbIterator, StructuredScanSplit, StructuredScanSplitScanner,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -38,6 +38,78 @@ pub(crate) enum StructuredSchemaBuilderHandle {
             cobble_data_structure::StructuredSingleDb,
         >,
     ),
+}
+
+pub(crate) struct StructuredPriorityQueueHandle {
+    queue: CobblePriorityQueue<'static>,
+    direct_buffer_pool_config: (usize, usize),
+}
+
+impl StructuredPriorityQueueHandle {
+    fn column_family(&self) -> &str {
+        self.queue.column_family()
+    }
+
+    fn direct_buffer_pool_config(&self) -> (usize, usize) {
+        self.direct_buffer_pool_config
+    }
+
+    fn offer<K, V>(&self, bucket: u16, key: K, value: V) -> cobble::Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.queue.offer(bucket, key, value)
+    }
+
+    fn delete<K>(&self, bucket: u16, key: K) -> cobble::Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.queue.delete(bucket, key)
+    }
+
+    fn advance_to<K>(&self, bucket: u16, key: K) -> cobble::Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.queue.advance_to(bucket, key)
+    }
+
+    fn cursor(&self, bucket: u16) -> cobble::Result<Option<Vec<u8>>> {
+        self.queue.cursor(bucket)
+    }
+
+    fn peek_batch(
+        &self,
+        bucket: u16,
+        batch_size: Option<usize>,
+    ) -> cobble::Result<Vec<(Bytes, Bytes)>> {
+        self.queue.peek_batch(bucket, batch_size)
+    }
+
+    fn poll_batch(
+        &self,
+        bucket: u16,
+        batch_size: Option<usize>,
+    ) -> cobble::Result<Vec<(Bytes, Bytes)>> {
+        self.queue.poll_batch(bucket, batch_size)
+    }
+}
+
+pub(crate) fn new_priority_queue_handle(
+    queue: CobblePriorityQueue<'_>,
+    direct_buffer_pool_config: (usize, usize),
+) -> jlong {
+    let queue = unsafe {
+        // Java queue handles are non-owning views over their parent Db. The Java wrapper retains
+        // the parent object so the Rust reference remains valid until callers close the queue.
+        std::mem::transmute::<CobblePriorityQueue<'_>, CobblePriorityQueue<'static>>(queue)
+    };
+    Box::into_raw(Box::new(StructuredPriorityQueueHandle {
+        queue,
+        direct_buffer_pool_config,
+    })) as jlong
 }
 
 // ── open ────────────────────────────────────────────────────────────────────
@@ -149,7 +221,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_directBufferPoolConfig(
     direct_buffer_pool_config_array(&mut env, buffer_size_bytes, pool_size)
 }
 
-fn direct_buffer_pool_config_array(
+pub(crate) fn direct_buffer_pool_config_array(
     env: &mut JNIEnv,
     buffer_size_bytes: usize,
     pool_size: usize,
@@ -225,6 +297,617 @@ pub extern "system" fn Java_io_cobble_structured_Db_createSchemaBuilder(
     };
     let handle = StructuredSchemaBuilderHandle::Db(builder);
     Box::into_raw(Box::new(handle)) as jlong
+}
+
+// ── priority queue ─────────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_newPriorityQueue(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+) -> jlong {
+    let Some(db) = db_from_handle_mut(&mut env, handle) else {
+        return 0;
+    };
+    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    match db.new_priority_queue(name) {
+        Ok(queue) => new_priority_queue_handle(queue, direct_buffer_pool_config),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_getPriorityQueue(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+) -> jlong {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    match db.get_priority_queue(name) {
+        Ok(queue) => new_priority_queue_handle(queue, direct_buffer_pool_config),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_getOrNewPriorityQueue(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+) -> jlong {
+    let Some(db) = db_from_handle_mut(&mut env, handle) else {
+        return 0;
+    };
+    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    match db.get_or_new_priority_queue(name) {
+        Ok(queue) => new_priority_queue_handle(queue, direct_buffer_pool_config),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_disposeInternal(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle == 0 {
+        throw_illegal_state(&mut env, "priority queue handle is disposed".to_string());
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle as *mut StructuredPriorityQueueHandle));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_columnFamily(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    to_java_string_or_throw(&mut env, queue.column_family().to_string())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_directBufferPoolConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jintArray {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let (buffer_size_bytes, pool_size) = queue.direct_buffer_pool_config();
+    direct_buffer_pool_config_array(&mut env, buffer_size_bytes, pool_size)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueueOffer(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    value: JByteArray,
+) {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes_ref(&mut env, &key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let value = match decode_java_bytes_ref(&mut env, &value) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    if let Err(err) = queue.offer(bucket, key, value) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueueOfferDirect(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key_address: jlong,
+    key_capacity: jint,
+    key_length: jint,
+    value_address: jlong,
+    value_capacity: jint,
+    value_length: jint,
+) {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let Some(key) =
+        decode_direct_buffer_slice(&mut env, "key", key_address, key_capacity, key_length)
+    else {
+        return;
+    };
+    let Some(value) = decode_direct_buffer_slice(
+        &mut env,
+        "value",
+        value_address,
+        value_capacity,
+        value_length,
+    ) else {
+        return;
+    };
+    if let Err(err) = queue.offer(bucket, key, value) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueueDelete(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+) {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes_ref(&mut env, &key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    if let Err(err) = queue.delete(bucket, key) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueueAdvance(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+) {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes_ref(&mut env, &key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    if let Err(err) = queue.advance_to(bucket, key) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueueAdvanceDirect(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key_address: jlong,
+    key_capacity: jint,
+    key_length: jint,
+) {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let Some(key) =
+        decode_direct_buffer_slice(&mut env, "key", key_address, key_capacity, key_length)
+    else {
+        return;
+    };
+    if let Err(err) = queue.advance_to(bucket, key) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueueCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+) -> jobject {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let cursor = match queue.cursor(bucket) {
+        Ok(cursor) => cursor,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let Some(cursor) = cursor else {
+        return std::ptr::null_mut();
+    };
+    match env.byte_array_from_slice(&cursor) {
+        Ok(array) => array.into_raw(),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueuePeek(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+) -> jobject {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let rows = match queue.peek_batch(bucket, Some(1)) {
+        Ok(rows) if rows.is_empty() => return std::ptr::null_mut(),
+        Ok(rows) => rows,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match to_java_priority_queue_pairs(&mut env, rows) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueuePeekBatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    batch_size: jint,
+) -> jobject {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let batch_size = match decode_priority_queue_batch_size(&mut env, batch_size) {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+    let rows = match queue.peek_batch(bucket, batch_size) {
+        Ok(rows) => rows,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match to_java_priority_queue_pairs(&mut env, rows) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueuePoll(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+) -> jobject {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let rows = match queue.poll_batch(bucket, Some(1)) {
+        Ok(rows) if rows.is_empty() => return std::ptr::null_mut(),
+        Ok(rows) => rows,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match to_java_priority_queue_pairs(&mut env, rows) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueuePollBatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    batch_size: jint,
+) -> jobject {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let batch_size = match decode_priority_queue_batch_size(&mut env, batch_size) {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+    let rows = match queue.poll_batch(bucket, batch_size) {
+        Ok(rows) => rows,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match to_java_priority_queue_pairs(&mut env, rows) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueuePeekBatchDirect<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    batch_size: jint,
+    io_address: jlong,
+    io_capacity: jint,
+) -> jint {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let batch_size = match decode_priority_queue_batch_size(&mut env, batch_size) {
+        Some(v) => v,
+        None => return 0,
+    };
+    let Some((direct_addr, direct_capacity)) =
+        decode_direct_buffer_output(&mut env, "io", io_address, io_capacity)
+    else {
+        return 0;
+    };
+    let rows = match queue.peek_batch(bucket, batch_size) {
+        Ok(rows) => rows,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    match encode_priority_queue_rows_to_direct_buffer(
+        &mut env,
+        rows.as_slice(),
+        direct_addr,
+        direct_capacity,
+    ) {
+        Ok(encoded_len) => encoded_len,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueuePollBatchDirect<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    batch_size: jint,
+    io_address: jlong,
+    io_capacity: jint,
+) -> jint {
+    let Some(queue) = priority_queue_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let batch_size = match decode_priority_queue_batch_size(&mut env, batch_size) {
+        Some(v) => v,
+        None => return 0,
+    };
+    let Some((direct_addr, direct_capacity)) =
+        decode_direct_buffer_output(&mut env, "io", io_address, io_capacity)
+    else {
+        return 0;
+    };
+    let rows = match queue.poll_batch(bucket, batch_size) {
+        Ok(rows) => rows,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    match encode_priority_queue_rows_to_direct_buffer(
+        &mut env,
+        rows.as_slice(),
+        direct_addr,
+        direct_capacity,
+    ) {
+        Ok(encoded_len) => encoded_len,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_PriorityQueue_getLastDirectOverflowBuffer<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+) -> jobject {
+    match take_last_overflow_direct_buffer(&mut env) {
+        Ok(buffer) => buffer,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
 }
 
 fn open_structured_db(env: &mut JNIEnv, config: Config) -> jlong {
@@ -1581,7 +2264,7 @@ fn apply_encoded_list_direct_with_options(
     }
 }
 
-fn decode_direct_buffer_slice<'a>(
+pub(crate) fn decode_direct_buffer_slice<'a>(
     env: &mut JNIEnv,
     label: &str,
     address: jlong,
@@ -1617,6 +2300,29 @@ fn decode_direct_buffer_slice<'a>(
         return None;
     }
     Some(unsafe { std::slice::from_raw_parts(address, length) })
+}
+
+pub(crate) fn decode_direct_buffer_output(
+    env: &mut JNIEnv,
+    label: &str,
+    address: jlong,
+    capacity: jint,
+) -> Option<(*mut u8, usize)> {
+    let capacity = match usize::try_from(capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(env, format!("{label}Capacity must be >= 0"));
+            return None;
+        }
+    };
+    let address = match usize::try_from(address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(env, format!("{label}Address must be > 0"));
+            return None;
+        }
+    };
+    Some((address, capacity))
 }
 
 // ── typed scan ──────────────────────────────────────────────────────────────
@@ -2306,6 +3012,119 @@ pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_nextRowDirectI
     cursor.next_row_direct(&mut env, io_address, io_capacity)
 }
 
+pub(crate) fn decode_priority_queue_batch_size(
+    env: &mut JNIEnv,
+    batch_size: jint,
+) -> Option<Option<usize>> {
+    if batch_size < -1 {
+        throw_illegal_argument(
+            env,
+            format!("batchSize must be >= 0 or -1 for boundary-sized batches, got {batch_size}"),
+        );
+        return None;
+    }
+    if batch_size < 0 {
+        return Some(None);
+    }
+    Some(Some(batch_size as usize))
+}
+
+pub(crate) fn to_java_priority_queue_pairs(
+    env: &mut JNIEnv,
+    rows: Vec<(Bytes, Bytes)>,
+) -> std::result::Result<jobject, String> {
+    let byte_array_class = byte_array_class(env)?;
+    let array = new_object_array(env, (rows.len() * 2) as i32, byte_array_class)?;
+    for (index, (key, value)) in rows.into_iter().enumerate() {
+        let key_array = env
+            .byte_array_from_slice(key.as_ref())
+            .map_err(|err| err.to_string())?;
+        env.set_object_array_element(&array, (index * 2) as i32, key_array)
+            .map_err(|err| err.to_string())?;
+        let value_array = env
+            .byte_array_from_slice(value.as_ref())
+            .map_err(|err| err.to_string())?;
+        env.set_object_array_element(&array, (index * 2 + 1) as i32, value_array)
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(array.into_raw() as jobject)
+}
+
+pub(crate) fn encode_priority_queue_rows_to_direct_buffer<'local>(
+    env: &mut JNIEnv<'local>,
+    rows: &[(Bytes, Bytes)],
+    direct_addr: *mut u8,
+    direct_capacity: usize,
+) -> std::result::Result<jint, String> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let payload_len = encoded_priority_queue_rows_payload_size(rows)?;
+    if payload_len <= direct_capacity {
+        let out = unsafe { std::slice::from_raw_parts_mut(direct_addr, payload_len) };
+        encode_priority_queue_rows_payload_into(rows, out)?;
+        return Ok(payload_len as jint);
+    }
+    let mut encoded = vec![0; payload_len];
+    encode_priority_queue_rows_payload_into(rows, &mut encoded)?;
+    write_payload_to_io_or_cached_overflow(env, direct_addr, direct_capacity, &encoded)
+}
+
+fn encoded_priority_queue_rows_payload_size(
+    rows: &[(Bytes, Bytes)],
+) -> std::result::Result<usize, String> {
+    let mut total = std::mem::size_of::<i32>();
+    for (key, value) in rows {
+        total = total
+            .checked_add(std::mem::size_of::<i32>())
+            .and_then(|v| v.checked_add(key.len()))
+            .and_then(|v| v.checked_add(std::mem::size_of::<i32>()))
+            .and_then(|v| v.checked_add(value.len()))
+            .ok_or_else(|| "priority queue direct payload size overflow".to_string())?;
+    }
+    if rows.len() > i32::MAX as usize {
+        return Err("priority queue direct payload has too many rows".to_string());
+    }
+    Ok(total)
+}
+
+fn encode_priority_queue_rows_payload_into(
+    rows: &[(Bytes, Bytes)],
+    dst: &mut [u8],
+) -> std::result::Result<(), String> {
+    let expected_len = encoded_priority_queue_rows_payload_size(rows)?;
+    if dst.len() != expected_len {
+        return Err(format!(
+            "priority queue direct payload size mismatch: expected {}, got {}",
+            expected_len,
+            dst.len()
+        ));
+    }
+    let mut offset = 0usize;
+    dst[offset..offset + std::mem::size_of::<i32>()]
+        .copy_from_slice(&(rows.len() as i32).to_be_bytes());
+    offset += std::mem::size_of::<i32>();
+    for (key, value) in rows {
+        if key.len() > i32::MAX as usize {
+            return Err("priority queue key exceeds direct payload limit".to_string());
+        }
+        dst[offset..offset + std::mem::size_of::<i32>()]
+            .copy_from_slice(&(key.len() as i32).to_be_bytes());
+        offset += std::mem::size_of::<i32>();
+        dst[offset..offset + key.len()].copy_from_slice(key.as_ref());
+        offset += key.len();
+        if value.len() > i32::MAX as usize {
+            return Err("priority queue value exceeds direct payload limit".to_string());
+        }
+        dst[offset..offset + std::mem::size_of::<i32>()]
+            .copy_from_slice(&(value.len() as i32).to_be_bytes());
+        offset += std::mem::size_of::<i32>();
+        dst[offset..offset + value.len()].copy_from_slice(value.as_ref());
+        offset += value.len();
+    }
+    Ok(())
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 fn db_from_handle(env: &mut JNIEnv, handle: jlong) -> Option<&'static DataStructureDb> {
@@ -2336,6 +3155,17 @@ fn structured_builder_from_handle(
         return None;
     }
     Some(unsafe { &mut *(handle as *mut StructuredSchemaBuilderHandle) })
+}
+
+fn priority_queue_from_handle(
+    env: &mut JNIEnv,
+    handle: jlong,
+) -> Option<&'static StructuredPriorityQueueHandle> {
+    if handle == 0 {
+        throw_illegal_state(env, "priority queue handle is disposed".to_string());
+        return None;
+    }
+    Some(unsafe { &*(handle as *const StructuredPriorityQueueHandle) })
 }
 
 #[unsafe(no_mangle)]

@@ -265,6 +265,87 @@ Structured distributed scan behaves the same way: `StructuredScanSplit` is seria
 optional boundary metadata, and `splitAfter(bucket, keyInclusive)` returns `before` / `after`
 halves around that row boundary.
 
+## Structured Priority Queue APIs
+
+Structured `Db` and `SingleDb` expose column-family-scoped priority queues through
+`io.cobble.structured.PriorityQueue`.
+
+```java
+io.cobble.structured.Db db = io.cobble.structured.Db.open("config.yaml");
+
+// Create a new queue, open an existing one, or open/create on first use.
+PriorityQueue queue = db.getOrNewPriorityQueue("timers");
+```
+
+Each queue owns one dedicated structured column family with one bytes column. Items are ordered by
+key within each bucket. Queue consumption is cursor based: advancing or polling moves a monotonic
+cursor, making the consumed key and all earlier keys invisible. Offering an item at or before the
+current cursor does not make it visible again.
+
+`PriorityQueue` is an `AutoCloseable` native object. The parent `Db` or `SingleDb` only creates the
+queue handle; after construction, queue operations go directly through the queue native handle,
+which caches the resolved column-family metadata used by cursor operations. Close queue handles
+before closing the parent DB handle.
+
+### Heap-buffer APIs
+
+```java
+queue.offer(0, "timer:001".getBytes(), payload);
+queue.offer(0, "timer:002".getBytes(), payload);
+
+PriorityQueue.Entry next = queue.peek(0);       // does not advance
+PriorityQueue.Entry consumed = queue.poll(0);   // advances to consumed key
+
+List<PriorityQueue.Entry> fixed = queue.peekBatch(0, 128);
+List<PriorityQueue.Entry> dynamic = queue.pollBatch(0);
+
+queue.advance(0, "timer:010".getBytes());
+byte[] cursor = queue.cursor(0);
+queue.delete(0, "timer:020".getBytes());
+```
+
+- `newPriorityQueue(name)` creates a new queue and fails if it already exists.
+- `getPriorityQueue(name)` opens an existing queue and validates that it is a queue column family.
+- `getOrNewPriorityQueue(name)` opens an existing queue or creates it on first use.
+- `peek(...)` / `peekBatch(...)` read without moving the cursor.
+- `poll(...)` / `pollBatch(...)` return visible entries and advance once to the last consumed key.
+- Passing an explicit `batchSize` bounds the returned count; passing `0` returns an empty batch.
+- The no-`batchSize` batch overload returns one physical-boundary-sized batch, stopping after the
+  next SST block, Parquet row group, or file boundary when the source has such a boundary.
+
+### Direct-buffer APIs
+
+Use direct APIs on timer or queue hot paths to avoid JNI heap-array materialization.
+
+```java
+ByteBuffer key = ByteBuffer.allocateDirect(64);
+ByteBuffer value = ByteBuffer.allocateDirect(256);
+// write key/value bytes into [0, keyLen) and [0, valueLen)
+
+queue.offerDirect(0, key, keyLen, value, valueLen);
+
+try (DirectPriorityQueueEntry entry = queue.peekDirect(0)) {
+    if (entry != null) {
+        ByteBuffer keyView = entry.getKey();
+        ByteBuffer valueView = entry.getValue();
+    }
+}
+
+try (DirectPriorityQueueBatch batch = queue.peekBatchDirect(0)) {
+    for (DirectPriorityQueueEntry entry : batch) {
+        ByteBuffer keyView = entry.getKey();
+        ByteBuffer valueView = entry.getValue();
+    }
+}
+
+queue.advance(0, key, keyLen);
+```
+
+Direct single-entry results own their payload and must be closed. Entries obtained from
+`DirectPriorityQueueBatch` are borrowed views and stay valid only until the parent batch is closed.
+There is no separate `advanceDirect` method; direct cursor advancement is exposed as the
+`advance(int bucket, ByteBuffer keyBuffer, int keyLength)` overload.
+
 ## Performance Guidance
 
 For hot paths, prefer direct buffer APIs.

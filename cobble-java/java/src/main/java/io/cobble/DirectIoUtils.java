@@ -35,6 +35,19 @@ public final class DirectIoUtils {
         UnsafeAccess.copyMemory(directAddress(keyBuffer), directAddress(target), keyLength);
     }
 
+    /** Returns a stable direct copy of {@code source[0..length)}. */
+    public static ByteBuffer copyDirectPrefix(ByteBuffer source, int length) {
+        if (source == null || !source.isDirect()) {
+            throw new IllegalArgumentException("source must be a direct ByteBuffer");
+        }
+        if (length < 0 || length > source.capacity()) {
+            throw new IllegalArgumentException("length out of range: " + length);
+        }
+        ByteBuffer copy = ByteBuffer.allocateDirect(length);
+        UnsafeAccess.copyMemory(directAddress(source), directAddress(copy), length);
+        return copy;
+    }
+
     public static void ensureRemaining(int totalLength, int offset, int size, String payloadName) {
         if (size < 0 || offset < 0 || offset > totalLength - size) {
             throw new IllegalStateException("malformed " + payloadName);

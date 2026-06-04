@@ -205,6 +205,281 @@ class StructuredDbTest {
     }
 
     @Test
+    void structuredPriorityQueueOfferPollAndBatch() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-priority-queue-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config);
+                PriorityQueue created = db.newPriorityQueue(" jobs ");
+                PriorityQueue queue = db.getPriorityQueue("jobs")) {
+            assertEquals("jobs", created.columnFamily());
+
+            queue.offer(
+                    0,
+                    "k2".getBytes(StandardCharsets.UTF_8),
+                    "v2".getBytes(StandardCharsets.UTF_8));
+            queue.offer(
+                    0,
+                    "k1".getBytes(StandardCharsets.UTF_8),
+                    "left".getBytes(StandardCharsets.UTF_8));
+            queue.offer(
+                    0,
+                    "k1".getBytes(StandardCharsets.UTF_8),
+                    "right".getBytes(StandardCharsets.UTF_8));
+
+            PriorityQueue.Entry first = queue.poll(0);
+            assertNotNull(first);
+            assertArrayEquals("k1".getBytes(StandardCharsets.UTF_8), first.getKey());
+            assertArrayEquals("leftright".getBytes(StandardCharsets.UTF_8), first.getValue());
+
+            List<PriorityQueue.Entry> remaining = queue.pollBatch(0, 10);
+            assertEquals(1, remaining.size());
+            assertArrayEquals("k2".getBytes(StandardCharsets.UTF_8), remaining.get(0).getKey());
+            assertArrayEquals("v2".getBytes(StandardCharsets.UTF_8), remaining.get(0).getValue());
+
+            assertNull(queue.poll(0));
+            assertTrue(queue.pollBatch(0, 0).isEmpty());
+        }
+    }
+
+    @Test
+    void structuredSingleDbPriorityQueueRoundTrip() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-single-priority-queue-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (SingleDb db = SingleDb.open(config);
+                PriorityQueue queue = db.getOrNewPriorityQueue("jobs")) {
+            assertEquals("jobs", queue.columnFamily());
+
+            queue.offer(
+                    0,
+                    "job-2".getBytes(StandardCharsets.UTF_8),
+                    "value-2".getBytes(StandardCharsets.UTF_8));
+            queue.offer(
+                    0,
+                    "job-1".getBytes(StandardCharsets.UTF_8),
+                    "value-1".getBytes(StandardCharsets.UTF_8));
+            queue.delete(0, "job-2".getBytes(StandardCharsets.UTF_8));
+
+            List<PriorityQueue.Entry> batch = queue.pollBatch(0, 10);
+            assertEquals(1, batch.size());
+            assertArrayEquals("job-1".getBytes(StandardCharsets.UTF_8), batch.get(0).getKey());
+            assertArrayEquals("value-1".getBytes(StandardCharsets.UTF_8), batch.get(0).getValue());
+            assertNull(queue.poll(0));
+        }
+    }
+
+    @Test
+    void structuredPriorityQueuePeekAndAdvance() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-priority-queue-peek-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config);
+                PriorityQueue queue = db.getOrNewPriorityQueue("jobs")) {
+            queue.offer(
+                    0,
+                    "job-2".getBytes(StandardCharsets.UTF_8),
+                    "value-2".getBytes(StandardCharsets.UTF_8));
+            queue.offer(
+                    0,
+                    "job-1".getBytes(StandardCharsets.UTF_8),
+                    "value-1".getBytes(StandardCharsets.UTF_8));
+
+            PriorityQueue.Entry peeked = queue.peek(0);
+            assertNotNull(peeked);
+            assertArrayEquals("job-1".getBytes(StandardCharsets.UTF_8), peeked.getKey());
+            assertArrayEquals("value-1".getBytes(StandardCharsets.UTF_8), peeked.getValue());
+
+            List<PriorityQueue.Entry> peekBatch = queue.peekBatch(0, 10);
+            assertEquals(2, peekBatch.size());
+            assertArrayEquals("job-1".getBytes(StandardCharsets.UTF_8), peekBatch.get(0).getKey());
+            assertArrayEquals("job-2".getBytes(StandardCharsets.UTF_8), peekBatch.get(1).getKey());
+            assertTrue(queue.peekBatch(0, 0).isEmpty());
+
+            queue.advance(0, "job-1".getBytes(StandardCharsets.UTF_8));
+            assertArrayEquals("job-1".getBytes(StandardCharsets.UTF_8), queue.cursor(0));
+
+            PriorityQueue.Entry remaining = queue.poll(0);
+            assertNotNull(remaining);
+            assertArrayEquals("job-2".getBytes(StandardCharsets.UTF_8), remaining.getKey());
+            assertArrayEquals("value-2".getBytes(StandardCharsets.UTF_8), remaining.getValue());
+            assertNull(queue.poll(0));
+        }
+    }
+
+    @Test
+    void structuredPriorityQueueDirectOfferAndPoll() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-priority-queue-direct-offer-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config);
+                PriorityQueue queue = db.getOrNewPriorityQueue("jobs")) {
+            byte[] largeValue = largeValueBytes("pq-direct-large", 1, 4096);
+
+            queue.offerDirect(
+                    0,
+                    directBufferOf("job-2".getBytes(StandardCharsets.UTF_8)),
+                    directBufferOf("value-2".getBytes(StandardCharsets.UTF_8)));
+            queue.offerDirect(
+                    0,
+                    directBufferOf("job-1".getBytes(StandardCharsets.UTF_8)),
+                    directBufferOf(largeValue));
+            queue.offerDirect(
+                    0,
+                    directBufferOf("job-3".getBytes(StandardCharsets.UTF_8)),
+                    directBufferOf("value-3".getBytes(StandardCharsets.UTF_8)));
+            queue.delete(0, "job-3".getBytes(StandardCharsets.UTF_8));
+
+            try (DirectPriorityQueueEntry first = queue.pollDirect(0)) {
+                assertNotNull(first);
+                assertArrayEquals(
+                        "job-1".getBytes(StandardCharsets.UTF_8), readDirectBytes(first.getKey()));
+                assertArrayEquals(largeValue, readDirectBytes(first.getValue()));
+            }
+
+            try (DirectPriorityQueueBatch remaining = queue.pollBatchDirect(0, 10)) {
+                assertEquals(1, remaining.size());
+                assertArrayEquals(
+                        "job-2".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(remaining.get(0).getKey()));
+                assertArrayEquals(
+                        "value-2".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(remaining.get(0).getValue()));
+            }
+
+            assertNull(queue.pollDirect(0));
+            try (DirectPriorityQueueBatch empty = queue.pollBatchDirect(0)) {
+                assertTrue(empty.isEmpty());
+            }
+        }
+    }
+
+    @Test
+    void structuredPriorityQueueDirectOverflowViewsRemainStableUntilClosed() throws IOException {
+        Path dataDir =
+                Files.createTempDirectory("cobble-structured-priority-queue-direct-overflow-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config);
+                PriorityQueue queue = db.getOrNewPriorityQueue("jobs")) {
+            byte[] firstKey = "job-1".getBytes(StandardCharsets.UTF_8);
+            byte[] secondKey = "job-2".getBytes(StandardCharsets.UTF_8);
+            byte[] firstValue = largeValueBytes("pq-overflow-first", 1, 4096);
+            byte[] secondValue = largeValueBytes("pq-overflow-second", 2, 4096);
+
+            queue.offer(0, firstKey, firstValue);
+            queue.offer(0, secondKey, secondValue);
+
+            try (DirectPriorityQueueEntry first = queue.peekDirect(0)) {
+                queue.advance(0, firstKey);
+                try (DirectPriorityQueueEntry second = queue.peekDirect(0)) {
+                    assertArrayEquals(secondKey, readDirectBytes(second.getKey()));
+                    assertArrayEquals(secondValue, readDirectBytes(second.getValue()));
+                    assertArrayEquals(firstKey, readDirectBytes(first.getKey()));
+                    assertArrayEquals(firstValue, readDirectBytes(first.getValue()));
+                }
+            }
+        }
+    }
+
+    @Test
+    void structuredPriorityQueueDirectPeekAndAdvance() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-priority-queue-direct-peek-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (SingleDb db = SingleDb.open(config);
+                PriorityQueue queue = db.getOrNewPriorityQueue("jobs")) {
+
+            queue.offerDirect(
+                    0,
+                    directBufferOf("job-2".getBytes(StandardCharsets.UTF_8)),
+                    directBufferOf("value-2".getBytes(StandardCharsets.UTF_8)));
+            queue.offerDirect(
+                    0,
+                    directBufferOf("job-1".getBytes(StandardCharsets.UTF_8)),
+                    directBufferOf("value-1".getBytes(StandardCharsets.UTF_8)));
+            queue.offerDirect(
+                    0,
+                    directBufferOf("job-3".getBytes(StandardCharsets.UTF_8)),
+                    directBufferOf("value-3".getBytes(StandardCharsets.UTF_8)));
+            queue.delete(0, "job-3".getBytes(StandardCharsets.UTF_8));
+
+            try (DirectPriorityQueueEntry peeked = queue.peekDirect(0)) {
+                assertNotNull(peeked);
+                assertArrayEquals(
+                        "job-1".getBytes(StandardCharsets.UTF_8), readDirectBytes(peeked.getKey()));
+                assertArrayEquals(
+                        "value-1".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(peeked.getValue()));
+            }
+
+            try (DirectPriorityQueueBatch batch = queue.peekBatchDirect(0, 10)) {
+                assertEquals(2, batch.size());
+                assertArrayEquals(
+                        "job-1".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(batch.get(0).getKey()));
+                assertArrayEquals(
+                        "job-2".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(batch.get(1).getKey()));
+            }
+
+            queue.advance(0, directBufferOf("job-1".getBytes(StandardCharsets.UTF_8)));
+
+            try (DirectPriorityQueueEntry remaining = queue.pollDirect(0)) {
+                assertNotNull(remaining);
+                assertArrayEquals(
+                        "job-2".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(remaining.getKey()));
+                assertArrayEquals(
+                        "value-2".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(remaining.getValue()));
+            }
+
+            assertNull(queue.pollDirect(0));
+            try (DirectPriorityQueueBatch empty = queue.peekBatchDirect(0)) {
+                assertTrue(empty.isEmpty());
+            }
+        }
+    }
+
+    @Test
+    void structuredSingleDbPriorityQueueDirectBatchPoll() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-single-priority-queue-direct-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (SingleDb db = SingleDb.open(config);
+                PriorityQueue queue = db.getOrNewPriorityQueue("jobs")) {
+
+            queue.offerDirect(
+                    0,
+                    directBufferOf("job-2".getBytes(StandardCharsets.UTF_8)),
+                    directBufferOf("value-2".getBytes(StandardCharsets.UTF_8)));
+            queue.offerDirect(
+                    0,
+                    directBufferOf("job-1".getBytes(StandardCharsets.UTF_8)),
+                    directBufferOf("value-1".getBytes(StandardCharsets.UTF_8)));
+
+            try (DirectPriorityQueueBatch batch = queue.pollBatchDirect(0, 10)) {
+                assertEquals(2, batch.size());
+                assertArrayEquals(
+                        "job-1".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(batch.get(0).getKey()));
+                assertArrayEquals(
+                        "value-1".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(batch.get(0).getValue()));
+                assertArrayEquals(
+                        "job-2".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(batch.get(1).getKey()));
+                assertArrayEquals(
+                        "value-2".getBytes(StandardCharsets.UTF_8),
+                        readDirectBytes(batch.get(1).getValue()));
+            }
+
+            assertNull(queue.pollDirect(0));
+        }
+    }
+
+    @Test
     void listMergeAppendsElements() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-structured-merge-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
