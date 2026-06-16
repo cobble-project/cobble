@@ -33,6 +33,9 @@ We list some of Cobble's key features below, they are either implemented or are 
 For more details on features and design, see docs:
 - https://cobble-project.github.io/cobble/latest/architecture/
 
+Projects that use Cobble:
+- [Cobble Flink](https://github.com/cobble-project/cobble-flink) - a [Apache Flink](https://github.com/apache/flink)'s state backend, source and sink built on Cobble.
+
 ## Install
 
 Add `cobble` to your `Cargo.toml`:
