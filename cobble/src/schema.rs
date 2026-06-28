@@ -129,7 +129,7 @@ fn build_column_family_name_index(column_families: &[ColumnFamily]) -> HashMap<S
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct ColumnFamilyFile {
+pub(crate) struct ColumnFamilyFile {
     id: u8,
     name: String,
     merge_operator_ids: Vec<String>,
@@ -907,10 +907,51 @@ impl SchemaManager {
         file_manager: &Arc<FileManager>,
         schema_id: u64,
     ) -> Result<()> {
+        self.register_schema_from_file_with_resolver(file_manager, schema_id, None)
+    }
+
+    /// Loads a persisted schema file from the shared metadata volume and registers it, preserving
+    /// its original schema version. The merge-operator resolver lets column families that reference
+    /// custom operators resolve to the correct implementation; pass `None` to fall back to the
+    /// built-in operators. Used by snapshot/restore to rebuild the writer's schema registry.
+    pub(crate) fn register_schema_from_file_with_resolver(
+        &self,
+        file_manager: &Arc<FileManager>,
+        schema_id: u64,
+        resolver: Option<&Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<()> {
         if self.schemas.read().unwrap().contains_key(&schema_id) {
             return Ok(());
         }
-        let schema = Arc::new(load_schema(file_manager, schema_id, None)?);
+        let schema = Arc::new(load_schema(file_manager, schema_id, resolver)?);
+        self.register_loaded_schema(schema);
+        Ok(())
+    }
+
+    /// Registers an in-memory `SchemaFile` definition (e.g. received over the remote-compaction
+    /// protocol) into the registry, preserving its original schema version. This is how the remote
+    /// compactor reconstructs the writer's schema registry: the writer carries the schema
+    /// definitions it needs in the compaction request, so the compactor can decode input SST files
+    /// stamped with non-zero schema ids and stamp output with the writer's latest schema version —
+    /// without reading the shared volume.
+    pub(crate) fn register_schema_from_def(
+        &self,
+        schema_file: &SchemaFile,
+        resolver: Option<&Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<()> {
+        if self.schemas.read().unwrap().contains_key(&schema_file.id) {
+            return Ok(());
+        }
+        let schema = Arc::new(schema_from_file(schema_file, resolver)?);
+        self.register_loaded_schema(schema);
+        Ok(())
+    }
+
+    /// Inserts an already-loaded schema into the registry, promotes it to latest when it is newer
+    /// than the current latest, and advances `next_version` past it. ArcSwap guarantees the
+    /// promotion is atomic; a concurrent loader that registers an even-newer version simply wins,
+    /// which is correct because both are writer-persisted schemas.
+    fn register_loaded_schema(&self, schema: Arc<Schema>) {
         self.schemas
             .write()
             .unwrap()
@@ -919,6 +960,10 @@ impl SchemaManager {
             .write()
             .unwrap()
             .insert(schema.version(), schema.evolution());
+        let current_latest_version = self.latest_schema.load().version();
+        if schema.version() > current_latest_version {
+            self.latest_schema.store(Arc::clone(&schema));
+        }
         let target_next = schema.version().saturating_add(1);
         let mut current_next = self.next_version.load(Ordering::SeqCst);
         while current_next < target_next {
@@ -932,7 +977,6 @@ impl SchemaManager {
                 Err(value) => current_next = value,
             }
         }
-        Ok(())
     }
 }
 
@@ -954,14 +998,32 @@ fn collect_schema_ids_from_manifest(manifest: &ManifestSnapshot, schema_ids: &mu
     }
 }
 
-#[derive(Deserialize, Serialize)]
-struct SchemaFile {
-    format_version: u32,
-    id: u64,
-    column_families: Vec<ColumnFamilyFile>,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct SchemaFile {
+    pub(crate) format_version: u32,
+    pub(crate) id: u64,
+    pub(crate) column_families: Vec<ColumnFamilyFile>,
 }
 
 pub(crate) fn persist_schema(file_manager: &FileManager, schema: &Schema) -> Result<()> {
+    let schema_file = schema_to_file(schema);
+    let json = serde_json::to_vec(&schema_file)
+        .map_err(|err| Error::FileFormatError(format!("Failed to encode schema file: {}", err)))?;
+    let mut writer = BufferedWriter::new(
+        file_manager.create_metadata_file(&schema_file_relative_path(schema.version()))?,
+        4096,
+    );
+    writer.write(json.as_ref())?;
+    writer.close()?;
+    Ok(())
+}
+
+/// Serializes a `Schema` into the portable `SchemaFile` representation used both for on-disk
+/// persistence and for the remote-compaction protocol. Carrying `SchemaFile` in the request lets
+/// the compactor reconstruct the writer's schema registry without reading the shared volume, so
+/// remote compaction works even when it is triggered by a flush before the first checkpoint
+/// persists schemas.
+pub(crate) fn schema_to_file(schema: &Schema) -> SchemaFile {
     let column_families = schema
         .column_families
         .iter()
@@ -980,20 +1042,38 @@ pub(crate) fn persist_schema(file_manager: &FileManager, schema: &Schema) -> Res
             }
         })
         .collect();
-    let schema_file = SchemaFile {
+    SchemaFile {
         format_version: SCHEMA_FILE_FORMAT_VERSION,
         id: schema.version(),
         column_families,
-    };
-    let json = serde_json::to_vec(&schema_file)
-        .map_err(|err| Error::FileFormatError(format!("Failed to encode schema file: {}", err)))?;
-    let mut writer = BufferedWriter::new(
-        file_manager.create_metadata_file(&schema_file_relative_path(schema.version()))?,
-        4096,
-    );
-    writer.write(json.as_ref())?;
-    writer.close()?;
-    Ok(())
+    }
+}
+
+/// Deserializes a `SchemaFile` (received over the protocol or read from disk) into a `Schema`,
+/// resolving merge operators via the resolver. Validates the format version and column-family
+/// invariants.
+pub(crate) fn schema_from_file(
+    schema_file: &SchemaFile,
+    resolver: Option<&Arc<dyn MergeOperatorResolver>>,
+) -> Result<Schema> {
+    if schema_file.format_version != SCHEMA_FILE_FORMAT_VERSION {
+        return Err(Error::FileFormatError(format!(
+            "Unsupported schema file format version {} (expected {})",
+            schema_file.format_version, SCHEMA_FILE_FORMAT_VERSION
+        )));
+    }
+    let column_families = load_column_families(schema_file, resolver)?;
+    if column_families.len() > MAX_COLUMN_FAMILY_COUNT {
+        return Err(Error::FileFormatError(format!(
+            "column family count {} exceeds max {}",
+            column_families.len(),
+            MAX_COLUMN_FAMILY_COUNT
+        )));
+    }
+    Ok(Schema::new_with_column_families(
+        schema_file.id,
+        column_families,
+    ))
 }
 
 pub(crate) fn load_schema(

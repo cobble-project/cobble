@@ -30,7 +30,7 @@ use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use bytes::Bytes;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -42,17 +42,35 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 const REMOTE_FILE_ID_START: u64 = u64::MAX / 2;
-const REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT: u32 = 2;
-const REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION: u32 = 2;
+/// Remote-compaction protocol version.
+///
+/// Bumped to 3 when the request started carrying schema definitions (`schemas`). Because a
+/// compactor that predates this field silently ignores it (serde `default`) and then fails at
+/// runtime with "Missing schema version N", the minimum compatible version is also raised to 3.
+/// With both current and min-compatible at 3, v2 and v3 are mutually incompatible in both
+/// directions: a v3 writer is rejected by a v2 compactor (`peer_min(3) > local(2)`), and a v2
+/// writer is rejected by a v3 compactor (`peer(2) < local_min(3)`). There is therefore no safe
+/// rolling order — v2 and v3 cannot run mixed. The compactor and the writer (TaskManagers) must
+/// be upgraded together in the same maintenance window.
+const REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT: u32 = 3;
+const REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION: u32 = 3;
 type RemoteCompactionOutput = (Vec<RemoteDataFile>, Vec<(u32, i64)>, Vec<BlockCachePreload>);
 
+/// Checks whether a peer speaking `(peer_version, peer_min_compatible_version)` is compatible
+/// with a local endpoint speaking `(local_version, local_min_compatible)`.
+///
+/// Incompatible when the peer requires something newer than we speak
+/// (`peer_min > local_version`) or when we require something newer than the peer speaks
+/// (`peer_version < local_min_compatible`). Kept as a free function taking explicit local
+/// versions so the protocol-compatibility tests can exercise the full version matrix against
+/// arbitrary local/peer pairs.
 fn validate_protocol_compatibility(
     role: &str,
     peer_version: u32,
     peer_min_compatible_version: u32,
+    local_version: u32,
+    local_min_compatible: u32,
 ) -> Result<()> {
-    let local_version = REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT;
-    let local_min_compatible = REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION;
     if peer_min_compatible_version > local_version || peer_version < local_min_compatible {
         return Err(Error::IoError(format!(
             "{} protocol incompatible: peer(version={}, compatible_version={}), local(version={}, compatible_version={})",
@@ -405,6 +423,18 @@ struct RemoteCompactionRequest {
     merge_operator_ids: Vec<String>,
     merge_operator_metadata: Vec<Option<serde_json::Value>>,
     truncation_cursors: Vec<RemoteTruncationCursor>,
+    /// Schema definitions the compactor needs to decode input SST files and stamp output.
+    ///
+    /// Carries exactly the schema versions referenced by the input files (version 0 excluded),
+    /// serialized as `SchemaFile`. This lets the compactor reconstruct the writer's schema registry
+    /// from the request alone, without reading the shared volume — so remote compaction works even
+    /// when triggered by a flush before the first checkpoint persists schemas. Schemas remain
+    /// persisted to the volume only at checkpoint time, as before.
+    ///
+    /// Only input-referenced versions are carried so the compaction target is the highest version
+    /// actually present in the input, avoiding spurious schema evolution (see `build_request`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    schemas: Vec<crate::schema::SchemaFile>,
     /// Snapshot of local scan-hot input block keys.
     ///
     /// The remote server seeds its `ScanHotBlockRegistry` from this list, so its
@@ -447,7 +477,13 @@ impl RemoteTruncationCursor {
 
 impl RemoteCompactionRequest {
     fn validate_protocol_compatibility(&self) -> Result<()> {
-        validate_protocol_compatibility("request", self.version, self.compatible_version)
+        validate_protocol_compatibility(
+            "request",
+            self.version,
+            self.compatible_version,
+            REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT,
+            REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
+        )
     }
 }
 
@@ -529,7 +565,13 @@ impl RemoteCompactionResponse {
     }
 
     fn validate_protocol_compatibility(&self) -> Result<()> {
-        validate_protocol_compatibility("response", self.version, self.compatible_version)
+        validate_protocol_compatibility(
+            "response",
+            self.version,
+            self.compatible_version,
+            REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT,
+            REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
+        )
     }
 }
 
@@ -652,6 +694,36 @@ impl RemoteCompactionWorker {
                 )));
             }
         }
+        // Collect every schema version referenced by an input file. The compactor registers these
+        // from the request so it can decode input SST files stamped with non-zero schema ids and
+        // stamps output with the highest registered version (its `latest_schema`). Version 0 is
+        // excluded: it has no real column-family layout (the writer starts from a default schema
+        // and evolves from there), and the compactor already reconstructs a version-0 fallback
+        // from the request's resolved merge operators. Schemas are carried in the request itself
+        // rather than read back from the shared volume, so remote compaction works regardless of
+        // when the writer last persisted schemas to disk.
+        //
+        // Only input-referenced versions are carried (not unconditionally the writer's latest) so
+        // that the compaction target is the highest version actually present in the input. This
+        // avoids spurious schema evolution: when every input file shares the writer's latest
+        // version (the steady-state Flink case) the target equals that version and no evolution
+        // runs; when input files predate the latest schema version, the target stays at the input
+        // version and evolution is not attempted.
+        let mut schema_ids: BTreeSet<u64> = BTreeSet::new();
+        for run in sorted_runs {
+            for file in run.files() {
+                if file.schema_id > 0 {
+                    schema_ids.insert(file.schema_id);
+                }
+            }
+        }
+        let schemas = schema_ids
+            .into_iter()
+            .map(|schema_id| {
+                let schema = self.schema_manager.schema(schema_id)?;
+                Ok(crate::schema::schema_to_file(schema.as_ref()))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(RemoteCompactionRequest {
             version: REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT,
             compatible_version: REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
@@ -671,6 +743,7 @@ impl RemoteCompactionWorker {
             merge_operator_metadata,
             truncation_cursors: RemoteTruncationCursor::from_map(&truncation_cursors),
             scan_hot_block_keys,
+            schemas,
         })
     }
 }
@@ -1014,6 +1087,8 @@ impl RemoteCompactionServer {
             Self::file_manager_for_with(config, &data_volumes, &request.db_id, &metrics_manager)?;
         let data_file_type = request.writer_options.data_file_type();
         let num_columns = request.writer_options.num_columns();
+        let column_family_id = request.column_family_id;
+        let merge_operator_metadata = request.merge_operator_metadata.clone();
         let writer_options = request.writer_options.into_writer_options(&metrics_manager);
         let file_builder_factory = super::make_data_file_builder_factory(writer_options.clone());
         let writer_options_factory = WriterOptionsFactory::from(&writer_options);
@@ -1041,6 +1116,8 @@ impl RemoteCompactionServer {
         ));
         let compaction_metrics = metrics_manager.compaction_metrics();
         let sst_metrics = metrics_manager.sst_iterator_metrics();
+        let schema_resolver = merge_operator_resolver.clone();
+        let request_schemas = request.schemas.clone();
         let merge_operators = Self::resolve_merge_operators(
             Arc::clone(&merge_operator_map),
             merge_operator_resolver,
@@ -1048,16 +1125,14 @@ impl RemoteCompactionServer {
             &request.merge_operator_metadata,
             num_columns,
         )?;
-        let schema_manager = Arc::new(SchemaManager::from_schemas(
-            vec![Schema::new_for_column_family(
-                0,
-                request.column_family_id,
-                merge_operators,
-                request.merge_operator_metadata.clone(),
-                crate::schema::ColumnFamilyOptions::default(),
-            )],
+        let schema_manager = Self::build_schema_manager(
+            column_family_id,
+            &merge_operator_metadata,
+            merge_operators,
+            schema_resolver.as_ref(),
             num_columns,
-        ));
+            &request_schemas,
+        )?;
         let cache_namespace = cache_namespace_for_db_id(&request.db_id);
         let scan_hot_blocks = ScanHotBlockRegistry::from_keys(request.scan_hot_block_keys);
         let truncation_cursors = RemoteTruncationCursor::into_map(request.truncation_cursors);
@@ -1151,6 +1226,61 @@ impl RemoteCompactionServer {
             FileManager::new(data_volumes.to_vec(), options, Arc::clone(metrics_manager))?;
         file_manager.set_next_file_id(REMOTE_FILE_ID_START);
         Ok(Arc::new(file_manager))
+    }
+
+    /// Builds the schema manager for a compaction request.
+    ///
+    /// The writer carries the schema versions referenced by the input files inside the request
+    /// itself (`schemas`), so the compactor can decode input SST files stamped with non-zero
+    /// schema ids — without reading the shared volume. This keeps schemas persisted to the volume
+    /// only at checkpoint time (as before) and makes remote compaction independent of the writer's
+    /// volume directory layout.
+    ///
+    /// Only input-referenced versions are registered, so the compaction target (`latest_schema`)
+    /// is the highest version actually present in the input. Output is stamped with that version,
+    /// which avoids spurious schema evolution: when every input file shares the writer's latest
+    /// version the target equals it and no evolution runs; when input files predate the latest
+    /// version the target stays at the input version and evolution is not attempted.
+    ///
+    /// A version-0 fallback schema (carrying the request's resolved merge operators) is always
+    /// registered first so that the existing version-0 protocol path keeps working when no schemas
+    /// are carried (e.g. an older writer). Each carried schema is then registered; a schema that
+    /// fails to decode fails the request immediately rather than silently falling back, since a
+    /// missing schema would only surface later inside the compaction executor as an opaque
+    /// "Missing schema version N" error.
+    fn build_schema_manager(
+        column_family_id: u8,
+        merge_operator_metadata: &[Option<serde_json::Value>],
+        merge_operators: Vec<Arc<dyn MergeOperator>>,
+        merge_operator_resolver: Option<&Arc<dyn MergeOperatorResolver>>,
+        num_columns: usize,
+        schemas: &[crate::schema::SchemaFile],
+    ) -> Result<Arc<SchemaManager>> {
+        let schema_manager = Arc::new(SchemaManager::from_schemas(
+            vec![Schema::new_for_column_family(
+                0,
+                column_family_id,
+                merge_operators,
+                merge_operator_metadata.to_vec(),
+                crate::schema::ColumnFamilyOptions::default(),
+            )],
+            num_columns,
+        ));
+        for schema_file in schemas {
+            if schema_file.id == 0 {
+                // Version 0 is already registered as the fallback above.
+                continue;
+            }
+            schema_manager
+                .register_schema_from_def(schema_file, merge_operator_resolver)
+                .map_err(|err| {
+                    Error::InvalidState(format!(
+                        "remote compactor failed to register carried schema version {}: {}",
+                        schema_file.id, err
+                    ))
+                })?;
+        }
+        Ok(schema_manager)
     }
 }
 
@@ -1328,6 +1458,15 @@ mod tests {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         options: SSTWriterOptions,
     ) -> Result<Arc<DataFile>> {
+        create_test_sst_with_schema(file_manager, entries, options, 0)
+    }
+
+    fn create_test_sst_with_schema(
+        file_manager: &Arc<FileManager>,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+        options: SSTWriterOptions,
+        schema_id: u64,
+    ) -> Result<Arc<DataFile>> {
         let (file_id, writer_file) = file_manager.create_data_file_with_offload()?;
         let mut writer = crate::sst::SSTWriter::new(writer_file, options);
 
@@ -1343,7 +1482,7 @@ mod tests {
             last_key,
             file_id,
             TrackedFileId::new(file_manager, file_id),
-            0,
+            schema_id,
             file_size,
             bucket_range.clone(),
             bucket_range,
@@ -1538,6 +1677,266 @@ mod tests {
         );
 
         cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_remote_compaction_loads_writer_schema_from_request() {
+        // Reproduces the Flink state-backend scenario: the writer registers several column
+        // families, so each registration bumps the schema version. The resulting SST files are
+        // stamped with a non-zero schema id. The writer carries the schema definitions in the
+        // compaction request itself, and the remote compactor registers them from the request —
+        // never reading the shared volume — so it can decode the input files and stamp output with
+        // the highest input schema version (here equal to the writer's latest). This holds even
+        // when no schema has been persisted to the volume (e.g. compaction triggered by a flush
+        // before the first checkpoint).
+        let root = "/tmp/remote_compaction_schema_request";
+        cleanup_test_root(root);
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            base_file_size: Size::from_const(128),
+            sst_bloom_filter_enabled: true,
+            compaction_threads: 2,
+            ..Config::default()
+        };
+        let db_id = "remote-compaction-schema-request".to_string();
+        let metrics_manager = Arc::new(MetricsManager::new(&db_id));
+        let file_manager = Arc::new(
+            FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
+        );
+
+        // Evolve the schema to version 2, mimicking a writer that registers two column families.
+        // Each commit bumps the schema version, exactly like the Flink state backend does when it
+        // calls updateSchema().commit() for a new state or timer queue.
+        let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
+        {
+            let mut builder = schema_manager.builder();
+            builder.ensure_column_family_exists("first-family").unwrap();
+            builder.commit();
+        }
+        {
+            let mut builder = schema_manager.builder();
+            builder.ensure_column_family_exists("second-family").unwrap();
+            builder.commit();
+        }
+        let latest_schema = schema_manager.latest_schema();
+        let latest_schema_id = latest_schema.version();
+        assert_eq!(
+            latest_schema_id, 2,
+            "test setup: schema should have evolved to version 2"
+        );
+
+        // Intentionally do NOT persist schemas to the volume: the compactor must get them from the
+        // request. Asserting the volume stays empty after compaction proves the protocol path.
+        assert!(
+            file_manager
+                .open_metadata_file_reader_untracked(&crate::paths::schema_file_relative_path(
+                    latest_schema_id
+                ))
+                .is_err(),
+            "test setup: schema file must not exist on the volume"
+        );
+
+        // Build SST files stamped with the latest schema id, as a flush would.
+        let mut sst_options = build_sst_writer_options(&config, 0, config.num_columns);
+        sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
+        let num_columns = sst_options.num_columns;
+        let value_payload = vec![b'x'; 128];
+        let entries_a = (0..40)
+            .map(|idx| {
+                let key = format!("a{:03}", idx).into_bytes();
+                let value = make_typed_value_bytes(ValueType::Put, &value_payload, num_columns);
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+        let entries_b = (0..40)
+            .map(|idx| {
+                let key = format!("b{:03}", idx).into_bytes();
+                let value = make_typed_value_bytes(ValueType::Put, &value_payload, num_columns);
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+        let file_a =
+            create_test_sst_with_schema(&file_manager, entries_a, sst_options.clone(), latest_schema_id)
+                .unwrap();
+        let file_b =
+            create_test_sst_with_schema(&file_manager, entries_b, sst_options.clone(), latest_schema_id)
+                .unwrap();
+        assert_eq!(file_a.schema_id, latest_schema_id);
+        assert_eq!(file_b.schema_id, latest_schema_id);
+
+        let lsm_version = LSMTreeVersion {
+            levels: vec![
+                Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: vec![Arc::clone(&file_a), Arc::clone(&file_b)],
+                },
+                Level {
+                    ordinal: 1,
+                    tiered: false,
+                    files: Vec::new(),
+                },
+            ],
+        };
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
+            suggested_base_snapshot_id: None,
+        });
+        let mut lsm_tree = LSMTree::with_state(Arc::clone(&db_state), Arc::clone(&metrics_manager));
+        let block_cache: BlockCache = Arc::new(MockCache::<BlockCacheKey, CachedBlock>::default());
+        lsm_tree.set_block_cache(Some(block_cache));
+        let lsm_tree = Arc::new(lsm_tree);
+
+        let remote_timeout = Duration::from_millis(config.compaction_remote_timeout_ms);
+        let server = Arc::new(RemoteCompactionServer::new(config.clone()).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = {
+            let server = Arc::clone(&server);
+            std::thread::spawn(move || {
+                for _ in 0..2 {
+                    if let Ok((stream, _)) = listener.accept() {
+                        server.handle_connection(stream).unwrap();
+                    }
+                }
+            })
+        };
+
+        let worker = RemoteCompactionWorker::new(
+            addr.to_string(),
+            Arc::clone(&file_manager),
+            Arc::downgrade(&lsm_tree),
+            config.clone(),
+            TtlConfig {
+                enabled: false,
+                default_ttl_seconds: None,
+            },
+            remote_timeout,
+            Arc::clone(&metrics_manager),
+            Arc::clone(&schema_manager),
+        )
+        .unwrap();
+
+        let runs = vec![
+            SortedRun::new(0, vec![file_a]),
+            SortedRun::new(0, vec![file_b]),
+        ];
+        let handle = worker
+            .submit_runs(
+                0,
+                runs,
+                1,
+                DataFileType::SSTable,
+                Arc::new(TTLProvider::disabled()),
+            )
+            .expect("compaction handle");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        // Before the fix, this failed with "Missing schema version 2".
+        let result = runtime.block_on(handle).unwrap().unwrap();
+        let _ = server_thread.join();
+
+        // Compaction succeeded and output files are stamped with the highest input schema id
+        // (here the writer's latest, since all input files share it).
+        let level1 = lsm_tree.level_files(1);
+        assert!(level1.len() > 1, "compaction should produce level-1 files");
+        assert!(
+            level1.iter().all(|file| file.schema_id == latest_schema_id),
+            "output files must be stamped with schema id {}, got {:?}",
+            latest_schema_id,
+            level1.iter().map(|f| f.schema_id).collect::<Vec<_>>()
+        );
+        let _ = result;
+
+        // The volume never held a schema file — the compactor reconstructed the schema registry
+        // purely from the request, proving the protocol-carrying path.
+        assert!(
+            file_manager
+                .open_metadata_file_reader_untracked(&crate::paths::schema_file_relative_path(
+                    latest_schema_id
+                ))
+                .is_err(),
+            "schema file must not have been written to the volume"
+        );
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    fn test_build_schema_manager_fails_on_malformed_carried_schema() {
+        // A malformed carried schema must fail the request immediately rather than silently falling
+        // back to the version-0 schema. A silent fallback would only surface later inside the
+        // compaction executor as an opaque "Missing schema version N" error.
+        let malformed = crate::schema::SchemaFile {
+            // Unsupported format version forces schema_from_file to error during registration.
+            format_version: u32::MAX,
+            id: 7,
+            column_families: Vec::new(),
+        };
+        let result = RemoteCompactionServer::build_schema_manager(
+            0,
+            &[],
+            Vec::new(),
+            None,
+            1,
+            &[malformed],
+        );
+        let err = match result {
+            Ok(_) => panic!("malformed schema must fail the request"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("schema version 7"),
+            "error should name the offending schema id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_remote_compaction_protocol_rejects_mismatched_versions() {
+        // The schemas field requires protocol v3, and the min-compatible version was raised to 3
+        // too, so v2 and v3 are mutually incompatible in both directions. There is no safe rolling
+        // order: a v3 writer talking to a v2 compactor, and a v2 writer talking to a v3 compactor,
+        // must both be rejected at the handshake (rather than silently ignoring the schemas field
+        // and failing later with "Missing schema version N").
+        //
+        // validate_protocol_compatibility(role, peer_version, peer_min, local_version, local_min)
+        // is a pure function, so we exercise the full version matrix directly.
+
+        // v3 peer against v3 local: accepted (the matched-pair steady state).
+        assert!(
+            validate_protocol_compatibility("request", 3, 3, 3, 3).is_ok(),
+            "a v3 peer against a v3 local must be accepted"
+        );
+
+        // v2 writer (peer v2, min 2) against a v3 compactor (local v3, min 3): rejected,
+        // because peer_version(2) < local_min(3).
+        assert!(
+            validate_protocol_compatibility("request", 2, 2, 3, 3).is_err(),
+            "a v2 writer must be rejected by a v3 compactor"
+        );
+
+        // v3 writer (peer v3, min 3) against a v2 compactor (local v2, min 2): rejected,
+        // because peer_min(3) > local_version(2).
+        assert!(
+            validate_protocol_compatibility("request", 3, 3, 2, 2).is_err(),
+            "a v3 writer must be rejected by a v2 compactor"
+        );
+
+        // v2 peer against v2 local: this is the pre-schemas behavior. It is accepted by the
+        // compatibility rule itself, but a v2 endpoint is not produced by the current code
+        // (CURRENT and MIN_COMPATIBLE are both 3). This case is documented here for completeness
+        // and is not part of the v3 guarantee.
+        assert!(
+            validate_protocol_compatibility("request", 2, 2, 2, 2).is_ok(),
+            "a v2 peer against a v2 local is compatible by the rule (legacy behavior)"
+        );
     }
 
     #[test]
