@@ -43,6 +43,8 @@
     <native.lib.name>cobblejni</native.lib.name>
     <cobble.skip.local.native.copy>false</cobble.skip.local.native.copy>
     <surefire.test.jvm.args></surefire.test.jvm.args>
+    <!-- Native executable suffix (without leading dot). Overridden per-OS profile for windows. -->
+    <native.cli.exe-suffix></native.cli.exe-suffix>
   </properties>
 
   <dependencies>
@@ -99,6 +101,39 @@
               </arguments>
             </configuration>
           </execution>
+          <execution>
+            <id>cargo-build-cli-debug</id>
+            <phase>generate-resources</phase>
+            <goals><goal>exec</goal></goals>
+            <configuration>
+              <workingDirectory>${project.basedir}/../..</workingDirectory>
+              <executable>cargo</executable>
+              <arguments>
+                <argument>build</argument>
+                <argument>-p</argument>
+                <argument>cobble-cli</argument>
+                <argument>--features</argument>
+                <argument>storage-all</argument>
+              </arguments>
+            </configuration>
+          </execution>
+          <execution>
+            <id>cargo-build-cli-release</id>
+            <phase>generate-resources</phase>
+            <goals><goal>exec</goal></goals>
+            <configuration>
+              <workingDirectory>${project.basedir}/../..</workingDirectory>
+              <executable>cargo</executable>
+              <arguments>
+                <argument>build</argument>
+                <argument>-p</argument>
+                <argument>cobble-cli</argument>
+                <argument>--features</argument>
+                <argument>storage-all</argument>
+                <argument>--release</argument>
+              </arguments>
+            </configuration>
+          </execution>
         </executions>
       </plugin>
       <plugin>
@@ -135,6 +170,36 @@
               </resources>
             </configuration>
           </execution>
+          <execution>
+            <id>copy-native-cli-debug</id>
+            <phase>process-resources</phase>
+            <goals><goal>copy-resources</goal></goals>
+            <configuration>
+              <skip>${cobble.skip.local.native.copy}</skip>
+              <outputDirectory>${project.build.outputDirectory}/native/${native.os}-${native.arch}/debug</outputDirectory>
+              <resources>
+                <resource>
+                  <directory>${project.basedir}/../../target/debug</directory>
+                  <includes><include>cobble-cli${native.cli.exe-suffix}</include></includes>
+                </resource>
+              </resources>
+            </configuration>
+          </execution>
+          <execution>
+            <id>copy-native-cli-release</id>
+            <phase>process-resources</phase>
+            <goals><goal>copy-resources</goal></goals>
+            <configuration>
+              <skip>${cobble.skip.local.native.copy}</skip>
+              <outputDirectory>${project.build.outputDirectory}/native/${native.os}-${native.arch}/release</outputDirectory>
+              <resources>
+                <resource>
+                  <directory>${project.basedir}/../../target/release</directory>
+                  <includes><include>cobble-cli${native.cli.exe-suffix}</include></includes>
+                </resource>
+              </resources>
+            </configuration>
+          </execution>
         </executions>
       </plugin>
       <plugin>
@@ -160,6 +225,11 @@
                   <shadedPattern>io.cobble.shaded.gson</shadedPattern>
                 </relocation>
               </relocations>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>io.cobble.Main</mainClass>
+                </transformer>
+              </transformers>
             </configuration>
           </execution>
         </executions>
@@ -171,6 +241,25 @@
           <argLine>${surefire.test.jvm.args}</argLine>
           <useSystemClassLoader>true</useSystemClassLoader>
         </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <version>3.2.5</version>
+        <configuration>
+          <!-- Inject the shaded JAR path so CobbleCliJarIT can launch it via java -jar. -->
+          <systemPropertyVariables>
+            <cobble.test.jar>${project.build.directory}/${project.build.finalName}.jar</cobble.test.jar>
+          </systemPropertyVariables>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
       </plugin>
       <plugin>
         <groupId>com.diffplug.spotless</groupId>
@@ -364,6 +453,7 @@
         <native.os>windows</native.os>
         <native.arch>x86_64</native.arch>
         <native.lib.file>${native.lib.name}.dll</native.lib.file>
+        <native.cli.exe-suffix>.exe</native.cli.exe-suffix>
       </properties>
     </profile>
     <profile>
@@ -375,6 +465,7 @@
         <native.os>windows</native.os>
         <native.arch>x86_64</native.arch>
         <native.lib.file>${native.lib.name}.dll</native.lib.file>
+        <native.cli.exe-suffix>.exe</native.cli.exe-suffix>
       </properties>
     </profile>
   </profiles>
