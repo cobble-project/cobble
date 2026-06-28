@@ -84,55 +84,7 @@ public final class NativeLoader {
     }
 
     static String resolveLibraryResourcePath(NativeProfile profile) {
-        String os = detectOs();
-        String arch = detectArch();
-        return "native/"
-                + os
-                + "-"
-                + arch
-                + "/"
-                + profile.resourceSegment()
-                + "/"
-                + detectLibraryFileName();
-    }
-
-    private static String detectOs() {
-        String osName = System.getProperty("os.name", "").toLowerCase();
-        if (osName.contains("mac") || osName.contains("darwin")) {
-            return "macos";
-        }
-        if (osName.contains("win")) {
-            return "windows";
-        }
-        if (osName.contains("nix") || osName.contains("nux") || osName.contains("linux")) {
-            return "linux";
-        }
-        throw new IllegalStateException("Unsupported OS: " + osName);
-    }
-
-    private static String detectArch() {
-        String arch = System.getProperty("os.arch", "").toLowerCase();
-        if (arch.equals("x86_64") || arch.equals("amd64")) {
-            return "x86_64";
-        }
-        if (arch.equals("aarch64") || arch.equals("arm64")) {
-            return "aarch64";
-        }
-        throw new IllegalStateException("Unsupported architecture: " + arch);
-    }
-
-    private static String detectLibraryFileName() {
-        String os = detectOs();
-        switch (os) {
-            case "macos":
-                return "libcobblejni.dylib";
-            case "linux":
-                return "libcobblejni.so";
-            case "windows":
-                return "cobblejni.dll";
-            default:
-                throw new IllegalStateException("Unsupported OS: " + os);
-        }
+        return NativePlatform.resourceBase(profile) + "/" + NativePlatform.nativeLibraryFileName();
     }
 
     private static boolean isBlank(String value) {

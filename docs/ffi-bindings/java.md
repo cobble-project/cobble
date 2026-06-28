@@ -388,6 +388,65 @@ SnapshotTools.pruneShardSnapshot(config, snapshot.dbId, snapshot.snapshotId);
 
 Java objects hold opaque pointers to Rust `Arc<T>` allocations. Calling `close()` on a Java wrapper releases the underlying Rust resources. If `close()` is not called, resources will not be freed and **may lead to memory leaks**. It is recommended to use try-with-resources or ensure `close()` is called in a `finally` block.
 
+## Bundled CLI
+
+The Java artifact also bundles the `cobble-cli` executable for the packaged
+platform. This is useful when a JVM application wants to start operational
+tools such as the remote compactor or web monitor without installing a separate
+Rust binary.
+
+You can run the bundled CLI directly from the jar:
+
+```bash
+java -jar cobble-0.2.0.jar --help
+java -jar cobble-0.2.0.jar remote-compactor --config ./config.yaml --bind 127.0.0.1:18888
+java -jar cobble-0.2.0.jar web-monitor --config ./config.yaml --bind 127.0.0.1:8080
+```
+
+Arguments after `java -jar ...` are forwarded to `cobble-cli` unchanged. The
+child process inherits stdout and stderr, so logs are visible in the same
+terminal. Long-running commands stop when the Java process is terminated.
+
+JVM applications can also start the bundled CLI through `io.cobble.CobbleCli`:
+
+```java
+import io.cobble.CobbleCli;
+import io.cobble.CobbleCliProcess;
+import java.nio.file.Paths;
+
+try (CobbleCliProcess process =
+        CobbleCli.startRemoteCompactor(Paths.get("config.yaml"), "127.0.0.1:18888")) {
+    // Keep the process for as long as the remote compactor should run.
+    process.waitFor();
+}
+```
+
+For custom redirection or environment variables, build a `ProcessBuilder` first:
+
+```java
+import io.cobble.CobbleCli;
+import io.cobble.CobbleCliProcess;
+import io.cobble.NativeProfile;
+import java.io.File;
+import java.util.Arrays;
+
+ProcessBuilder builder =
+        CobbleCli.command(
+                NativeProfile.RELEASE,
+                Arrays.asList("web-monitor", "--config", "config.yaml", "--bind", "127.0.0.1:8080"));
+builder.redirectOutput(new File("cobble-web-monitor.out"));
+builder.redirectError(new File("cobble-web-monitor.err"));
+
+try (CobbleCliProcess process = CobbleCli.start(builder)) {
+    process.waitFor();
+}
+```
+
+By default, the wrapper extracts the bundled release executable from the jar.
+Use `-Dcobble.native.profile=debug` or `COBBLE_NATIVE_PROFILE=debug` to select
+the debug executable when it is packaged. To use an external binary instead,
+set `-Dcobble.cli.path=/path/to/cobble-cli` or `COBBLE_CLI_PATH`.
+
 ## Building
 
 If you want to customize your java APIs, you can compile by yourself. The Java binding consists of two parts:
@@ -402,14 +461,14 @@ https://crates.io/crates/cobble
 Java native build commands use `--features storage-all` on `cobble-java`, so Java artifacts include all Cobble optional OpenDAL backend features (`alluxio`, `cos`, `oss`, `s3`, `ftp`, `hdfs`, `sftp`).
 
 ```bash
-# Local debug build (current platform only, includes debug + release JNI libs)
+# Local debug build (current platform only, includes debug + release JNI libs and CLI binaries)
 cd cobble-java/java
 ./mvnw package
 ```
 
 Local `mvn package` only bundles the current host platform into the jar (for fast debugging).
 
-To produce a **single multi-platform jar** (including `debug` + `release` JNI libs for common platforms), use the manual GitHub Actions workflow:
+To produce a **single multi-platform jar** (including `debug` + `release` JNI libs and CLI binaries for common platforms), use the manual GitHub Actions workflow:
 
 - Workflow: `.github/workflows/java-multi-platform-jar.yml`
 - Trigger: **Actions -> Build Java Multi-platform JAR -> Run workflow**
