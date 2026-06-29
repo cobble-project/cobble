@@ -833,6 +833,14 @@ impl LSMTree {
             state.compaction_config.output_file_type,
             self.ttl_provider(),
         ) {
+            // Pending is inserted AFTER submit_runs returns. This is safe against the worker's
+            // completion racing ahead: `on_compaction_complete` re-acquires this same `state` mutex,
+            // which we currently hold, so the worker's async completion task cannot remove pending
+            // until we release the lock here — i.e. after this insert. Insert always precedes
+            // remove. (A worker that called `on_compaction_complete` synchronously inside
+            // `submit_runs` would deadlock on this mutex; all real workers defer completion to a
+            // spawned task.) If submit_runs returns None (worker declined), no pending entry is
+            // inserted, leaving the slot free for the next trigger.
             state.pending_compaction.insert(tree_idx, expected_scope);
             std::mem::drop(handle);
         }
@@ -2053,6 +2061,84 @@ mod tests {
         );
         let submitted = worker.submitted_data_file_types.lock().unwrap().clone();
         assert_eq!(submitted, vec![DataFileType::SSTable]);
+    }
+
+    /// Regression: a worker that declines to submit (returns `None`) must not leave a stale
+    /// pending-compaction entry that blocks all future compactions for that tree. The scheduler
+    /// only inserts pending when `submit_runs` returns `Some(handle)`, so a `None` result leaves
+    /// the slot free and a subsequent trigger must reach the worker again. We trigger compaction
+    /// twice and assert two submissions.
+    ///
+    /// Note on the pending lifecycle: completion (`on_compaction_complete`) acquires the same
+    /// `state` mutex that `maybe_trigger_compaction_locked` holds, so a worker's async completion
+    /// task can never run (and remove pending) until the scheduler has released the lock — which
+    /// is after the pending insert. The insert therefore always precedes the remove; there is no
+    /// race. A worker that tried to call `on_compaction_complete` synchronously inside
+    /// `submit_runs` would deadlock on this mutex, which is why all real workers defer completion
+    /// to a spawned task.
+    #[test]
+    fn test_lsm_compaction_declining_worker_does_not_block_subsequent_compaction() {
+        let db_state = Arc::new(DbStateHandle::new());
+        let multi_lsm_version = MultiLSMTreeVersion::from_parts(
+            1,
+            vec![0u32],
+            vec![Arc::new(LSMTreeVersion {
+                levels: vec![
+                    Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: vec![create_data_file_with_size(b"a", b"b", 1)],
+                    },
+                    Level {
+                        ordinal: 1,
+                        tiered: false,
+                        files: Vec::new(),
+                    },
+                ],
+            })],
+        );
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version,
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
+            suggested_base_snapshot_id: None,
+        });
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+        let worker = Arc::new(RecordingCompactionWorker::default());
+        let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
+        let config = crate::compaction::CompactionConfig {
+            l0_file_limit: 0,
+            ..crate::compaction::CompactionConfig::default()
+        };
+        lsm_tree.configure_compaction(config, Some(worker_dyn));
+        // First trigger: worker declines (returns None). No pending entry is inserted.
+        lsm_tree.apply_edit(
+            0,
+            VersionEdit {
+                level_edits: Vec::new(),
+            },
+            None,
+        );
+        // Second trigger: must still reach the worker. A stale pending entry would suppress it.
+        lsm_tree.apply_edit(
+            0,
+            VersionEdit {
+                level_edits: Vec::new(),
+            },
+            None,
+        );
+        let mut submitted = worker.submitted_tree_idxs.lock().unwrap().clone();
+        submitted.sort_unstable();
+        assert_eq!(
+            submitted,
+            vec![0, 0],
+            "both compaction triggers must reach the worker (declining worker leaves no stale pending)"
+        );
     }
 
     #[test]

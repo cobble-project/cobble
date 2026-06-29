@@ -903,7 +903,13 @@ impl Db {
             crate::compaction::build_compaction_config(&config, runtime_num_columns)?;
         let compaction_worker: Arc<dyn crate::compaction::CompactionWorker> =
             if let Some(addr) = config.compaction_remote_addr.clone() {
-                Arc::new(crate::compaction::RemoteCompactionWorker::new(
+                // Remote compaction with a local fallback. The remote worker is constructed
+                // without connecting (capabilities are fetched lazily on the first compaction), so
+                // `Db::open` succeeds even when the compactor is down. The local worker backs
+                // every remote attempt so a transient remote failure falls back to local
+                // compaction (or is skipped, per the configured failure mode) instead of failing
+                // the DB.
+                let remote = crate::compaction::RemoteCompactionWorker::new(
                     addr,
                     Arc::clone(&file_manager),
                     Arc::downgrade(&lsm_tree),
@@ -912,7 +918,25 @@ impl Db {
                     Duration::from_millis(config.compaction_remote_timeout_ms),
                     Arc::clone(&metrics_manager),
                     Arc::clone(&schema_manager),
-                )?)
+                )?;
+                let local = crate::compaction::LocalCompactionWorker::new(
+                    crate::compaction::CompactionExecutor::new(
+                        compaction_options,
+                        Arc::clone(&db_lifecycle),
+                    )?,
+                    Arc::clone(&file_manager),
+                    Arc::downgrade(&lsm_tree),
+                    config.clone(),
+                    Arc::clone(&db_lifecycle),
+                    Arc::clone(&metrics_manager),
+                    Arc::clone(&schema_manager),
+                );
+                Arc::new(crate::compaction::ResilientRemoteCompactionWorker::new(
+                    remote,
+                    local,
+                    config.compaction_remote_failure_mode,
+                    Arc::clone(&db_lifecycle),
+                ))
             } else {
                 Arc::new(crate::compaction::LocalCompactionWorker::new(
                     crate::compaction::CompactionExecutor::new(

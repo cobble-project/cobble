@@ -94,6 +94,27 @@ pub enum CompactionPolicyKind {
     ScorePriority,
 }
 
+/// How the DB reacts when a remote compaction attempt fails.
+///
+/// Remote compaction is best-effort: the DB must stay open and writable even when the compactor is
+/// down. Failures are classified as transient (connect refused, timeout, connection reset, I/O) or
+/// permanent (protocol incompatible, unsupported merge operator, malformed schema, config error).
+/// Transient failures are handled according to this mode; permanent failures always give up the
+/// current attempt without falling back, so a misconfiguration is surfaced rather than silently
+/// masked by local compaction.
+///
+/// - `FallbackLocal` (default): run the compaction locally instead.
+/// - `Skip`: abandon this compaction attempt, release the pending slot, and leave the DB healthy.
+///   The next flush or write that re-triggers compaction will retry remote, so a recovered
+///   compactor is picked up automatically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCompactionFailureMode {
+    #[default]
+    FallbackLocal,
+    Skip,
+}
+
 /// Primary-volume offload policy selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -675,6 +696,10 @@ pub struct Config {
     pub compaction_threads: usize,
     /// Remote compaction network timeout in milliseconds.
     pub compaction_remote_timeout_ms: u64,
+    /// How to react when a transient remote compaction failure occurs (compactor down, connect
+    /// refused, timeout, I/O error). Defaults to falling back to local compaction. Permanent
+    /// failures (protocol/schema/config) always give up without falling back.
+    pub compaction_remote_failure_mode: RemoteCompactionFailureMode,
     /// Maximum number of concurrent requests the remote compaction server will process.
     pub compaction_server_max_concurrent: usize,
     /// Maximum number of queued requests before the server rejects new connections.
@@ -776,6 +801,7 @@ impl Default for Config {
             compaction_remote_addr: None,
             compaction_threads: 4,
             compaction_remote_timeout_ms: 300_000,
+            compaction_remote_failure_mode: RemoteCompactionFailureMode::FallbackLocal,
             compaction_server_max_concurrent: 4,
             compaction_server_max_queued: 64,
             block_cache_size: Size::from_mib(64),
@@ -1261,7 +1287,8 @@ fn collect_unrecognized_entry_paths(
 mod tests {
     use super::{
         Config, Error, GovernanceMode, MemtableType, PrimaryVolumeOffloadPolicyKind, ReadOptions,
-        ReaderConfigEntry, ScanOptions, VolumeDescriptor, VolumeUsageKind, WriteOptions,
+        ReaderConfigEntry, RemoteCompactionFailureMode, ScanOptions, VolumeDescriptor,
+        VolumeUsageKind, WriteOptions,
     };
     use crate::SstCompressionAlgorithm;
     use crate::data_file::DataFileType;
@@ -1347,6 +1374,7 @@ mod tests {
             compaction_remote_addr: Some("127.0.0.1:9999".to_string()),
             compaction_threads: 6,
             compaction_remote_timeout_ms: 120_000,
+            compaction_remote_failure_mode: RemoteCompactionFailureMode::Skip,
             compaction_server_max_concurrent: 8,
             compaction_server_max_queued: 32,
         };
@@ -1399,6 +1427,10 @@ mod tests {
         assert_eq!(decoded.value_separation_threshold, Some(Size::from_kib(4)));
         assert_eq!(decoded.compaction_server_max_concurrent, 8);
         assert_eq!(decoded.compaction_server_max_queued, 32);
+        assert_eq!(
+            decoded.compaction_remote_failure_mode,
+            RemoteCompactionFailureMode::Skip
+        );
         assert_eq!(decoded.data_file_type, DataFileType::Parquet);
         assert_eq!(decoded.parquet_row_group_size_bytes, Size::from_kib(4));
         assert_eq!(decoded.reader.block_cache_size, Size::from_kib(2));

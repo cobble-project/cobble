@@ -69,6 +69,9 @@ public final class Config {
     /** Remote compaction timeout in milliseconds. */
     public Long compactionRemoteTimeoutMs;
 
+    /** How to react when a transient remote compaction failure occurs. */
+    public RemoteCompactionFailureMode compactionRemoteFailureMode;
+
     /** Block cache memory size in bytes (0 means disabled). */
     public Integer blockCacheSize;
 
@@ -256,6 +259,13 @@ public final class Config {
         MIN_OVERLAP,
         @SerializedName("score_priority")
         SCORE_PRIORITY
+    }
+
+    public enum RemoteCompactionFailureMode {
+        @SerializedName("fallback_local")
+        FALLBACK_LOCAL,
+        @SerializedName("skip")
+        SKIP
     }
 
     public enum PrimaryVolumeOffloadPolicyKind {
