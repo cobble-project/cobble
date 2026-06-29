@@ -83,6 +83,7 @@ fails.
 | Type | Description |
 |------|-------------|
 | `RemoteCompactionServer` | Remote compaction worker server |
+| `RemoteCompactionFailureMode` | Writer behavior for transient remote compaction failures (`FallbackLocal` or `Skip`) |
 
 ### Key Operations
 
