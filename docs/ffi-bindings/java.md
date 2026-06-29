@@ -16,7 +16,7 @@ We have published the Java API to Maven Central. You can add it as a dependency 
 <dependency>
     <groupId>io.github.cobble-project</groupId>
     <artifactId>cobble</artifactId>
-    <version>0.2.0</version>
+    <version>0.2.1</version>
 </dependency>
 ```
 
@@ -419,9 +419,9 @@ Rust binary.
 You can run the bundled CLI directly from the jar:
 
 ```bash
-java -jar cobble-0.2.0.jar --help
-java -jar cobble-0.2.0.jar remote-compactor --config ./config.yaml --bind 127.0.0.1:18888
-java -jar cobble-0.2.0.jar web-monitor --config ./config.yaml --bind 127.0.0.1:8080
+java -jar cobble-0.2.1.jar --help
+java -jar cobble-0.2.1.jar remote-compactor --config ./config.yaml --bind 127.0.0.1:18888
+java -jar cobble-0.2.1.jar web-monitor --config ./config.yaml --bind 127.0.0.1:8080
 ```
 
 Arguments after `java -jar ...` are forwarded to `cobble-cli` unchanged. The
