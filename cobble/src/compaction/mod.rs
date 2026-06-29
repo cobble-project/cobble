@@ -7,6 +7,7 @@
 mod executor;
 mod policy;
 mod remote;
+mod resilient;
 
 #[allow(unused_imports)]
 pub(crate) use executor::{
@@ -20,6 +21,8 @@ pub(crate) use policy::{
 pub use remote::RemoteCompactionServer;
 #[allow(unused_imports)]
 pub(crate) use remote::RemoteCompactionWorker;
+#[allow(unused_imports)]
+pub(crate) use resilient::ResilientRemoteCompactionWorker;
 
 #[allow(unused_imports)]
 pub(crate) use crate::format::{FileBuilder, FileBuilderFactory};

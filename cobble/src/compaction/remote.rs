@@ -407,7 +407,7 @@ impl RemoteSortedRun {
 
 /// A struct representing the request for a remote compaction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct RemoteCompactionRequest {
+pub(crate) struct RemoteCompactionRequest {
     version: u32,
     compatible_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -507,6 +507,44 @@ impl fmt::Display for RemoteCompactionRequest {
     }
 }
 
+/// Classification of a server-side compaction error, sent back to the client so it can decide
+/// whether to fall back to local (transient) or surface the failure (permanent) without parsing
+/// the error message string.
+///
+/// `#[serde(default)]` on the response field keeps this backward compatible: an older server that
+/// does not send `error_kind` deserializes as `None`, which the client treats as transient (the
+/// pre-typing behavior). An older client simply ignores the unknown field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteCompactionErrorKind {
+    /// Recoverable: compactor overload/shutdown, transient I/O, cancelled task. The client may
+    /// fall back to local (or skip) and retry remote next time.
+    Transient,
+    /// Deterministic: malformed carried schema, unsupported/unknown merge operator, bad config,
+    /// invalid request shape, protocol mismatch. Falling back would mask a misconfiguration, so
+    /// the client must surface it and mark the DB errored.
+    Permanent,
+}
+
+/// Classifies a server-side `Error` produced while handling a compaction request. Mirrors the
+/// client-side `classify_remote_failure`: deterministic config/state/format errors are permanent;
+/// I/O, filesystem, and cancellation errors are transient.
+fn classify_server_error(err: &Error) -> RemoteCompactionErrorKind {
+    match err {
+        Error::ConfigError(_)
+        | Error::InvalidState(_)
+        | Error::FileFormatError(_)
+        | Error::InputError(_) => RemoteCompactionErrorKind::Permanent,
+        Error::IoError(_)
+        | Error::FileSystemError(_)
+        | Error::ChecksumMismatch(_)
+        | Error::CancelledError(_)
+        | Error::MemtableFull { .. }
+        | Error::CoordinationError(_)
+        | Error::UrlParseError(_) => RemoteCompactionErrorKind::Transient,
+    }
+}
+
 /// A struct representing the response from a remote compaction request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RemoteCompactionResponse {
@@ -520,6 +558,11 @@ struct RemoteCompactionResponse {
     /// reserved file ids before submitting them to the dedicated preload worker.
     preload_block_keys: Vec<BlockCachePreload>,
     error: Option<String>,
+    /// When `error` is `Some`, classifies it as transient or permanent so the client does not have
+    /// to parse the error string. `#[serde(default)]` for backward compatibility with older
+    /// servers (treated as transient by the client).
+    #[serde(default)]
+    error_kind: Option<RemoteCompactionErrorKind>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -550,10 +593,13 @@ impl RemoteCompactionResponse {
             vlog_entry_deltas,
             preload_block_keys,
             error: None,
+            error_kind: None,
         }
     }
 
-    fn err(message: impl Into<String>) -> Self {
+    /// Builds an error response. `kind` classifies the error so the client can decide fallback
+    /// without parsing the message string.
+    fn err(message: impl Into<String>, kind: RemoteCompactionErrorKind) -> Self {
         Self {
             version: REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT,
             compatible_version: REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
@@ -561,6 +607,7 @@ impl RemoteCompactionResponse {
             vlog_entry_deltas: Vec::new(),
             preload_block_keys: Vec::new(),
             error: Some(message.into()),
+            error_kind: Some(kind),
         }
     }
 
@@ -584,6 +631,64 @@ impl fmt::Display for RemoteCompactionResponse {
     }
 }
 
+/// Classification of a remote compaction failure, used by the resilient wrapper to decide whether
+/// to fall back to local compaction or give up.
+///
+/// Transient failures (compactor down, connect refused, timeout, connection reset, I/O) are
+/// recoverable: the DB should fall back to local (or skip) and retry remote next time. Permanent
+/// failures (protocol incompatible, unsupported merge operator, malformed schema, config error)
+/// are deterministic: falling back would silently mask a misconfiguration, so they must surface.
+pub(crate) enum RemoteCompactionFailure {
+    Transient(Error),
+    Permanent(Error),
+}
+
+impl RemoteCompactionFailure {
+    fn into_error(self) -> Error {
+        match self {
+            RemoteCompactionFailure::Transient(e) | RemoteCompactionFailure::Permanent(e) => e,
+        }
+    }
+}
+
+/// Classifies an error produced by the remote compaction path.
+///
+/// `Error::ConfigError` (unsupported merge operator, bad config) and `Error::InvalidState`
+/// (malformed carried schema, protocol/shape violations) are permanent. `Error::IoError` is
+/// ambiguous — the remote layer wraps both wire I/O (transient) and server-reported/protocol
+/// errors as `IoError(String)`. Because the structured permanent checks
+/// (`validate_protocol_compatibility`, `ensure_supported_merge_operator_ids`) are performed before
+/// the request is sent, an `IoError` reaching this point is overwhelmingly a transient
+/// connect/timeout/IO failure, so it is classified transient. This keeps a recoverable compactor
+/// outage from aborting the DB; the explicit permanent paths are still caught earlier.
+pub(crate) fn classify_remote_failure(err: Error) -> RemoteCompactionFailure {
+    match err {
+        Error::ConfigError(_) | Error::InvalidState(_) => RemoteCompactionFailure::Permanent(err),
+        other => RemoteCompactionFailure::Transient(other),
+    }
+}
+
+/// Outcome of attempting a single remote compaction request, carrying the transient/permanent
+/// classification so the resilient wrapper can decide fallback without re-parsing error strings.
+pub(crate) enum RemoteCompactionOutcome {
+    Succeeded(CompactionResult),
+    Failed(RemoteCompactionFailure),
+}
+
+impl RemoteCompactionOutcome {
+    pub(crate) fn succeeded(result: CompactionResult) -> Self {
+        RemoteCompactionOutcome::Succeeded(result)
+    }
+
+    pub(crate) fn failed_transient(err: Error) -> Self {
+        RemoteCompactionOutcome::Failed(RemoteCompactionFailure::Transient(err))
+    }
+
+    pub(crate) fn failed_permanent(err: Error) -> Self {
+        RemoteCompactionOutcome::Failed(RemoteCompactionFailure::Permanent(err))
+    }
+}
+
 /// A compaction worker that sends compaction tasks to a remote server.
 pub(crate) struct RemoteCompactionWorker {
     address: String,
@@ -595,7 +700,12 @@ pub(crate) struct RemoteCompactionWorker {
     remote_timeout: Duration,
     metrics_manager: Arc<MetricsManager>,
     schema_manager: Arc<SchemaManager>,
-    supported_merge_operator_ids: HashSet<String>,
+    /// Merge operator ids advertised by the remote compactor, fetched lazily on the first
+    /// compaction that needs them. `None` means "not yet fetched / invalidated"; a transient
+    /// connection failure during fetch is surfaced to the caller (and handled by the resilient
+    /// wrapper) rather than failing `Db::open`. A successful fetch is cached so subsequent
+    /// compactions skip the capability round-trip.
+    supported_merge_operator_ids: Mutex<Option<HashSet<String>>>,
 }
 
 impl RemoteCompactionWorker {
@@ -616,12 +726,8 @@ impl RemoteCompactionWorker {
             .enable_all()
             .build()
             .map_err(|e| Error::IoError(e.to_string()))?;
-        let supported_merge_operator_ids =
-            fetch_supported_merge_operator_ids(&address, remote_timeout)?
-                .into_iter()
-                .collect();
         info!(
-            "Cobble remote compactor ({}, Rev:{}) start at addr: {}.",
+            "Cobble remote compactor ({}, Rev:{}) configured for addr: {}.",
             build_version_string(),
             build_commit_short_id(),
             address
@@ -636,16 +742,70 @@ impl RemoteCompactionWorker {
             remote_timeout,
             metrics_manager,
             schema_manager,
-            supported_merge_operator_ids,
+            supported_merge_operator_ids: Mutex::new(None),
         })
     }
 
-    fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+    pub(crate) fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
         let guard = self.runtime.lock().unwrap();
         guard.as_ref().map(|runtime| runtime.handle().clone())
     }
 
-    fn build_request(
+    /// Lazily fetches and caches the remote compactor's supported merge operator ids, then checks
+    /// that every operator required by `required_ids` is supported.
+    ///
+    /// The fetch is best-effort: a connection/IO failure (compactor down) is returned as an
+    /// `Error::IoError` so the resilient wrapper can treat it as transient and fall back. A
+    /// successful fetch is cached in `supported_merge_operator_ids` so subsequent compactions skip
+    /// the round-trip. An unsupported operator is a permanent `Error::ConfigError`.
+    fn ensure_supported_merge_operator_ids(&self, required_ids: &[String]) -> Result<()> {
+        if required_ids.is_empty() {
+            return Ok(());
+        }
+        let mut cache = self.supported_merge_operator_ids.lock().unwrap();
+        if cache.is_none() {
+            let ids = fetch_supported_merge_operator_ids(&self.address, self.remote_timeout)?
+                .into_iter()
+                .collect::<HashSet<_>>();
+            *cache = Some(ids);
+        }
+        let supported = cache.as_ref().unwrap();
+        for merge_operator_id in required_ids {
+            if !supported.contains(merge_operator_id) {
+                return Err(Error::ConfigError(format!(
+                    "remote compactor {} does not support merge operator '{}'",
+                    self.address, merge_operator_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Invalidates the cached capability so the next compaction re-fetches it. Called when a
+    /// permanent protocol/capability mismatch is observed, in case the compactor was upgraded or
+    /// replaced and its advertised merge operators changed.
+    pub(crate) fn invalidate_supported_merge_operator_ids(&self) {
+        *self.supported_merge_operator_ids.lock().unwrap() = None;
+    }
+
+    /// The remote compactor address this worker is configured for.
+    pub(crate) fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub(crate) fn file_manager(&self) -> &Arc<FileManager> {
+        &self.file_manager
+    }
+
+    pub(crate) fn lsm_tree(&self) -> &Weak<LSMTree> {
+        &self.lsm_tree
+    }
+
+    pub(crate) fn remote_timeout(&self) -> Duration {
+        self.remote_timeout
+    }
+
+    pub(crate) fn build_request(
         &self,
         lsm_tree_idx: usize,
         sorted_runs: &[SortedRun],
@@ -680,20 +840,14 @@ impl RemoteCompactionWorker {
         };
         let merge_operator_ids =
             schema.operator_ids_for_column_family_id(tree_scope.column_family_id);
+        // Lazily fetch (and cache) the compactor's advertised merge operator ids. Fetching here —
+        // on the first compaction that needs it, rather than in `new()` — keeps `Db::open` from
+        // failing when the compactor is down. A fetch failure is returned as-is so the resilient
+        // wrapper can classify and handle it (fallback/skip). Once fetched the result is cached.
+        self.ensure_supported_merge_operator_ids(&merge_operator_ids)?;
         let merge_operator_metadata = schema
             .column_metadata_for_column_family_id(tree_scope.column_family_id)
             .to_vec();
-        for merge_operator_id in &merge_operator_ids {
-            if !self
-                .supported_merge_operator_ids
-                .contains(merge_operator_id)
-            {
-                return Err(Error::ConfigError(format!(
-                    "remote compactor {} does not support merge operator '{}'",
-                    self.address, merge_operator_id
-                )));
-            }
-        }
         // Collect every schema version referenced by an input file. The compactor registers these
         // from the request so it can decode input SST files stamped with non-zero schema ids and
         // stamps output with the highest registered version (its `latest_schema`). Version 0 is
@@ -782,62 +936,34 @@ impl CompactionWorker for RemoteCompactionWorker {
                 }));
             }
         };
-        let lsm_tree = self.lsm_tree.clone();
+        // Execute via the shared "execute request and apply" core. On success it releases the
+        // pending slot and applies the edit; on failure it returns the (classified) error without
+        // touching pending, and this direct path releases pending here. The resilient wrapper uses
+        // the same core but takes over pending handling to implement fallback/skip.
+        let worker_lsm_tree = self.lsm_tree.clone();
         let file_manager = Arc::clone(&self.file_manager);
         let address = self.address.clone();
         let remote_timeout = self.remote_timeout;
         Some(handle.spawn_blocking(move || {
             let result = (|| -> Result<CompactionResult> {
-                let response = send_compaction_request_to(&address, request, remote_timeout)?;
-                let Some(lsm_tree) = lsm_tree.upgrade() else {
-                    return Err(Error::IoError(
-                        "lsm tree dropped during compaction".to_string(),
-                    ));
-                };
-                if let Some(error) = response.error {
-                    return Err(Error::IoError(error));
-                }
-                let output_ids = file_manager.reserve_data_file_ids(response.output_files.len());
-                let remote_to_local_file_ids = response
-                    .output_files
-                    .iter()
-                    .zip(output_ids.iter().copied())
-                    .map(|(file, local_id)| (file.file_id, local_id))
-                    .collect::<HashMap<_, _>>();
-                let preload_block_keys =
-                    remap_preload_file_ids(response.preload_block_keys, &remote_to_local_file_ids);
-                let output_files = response
-                    .output_files
-                    .into_iter()
-                    .zip(output_ids)
-                    .map(|(file, file_id)| file.into_data_file(&file_manager, file_id, false))
-                    .collect::<Result<Vec<_>>>()?;
-                if let Err(err) = file_manager.trigger_offload_if_needed() {
-                    warn!("remote compaction check-in offload trigger failed: {}", err);
-                }
-                let edit = build_version_edit(&sorted_runs, output_level, output_files.clone());
-                let vlog_edit = {
-                    let edit = VlogEdit::from_entry_deltas(response.vlog_entry_deltas);
-                    (!edit.is_empty()).then_some(edit)
-                };
-                let apply_tree_idx = lsm_tree.on_compaction_complete(lsm_tree_idx);
-                if let Some(apply_tree_idx) = apply_tree_idx {
-                    lsm_tree.apply_edit(apply_tree_idx, edit.clone(), vlog_edit.clone());
-                    lsm_tree.submit_block_cache_preload(
-                        Arc::clone(&file_manager),
-                        preload_block_keys.clone(),
-                    );
-                }
-                Ok(CompactionResult::new(
+                let lsm_tree = worker_lsm_tree.upgrade().ok_or_else(|| {
+                    Error::IoError("lsm tree dropped during compaction".to_string())
+                })?;
+                match execute_compaction_request(
+                    &address,
+                    request,
+                    &sorted_runs,
                     lsm_tree_idx,
-                    output_files,
-                    edit,
-                    vlog_edit,
-                    preload_block_keys,
-                ))
+                    &file_manager,
+                    &lsm_tree,
+                    remote_timeout,
+                ) {
+                    RemoteCompactionOutcome::Succeeded(result) => Ok(result),
+                    RemoteCompactionOutcome::Failed(failure) => Err(failure.into_error()),
+                }
             })();
             if result.is_err()
-                && let Some(lsm_tree) = lsm_tree.upgrade()
+                && let Some(lsm_tree) = worker_lsm_tree.upgrade()
             {
                 let _ = lsm_tree.on_compaction_complete(lsm_tree_idx);
             }
@@ -1030,7 +1156,13 @@ impl RemoteCompactionServer {
                 RemoteCompactionCommand::Execute(mut request) => {
                     if let Err(err) = request.validate_protocol_compatibility() {
                         warn!("Reject incompatible request: {}", err);
-                        let response = RemoteCompactionResponse::err(err.to_string());
+                        // Protocol mismatch is deterministic — a version skew that will not fix
+                        // itself on retry — so classify it permanent to prevent the client from
+                        // masking it with a local fallback.
+                        let response = RemoteCompactionResponse::err(
+                            err.to_string(),
+                            RemoteCompactionErrorKind::Permanent,
+                        );
                         let _ =
                             write_message(&mut stream, &RemoteCompactionReply::Execute(response));
                         return;
@@ -1054,7 +1186,13 @@ impl RemoteCompactionServer {
                                 preload_block_keys,
                             )
                         }
-                        Err(err) => RemoteCompactionResponse::err(err.to_string()),
+                        // Classify the server-side error so the client can distinguish a
+                        // recoverable execution failure (transient) from a deterministic
+                        // schema/config/format error (permanent) without parsing the message.
+                        Err(err) => {
+                            let kind = classify_server_error(&err);
+                            RemoteCompactionResponse::err(err.to_string(), kind)
+                        }
                     };
                     info!("Request={} complete with response={}", request_id, response);
                     RemoteCompactionReply::Execute(response)
@@ -1409,6 +1547,100 @@ fn send_compaction_request_to(
     }
 }
 
+/// Sends a remote compaction request, remaps the response, and applies the resulting version/vlog/
+/// preload edits to the LSM tree.
+///
+/// This is the reusable "execute request and apply" core shared by the direct `RemoteCompactionWorker`
+/// path and the resilient wrapper. It owns the success path's `on_compaction_complete` +
+/// `apply_edit` (so the pending slot is released exactly once on success), but does **not** touch
+/// pending on error — the caller releases pending on failure. This separation lets the wrapper try
+/// remote and then, on a transient failure, hand the compaction to the local worker without
+/// double-releasing pending.
+///
+/// The outcome carries a transient/permanent classification:
+/// - protocol incompatibility (`validate_protocol_compatibility`) is **permanent** — surfaced as
+///   `Error::InvalidState` so a version mismatch is never masked by a local fallback;
+/// - connect/timeout/I/O failures and server-reported errors are **transient**.
+pub(crate) fn execute_compaction_request(
+    address: &str,
+    request: RemoteCompactionRequest,
+    sorted_runs: &[SortedRun],
+    lsm_tree_idx: usize,
+    file_manager: &Arc<FileManager>,
+    lsm_tree: &Arc<LSMTree>,
+    remote_timeout: Duration,
+) -> RemoteCompactionOutcome {
+    let output_level = request.output_level;
+    let response = match send_compaction_request_to(address, request, remote_timeout) {
+        Ok(response) => response,
+        Err(Error::IoError(msg)) if msg.contains("protocol incompatible") => {
+            // validate_protocol_compatibility wraps the mismatch in IoError; re-classify as a
+            // permanent InvalidState so the resilient wrapper does not mask a version mismatch.
+            return RemoteCompactionOutcome::failed_permanent(Error::InvalidState(msg));
+        }
+        Err(err) => return RemoteCompactionOutcome::failed_transient(err),
+    };
+    if let Some(error) = response.error {
+        // The server classifies its errors via `error_kind` so we do not have to parse the message.
+        // Permanent errors (malformed schema, unsupported operator, bad config, protocol mismatch)
+        // must surface — the resilient wrapper marks the DB errored and never falls back to local,
+        // which would silently mask a deterministic misconfiguration. Transient errors (overload,
+        // I/O, cancellation) fall back per the configured failure mode. An older server that omits
+        // `error_kind` deserializes as `None` and is treated as transient (the pre-typing behavior).
+        return match response.error_kind {
+            Some(RemoteCompactionErrorKind::Permanent) => {
+                RemoteCompactionOutcome::failed_permanent(Error::InvalidState(error))
+            }
+            _ => RemoteCompactionOutcome::failed_transient(Error::IoError(error)),
+        };
+    }
+    let result = (|| -> Result<CompactionResult> {
+        let output_ids = file_manager.reserve_data_file_ids(response.output_files.len());
+        let remote_to_local_file_ids = response
+            .output_files
+            .iter()
+            .zip(output_ids.iter().copied())
+            .map(|(file, local_id)| (file.file_id, local_id))
+            .collect::<HashMap<_, _>>();
+        let preload_block_keys =
+            remap_preload_file_ids(response.preload_block_keys, &remote_to_local_file_ids);
+        let output_files = response
+            .output_files
+            .into_iter()
+            .zip(output_ids)
+            .map(|(file, file_id)| file.into_data_file(file_manager, file_id, false))
+            .collect::<Result<Vec<_>>>()?;
+        if let Err(err) = file_manager.trigger_offload_if_needed() {
+            warn!("remote compaction check-in offload trigger failed: {}", err);
+        }
+        let edit = build_version_edit(sorted_runs, output_level, output_files.clone());
+        let vlog_edit = {
+            let edit = VlogEdit::from_entry_deltas(response.vlog_entry_deltas);
+            (!edit.is_empty()).then_some(edit)
+        };
+        // Success path: release the pending slot and apply the edit exactly once.
+        let apply_tree_idx = lsm_tree.on_compaction_complete(lsm_tree_idx);
+        if let Some(apply_tree_idx) = apply_tree_idx {
+            lsm_tree.apply_edit(apply_tree_idx, edit.clone(), vlog_edit.clone());
+            lsm_tree
+                .submit_block_cache_preload(Arc::clone(file_manager), preload_block_keys.clone());
+        }
+        Ok(CompactionResult::new(
+            lsm_tree_idx,
+            output_files,
+            edit,
+            vlog_edit,
+            preload_block_keys,
+        ))
+    })();
+    match result {
+        Ok(result) => RemoteCompactionOutcome::succeeded(result),
+        // Failures while remapping/applying the (already-validated) response are transient I/O
+        // issues. The pending slot has not been released on this path, so the caller still owns it.
+        Err(err) => RemoteCompactionOutcome::failed_transient(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1716,7 +1948,9 @@ mod tests {
         }
         {
             let mut builder = schema_manager.builder();
-            builder.ensure_column_family_exists("second-family").unwrap();
+            builder
+                .ensure_column_family_exists("second-family")
+                .unwrap();
             builder.commit();
         }
         let latest_schema = schema_manager.latest_schema();
@@ -1756,12 +1990,20 @@ mod tests {
                 (key, value)
             })
             .collect::<Vec<_>>();
-        let file_a =
-            create_test_sst_with_schema(&file_manager, entries_a, sst_options.clone(), latest_schema_id)
-                .unwrap();
-        let file_b =
-            create_test_sst_with_schema(&file_manager, entries_b, sst_options.clone(), latest_schema_id)
-                .unwrap();
+        let file_a = create_test_sst_with_schema(
+            &file_manager,
+            entries_a,
+            sst_options.clone(),
+            latest_schema_id,
+        )
+        .unwrap();
+        let file_b = create_test_sst_with_schema(
+            &file_manager,
+            entries_b,
+            sst_options.clone(),
+            latest_schema_id,
+        )
+        .unwrap();
         assert_eq!(file_a.schema_id, latest_schema_id);
         assert_eq!(file_b.schema_id, latest_schema_id);
 
@@ -1880,14 +2122,8 @@ mod tests {
             id: 7,
             column_families: Vec::new(),
         };
-        let result = RemoteCompactionServer::build_schema_manager(
-            0,
-            &[],
-            Vec::new(),
-            None,
-            1,
-            &[malformed],
-        );
+        let result =
+            RemoteCompactionServer::build_schema_manager(0, &[], Vec::new(), None, 1, &[malformed]);
         let err = match result {
             Ok(_) => panic!("malformed schema must fail the request"),
             Err(err) => err,
