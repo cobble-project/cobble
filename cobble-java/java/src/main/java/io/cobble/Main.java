@@ -7,8 +7,8 @@ import java.util.List;
 /**
  * Executable entry point for the {@code cobble-java} JAR.
  *
- * <p>This lets the bundled {@code cobble-cli} be launched directly from Java, with no
- * {@code cobble-cli} binary installed separately:
+ * <p>This lets the bundled {@code cobble-cli} be launched directly from Java, with no {@code
+ * cobble-cli} binary installed separately:
  *
  * <pre>{@code
  * java -jar cobble.jar remote-compactor --config config.yaml --bind 127.0.0.1:18888
@@ -16,10 +16,11 @@ import java.util.List;
  * }</pre>
  *
  * <p>Arguments are forwarded verbatim to {@code cobble-cli}. The executable is extracted from the
- * JAR's {@code native/} resources (cached per JVM) and run as a child process via {@link CobbleCli}.
- * The child's stdout/stderr are inherited so its logs are visible in the parent's console, and a
- * shutdown hook terminates the child gracefully when the JVM receives a signal (e.g. SIGINT/SIGTERM
- * or {@code kill <pid>}), so long-lived subcommands like {@code remote-compactor} shut down cleanly.
+ * JAR's {@code native/} resources (cached per JVM) and run as a child process via {@link
+ * CobbleCli}. The child's stdout/stderr are inherited so its logs are visible in the parent's
+ * console, and a shutdown hook terminates the child gracefully when the JVM receives a signal (e.g.
+ * SIGINT/SIGTERM or {@code kill <pid>}), so long-lived subcommands like {@code remote-compactor}
+ * shut down cleanly.
  *
  * <p>The JVM exits with the child's exit code. This mirrors running {@code cobble-cli} directly:
  * short-lived subcommands (e.g. {@code inspect}) return after completion, while server subcommands

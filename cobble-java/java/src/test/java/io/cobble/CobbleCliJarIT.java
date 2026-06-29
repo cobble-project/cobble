@@ -27,16 +27,16 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * <p>Runs via {@code maven-failsafe-plugin} in the {@code integration-test} phase, after the shade
  * plugin has produced {@code target/cobble-<version>.jar}. The JAR path is injected through the
- * {@code cobble.test.jar} system property (set by the plugin configuration from
- * {@code ${project.build.directory}/${project.build.finalName}.jar}).
+ * {@code cobble.test.jar} system property (set by the plugin configuration from {@code
+ * ${project.build.directory}/${project.build.finalName}.jar}).
  */
 class CobbleCliJarIT {
 
     /**
-     * {@code java -jar <shaded.jar> --help} must exit 0 and print the CLI usage banner. This
-     * single assertion covers: the manifest {@code Main-Class} resolves, {@link Main} forwards
-     * args to {@link CobbleCli}, the bundled {@code cobble-cli} resource is found and extracted,
-     * and the child process runs and returns its exit code.
+     * {@code java -jar <shaded.jar> --help} must exit 0 and print the CLI usage banner. This single
+     * assertion covers: the manifest {@code Main-Class} resolves, {@link Main} forwards args to
+     * {@link CobbleCli}, the bundled {@code cobble-cli} resource is found and extracted, and the
+     * child process runs and returns its exit code.
      */
     @Test
     void javaJarRunsCliAndExitsZero() throws Exception {
@@ -63,7 +63,9 @@ class CobbleCliJarIT {
                 "java -jar --help output should contain 'Usage:':\n" + output);
     }
 
-    /** Resolves the shaded JAR from the injected property, falling back to the conventional path. */
+    /**
+     * Resolves the shaded JAR from the injected property, falling back to the conventional path.
+     */
     private static Path resolveJar() throws IOException {
         String configured = System.getProperty("cobble.test.jar");
         if (configured != null && !configured.isEmpty()) {
