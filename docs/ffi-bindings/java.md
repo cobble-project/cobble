@@ -51,6 +51,7 @@ For multi-shard deployments. See [Distributed Deployment](../getting-started/dis
 
 ```java
 import io.cobble.Db;
+import io.cobble.Config;
 import io.cobble.PendingSnapshot;
 import io.cobble.ShardSnapshot;
 
@@ -69,6 +70,26 @@ Db restoredFresh = Db.restore("config.yaml", input.snapshotId, db.id(), true);
 // Restore from an explicit manifest path (always creates a fresh db identity)
 Db restoredFromManifest = Db.restoreWithManifest("config.yaml", input.manifestPath);
 ```
+
+Java `Config` exposes the same remote compaction failure policy as Rust:
+
+```java
+Config config =
+        new Config()
+                .addVolume("/data/cobble")
+                .numColumns(1)
+                .totalBuckets(128);
+
+config.compactionRemoteAddr = "127.0.0.1:9000";
+config.compactionRemoteTimeoutMs = 300_000L;
+config.compactionRemoteFailureMode = Config.RemoteCompactionFailureMode.FALLBACK_LOCAL;
+
+try (Db db = Db.open(config)) {
+    // Transient remote compaction failures fall back to local compaction by default.
+}
+```
+
+Use `Config.RemoteCompactionFailureMode.SKIP` when a writer should abandon a failed remote compaction attempt instead of doing local compaction. Permanent protocol, schema, and configuration errors are still surfaced to the DB.
 
 ### Reader
 
