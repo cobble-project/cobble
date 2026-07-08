@@ -1,6 +1,7 @@
 package io.cobble;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -121,7 +122,9 @@ public final class CobbleCli {
         if (args != null) {
             command.addAll(args);
         }
-        return new ProcessBuilder(command);
+        ProcessBuilder builder = new ProcessBuilder(command);
+        injectJvmLibraryPath(builder);
+        return builder;
     }
 
     /**
@@ -341,6 +344,73 @@ public final class CobbleCli {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /**
+     * Injects the JVM shared library directory into the process environment so that the {@code
+     * cobble-cli} binary — which may be dynamically linked against {@code libjvm.so} via the HDFS
+     * storage backend — can locate the JVM library at startup.
+     *
+     * <p>On Linux the environment variable is {@code LD_LIBRARY_PATH}; on macOS it is {@code
+     * DYLD_LIBRARY_PATH}. The JVM library directory is derived from the {@code java.home} system
+     * property by searching the conventional locations ({@code $java.home/lib/server} for JDK 9+
+     * and {@code $java.home/lib/amd64/server} for JDK 8). If the directory cannot be found the
+     * method returns without modifying the environment.
+     */
+    private static void injectJvmLibraryPath(ProcessBuilder builder) {
+        String jvmLibDir = findJvmLibraryDir();
+        if (jvmLibDir == null) {
+            return;
+        }
+        String os = NativePlatform.detectOs();
+        String envVar = os.equals("macos") ? "DYLD_LIBRARY_PATH" : "LD_LIBRARY_PATH";
+        Map<String, String> env = builder.environment();
+        String existing = env.get(envVar);
+        if (existing == null || existing.isEmpty()) {
+            env.put(envVar, jvmLibDir);
+        } else {
+            env.put(envVar, jvmLibDir + File.pathSeparator + existing);
+        }
+    }
+
+    /**
+     * Searches for the directory that contains the JVM shared library ({@code libjvm.so} on Linux,
+     * {@code libjvm.dylib} on macOS) under {@code java.home}. Returns {@code null} if the directory
+     * cannot be determined.
+     */
+    private static String findJvmLibraryDir() {
+        String javaHome = System.getProperty("java.home");
+        if (isBlank(javaHome)) {
+            return null;
+        }
+        String os = NativePlatform.detectOs();
+        String libName;
+        switch (os) {
+            case "macos":
+                libName = "libjvm.dylib";
+                break;
+            case "linux":
+                libName = "libjvm.so";
+                break;
+            default:
+                // Windows does not use LD_LIBRARY_PATH; skip injection.
+                return null;
+        }
+        // JDK 9+ layout: $java.home/lib/server/
+        Path candidate = Paths.get(javaHome, "lib", "server", libName);
+        if (Files.exists(candidate)) {
+            return candidate.getParent().toAbsolutePath().toString();
+        }
+        // JDK 8 Linux layout: $java.home/lib/amd64/server/
+        candidate = Paths.get(javaHome, "lib", "amd64", "server", libName);
+        if (Files.exists(candidate)) {
+            return candidate.getParent().toAbsolutePath().toString();
+        }
+        LOG.warning(
+                "Could not locate JVM shared library under java.home="
+                        + javaHome
+                        + "; cobble-cli may fail to start if it requires libjvm");
+        return null;
     }
 
     private static void makeExecutable(Path target) throws IOException {
