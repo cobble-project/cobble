@@ -94,6 +94,27 @@ fn compaction_happened_quick(db: &Db, db_id: &str) -> bool {
     })
 }
 
+fn completed_compactions(db: &Db, db_id: &str) -> u64 {
+    compaction_counter(db, db_id, "compactions_total")
+}
+
+fn compaction_counter(db: &Db, db_id: &str, name: &str) -> u64 {
+    db.metrics()
+        .into_iter()
+        .find(|sample| {
+            sample.name == name
+                && sample
+                    .labels
+                    .iter()
+                    .any(|(key, value)| key == "db_id" && value == db_id)
+        })
+        .and_then(|sample| match sample.value {
+            cobble::MetricValue::Counter(value) => Some(value),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// Read a length-prefixed JSON message from `stream`.
 fn read_message_raw(stream: &mut TcpStream) -> Vec<u8> {
     let mut len_bytes = [0u8; 4];
@@ -164,6 +185,13 @@ fn remote_compaction_falls_back_to_local_when_connect_refused() {
     let config = base_config(root, Some(dead_addr));
     let db = open_db(config);
     write_until_compaction(&db, db.id(), 1024);
+    assert_eq!(
+        completed_compactions(&db, db.id()),
+        1,
+        "the failed remote attempt must not double-count the local fallback"
+    );
+    assert!(compaction_counter(&db, db.id(), "compaction_read_bytes_total") > 0);
+    assert!(compaction_counter(&db, db.id(), "compaction_write_bytes_total") > 0);
     // Verify data is intact after local-fallback compaction: each written key reads back its
     // full value (1024 bytes of 'v').
     for i in 0..10 {
@@ -216,6 +244,19 @@ fn remote_compaction_skip_mode_releases_pending_without_db_error() {
     // The DB must remain writable and not enter an error state: a final put + get must succeed.
     db.put(0, b"final", 0, vec![b'v'; 16])
         .expect("db still writable after skip-mode attempts");
+    assert_eq!(
+        completed_compactions(&db, db.id()),
+        0,
+        "failed remote requests in skip mode must not count as completed compactions"
+    );
+    assert_eq!(
+        compaction_counter(&db, db.id(), "compaction_read_bytes_total"),
+        0
+    );
+    assert_eq!(
+        compaction_counter(&db, db.id(), "compaction_write_bytes_total"),
+        0
+    );
     let value = db
         .get(0, b"final")
         .expect("get must succeed")

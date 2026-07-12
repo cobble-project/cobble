@@ -6,7 +6,8 @@ use crate::sst::bloom::BloomFilter;
 use crate::sst::format::Block;
 use bytes::Bytes;
 use dashmap::DashMap;
-use foyer::{Code, Error as FoyerError};
+use foyer::{Code, Error as FoyerError, Event, EventListener};
+use metrics::{Gauge, gauge};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -32,6 +33,117 @@ impl CachedBlock {
 }
 
 pub type BlockCache = Arc<dyn CacheHandle<BlockCacheKey, CachedBlock>>;
+
+struct BlockCacheUsage {
+    data: AtomicU64,
+    index: AtomicU64,
+    filter: AtomicU64,
+    parquet_data: AtomicU64,
+    data_gauge: Gauge,
+    index_gauge: Gauge,
+    filter_gauge: Gauge,
+    parquet_data_gauge: Gauge,
+}
+
+impl BlockCacheUsage {
+    fn new(db_id: &str) -> Self {
+        Self {
+            data: AtomicU64::new(0),
+            index: AtomicU64::new(0),
+            filter: AtomicU64::new(0),
+            parquet_data: AtomicU64::new(0),
+            data_gauge: gauge!("block_cache_usage_bytes", "db_id" => db_id.to_string(), "kind" => "data"),
+            index_gauge: gauge!("block_cache_usage_bytes", "db_id" => db_id.to_string(), "kind" => "index"),
+            filter_gauge: gauge!("block_cache_usage_bytes", "db_id" => db_id.to_string(), "kind" => "filter"),
+            parquet_data_gauge: gauge!("block_cache_usage_bytes", "db_id" => db_id.to_string(), "kind" => "parquet_data"),
+        }
+    }
+
+    fn add(&self, key: &BlockCacheKey, bytes: u64) {
+        let (value, gauge) = self.metric_for_kind(&key.kind);
+        let mut current = value.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_add(bytes);
+            match value.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    gauge.set(next as f64);
+                    break;
+                }
+                Err(updated) => current = updated,
+            }
+        }
+    }
+
+    fn subtract(&self, key: &BlockCacheKey, bytes: u64) {
+        let (value, gauge) = self.metric_for_kind(&key.kind);
+        let mut current = value.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match value.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    gauge.set(next as f64);
+                    break;
+                }
+                Err(updated) => current = updated,
+            }
+        }
+    }
+
+    fn metric_for_kind(&self, kind: &BlockCacheKind) -> (&AtomicU64, &Gauge) {
+        match kind {
+            BlockCacheKind::Data => (&self.data, &self.data_gauge),
+            BlockCacheKind::IndexPartition | BlockCacheKind::IndexTop => {
+                (&self.index, &self.index_gauge)
+            }
+            BlockCacheKind::FilterPartition | BlockCacheKind::FilterIndex => {
+                (&self.filter, &self.filter_gauge)
+            }
+            BlockCacheKind::ParquetData(_) => (&self.parquet_data, &self.parquet_data_gauge),
+        }
+    }
+
+    #[cfg(test)]
+    fn current(&self, kind: &BlockCacheKind) -> u64 {
+        self.metric_for_kind(kind).0.load(Ordering::Acquire)
+    }
+}
+
+struct BlockCacheUsageListener {
+    usage: Arc<BlockCacheUsage>,
+}
+
+impl EventListener for BlockCacheUsageListener {
+    type Key = BlockCacheKey;
+    type Value = CachedBlock;
+
+    fn on_leave(&self, _event: Event, key: &Self::Key, value: &Self::Value) {
+        self.usage.subtract(key, value.size_in_bytes() as u64);
+    }
+}
+
+struct MeteredBlockCache {
+    inner: BlockCache,
+    usage: Arc<BlockCacheUsage>,
+}
+
+impl CacheHandle<BlockCacheKey, CachedBlock> for MeteredBlockCache {
+    fn get(&self, key: &BlockCacheKey) -> Option<CachedBlock> {
+        self.inner.get(key)
+    }
+
+    fn insert(&self, key: BlockCacheKey, value: CachedBlock) {
+        self.usage.add(&key, value.size_in_bytes() as u64);
+        self.inner.insert(key, value);
+    }
+
+    fn remove(&self, key: &BlockCacheKey) {
+        self.inner.remove(key);
+    }
+
+    fn clear(&self) {
+        self.inner.clear();
+    }
+}
 
 /// Tracks physical cache entries currently adjacent to cursor-driven scans.
 ///
@@ -343,22 +455,38 @@ pub(crate) fn new_block_cache_with_config(
             "block cache size must be greater than 0".to_string(),
         ));
     }
+    let usage = Arc::new(BlockCacheUsage::new(db_id));
+    let listener = Arc::new(BlockCacheUsageListener {
+        usage: Arc::clone(&usage),
+    });
     let plan = if let Some(plan) = selected_plan {
         Some(plan.clone())
     } else {
         config.resolve_hybrid_cache_volume_plan(memory_capacity)?
     };
     let Some(plan) = plan else {
-        return Ok(new_block_cache(memory_capacity));
+        let cache = FoyerCache::new_with_event_listener(
+            memory_capacity,
+            |_, value: &CachedBlock| value.size_in_bytes(),
+            Some(listener),
+        );
+        return Ok(Arc::new(MeteredBlockCache {
+            inner: Arc::new(cache),
+            usage,
+        }));
     };
     let cache_dir = build_hybrid_cache_dir(&plan.base_dir, db_id)?;
-    let hybrid = FoyerCache::new_hybrid(
+    let hybrid = FoyerCache::new_hybrid_with_event_listener(
         memory_capacity,
         plan.disk_capacity_bytes,
         cache_dir,
         |_, value: &CachedBlock| value.size_in_bytes(),
+        Some(listener),
     )?;
-    Ok(Arc::new(hybrid))
+    Ok(Arc::new(MeteredBlockCache {
+        inner: Arc::new(hybrid),
+        usage,
+    }))
 }
 
 fn build_hybrid_cache_dir(base_dir: &str, db_id: &str) -> Result<PathBuf> {
@@ -381,6 +509,9 @@ fn build_hybrid_cache_dir(base_dir: &str, db_id: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::{BlockCacheUsage, BlockCacheUsageListener, new_block_cache_with_config};
+    use crate::{Config, VolumeDescriptor, VolumeUsageKind};
+    use size::Size;
     use std::sync::Arc;
 
     use crate::cache::MockCache;
@@ -392,6 +523,7 @@ mod tests {
     use crate::sst::writer::{SSTWriter, SSTWriterOptions};
     use bytes::Bytes;
     use foyer::Code;
+    use foyer::{Event, EventListener};
 
     #[test]
     #[serial_test::serial(file)]
@@ -458,6 +590,134 @@ mod tests {
         assert!(mock_cache.get_count() > 0);
 
         let _ = std::fs::remove_dir_all("/tmp/cache_it_test");
+    }
+
+    #[test]
+    fn block_cache_usage_tracks_insert_replace_leave_and_never_underflows() {
+        let usage = Arc::new(BlockCacheUsage::new("block-cache-usage-test"));
+        let listener = BlockCacheUsageListener {
+            usage: Arc::clone(&usage),
+        };
+        let data_key = BlockCacheKey {
+            namespace: 1,
+            file_id: 2,
+            block_id: 3,
+            kind: BlockCacheKind::Data,
+        };
+        let old = CachedBlock::ParquetBlock(Bytes::from_static(b"old"));
+        let replacement = CachedBlock::ParquetBlock(Bytes::from_static(b"replacement"));
+
+        usage.add(&data_key, old.size_in_bytes() as u64);
+        assert_eq!(usage.current(&data_key.kind), 3);
+        usage.add(&data_key, replacement.size_in_bytes() as u64);
+        listener.on_leave(Event::Replace, &data_key, &old);
+        assert_eq!(
+            usage.current(&data_key.kind),
+            replacement.size_in_bytes() as u64
+        );
+        listener.on_leave(Event::Evict, &data_key, &replacement);
+        assert_eq!(usage.current(&data_key.kind), 0);
+        listener.on_leave(Event::Clear, &data_key, &replacement);
+        assert_eq!(usage.current(&data_key.kind), 0);
+
+        let index_key = BlockCacheKey {
+            kind: BlockCacheKind::IndexTop,
+            ..data_key
+        };
+        let filter_key = BlockCacheKey {
+            kind: BlockCacheKind::FilterIndex,
+            ..data_key
+        };
+        let parquet_key = BlockCacheKey {
+            kind: BlockCacheKind::ParquetData(16),
+            ..data_key
+        };
+        for key in [&index_key, &filter_key, &parquet_key] {
+            usage.add(key, 1);
+            assert_eq!(usage.current(&key.kind), 1);
+            listener.on_leave(Event::Remove, key, &old);
+            assert_eq!(usage.current(&key.kind), 0);
+        }
+    }
+
+    #[test]
+    fn foyer_block_cache_usage_tracks_replacement_remove_and_clear() {
+        crate::metrics_registry::init_metrics();
+        let db_id = "foyer-block-cache-usage-test";
+        let cache = new_block_cache_with_config(&Config::default(), db_id, 8, None).unwrap();
+        let key = BlockCacheKey {
+            namespace: 7,
+            file_id: 8,
+            block_id: 9,
+            kind: BlockCacheKind::Data,
+        };
+        cache.insert(key, CachedBlock::ParquetBlock(Bytes::from_static(b"four")));
+        assert_eq!(block_cache_usage_sample(db_id, "data"), 4.0);
+
+        cache.insert(
+            key,
+            CachedBlock::ParquetBlock(Bytes::from_static(b"replace")),
+        );
+        assert_eq!(block_cache_usage_sample(db_id, "data"), 7.0);
+
+        cache.remove(&key);
+        assert_eq!(block_cache_usage_sample(db_id, "data"), 0.0);
+
+        cache.insert(key, CachedBlock::ParquetBlock(Bytes::from_static(b"clear")));
+        assert_eq!(block_cache_usage_sample(db_id, "data"), 5.0);
+        cache.clear();
+        assert_eq!(block_cache_usage_sample(db_id, "data"), 0.0);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn hybrid_block_cache_usage_tracks_memory_tier_entries() {
+        crate::metrics_registry::init_metrics();
+        let root = "/tmp/hybrid-block-cache-usage-test";
+        let _ = std::fs::remove_dir_all(root);
+        let db_id = "hybrid-block-cache-usage-test";
+        let config = Config {
+            volumes: vec![VolumeDescriptor::new(
+                format!("file://{root}"),
+                vec![VolumeUsageKind::Cache],
+            )],
+            block_cache_hybrid_enabled: true,
+            block_cache_hybrid_disk_size: Some(Size::from_mib(32)),
+            ..Config::default()
+        };
+        let cache = new_block_cache_with_config(&config, db_id, 4 * 1024 * 1024, None).unwrap();
+        let key = BlockCacheKey {
+            namespace: 17,
+            file_id: 18,
+            block_id: 19,
+            kind: BlockCacheKind::Data,
+        };
+        cache.insert(
+            key,
+            CachedBlock::ParquetBlock(Bytes::from_static(b"hybrid")),
+        );
+        assert_eq!(block_cache_usage_sample(db_id, "data"), 6.0);
+        cache.remove(&key);
+        assert_eq!(block_cache_usage_sample(db_id, "data"), 0.0);
+        drop(cache);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn block_cache_usage_sample(db_id: &str, kind: &str) -> f64 {
+        crate::metrics_registry::snapshot_metrics(Some(db_id))
+            .into_iter()
+            .find(|sample| {
+                sample.name == "block_cache_usage_bytes"
+                    && sample
+                        .labels
+                        .iter()
+                        .any(|(key, value)| key == "kind" && value == kind)
+            })
+            .and_then(|sample| match sample.value {
+                crate::MetricValue::Gauge(value) => Some(value),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     #[test]

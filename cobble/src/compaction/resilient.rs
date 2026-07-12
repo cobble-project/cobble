@@ -78,6 +78,7 @@ impl CompactionWorker for ResilientRemoteCompactionWorker {
         let lsm_tree_weak = remote.lsm_tree().clone();
         let address = remote.address().to_string();
         let remote_timeout = remote.remote_timeout();
+        let compaction_metrics = remote.compaction_metrics();
         Some(handle.spawn_blocking(move || {
             let lsm_tree = match lsm_tree_weak.upgrade() {
                 Some(tree) => tree,
@@ -126,6 +127,7 @@ impl CompactionWorker for ResilientRemoteCompactionWorker {
                 &file_manager,
                 &lsm_tree,
                 remote_timeout,
+                &compaction_metrics,
             ) {
                 RemoteCompactionOutcome::Succeeded(result) => Ok(result),
                 RemoteCompactionOutcome::Failed(failure) => handle_remote_execution_failure(

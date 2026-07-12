@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use foyer::{
-    BlockEngineConfig, Cache, CacheBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache,
-    HybridCacheBuilder, PsyncIoEngineConfig,
+    BlockEngineConfig, Cache, CacheBuilder, DeviceBuilder, EventListener, FsDeviceBuilder,
+    HybridCache, HybridCacheBuilder, PsyncIoEngineConfig,
 };
 use log::warn;
 use std::collections::HashMap;
@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 pub trait CacheHandle<K, V>: Send + Sync {
     fn get(&self, key: &K) -> Option<V>;
     fn insert(&self, key: K, value: V);
+    fn remove(&self, key: &K);
+    fn clear(&self);
 }
 
 struct HybridCacheBackend<K, V>
@@ -75,10 +77,20 @@ where
         capacity: usize,
         weighter: impl Fn(&K, &V) -> usize + Send + Sync + 'static,
     ) -> Self {
+        Self::new_with_event_listener(capacity, weighter, None)
+    }
+
+    pub fn new_with_event_listener(
+        capacity: usize,
+        weighter: impl Fn(&K, &V) -> usize + Send + Sync + 'static,
+        event_listener: Option<Arc<dyn EventListener<Key = K, Value = V>>>,
+    ) -> Self {
+        let mut builder = CacheBuilder::new(capacity).with_weighter(weighter);
+        if let Some(event_listener) = event_listener {
+            builder = builder.with_event_listener(event_listener);
+        }
         Self {
-            backend: FoyerCacheBackend::Memory(
-                CacheBuilder::new(capacity).with_weighter(weighter).build(),
-            ),
+            backend: FoyerCacheBackend::Memory(builder.build()),
         }
     }
 
@@ -87,6 +99,22 @@ where
         disk_capacity: usize,
         disk_path: impl AsRef<Path>,
         weighter: impl Fn(&K, &V) -> usize + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::new_hybrid_with_event_listener(
+            memory_capacity,
+            disk_capacity,
+            disk_path,
+            weighter,
+            None,
+        )
+    }
+
+    pub fn new_hybrid_with_event_listener(
+        memory_capacity: usize,
+        disk_capacity: usize,
+        disk_path: impl AsRef<Path>,
+        weighter: impl Fn(&K, &V) -> usize + Send + Sync + 'static,
+        event_listener: Option<Arc<dyn EventListener<Key = K, Value = V>>>,
     ) -> Result<Self> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -115,8 +143,11 @@ where
                     .map_err(|err| {
                         Error::ConfigError(format!("Failed to build hybrid cache device: {}", err))
                     })?;
-                let cache = HybridCacheBuilder::new()
-                    .with_name("cobble-block-cache")
+                let mut builder = HybridCacheBuilder::new().with_name("cobble-block-cache");
+                if let Some(event_listener) = event_listener {
+                    builder = builder.with_event_listener(event_listener);
+                }
+                let cache = builder
                     .memory(memory_capacity)
                     .with_weighter(weighter)
                     .storage()
@@ -170,6 +201,28 @@ where
             }
         }
     }
+
+    fn remove(&self, key: &K) {
+        match &self.backend {
+            FoyerCacheBackend::Memory(cache) => {
+                cache.remove(key);
+            }
+            FoyerCacheBackend::Hybrid(cache) => {
+                cache.inner.remove(key);
+            }
+        }
+    }
+
+    fn clear(&self) {
+        match &self.backend {
+            FoyerCacheBackend::Memory(cache) => cache.clear(),
+            FoyerCacheBackend::Hybrid(cache) => {
+                if let Err(err) = cache.runtime.block_on(cache.inner.clear()) {
+                    warn!("failed to clear hybrid block cache: {}", err);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -214,6 +267,14 @@ where
     fn insert(&self, key: K, value: V) {
         self.insert_count.fetch_add(1, Ordering::Relaxed);
         self.values.lock().unwrap().insert(key, value);
+    }
+
+    fn remove(&self, key: &K) {
+        self.values.lock().unwrap().remove(key);
+    }
+
+    fn clear(&self) {
+        self.values.lock().unwrap().clear();
     }
 }
 

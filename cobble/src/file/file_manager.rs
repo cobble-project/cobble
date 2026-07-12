@@ -104,7 +104,8 @@ pub(crate) struct DataVolume {
     pub(crate) fs: Arc<dyn FileSystem>,
     pub(crate) base_dir: Option<String>,
     pub(crate) size_limit: Option<u64>,
-    pub(crate) used_bytes: AtomicU64,
+    pub(crate) used_bytes: Arc<AtomicU64>,
+    storage_file_bytes: Option<Gauge>,
     pub(crate) projected_offload_bytes: AtomicU64,
     pub(crate) priority: VolumePriority,
     pub(crate) supports_primary_data: bool,
@@ -119,7 +120,8 @@ impl Clone for DataVolume {
             fs: Arc::clone(&self.fs),
             base_dir: self.base_dir.clone(),
             size_limit: self.size_limit,
-            used_bytes: AtomicU64::new(self.used_bytes.load(Ordering::SeqCst)),
+            used_bytes: Arc::clone(&self.used_bytes),
+            storage_file_bytes: self.storage_file_bytes.clone(),
             projected_offload_bytes: AtomicU64::new(
                 self.projected_offload_bytes.load(Ordering::SeqCst),
             ),
@@ -138,7 +140,24 @@ impl DataVolume {
     }
 
     pub(crate) fn add_usage(&self, bytes: u64) {
-        self.used_bytes.fetch_add(bytes, Ordering::SeqCst);
+        let mut current = self.used_bytes.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_add(bytes);
+            match self.used_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    if let Some(gauge) = &self.storage_file_bytes {
+                        gauge.set(next as f64);
+                    }
+                    break;
+                }
+                Err(updated) => current = updated,
+            }
+        }
     }
 
     pub(crate) fn add_projected_offload_bytes(&self, bytes: u64) {
@@ -177,7 +196,12 @@ impl DataVolume {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    if let Some(gauge) = &self.storage_file_bytes {
+                        gauge.set(next as f64);
+                    }
+                    break;
+                }
                 Err(updated) => current = updated,
             }
         }
@@ -558,12 +582,14 @@ impl AtomicMetadataWriter {
         };
         let mut writer = writer;
         writer.close()?;
+        let size = self.fs.open_read(&self.temp_path)?.size() as u64;
         self.fs.rename(&self.temp_path, &self.final_path)?;
         let tracked = Arc::new(TrackedFile::readonly(
             self.final_path.clone(),
             Arc::clone(&self.fs),
             self.volume.clone(),
         ));
+        tracked.update_size_bytes(size);
         self.metadata_files
             .insert(self.final_name.clone(), Arc::clone(&tracked));
         self.metadata_files_gauge
@@ -849,7 +875,8 @@ impl FileManager {
             fs,
             base_dir: None,
             size_limit: None,
-            used_bytes: AtomicU64::new(0),
+            used_bytes: Arc::new(AtomicU64::new(0)),
+            storage_file_bytes: None,
             projected_offload_bytes: AtomicU64::new(0),
             priority: VolumePriority::High,
             supports_primary_data: true,
@@ -865,7 +892,7 @@ impl FileManager {
         db_id: &str,
         metrics_manager: Arc<MetricsManager>,
     ) -> Result<Self> {
-        let data_volumes = Self::data_volumes_from_config(config)?;
+        let data_volumes = Self::data_volumes_from_config_with_metrics(config, Some(db_id))?;
         let options = FileManagerOptions {
             base_dir: db_id.to_string(),
             base_file_size: config.base_file_size_bytes()?,
@@ -879,6 +906,13 @@ impl FileManager {
     }
 
     pub(crate) fn data_volumes_from_config(config: &Config) -> Result<Vec<DataVolume>> {
+        Self::data_volumes_from_config_with_metrics(config, None)
+    }
+
+    fn data_volumes_from_config_with_metrics(
+        config: &Config,
+        db_id: Option<&str>,
+    ) -> Result<Vec<DataVolume>> {
         let registry = FileSystemRegistry::new();
         let volumes = if config.volumes.is_empty() {
             return Err(Error::ConfigError("No volumes configured".to_string()));
@@ -889,7 +923,7 @@ impl FileManager {
             .iter()
             .any(|volume| volume.supports(VolumeUsageKind::Snapshot));
         let mut data_volumes = Vec::new();
-        for volume in &volumes {
+        for (volume_index, volume) in volumes.iter().enumerate() {
             let readonly_source = volume.supports(VolumeUsageKind::Readonly);
             if readonly_source {
                 let has_other_kinds = volume.supports(VolumeUsageKind::Meta)
@@ -929,7 +963,14 @@ impl FileManager {
                     fs,
                     base_dir: Some(normalized_base_dir),
                     size_limit: volume.size_limit_bytes()?,
-                    used_bytes: AtomicU64::new(0),
+                    used_bytes: Arc::new(AtomicU64::new(0)),
+                    storage_file_bytes: db_id.map(|db_id| {
+                        gauge!(
+                            "storage_file_bytes",
+                            "db_id" => db_id.to_string(),
+                            "volume" => volume_index.to_string()
+                        )
+                    }),
                     projected_offload_bytes: AtomicU64::new(0),
                     priority: priority.unwrap_or(VolumePriority::Low),
                     supports_primary_data,
@@ -1747,6 +1788,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn data_volume_clones_share_usage_and_saturate_removal() {
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/file_manager_usage_test")
+            .unwrap();
+        let volume = DataVolume {
+            fs,
+            base_dir: None,
+            size_limit: None,
+            used_bytes: Arc::new(AtomicU64::new(0)),
+            storage_file_bytes: None,
+            projected_offload_bytes: AtomicU64::new(0),
+            priority: VolumePriority::High,
+            supports_primary_data: true,
+            supports_meta: true,
+            snapshot_persistable: true,
+            readonly_source: false,
+        };
+        let clone = volume.clone();
+        volume.add_usage(17);
+        assert_eq!(clone.used_bytes.load(Ordering::SeqCst), 17);
+        clone.subtract_usage(99);
+        assert_eq!(volume.used_bytes.load(Ordering::SeqCst), 0);
+        volume
+            .used_bytes
+            .store(u64::MAX.saturating_sub(2), Ordering::SeqCst);
+        clone.add_usage(9);
+        assert_eq!(volume.used_bytes.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
     #[serial_test::serial(file)]
     fn test_file_manager_create_data_file() {
         let (_fs, fm) = create_test_file_manager();
@@ -1991,7 +2063,8 @@ pub(crate) mod tests {
             fs: Arc::clone(&high_fs),
             base_dir: Some(format!("{}/high", root)),
             size_limit: Some(128),
-            used_bytes: AtomicU64::new(0),
+            used_bytes: Arc::new(AtomicU64::new(0)),
+            storage_file_bytes: None,
             projected_offload_bytes: AtomicU64::new(0),
             priority: VolumePriority::High,
             supports_primary_data: true,
@@ -2003,7 +2076,8 @@ pub(crate) mod tests {
             fs: Arc::clone(&low_fs),
             base_dir: Some(format!("{}/low", root)),
             size_limit: None,
-            used_bytes: AtomicU64::new(0),
+            used_bytes: Arc::new(AtomicU64::new(0)),
+            storage_file_bytes: None,
             projected_offload_bytes: AtomicU64::new(0),
             priority: VolumePriority::Low,
             supports_primary_data: true,
@@ -2044,6 +2118,7 @@ pub(crate) mod tests {
     #[test]
     #[serial_test::serial(file)]
     fn test_file_manager_snapshot_volume_for_metadata_and_copy() {
+        crate::metrics_registry::init_metrics();
         let root = "/tmp/file_manager_snapshot_volume";
         let _ = std::fs::remove_dir_all(root);
         let primary_url = format!("file://{}/primary", root);
@@ -2065,11 +2140,13 @@ pub(crate) mod tests {
             ..Config::default()
         };
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-snapshot"));
-        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+        let db_id = "file-manager-storage-metrics";
+        let fm = FileManager::from_config(&config, db_id, metrics_manager).unwrap();
 
         let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
         source_writer.write(b"source-bytes").unwrap();
         source_writer.close().unwrap();
+        drop(source_writer);
         let source_path = fm.get_data_file_path(source_file_id).unwrap();
         assert!(primary_fs.exists(&source_path).unwrap());
         assert!(!fm.is_data_file_persistable_for_snapshot(source_file_id));
@@ -2077,9 +2154,13 @@ pub(crate) mod tests {
         let mut metadata_writer = fm.create_metadata_file("snapshot/MANIFEST").unwrap();
         metadata_writer.write(b"manifest").unwrap();
         metadata_writer.close().unwrap();
+        drop(metadata_writer);
         let metadata_path = fm.get_metadata_file_path("snapshot/MANIFEST").unwrap();
         assert!(snapshot_fs.exists(&metadata_path).unwrap());
         assert!(!primary_fs.exists(&metadata_path).unwrap());
+
+        assert_storage_file_bytes(db_id, "0", 12.0);
+        assert_storage_file_bytes(db_id, "1", 16.0);
 
         let copied_file_id = fm
             .copy_data_file_to_snapshot_volume(source_file_id)
@@ -2090,7 +2171,32 @@ pub(crate) mod tests {
         assert!(snapshot_fs.exists(&copied_path).unwrap());
         let copied_reader = fm.open_data_file_reader(copied_file_id).unwrap();
         assert_eq!(&copied_reader.read_at(0, 12).unwrap()[..], b"source-bytes");
+        drop(copied_reader);
+        assert_storage_file_bytes(db_id, "0", 12.0);
+        assert_storage_file_bytes(db_id, "1", 28.0);
+
+        fm.remove_data_file(source_file_id).unwrap();
+        fm.remove_metadata_file("snapshot/MANIFEST").unwrap();
+        assert_storage_file_bytes(db_id, "0", 0.0);
+        assert_storage_file_bytes(db_id, "1", 12.0);
+
+        fm.remove_data_file(copied_file_id).unwrap();
+        assert_storage_file_bytes(db_id, "1", 0.0);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn assert_storage_file_bytes(db_id: &str, volume: &str, expected: f64) {
+        let sample = crate::metrics_registry::snapshot_metrics(Some(db_id))
+            .into_iter()
+            .find(|sample| {
+                sample.name == "storage_file_bytes"
+                    && sample
+                        .labels
+                        .iter()
+                        .any(|(key, value)| key == "volume" && value == volume)
+            })
+            .expect("configured volume must expose a storage-byte gauge");
+        assert!(matches!(sample.value, crate::MetricValue::Gauge(value) if value == expected));
     }
 
     #[test]
