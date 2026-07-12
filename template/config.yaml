@@ -81,6 +81,7 @@ base_file_size: "64MiB"
 sst_bloom_filter_enabled: false
 sst_bloom_bits_per_key: 10
 sst_partitioned_index: false
+block_checksum_enabled: true             # SST data-block CRC; not currently supported for Parquet
 data_file_type: sst                      # sst | parquet
 parquet_row_group_size_bytes: "256KiB"
 

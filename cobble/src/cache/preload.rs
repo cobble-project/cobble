@@ -2,7 +2,7 @@ use super::{BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock, ScanHotBlock
 use crate::db_status::{DbLifecycle, DbLifecycleState};
 use crate::file::{FileManager, RandomAccessFile};
 use crate::parquet::cache_parquet_data_block;
-use crate::sst::compression::decode_block_bytes;
+use crate::sst::compression::{decode_block_bytes, verify_block_checksum};
 use crate::sst::format::Block;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -17,6 +17,11 @@ use std::time::Duration;
 pub(crate) struct BlockCachePreload {
     pub(crate) key: BlockCacheKey,
     pub(crate) size: usize,
+    /// Whether an SST data block includes a CRC32 trailer.
+    ///
+    /// The serde default keeps remote-compaction responses from older workers readable.
+    #[serde(default)]
+    pub(crate) checksum_enabled: bool,
 }
 
 /// Writer-side bridge between `ScanHotBlockRegistry` and deferred cache preload.
@@ -61,14 +66,21 @@ impl WriterHotBlockCache {
 
     /// Records an output cache entry for later background preload if the caller
     /// has already armed the current output block / row group.
-    pub(crate) fn push_preload(&self, key: BlockCacheKey, size: usize, armed: bool) {
+    pub(crate) fn push_preload(
+        &self,
+        key: BlockCacheKey,
+        size: usize,
+        checksum_enabled: bool,
+        armed: bool,
+    ) {
         if !armed {
             return;
         }
-        self.preloads
-            .lock()
-            .unwrap()
-            .push(BlockCachePreload { key, size });
+        self.preloads.lock().unwrap().push(BlockCachePreload {
+            key,
+            size,
+            checksum_enabled,
+        });
     }
 }
 
@@ -302,12 +314,21 @@ fn preload_block_cache_keys(
                 return;
             }
             let key = preload.key;
+            // As with foreground SST reads, checksum verification belongs to the storage-read
+            // path. A hit is already verified and must not rescan bytes or perturb cache order.
             if block_cache.get(&key).is_some() {
                 continue;
             }
             match key.kind {
                 BlockCacheKind::Data => match reader
                     .read_at(key.block_id as usize, preload.size)
+                    .and_then(|data| {
+                        verify_block_checksum(
+                            data,
+                            preload.checksum_enabled,
+                            "preloaded SST data block",
+                        )
+                    })
                     .and_then(decode_block_bytes)
                     .and_then(Block::decode)
                 {

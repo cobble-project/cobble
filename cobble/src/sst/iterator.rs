@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
 use crate::iterator::KvIterator;
 use crate::sst::bloom::BloomFilter;
-use crate::sst::compression::decode_block_bytes;
+use crate::sst::compression::{decode_block_bytes, verify_block_checksum};
 use crate::sst::format::{Block, FOOTER_SIZE, Footer};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, KvValue, Value};
@@ -553,6 +553,9 @@ impl SSTIterator {
         }
         let block = if let Some(cache) = &self.block_cache {
             if let Some(cached) = cache.get(&cache_key) {
+                // Cached SST blocks are trusted: every internal cache-fill path verifies bytes
+                // immediately after read_at and before insertion. Keep checksum work on storage
+                // reads only so cache hits do not rescan block contents.
                 self.metrics.data_hits.increment(1);
                 match cached {
                     CachedBlock::Block(block) => block,
@@ -566,7 +569,9 @@ impl SSTIterator {
             } else {
                 self.metrics.data_misses.increment(1);
                 let data = self.file.read_at(offset as usize, size)?;
-                let decoded = decode_block_bytes(data)?;
+                let verified =
+                    verify_block_checksum(data, self.footer.block_checksums, "SST data block")?;
+                let decoded = decode_block_bytes(verified)?;
                 let mut block = Block::decode(decoded)?;
                 block.set_block_id(block_idx as u32);
                 let block = Arc::new(block);
@@ -575,7 +580,9 @@ impl SSTIterator {
             }
         } else {
             let data = self.file.read_at(offset as usize, size)?;
-            let decoded = decode_block_bytes(data)?;
+            let verified =
+                verify_block_checksum(data, self.footer.block_checksums, "SST data block")?;
+            let decoded = decode_block_bytes(verified)?;
             let mut block = Block::decode(decoded)?;
             block.set_block_id(block_idx as u32);
             Arc::new(block)
@@ -1169,7 +1176,9 @@ mod tests {
     use super::*;
     use crate::file::FileSystemRegistry;
     use crate::sst::bloom::{BloomFilter, BloomFilterBuilder};
+    use crate::sst::format::Footer;
     use crate::sst::writer::{SSTWriter, SSTWriterOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
 
     fn build_filter(bits_per_key: u32, keys: &[&[u8]]) -> BloomFilter {
         let mut builder = BloomFilterBuilder::new(bits_per_key);
@@ -1187,6 +1196,72 @@ mod tests {
             }
         }
         panic!("unable to find missing key not in filter");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_data_block_checksum_detects_corruption() {
+        let root = "/tmp/sst_block_checksum_test";
+        let _ = std::fs::remove_dir_all(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let writer_file = fs.open_write("test.sst").unwrap();
+        let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+        writer.add(b"key", b"value").unwrap();
+        let (_, _, _, footer_bytes) = writer.finish_with_range().unwrap();
+        assert!(Footer::decode(&footer_bytes).unwrap().block_checksums);
+
+        let path = format!("{}/test.sst", root);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(8)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x80;
+        file.seek(SeekFrom::Start(8)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.flush().unwrap();
+
+        let reader_file = fs.open_read("test.sst").unwrap();
+        let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+        assert!(matches!(
+            iter.seek_to_first(),
+            Err(Error::ChecksumMismatch(_))
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_data_block_checksum_can_be_disabled() {
+        let root = "/tmp/sst_block_checksum_disabled_test";
+        let _ = std::fs::remove_dir_all(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let writer_file = fs.open_write("test.sst").unwrap();
+        let mut writer = SSTWriter::new(
+            writer_file,
+            SSTWriterOptions {
+                block_checksum_enabled: false,
+                ..Default::default()
+            },
+        );
+        writer.add(b"key", b"value").unwrap();
+        let (_, _, _, footer_bytes) = writer.finish_with_range().unwrap();
+        assert!(!Footer::decode(&footer_bytes).unwrap().block_checksums);
+
+        let reader_file = fs.open_read("test.sst").unwrap();
+        let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+        iter.seek_to_first().unwrap();
+        assert_eq!(iter.key().unwrap().unwrap().as_ref(), b"key");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1393,6 +1468,7 @@ mod tests {
                     data_block_restart_interval: 16,
                     compression: crate::SstCompressionAlgorithm::None,
                     value_has_ttl: true,
+                    block_checksum_enabled: false,
                 },
             );
 

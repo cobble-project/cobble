@@ -265,6 +265,7 @@ pub(crate) fn build_sst_writer_options(
         partitioned_index: config.sst_partitioned_index,
         data_block_restart_interval: config.sst_data_block_restart_interval,
         compression: config.sst_compression_for_level(level),
+        block_checksum_enabled: config.block_checksum_enabled,
         ..SSTWriterOptions::default()
     }
 }

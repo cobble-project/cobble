@@ -4,7 +4,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Magic number at the end of SST file for validation
 const SST_FILE_MAGIC: u32 = 0x53535431; // "SST1"
-const SST_FOOTER_VERSION_CURRENT: u32 = 1;
+const SST_FOOTER_VERSION_LEGACY: u32 = 1;
+const SST_FOOTER_VERSION_CURRENT: u32 = 2;
 
 /// Footer structure at the end of SST file
 /// Layout: [index_block_offset: u64][index_block_size: u64]
@@ -15,6 +16,7 @@ pub(crate) const FOOTER_SIZE: usize = 44; // 8 + 8 + 8 + 8 + 4 + 4 + 4
 const FOOTER_FLAG_FILTER_PRESENT: u32 = 0x1;
 const FOOTER_FLAG_PARTITIONED_INDEX: u32 = 0x2;
 const FOOTER_FLAG_VALUE_WITHOUT_TTL: u32 = 0x4;
+const FOOTER_FLAG_BLOCK_CHECKSUMS: u32 = 0x8;
 
 #[derive(Debug, Clone)]
 pub struct Footer {
@@ -25,29 +27,10 @@ pub struct Footer {
     pub filter_present: bool,
     pub partitioned_index: bool,
     pub value_has_ttl: bool,
+    pub block_checksums: bool,
 }
 
 impl Footer {
-    pub(crate) fn new(
-        index_block_offset: u64,
-        index_block_size: u64,
-        filter_block_offset: u64,
-        filter_block_size: u64,
-        filter_present: bool,
-        partitioned_index: bool,
-        value_has_ttl: bool,
-    ) -> Self {
-        Self {
-            index_block_offset,
-            index_block_size,
-            filter_block_offset,
-            filter_block_size,
-            filter_present,
-            partitioned_index,
-            value_has_ttl,
-        }
-    }
-
     pub(crate) fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(FOOTER_SIZE);
         buf.put_u64_le(self.index_block_offset);
@@ -64,7 +47,14 @@ impl Footer {
         if !self.value_has_ttl {
             flags |= FOOTER_FLAG_VALUE_WITHOUT_TTL;
         }
+        if self.block_checksums {
+            flags |= FOOTER_FLAG_BLOCK_CHECKSUMS;
+        }
         buf.put_u32_le(flags);
+        // The format version identifies the writer generation, while the flag
+        // independently records whether this file contains block checksums.
+        // Therefore every newly written SST is v2, even when checksums are
+        // disabled by configuration. Version 1 is reserved for legacy files.
         buf.put_u32_le(SST_FOOTER_VERSION_CURRENT);
         buf.put_u32_le(SST_FILE_MAGIC);
         buf.freeze()
@@ -88,10 +78,19 @@ impl Footer {
         let version = buf.get_u32_le();
         let magic = buf.get_u32_le();
 
-        if version != SST_FOOTER_VERSION_CURRENT {
+        if version != SST_FOOTER_VERSION_LEGACY && version != SST_FOOTER_VERSION_CURRENT {
             return Err(Error::IoError(format!(
-                "Unsupported SST footer version: {} (expected {})",
-                version, SST_FOOTER_VERSION_CURRENT
+                "Unsupported SST footer version: {} (expected {} or {})",
+                version, SST_FOOTER_VERSION_LEGACY, SST_FOOTER_VERSION_CURRENT
+            )));
+        }
+        let block_checksums = (flags & FOOTER_FLAG_BLOCK_CHECKSUMS) != 0;
+        // Legacy v1 blocks never carry checksum trailers. In v2, the flag is
+        // authoritative and supports both checksum-enabled and disabled files.
+        if version == SST_FOOTER_VERSION_LEGACY && block_checksums {
+            return Err(Error::IoError(format!(
+                "Invalid SST footer checksum flag for version {}",
+                version
             )));
         }
 
@@ -110,6 +109,7 @@ impl Footer {
             filter_present: (flags & FOOTER_FLAG_FILTER_PRESENT) != 0,
             partitioned_index: (flags & FOOTER_FLAG_PARTITIONED_INDEX) != 0,
             value_has_ttl: (flags & FOOTER_FLAG_VALUE_WITHOUT_TTL) == 0,
+            block_checksums,
         })
     }
 }
@@ -798,11 +798,37 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 mod tests {
     use super::*;
 
+    const FOOTER_VERSION_OFFSET: usize =
+        4 * std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+
+    fn footer_version(encoded: &[u8]) -> u32 {
+        u32::from_le_bytes(
+            encoded[FOOTER_VERSION_OFFSET..FOOTER_VERSION_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    fn set_footer_version(encoded: &mut [u8], version: u32) {
+        encoded[FOOTER_VERSION_OFFSET..FOOTER_VERSION_OFFSET + 4]
+            .copy_from_slice(&version.to_le_bytes());
+    }
+
     #[test]
     fn test_footer_encode_decode() {
-        let footer = Footer::new(100, 200, 300, 400, true, false, true);
+        let footer = Footer {
+            index_block_offset: 100,
+            index_block_size: 200,
+            filter_block_offset: 300,
+            filter_block_size: 400,
+            filter_present: true,
+            partitioned_index: false,
+            value_has_ttl: true,
+            block_checksums: true,
+        };
         let encoded = footer.encode();
         assert_eq!(encoded.len(), FOOTER_SIZE);
+        assert_eq!(footer_version(&encoded), SST_FOOTER_VERSION_CURRENT);
 
         let decoded = Footer::decode(&encoded).unwrap();
         assert_eq!(decoded.index_block_offset, 100);
@@ -812,12 +838,23 @@ mod tests {
         assert!(decoded.filter_present);
         assert!(!decoded.partitioned_index);
         assert!(decoded.value_has_ttl);
+        assert!(decoded.block_checksums);
     }
 
     #[test]
-    fn test_footer_contains_version() {
-        let footer = Footer::new(10, 20, 30, 40, true, true, false);
+    fn test_footer_without_checksums_still_uses_current_version() {
+        let footer = Footer {
+            index_block_offset: 10,
+            index_block_size: 20,
+            filter_block_offset: 30,
+            filter_block_size: 40,
+            filter_present: true,
+            partitioned_index: true,
+            value_has_ttl: false,
+            block_checksums: false,
+        };
         let encoded = footer.encode();
+        assert_eq!(footer_version(&encoded), SST_FOOTER_VERSION_CURRENT);
         let decoded = Footer::decode(&encoded).unwrap();
         assert_eq!(decoded.index_block_offset, 10);
         assert_eq!(decoded.index_block_size, 20);
@@ -826,6 +863,44 @@ mod tests {
         assert!(decoded.filter_present);
         assert!(decoded.partitioned_index);
         assert!(!decoded.value_has_ttl);
+        assert!(!decoded.block_checksums);
+    }
+
+    #[test]
+    fn test_legacy_footer_without_checksums_is_supported() {
+        let footer = Footer {
+            index_block_offset: 10,
+            index_block_size: 20,
+            filter_block_offset: 30,
+            filter_block_size: 40,
+            filter_present: false,
+            partitioned_index: false,
+            value_has_ttl: true,
+            block_checksums: false,
+        };
+        let mut encoded = footer.encode().to_vec();
+        set_footer_version(&mut encoded, SST_FOOTER_VERSION_LEGACY);
+
+        let decoded = Footer::decode(&encoded).unwrap();
+        assert!(!decoded.block_checksums);
+    }
+
+    #[test]
+    fn test_legacy_footer_rejects_checksum_flag() {
+        let footer = Footer {
+            index_block_offset: 10,
+            index_block_size: 20,
+            filter_block_offset: 30,
+            filter_block_size: 40,
+            filter_present: false,
+            partitioned_index: false,
+            value_has_ttl: true,
+            block_checksums: true,
+        };
+        let mut encoded = footer.encode().to_vec();
+        set_footer_version(&mut encoded, SST_FOOTER_VERSION_LEGACY);
+
+        assert!(Footer::decode(&encoded).is_err());
     }
 
     #[test]

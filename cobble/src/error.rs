@@ -19,7 +19,7 @@ pub enum Error {
     InvalidState(String),
     #[error("File format error: {0}")]
     FileFormatError(String),
-    #[error("Metadata checksum error: {0}")]
+    #[error("Checksum error: {0}")]
     ChecksumMismatch(String),
     #[error("Cancelled error: {0}")]
     CancelledError(String),

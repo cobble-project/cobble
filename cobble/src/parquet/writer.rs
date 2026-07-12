@@ -301,7 +301,7 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
                 crate::cache::BlockCacheKind::ParquetData(length) => length as usize,
                 _ => continue,
             };
-            cache.push_preload(key, size, self.cache_current_row_group);
+            cache.push_preload(key, size, false, self.cache_current_row_group);
         }
         Ok(())
     }

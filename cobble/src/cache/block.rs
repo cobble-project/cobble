@@ -549,6 +549,7 @@ mod tests {
                     data_block_restart_interval: 16,
                     compression: crate::SstCompressionAlgorithm::None,
                     value_has_ttl: true,
+                    block_checksum_enabled: false,
                 },
             );
 

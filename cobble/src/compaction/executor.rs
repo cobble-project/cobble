@@ -1002,6 +1002,7 @@ mod tests {
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
+            block_checksum_enabled: false,
         });
         crate::metrics_registry::init_metrics();
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("compaction-success-test"));
@@ -1131,6 +1132,7 @@ mod tests {
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
+            block_checksum_enabled: false,
         });
         let task = CompactionTask::new(
             Arc::new(CompactionTaskMetrics::new("test")),
@@ -1238,6 +1240,7 @@ mod tests {
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
+            block_checksum_enabled: false,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
@@ -1407,6 +1410,7 @@ mod tests {
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
+            block_checksum_enabled: false,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
@@ -1516,6 +1520,7 @@ mod tests {
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
+            block_checksum_enabled: false,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
@@ -1605,6 +1610,7 @@ mod tests {
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
+            block_checksum_enabled: false,
         });
         let factory = crate::compaction::make_data_file_builder_factory(writer_options.clone());
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
@@ -1740,6 +1746,7 @@ mod tests {
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
+            block_checksum_enabled: false,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
@@ -1814,6 +1821,7 @@ mod tests {
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
+            block_checksum_enabled: false,
         });
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
