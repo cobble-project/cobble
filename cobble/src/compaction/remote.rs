@@ -197,6 +197,8 @@ struct RemoteSstOptions {
     partitioned_index: bool,
     data_block_restart_interval: usize,
     compression: crate::SstCompressionAlgorithm,
+    #[serde(default)]
+    block_checksum_enabled: bool,
 }
 
 impl RemoteSstOptions {
@@ -210,6 +212,7 @@ impl RemoteSstOptions {
             partitioned_index: options.partitioned_index,
             data_block_restart_interval: options.data_block_restart_interval,
             compression: options.compression,
+            block_checksum_enabled: options.block_checksum_enabled,
         }
     }
 
@@ -225,6 +228,7 @@ impl RemoteSstOptions {
             data_block_restart_interval: self.data_block_restart_interval,
             compression: self.compression,
             value_has_ttl: true,
+            block_checksum_enabled: self.block_checksum_enabled,
         }
     }
 }
@@ -2219,6 +2223,22 @@ mod tests {
             validate_protocol_compatibility("request", 2, 2, 2, 2).is_ok(),
             "a v2 peer against a v2 local is compatible by the rule (legacy behavior)"
         );
+    }
+
+    #[test]
+    fn test_remote_sst_options_default_missing_checksum_field_to_disabled() {
+        let sst: RemoteSstOptions = serde_json::from_value(serde_json::json!({
+            "block_size": 4096,
+            "buffer_size": 8192,
+            "num_columns": 1,
+            "bloom_filter_enabled": false,
+            "bloom_bits_per_key": 10,
+            "partitioned_index": false,
+            "data_block_restart_interval": 16,
+            "compression": "none"
+        }))
+        .unwrap();
+        assert!(!sst.block_checksum_enabled);
     }
 
     #[test]

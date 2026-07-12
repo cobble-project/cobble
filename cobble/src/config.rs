@@ -726,6 +726,9 @@ pub struct Config {
     pub sst_data_block_restart_interval: usize,
     /// Output data-file format used by flush/compaction writers.
     pub data_file_type: DataFileType,
+    /// Record CRC32 checksums for newly written SST data blocks.
+    /// Parquet page checksums are not currently supported.
+    pub block_checksum_enabled: bool,
     /// Target parquet row-group size in bytes when parquet output format is selected.
     pub parquet_row_group_size_bytes: Size,
     /// Compression algorithm per level (index by level number).
@@ -814,6 +817,7 @@ impl Default for Config {
             sst_partitioned_index: false,
             sst_data_block_restart_interval: 16,
             data_file_type: DataFileType::SSTable,
+            block_checksum_enabled: true,
             parquet_row_group_size_bytes: Size::from_kib(256),
             sst_compression_by_level: vec![
                 SstCompressionAlgorithm::None,
@@ -1343,6 +1347,7 @@ mod tests {
             sst_partitioned_index: true,
             sst_data_block_restart_interval: 32,
             data_file_type: DataFileType::Parquet,
+            block_checksum_enabled: false,
             parquet_row_group_size_bytes: Size::from_kib(4),
             sst_compression_by_level: vec![
                 SstCompressionAlgorithm::None,
@@ -1432,6 +1437,7 @@ mod tests {
             RemoteCompactionFailureMode::Skip
         );
         assert_eq!(decoded.data_file_type, DataFileType::Parquet);
+        assert!(!decoded.block_checksum_enabled);
         assert_eq!(decoded.parquet_row_group_size_bytes, Size::from_kib(4));
         assert_eq!(decoded.reader.block_cache_size, Size::from_kib(2));
         assert_eq!(decoded.reader.reload_tolerance_seconds, 5);
@@ -1710,6 +1716,7 @@ mod tests {
         assert_eq!(decoded.memtable_capacity, Size::from_kib(2));
         assert_eq!(decoded.num_columns, Config::default().num_columns);
         assert_eq!(decoded.data_file_type, Config::default().data_file_type);
+        assert!(decoded.block_checksum_enabled);
     }
 
     #[test]
@@ -1722,6 +1729,7 @@ mod tests {
         assert_eq!(decoded.memtable_capacity, Size::from_kib(2));
         assert_eq!(decoded.num_columns, Config::default().num_columns);
         assert_eq!(decoded.data_file_type, Config::default().data_file_type);
+        assert!(decoded.block_checksum_enabled);
         assert_eq!(decoded.governance_mode, Config::default().governance_mode);
     }
 

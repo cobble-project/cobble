@@ -55,6 +55,8 @@ pub struct SSTWriterOptions {
     pub compression: SstCompressionAlgorithm,
     /// Whether encoded values written to this SST include the 4-byte TTL header.
     pub value_has_ttl: bool,
+    /// Append a CRC32 trailer to every SST data block.
+    pub block_checksum_enabled: bool,
 }
 
 impl Default for SSTWriterOptions {
@@ -70,6 +72,7 @@ impl Default for SSTWriterOptions {
             data_block_restart_interval: 16,
             compression: SstCompressionAlgorithm::None,
             value_has_ttl: true,
+            block_checksum_enabled: true,
         }
     }
 }
@@ -222,7 +225,12 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         let raw_len = encoded.len();
 
         // Write the block
-        let size = write_block(&mut self.writer, encoded, self.options.compression)?;
+        let size = write_block(
+            &mut self.writer,
+            encoded,
+            self.options.compression,
+            self.options.block_checksum_enabled,
+        )?;
         self.record_block_cache_preload_if_hot(&first_key, offset as u64, size);
         self.record_compression_ratio(raw_len, size);
         self.cache_current_data_block = false;
@@ -272,6 +280,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         cache.push_preload(
             data_block_cache_key(namespace, output_file_id, offset),
             size,
+            self.options.block_checksum_enabled,
             self.cache_current_data_block,
         );
     }
@@ -322,15 +331,16 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
                 };
 
             // Write footer
-            let footer = Footer::new(
-                index_offset as u64,
-                index_size as u64,
-                filter_offset,
-                filter_size,
-                filter_enabled,
-                false,
-                self.options.value_has_ttl,
-            );
+            let footer = Footer {
+                index_block_offset: index_offset as u64,
+                index_block_size: index_size as u64,
+                filter_block_offset: filter_offset,
+                filter_block_size: filter_size,
+                filter_present: filter_enabled,
+                partitioned_index: false,
+                value_has_ttl: self.options.value_has_ttl,
+                block_checksums: self.options.block_checksum_enabled,
+            };
             let footer_encoded = footer.encode();
             let meta_bytes = footer_encoded.clone();
             self.writer.write(&footer_encoded)?;
@@ -437,15 +447,16 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         let filter_size = filter_index_size as u64;
 
         // Write footer
-        let footer = Footer::new(
-            index_top_offset as u64,
-            index_top_size as u64,
-            filter_offset,
-            filter_size,
-            filter_enabled,
-            self.options.partitioned_index,
-            self.options.value_has_ttl,
-        );
+        let footer = Footer {
+            index_block_offset: index_top_offset as u64,
+            index_block_size: index_top_size as u64,
+            filter_block_offset: filter_offset,
+            filter_block_size: filter_size,
+            filter_present: filter_enabled,
+            partitioned_index: self.options.partitioned_index,
+            value_has_ttl: self.options.value_has_ttl,
+            block_checksums: self.options.block_checksum_enabled,
+        };
         let footer_encoded = footer.encode();
         let meta_bytes = footer_encoded.clone();
         self.writer.write(&footer_encoded)?;
@@ -603,6 +614,7 @@ mod tests {
                 data_block_restart_interval: 16,
                 compression: crate::SstCompressionAlgorithm::None,
                 value_has_ttl: true,
+                block_checksum_enabled: false,
             },
         );
 

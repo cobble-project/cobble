@@ -2215,6 +2215,7 @@ fn make_sst_builder_factory(options: SSTWriterOptions) -> FileBuilderFactory {
                 data_block_restart_interval: options.data_block_restart_interval,
                 compression: options.compression,
                 value_has_ttl: options.value_has_ttl,
+                block_checksum_enabled: options.block_checksum_enabled,
             },
         )) as Box<dyn FileBuilder>
     })

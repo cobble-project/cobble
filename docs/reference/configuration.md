@@ -81,6 +81,7 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 | `sst_bloom_bits_per_key` | `u32` | 10 | Bits per key for bloom filter |
 | `sst_partitioned_index` | `bool` | `false` | Enable two-level partitioned index |
 | `sst_data_block_restart_interval` | `usize` | 16 | Restart interval in SST data blocks (`>1` enables prefix compression, `1` disables; range `1..=65535`) |
+| `block_checksum_enabled` | `bool` | `true` | Record CRC32 checksums for new SST data blocks; SST reads verify existing checksums automatically |
 | `sst_compression_by_level` | `Vec<SstCompressionAlgorithm>` | `[None, None, Lz4]` | Compression per level |
 
 ### Parquet
@@ -88,6 +89,10 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `parquet_row_group_size_bytes` | `Size` | `256KiB` | Row group size |
+
+Parquet page checksums are not currently supported. The upstream Rust Parquet writer does not yet
+write the standard optional page CRC field, and `block_checksum_enabled` therefore has no effect on
+Parquet output.
 
 ### Block Cache
 
