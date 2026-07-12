@@ -751,6 +751,10 @@ impl RemoteCompactionWorker {
         guard.as_ref().map(|runtime| runtime.handle().clone())
     }
 
+    pub(crate) fn compaction_metrics(&self) -> Arc<super::CompactionTaskMetrics> {
+        self.metrics_manager.compaction_metrics()
+    }
+
     /// Lazily fetches and caches the remote compactor's supported merge operator ids, then checks
     /// that every operator required by `required_ids` is supported.
     ///
@@ -944,6 +948,7 @@ impl CompactionWorker for RemoteCompactionWorker {
         let file_manager = Arc::clone(&self.file_manager);
         let address = self.address.clone();
         let remote_timeout = self.remote_timeout;
+        let compaction_metrics = self.metrics_manager.compaction_metrics();
         Some(handle.spawn_blocking(move || {
             let result = (|| -> Result<CompactionResult> {
                 let lsm_tree = worker_lsm_tree.upgrade().ok_or_else(|| {
@@ -957,6 +962,7 @@ impl CompactionWorker for RemoteCompactionWorker {
                     &file_manager,
                     &lsm_tree,
                     remote_timeout,
+                    &compaction_metrics,
                 ) {
                     RemoteCompactionOutcome::Succeeded(result) => Ok(result),
                     RemoteCompactionOutcome::Failed(failure) => Err(failure.into_error()),
@@ -1561,6 +1567,7 @@ fn send_compaction_request_to(
 /// - protocol incompatibility (`validate_protocol_compatibility`) is **permanent** — surfaced as
 ///   `Error::InvalidState` so a version mismatch is never masked by a local fallback;
 /// - connect/timeout/I/O failures and server-reported errors are **transient**.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_compaction_request(
     address: &str,
     request: RemoteCompactionRequest,
@@ -1569,6 +1576,7 @@ pub(crate) fn execute_compaction_request(
     file_manager: &Arc<FileManager>,
     lsm_tree: &Arc<LSMTree>,
     remote_timeout: Duration,
+    compaction_metrics: &super::CompactionTaskMetrics,
 ) -> RemoteCompactionOutcome {
     let output_level = request.output_level;
     let response = match send_compaction_request_to(address, request, remote_timeout) {
@@ -1595,6 +1603,10 @@ pub(crate) fn execute_compaction_request(
         };
     }
     let result = (|| -> Result<CompactionResult> {
+        let input_bytes = sorted_runs
+            .iter()
+            .flat_map(|run| run.files().iter())
+            .fold(0u64, |total, file| total.saturating_add(file.size as u64));
         let output_ids = file_manager.reserve_data_file_ids(response.output_files.len());
         let remote_to_local_file_ids = response
             .output_files
@@ -1610,6 +1622,9 @@ pub(crate) fn execute_compaction_request(
             .zip(output_ids)
             .map(|(file, file_id)| file.into_data_file(file_manager, file_id, false))
             .collect::<Result<Vec<_>>>()?;
+        let output_bytes = output_files
+            .iter()
+            .fold(0u64, |total, file| total.saturating_add(file.size as u64));
         if let Err(err) = file_manager.trigger_offload_if_needed() {
             warn!("remote compaction check-in offload trigger failed: {}", err);
         }
@@ -1624,6 +1639,9 @@ pub(crate) fn execute_compaction_request(
             lsm_tree.apply_edit(apply_tree_idx, edit.clone(), vlog_edit.clone());
             lsm_tree
                 .submit_block_cache_preload(Arc::clone(file_manager), preload_block_keys.clone());
+            compaction_metrics.record_read_bytes(input_bytes);
+            compaction_metrics.record_write_bytes(output_bytes);
+            compaction_metrics.record_completed();
         }
         Ok(CompactionResult::new(
             lsm_tree_idx,
@@ -1778,6 +1796,7 @@ mod tests {
     #[test]
     #[serial(file)]
     fn test_remote_compaction_roundtrip_multiple_files() {
+        crate::metrics_registry::init_metrics();
         let root = "/tmp/remote_compaction_roundtrip";
         cleanup_test_root(root);
         let config = Config {
@@ -1814,6 +1833,7 @@ mod tests {
 
         let file_a = create_test_sst(&file_manager, entries_a, sst_options.clone()).unwrap();
         let file_b = create_test_sst(&file_manager, entries_b, sst_options.clone()).unwrap();
+        let expected_input_bytes = (file_a.size as u64).saturating_add(file_b.size as u64);
 
         let lsm_version = LSMTreeVersion {
             levels: vec![
@@ -1847,6 +1867,8 @@ mod tests {
 
         let remote_timeout = Duration::from_millis(config.compaction_remote_timeout_ms);
         let server = Arc::new(RemoteCompactionServer::new(config.clone()).unwrap());
+        let server_metrics_db_id = server.metrics_manager.db_id().to_string();
+        assert_ne!(server_metrics_db_id, db_id);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server_thread = {
@@ -1890,8 +1912,12 @@ mod tests {
             )
             .expect("compaction handle");
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(handle).unwrap().unwrap();
+        let result = runtime.block_on(handle).unwrap().unwrap();
         let _ = server_thread.join();
+        let expected_output_bytes = result
+            .new_files()
+            .iter()
+            .fold(0u64, |total, file| total.saturating_add(file.size as u64));
 
         let level0 = lsm_tree.level_files(0);
         let level1 = lsm_tree.level_files(1);
@@ -1907,8 +1933,28 @@ mod tests {
                 .iter()
                 .all(|file| file.file_type == DataFileType::SSTable)
         );
+        assert_eq!(metric_counter(&db_id, "compactions_total"), 1);
+        assert_eq!(
+            metric_counter(&db_id, "compaction_read_bytes_total"),
+            expected_input_bytes
+        );
+        assert_eq!(
+            metric_counter(&db_id, "compaction_write_bytes_total"),
+            expected_output_bytes
+        );
 
         cleanup_test_root(root);
+    }
+
+    fn metric_counter(db_id: &str, name: &str) -> u64 {
+        crate::metrics_registry::snapshot_metrics(Some(db_id))
+            .into_iter()
+            .find(|sample| sample.name == name)
+            .and_then(|sample| match sample.value {
+                crate::MetricValue::Counter(value) => Some(value),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     #[test]

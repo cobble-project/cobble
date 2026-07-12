@@ -2298,7 +2298,7 @@ fn test_db_metrics_list() {
         memtable_capacity: Size::from_const(128),
         memtable_buffer_count: 2,
         num_columns: 1,
-        block_cache_size: Size::from_const(0),
+        block_cache_size: Size::from_const(1024),
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -2340,6 +2340,32 @@ fn test_db_metrics_list() {
             _ => panic!("expected counter"),
         }
     }
+
+    let storage_bytes = metrics.iter().find(|sample| {
+        sample.name == "storage_file_bytes"
+            && matches_db(&sample.labels)
+            && sample
+                .labels
+                .iter()
+                .any(|(key, value)| key == "volume" && value == "0")
+    });
+    assert!(matches!(
+        storage_bytes.map(|sample| &sample.value),
+        Some(MetricValue::Gauge(_))
+    ));
+
+    let cache_usage = metrics.iter().find(|sample| {
+        sample.name == "block_cache_usage_bytes"
+            && matches_db(&sample.labels)
+            && sample
+                .labels
+                .iter()
+                .any(|(key, value)| key == "kind" && value == "data")
+    });
+    assert!(matches!(
+        cache_usage.map(|sample| &sample.value),
+        Some(MetricValue::Gauge(_))
+    ));
 
     cleanup_test_root(root);
 }

@@ -70,6 +70,7 @@ pub struct CompactionTask {
 
 #[derive(Clone)]
 pub(crate) struct CompactionTaskMetrics {
+    completed_total: Counter,
     read_bytes_total: Counter,
     write_bytes_total: Counter,
 }
@@ -78,9 +79,22 @@ impl CompactionTaskMetrics {
     pub(crate) fn new(db_id: &str) -> Self {
         let db_id = db_id.to_string();
         Self {
+            completed_total: counter!("compactions_total", "db_id" => db_id.clone()),
             read_bytes_total: counter!("compaction_read_bytes_total", "db_id" => db_id.clone()),
             write_bytes_total: counter!("compaction_write_bytes_total", "db_id" => db_id),
         }
+    }
+
+    pub(crate) fn record_completed(&self) {
+        self.completed_total.increment(1);
+    }
+
+    pub(crate) fn record_read_bytes(&self, bytes: u64) {
+        self.read_bytes_total.increment(bytes);
+    }
+
+    pub(crate) fn record_write_bytes(&self, bytes: u64) {
+        self.write_bytes_total.increment(bytes);
     }
 }
 
@@ -516,7 +530,7 @@ impl CompactionExecutor {
             });
             all_iters.push(Box::new(run_iter));
         }
-        task.metrics.read_bytes_total.increment(read_bytes);
+        task.metrics.record_read_bytes(read_bytes);
 
         // Create merging iterator
         let merging_iter = MergingIterator::new(all_iters);
@@ -710,7 +724,7 @@ impl CompactionExecutor {
             output_files.push(Arc::new(data_file));
             written_bytes = written_bytes.saturating_add(file_size as u64);
         }
-        task.metrics.write_bytes_total.increment(written_bytes);
+        task.metrics.record_write_bytes(written_bytes);
 
         // Create version edits
         let mut level_edits: std::collections::BTreeMap<u8, LevelEdit> =
@@ -767,6 +781,7 @@ impl CompactionExecutor {
                 task.file_manager.make_data_file_readonly(file.file_id)?;
             }
         }
+        task.metrics.record_completed();
         Ok(CompactionResult::new(
             task.lsm_tree_idx,
             output_files,
@@ -988,7 +1003,8 @@ mod tests {
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
         });
-        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        crate::metrics_registry::init_metrics();
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("compaction-success-test"));
         let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
         let task = CompactionTask::new(
             compaction_metrics,
@@ -1017,6 +1033,11 @@ mod tests {
 
         // Verify output
         assert!(!result.new_files().is_empty());
+        let completed = crate::metrics_registry::snapshot_metrics(Some("compaction-success-test"))
+            .into_iter()
+            .find(|sample| sample.name == "compactions_total")
+            .expect("successful compaction must increment its completion counter");
+        assert_eq!(completed.value, crate::MetricValue::Counter(1));
 
         // Verify first file has correct key range
         let first_file = &result.new_files()[0];
