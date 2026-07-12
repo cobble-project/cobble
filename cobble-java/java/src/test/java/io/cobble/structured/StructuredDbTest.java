@@ -3,6 +3,7 @@ package io.cobble.structured;
 import io.cobble.Config;
 import io.cobble.DbCoordinator;
 import io.cobble.GlobalSnapshot;
+import io.cobble.MetricSample;
 import io.cobble.ShardSnapshot;
 
 import org.junit.jupiter.api.Test;
@@ -22,6 +23,18 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 class StructuredDbTest {
+
+    @Test
+    void forwardsNativeMetricsFromInnerDb() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-metrics-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            List<MetricSample> metrics = db.metrics();
+            assertFalse(metrics.isEmpty());
+            assertNotNull(metrics.get(0).value());
+        }
+    }
 
     @Test
     void typedBytesAndListPutGetRoundTrip() throws IOException {

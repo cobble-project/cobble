@@ -1112,6 +1112,11 @@ impl StructuredDb {
         self.db.id()
     }
 
+    /// Returns the native Cobble metric samples for this structured database.
+    pub fn metrics(&self) -> Vec<cobble::MetricSample> {
+        self.db.metrics()
+    }
+
     pub fn current_schema(&self) -> StructuredSchema {
         self.structured_schema.as_ref().clone()
     }
