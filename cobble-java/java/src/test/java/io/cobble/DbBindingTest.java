@@ -23,6 +23,25 @@ import java.util.concurrent.ExecutionException;
 import static org.junit.jupiter.api.Assertions.*;
 
 class DbBindingTest {
+
+    @Test
+    void nativeMetricsAreExposedAsTypedImmutableSamples() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-metrics-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            List<MetricSample> metrics = db.metrics();
+            assertFalse(metrics.isEmpty());
+            MetricSample sample = metrics.get(0);
+            assertNotNull(sample.name());
+            assertNotNull(sample.type());
+            assertNotNull(sample.value());
+            assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> sample.labels().put("unexpected", "value"));
+        }
+    }
+
     @Test
     void dbBulkReadWriteWithConfigJson() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-db-json-");

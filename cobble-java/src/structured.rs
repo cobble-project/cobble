@@ -4,6 +4,7 @@
 // Typed get returns Object[] where each element is null | byte[] | byte[][].
 // Typed scan cursor yields structured batches with mixed column types.
 
+use crate::metrics::metrics_json;
 use crate::structured_read_options::structured_read_options_from_handle_or_throw;
 use crate::structured_scan_options::{
     decode_structured_scan_open_bounds_args, decode_structured_scan_open_direct_bounds_args,
@@ -219,6 +220,18 @@ pub extern "system" fn Java_io_cobble_structured_Db_directBufferPoolConfig(
         }
     };
     direct_buffer_pool_config_array(&mut env, buffer_size_bytes, pool_size)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_metricsJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jstring {
+    let Some(db) = db_from_handle(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    to_java_string_or_throw(&mut env, metrics_json(db.metrics()))
 }
 
 pub(crate) fn direct_buffer_pool_config_array(

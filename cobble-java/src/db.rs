@@ -1,3 +1,4 @@
+use crate::metrics::metrics_json;
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{ScanCursorHandle, decode_scan_open_bounds_args};
 use crate::util::{
@@ -442,6 +443,18 @@ pub extern "system" fn Java_io_cobble_Db_directBufferPoolConfig(
         }
     };
     direct_buffer_pool_config_array(&mut env, buffer_size_bytes, pool_size)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_metricsJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jstring {
+    let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    to_java_string_or_throw(&mut env, metrics_json(db.metrics()))
 }
 
 #[unsafe(no_mangle)]

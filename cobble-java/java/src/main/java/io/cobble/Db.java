@@ -2,6 +2,7 @@ package io.cobble;
 
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -892,6 +893,11 @@ public final class Db extends NativeObject {
         return id(nativeHandle);
     }
 
+    /** Returns an immutable snapshot of the native Cobble metrics for this DB. */
+    public List<MetricSample> metrics() {
+        return parseMetricSamples(metricsJson(nativeHandle));
+    }
+
     /**
      * Return current time in seconds from the DB's time provider.
      *
@@ -1110,6 +1116,8 @@ public final class Db extends NativeObject {
     private static native void setTime(long nativeHandle, int nextSeconds);
 
     private static native String id(long nativeHandle);
+
+    private static native String metricsJson(long nativeHandle);
 
     private static native int nowSeconds(long nativeHandle);
 
