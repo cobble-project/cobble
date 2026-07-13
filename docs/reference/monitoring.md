@@ -1,10 +1,12 @@
 ---
 title: Monitoring
 parent: Reference
-nav_order: 4
+nav_order: 5
 ---
 
 # Monitoring
+
+For operational counters, gauges, and histograms, see the [Metrics reference](metrics).
 
 The `cobble-web-monitor` crate provides an embeddable HTTP server with a web dashboard for inspecting Cobble databases. It is designed for development, debugging, and operational visibility — point it at a database path and browse its contents through a browser or API client.
 
