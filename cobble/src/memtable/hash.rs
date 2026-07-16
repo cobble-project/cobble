@@ -22,6 +22,7 @@ pub(crate) struct HashMemtable {
     index_cursor: usize,
     bucket_base: usize,
     bucket_count: usize,
+    entry_count: usize,
     reclaimer: Option<MemtableReclaimer>,
 }
 
@@ -38,9 +39,18 @@ impl HashMemtable {
         Self::with_capacity_and_buckets(capacity, bucket_count)
     }
 
-    pub(crate) fn with_buffer(mut buffer: Vec<u8>) -> Self {
+    pub(crate) fn with_buffer_and_bucket_count_and_reclaimer(
+        buffer: Vec<u8>,
+        bucket_count: usize,
+        reclaimer: MemtableReclaimer,
+    ) -> Self {
+        let mut memtable = Self::with_buffer_and_bucket_count(buffer, bucket_count);
+        memtable.reclaimer = Some(reclaimer);
+        memtable
+    }
+
+    fn with_buffer_and_bucket_count(mut buffer: Vec<u8>, bucket_count: usize) -> Self {
         let capacity = buffer.len();
-        let bucket_count = Self::default_bucket_count(capacity);
         let bucket_count = bucket_count.max(1);
         let bucket_table_bytes = bucket_count * 4;
         assert!(
@@ -55,14 +65,9 @@ impl HashMemtable {
             index_cursor: bucket_base,
             bucket_base,
             bucket_count,
+            entry_count: 0,
             reclaimer: None,
         }
-    }
-
-    pub(crate) fn with_buffer_and_reclaimer(buffer: Vec<u8>, reclaimer: MemtableReclaimer) -> Self {
-        let mut memtable = Self::with_buffer(buffer);
-        memtable.reclaimer = Some(reclaimer);
-        memtable
     }
 
     fn with_capacity_and_buckets(capacity: usize, bucket_count: usize) -> Self {
@@ -81,15 +86,38 @@ impl HashMemtable {
             index_cursor: bucket_base,
             bucket_base,
             bucket_count,
+            entry_count: 0,
             reclaimer: None,
         }
     }
 
-    fn default_bucket_count(capacity: usize) -> usize {
+    pub(crate) fn default_bucket_count(capacity: usize) -> usize {
         // Keep the average chain short as the memtable grows. A fixed upper bound makes point
         // lookups effectively linear once a large memtable contains substantially more entries
         // than buckets. The bucket table remains bounded to roughly 3% of the configured capacity.
-        (capacity / 128).max(4)
+        Self::clamp_bucket_count(capacity, (capacity / 128).max(4))
+    }
+
+    pub(crate) fn clamp_bucket_count(capacity: usize, bucket_count: usize) -> usize {
+        let (min_bucket_count, max_bucket_count) = Self::bucket_count_bounds(capacity);
+        bucket_count.clamp(min_bucket_count, max_bucket_count)
+    }
+
+    fn bucket_count_bounds(capacity: usize) -> (usize, usize) {
+        assert!(capacity > 4, "capacity must leave room for a bucket table");
+        (1, (capacity - 1) / 4)
+    }
+
+    pub(crate) fn bucket_count(&self) -> usize {
+        self.bucket_count
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    pub(crate) fn used_entry_bytes(&self) -> usize {
+        self.data_end + (self.bucket_base - self.index_cursor)
     }
 
     fn init_bucket_table(buffer: &mut [u8], bucket_base: usize) {
@@ -173,7 +201,7 @@ impl HashMemtable {
         slice.put_u32_le(head);
     }
 
-    fn write_index(&mut self, bucket: usize, hash: u64, key_offset: u32) -> u32 {
+    fn install_index(&mut self, bucket: usize, hash: u64, key_offset: u32) {
         let entry_size = Self::index_entry_size();
         let start = self.index_cursor - entry_size;
         let head = self.bucket_head(bucket);
@@ -184,7 +212,8 @@ impl HashMemtable {
             slice.put_u32(head);
         }
         self.index_cursor = start;
-        start as u32
+        self.set_bucket_head(bucket, start as u32);
+        self.entry_count += 1;
     }
 
     fn bucket_index_from_hash(&self, hash: u64) -> usize {
@@ -235,8 +264,7 @@ impl Memtable for HashMemtable {
         let data_offset = self.write_data(key, value);
         let hash = Self::hash_key(key);
         let bucket = self.bucket_index_from_hash(hash);
-        let node_off = self.write_index(bucket, hash, data_offset as u32);
-        self.set_bucket_head(bucket, node_off);
+        self.install_index(bucket, hash, data_offset as u32);
         Ok(())
     }
 
@@ -254,8 +282,7 @@ impl Memtable for HashMemtable {
             self.write_data_ref(key, value, num_columns, key_len, value_len);
         let hash = Self::hash_key(&self.buffer[key_offset..key_offset + key_len]);
         let bucket = self.bucket_index_from_hash(hash);
-        let node_off = self.write_index(bucket, hash, data_offset as u32);
-        self.set_bucket_head(bucket, node_off);
+        self.install_index(bucket, hash, data_offset as u32);
         Ok(())
     }
 
@@ -433,6 +460,33 @@ mod tests {
         assert_eq!(mem.get(b"key1").unwrap(), b"v1");
         assert_eq!(mem.get(b"key2").unwrap(), b"v2");
         assert_eq!(mem.get(b"key3").unwrap(), b"v3");
+    }
+
+    #[test]
+    fn entry_stats_count_successful_writes_including_duplicate_keys() {
+        let mut mem = HashMemtable::with_capacity_and_buckets(128, 1);
+        assert_eq!(mem.entry_count(), 0);
+        assert_eq!(mem.used_entry_bytes(), 0);
+
+        mem.put(b"key", b"value").unwrap();
+        let entry_bytes = HashMemtable::entry_size(3, 5) + HashMemtable::index_entry_size();
+        assert_eq!(mem.entry_count(), 1);
+        assert_eq!(mem.used_entry_bytes(), entry_bytes);
+
+        mem.put(b"key", b"value").unwrap();
+        assert_eq!(mem.entry_count(), 2);
+        assert_eq!(mem.used_entry_bytes(), entry_bytes * 2);
+
+        let mut full_mem = HashMemtable::with_capacity_and_buckets(64, 1);
+        full_mem.put(b"k", b"v").unwrap();
+        let entry_count = full_mem.entry_count();
+        let used_entry_bytes = full_mem.used_entry_bytes();
+        assert!(matches!(
+            full_mem.put(b"k", &[b'x'; 32]),
+            Err(Error::MemtableFull { .. })
+        ));
+        assert_eq!(full_mem.entry_count(), entry_count);
+        assert_eq!(full_mem.used_entry_bytes(), used_entry_bytes);
     }
 
     #[test]
