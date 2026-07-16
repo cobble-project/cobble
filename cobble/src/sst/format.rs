@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::file::SequentialWriteFile;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::sync::Arc;
 
 /// Magic number at the end of SST file for validation
 const SST_FILE_MAGIC: u32 = 0x53535431; // "SST1"
@@ -111,6 +112,72 @@ impl Footer {
             value_has_ttl: (flags & FOOTER_FLAG_VALUE_WITHOUT_TTL) == 0,
             block_checksums,
         })
+    }
+}
+
+/// Immutable SST read metadata shared by iterators for one DataFile.
+///
+/// This deliberately excludes decoded blocks and bloom filters. Those remain
+/// owned by the existing block cache and retain its eviction behavior.
+#[derive(Debug)]
+pub(crate) struct SstReadMetadata {
+    footer: Footer,
+    index_partitions: Arc<[(u64, u64)]>,
+}
+
+impl SstReadMetadata {
+    pub(crate) fn from_index_block(footer: Footer, index_block: &Block) -> Result<Self> {
+        let mut index_partitions = Vec::with_capacity(index_block.offsets_len());
+        if footer.partitioned_index {
+            for idx in 0..index_block.offsets_len() {
+                let value = index_block.value(idx)?;
+                if value.len() != 16 {
+                    return Err(Error::IoError("Invalid index partition entry".to_string()));
+                }
+                let offset = u64::from_le_bytes(value[0..8].try_into().unwrap());
+                let size = u64::from_le_bytes(value[8..16].try_into().unwrap());
+                if size == 0 {
+                    return Err(Error::IoError("Index partition size is zero".to_string()));
+                }
+                index_partitions.push((offset, size));
+            }
+        } else if footer.index_block_size > 0 {
+            index_partitions.push((footer.index_block_offset, footer.index_block_size));
+        } else {
+            return Err(Error::IoError("Index block size is zero".to_string()));
+        }
+
+        Self::from_parts(footer, index_partitions)
+    }
+
+    pub(crate) fn from_parts(footer: Footer, index_partitions: Vec<(u64, u64)>) -> Result<Self> {
+        if index_partitions.is_empty() {
+            return Err(Error::IoError("SST index has no partitions".to_string()));
+        }
+        if index_partitions.iter().any(|(_, size)| *size == 0) {
+            return Err(Error::IoError("Index partition size is zero".to_string()));
+        }
+        if !footer.partitioned_index
+            && (index_partitions.len() != 1
+                || index_partitions[0] != (footer.index_block_offset, footer.index_block_size))
+        {
+            return Err(Error::IoError(
+                "Unpartitioned SST index metadata does not match footer".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            footer,
+            index_partitions: index_partitions.into(),
+        })
+    }
+
+    pub(crate) fn footer(&self) -> &Footer {
+        &self.footer
+    }
+
+    pub(crate) fn index_partitions(&self) -> Arc<[(u64, u64)]> {
+        Arc::clone(&self.index_partitions)
     }
 }
 
@@ -839,6 +906,24 @@ mod tests {
         assert!(!decoded.partitioned_index);
         assert!(decoded.value_has_ttl);
         assert!(decoded.block_checksums);
+    }
+
+    #[test]
+    fn test_sst_read_metadata_rejects_zero_sized_unpartitioned_index() {
+        let mut builder = BlockBuilder::new(1024);
+        builder.add(b"key", b"value");
+        let footer = Footer {
+            index_block_offset: 0,
+            index_block_size: 0,
+            filter_block_offset: 0,
+            filter_block_size: 0,
+            filter_present: false,
+            partitioned_index: false,
+            value_has_ttl: true,
+            block_checksums: false,
+        };
+
+        assert!(SstReadMetadata::from_index_block(footer, &builder.build()).is_err());
     }
 
     #[test]

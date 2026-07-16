@@ -25,6 +25,14 @@ import static org.junit.jupiter.api.Assertions.*;
 class DbBindingTest {
 
     @Test
+    void configSerializesSstReadMetadataCacheMode() {
+        Config config = new Config();
+        config.sstReadMetadataCacheMode = Config.SstReadMetadataCacheMode.LAZY;
+
+        assertTrue(config.toJson().contains("\"sst_read_metadata_cache_mode\":\"lazy\""));
+    }
+
+    @Test
     void nativeMetricsAreExposedAsTypedImmutableSamples() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-metrics-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);

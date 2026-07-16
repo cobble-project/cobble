@@ -1047,6 +1047,7 @@ mod tests {
                     bloom_filter_enabled: true,
                     bloom_bits_per_key: 10,
                     partitioned_index: false,
+                    read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
                     data_block_restart_interval: 16,
                     compression: crate::SstCompressionAlgorithm::None,
                     value_has_ttl: true,

@@ -130,6 +130,7 @@ All capacity/size fields in `Config` (such as `memtable_capacity`, `l1_base_byte
 | `sst_bloom_filter_enabled` | `false` | Enable bloom filters for point lookups |
 | `sst_bloom_bits_per_key` | 10 | Bits per key for bloom filters |
 | `sst_partitioned_index` | `false` | Enable two-level index for large files |
+| `sst_read_metadata_cache_mode` | `Eager` | Cache decoded SST metadata eagerly, lazily on first read, or not at all |
 | `block_checksum_enabled` | `true` | Record CRC32 checksums for new SST data blocks; SST reads verify checksums automatically |
 | `sst_compression_by_level` | `[None, None, Lz4]` | Compression algorithm per level |
 | `parquet_row_group_size_bytes` | 256 KB | Parquet row group size |

@@ -1,4 +1,4 @@
-use crate::config::CompactionPolicyKind;
+use crate::config::{CompactionPolicyKind, SstReadMetadataCacheMode};
 use crate::data_file::DataFile;
 use crate::data_file::DataFileType;
 use crate::db_state::{LSMTreeScope, TruncationCursorMap};
@@ -26,6 +26,7 @@ pub(crate) struct CompactionConfig {
     pub(crate) bloom_filter_enabled: bool,
     pub(crate) bloom_bits_per_key: u32,
     pub(crate) partitioned_index: bool,
+    pub(crate) read_metadata_cache_mode: SstReadMetadataCacheMode,
     pub(crate) max_threads: usize,
     pub(crate) split_trigger_level: Option<u8>,
     pub(crate) output_file_type: DataFileType,
@@ -48,6 +49,7 @@ impl Default for CompactionConfig {
             bloom_filter_enabled: false,
             bloom_bits_per_key: 10,
             partitioned_index: false,
+            read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
             max_threads: 4,
             split_trigger_level: None,
             output_file_type: DataFileType::SSTable,

@@ -3,7 +3,6 @@
 //! and the `RemoteCompactionServer` listens for incoming compaction requests
 //! executes them using a local `CompactionExecutor`, and returns the results back to the worker.
 use super::{CompactionExecutor, CompactionResult, CompactionTask, CompactionWorker};
-use crate::Config;
 use crate::cache::{
     BlockCacheKey, BlockCachePreload, ScanHotBlockRegistry, cache_namespace_for_db_id,
 };
@@ -27,6 +26,7 @@ use crate::ttl::{TTLProvider, TtlConfig};
 use crate::util::{build_commit_short_id, build_version_string, init_logging};
 use crate::vlog::VlogEdit;
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
+use crate::{Config, SstReadMetadataCacheMode};
 use bytes::Bytes;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -195,6 +195,8 @@ struct RemoteSstOptions {
     bloom_filter_enabled: bool,
     bloom_bits_per_key: u32,
     partitioned_index: bool,
+    #[serde(default)]
+    read_metadata_cache_mode: SstReadMetadataCacheMode,
     data_block_restart_interval: usize,
     compression: crate::SstCompressionAlgorithm,
     #[serde(default)]
@@ -210,6 +212,7 @@ impl RemoteSstOptions {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            read_metadata_cache_mode: options.read_metadata_cache_mode,
             data_block_restart_interval: options.data_block_restart_interval,
             compression: options.compression,
             block_checksum_enabled: options.block_checksum_enabled,
@@ -225,6 +228,7 @@ impl RemoteSstOptions {
             bloom_filter_enabled: self.bloom_filter_enabled,
             bloom_bits_per_key: self.bloom_bits_per_key,
             partitioned_index: self.partitioned_index,
+            read_metadata_cache_mode: self.read_metadata_cache_mode,
             data_block_restart_interval: self.data_block_restart_interval,
             compression: self.compression,
             value_has_ttl: true,
@@ -1673,6 +1677,7 @@ mod tests {
     use crate::compaction::{build_sst_writer_options, make_data_file_builder_factory};
     use crate::db_state::{DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion};
     use crate::file::RandomAccessFile;
+    use crate::format::FileBuildResult;
     use crate::lsm::{LSMTree, LSMTreeVersion, Level};
     use crate::parquet::{ParquetIterator, RandomAccessChunkReader, parquet_row_group_cache_keys};
     use crate::sst::row_codec::{decode_value, encode_key, encode_value};
@@ -1728,7 +1733,13 @@ mod tests {
             writer.add(&key, &value)?;
         }
 
-        let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
+        let FileBuildResult {
+            first_key,
+            last_key,
+            file_size,
+            meta_bytes,
+            sst_read_metadata,
+        } = writer.finish_with_range()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
         let data_file = DataFile::new(
             DataFileType::SSTable,
@@ -1741,7 +1752,10 @@ mod tests {
             bucket_range.clone(),
             bucket_range,
         );
-        data_file.set_meta_bytes(footer_bytes);
+        data_file.set_meta_bytes(meta_bytes);
+        if let Some(metadata) = sst_read_metadata {
+            data_file.set_sst_read_metadata(metadata);
+        }
         Ok(Arc::new(data_file))
     }
 
@@ -1760,7 +1774,13 @@ mod tests {
         for (key, value) in entries {
             writer.add(&key, &KvValue::Encoded(Bytes::from(value)))?;
         }
-        let (first_key, last_key, file_size, footer_bytes) = writer.finish()?;
+        let FileBuildResult {
+            first_key,
+            last_key,
+            file_size,
+            meta_bytes,
+            ..
+        } = writer.finish()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
         let data_file = DataFile::new(
             DataFileType::Parquet,
@@ -1773,7 +1793,7 @@ mod tests {
             bucket_range.clone(),
             bucket_range,
         );
-        data_file.set_meta_bytes(footer_bytes);
+        data_file.set_meta_bytes(meta_bytes);
         Ok(Arc::new(data_file))
     }
 
@@ -2239,6 +2259,10 @@ mod tests {
         }))
         .unwrap();
         assert!(!sst.block_checksum_enabled);
+        assert_eq!(
+            sst.read_metadata_cache_mode,
+            SstReadMetadataCacheMode::Eager
+        );
     }
 
     #[test]

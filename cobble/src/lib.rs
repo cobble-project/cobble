@@ -136,8 +136,8 @@ mod writer_options;
 pub use compaction::RemoteCompactionServer;
 pub use config::{
     CompactionPolicyKind, Config, GovernanceMode, MemtableType, PrimaryVolumeOffloadPolicyKind,
-    ReadOptions, RemoteCompactionFailureMode, ScanOptions, VolumeDescriptor, VolumeUsageKind,
-    WriteOptions,
+    ReadOptions, RemoteCompactionFailureMode, ScanOptions, SstReadMetadataCacheMode,
+    VolumeDescriptor, VolumeUsageKind, WriteOptions,
 };
 pub use coordinator::{
     CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef,

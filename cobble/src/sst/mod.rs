@@ -6,6 +6,7 @@ pub(crate) mod row_codec;
 pub(crate) mod writer;
 
 pub use compression::SstCompressionAlgorithm;
+pub(crate) use format::SstReadMetadata;
 pub(crate) use iterator::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 #[allow(unused_imports)]
 pub(crate) use writer::{SSTWriter, SSTWriterMetrics, SSTWriterOptions};

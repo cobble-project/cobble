@@ -96,6 +96,9 @@ public final class Config {
     /** Whether SST partitioned index/filter blocks are enabled. */
     public Boolean sstPartitionedIndex;
 
+    /** Caching policy for decoded SST footer and index-partition metadata. */
+    public SstReadMetadataCacheMode sstReadMetadataCacheMode;
+
     /** Data-file format for flush/compaction output. */
     public DataFileType dataFileType;
 
@@ -259,6 +262,15 @@ public final class Config {
         MIN_OVERLAP,
         @SerializedName("score_priority")
         SCORE_PRIORITY
+    }
+
+    public enum SstReadMetadataCacheMode {
+        @SerializedName("eager")
+        EAGER,
+        @SerializedName("lazy")
+        LAZY,
+        @SerializedName("off")
+        OFF
     }
 
     public enum RemoteCompactionFailureMode {

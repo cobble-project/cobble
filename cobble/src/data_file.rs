@@ -1,4 +1,5 @@
 use crate::file::{FileId, TrackedFileId};
+use crate::sst::SstReadMetadata;
 use crate::r#type::key_bucket;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,8 @@ pub struct DataFile {
     pub snapshot_data_file: Mutex<Option<Arc<TrackedFileId>>>,
     /// Optional cached meta bytes to avoid re-reading from disk.
     pub meta_bytes: OnceLock<Bytes>,
+    /// Decoded SST footer and index partition descriptors for this immutable file.
+    pub(crate) sst_read_metadata: OnceLock<Arc<SstReadMetadata>>,
 }
 
 impl DataFile {
@@ -97,6 +100,7 @@ impl DataFile {
             has_separated_values: false,
             snapshot_data_file: Default::default(),
             meta_bytes: Default::default(),
+            sst_read_metadata: Default::default(),
         }
     }
 
@@ -131,6 +135,7 @@ impl DataFile {
                     .clone(),
             ),
             meta_bytes: Default::default(),
+            sst_read_metadata: Default::default(),
         };
         data_file.copy_meta_from(self);
         data_file
@@ -173,10 +178,13 @@ impl DataFile {
         self
     }
 
-    /// Copy meta_bytes from another DataFile if present.
+    /// Copy cached immutable file metadata from another handle for the same physical file.
     pub(crate) fn copy_meta_from(&self, source: &DataFile) {
         if let Some(meta_bytes) = source.meta_bytes() {
             self.set_meta_bytes(meta_bytes);
+        }
+        if let Some(metadata) = source.sst_read_metadata() {
+            self.set_sst_read_metadata(metadata);
         }
     }
 
@@ -191,6 +199,14 @@ impl DataFile {
 
     pub fn set_meta_bytes(&self, bytes: Bytes) {
         let _ = self.meta_bytes.set(bytes);
+    }
+
+    pub(crate) fn sst_read_metadata(&self) -> Option<Arc<SstReadMetadata>> {
+        self.sst_read_metadata.get().cloned()
+    }
+
+    pub(crate) fn set_sst_read_metadata(&self, metadata: Arc<SstReadMetadata>) {
+        let _ = self.sst_read_metadata.set(metadata);
     }
 
     pub fn has_separated_values(&self) -> bool {

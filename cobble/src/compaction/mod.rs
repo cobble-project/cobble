@@ -263,6 +263,7 @@ pub(crate) fn build_sst_writer_options(
         bloom_filter_enabled: config.sst_bloom_filter_enabled,
         bloom_bits_per_key: config.sst_bloom_bits_per_key,
         partitioned_index: config.sst_partitioned_index,
+        read_metadata_cache_mode: config.sst_read_metadata_cache_mode,
         data_block_restart_interval: config.sst_data_block_restart_interval,
         compression: config.sst_compression_for_level(level),
         block_checksum_enabled: config.block_checksum_enabled,
@@ -301,6 +302,7 @@ pub(crate) fn build_compaction_config(
         bloom_filter_enabled: config.sst_bloom_filter_enabled,
         bloom_bits_per_key: config.sst_bloom_bits_per_key,
         partitioned_index: config.sst_partitioned_index,
+        read_metadata_cache_mode: config.sst_read_metadata_cache_mode,
         read_ahead_enabled: config.compaction_read_ahead_enabled,
         max_threads: config.compaction_threads,
         split_trigger_level: config.lsm_split_trigger_level,
@@ -315,6 +317,7 @@ mod tests {
     use crate::VolumeDescriptor;
     use crate::data_file::DataFile;
     use crate::db_state::{DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion};
+    use crate::format::FileBuildResult;
     use crate::iterator::SortedRun;
     use crate::lsm::{LSMTree, LSMTreeVersion, Level};
     use crate::metrics_manager::MetricsManager;
@@ -355,7 +358,13 @@ mod tests {
         for (key, value) in entries {
             writer.add(&key, &value)?;
         }
-        let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
+        let FileBuildResult {
+            first_key,
+            last_key,
+            file_size,
+            meta_bytes,
+            sst_read_metadata,
+        } = writer.finish_with_range()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
         let data_file = DataFile::new(
             crate::data_file::DataFileType::SSTable,
@@ -368,7 +377,10 @@ mod tests {
             bucket_range.clone(),
             bucket_range,
         );
-        data_file.set_meta_bytes(footer_bytes);
+        data_file.set_meta_bytes(meta_bytes);
+        if let Some(metadata) = sst_read_metadata {
+            data_file.set_sst_read_metadata(metadata);
+        }
         Ok(Arc::new(data_file))
     }
 
