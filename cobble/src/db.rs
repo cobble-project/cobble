@@ -1158,24 +1158,34 @@ impl Db {
                 Ok(())
             },
         )?;
-        let mut should_stop =
-            num_columns > 1 && values.last().is_some_and(|value| value.is_terminal());
-        let lsm_values = self.lsm_tree.get_with_snapshot(
-            &self.file_manager,
-            Arc::clone(&snapshot),
-            bucket,
-            encoded_key.as_ref(),
-            schema.as_ref(),
-            self.schema_manager.as_ref(),
-            selected_columns,
-            selected_mask,
-            terminal_mask.as_deref_mut(),
-        );
-        let lsm_values = match lsm_values {
-            Ok(values) => values,
-            Err(err) => {
-                self.maybe_mark_error_on_read(&err);
-                return Err(err);
+        // A terminal value in a single-column memtable cuts off every older LSM value. This is
+        // the common state-backend point-lookup path, where probing the LSM after a recent put or
+        // delete is both unnecessary and expensive. Multi-column reads keep using the per-column
+        // terminal mask below.
+        let mut should_stop = if num_columns == 1 {
+            values.iter().any(Value::is_terminal)
+        } else {
+            values.last().is_some_and(|value| value.is_terminal())
+        };
+        let lsm_values = if should_stop {
+            Vec::new()
+        } else {
+            match self.lsm_tree.get_with_snapshot(
+                &self.file_manager,
+                Arc::clone(&snapshot),
+                bucket,
+                encoded_key.as_ref(),
+                schema.as_ref(),
+                self.schema_manager.as_ref(),
+                selected_columns,
+                selected_mask,
+                terminal_mask.as_deref_mut(),
+            ) {
+                Ok(values) => values,
+                Err(err) => {
+                    self.maybe_mark_error_on_read(&err);
+                    return Err(err);
+                }
             }
         };
         for value in lsm_values {
