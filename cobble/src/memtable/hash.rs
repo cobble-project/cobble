@@ -28,8 +28,8 @@ pub(crate) struct HashMemtable {
 pub(crate) struct MemtableValueIter<'a> {
     mem: &'a HashMemtable,
     key: Vec<u8>,
+    hash: u64,
     next_node: u32,
-    bucket: usize,
 }
 
 impl HashMemtable {
@@ -86,8 +86,10 @@ impl HashMemtable {
     }
 
     fn default_bucket_count(capacity: usize) -> usize {
-        let target = capacity / 128;
-        target.clamp(4, 1024)
+        // Keep the average chain short as the memtable grows. A fixed upper bound makes point
+        // lookups effectively linear once a large memtable contains substantially more entries
+        // than buckets. The bucket table remains bounded to roughly 3% of the configured capacity.
+        (capacity / 128).max(4)
     }
 
     fn init_bucket_table(buffer: &mut [u8], bucket_base: usize) {
@@ -286,13 +288,14 @@ impl Memtable for HashMemtable {
     }
 
     fn get_all(&self, key: &[u8]) -> MemtableValueIter<'_> {
-        let bucket = self.bucket_index_from_hash(Self::hash_key(key));
-        let head = self.bucket_head(bucket);
+        let hash = Self::hash_key(key);
+        let hash_bucket = self.bucket_index_from_hash(hash);
+        let head = self.bucket_head(hash_bucket);
         MemtableValueIter {
             mem: self,
             key: key.to_vec(),
+            hash,
             next_node: head,
-            bucket,
         }
     }
 
@@ -353,7 +356,7 @@ impl<'a> Iterator for MemtableValueIter<'a> {
             let key_off = node_slice.get_u32() as usize;
             let next = node_slice.get_u32();
             self.next_node = next;
-            if h == HashMemtable::hash_key(&self.key) && key_off + 8 <= self.mem.data_end {
+            if h == self.hash && key_off + 8 <= self.mem.data_end {
                 let mut slice = &self.mem.buffer[key_off..self.mem.data_end];
                 let key_len = slice.get_u32() as usize;
                 let value_len = slice.get_u32() as usize;
@@ -430,6 +433,14 @@ mod tests {
         assert_eq!(mem.get(b"key1").unwrap(), b"v1");
         assert_eq!(mem.get(b"key2").unwrap(), b"v2");
         assert_eq!(mem.get(b"key3").unwrap(), b"v3");
+    }
+
+    #[test]
+    fn bucket_count_scales_with_memtable_capacity() {
+        assert_eq!(
+            HashMemtable::default_bucket_count(128 * 1024 * 1024),
+            1024 * 1024
+        );
     }
 
     #[test]
