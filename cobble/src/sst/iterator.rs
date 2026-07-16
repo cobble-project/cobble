@@ -2,13 +2,14 @@ use crate::cache::{
     BlockCache, BlockCacheKey, BlockCacheKind, CachedBlock, ScanHotBlockHandle,
     ScanHotBlockRegistry, data_block_cache_key,
 };
+use crate::config::SstReadMetadataCacheMode;
 use crate::data_file::DataFile;
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
 use crate::iterator::KvIterator;
 use crate::sst::bloom::BloomFilter;
 use crate::sst::compression::{decode_block_bytes, verify_block_checksum};
-use crate::sst::format::{Block, FOOTER_SIZE, Footer};
+use crate::sst::format::{Block, FOOTER_SIZE, Footer, SstReadMetadata};
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, KvValue, Value};
 use crate::util::unsafe_bytes;
@@ -29,6 +30,8 @@ pub(crate) struct SSTIteratorOptions {
     pub num_columns: usize,
     /// Whether to use bloom filter for point lookups.
     pub bloom_filter_enabled: bool,
+    /// Caching policy for decoded footer and index-partition descriptors.
+    pub read_metadata_cache_mode: SstReadMetadataCacheMode,
     /// Namespace used to isolate block-cache keys across shards/dbs.
     pub cache_namespace: u64,
     /// Preload the data block after the current one during scan iteration.
@@ -105,6 +108,7 @@ impl Default for SSTIteratorOptions {
             num_columns: 1,
             metrics: None,
             bloom_filter_enabled: false,
+            read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
             cache_namespace: 0,
             preload_next_data_block: false,
             hot_block_registry: None,
@@ -119,7 +123,7 @@ pub(crate) struct SSTIterator {
     file_id: u64,
     footer: Footer,
     index_block: Arc<Block>,
-    index_partitions: Vec<(u64, u64)>,
+    index_partitions: Arc<[(u64, u64)]>,
     bloom_filter: Option<Arc<BloomFilter>>,
     bloom_filter_partition_idx: Option<usize>,
     current_data_block: Option<Arc<Block>>,
@@ -206,18 +210,47 @@ impl SSTIterator {
         options: SSTIteratorOptions,
         block_cache: Option<BlockCache>,
     ) -> Result<Self> {
-        let footer_bytes = data_file.meta_bytes();
-        let (iter, cached_footer) = Self::with_cache_and_footer_bytes(
+        let cached_metadata = options
+            .read_metadata_cache_mode
+            .caches_reads()
+            .then(|| data_file.sst_read_metadata())
+            .flatten();
+        let (footer, cached_footer) = if let Some(metadata) = &cached_metadata {
+            (metadata.footer().clone(), None)
+        } else {
+            Self::decode_footer(data_file.meta_bytes(), &*file)?
+        };
+        let metrics = Self::metrics_for(&options);
+        let index_block = Self::load_index_block(
+            &*file,
+            data_file.file_id,
+            &options,
+            &block_cache,
+            &metrics,
+            &footer,
+        )?;
+        let metadata = match cached_metadata {
+            Some(metadata) => metadata,
+            None => {
+                let metadata = Arc::new(SstReadMetadata::from_index_block(footer, &index_block)?);
+                if options.read_metadata_cache_mode.caches_reads() {
+                    data_file.set_sst_read_metadata(Arc::clone(&metadata));
+                }
+                if let Some(bytes) = cached_footer {
+                    data_file.set_meta_bytes(bytes);
+                }
+                metadata
+            }
+        };
+        Ok(Self::from_read_metadata(
             file,
             data_file.file_id,
             options,
             block_cache,
-            footer_bytes,
-        )?;
-        if let Some(bytes) = cached_footer {
-            data_file.set_meta_bytes(bytes);
-        }
-        Ok(iter)
+            metrics,
+            index_block,
+            &metadata,
+        ))
     }
 
     fn with_cache_and_footer_bytes(
@@ -227,21 +260,54 @@ impl SSTIterator {
         block_cache: Option<BlockCache>,
         footer_bytes: Option<Bytes>,
     ) -> Result<(Self, Option<Bytes>)> {
-        let metrics = options
+        let metrics = Self::metrics_for(&options);
+        let (footer, cached_footer) = Self::decode_footer(footer_bytes, &*file)?;
+        let index_block =
+            Self::load_index_block(&*file, file_id, &options, &block_cache, &metrics, &footer)?;
+        let metadata = SstReadMetadata::from_index_block(footer, &index_block)?;
+        Ok((
+            Self::from_read_metadata(
+                file,
+                file_id,
+                options,
+                block_cache,
+                metrics,
+                index_block,
+                &metadata,
+            ),
+            cached_footer,
+        ))
+    }
+
+    fn metrics_for(options: &SSTIteratorOptions) -> Arc<SSTIteratorMetrics> {
+        options
             .metrics
             .clone()
-            .unwrap_or_else(|| Arc::new(SSTIteratorMetrics::new("unknown")));
-        // Read footer
-        let (footer, cached_footer) = if let Some(bytes) = footer_bytes {
-            (Footer::decode(bytes.as_ref())?, None)
-        } else {
-            let bytes = Self::read_footer_bytes(&*file)?;
-            let footer = Footer::decode(bytes.as_ref())?;
-            (footer, Some(bytes))
-        };
+            .unwrap_or_else(|| Arc::new(SSTIteratorMetrics::new("unknown")))
+    }
 
-        // Read index block
-        let index_block = if let Some(cache) = &block_cache {
+    fn decode_footer(
+        footer_bytes: Option<Bytes>,
+        file: &dyn RandomAccessFile,
+    ) -> Result<(Footer, Option<Bytes>)> {
+        if let Some(bytes) = footer_bytes {
+            Ok((Footer::decode(bytes.as_ref())?, None))
+        } else {
+            let bytes = Self::read_footer_bytes(file)?;
+            let footer = Footer::decode(bytes.as_ref())?;
+            Ok((footer, Some(bytes)))
+        }
+    }
+
+    fn load_index_block(
+        file: &dyn RandomAccessFile,
+        file_id: u64,
+        options: &SSTIteratorOptions,
+        block_cache: &Option<BlockCache>,
+        metrics: &SSTIteratorMetrics,
+        footer: &Footer,
+    ) -> Result<Arc<Block>> {
+        let index_block = if let Some(cache) = block_cache {
             let cache_key = BlockCacheKey {
                 namespace: options.cache_namespace,
                 file_id,
@@ -284,60 +350,50 @@ impl SSTIterator {
             index_block.set_block_id(u32::MAX);
             Arc::new(index_block)
         };
-        let mut index_partitions = Vec::with_capacity(index_block.offsets_len());
-        if footer.partitioned_index {
-            for idx in 0..index_block.offsets_len() {
-                let value = index_block.value(idx)?;
-                if value.len() != 16 {
-                    return Err(Error::IoError("Invalid index partition entry".to_string()));
-                }
-                let offset = u64::from_le_bytes(value[0..8].try_into().unwrap());
-                let size = u64::from_le_bytes(value[8..16].try_into().unwrap());
-                if size == 0 {
-                    return Err(Error::IoError("Index partition size is zero".to_string()));
-                }
-                index_partitions.push((offset, size));
-            }
-        } else if footer.index_block_size > 0 {
-            index_partitions.push((footer.index_block_offset, footer.index_block_size));
-        } else {
-            return Err(Error::IoError("Index block size is zero".to_string()));
-        }
+        Ok(index_block)
+    }
+
+    fn from_read_metadata(
+        file: Box<dyn RandomAccessFile>,
+        file_id: u64,
+        options: SSTIteratorOptions,
+        block_cache: Option<BlockCache>,
+        metrics: Arc<SSTIteratorMetrics>,
+        index_block: Arc<Block>,
+        metadata: &SstReadMetadata,
+    ) -> Self {
         let hot_block_handle = options
             .preload_next_data_block
             .then(|| options.hot_block_registry.as_ref().map(Arc::clone))
             .flatten()
             .map(|registry| registry.handle());
-        Ok((
-            Self {
-                file,
-                file_id,
-                footer,
-                index_block,
-                index_partitions,
-                bloom_filter: None,
-                bloom_filter_partition_idx: None,
-                current_data_block: None,
-                current_index_partition_idx: 0,
-                current_index_partition: None,
-                current_block_idx: 0,
-                current_entry_idx: 0,
-                options,
-                block_cache,
-                hot_block_handle,
-                metrics,
-                cached_key_entry_idx: Cell::new(None),
-                cached_value_entry_idx: Cell::new(None),
-                cached_prefix_key_block_id: Cell::new(None),
-                cached_prefix_key_entry_idx: Cell::new(None),
-                cached_prefix_key_bytes: RefCell::new(Vec::new()),
-                cached_key_bytes: RefCell::new(None),
-                cached_value_bytes: RefCell::new(None),
-                should_stop_at_block_boundary: false,
-                boundary_state: BoundaryState::None,
-            },
-            cached_footer,
-        ))
+        Self {
+            file,
+            file_id,
+            footer: metadata.footer().clone(),
+            index_block,
+            index_partitions: metadata.index_partitions(),
+            bloom_filter: None,
+            bloom_filter_partition_idx: None,
+            current_data_block: None,
+            current_index_partition_idx: 0,
+            current_index_partition: None,
+            current_block_idx: 0,
+            current_entry_idx: 0,
+            options,
+            block_cache,
+            hot_block_handle,
+            metrics,
+            cached_key_entry_idx: Cell::new(None),
+            cached_value_entry_idx: Cell::new(None),
+            cached_prefix_key_block_id: Cell::new(None),
+            cached_prefix_key_entry_idx: Cell::new(None),
+            cached_prefix_key_bytes: RefCell::new(Vec::new()),
+            cached_key_bytes: RefCell::new(None),
+            cached_value_bytes: RefCell::new(None),
+            should_stop_at_block_boundary: false,
+            boundary_state: BoundaryState::None,
+        }
     }
 
     #[cfg(test)]
@@ -1174,11 +1230,218 @@ impl SSTIteratorTestCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::FileSystemRegistry;
+    use crate::cache::MockCache;
+    use crate::data_file::DataFileType;
+    use crate::file::{File, FileSystemRegistry};
+    use crate::format::FileBuildResult;
     use crate::sst::bloom::{BloomFilter, BloomFilterBuilder};
-    use crate::sst::format::Footer;
+    use crate::sst::format::{BlockBuilder, Footer};
     use crate::sst::writer::{SSTWriter, SSTWriterOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
+
+    struct BytesRandomAccessFile {
+        data: Bytes,
+    }
+
+    impl File for BytesRandomAccessFile {
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl RandomAccessFile for BytesRandomAccessFile {
+        fn read_at(&self, offset: usize, size: usize) -> Result<Bytes> {
+            let end = offset
+                .checked_add(size)
+                .filter(|&end| end <= self.data.len())
+                .ok_or_else(|| Error::IoError("Read beyond test file".to_string()))?;
+            Ok(self.data.slice(offset..end))
+        }
+    }
+
+    fn test_data_file(file_id: u64, size: usize) -> DataFile {
+        DataFile::new_detached(
+            DataFileType::SSTable,
+            b"a".to_vec(),
+            b"z".to_vec(),
+            file_id,
+            0,
+            size,
+            0..=0,
+            0..=0,
+        )
+    }
+
+    fn test_sst_bytes(partitioned_index: bool, index_value: &[u8]) -> Bytes {
+        let mut index_builder = BlockBuilder::new(1024);
+        index_builder.add(b"index", index_value);
+        let index_block = index_builder.build().encode();
+        let footer = Footer {
+            index_block_offset: 0,
+            index_block_size: index_block.len() as u64,
+            filter_block_offset: 0,
+            filter_block_size: 0,
+            filter_present: false,
+            partitioned_index,
+            value_has_ttl: true,
+            block_checksums: false,
+        }
+        .encode();
+        let mut bytes = BytesMut::with_capacity(index_block.len() + footer.len());
+        bytes.extend_from_slice(index_block.as_ref());
+        bytes.extend_from_slice(footer.as_ref());
+        bytes.freeze()
+    }
+
+    fn test_reader(data: Bytes) -> Box<dyn RandomAccessFile> {
+        Box::new(BytesRandomAccessFile { data })
+    }
+
+    #[test]
+    fn test_data_file_read_metadata_reuses_partitioned_descriptors_and_index_cache() {
+        let mut partition = Vec::with_capacity(16);
+        partition.extend_from_slice(&128_u64.to_le_bytes());
+        partition.extend_from_slice(&64_u64.to_le_bytes());
+        let bytes = test_sst_bytes(true, &partition);
+        let data_file = test_data_file(100, bytes.len());
+        let cache = Arc::new(MockCache::<BlockCacheKey, CachedBlock>::default());
+        let block_cache: BlockCache = cache.clone();
+
+        let first = SSTIterator::with_cache_and_file(
+            test_reader(bytes.clone()),
+            &data_file,
+            SSTIteratorOptions {
+                read_metadata_cache_mode: SstReadMetadataCacheMode::Lazy,
+                ..SSTIteratorOptions::default()
+            },
+            Some(block_cache.clone()),
+        )
+        .unwrap();
+        let metadata = data_file.sst_read_metadata().unwrap();
+        assert_eq!(metadata.index_partitions().as_ref(), &[(128, 64)]);
+        assert_eq!(cache.get_count(), 1);
+        assert_eq!(cache.insert_count(), 1);
+
+        let second = SSTIterator::with_cache_and_file(
+            test_reader(bytes),
+            &data_file,
+            SSTIteratorOptions {
+                read_metadata_cache_mode: SstReadMetadataCacheMode::Lazy,
+                ..SSTIteratorOptions::default()
+            },
+            Some(block_cache),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &metadata,
+            &data_file.sst_read_metadata().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &first.index_partitions,
+            &second.index_partitions
+        ));
+        assert_eq!(cache.get_count(), 2);
+        assert_eq!(cache.insert_count(), 1);
+    }
+
+    #[test]
+    fn test_data_file_read_metadata_reuses_unpartitioned_descriptor() {
+        let bytes = test_sst_bytes(false, b"data-block-location");
+        let data_file = test_data_file(101, bytes.len());
+
+        let first = SSTIterator::with_cache_and_file(
+            test_reader(bytes.clone()),
+            &data_file,
+            SSTIteratorOptions::default(),
+            None,
+        )
+        .unwrap();
+        let metadata = data_file.sst_read_metadata().unwrap();
+        assert_eq!(
+            metadata.index_partitions().as_ref(),
+            &[(0, (bytes.len() - FOOTER_SIZE) as u64)]
+        );
+
+        let second = SSTIterator::with_cache_and_file(
+            test_reader(bytes),
+            &data_file,
+            SSTIteratorOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &first.index_partitions,
+            &second.index_partitions
+        ));
+    }
+
+    #[test]
+    fn test_data_file_read_metadata_is_retained_by_derived_files() {
+        let mut partition = Vec::with_capacity(16);
+        partition.extend_from_slice(&128_u64.to_le_bytes());
+        partition.extend_from_slice(&64_u64.to_le_bytes());
+        let bytes = test_sst_bytes(true, &partition);
+        let data_file = test_data_file(102, bytes.len());
+        SSTIterator::with_cache_and_file(
+            test_reader(bytes),
+            &data_file,
+            SSTIteratorOptions::default(),
+            None,
+        )
+        .unwrap();
+        let metadata = data_file.sst_read_metadata().unwrap();
+
+        let ranged = data_file.with_effective_bucket_range(0..=0);
+        let copied = test_data_file(data_file.file_id, data_file.size);
+        copied.copy_meta_from(&data_file);
+
+        assert!(Arc::ptr_eq(&metadata, &ranged.sst_read_metadata().unwrap()));
+        assert!(Arc::ptr_eq(&metadata, &copied.sst_read_metadata().unwrap()));
+    }
+
+    #[test]
+    fn test_data_file_read_metadata_malformed_first_construction_does_not_cache() {
+        let mut zero_sized_partition = Vec::with_capacity(16);
+        zero_sized_partition.extend_from_slice(&128_u64.to_le_bytes());
+        zero_sized_partition.extend_from_slice(&0_u64.to_le_bytes());
+
+        for (file_id, value) in [(104, vec![0; 15]), (105, zero_sized_partition)] {
+            let bytes = test_sst_bytes(true, &value);
+            let data_file = test_data_file(file_id, bytes.len());
+            assert!(
+                SSTIterator::with_cache_and_file(
+                    test_reader(bytes),
+                    &data_file,
+                    SSTIteratorOptions::default(),
+                    None,
+                )
+                .is_err()
+            );
+            assert!(data_file.sst_read_metadata().is_none());
+            assert!(data_file.meta_bytes().is_none());
+        }
+    }
+
+    #[test]
+    fn test_data_file_read_metadata_cache_can_be_disabled() {
+        let mut partition = Vec::with_capacity(16);
+        partition.extend_from_slice(&128_u64.to_le_bytes());
+        partition.extend_from_slice(&64_u64.to_le_bytes());
+        let bytes = test_sst_bytes(true, &partition);
+        let data_file = test_data_file(106, bytes.len());
+        let options = SSTIteratorOptions {
+            read_metadata_cache_mode: SstReadMetadataCacheMode::Off,
+            ..SSTIteratorOptions::default()
+        };
+
+        SSTIterator::with_cache_and_file(test_reader(bytes), &data_file, options, None).unwrap();
+
+        assert!(data_file.sst_read_metadata().is_none());
+    }
 
     fn build_filter(bits_per_key: u32, keys: &[&[u8]]) -> BloomFilter {
         let mut builder = BloomFilterBuilder::new(bits_per_key);
@@ -1210,8 +1473,8 @@ mod tests {
         let writer_file = fs.open_write("test.sst").unwrap();
         let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
         writer.add(b"key", b"value").unwrap();
-        let (_, _, _, footer_bytes) = writer.finish_with_range().unwrap();
-        assert!(Footer::decode(&footer_bytes).unwrap().block_checksums);
+        let FileBuildResult { meta_bytes, .. } = writer.finish_with_range().unwrap();
+        assert!(Footer::decode(&meta_bytes).unwrap().block_checksums);
 
         let path = format!("{}/test.sst", root);
         let mut file = std::fs::OpenOptions::new()
@@ -1254,8 +1517,8 @@ mod tests {
             },
         );
         writer.add(b"key", b"value").unwrap();
-        let (_, _, _, footer_bytes) = writer.finish_with_range().unwrap();
-        assert!(!Footer::decode(&footer_bytes).unwrap().block_checksums);
+        let FileBuildResult { meta_bytes, .. } = writer.finish_with_range().unwrap();
+        assert!(!Footer::decode(&meta_bytes).unwrap().block_checksums);
 
         let reader_file = fs.open_read("test.sst").unwrap();
         let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
@@ -1404,6 +1667,7 @@ mod tests {
                     bloom_filter_enabled: true,
                     bloom_bits_per_key: bits_per_key,
                     partitioned_index: false,
+                    read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
                     ..SSTWriterOptions::default()
                 },
             );
@@ -1465,6 +1729,7 @@ mod tests {
                     bloom_filter_enabled: true,
                     bloom_bits_per_key: bits_per_key,
                     partitioned_index: true,
+                    read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
                     data_block_restart_interval: 16,
                     compression: crate::SstCompressionAlgorithm::None,
                     value_has_ttl: true,

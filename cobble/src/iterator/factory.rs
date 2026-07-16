@@ -95,6 +95,7 @@ mod tests {
     use super::*;
     use crate::data_file::{DataFile, DataFileType};
     use crate::file::{FileManager, FileSystemRegistry, TrackedFileId};
+    use crate::format::FileBuildResult;
     use crate::metrics_manager::MetricsManager;
     use crate::parquet::ParquetWriter;
     use crate::sst::row_codec::encode_value;
@@ -134,7 +135,13 @@ mod tests {
         );
         writer.add(&[1, 0, b'a'], &encoded_v1).unwrap();
         writer.add(&[2, 0, b'b'], &encoded_v2).unwrap();
-        let (start_key, end_key, file_size, meta) = writer.finish().unwrap();
+        let FileBuildResult {
+            first_key: start_key,
+            last_key: end_key,
+            file_size,
+            meta_bytes,
+            ..
+        } = writer.finish().unwrap();
 
         let data_file = DataFile::new(
             DataFileType::Parquet,
@@ -147,7 +154,7 @@ mod tests {
             1..=2,
             2..=2,
         );
-        data_file.set_meta_bytes(meta);
+        data_file.set_meta_bytes(meta_bytes);
 
         let options = IteratorFactoryOptions::default();
         let mut iter = create_iterator(&data_file, &file_manager, &options).unwrap();

@@ -1,10 +1,11 @@
 use crate::cache::{WriterHotBlockCache, bucket_scoped_cache_namespace, data_block_cache_key};
+use crate::config::SstReadMetadataCacheMode;
 use crate::error::{Error, Result};
 use crate::file::{BufferedWriter, File, SequentialWriteFile};
-use crate::format::FileBuilder;
+use crate::format::{FileBuildResult, FileBuilder};
 use crate::sst::bloom::BloomFilterBuilder;
 use crate::sst::compression::{SstCompressionAlgorithm, write_block};
-use crate::sst::format::{BlockBuilder, Footer};
+use crate::sst::format::{BlockBuilder, Footer, SstReadMetadata};
 use crate::sst::row_codec::{encode_key, encode_value};
 use crate::r#type::{Key, KvValue, Value, key_bucket};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -49,6 +50,8 @@ pub struct SSTWriterOptions {
     pub bloom_bits_per_key: u32,
     /// Enable two-level index/filter blocks.
     pub partitioned_index: bool,
+    /// Caching policy for decoded footer and index-partition descriptors.
+    pub read_metadata_cache_mode: SstReadMetadataCacheMode,
     /// Number of entries between full restart keys in prefix-compressed data blocks.
     pub data_block_restart_interval: usize,
     /// Compression algorithm for data blocks.
@@ -69,6 +72,7 @@ impl Default for SSTWriterOptions {
             bloom_filter_enabled: false,
             bloom_bits_per_key: 10,
             partitioned_index: false,
+            read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
             data_block_restart_interval: 16,
             compression: SstCompressionAlgorithm::None,
             value_has_ttl: true,
@@ -293,9 +297,8 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         self.metrics.compression_ratio.record(ratio);
     }
 
-    /// Finish writing the SST file and return (first_key, last_key, file_size, footer_bytes).
-    /// This writes the index block and footer, and returns the key range.
-    fn finish_internal(mut self) -> Result<(Vec<u8>, Vec<u8>, usize, Bytes)> {
+    /// Finish writing the SST file and return its key range and read metadata.
+    fn finish_internal(mut self) -> Result<FileBuildResult> {
         // Capture first/last keys before finishing
         let first_key = self.first_key.clone().unwrap_or_default();
         let last_key = self.last_key.clone();
@@ -341,6 +344,10 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
                 value_has_ttl: self.options.value_has_ttl,
                 block_checksums: self.options.block_checksum_enabled,
             };
+            let read_metadata = SstReadMetadata::from_parts(
+                footer.clone(),
+                vec![(index_offset as u64, index_size as u64)],
+            )?;
             let footer_encoded = footer.encode();
             let meta_bytes = footer_encoded.clone();
             self.writer.write(&footer_encoded)?;
@@ -349,7 +356,12 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             let mut writer = self.writer;
             writer.close()?;
 
-            return Ok((first_key, last_key, file_size, meta_bytes));
+            let result = FileBuildResult::new(first_key, last_key, file_size, meta_bytes);
+            return Ok(if self.options.read_metadata_cache_mode.embeds_on_write() {
+                result.with_sst_read_metadata(read_metadata)
+            } else {
+                result
+            });
         }
 
         // Write two-level index
@@ -358,6 +370,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
 
         let mut index_builder = BlockBuilder::new(self.options.block_size);
         let mut index_partition_first_key: Option<&Vec<u8>> = None;
+        let mut index_partitions = Vec::new();
         // Current bloom filter builder for the partition, maybe optional if bloom filter is disabled
         let mut current_filter_builder = self
             .bloom_filter_builder
@@ -383,6 +396,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             if index_builder.should_finish() {
                 let index_offset = self.writer.offset();
                 let index_size = index_builder.write_to(&mut self.writer)?;
+                index_partitions.push((index_offset as u64, index_size as u64));
                 let first_key = index_partition_first_key
                     .take()
                     .expect("There should be at least one key");
@@ -410,6 +424,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         if !index_builder.is_empty() {
             let index_offset = self.writer.offset();
             let index_size = index_builder.write_to(&mut self.writer)?;
+            index_partitions.push((index_offset as u64, index_size as u64));
             let first_key = index_partition_first_key
                 .take()
                 .expect("There should be at least one key");
@@ -457,6 +472,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             value_has_ttl: self.options.value_has_ttl,
             block_checksums: self.options.block_checksum_enabled,
         };
+        let read_metadata = SstReadMetadata::from_parts(footer.clone(), index_partitions)?;
         let footer_encoded = footer.encode();
         let meta_bytes = footer_encoded.clone();
         self.writer.write(&footer_encoded)?;
@@ -468,7 +484,12 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         let mut writer = self.writer;
         writer.close()?;
 
-        Ok((first_key, last_key, file_size, meta_bytes))
+        let result = FileBuildResult::new(first_key, last_key, file_size, meta_bytes);
+        Ok(if self.options.read_metadata_cache_mode.embeds_on_write() {
+            result.with_sst_read_metadata(read_metadata)
+        } else {
+            result
+        })
     }
 
     /// Finish writing the SST file
@@ -478,9 +499,8 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         Ok(())
     }
 
-    /// Finish writing the SST file and return (first_key, last_key, file_size, footer_bytes).
-    /// This writes the index block and footer, and returns the key range and total file size.
-    pub fn finish_with_range(self) -> Result<(Vec<u8>, Vec<u8>, usize, Bytes)> {
+    /// Finish writing the SST file and return its immutable build result.
+    pub(crate) fn finish_with_range(self) -> Result<FileBuildResult> {
         self.finish_internal()
     }
 
@@ -517,7 +537,7 @@ impl<W: SequentialWriteFile + 'static> FileBuilder for SSTWriter<W> {
         }
     }
 
-    fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>, usize, Bytes)> {
+    fn finish(self: Box<Self>) -> Result<FileBuildResult> {
         (*self).finish_with_range()
     }
 
@@ -611,6 +631,7 @@ mod tests {
                 bloom_filter_enabled: true,
                 bloom_bits_per_key: 10,
                 partitioned_index: false,
+                read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
                 data_block_restart_interval: 16,
                 compression: crate::SstCompressionAlgorithm::None,
                 value_has_ttl: true,
@@ -629,5 +650,37 @@ mod tests {
         assert!(fs.exists("test_blocks.sst").unwrap());
 
         let _ = std::fs::remove_dir_all("/tmp/sst_writer_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_writer_only_embeds_read_metadata_in_eager_mode() {
+        let root = "/tmp/sst_writer_metadata_cache_test";
+        let _ = std::fs::remove_dir_all(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(format!("file://{root}")).unwrap();
+        for (index, mode) in [
+            SstReadMetadataCacheMode::Eager,
+            SstReadMetadataCacheMode::Lazy,
+            SstReadMetadataCacheMode::Off,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let writer_file = fs.open_write(&format!("test-{index}.sst")).unwrap();
+            let mut writer = SSTWriter::new(
+                writer_file,
+                SSTWriterOptions {
+                    read_metadata_cache_mode: mode,
+                    ..SSTWriterOptions::default()
+                },
+            );
+            writer.add(b"key", b"value").unwrap();
+
+            let result = writer.finish_with_range().unwrap();
+            assert_eq!(result.sst_read_metadata.is_some(), index == 0);
+        }
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

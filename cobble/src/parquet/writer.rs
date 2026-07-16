@@ -1,7 +1,7 @@
 use crate::cache::{WriterHotBlockCache, bucket_scoped_cache_namespace};
 use crate::error::{Error, Result};
 use crate::file::{File, SequentialWriteFile};
-use crate::format::FileBuilder;
+use crate::format::{FileBuildResult, FileBuilder};
 use crate::parquet::file_adapter::{SequentialWriteFileAdapter, parquet_row_group_cache_keys};
 use crate::parquet::meta::{ParquetMeta, ParquetRowGroupRange};
 use crate::sst::row_codec::decode_value;
@@ -306,7 +306,7 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> Result<(Vec<u8>, Vec<u8>, usize, Bytes)> {
+    pub(crate) fn finish(mut self) -> Result<FileBuildResult> {
         let first_key = self.first_key.clone().unwrap_or_default();
         self.flush_current_group()?;
         let last_key = self.last_key;
@@ -316,7 +316,7 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
             .map_err(|err| Error::IoError(format!("Failed to finalize parquet file: {}", err)))?;
         let file_size = adapter.size();
         adapter.close()?;
-        Ok((
+        Ok(FileBuildResult::new(
             first_key,
             last_key,
             file_size,
@@ -352,7 +352,7 @@ impl<W: SequentialWriteFile + Send + 'static> FileBuilder for ParquetWriter<W> {
         }
     }
 
-    fn finish(self: Box<Self>) -> Result<(Vec<u8>, Vec<u8>, usize, Bytes)> {
+    fn finish(self: Box<Self>) -> Result<FileBuildResult> {
         (*self).finish()
     }
 

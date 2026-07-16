@@ -15,7 +15,7 @@ use crate::db_state::{TruncationCursorId, TruncationCursorMap};
 use crate::db_status::DbLifecycle;
 use crate::error::Result;
 use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId, read_ahead_runtime};
-use crate::format::{FileBuilder, FileBuilderFactory};
+use crate::format::{FileBuildResult, FileBuilder, FileBuilderFactory};
 use crate::iterator::{
     BucketFilterIterator, DeduplicatingIterator, KvIterator, MergingIterator,
     SchemaEvolvingIterator, SortedRun, VlogSeqOffsetIterator,
@@ -450,6 +450,7 @@ impl CompactionExecutor {
                             metrics: Some(Arc::clone(&sst_metrics)),
                             num_columns: source_num_columns,
                             bloom_filter_enabled: options.bloom_filter_enabled,
+                            read_metadata_cache_mode: options.read_metadata_cache_mode,
                             cache_namespace: single_bucket_in_range(&file.effective_bucket_range)
                                 .map(|bucket| {
                                     bucket_scoped_cache_namespace(base_cache_namespace, bucket)
@@ -654,7 +655,13 @@ impl CompactionExecutor {
                 if builder.offset() >= options.target_file_size {
                     let file_id = current_file_id.take().unwrap();
                     let builder = current_builder.take().unwrap();
-                    let (first_key, last_key, file_size, footer_bytes) = builder.finish()?;
+                    let FileBuildResult {
+                        first_key,
+                        last_key,
+                        file_size,
+                        meta_bytes,
+                        sst_read_metadata,
+                    } = builder.finish()?;
                     let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
                     trace!(
                         "compaction output file level={} file_id={} size={}",
@@ -677,7 +684,10 @@ impl CompactionExecutor {
                             .as_ref()
                             .is_some_and(|collector| collector.borrow().has_separated_values()),
                     );
-                    data_file.set_meta_bytes(footer_bytes);
+                    data_file.set_meta_bytes(meta_bytes);
+                    if let Some(metadata) = sst_read_metadata {
+                        data_file.set_sst_read_metadata(metadata);
+                    }
                     output_files.push(Arc::new(data_file));
                     written_bytes = written_bytes.saturating_add(file_size as u64);
                     if let Some(collector) = &merge_collector {
@@ -697,7 +707,13 @@ impl CompactionExecutor {
             && !builder.is_empty()
         {
             let file_id = current_file_id.take().unwrap();
-            let (first_key, last_key, file_size, footer_bytes) = builder.finish()?;
+            let FileBuildResult {
+                first_key,
+                last_key,
+                file_size,
+                meta_bytes,
+                sst_read_metadata,
+            } = builder.finish()?;
             let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
             trace!(
                 "compaction output file level={} file_id={} size={}",
@@ -720,7 +736,10 @@ impl CompactionExecutor {
                     .as_ref()
                     .is_some_and(|collector| collector.borrow().has_separated_values()),
             );
-            data_file.set_meta_bytes(footer_bytes);
+            data_file.set_meta_bytes(meta_bytes);
+            if let Some(metadata) = sst_read_metadata {
+                data_file.set_sst_read_metadata(metadata);
+            }
             output_files.push(Arc::new(data_file));
             written_bytes = written_bytes.saturating_add(file_size as u64);
         }
@@ -867,7 +886,13 @@ mod tests {
             writer.add(key, value)?;
         }
 
-        let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
+        let FileBuildResult {
+            first_key,
+            last_key,
+            file_size,
+            meta_bytes,
+            sst_read_metadata,
+        } = writer.finish_with_range()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
 
         let data_file = DataFile::new(
@@ -882,7 +907,10 @@ mod tests {
             bucket_range,
         )
         .with_separated_values(true);
-        data_file.set_meta_bytes(footer_bytes);
+        data_file.set_meta_bytes(meta_bytes);
+        if let Some(metadata) = sst_read_metadata {
+            data_file.set_sst_read_metadata(metadata);
+        }
         Ok(Arc::new(data_file))
     }
 
@@ -901,7 +929,13 @@ mod tests {
         for (key, value) in entries {
             writer.add(key, value)?;
         }
-        let (first_key, last_key, file_size, meta_bytes) = writer.finish()?;
+        let FileBuildResult {
+            first_key,
+            last_key,
+            file_size,
+            meta_bytes,
+            ..
+        } = writer.finish()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
         let data_file = DataFile::new(
             DataFileType::Parquet,
@@ -999,6 +1033,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
@@ -1129,6 +1164,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
@@ -1237,6 +1273,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
@@ -1407,6 +1444,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
@@ -1517,6 +1555,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
@@ -1541,6 +1580,9 @@ mod tests {
         let result = executor.execute_blocking(task, None).unwrap();
         assert_eq!(result.new_files().len(), 1);
         assert_eq!(result.new_files()[0].schema_id, target_schema.version());
+        let write_metadata = result.new_files()[0]
+            .sst_read_metadata()
+            .expect("compaction should install SST read metadata eagerly");
 
         let reader = file_manager
             .open_data_file_reader(result.new_files()[0].file_id)
@@ -1556,6 +1598,10 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(Arc::ptr_eq(
+            &write_metadata,
+            &result.new_files()[0].sst_read_metadata().unwrap()
+        ));
         iter.seek_to_first().unwrap();
         let (_, mut value) = iter.current().unwrap().unwrap();
         let decoded =
@@ -1607,6 +1653,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
@@ -1707,7 +1754,13 @@ mod tests {
         for (key, value) in &entries {
             writer.add(key, value).unwrap();
         }
-        let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range().unwrap();
+        let FileBuildResult {
+            first_key,
+            last_key,
+            file_size,
+            meta_bytes,
+            sst_read_metadata,
+        } = writer.finish_with_range().unwrap();
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
 
         let file = DataFile::new(
@@ -1721,7 +1774,10 @@ mod tests {
             bucket_range.clone(),
             bucket_range,
         );
-        file.set_meta_bytes(footer_bytes);
+        file.set_meta_bytes(meta_bytes);
+        if let Some(metadata) = sst_read_metadata {
+            file.set_sst_read_metadata(metadata);
+        }
         let file = Arc::new(file);
 
         let run = SortedRun::new(0, vec![file]);
@@ -1743,6 +1799,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,
@@ -1818,6 +1875,7 @@ mod tests {
             bloom_filter_enabled: options.bloom_filter_enabled,
             bloom_bits_per_key: options.bloom_bits_per_key,
             partitioned_index: options.partitioned_index,
+            read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
             data_block_restart_interval: 16,
             compression: crate::SstCompressionAlgorithm::None,
             value_has_ttl: true,

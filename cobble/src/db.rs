@@ -867,6 +867,7 @@ impl Db {
             Arc::clone(&db_lifecycle),
             Arc::clone(&metrics_manager),
         );
+        lsm_tree.set_sst_read_metadata_cache_mode(config.sst_read_metadata_cache_mode);
         if block_cache_size > 0 {
             lsm_tree.set_block_cache(Some(new_block_cache_with_config(
                 &config,

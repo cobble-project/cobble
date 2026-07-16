@@ -134,6 +134,29 @@ pub enum MemtableType {
     Vec,
 }
 
+/// Caching policy for decoded SST footer and index-partition metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SstReadMetadataCacheMode {
+    /// Build and attach decoded metadata while writing new SST files.
+    #[default]
+    Eager,
+    /// Decode and cache metadata when an SST is first read.
+    Lazy,
+    /// Decode metadata separately for every reader.
+    Off,
+}
+
+impl SstReadMetadataCacheMode {
+    pub(crate) fn caches_reads(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub(crate) fn embeds_on_write(self) -> bool {
+        matches!(self, Self::Eager)
+    }
+}
+
 /// Governance coordination mode used during writable DB open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -721,6 +744,8 @@ pub struct Config {
     pub sst_bloom_bits_per_key: u32,
     /// Whether to enable two-level index and filter blocks in SST files.
     pub sst_partitioned_index: bool,
+    /// Caching policy for decoded SST footer and index-partition descriptors.
+    pub sst_read_metadata_cache_mode: SstReadMetadataCacheMode,
     /// Number of entries between restart points in SST data-block encoding.
     /// Values > 1 enable prefix compression; value 1 disables prefix compression.
     pub sst_data_block_restart_interval: usize,
@@ -815,6 +840,7 @@ impl Default for Config {
             sst_bloom_filter_enabled: false,
             sst_bloom_bits_per_key: 10,
             sst_partitioned_index: false,
+            sst_read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
             sst_data_block_restart_interval: 16,
             data_file_type: DataFileType::SSTable,
             block_checksum_enabled: true,
@@ -1291,8 +1317,8 @@ fn collect_unrecognized_entry_paths(
 mod tests {
     use super::{
         Config, Error, GovernanceMode, MemtableType, PrimaryVolumeOffloadPolicyKind, ReadOptions,
-        ReaderConfigEntry, RemoteCompactionFailureMode, ScanOptions, VolumeDescriptor,
-        VolumeUsageKind, WriteOptions,
+        ReaderConfigEntry, RemoteCompactionFailureMode, ScanOptions, SstReadMetadataCacheMode,
+        VolumeDescriptor, VolumeUsageKind, WriteOptions,
     };
     use crate::SstCompressionAlgorithm;
     use crate::data_file::DataFileType;
@@ -1345,6 +1371,7 @@ mod tests {
             sst_bloom_filter_enabled: true,
             sst_bloom_bits_per_key: 11,
             sst_partitioned_index: true,
+            sst_read_metadata_cache_mode: SstReadMetadataCacheMode::Off,
             sst_data_block_restart_interval: 32,
             data_file_type: DataFileType::Parquet,
             block_checksum_enabled: false,
@@ -1414,6 +1441,10 @@ mod tests {
             super::CompactionPolicyKind::ScorePriority
         );
         assert!(decoded.sst_partitioned_index);
+        assert_eq!(
+            decoded.sst_read_metadata_cache_mode,
+            SstReadMetadataCacheMode::Off
+        );
         assert_eq!(decoded.time_provider, crate::time::TimeProviderKind::Manual);
         assert_eq!(decoded.log_max_file_size, Size::from_mib(16));
         assert_eq!(decoded.log_keep_files, 5);

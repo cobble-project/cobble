@@ -14,7 +14,7 @@ use crate::db_status::DbLifecycle;
 use crate::error::Error::InvalidState;
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager, MetadataReader, TrackedFileId};
-use crate::format::{FileBuilder, FileBuilderFactory};
+use crate::format::{FileBuildResult, FileBuilder, FileBuilderFactory};
 use crate::iterator::{
     ColumnMaskingIterator, DeduplicatingIterator, KvIterator, SchemaEvolvingIterator,
 };
@@ -2150,7 +2150,13 @@ fn flush_memtable(
         },
     ) in builders
     {
-        let (start_key, end_key, file_size, footer_bytes) = builder.finish()?;
+        let FileBuildResult {
+            first_key: start_key,
+            last_key: end_key,
+            file_size,
+            meta_bytes,
+            sst_read_metadata,
+        } = builder.finish()?;
         let bucket_range = min_bucket..=max_bucket;
         let data_file = DataFile::new(
             data_file_type,
@@ -2164,7 +2170,10 @@ fn flush_memtable(
             bucket_range,
         )
         .with_separated_values(has_separated_values);
-        data_file.set_meta_bytes(footer_bytes);
+        data_file.set_meta_bytes(meta_bytes);
+        if let Some(metadata) = sst_read_metadata {
+            data_file.set_sst_read_metadata(metadata);
+        }
         data_files_by_scope.push((tree_scope, Arc::new(data_file)));
     }
     Ok(MemtableFlushResult {
@@ -2341,6 +2350,7 @@ fn make_sst_builder_factory(options: SSTWriterOptions) -> FileBuilderFactory {
                 bloom_filter_enabled: options.bloom_filter_enabled,
                 bloom_bits_per_key: options.bloom_bits_per_key,
                 partitioned_index: options.partitioned_index,
+                read_metadata_cache_mode: options.read_metadata_cache_mode,
                 data_block_restart_interval: options.data_block_restart_interval,
                 compression: options.compression,
                 value_has_ttl: options.value_has_ttl,
@@ -2772,6 +2782,9 @@ mod tests {
         let level0_files = lsm_tree.level_files(0);
         assert_eq!(level0_files.len(), 1);
         assert_eq!(level0_files[0].file_id, data_file.file_id);
+        let write_metadata = data_file
+            .sst_read_metadata()
+            .expect("flush should install SST read metadata eagerly");
         let reader = file_manager
             .open_data_file_reader(data_file.file_id)
             .unwrap();
@@ -2785,6 +2798,10 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(Arc::ptr_eq(
+            &write_metadata,
+            &data_file.sst_read_metadata().unwrap()
+        ));
         iter.seek_to_first().unwrap();
         let mut entries = Vec::new();
         while iter.valid() {

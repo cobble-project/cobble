@@ -7,6 +7,7 @@ use crate::compaction::{
     MinOverlapPolicy, RoundRobinPolicy, ScorePriorityPolicy, build_runs_for_plan,
     file_fully_covered_by_truncation_cursor, level_threshold,
 };
+use crate::config::SstReadMetadataCacheMode;
 use crate::data_file::{DataFile, DataFileType, intersect_bucket_ranges};
 use crate::db_status::DbLifecycle;
 use crate::error::Result;
@@ -58,6 +59,7 @@ pub(crate) struct LSMTree {
     state: Mutex<LSMTreeState>,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     sst_metrics: Arc<SSTIteratorMetrics>,
+    sst_read_metadata_cache_mode: SstReadMetadataCacheMode,
     cache_namespace: u64,
     scan_hot_blocks: Arc<ScanHotBlockRegistry>,
     block_cache_preload_worker: Arc<BlockCachePreloadWorker>,
@@ -155,6 +157,7 @@ impl LSMTree {
             }),
             ttl_provider,
             sst_metrics: metrics_manager.sst_iterator_metrics(),
+            sst_read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
             cache_namespace,
             scan_hot_blocks: Arc::new(ScanHotBlockRegistry::new()),
             block_cache_preload_worker,
@@ -444,6 +447,10 @@ impl LSMTree {
 
     pub(crate) fn set_block_cache(&mut self, block_cache: Option<BlockCache>) {
         self.block_cache = block_cache;
+    }
+
+    pub(crate) fn set_sst_read_metadata_cache_mode(&mut self, mode: SstReadMetadataCacheMode) {
+        self.sst_read_metadata_cache_mode = mode;
     }
 
     pub(crate) fn sst_metrics(&self) -> Arc<SSTIteratorMetrics> {
@@ -1051,6 +1058,7 @@ impl LSMTree {
     ) -> Result<Vec<DynKvIterator>> {
         let selected_columns = selected_columns.map(|columns| columns.to_vec());
         let preload_scan_cursor_block = preload_scan_cursor_block && self.block_cache.is_some();
+        let read_metadata_cache_mode = self.sst_read_metadata_cache_mode;
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let use_read_ahead = read_ahead_bytes > 0;
         let mut runs: Vec<SortedRun> = Vec::new();
@@ -1104,6 +1112,7 @@ impl LSMTree {
                             metrics: Some(Arc::clone(&sst_metrics)),
                             num_columns: source_num_columns,
                             bloom_filter_enabled: true,
+                            read_metadata_cache_mode,
                             cache_namespace,
                             preload_next_data_block: preload_scan_cursor_block,
                             hot_block_registry: preload_scan_cursor_block
@@ -1226,6 +1235,7 @@ impl LSMTree {
                         num_columns: source_num_columns,
                         metrics: Some(Arc::clone(&self.sst_metrics)),
                         bloom_filter_enabled: true,
+                        read_metadata_cache_mode: self.sst_read_metadata_cache_mode,
                         cache_namespace,
                         ..SSTIteratorOptions::default()
                     },
@@ -1327,6 +1337,7 @@ mod tests {
     use crate::data_file::DataFileType;
     use crate::db_state::{DbState, DbStateHandle, MultiLSMTreeVersion};
     use crate::file::{FileId, FileManager, FileSystemRegistry, TrackedFileId};
+    use crate::format::FileBuildResult;
     use crate::sst::row_codec::{encode_key, encode_value};
     use crate::sst::{SSTWriter, SSTWriterOptions};
     use crate::r#type::{Column, Key, Value, ValueType};
@@ -1431,7 +1442,13 @@ mod tests {
             let encoded_key = encode_key(&Key::new(bucket, key.to_vec()));
             writer.add(encoded_key.as_ref(), value)?;
         }
-        let (first_key, last_key, file_size, footer_bytes) = writer.finish_with_range()?;
+        let FileBuildResult {
+            first_key,
+            last_key,
+            file_size,
+            meta_bytes,
+            sst_read_metadata,
+        } = writer.finish_with_range()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
         let data_file = DataFile::new(
             DataFileType::SSTable,
@@ -1444,7 +1461,10 @@ mod tests {
             bucket_range.clone(),
             bucket_range,
         );
-        data_file.set_meta_bytes(footer_bytes);
+        data_file.set_meta_bytes(meta_bytes);
+        if let Some(metadata) = sst_read_metadata {
+            data_file.set_sst_read_metadata(metadata);
+        }
         Ok(Arc::new(data_file))
     }
 

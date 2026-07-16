@@ -19,6 +19,7 @@ mod tests {
     use crate::cache::{BlockCache, BlockCacheKey, CachedBlock, MockCache};
     use crate::data_file::{DataFile, DataFileType};
     use crate::file::{FileSystemRegistry, RandomAccessFile, TrackedFileId};
+    use crate::format::FileBuildResult;
     use crate::iterator::KvIterator;
     use crate::parquet::meta::decode_meta_row_group_ranges;
     use crate::sst::row_codec::{decode_value, encode_value};
@@ -68,7 +69,13 @@ mod tests {
             );
             writer.add(key, &encoded).unwrap();
         }
-        let (start_key, end_key, file_size, meta) = writer.finish().unwrap();
+        let FileBuildResult {
+            first_key: start_key,
+            last_key: end_key,
+            file_size,
+            meta_bytes,
+            ..
+        } = writer.finish().unwrap();
         let data_file = DataFile::new(
             DataFileType::Parquet,
             start_key,
@@ -80,7 +87,7 @@ mod tests {
             0..=0,
             0..=0,
         );
-        data_file.set_meta_bytes(meta);
+        data_file.set_meta_bytes(meta_bytes);
 
         let mock = Arc::new(MockCache::<BlockCacheKey, CachedBlock>::default());
         let cache: BlockCache = mock.clone();
@@ -149,8 +156,8 @@ mod tests {
         writer.add(b"aa", &encode(b"11")).unwrap();
         writer.add(b"bb", &encode(b"22")).unwrap();
         writer.add(b"cc", &encode(b"33")).unwrap();
-        let (_, _, _, meta) = writer.finish().unwrap();
-        assert_eq!(decode_meta_row_count(Some(meta)).unwrap(), Some(3));
+        let meta_bytes = writer.finish().unwrap().meta_bytes;
+        assert_eq!(decode_meta_row_count(Some(meta_bytes)).unwrap(), Some(3));
 
         let mut iter = ParquetIterator::new(build_reader(root)).unwrap();
         iter.seek_to_first().unwrap();
@@ -347,8 +354,10 @@ mod tests {
         writer.add(b"b1", &encoded).unwrap();
         writer.add(b"c1", &encoded).unwrap();
         writer.add(b"d1", &encoded).unwrap();
-        let (_, _, _, meta) = writer.finish().unwrap();
-        let groups = decode_meta_row_group_ranges(Some(meta)).unwrap().unwrap();
+        let meta_bytes = writer.finish().unwrap().meta_bytes;
+        let groups = decode_meta_row_group_ranges(Some(meta_bytes))
+            .unwrap()
+            .unwrap();
         assert!(groups.len() >= 2);
         assert_eq!(groups.first().unwrap().start_key, b"a1".to_vec());
         assert_eq!(groups.last().unwrap().end_key, b"d1".to_vec());
@@ -380,8 +389,8 @@ mod tests {
         writer.add(b"b1", &encoded).unwrap();
         writer.add(b"c1", &encoded).unwrap();
         writer.add(b"d1", &encoded).unwrap();
-        let (_, _, _, meta) = writer.finish().unwrap();
-        let groups = decode_meta_row_group_ranges(Some(meta.clone()))
+        let meta_bytes = writer.finish().unwrap().meta_bytes;
+        let groups = decode_meta_row_group_ranges(Some(meta_bytes.clone()))
             .unwrap()
             .unwrap();
         assert!(groups.len() >= 2);
