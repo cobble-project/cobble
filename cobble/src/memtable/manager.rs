@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
@@ -129,6 +129,114 @@ struct MemtableManagerState {
     in_flight: usize,
     restore_in_progress: bool,
     flush_results: Vec<Result<MemtableFlushResult>>,
+    hash_bucket_advisor: HashMemtableBucketAdvisor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlushCause {
+    CapacityFull(Uuid),
+    Manual,
+    Snapshot,
+}
+
+const HASH_BUCKET_TARGET_LOAD_PERCENT: u128 = 70;
+const HASH_BUCKET_SAMPLE_COUNT: usize = 3;
+const HASH_BUCKET_ENTRY_SIZE_SCALE: u128 = 1_000_000;
+
+#[derive(Default)]
+struct HashMemtableBucketAdvisor {
+    capacity_full_samples: VecDeque<HashMemtableCapacitySample>,
+    recommended_bucket_count: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HashMemtableCapacitySample {
+    entry_count: usize,
+    used_entry_bytes: usize,
+}
+
+impl HashMemtableBucketAdvisor {
+    fn observe_flush(
+        &mut self,
+        cause: FlushCause,
+        memtable_id: Uuid,
+        memtable: &MemtableImpl,
+        memtable_capacity: usize,
+    ) {
+        let FlushCause::CapacityFull(expected_memtable_id) = cause else {
+            return;
+        };
+        if expected_memtable_id != memtable_id {
+            return;
+        }
+        let MemtableImpl::Hash(memtable) = memtable else {
+            return;
+        };
+        self.record_capacity_full(
+            HashMemtableCapacitySample {
+                entry_count: memtable.entry_count(),
+                used_entry_bytes: memtable.used_entry_bytes(),
+            },
+            memtable_capacity,
+        );
+    }
+
+    fn record_capacity_full(
+        &mut self,
+        sample: HashMemtableCapacitySample,
+        memtable_capacity: usize,
+    ) {
+        if sample.entry_count == 0 {
+            return;
+        }
+        self.capacity_full_samples.push_back(sample);
+        if self.capacity_full_samples.len() > HASH_BUCKET_SAMPLE_COUNT {
+            self.capacity_full_samples.pop_front();
+        }
+        if self.capacity_full_samples.len() < HASH_BUCKET_SAMPLE_COUNT {
+            self.recommended_bucket_count = None;
+            return;
+        }
+
+        let weighted_average_entry_bytes = self
+            .capacity_full_samples
+            .iter()
+            .zip([2u128, 3, 5])
+            .fold(0u128, |weighted_sum, (sample, weight)| {
+                let average_entry_bytes = (sample.used_entry_bytes as u128)
+                    .saturating_mul(HASH_BUCKET_ENTRY_SIZE_SCALE)
+                    .saturating_add((sample.entry_count / 2) as u128)
+                    / sample.entry_count as u128;
+                weighted_sum.saturating_add(average_entry_bytes.saturating_mul(weight))
+            })
+            .saturating_add(5)
+            / 10;
+        // At the target load, entries = 0.70 * buckets. Each bucket head uses four bytes, so
+        // capacity = buckets * (4 + 0.70 * average entry footprint).
+        let denominator = 4u128
+            .saturating_mul(100)
+            .saturating_mul(HASH_BUCKET_ENTRY_SIZE_SCALE)
+            .saturating_add(
+                HASH_BUCKET_TARGET_LOAD_PERCENT.saturating_mul(weighted_average_entry_bytes),
+            );
+        let rounded_bucket_count = (memtable_capacity as u128)
+            .saturating_mul(100)
+            .saturating_mul(HASH_BUCKET_ENTRY_SIZE_SCALE)
+            .saturating_add(denominator / 2)
+            / denominator;
+        let rounded_bucket_count = usize::try_from(rounded_bucket_count).unwrap_or(usize::MAX);
+        self.recommended_bucket_count = Some(HashMemtable::clamp_bucket_count(
+            memtable_capacity,
+            rounded_bucket_count,
+        ));
+    }
+
+    fn bucket_count_for(&self, memtable_capacity: usize) -> usize {
+        self.recommended_bucket_count.map_or_else(
+            || HashMemtable::default_bucket_count(memtable_capacity),
+            |bucket_count| HashMemtable::clamp_bucket_count(memtable_capacity, bucket_count),
+        )
+    }
 }
 
 struct FlushJob {
@@ -757,6 +865,7 @@ impl MemtableManager {
             in_flight: 0,
             restore_in_progress: false,
             flush_results: Vec::new(),
+            hash_bucket_advisor: HashMemtableBucketAdvisor::default(),
         };
         let state = Arc::new(Mutex::new(state));
         let buffer_ready = Arc::new(Condvar::new());
@@ -1154,8 +1263,12 @@ impl MemtableManager {
             let memtable = match memtable_type {
                 MemtableType::Hash => {
                     let buffer = vec![0u8; memtable_capacity];
-                    MemtableImpl::Hash(HashMemtable::with_buffer_and_reclaimer(
+                    let bucket_count = state
+                        .hash_bucket_advisor
+                        .bucket_count_for(memtable_capacity);
+                    MemtableImpl::Hash(HashMemtable::with_buffer_and_bucket_count_and_reclaimer(
                         buffer,
+                        bucket_count,
                         reclaimer.clone(),
                     ))
                 }
@@ -1409,8 +1522,9 @@ impl MemtableManager {
                     self.allocate_one_key_value_special_vec_memtable_as_active(key, value)?;
                 } else {
                     // flush active memtable and retry
+                    let active_id = active.id;
                     drop(active);
-                    self.flush_active()?;
+                    self.flush_active_for_capacity_full(active_id)?;
                 }
             }
             _ => {
@@ -1593,6 +1707,14 @@ impl MemtableManager {
     }
 
     pub(crate) fn flush_active(&self) -> Result<Option<Uuid>> {
+        self.flush_active_with_auto_snapshot(FlushCause::Manual)
+    }
+
+    fn flush_active_for_capacity_full(&self, active_id: Uuid) -> Result<Option<Uuid>> {
+        self.flush_active_with_auto_snapshot(FlushCause::CapacityFull(active_id))
+    }
+
+    fn flush_active_with_auto_snapshot(&self, cause: FlushCause) -> Result<Option<Uuid>> {
         let auto_snapshot = self
             .auto_snapshot_manager
             .as_ref()
@@ -1601,7 +1723,7 @@ impl MemtableManager {
                 manager: manager.clone(),
                 truncation_cursors: None,
             });
-        self.flush_active_internal(auto_snapshot)
+        self.flush_active_internal(auto_snapshot, cause)
     }
 
     pub(crate) fn flush_snapshot(&self, snapshot_id: u64, manager: SnapshotManager) -> Result<()> {
@@ -1610,13 +1732,14 @@ impl MemtableManager {
             manager,
             truncation_cursors: None,
         };
-        let _ = self.flush_active_internal(Some(snapshot))?;
+        let _ = self.flush_active_internal(Some(snapshot), FlushCause::Snapshot)?;
         Ok(())
     }
 
     fn flush_active_internal(
         &self,
         mut snapshot: Option<SnapshotCompletion>,
+        cause: FlushCause,
     ) -> Result<Option<Uuid>> {
         self.db_lifecycle.ensure_open()?;
         let mut state = self.state.lock().unwrap();
@@ -1687,6 +1810,12 @@ impl MemtableManager {
         }
         drop(guard);
         let job = if let Some(to_flush) = to_flush {
+            state.hash_bucket_advisor.observe_flush(
+                cause,
+                to_flush.id,
+                to_flush.memtable.as_ref(),
+                self.memtable_capacity,
+            );
             Self::make_active_buffer(
                 &mut state,
                 &self.db_state,
@@ -2284,6 +2413,188 @@ mod tests {
             memtable.put_ref(&key, &value, 1).unwrap();
         }
         memtable
+    }
+
+    #[test]
+    fn hash_bucket_advisor_waits_for_three_samples_and_weights_them() {
+        let mut advisor = HashMemtableBucketAdvisor::default();
+        let capacity = 4096;
+        let default_bucket_count = HashMemtable::default_bucket_count(capacity);
+
+        advisor.record_capacity_full(
+            HashMemtableCapacitySample {
+                entry_count: 1,
+                used_entry_bytes: 100,
+            },
+            capacity,
+        );
+        advisor.record_capacity_full(
+            HashMemtableCapacitySample {
+                entry_count: 1,
+                used_entry_bytes: 200,
+            },
+            capacity,
+        );
+        assert_eq!(advisor.recommended_bucket_count, None);
+        assert_eq!(advisor.bucket_count_for(capacity), default_bucket_count);
+
+        advisor.record_capacity_full(
+            HashMemtableCapacitySample {
+                entry_count: 1,
+                used_entry_bytes: 300,
+            },
+            capacity,
+        );
+        // 20/30/50 weighting gives 230 bytes per entry, so B = round(4096 / (4 + .70 * 230)).
+        assert_eq!(advisor.recommended_bucket_count, Some(25));
+        assert_eq!(advisor.bucket_count_for(capacity), 25);
+    }
+
+    #[test]
+    fn hash_bucket_advisor_keeps_only_the_latest_three_samples() {
+        let mut advisor = HashMemtableBucketAdvisor::default();
+        let capacity = 4096;
+        for used_entry_bytes in [100, 200, 300, 400] {
+            advisor.record_capacity_full(
+                HashMemtableCapacitySample {
+                    entry_count: 1,
+                    used_entry_bytes,
+                },
+                capacity,
+            );
+        }
+
+        assert_eq!(
+            advisor
+                .capacity_full_samples
+                .iter()
+                .map(|sample| sample.used_entry_bytes)
+                .collect::<Vec<_>>(),
+            vec![200, 300, 400]
+        );
+        // 20/30/50 weighting gives 330 bytes per entry.
+        assert_eq!(advisor.recommended_bucket_count, Some(17));
+    }
+
+    #[test]
+    fn hash_bucket_advisor_ignores_manual_and_snapshot_flushes() {
+        let mut hash_memtable = HashMemtable::with_capacity(256);
+        hash_memtable.put(b"key", b"value").unwrap();
+        let memtable = MemtableImpl::Hash(hash_memtable);
+        let mut advisor = HashMemtableBucketAdvisor::default();
+
+        let memtable_id = Uuid::new_v4();
+        advisor.observe_flush(FlushCause::Manual, memtable_id, &memtable, 256);
+        advisor.observe_flush(FlushCause::Snapshot, memtable_id, &memtable, 256);
+        advisor.observe_flush(
+            FlushCause::CapacityFull(Uuid::new_v4()),
+            memtable_id,
+            &memtable,
+            256,
+        );
+        assert!(advisor.capacity_full_samples.is_empty());
+        assert_eq!(advisor.recommended_bucket_count, None);
+
+        advisor.observe_flush(
+            FlushCause::CapacityFull(memtable_id),
+            memtable_id,
+            &memtable,
+            256,
+        );
+        assert_eq!(advisor.capacity_full_samples.len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn hash_capacity_full_rotation_uses_recommended_bucket_count() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_test")
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-hash-advisor-test"));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let db_lifecycle = Arc::new(DbLifecycle::new_open());
+        let schema_manager = Arc::new(SchemaManager::new(1));
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::new(DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
+        let snapshot_manager = SnapshotManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&schema_manager),
+            Arc::clone(&db_lifecycle),
+            None,
+            false,
+            false,
+            vec![0..=u16::MAX],
+        );
+        let manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 256,
+                buffer_count: 2,
+                num_columns: 1,
+                write_stall_limit: 8,
+                schema_manager: Some(schema_manager),
+                auto_snapshot_manager: Some(snapshot_manager.clone()),
+                db_lifecycle: Some(db_lifecycle),
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        manager.open().unwrap();
+
+        {
+            let mut state = manager.state.lock().unwrap();
+            for used_entry_bytes in [100, 200, 300] {
+                state.hash_bucket_advisor.record_capacity_full(
+                    HashMemtableCapacitySample {
+                        entry_count: 1,
+                        used_entry_bytes,
+                    },
+                    256,
+                );
+            }
+            assert_eq!(state.hash_bucket_advisor.recommended_bucket_count, Some(2));
+        }
+
+        let large_value = vec![b'v'; 96];
+        for key_bytes in [b"key1".as_slice(), b"key2".as_slice(), b"key3".as_slice()] {
+            let key = RefKey::new(0, key_bytes);
+            let value = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, &large_value))]);
+            manager.put(&key, &value).unwrap();
+        }
+
+        let expected_bucket_count = {
+            let state = manager.state.lock().unwrap();
+            assert_ne!(
+                state
+                    .hash_bucket_advisor
+                    .capacity_full_samples
+                    .front()
+                    .map(|sample| sample.used_entry_bytes),
+                Some(100)
+            );
+            state.hash_bucket_advisor.bucket_count_for(256)
+        };
+        let active = manager.db_state.load().active.clone().unwrap();
+        let active = active.lock().unwrap();
+        let MemtableImpl::Hash(memtable) = active.memtable.as_ref().unwrap() else {
+            panic!("expected active HashMemtable");
+        };
+        assert_eq!(memtable.bucket_count(), expected_bucket_count);
+        drop(active);
+
+        let results = manager.wait_for_flushes();
+        assert!(!results.is_empty());
+        assert!(results.iter().all(Result::is_ok));
+        assert!(snapshot_manager.wait_for_materialization(Duration::from_secs(5)));
+        assert!(manager.db_state.load().suggested_base_snapshot_id.is_some());
+        snapshot_manager.close().unwrap();
+        cleanup_test_root();
     }
 
     #[test]
