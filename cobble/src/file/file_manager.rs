@@ -69,6 +69,15 @@ impl RandomAccessFile for CachedRandomAccessFile {
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
         self.inner.read_at(offset, size)
     }
+
+    fn read_at_async(
+        self: Arc<Self>,
+        offset: usize,
+        size: usize,
+        runtime: &tokio::runtime::Handle,
+    ) -> tokio::task::JoinHandle<Result<Bytes, Error>> {
+        Arc::clone(&self.inner).read_at_async(offset, size, runtime)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -479,13 +488,13 @@ impl Drop for TrackedFile {
 /// A wrapper around a RandomAccessFile that holds a reference to the TrackedFile.
 /// This ensures the TrackedFile is not dropped while the file is in use.
 pub struct TrackedReader {
-    inner: Box<dyn RandomAccessFile>,
+    inner: Arc<dyn RandomAccessFile>,
     _tracked: Arc<TrackedFile>,
 }
 
 impl TrackedReader {
     /// Creates a new TrackedReader.
-    pub fn new(inner: Box<dyn RandomAccessFile>, tracked: Arc<TrackedFile>) -> Self {
+    pub fn new(inner: Arc<dyn RandomAccessFile>, tracked: Arc<TrackedFile>) -> Self {
         Self {
             inner,
             _tracked: tracked,
@@ -495,7 +504,7 @@ impl TrackedReader {
 
 impl File for TrackedReader {
     fn close(&mut self) -> Result<(), Error> {
-        self.inner.close()
+        Arc::get_mut(&mut self.inner).map_or(Ok(()), File::close)
     }
 
     fn size(&self) -> usize {
@@ -506,6 +515,15 @@ impl File for TrackedReader {
 impl RandomAccessFile for TrackedReader {
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
         self.inner.read_at(offset, size)
+    }
+
+    fn read_at_async(
+        self: Arc<Self>,
+        offset: usize,
+        size: usize,
+        runtime: &tokio::runtime::Handle,
+    ) -> tokio::task::JoinHandle<Result<Bytes, Error>> {
+        Arc::clone(&self.inner).read_at_async(offset, size, runtime)
     }
 }
 
@@ -1322,7 +1340,7 @@ impl FileManager {
             cache.insert(file_id, Arc::clone(&reader));
             reader
         };
-        let reader = Box::new(CachedRandomAccessFile::new(reader));
+        let reader: Arc<dyn RandomAccessFile> = Arc::new(CachedRandomAccessFile::new(reader));
         Ok(TrackedReader::new(reader, Arc::clone(&tracked)))
     }
 
@@ -1611,7 +1629,7 @@ impl FileManager {
         })?;
 
         let reader = self.meta_volume.fs().open_read(tracked.path())?;
-        Ok(TrackedReader::new(reader, Arc::clone(&tracked)))
+        Ok(TrackedReader::new(reader.into(), Arc::clone(&tracked)))
     }
 
     /// Opens a metadata file for reading without tracking it.

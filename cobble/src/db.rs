@@ -2569,25 +2569,19 @@ mod tests {
         db.memtable_manager.flush_active().unwrap();
         let _ = db.memtable_manager.wait_for_flushes();
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        let mut options = ScanOptions::default();
+        options.read_ahead_bytes = Size::from_const(128);
+        let iter = db
+            .scan_with_options_bounds(0, None, None, &options)
             .unwrap();
-        runtime.block_on(async {
-            let mut options = ScanOptions::default();
-            options.read_ahead_bytes = Size::from_const(128);
-            let iter = db
-                .scan_with_options_bounds(0, None, None, &options)
-                .unwrap();
-            let mut keys = Vec::new();
-            for row in iter {
-                let (key, _) = row.unwrap();
-                keys.push(key);
-            }
-            assert_eq!(keys.len(), 2);
-            assert_eq!(keys[0].as_ref(), b"k1");
-            assert_eq!(keys[1].as_ref(), b"k2");
-        });
+        let mut keys = Vec::new();
+        for row in iter {
+            let (key, _) = row.unwrap();
+            keys.push(key);
+        }
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].as_ref(), b"k1");
+        assert_eq!(keys[1].as_ref(), b"k2");
 
         cleanup_test_root(root);
     }

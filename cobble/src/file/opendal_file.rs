@@ -42,9 +42,9 @@ impl RandomAccessFile for OpendalRandomAccessFile {
         self: Arc<Self>,
         offset: usize,
         size: usize,
+        runtime: &tokio::runtime::Handle,
     ) -> tokio::task::JoinHandle<Result<Bytes>> {
         let reader = self.reader.clone();
-        let runtime = Arc::clone(&self.runtime);
         runtime.spawn(async move {
             let result: opendal::Result<Buffer> =
                 reader.read(offset as u64..(offset + size) as u64).await;
