@@ -182,12 +182,18 @@ where
     fn get(&self, key: &K) -> Option<V> {
         match &self.backend {
             FoyerCacheBackend::Memory(cache) => cache.get(key).map(|entry| entry.value().clone()),
-            FoyerCacheBackend::Hybrid(cache) => cache
-                .runtime
-                .block_on(cache.inner.get(key))
-                .ok()
-                .flatten()
-                .map(|entry| entry.value().clone()),
+            FoyerCacheBackend::Hybrid(cache) => {
+                if let Some(entry) = cache.inner.memory().get(key) {
+                    return Some(entry.value().clone());
+                }
+
+                cache
+                    .runtime
+                    .block_on(cache.inner.get(key))
+                    .ok()
+                    .flatten()
+                    .map(|entry| entry.value().clone())
+            }
         }
     }
 
@@ -275,6 +281,65 @@ where
 
     fn clear(&self) {
         self.values.lock().unwrap().clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheHandle, FoyerCache, FoyerCacheBackend};
+
+    #[test]
+    fn hybrid_get_returns_memory_hit() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = FoyerCache::new_hybrid(
+            4 * 1024 * 1024,
+            16 * 1024 * 1024,
+            directory.path(),
+            |_, value: &Vec<u8>| value.len(),
+        )
+        .unwrap();
+        let key = 7_u64;
+        let value = vec![b'm'; 7 * 1024];
+
+        cache.insert(key, value.clone());
+
+        let FoyerCacheBackend::Hybrid(backend) = &cache.backend else {
+            panic!("expected hybrid cache backend");
+        };
+        assert_eq!(
+            backend
+                .inner
+                .memory()
+                .get(&key)
+                .map(|entry| entry.value().clone()),
+            Some(value.clone())
+        );
+        assert_eq!(cache.get(&key), Some(value));
+    }
+
+    #[test]
+    fn hybrid_get_falls_back_to_disk_after_memory_eviction() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = FoyerCache::new_hybrid(
+            4 * 1024 * 1024,
+            16 * 1024 * 1024,
+            directory.path(),
+            |_, value: &Vec<u8>| value.len(),
+        )
+        .unwrap();
+        let key = 8_u64;
+        let value = vec![b'd'; 7 * 1024];
+
+        cache.insert(key, value.clone());
+
+        let FoyerCacheBackend::Hybrid(backend) = &cache.backend else {
+            panic!("expected hybrid cache backend");
+        };
+        backend.inner.memory().evict_all();
+        backend.runtime.block_on(backend.inner.storage().wait());
+        assert!(backend.inner.memory().get(&key).is_none());
+
+        assert_eq!(cache.get(&key), Some(value));
     }
 }
 
