@@ -23,6 +23,7 @@ pub use self::file_system::{
     FileSystem, FileSystemRegistry, ProcessFileSystemRegistry, ProcessFileSystemRequest,
     clear_process_custom_file_system_registry, register_process_custom_file_system_registry,
 };
+pub(crate) use self::files::read_ahead_runtime;
 pub use self::files::{
     BufferedReader, BufferedWriter, File, RandomAccessFile, ReadAheadBufferedReader,
     SequentialWriteFile,

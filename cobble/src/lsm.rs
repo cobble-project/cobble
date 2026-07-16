@@ -10,7 +10,9 @@ use crate::compaction::{
 use crate::data_file::{DataFile, DataFileType, intersect_bucket_ranges};
 use crate::db_status::DbLifecycle;
 use crate::error::Result;
-use crate::file::{FileManager, ReadAheadBufferedReader, lsm_file_priority_for_level};
+use crate::file::{
+    FileManager, ReadAheadBufferedReader, lsm_file_priority_for_level, read_ahead_runtime,
+};
 use crate::iterator::{
     BucketFilterIterator, ColumnMaskingIterator, KvIterator, SchemaEvolvingIterator, SortedRun,
     VlogSeqOffsetIterator,
@@ -1050,7 +1052,7 @@ impl LSMTree {
         let selected_columns = selected_columns.map(|columns| columns.to_vec());
         let preload_scan_cursor_block = preload_scan_cursor_block && self.block_cache.is_some();
         let mut iterators: Vec<DynKvIterator> = Vec::new();
-        let use_read_ahead = read_ahead_bytes > 0 && tokio::runtime::Handle::try_current().is_ok();
+        let use_read_ahead = read_ahead_bytes > 0;
         let mut runs: Vec<SortedRun> = Vec::new();
         let target_num_columns = target_schema
             .num_columns_in_family(column_family_id)
@@ -1088,7 +1090,11 @@ impl LSMTree {
                     .unwrap_or(0);
                 let reader = file_manager.open_data_file_reader(file.file_id)?;
                 let reader: Box<dyn crate::file::RandomAccessFile> = if use_read_ahead {
-                    Box::new(ReadAheadBufferedReader::new(reader, read_ahead_bytes))
+                    Box::new(ReadAheadBufferedReader::new(
+                        reader,
+                        read_ahead_bytes,
+                        read_ahead_runtime(),
+                    ))
                 } else {
                     Box::new(reader)
                 };

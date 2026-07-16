@@ -1,7 +1,25 @@
 use crate::error::Error;
 use bytes::{Bytes, BytesMut};
+use std::sync::OnceLock;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex};
-use tokio::task::JoinHandle;
+use tokio::runtime::{Builder, Handle, Runtime};
+use tokio::task::{AbortHandle, JoinHandle};
+
+pub(crate) fn read_ahead_runtime() -> Handle {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name("cobble-read-ahead")
+                .build()
+                .expect("create Cobble read-ahead runtime")
+        })
+        .handle()
+        .clone()
+}
 
 pub trait File {
     fn close(&mut self) -> Result<(), Error>;
@@ -20,10 +38,9 @@ pub trait RandomAccessFile: File + Send + Sync + 'static {
         self: Arc<Self>,
         offset: usize,
         size: usize,
+        runtime: &Handle,
     ) -> JoinHandle<Result<Bytes, Error>> {
-        let handle = tokio::runtime::Handle::try_current()
-            .expect("Read-ahead requires an active tokio runtime");
-        handle.spawn_blocking(move || self.read_at(offset, size))
+        runtime.spawn_blocking(move || self.read_at(offset, size))
     }
 }
 
@@ -125,12 +142,15 @@ impl<R: RandomAccessFile> BufferedReader<R> {
 
 struct PrefetchState {
     offset: usize,
-    handle: JoinHandle<Result<Bytes, Error>>,
+    result: Receiver<Result<Bytes, Error>>,
+    relay: JoinHandle<()>,
+    io_abort: AbortHandle,
 }
 
 impl PrefetchState {
     fn abort(self) {
-        self.handle.abort();
+        self.io_abort.abort();
+        self.relay.abort();
     }
 }
 
@@ -144,16 +164,18 @@ struct ReadAheadState {
 /// It buffers a fixed-size window and asynchronously prefetches the next window.
 pub struct ReadAheadBufferedReader<R: RandomAccessFile> {
     inner: Arc<R>,
+    runtime: Handle,
     buffer_size: usize,
     file_size: usize,
     state: Mutex<ReadAheadState>,
 }
 
 impl<R: RandomAccessFile> ReadAheadBufferedReader<R> {
-    pub fn new(inner: R, buffer_size: usize) -> Self {
+    pub fn new(inner: R, buffer_size: usize, runtime: Handle) -> Self {
         let file_size = inner.size();
         Self {
             inner: Arc::new(inner),
+            runtime,
             buffer_size,
             file_size,
             state: Mutex::new(ReadAheadState {
@@ -165,13 +187,7 @@ impl<R: RandomAccessFile> ReadAheadBufferedReader<R> {
     }
 
     fn join_prefetch(&self, prefetch: PrefetchState) -> Result<Bytes, Error> {
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| Error::IoError("Read-ahead requires a tokio runtime".to_string()))?;
-        match handle.block_on(prefetch.handle) {
-            Ok(result) => result,
-            Err(err) if err.is_cancelled() => Ok(Bytes::new()),
-            Err(err) => Err(Error::IoError(format!("Read-ahead task failed: {}", err))),
-        }
+        prefetch.result.recv().unwrap_or_else(|_| Ok(Bytes::new()))
     }
 
     fn cancel_prefetch(&self) -> Result<(), Error> {
@@ -193,7 +209,7 @@ impl<R: RandomAccessFile> ReadAheadBufferedReader<R> {
             return;
         }
         if let Some(existing) = &state.prefetch
-            && !existing.handle.is_finished()
+            && !existing.relay.is_finished()
         {
             return;
         }
@@ -201,8 +217,23 @@ impl<R: RandomAccessFile> ReadAheadBufferedReader<R> {
         if size == 0 {
             return;
         }
-        let handle = Arc::clone(&self.inner).read_at_async(offset, size);
-        state.prefetch = Some(PrefetchState { offset, handle });
+        let io = Arc::clone(&self.inner).read_at_async(offset, size, &self.runtime);
+        let io_abort = io.abort_handle();
+        let (sender, result) = sync_channel(1);
+        let relay = self.runtime.spawn(async move {
+            let result = match io.await {
+                Ok(result) => result,
+                Err(err) if err.is_cancelled() => Ok(Bytes::new()),
+                Err(err) => Err(Error::IoError(format!("Read-ahead task failed: {}", err))),
+            };
+            let _ = sender.send(result);
+        });
+        state.prefetch = Some(PrefetchState {
+            offset,
+            result,
+            relay,
+            io_abort,
+        });
     }
 
     pub fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
@@ -236,7 +267,7 @@ impl<R: RandomAccessFile> ReadAheadBufferedReader<R> {
                         let start = offset - state.buffer_offset;
                         return Ok(state.buffer.slice(start..start + size));
                     }
-                } else if !prefetch.handle.is_finished() {
+                } else if !prefetch.relay.is_finished() {
                     state.prefetch = Some(prefetch);
                 }
             }
@@ -411,10 +442,11 @@ mod tests {
             self: Arc<Self>,
             offset: usize,
             size: usize,
+            runtime: &Handle,
         ) -> JoinHandle<Result<Bytes, Error>> {
             let gate = Arc::clone(&self.prefetch_gate);
             let stopped = Arc::clone(&self.pending_prefetch_stopped);
-            tokio::spawn(async move {
+            runtime.spawn(async move {
                 struct StopGuard {
                     stopped: Arc<AtomicBool>,
                 }
@@ -572,53 +604,63 @@ mod tests {
 
     #[test]
     fn test_read_ahead_close_aborts_pending_prefetch() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        {
-            let _guard = runtime.enter();
-            let gate = Arc::new(Notify::new());
-            let file = AbortTrackingRandomAccessFile {
-                data: Bytes::from_static(b"0123456789"),
-                pending_prefetch_stopped: Arc::new(AtomicBool::new(false)),
-                prefetch_gate: Arc::clone(&gate),
-            };
-            let mut reader = ReadAheadBufferedReader::new(file, 4);
+        let gate = Arc::new(Notify::new());
+        let file = AbortTrackingRandomAccessFile {
+            data: Bytes::from_static(b"0123456789"),
+            pending_prefetch_stopped: Arc::new(AtomicBool::new(false)),
+            prefetch_gate: Arc::clone(&gate),
+        };
+        let mut reader = ReadAheadBufferedReader::new(file, 4, read_ahead_runtime());
 
-            assert_eq!(&reader.read_at(0, 2).unwrap()[..], b"01");
-            assert!(
-                reader.state.lock().unwrap().prefetch.is_some(),
-                "prefetch should be scheduled after the initial read"
-            );
+        assert_eq!(&reader.read_at(0, 2).unwrap()[..], b"01");
+        assert!(
+            reader.state.lock().unwrap().prefetch.is_some(),
+            "prefetch should be scheduled after the initial read"
+        );
 
-            reader.close().unwrap();
-            assert!(
-                reader.state.lock().unwrap().prefetch.is_none(),
-                "close should clear the in-flight prefetch handle"
-            );
-        }
-        runtime.block_on(tokio::task::yield_now());
+        reader.close().unwrap();
+        assert!(
+            reader.state.lock().unwrap().prefetch.is_none(),
+            "close should clear the in-flight prefetch handle"
+        );
     }
 
     #[test]
     fn test_read_ahead_cancelled_prefetch_falls_back_to_sync_read() {
+        let gate = Arc::new(Notify::new());
+        let file = AbortTrackingRandomAccessFile {
+            data: Bytes::from_static(b"0123456789"),
+            pending_prefetch_stopped: Arc::new(AtomicBool::new(false)),
+            prefetch_gate: Arc::clone(&gate),
+        };
+        let reader = ReadAheadBufferedReader::new(file, 4, read_ahead_runtime());
+
+        assert_eq!(&reader.read_at(0, 2).unwrap()[..], b"01");
+        reader.cancel_prefetch().unwrap();
+        assert!(
+            reader.state.lock().unwrap().prefetch.is_none(),
+            "explicit cancellation should clear the in-flight prefetch handle"
+        );
+        assert_eq!(&reader.read_at(4, 2).unwrap()[..], b"45");
+    }
+
+    #[test]
+    fn test_read_ahead_from_tokio_context() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        {
-            let _guard = runtime.enter();
+        runtime.block_on(async {
             let gate = Arc::new(Notify::new());
             let file = AbortTrackingRandomAccessFile {
                 data: Bytes::from_static(b"0123456789"),
                 pending_prefetch_stopped: Arc::new(AtomicBool::new(false)),
                 prefetch_gate: Arc::clone(&gate),
             };
-            let reader = ReadAheadBufferedReader::new(file, 4);
+            let reader = ReadAheadBufferedReader::new(file, 4, read_ahead_runtime());
 
             assert_eq!(&reader.read_at(0, 2).unwrap()[..], b"01");
-            reader.cancel_prefetch().unwrap();
-            assert!(
-                reader.state.lock().unwrap().prefetch.is_none(),
-                "explicit cancellation should clear the in-flight prefetch handle"
-            );
+            gate.notify_one();
             assert_eq!(&reader.read_at(4, 2).unwrap()[..], b"45");
-        }
-        runtime.block_on(tokio::task::yield_now());
+            gate.notify_one();
+            assert_eq!(&reader.read_at(8, 2).unwrap()[..], b"89");
+        });
     }
 }

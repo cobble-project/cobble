@@ -14,7 +14,7 @@ use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{TruncationCursorId, TruncationCursorMap};
 use crate::db_status::DbLifecycle;
 use crate::error::Result;
-use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId};
+use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId, read_ahead_runtime};
 use crate::format::{FileBuilder, FileBuilderFactory};
 use crate::iterator::{
     BucketFilterIterator, DeduplicatingIterator, KvIterator, MergingIterator,
@@ -404,8 +404,7 @@ impl CompactionExecutor {
     fn run_compaction(task: CompactionTask, options: CompactionConfig) -> Result<CompactionResult> {
         let mut all_iters: Vec<Box<dyn for<'a> KvIterator<'a>>> = Vec::new();
         let mut read_bytes = 0u64;
-        let use_read_ahead =
-            options.read_ahead_enabled && tokio::runtime::Handle::try_current().is_ok();
+        let use_read_ahead = options.read_ahead_enabled;
         let target_schema = task.schema_manager.latest_schema();
         let column_family_id = task.column_family_id;
         let num_columns = target_schema
@@ -440,6 +439,7 @@ impl CompactionExecutor {
                     Box::new(ReadAheadBufferedReader::new(
                         reader,
                         options.read_buffer_size,
+                        read_ahead_runtime(),
                     ))
                 } else {
                     Box::new(reader)
