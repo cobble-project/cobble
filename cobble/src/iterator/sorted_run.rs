@@ -138,7 +138,7 @@ where
         }
     }
 
-    fn load_file(&mut self, idx: usize) -> Result<bool> {
+    fn load_file(&mut self, idx: usize, target: Option<&[u8]>) -> Result<bool> {
         if idx >= self.files.len() {
             self.current_iter = None;
             return Ok(false);
@@ -146,7 +146,10 @@ where
 
         let mut iter = (self.create_iterator)(&self.files[idx])?;
         iter.set_stop_at_block_boundary(self.should_stop_at_block_boundary);
-        iter.seek_to_first()?;
+        match target {
+            Some(target) => iter.seek(target)?,
+            None => iter.seek_to_first()?,
+        }
         self.current_file_idx = idx;
         self.current_iter = Some(iter);
         Ok(true)
@@ -182,14 +185,13 @@ where
             return Ok(());
         }
 
-        self.load_file(file_idx)?;
+        self.load_file(file_idx, Some(target))?;
 
         if let Some(iter) = &mut self.current_iter {
-            iter.seek(target)?;
             // If the current iterator is not valid after seek,
             // the target might be between files, try the next file
             if !iter.valid() && file_idx + 1 < self.files.len() {
-                self.load_file(file_idx + 1)?;
+                self.load_file(file_idx + 1, None)?;
             }
         }
 
@@ -204,7 +206,7 @@ where
             self.current_iter = None;
             return Ok(());
         }
-        self.load_file(0)?;
+        self.load_file(0, None)?;
         Ok(())
     }
 
@@ -226,7 +228,7 @@ where
             }
         }
         if let Some(next_idx) = self.pending_file_boundary.take() {
-            self.load_file(next_idx)?;
+            self.load_file(next_idx, None)?;
             return Ok(self.current_iter.as_ref().is_some_and(|i| i.valid()));
         }
         if let Some(iter) = &mut self.current_iter {
@@ -248,7 +250,7 @@ where
                     self.stopped_at_block_boundary = true;
                     return Ok(false);
                 }
-                self.load_file(next_idx)?;
+                self.load_file(next_idx, None)?;
                 return Ok(self.current_iter.as_ref().is_some_and(|i| i.valid()));
             } else {
                 self.current_iter = None;
@@ -313,6 +315,45 @@ mod tests {
     use super::*;
     use crate::data_file::DataFileType;
     use crate::iterator::mock_iterator::MockIterator;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingIterator {
+        inner: MockIterator,
+        seek_calls: Arc<AtomicUsize>,
+        seek_to_first_calls: Arc<AtomicUsize>,
+    }
+
+    impl<'a> KvIterator<'a> for CountingIterator {
+        fn seek(&mut self, target: &[u8]) -> Result<()> {
+            self.seek_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.seek(target)
+        }
+
+        fn seek_to_first(&mut self) -> Result<()> {
+            self.seek_to_first_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.seek_to_first()
+        }
+
+        fn next(&mut self) -> Result<bool> {
+            self.inner.next()
+        }
+
+        fn valid(&self) -> bool {
+            self.inner.valid()
+        }
+
+        fn key(&self) -> Result<Option<&[u8]>> {
+            self.inner.key()
+        }
+
+        fn take_key(&mut self) -> Result<Option<Bytes>> {
+            self.inner.take_key()
+        }
+
+        fn take_value(&mut self) -> Result<Option<KvValue>> {
+            self.inner.take_value()
+        }
+    }
 
     fn create_data_file(id: u64, start: &[u8], end: &[u8]) -> Arc<DataFile> {
         let bucket_range = DataFile::bucket_range_from_keys(start, end);
@@ -455,5 +496,41 @@ mod tests {
         iter.seek(b"d").unwrap();
         assert!(iter.valid());
         assert_eq!(iter.key().unwrap().unwrap(), b"d");
+    }
+
+    #[test]
+    fn test_sorted_run_seek_only_seeks_loaded_child_once() {
+        let files = vec![
+            create_data_file(1, b"a", b"c"),
+            create_data_file(2, b"d", b"f"),
+        ];
+        let seek_calls = Arc::new(AtomicUsize::new(0));
+        let seek_to_first_calls = Arc::new(AtomicUsize::new(0));
+        let seek_calls_for_factory = Arc::clone(&seek_calls);
+        let seek_to_first_calls_for_factory = Arc::clone(&seek_to_first_calls);
+        let run = SortedRun::new(1, files);
+        let mut iter = run.iter(move |file: &DataFile| {
+            let entries = if file.file_id == 1 {
+                vec![(b"a".as_slice(), b"v1"), (b"b", b"v2")]
+            } else {
+                vec![(b"d".as_slice(), b"v3"), (b"e", b"v4")]
+            };
+            Ok(CountingIterator {
+                inner: MockIterator::new(entries),
+                seek_calls: Arc::clone(&seek_calls_for_factory),
+                seek_to_first_calls: Arc::clone(&seek_to_first_calls_for_factory),
+            })
+        });
+
+        iter.seek(b"b").unwrap();
+
+        assert_eq!(seek_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(seek_to_first_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(iter.key().unwrap(), Some(b"b".as_slice()));
+
+        assert!(iter.next().unwrap());
+        assert_eq!(iter.key().unwrap(), Some(b"d".as_slice()));
+        assert_eq!(seek_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(seek_to_first_calls.load(Ordering::Relaxed), 1);
     }
 }
