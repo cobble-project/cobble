@@ -43,7 +43,7 @@ volumes:
 # Memtable settings.
 memtable_capacity: "64MiB"
 memtable_buffer_count: 2                 # active + immutable buffers
-memtable_type: hash                      # hash | skiplist | vec
+memtable_type: skiplist                  # hash | skiplist | vec
 
 # Value schema / shard-bucket settings.
 num_columns: 1

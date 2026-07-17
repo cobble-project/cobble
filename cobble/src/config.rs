@@ -128,8 +128,8 @@ pub enum PrimaryVolumeOffloadPolicyKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemtableType {
-    #[default]
     Hash,
+    #[default]
     Skiplist,
     Vec,
 }
@@ -816,7 +816,7 @@ impl Default for Config {
             volumes: VolumeDescriptor::single_volume("file:///tmp/cobble"),
             memtable_capacity: Size::from_mib(64),
             memtable_buffer_count: 2,
-            memtable_type: MemtableType::Hash,
+            memtable_type: MemtableType::Skiplist,
             num_columns: 1,
             total_buckets: 1,
             l0_file_limit: 4,
@@ -1330,6 +1330,12 @@ mod tests {
     use tempfile::Builder;
 
     #[test]
+    fn test_default_memtable_type_is_skiplist() {
+        assert_eq!(MemtableType::default(), MemtableType::Skiplist);
+        assert_eq!(Config::default().memtable_type, MemtableType::Skiplist);
+    }
+
+    #[test]
     fn test_config_from_file_round_trip() {
         let mut volume = VolumeDescriptor::new(
             "file:///tmp/cobble".to_string(),
@@ -1758,6 +1764,7 @@ mod tests {
         }"#;
         let decoded = Config::from_json_str(json).expect("Cannot deserialize partial json");
         assert_eq!(decoded.memtable_capacity, Size::from_kib(2));
+        assert_eq!(decoded.memtable_type, MemtableType::Skiplist);
         assert_eq!(decoded.num_columns, Config::default().num_columns);
         assert_eq!(decoded.data_file_type, Config::default().data_file_type);
         assert!(decoded.block_checksum_enabled);
@@ -1872,7 +1879,7 @@ mod tests {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../template/config.yaml");
         let parsed = Config::from_path(path).expect("template/config.yaml should be valid");
         assert_eq!(parsed.total_buckets, 1);
-        assert_eq!(parsed.memtable_type, MemtableType::Hash);
+        assert_eq!(parsed.memtable_type, MemtableType::Skiplist);
         assert_eq!(parsed.data_file_type, DataFileType::SSTable);
         assert_eq!(
             parsed.primary_volume_offload_policy,

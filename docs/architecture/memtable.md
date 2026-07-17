@@ -12,13 +12,13 @@ The memtable is Cobble's in-memory write buffer. All incoming writes — `put`, 
 
 Cobble provides three memtable implementations, each optimized for different access patterns. You select one via `memtable_type`:
 
-### Hash (default)
+### Hash
 
-Uses a hash table with chaining. Point lookups are O(1) on average, making it the best choice when you need to read recently written data frequently. At flush time, entries are sorted before writing to disk. This is the default and recommended for most workloads.
+Uses a hash table with chaining. Point lookups are O(1) on average, making it the best choice when you need to read recently written data frequently. At flush time, entries are sorted before writing to disk.
 
-### Skiplist
+### Skiplist (default)
 
-Uses a probabilistic balanced tree. Entries are always maintained in sorted order, so iteration and range queries over the memtable are efficient. Point lookups are O(log n). Choose Skiplist if your application frequently scans over recently written data before it has been flushed.
+Uses a probabilistic balanced tree. Entries are always maintained in sorted order, so iteration and range queries over the memtable are efficient. Point lookups are O(log n). This is the default and recommended for workloads that frequently scan recently written data before it has been flushed.
 
 ### Vec
 

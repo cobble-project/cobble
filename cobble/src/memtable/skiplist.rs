@@ -12,6 +12,7 @@ use crate::r#type::{RefKey, RefValue};
 use crate::util::unsafe_bytes;
 use bytes::Bytes;
 use std::cmp::Ordering;
+use std::ops::Range;
 
 const NULL_OFFSET: u32 = u32::MAX;
 const MAX_HEIGHT: usize = 12;
@@ -278,6 +279,29 @@ impl SkiplistMemtable {
 
     pub(crate) fn node_entry(&self, node: u32) -> Option<(&[u8], &[u8])> {
         self.node_key_value(node)
+    }
+
+    /// Returns the contiguous key-value payload range and key length for a node.
+    pub(crate) fn node_entry_range(&self, node: u32) -> Option<(Range<usize>, usize)> {
+        let entry_offset = self.node_entry_offset(node)?;
+        let key_start = self.node_key_start(node)?;
+        let key_len = self.node_key_len(node)?;
+        if entry_offset.checked_add(8)? != key_start {
+            return None;
+        }
+        let value_len = self.read_u32_le(entry_offset.checked_add(4)?)? as usize;
+        let value_end = key_start.checked_add(key_len)?.checked_add(value_len)?;
+        if value_end > self.data_end {
+            return None;
+        }
+        Some((key_start..value_end, key_len))
+    }
+
+    pub(crate) fn entry_bytes(&self, range: &Range<usize>) -> Option<&[u8]> {
+        if range.start > range.end || range.end > self.data_end {
+            return None;
+        }
+        Some(&self.buffer[range.clone()])
     }
 
     fn set_node_next(&mut self, node: u32, level: usize, next: u32) -> Result<()> {

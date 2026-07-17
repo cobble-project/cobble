@@ -33,6 +33,7 @@ use crate::vlog::{VlogEdit, VlogStore};
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::{debug, trace, warn};
 use metrics::{Counter, counter};
+use std::ops::{ControlFlow, Range};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -88,7 +89,7 @@ impl Default for MemtableManagerOptions {
                 ..SSTWriterOptions::default()
             }),
             num_columns: 1,
-            memtable_type: MemtableType::Hash,
+            memtable_type: MemtableType::Skiplist,
             write_stall_limit: 8,
             auto_snapshot_manager: None,
             metrics_manager: None,
@@ -302,6 +303,23 @@ enum MemtableScanSource {
     Immutable(Arc<MemtableImpl>),
 }
 
+/// Keeps an immutable skiplist entry alive for `Bytes` views that outlive a scan cursor.
+struct ImmutableSkiplistEntry {
+    memtable: Arc<MemtableImpl>,
+    range: Range<usize>,
+}
+
+impl AsRef<[u8]> for ImmutableSkiplistEntry {
+    fn as_ref(&self) -> &[u8] {
+        let MemtableImpl::Skiplist(skiplist_memtable) = self.memtable.as_ref() else {
+            unreachable!("immutable skiplist entry must keep a skiplist memtable")
+        };
+        skiplist_memtable
+            .entry_bytes(&self.range)
+            .expect("immutable skiplist entry must remain valid")
+    }
+}
+
 struct SkiplistScanCursor {
     source: MemtableScanSource,
     end_bound_exclusive: Option<Bytes>,
@@ -322,14 +340,14 @@ impl SkiplistScanCursor {
     }
 
     fn read_skiplist_node(&self, node: u32) -> Result<Option<(Bytes, Bytes, Option<u32>)>> {
-        let read_from_skiplist = |memtable: &SkiplistMemtable| {
-            memtable.node_entry(node).map(|(key, value)| {
-                (
-                    Bytes::copy_from_slice(key),
-                    Bytes::copy_from_slice(value),
-                    memtable.next_node_offset(node),
-                )
-            })
+        let copy_active_entry = |memtable: &SkiplistMemtable| {
+            let (range, key_len) = memtable.node_entry_range(node)?;
+            let entry = Bytes::copy_from_slice(memtable.entry_bytes(&range)?);
+            Some((
+                entry.slice(..key_len),
+                entry.slice(key_len..),
+                memtable.next_node_offset(node),
+            ))
         };
         match &self.source {
             MemtableScanSource::Active(active) => {
@@ -339,7 +357,7 @@ impl SkiplistScanCursor {
                 };
                 match memtable {
                     MemtableImpl::Skiplist(skiplist_memtable) => {
-                        Ok(read_from_skiplist(skiplist_memtable))
+                        Ok(copy_active_entry(skiplist_memtable))
                     }
                     _ => Err(InvalidState(
                         "skiplist iterator expected skiplist active memtable".to_string(),
@@ -348,7 +366,18 @@ impl SkiplistScanCursor {
             }
             MemtableScanSource::Immutable(memtable) => match memtable.as_ref() {
                 MemtableImpl::Skiplist(skiplist_memtable) => {
-                    Ok(read_from_skiplist(skiplist_memtable))
+                    let Some((range, key_len)) = skiplist_memtable.node_entry_range(node) else {
+                        return Ok(None);
+                    };
+                    let entry = Bytes::from_owner(ImmutableSkiplistEntry {
+                        memtable: Arc::clone(memtable),
+                        range,
+                    });
+                    Ok(Some((
+                        entry.slice(..key_len),
+                        entry.slice(key_len..),
+                        skiplist_memtable.next_node_offset(node),
+                    )))
                 }
                 _ => Err(InvalidState(
                     "skiplist iterator expected skiplist immutable memtable".to_string(),
@@ -1556,17 +1585,40 @@ impl MemtableManager {
     where
         F: FnMut(&[u8], &Schema) -> Result<()>,
     {
+        self.get_all_with_snapshot_until(snapshot, key, |value, schema| {
+            f(value, schema)?;
+            Ok(ControlFlow::Continue(()))
+        })
+    }
+
+    /// Visits values newest-to-oldest, stopping when the visitor returns `Break`.
+    ///
+    /// This keeps the active lock only while visiting its own values. Callers that can prove an
+    /// observed value hides every older version can avoid traversing immutable memtables.
+    pub(crate) fn get_all_with_snapshot_until<F>(
+        &self,
+        snapshot: Arc<DbState>,
+        key: &[u8],
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &Schema) -> Result<ControlFlow<()>>,
+    {
         if let Some(active) = &snapshot.active {
             let active = active.lock().unwrap();
             let memtable = active.memtable.as_ref().expect("active memtable exists");
             for value in memtable.get_all(key) {
-                f(value, active.schema.as_ref())?;
+                if f(value, active.schema.as_ref())?.is_break() {
+                    return Ok(());
+                }
             }
             drop(active);
         }
         for immutable in snapshot.immutables.iter().rev() {
             for value in immutable.memtable.get_all(key) {
-                f(value, immutable.schema.as_ref())?;
+                if f(value, immutable.schema.as_ref())?.is_break() {
+                    return Ok(());
+                }
             }
         }
         Ok(())
@@ -2396,7 +2448,16 @@ mod tests {
     use crate::vlog::VlogStore;
     use bytes::Bytes;
     use std::collections::VecDeque;
+    use std::ops::ControlFlow;
     use uuid::Uuid;
+
+    #[test]
+    fn default_options_use_skiplist_memtable() {
+        assert_eq!(
+            MemtableManagerOptions::default().memtable_type,
+            MemtableType::Skiplist
+        );
+    }
 
     fn cleanup_test_root() {
         let _ = std::fs::remove_dir_all("/tmp/memtable_manager_test");
@@ -2423,6 +2484,200 @@ mod tests {
             memtable.put_ref(&key, &value, 1).unwrap();
         }
         memtable
+    }
+
+    #[test]
+    fn get_all_until_stops_before_older_active_and_immutable_values() {
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_point_get")
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-point-get-test"));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::new(DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
+        let manager = MemtableManager::new(file_manager, lsm_tree, Default::default()).unwrap();
+        let schema = manager.schema_manager.latest_schema();
+        let snapshot = Arc::new(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: Vec::new() }),
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: Some(Arc::new(Mutex::new(ActiveMemtable {
+                id: Uuid::new_v4(),
+                schema: Arc::clone(&schema),
+                memtable: Some(build_test_memtable(
+                    MemtableType::Skiplist,
+                    &[
+                        (b"k", ValueType::Put, b"old-active"),
+                        (b"k", ValueType::Put, b"new-active"),
+                    ],
+                )),
+            }))),
+            immutables: VecDeque::from([ImmutableMemtable {
+                id: Uuid::new_v4(),
+                schema,
+                memtable: Arc::new(build_test_memtable(
+                    MemtableType::Skiplist,
+                    &[(b"k", ValueType::Put, b"immutable")],
+                )),
+            }]),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
+            suggested_base_snapshot_id: None,
+        });
+
+        let key = encode_scan_key(0, 0, b"k");
+        let mut visited = Vec::new();
+        manager
+            .get_all_with_snapshot_until(snapshot, key.as_ref(), |raw, _| {
+                visited.push(Bytes::copy_from_slice(raw));
+                Ok(ControlFlow::Break(()))
+            })
+            .unwrap();
+
+        assert_eq!(visited.len(), 1);
+        let mut value = visited.pop().unwrap();
+        let decoded = decode_value(&mut value, 1).unwrap();
+        assert_eq!(
+            decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"new-active"
+        );
+        manager.force_close();
+    }
+
+    fn build_test_skiplist_with_reclaimer(
+        entries: &[(&[u8], ValueType, &[u8])],
+        reclaimer: MemtableReclaimer,
+    ) -> Arc<MemtableImpl> {
+        let mut memtable = SkiplistMemtable::with_buffer_and_reclaimer(vec![0; 4096], reclaimer);
+        for (key_bytes, value_type, value_bytes) in entries {
+            let key = RefKey::new(0, key_bytes);
+            let value = RefValue::new(vec![Some(RefColumn::new(*value_type, value_bytes))]);
+            memtable.put_ref(&key, &value, 1).unwrap();
+        }
+        Arc::new(MemtableImpl::Skiplist(memtable))
+    }
+
+    #[test]
+    fn skiplist_scan_cursor_immutable_pins_and_borrows_without_copy() {
+        let reclaimed = Arc::new(AtomicUsize::new(0));
+        let reclaimer: MemtableReclaimer = {
+            let reclaimed = Arc::clone(&reclaimed);
+            Arc::new(move |_| {
+                reclaimed.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let memtable = build_test_skiplist_with_reclaimer(
+            &[
+                (b"a", ValueType::Put, b"outside"),
+                (b"b", ValueType::Put, b"old"),
+                (b"b", ValueType::Delete, b""),
+                (b"b", ValueType::Put, b"new"),
+                (b"c", ValueType::Put, b"outside"),
+            ],
+            reclaimer,
+        );
+        let start = encode_scan_key(0, 0, b"b");
+        let end = encode_scan_key(0, 0, b"c");
+        let expected_key_ptr = match memtable.as_ref() {
+            MemtableImpl::Skiplist(skiplist_memtable) => {
+                let mut iter = skiplist_memtable.iter();
+                iter.seek(start.as_ref()).unwrap();
+                assert!(iter.next().unwrap());
+                iter.key().unwrap().unwrap().as_ptr()
+            }
+            _ => unreachable!(),
+        };
+        let mut cursor = SkiplistScanCursor::new(
+            MemtableScanSource::Immutable(Arc::clone(&memtable)),
+            Some(end),
+        );
+        drop(memtable);
+        assert_eq!(reclaimed.load(Ordering::Relaxed), 0);
+
+        cursor.seek(start.as_ref()).unwrap();
+        let retained_key = cursor.take_key().unwrap().unwrap();
+        let retained_value = cursor.take_value().unwrap().unwrap().unwrap_encoded();
+        assert_eq!(retained_key.as_ptr(), expected_key_ptr);
+        assert_eq!(
+            retained_value.as_ptr(),
+            retained_key.as_ptr().wrapping_add(retained_key.len())
+        );
+        assert_eq!(retained_key.as_ref(), start.as_ref());
+        assert!(cursor.next().unwrap());
+        for (index, (expected_type, expected_data)) in [
+            (ValueType::Delete, b"".as_slice()),
+            (ValueType::Put, b"old".as_slice()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(cursor.valid());
+            assert_eq!(cursor.key().unwrap(), Some(start.as_ref()));
+            let mut value = cursor.take_value().unwrap().unwrap().unwrap_encoded();
+            let decoded = decode_value(&mut value, 1).unwrap();
+            let column = decoded.columns()[0].as_ref().unwrap();
+            assert_eq!(column.value_type, expected_type);
+            assert_eq!(column.data().as_ref(), expected_data);
+            assert_eq!(cursor.next().unwrap(), index == 0);
+        }
+        assert!(!cursor.valid());
+        drop(cursor);
+        assert_eq!(reclaimed.load(Ordering::Relaxed), 0);
+        let mut retained_value = retained_value;
+        let retained = decode_value(&mut retained_value, 1).unwrap();
+        assert_eq!(
+            retained.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"new"
+        );
+        drop(retained);
+        drop(retained_key);
+        drop(retained_value);
+        assert_eq!(reclaimed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn skiplist_scan_cursor_active_releases_lock_and_retains_entry_across_rotation() {
+        let schema = Arc::new(Schema::new(1, 1, Vec::new()));
+        let active = Arc::new(Mutex::new(ActiveMemtable {
+            id: Uuid::new_v4(),
+            schema,
+            memtable: Some(build_test_memtable(
+                MemtableType::Skiplist,
+                &[(b"a", ValueType::Put, b"value")],
+            )),
+        }));
+        let mut active_cursor =
+            SkiplistScanCursor::new(MemtableScanSource::Active(Arc::clone(&active)), None);
+
+        active_cursor.seek_to_first().unwrap();
+        assert!(active.try_lock().is_ok());
+
+        let rotated = {
+            let mut active_guard = active.lock().unwrap();
+            active_guard.memtable.take().unwrap()
+        };
+        let key = active_cursor.take_key().unwrap().unwrap();
+        let value = active_cursor
+            .take_value()
+            .unwrap()
+            .unwrap()
+            .unwrap_encoded();
+        drop(rotated);
+        assert_eq!(key.as_ref(), encode_scan_key(0, 0, b"a").as_ref());
+        let mut decoded = value;
+        assert_eq!(
+            decode_value(&mut decoded, 1).unwrap().columns()[0]
+                .as_ref()
+                .unwrap()
+                .data()
+                .as_ref(),
+            b"value"
+        );
+        assert!(!active_cursor.next().unwrap());
     }
 
     #[test]
@@ -2546,6 +2801,7 @@ mod tests {
             MemtableManagerOptions {
                 memtable_capacity: 256,
                 buffer_count: 2,
+                memtable_type: MemtableType::Hash,
                 num_columns: 1,
                 write_stall_limit: 8,
                 schema_manager: Some(schema_manager),
