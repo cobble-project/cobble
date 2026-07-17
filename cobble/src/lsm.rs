@@ -12,7 +12,8 @@ use crate::data_file::{DataFile, DataFileType, intersect_bucket_ranges};
 use crate::db_status::DbLifecycle;
 use crate::error::Result;
 use crate::file::{
-    FileManager, ReadAheadBufferedReader, lsm_file_priority_for_level, read_ahead_runtime,
+    FileManager, RandomAccessFile, ReadAheadBufferedReader, lsm_file_priority_for_level,
+    read_ahead_runtime,
 };
 use crate::iterator::{
     BucketFilterIterator, ColumnMaskingIterator, KvIterator, SchemaEvolvingIterator, SortedRun,
@@ -1067,7 +1068,6 @@ impl LSMTree {
         let preload_scan_cursor_block = preload_scan_cursor_block && self.block_cache.is_some();
         let read_metadata_cache_mode = self.sst_read_metadata_cache_mode;
         let mut iterators: Vec<DynKvIterator> = Vec::new();
-        let use_read_ahead = read_ahead_bytes > 0;
         let mut runs: Vec<SortedRun> = Vec::new();
         let target_num_columns = target_schema
             .num_columns_in_family(column_family_id)
@@ -1114,15 +1114,16 @@ impl LSMTree {
                     .num_columns_in_family(column_family_id)
                     .unwrap_or(0);
                 let reader = file_manager.open_data_file_reader(file.file_id)?;
-                let reader: Box<dyn crate::file::RandomAccessFile> = if use_read_ahead {
-                    Box::new(ReadAheadBufferedReader::new(
-                        reader,
-                        read_ahead_bytes,
-                        read_ahead_runtime(),
-                    ))
-                } else {
-                    Box::new(reader)
-                };
+                let reader: Box<dyn crate::file::RandomAccessFile> =
+                    if read_ahead_bytes > 0 && reader.prefers_read_ahead() {
+                        Box::new(ReadAheadBufferedReader::new(
+                            reader,
+                            read_ahead_bytes,
+                            read_ahead_runtime(),
+                        ))
+                    } else {
+                        Box::new(reader)
+                    };
                 let iter: DynKvIterator = match file.file_type {
                     DataFileType::SSTable => {
                         let sst_options = SSTIteratorOptions {

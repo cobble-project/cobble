@@ -31,6 +31,11 @@ pub trait File {
 pub trait RandomAccessFile: File + Send + Sync + 'static {
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error>;
 
+    /// Whether sequential read-ahead is useful for this file's backing storage.
+    fn prefers_read_ahead(&self) -> bool {
+        false
+    }
+
     /// Asynchronously read a chunk of data at the specified offset and size.
     /// Returns a JoinHandle that resolves to the read data or an error.
     /// This allows for prefetching data in the background while processing other tasks.
@@ -73,6 +78,10 @@ impl File for Box<dyn RandomAccessFile> {
 impl RandomAccessFile for Box<dyn RandomAccessFile> {
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
         (**self).read_at(offset, size)
+    }
+
+    fn prefers_read_ahead(&self) -> bool {
+        (**self).prefers_read_ahead()
     }
 }
 
@@ -315,6 +324,10 @@ impl<R: RandomAccessFile> RandomAccessFile for ReadAheadBufferedReader<R> {
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
         ReadAheadBufferedReader::read_at(self, offset, size)
     }
+
+    fn prefers_read_ahead(&self) -> bool {
+        self.inner.prefers_read_ahead()
+    }
 }
 
 impl<R: RandomAccessFile> Drop for ReadAheadBufferedReader<R> {
@@ -462,6 +475,56 @@ mod tests {
                 self.read_at(offset, size)
             })
         }
+    }
+
+    struct ReadAheadCapabilityFile {
+        data: Bytes,
+    }
+
+    impl File for ReadAheadCapabilityFile {
+        fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn size(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl RandomAccessFile for ReadAheadCapabilityFile {
+        fn prefers_read_ahead(&self) -> bool {
+            true
+        }
+
+        fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
+            let end = offset + size.min(self.data.len().saturating_sub(offset));
+            Ok(self.data.slice(offset..end))
+        }
+    }
+
+    #[test]
+    fn read_ahead_capability_defaults_false_and_survives_wrappers() {
+        let local = AbortTrackingRandomAccessFile {
+            data: Bytes::from_static(b"local"),
+            pending_prefetch_stopped: Arc::new(AtomicBool::new(false)),
+            prefetch_gate: Arc::new(Notify::new()),
+        };
+        assert!(!local.prefers_read_ahead());
+
+        let remote = ReadAheadCapabilityFile {
+            data: Bytes::from_static(b"remote"),
+        };
+        let remote: Box<dyn RandomAccessFile> = Box::new(remote);
+        assert!(remote.prefers_read_ahead());
+
+        let wrapped = ReadAheadBufferedReader::new(
+            ReadAheadCapabilityFile {
+                data: Bytes::from_static(b"remote"),
+            },
+            4,
+            read_ahead_runtime(),
+        );
+        assert!(wrapped.prefers_read_ahead());
     }
 
     #[test]

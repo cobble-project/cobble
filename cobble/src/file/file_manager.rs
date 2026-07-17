@@ -66,6 +66,10 @@ impl File for CachedRandomAccessFile {
 }
 
 impl RandomAccessFile for CachedRandomAccessFile {
+    fn prefers_read_ahead(&self) -> bool {
+        self.inner.prefers_read_ahead()
+    }
+
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
         self.inner.read_at(offset, size)
     }
@@ -513,6 +517,10 @@ impl File for TrackedReader {
 }
 
 impl RandomAccessFile for TrackedReader {
+    fn prefers_read_ahead(&self) -> bool {
+        self.inner.prefers_read_ahead()
+    }
+
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
         self.inner.read_at(offset, size)
     }
@@ -1825,6 +1833,10 @@ pub(crate) mod tests {
     }
 
     impl RandomAccessFile for TestCopyReader {
+        fn prefers_read_ahead(&self) -> bool {
+            true
+        }
+
         fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
             Ok(self.data.slice(offset..offset + size))
         }
@@ -1900,6 +1912,23 @@ pub(crate) mod tests {
         assert!(matches!(result, Err(Error::CancelledError(_))));
         assert_eq!(data.lock().unwrap().as_slice(), b"copy-me");
         assert!(!close_called.load(Ordering::SeqCst));
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_random_access_reader_wrappers_preserve_read_ahead_capability() {
+        let (fs, _fm) = create_test_file_manager();
+        let inner: Arc<dyn RandomAccessFile> = Arc::new(TestCopyReader {
+            data: Bytes::from_static(b"remote"),
+        });
+        let cached: Arc<dyn RandomAccessFile> =
+            Arc::new(CachedRandomAccessFile::new(Arc::clone(&inner)));
+        assert!(cached.prefers_read_ahead());
+
+        let tracked = Arc::new(TrackedFile::new("test-reader".to_string(), fs, None));
+        let tracked_reader = TrackedReader::new(cached, tracked);
+        assert!(tracked_reader.prefers_read_ahead());
         cleanup_test_root();
     }
 
