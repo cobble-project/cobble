@@ -22,6 +22,7 @@ const NODE_KEY_LEN_POS: usize = 8;
 const NODE_HEIGHT_POS: usize = 12;
 const NODE_KEY_PREFIX_POS: usize = 16;
 const NODE_KEY_PREFIX_SIZE: usize = 16;
+const U64_PREFIX_SIZE: usize = std::mem::size_of::<u64>();
 const NODE_HEADER_SIZE: usize = 32; // entry_offset(u32) + key_start(u32) + key_len(u32) + height(u8) + reserved(3) + key_prefix([u8; 16])
 
 pub(crate) struct SkiplistMemtableIter<'a> {
@@ -353,17 +354,47 @@ impl SkiplistMemtable {
         Some((key, &self.buffer[value_start..value_end]))
     }
 
+    fn compare_u64_prefixes(left: &[u8], right: &[u8]) -> Option<Ordering> {
+        debug_assert_eq!(left.len(), right.len());
+        debug_assert!(left.len() == U64_PREFIX_SIZE || left.len() == NODE_KEY_PREFIX_SIZE);
+
+        let left_first = u64::from_be_bytes(left[..U64_PREFIX_SIZE].try_into().ok()?);
+        let right_first = u64::from_be_bytes(right[..U64_PREFIX_SIZE].try_into().ok()?);
+        let first_cmp = left_first.cmp(&right_first);
+        if first_cmp != Ordering::Equal || left.len() == U64_PREFIX_SIZE {
+            return Some(first_cmp);
+        }
+
+        let left_second = u64::from_be_bytes(
+            left[U64_PREFIX_SIZE..NODE_KEY_PREFIX_SIZE]
+                .try_into()
+                .ok()?,
+        );
+        let right_second = u64::from_be_bytes(
+            right[U64_PREFIX_SIZE..NODE_KEY_PREFIX_SIZE]
+                .try_into()
+                .ok()?,
+        );
+        Some(left_second.cmp(&right_second))
+    }
+
     fn compare_node_key(&self, node: u32, key: &[u8]) -> Option<Ordering> {
         let node_key_len = self.node_key_len(node)?;
         let prefix_len = NODE_KEY_PREFIX_SIZE.min(node_key_len).min(key.len());
-        let prefix_cmp = self.node_key_prefix(node)?[..prefix_len].cmp(&key[..prefix_len]);
+        let node_prefix = self.node_key_prefix(node)?;
+        let prefix_cmp = if prefix_len == U64_PREFIX_SIZE || prefix_len == NODE_KEY_PREFIX_SIZE {
+            Self::compare_u64_prefixes(&node_prefix[..prefix_len], &key[..prefix_len])?
+        } else {
+            node_prefix[..prefix_len].cmp(&key[..prefix_len])
+        };
         if prefix_cmp != Ordering::Equal {
             return Some(prefix_cmp);
         }
         if node_key_len <= prefix_len && key.len() <= prefix_len {
             return Some(node_key_len.cmp(&key.len()));
         }
-        Some(self.node_key(node)?.cmp(key))
+        let node_key = self.node_key(node)?;
+        Some(node_key[prefix_len..].cmp(&key[prefix_len..]))
     }
 
     fn find_greater_or_equal_node(&self, key: &[u8]) -> u32 {
@@ -637,6 +668,28 @@ mod tests {
     use super::*;
     use crate::iterator::KvIterator;
 
+    fn assert_compare_matches_full_key_ordering(keys: &[&[u8]]) {
+        let mut mem = SkiplistMemtable::with_capacity(8192);
+        for &key in keys {
+            mem.put(key, b"value").unwrap();
+        }
+
+        for &stored_key in keys {
+            let node = mem.lower_bound_node(stored_key);
+            assert_ne!(node, NULL_OFFSET);
+            assert_eq!(mem.node_key(node), Some(stored_key));
+            for &target in keys {
+                assert_eq!(
+                    mem.compare_node_key(node, target),
+                    Some(stored_key.cmp(target)),
+                    "stored {:?}, target {:?}",
+                    stored_key,
+                    target
+                );
+            }
+        }
+    }
+
     #[test]
     fn put_and_get() {
         let mut mem = SkiplistMemtable::with_capacity(1024);
@@ -742,6 +795,113 @@ mod tests {
             };
             assert_eq!(derived_lower_bound, lower_bound, "target {:?}", target);
         }
+    }
+
+    #[test]
+    fn cached_prefix_comparison_matches_full_key_ordering() {
+        let ascii_keys: [&[u8]; 9] = [
+            b"1234567".as_slice(),
+            b"12345678",
+            b"123456789",
+            b"shared08-a",
+            b"shared08-z",
+            b"0123456789abcde",
+            b"0123456789abcdef",
+            b"0123456789abcdef-a",
+            b"0123456789abcdef-z",
+        ];
+        let eight_byte_keys = [
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f],
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80],
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff],
+            [0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            [0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        ];
+        let key = |first, second| {
+            let mut key = [0u8; NODE_KEY_PREFIX_SIZE];
+            key[0] = first;
+            key[U64_PREFIX_SIZE] = second;
+            key
+        };
+        let sixteen_byte_keys = [
+            key(0x00, 0x00),
+            key(0x7f, 0x00),
+            key(0x80, 0x00),
+            key(0xff, 0x00),
+            key(0x40, 0x00),
+            key(0x40, 0x7f),
+            key(0x40, 0x80),
+            key(0x40, 0xff),
+        ];
+        let mut keys = ascii_keys.to_vec();
+        keys.extend(eight_byte_keys.iter().map(|key| key.as_slice()));
+        keys.extend(sixteen_byte_keys.iter().map(|key| key.as_slice()));
+        assert_compare_matches_full_key_ordering(&keys);
+    }
+
+    #[test]
+    fn prefix_comparison_preserves_lower_bound_put_get_and_iteration_order() {
+        let entries = [
+            (b"0123456789abcdef-z".as_slice(), b"z1".as_slice()),
+            (b"123456789", b"nine"),
+            (b"shared08-z", b"z"),
+            (b"12345678", b"eight"),
+            (b"0123456789abcdef", b"sixteen"),
+            (b"shared08-a", b"a"),
+            (b"1234567", b"seven"),
+            (b"0123456789abcdef-a", b"a1"),
+            (b"12345678", b"latest-eight"),
+        ];
+        let mut mem = SkiplistMemtable::with_capacity(8192);
+        for (key, value) in entries {
+            mem.put(key, value).unwrap();
+        }
+
+        assert_eq!(mem.get(b"12345678"), Some(b"latest-eight".as_slice()));
+        assert_eq!(mem.get(b"123456789"), Some(b"nine".as_slice()));
+        assert_eq!(mem.get(b"shared08-a"), Some(b"a".as_slice()));
+
+        for (target, expected) in [
+            (b"1234567".as_slice(), Some(b"1234567".as_slice())),
+            (b"1234567\0", Some(b"12345678".as_slice())),
+            (b"12345678\x01", Some(b"123456789".as_slice())),
+            (b"shared08-m", Some(b"shared08-z".as_slice())),
+            (
+                b"0123456789abcdef-y",
+                Some(b"0123456789abcdef-z".as_slice()),
+            ),
+            (b"zzzz", None),
+        ] {
+            let node = mem.lower_bound_node(target);
+            let found = if node == NULL_OFFSET {
+                None
+            } else {
+                mem.node_key(node)
+            };
+            assert_eq!(found, expected, "target {:?}", target);
+        }
+
+        let mut iter = mem.iter();
+        iter.seek_to_first().unwrap();
+        let mut keys = Vec::new();
+        while iter.next().unwrap() {
+            keys.push(iter.take_key().unwrap().unwrap());
+        }
+        assert_eq!(
+            keys,
+            vec![
+                Bytes::from_static(b"0123456789abcdef"),
+                Bytes::from_static(b"0123456789abcdef-a"),
+                Bytes::from_static(b"0123456789abcdef-z"),
+                Bytes::from_static(b"1234567"),
+                Bytes::from_static(b"12345678"),
+                Bytes::from_static(b"12345678"),
+                Bytes::from_static(b"123456789"),
+                Bytes::from_static(b"shared08-a"),
+                Bytes::from_static(b"shared08-z"),
+            ]
+        );
     }
 
     #[test]
