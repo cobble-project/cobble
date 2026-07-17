@@ -1206,6 +1206,11 @@ impl FileManager {
             writer.write(bytes.as_ref())?;
             offset += bytes.len();
         }
+        if lifecycle_state.is_some_and(SnapshotLifecycleState::is_cancelled_raw) {
+            return Err(Error::CancelledError(
+                "Snapshot upload cancelled while copying data files".to_string(),
+            ));
+        }
         writer.close()?;
         Ok(())
     }
@@ -1803,6 +1808,116 @@ pub(crate) mod tests {
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-test"));
         let fm = FileManager::with_defaults(Arc::clone(&fs), metrics_manager).unwrap();
         (fs, fm)
+    }
+
+    struct TestCopyReader {
+        data: Bytes,
+    }
+
+    impl File for TestCopyReader {
+        fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn size(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl RandomAccessFile for TestCopyReader {
+        fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
+            Ok(self.data.slice(offset..offset + size))
+        }
+    }
+
+    struct TestCopyWriter {
+        data: Arc<Mutex<Vec<u8>>>,
+        close_called: Arc<AtomicBool>,
+        cancel_after_write: Option<Arc<AtomicU8>>,
+    }
+
+    impl File for TestCopyWriter {
+        fn close(&mut self) -> Result<(), Error> {
+            self.close_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn size(&self) -> usize {
+            self.data.lock().unwrap().len()
+        }
+    }
+
+    impl SequentialWriteFile for TestCopyWriter {
+        fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+            self.data.lock().unwrap().extend_from_slice(data);
+            if let Some(state) = &self.cancel_after_write {
+                state.store(SnapshotLifecycleState::Cancelled as u8, Ordering::SeqCst);
+            }
+            Ok(data.len())
+        }
+    }
+
+    fn test_copy_writer(
+        fs: &Arc<dyn FileSystem>,
+        cancel_after_write: Option<Arc<AtomicU8>>,
+    ) -> (TrackedWriter, Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>) {
+        let data = Arc::new(Mutex::new(Vec::new()));
+        let close_called = Arc::new(AtomicBool::new(false));
+        let inner = TestCopyWriter {
+            data: Arc::clone(&data),
+            close_called: Arc::clone(&close_called),
+            cancel_after_write,
+        };
+        let tracked = Arc::new(TrackedFile::new(
+            "test-copy".to_string(),
+            Arc::clone(fs),
+            None,
+        ));
+        (
+            TrackedWriter::new(Box::new(inner), tracked),
+            data,
+            close_called,
+        )
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_copy_reader_cancels_after_last_write_before_close() {
+        let (fs, fm) = create_test_file_manager();
+        let lifecycle_state = Arc::new(AtomicU8::new(0));
+        let (mut writer, data, close_called) =
+            test_copy_writer(&fs, Some(Arc::clone(&lifecycle_state)));
+        let source = TestCopyReader {
+            data: Bytes::from_static(b"copy-me"),
+        };
+
+        let result = fm.copy_reader_to_tracked_writer_with_cancel(
+            &source,
+            &mut writer,
+            Some(lifecycle_state.as_ref()),
+        );
+
+        assert!(matches!(result, Err(Error::CancelledError(_))));
+        assert_eq!(data.lock().unwrap().as_slice(), b"copy-me");
+        assert!(!close_called.load(Ordering::SeqCst));
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_copy_reader_closes_after_last_write_without_cancellation() {
+        let (fs, fm) = create_test_file_manager();
+        let (mut writer, data, close_called) = test_copy_writer(&fs, None);
+        let source = TestCopyReader {
+            data: Bytes::from_static(b"copy-me"),
+        };
+
+        fm.copy_reader_to_tracked_writer_with_cancel(&source, &mut writer, None)
+            .unwrap();
+
+        assert_eq!(data.lock().unwrap().as_slice(), b"copy-me");
+        assert!(close_called.load(Ordering::SeqCst));
+        cleanup_test_root();
     }
 
     #[test]
