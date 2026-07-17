@@ -445,6 +445,34 @@ impl Column {
         }
     }
 
+    /// Applies a contiguous run of ordinary inline merge operands.
+    ///
+    /// Separated values and tombstones are deliberately excluded by the caller: their existing
+    /// pairwise handling preserves the lazy separated-array representation and delete semantics.
+    fn merge_batch(
+        self,
+        operands: Vec<Column>,
+        merge_operator: &dyn MergeOperator,
+        time_provider: Option<&dyn TimeProvider>,
+    ) -> Result<Column> {
+        debug_assert!(matches!(self.value_type, ValueType::Put | ValueType::Merge));
+        debug_assert!(!self.data.is_empty());
+        debug_assert!(
+            operands
+                .iter()
+                .all(|operand| operand.value_type == ValueType::Merge)
+        );
+
+        let fallback_value_type = self.value_type;
+        let operands = operands.into_iter().map(Bytes::from).collect();
+        let (merged_value, override_value_type) =
+            merge_operator.merge_batch(Bytes::from(self), operands, time_provider)?;
+        Ok(Column::new(
+            Self::resolve_merged_value_type(fallback_value_type, override_value_type)?,
+            merged_value,
+        ))
+    }
+
     fn resolve_merged_value_type(
         fallback: ValueType,
         override_type: Option<ValueType>,
@@ -593,6 +621,114 @@ impl Value {
         )
     }
 
+    /// Merges values ordered from oldest to newest, batching contiguous ordinary `Merge` values
+    /// per column. Separated values, deletes, and terminal puts remain pairwise boundaries.
+    pub(crate) fn merge_all_in_column_family(
+        values: impl IntoIterator<Item = Value>,
+        schema: &Schema,
+        column_family_id: u8,
+        time_provider: Option<&dyn TimeProvider>,
+    ) -> Result<Value> {
+        let mut merged_columns: Vec<Option<Column>> = Vec::new();
+        let mut pending_operands: Vec<Vec<Column>> = Vec::new();
+        let mut latest_expired_at = None;
+        let mut saw_value = false;
+
+        for value in values {
+            saw_value = true;
+            latest_expired_at = value.expired_at;
+            if merged_columns.len() < value.columns.len() {
+                merged_columns.resize_with(value.columns.len(), || None);
+                pending_operands.resize_with(value.columns.len(), Vec::new);
+            }
+
+            for (column_idx, newer) in value.columns.into_iter().enumerate() {
+                let Some(newer) = newer else {
+                    continue;
+                };
+                let operator = schema.operator_in_family(column_family_id, column_idx);
+
+                if newer.value_type != ValueType::Merge {
+                    Self::flush_pending_merges(
+                        &mut merged_columns[column_idx],
+                        &mut pending_operands[column_idx],
+                        operator,
+                        time_provider,
+                    )?;
+                    if newer.value_type.is_terminal() {
+                        merged_columns[column_idx] = Some(newer);
+                    } else {
+                        let older = merged_columns[column_idx].take();
+                        merged_columns[column_idx] = match older {
+                            Some(older) if older.data().is_empty() => Some(newer),
+                            Some(older) => Some(older.merge(newer, operator, time_provider)?),
+                            None => Some(newer),
+                        };
+                    }
+                    continue;
+                }
+
+                match merged_columns[column_idx].as_ref() {
+                    None => merged_columns[column_idx] = Some(newer),
+                    Some(existing) if existing.data().is_empty() => {
+                        // Preserve `merge_with_callback`'s no-operator fast path for an empty base.
+                        merged_columns[column_idx] = Some(newer);
+                    }
+                    Some(existing) if existing.value_type.uses_separated_storage() => {
+                        Self::flush_pending_merges(
+                            &mut merged_columns[column_idx],
+                            &mut pending_operands[column_idx],
+                            operator,
+                            time_provider,
+                        )?;
+                        let older = merged_columns[column_idx]
+                            .take()
+                            .expect("existing column checked");
+                        merged_columns[column_idx] =
+                            Some(older.merge(newer, operator, time_provider)?);
+                    }
+                    Some(existing) if existing.value_type == ValueType::Delete => {
+                        let older = merged_columns[column_idx]
+                            .take()
+                            .expect("existing column checked");
+                        merged_columns[column_idx] =
+                            Some(older.merge(newer, operator, time_provider)?);
+                    }
+                    Some(_) => pending_operands[column_idx].push(newer),
+                }
+            }
+        }
+
+        assert!(saw_value, "merge_all requires at least one value");
+        for column_idx in 0..merged_columns.len() {
+            Self::flush_pending_merges(
+                &mut merged_columns[column_idx],
+                &mut pending_operands[column_idx],
+                schema.operator_in_family(column_family_id, column_idx),
+                time_provider,
+            )?;
+        }
+        Ok(Value::new_with_expired_at(
+            merged_columns,
+            latest_expired_at,
+        ))
+    }
+
+    fn flush_pending_merges(
+        existing: &mut Option<Column>,
+        operands: &mut Vec<Column>,
+        merge_operator: &dyn MergeOperator,
+        time_provider: Option<&dyn TimeProvider>,
+    ) -> Result<()> {
+        if operands.is_empty() {
+            return Ok(());
+        }
+        let older = existing.take().expect("merge operands require a base");
+        *existing =
+            Some(older.merge_batch(std::mem::take(operands), merge_operator, time_provider)?);
+        Ok(())
+    }
+
     pub(crate) fn merge_with_callback<F>(
         self,
         newer: Value,
@@ -713,6 +849,188 @@ mod tests {
         ) -> Result<(Bytes, Option<ValueType>)> {
             panic!("merge operator should not be invoked for empty old value");
         }
+    }
+
+    struct TerminalBatchMergeOperator;
+
+    impl MergeOperator for TerminalBatchMergeOperator {
+        fn merge(
+            &self,
+            existing_value: Bytes,
+            value: Bytes,
+            _time_provider: Option<&dyn TimeProvider>,
+        ) -> Result<(Bytes, Option<ValueType>)> {
+            let mut merged = BytesMut::with_capacity(existing_value.len() + value.len());
+            merged.extend_from_slice(existing_value.as_ref());
+            merged.extend_from_slice(value.as_ref());
+            Ok((merged.freeze(), Some(ValueType::Put)))
+        }
+
+        fn merge_batch(
+            &self,
+            existing_value: Bytes,
+            operands: Vec<Bytes>,
+            _time_provider: Option<&dyn TimeProvider>,
+        ) -> Result<(Bytes, Option<ValueType>)> {
+            let mut merged = BytesMut::with_capacity(
+                existing_value.len() + operands.iter().map(Bytes::len).sum::<usize>(),
+            );
+            merged.extend_from_slice(existing_value.as_ref());
+            for operand in operands {
+                merged.extend_from_slice(operand.as_ref());
+            }
+            Ok((merged.freeze(), Some(ValueType::Put)))
+        }
+    }
+
+    fn merge_values_pairwise(values: Vec<Value>, schema: &Schema) -> Value {
+        let mut values = values.into_iter();
+        let mut merged = values.next().expect("test values not empty");
+        for newer in values {
+            merged = merged
+                .merge_in_column_family(newer, schema, DEFAULT_COLUMN_FAMILY_ID, None)
+                .unwrap();
+        }
+        merged
+    }
+
+    fn value_signature(value: &Value) -> Vec<Option<(ValueType, Vec<u8>)>> {
+        value
+            .columns()
+            .iter()
+            .map(|column| {
+                column
+                    .as_ref()
+                    .map(|column| (column.value_type, column.data().as_ref().to_vec()))
+            })
+            .collect()
+    }
+
+    fn assert_batch_matches_pairwise(values: Vec<Value>, schema: &Schema) {
+        let pairwise = merge_values_pairwise(values.clone(), schema);
+        let batched =
+            Value::merge_all_in_column_family(values, schema, DEFAULT_COLUMN_FAMILY_ID, None)
+                .unwrap();
+        assert_eq!(value_signature(&batched), value_signature(&pairwise));
+        assert_eq!(batched.expired_at(), pairwise.expired_at());
+    }
+
+    #[test]
+    fn test_value_merge_all_matches_put_and_many_merges() {
+        let values = vec![
+            Value::new(vec![Some(Column::new(ValueType::Put, b"base".as_slice()))]),
+            Value::new(vec![Some(Column::new(ValueType::Merge, b"-a".as_slice()))]),
+            Value::new(vec![Some(Column::new(ValueType::Merge, b"-b".as_slice()))]),
+            Value::new(vec![Some(Column::new(ValueType::Merge, b"-c".as_slice()))]),
+        ];
+        let schema = Schema::empty();
+        assert_batch_matches_pairwise(values, schema.as_ref());
+    }
+
+    #[test]
+    fn test_value_merge_all_matches_delete_and_merge_only_histories() {
+        let schema = Schema::empty();
+        let delete_history = vec![
+            Value::new(vec![Some(Column::new(ValueType::Delete, Bytes::new()))]),
+            Value::new(vec![Some(Column::new(ValueType::Merge, b"a".as_slice()))]),
+            Value::new(vec![Some(Column::new(ValueType::Merge, b"b".as_slice()))]),
+        ];
+        assert_batch_matches_pairwise(delete_history, schema.as_ref());
+
+        let merge_only_history = vec![
+            Value::new(vec![Some(Column::new(ValueType::Merge, b"a".as_slice()))]),
+            Value::new(vec![Some(Column::new(ValueType::Merge, b"b".as_slice()))]),
+            Value::new(vec![Some(Column::new(ValueType::Merge, b"c".as_slice()))]),
+        ];
+        let batched = Value::merge_all_in_column_family(
+            merge_only_history.clone(),
+            schema.as_ref(),
+            DEFAULT_COLUMN_FAMILY_ID,
+            None,
+        )
+        .unwrap();
+        assert_batch_matches_pairwise(merge_only_history, schema.as_ref());
+        assert_eq!(
+            batched.columns()[0].as_ref().unwrap().value_type,
+            ValueType::Merge
+        );
+    }
+
+    #[test]
+    fn test_value_merge_all_preserves_custom_terminal_override() {
+        let schema = Schema::new(0, 1, vec![Arc::new(TerminalBatchMergeOperator)]);
+        let values = vec![
+            Value::new(vec![Some(Column::new(
+                ValueType::Merge,
+                b"base".as_slice(),
+            ))]),
+            Value::new(vec![Some(Column::new(ValueType::Merge, b"-a".as_slice()))]),
+            Value::new(vec![Some(Column::new(ValueType::Merge, b"-b".as_slice()))]),
+        ];
+        let batched = Value::merge_all_in_column_family(
+            values.clone(),
+            &schema,
+            DEFAULT_COLUMN_FAMILY_ID,
+            None,
+        )
+        .unwrap();
+        assert_batch_matches_pairwise(values, &schema);
+        assert_eq!(
+            batched.columns()[0].as_ref().unwrap().value_type,
+            ValueType::Put
+        );
+    }
+
+    #[test]
+    fn test_value_merge_all_matches_sparse_multi_column_history() {
+        let values = vec![
+            Value::new(vec![
+                Some(Column::new(ValueType::Put, b"c0".as_slice())),
+                Some(Column::new(ValueType::Put, b"c1".as_slice())),
+            ]),
+            Value::new(vec![
+                Some(Column::new(ValueType::Merge, b"-a".as_slice())),
+                None,
+            ]),
+            Value::new(vec![
+                None,
+                Some(Column::new(ValueType::Merge, b"-b".as_slice())),
+            ]),
+            Value::new(vec![
+                Some(Column::new(ValueType::Merge, b"-c".as_slice())),
+                None,
+            ]),
+        ];
+        let schema = Schema::empty();
+        assert_batch_matches_pairwise(values, schema.as_ref());
+    }
+
+    #[test]
+    fn test_value_merge_all_keeps_separated_values_pairwise() {
+        let values = vec![
+            Value::new(vec![Some(Column::new(
+                ValueType::PutSeparated,
+                b"p".as_slice(),
+            ))]),
+            Value::new(vec![Some(Column::new(ValueType::Merge, b"m".as_slice()))]),
+            Value::new(vec![Some(Column::new(
+                ValueType::MergeSeparated,
+                b"s".as_slice(),
+            ))]),
+        ];
+        let schema = Schema::empty();
+        let batched = Value::merge_all_in_column_family(
+            values.clone(),
+            schema.as_ref(),
+            DEFAULT_COLUMN_FAMILY_ID,
+            None,
+        )
+        .unwrap();
+        assert_batch_matches_pairwise(values, schema.as_ref());
+        assert_eq!(
+            batched.columns()[0].as_ref().unwrap().value_type,
+            ValueType::PutSeparatedArray
+        );
     }
 
     #[test]
