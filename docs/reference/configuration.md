@@ -60,7 +60,7 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 |-----------|------|---------|-------------|
 | `memtable_capacity` | `Size` | `64MiB` | Max memtable size before flush |
 | `memtable_buffer_count` | `usize` | 2 | Number of memtable buffers (active + immutable) |
-| `memtable_type` | `MemtableType` | `Hash` | Implementation: `Hash`, `Skiplist`, `Vec` |
+| `memtable_type` | `MemtableType` | `Skiplist` | Implementation: `Hash`, `Skiplist`, `Vec` |
 
 ### LSM Tree
 
@@ -324,8 +324,8 @@ Configuration for the read proxy.
 
 | Variant | Description |
 |---------|-------------|
-| `Hash` | Hash table (default) |
-| `Skiplist` | Skip list |
+| `Hash` | Hash table |
+| `Skiplist` | Skip list (default) |
 | `Vec` | Vector-based |
 
 ### CompactionPolicyKind
