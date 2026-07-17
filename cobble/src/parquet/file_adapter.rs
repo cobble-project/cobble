@@ -136,6 +136,10 @@ impl File for SharedRandomAccessFile {
 }
 
 impl RandomAccessFile for SharedRandomAccessFile {
+    fn prefers_read_ahead(&self) -> bool {
+        self.inner.prefers_read_ahead()
+    }
+
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes> {
         self.inner.read_at(offset, size)
     }
@@ -350,6 +354,10 @@ mod tests {
     }
 
     impl RandomAccessFile for CountingRandomAccessFile {
+        fn prefers_read_ahead(&self) -> bool {
+            self.inner.prefers_read_ahead()
+        }
+
         fn read_at(&self, offset: usize, size: usize) -> Result<Bytes> {
             self.read_count.fetch_add(1, Ordering::Relaxed);
             self.inner.read_at(offset, size)

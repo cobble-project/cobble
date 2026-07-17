@@ -21,6 +21,10 @@ impl File for OpendalRandomAccessFile {
 }
 
 impl RandomAccessFile for OpendalRandomAccessFile {
+    fn prefers_read_ahead(&self) -> bool {
+        true
+    }
+
     fn read_at(&self, offset: usize, size: usize) -> Result<Bytes> {
         self.runtime
             .block_on(async {
