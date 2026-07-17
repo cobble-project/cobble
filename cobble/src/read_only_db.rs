@@ -374,17 +374,6 @@ impl ReadOnlyDb {
             )));
         }
         let truncation_cursor = snapshot.truncation_cursor(bucket, column_family_id);
-        let lsm_iters = self.lsm_tree.scan_with_snapshot(
-            &self.file_manager,
-            Arc::clone(&snapshot),
-            Arc::clone(&schema),
-            Arc::clone(&self.schema_manager),
-            options.read_ahead_bytes()?,
-            options.columns(),
-            bucket,
-            column_family_id,
-            options.preload_scan_cursor_block(),
-        )?;
         let start_key = match truncation_cursor {
             Some(ref cursor) if start.is_none_or(|candidate| candidate <= cursor.as_slice()) => {
                 encode_scan_key_after(bucket, column_family_id, cursor.as_slice())
@@ -399,6 +388,19 @@ impl ReadOnlyDb {
                 false,
             ))
         };
+        let lsm_iters = self.lsm_tree.scan_with_snapshot(
+            &self.file_manager,
+            Arc::clone(&snapshot),
+            Arc::clone(&schema),
+            Arc::clone(&self.schema_manager),
+            options.read_ahead_bytes()?,
+            options.columns(),
+            bucket,
+            column_family_id,
+            start_key.as_ref(),
+            end_bound.as_ref().map(|(end, _)| end.as_ref()),
+            options.preload_scan_cursor_block(),
+        )?;
         let mut iter: DbIterator<'static> = DbIterator::new(
             Vec::new(),
             lsm_iters,

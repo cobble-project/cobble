@@ -1327,6 +1327,7 @@ impl Db {
                 end_key.clone(),
                 options.max_rows(),
             )?;
+        let end_bound = end_key.map(|end_key| (end_key, false));
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
@@ -1336,6 +1337,8 @@ impl Db {
             options.columns(),
             bucket,
             column_family_id,
+            start_key.as_ref(),
+            end_bound.as_ref().map(|(end, _)| end.as_ref()),
             options.preload_scan_cursor_block(),
         );
         let lsm_iters = match lsm_iters {
@@ -1345,7 +1348,6 @@ impl Db {
                 return Err(err);
             }
         };
-        let end_bound = end_key.map(|end_key| (end_key, false));
         let mut iter = DbIterator::new(
             memtable_iters,
             lsm_iters,
