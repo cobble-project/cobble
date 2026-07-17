@@ -47,6 +47,11 @@ pub(crate) struct LevelOptions {
     pub(crate) tiered: bool,
 }
 
+fn file_intersects_scan(file: &DataFile, encoded_start: &[u8], encoded_end: Option<&[u8]>) -> bool {
+    file.end_key.as_slice() >= encoded_start
+        && encoded_end.is_none_or(|end| file.start_key.as_slice() < end)
+}
+
 #[derive(Clone)]
 pub(crate) struct LSMTreeVersion {
     pub(crate) levels: Vec<Level>,
@@ -1054,6 +1059,8 @@ impl LSMTree {
         selected_columns: Option<&[usize]>,
         bucket: u16,
         column_family_id: u8,
+        encoded_start: &[u8],
+        encoded_end: Option<&[u8]>,
         preload_scan_cursor_block: bool,
     ) -> Result<Vec<DynKvIterator>> {
         let selected_columns = selected_columns.map(|columns| columns.to_vec());
@@ -1075,10 +1082,20 @@ impl LSMTree {
                 }
                 if level.tiered {
                     for file in level.files.iter().rev() {
-                        runs.push(SortedRun::new(level.ordinal, vec![Arc::clone(file)]));
+                        if file_intersects_scan(file, encoded_start, encoded_end) {
+                            runs.push(SortedRun::new(level.ordinal, vec![Arc::clone(file)]));
+                        }
                     }
                 } else {
-                    runs.push(SortedRun::new(level.ordinal, level.files.clone()));
+                    let files: Vec<Arc<DataFile>> = level
+                        .files
+                        .iter()
+                        .filter(|file| file_intersects_scan(file, encoded_start, encoded_end))
+                        .cloned()
+                        .collect();
+                    if !files.is_empty() {
+                        runs.push(SortedRun::new(level.ordinal, files));
+                    }
                 }
             }
         }
@@ -1363,6 +1380,17 @@ mod tests {
                 bucket_range,
             ))
         }
+    }
+
+    #[test]
+    fn file_intersection_respects_inclusive_start_and_exclusive_end() {
+        let first = create_data_file(b"a", b"c");
+        let second = create_data_file(b"d", b"f");
+        assert!(file_intersects_scan(&first, b"c", Some(b"d")));
+        assert!(!file_intersects_scan(&second, b"a", Some(b"d")));
+        assert!(file_intersects_scan(&first, b"b", Some(b"e")));
+        assert!(file_intersects_scan(&second, b"b", Some(b"e")));
+        assert!(file_intersects_scan(&second, b"e", None));
     }
 
     fn create_data_file_with_size(start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
