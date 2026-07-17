@@ -26,7 +26,7 @@ use crate::writer_options::WriterOptions;
 use crate::{Config, ReadOptions, ScanOptions, TimeProvider, WriteOptions};
 use bytes::Bytes;
 use log::{error, info, warn};
-use std::ops::{Range, RangeInclusive};
+use std::ops::{ControlFlow, Range, RangeInclusive};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -1113,7 +1113,8 @@ impl Db {
             Some(vec![0u8; mask_size])
         };
         let mut values: Vec<Value> = Vec::new();
-        self.memtable_manager.get_all_with_snapshot(
+        let mut stopped_by_memtable_terminal = false;
+        self.memtable_manager.get_all_with_snapshot_until(
             Arc::clone(&snapshot),
             encoded_key.as_ref(),
             |raw, source_schema| {
@@ -1140,6 +1141,7 @@ impl Db {
                         schema.version(),
                     )?
                 };
+                // Keep the established multi-column terminal-mask behavior unchanged.
                 if let Some(mask) = terminal_mask.as_mut() {
                     for (idx, column) in value.columns().iter().enumerate().take(num_columns) {
                         if column
@@ -1155,19 +1157,21 @@ impl Db {
                         }
                     }
                 }
+                // A terminal value in a physical single-column family, regardless of TTL, hides
+                // all older versions. Multi-column reads keep traversing for per-column masking.
+                let stop = num_columns == 1 && value.is_terminal();
                 values.push(value);
-                Ok(())
+                if stop {
+                    stopped_by_memtable_terminal = true;
+                    Ok(ControlFlow::Break(()))
+                } else {
+                    Ok(ControlFlow::Continue(()))
+                }
             },
         )?;
-        // A terminal value in a single-column memtable cuts off every older LSM value. This is
-        // the common state-backend point-lookup path, where probing the LSM after a recent put or
-        // delete is both unnecessary and expensive. Multi-column reads keep using the per-column
-        // terminal mask below.
-        let mut should_stop = if num_columns == 1 {
-            values.iter().any(Value::is_terminal)
-        } else {
-            values.last().is_some_and(|value| value.is_terminal())
-        };
+        // A single-column terminal cuts off the rest of the lookup before older layers are read.
+        // Multi-column reads continue through the LSM mask path.
+        let mut should_stop = stopped_by_memtable_terminal;
         let lsm_values = if should_stop {
             Vec::new()
         } else {
@@ -1208,16 +1212,12 @@ impl Db {
         if values.is_empty() {
             return Ok(None);
         }
-        let mut iter = values.into_iter();
-        let mut merged = iter.next().expect("values not empty");
-        for newer in iter {
-            merged = merged.merge_in_column_family(
-                newer,
-                &schema,
-                column_family_id,
-                Some(self.time_provider.as_ref()),
-            )?;
-        }
+        let merged = Value::merge_all_in_column_family(
+            values,
+            &schema,
+            column_family_id,
+            Some(self.time_provider.as_ref()),
+        )?;
         let result = value_to_vec_of_columns_with_vlog(
             merged,
             |pointer| {
@@ -1444,6 +1444,7 @@ mod tests {
     use bytes::BytesMut;
     use serial_test::serial;
     use size::Size;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
@@ -1696,6 +1697,44 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BatchCountingMergeOperator {
+        merge_calls: AtomicUsize,
+        merge_batch_calls: AtomicUsize,
+    }
+
+    impl MergeOperator for BatchCountingMergeOperator {
+        fn merge(
+            &self,
+            existing_value: Bytes,
+            value: Bytes,
+            _time_provider: Option<&dyn TimeProvider>,
+        ) -> Result<(Bytes, Option<ValueType>)> {
+            self.merge_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            let mut merged = BytesMut::with_capacity(existing_value.len() + value.len());
+            merged.extend_from_slice(existing_value.as_ref());
+            merged.extend_from_slice(value.as_ref());
+            Ok((merged.freeze(), None))
+        }
+
+        fn merge_batch(
+            &self,
+            existing_value: Bytes,
+            operands: Vec<Bytes>,
+            _time_provider: Option<&dyn TimeProvider>,
+        ) -> Result<(Bytes, Option<ValueType>)> {
+            self.merge_batch_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            let mut merged = BytesMut::with_capacity(
+                existing_value.len() + operands.iter().map(Bytes::len).sum::<usize>(),
+            );
+            merged.extend_from_slice(existing_value.as_ref());
+            for operand in operands {
+                merged.extend_from_slice(operand.as_ref());
+            }
+            Ok((merged.freeze(), None))
+        }
+    }
+
     #[test]
     #[serial(file)]
     fn test_db_write_batch_triggers_flush() {
@@ -1913,6 +1952,33 @@ mod tests {
         let value = db.get(0, b"k2").unwrap().expect("value present");
         assert_eq!(value[0].as_ref().unwrap().as_ref(), b"a|b");
 
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_get_batches_contiguous_merge_operands() {
+        let root = "/tmp/db_get_batches_merges";
+        cleanup_test_root(root);
+        let mut config = config_with_small_memtable(root);
+        config.memtable_capacity = Size::from_const(1024 * 1024);
+        let db = open_db(config);
+        let operator = Arc::new(BatchCountingMergeOperator::default());
+        let mut schema = db.update_schema();
+        schema
+            .set_column_operator(None, 0, Arc::clone(&operator) as Arc<dyn MergeOperator>)
+            .unwrap();
+        schema.commit();
+
+        db.put(0, b"k1", 0, b"base").unwrap();
+        for operand in [b"-a".as_slice(), b"-b".as_slice(), b"-c".as_slice()] {
+            db.merge(0, b"k1", 0, operand).unwrap();
+        }
+
+        let value = db.get(0, b"k1").unwrap().expect("value present");
+        assert_eq!(value[0].as_deref(), Some(b"base-a-b-c".as_slice()));
+        assert_eq!(operator.merge_batch_calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(operator.merge_calls.load(AtomicOrdering::Relaxed), 0);
         cleanup_test_root(root);
     }
 
@@ -2246,6 +2312,64 @@ mod tests {
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"new");
 
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_get_active_merge_collects_terminal_base() {
+        let root = "/tmp/db_get_active_merge_terminal";
+        cleanup_test_root(root);
+        let db = open_db(config_with_small_memtable(root));
+
+        db.put(0, b"k1", 0, b"base").unwrap();
+        db.merge(0, b"k1", 0, b"_merge").unwrap();
+
+        let value = db.get(0, b"k1").unwrap().expect("value present");
+        assert_eq!(value[0].as_deref(), Some(b"base_merge".as_slice()));
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_get_active_delete_hides_l0_value() {
+        let root = "/tmp/db_get_active_delete_terminal";
+        cleanup_test_root(root);
+        let db = open_db(config_with_small_memtable(root));
+
+        db.put(0, b"k1", 0, b"old").unwrap();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+        db.delete(0, b"k1", 0).unwrap();
+
+        assert_eq!(db.get(0, b"k1").unwrap(), None);
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_multi_column_expired_terminal_keeps_l0_column_masked() {
+        let root = "/tmp/db_multi_column_expired_terminal_mask";
+        cleanup_test_root(root);
+        let mut config = Config {
+            num_columns: 2,
+            ..config_with_small_memtable(root)
+        };
+        config.ttl_enabled = true;
+        let db = open_db(config);
+
+        db.put(0, b"k1", 0, b"c0-old").unwrap();
+        db.put(0, b"k1", 1, b"c1-old").unwrap();
+        db.memtable_manager.flush_active().unwrap();
+        let _ = db.memtable_manager.wait_for_flushes();
+
+        db.put_with_options(0, b"k1", 0, b"c0-expired", &WriteOptions::with_ttl(1))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        let value = db.get(0, b"k1").unwrap().expect("remaining column present");
+        assert_eq!(value[0], None);
+        assert_eq!(value[1].as_deref(), Some(b"c1-old".as_slice()));
         cleanup_test_root(root);
     }
 
