@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema};
 use crate::ttl::TTLProvider;
-use crate::r#type::{Column, KvValue, key_column_family};
+use crate::r#type::{Column, KvValue, Value, key_column_family};
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -240,15 +240,16 @@ impl<I> DeduplicatingIterator<I> {
                 continue;
             }
 
-            // Merge from oldest to newest (reverse order)
-            // The last value in the list is the oldest, the first is the newest
-            let mut values_iter = values.into_iter().rev();
-            let first = values_iter.next().expect("values is non-empty");
-            let mut merged_value = first.into_decoded(num_columns)?;
             let column_family_id =
                 key_column_family(current_key.as_ref()).unwrap_or(DEFAULT_COLUMN_FAMILY_ID);
-
             if let Some(callback) = self.on_merge.as_deref_mut() {
+                // Keep callback semantics and memory usage pairwise: decode each value only when
+                // it is consumed by the callback merge path.
+                let mut values_iter = values.into_iter().rev();
+                let mut merged_value = values_iter
+                    .next()
+                    .expect("values is non-empty")
+                    .into_decoded(num_columns)?;
                 // The first column is invoked with callback(None, first_column) to indicate it's the oldest column being merged.
                 for column in merged_value.columns() {
                     if column.is_some() {
@@ -266,21 +267,26 @@ impl<I> DeduplicatingIterator<I> {
                         callback,
                     )?;
                 }
+                self.current_value = Some(KvValue::Decoded(merged_value));
             } else {
-                for newer_value in values_iter {
-                    let newer_value = newer_value.into_decoded(num_columns)?;
-                    merged_value = merged_value.merge_in_column_family(
-                        newer_value,
-                        &self.schema,
-                        column_family_id,
-                        Some(self.ttl_provider.time_provider()),
-                    )?;
-                }
+                // The non-callback path can retain decoded values and batch all merge operands in
+                // Value::merge_all_in_column_family, avoiding pairwise Column::merge calls.
+                let decoded_values: Vec<Value> = values
+                    .into_iter()
+                    .rev()
+                    .map(|value| value.into_decoded(num_columns))
+                    .collect::<Result<Vec<_>>>()?;
+                let merged_value = Value::merge_all_in_column_family(
+                    decoded_values,
+                    &self.schema,
+                    column_family_id,
+                    Some(self.ttl_provider.time_provider()),
+                )?;
+                self.current_value = Some(KvValue::Decoded(merged_value));
             }
 
             // Store the merged value as Decoded to avoid re-encoding
             self.current_key = Some(current_key);
-            self.current_value = Some(KvValue::Decoded(merged_value));
 
             return Ok(());
         }
@@ -377,8 +383,43 @@ where
 mod tests {
     use super::*;
     use crate::iterator::mock_iterator::MockIterator;
+    use crate::merge_operator::MergeOperator;
     use crate::sst::row_codec::encode_value;
     use crate::r#type::{Column, Value, ValueType};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingMergeOperator {
+        merge_calls: Arc<AtomicUsize>,
+        merge_batch_calls: Arc<AtomicUsize>,
+    }
+
+    impl MergeOperator for CountingMergeOperator {
+        fn merge(
+            &self,
+            existing_value: Bytes,
+            value: Bytes,
+            _time_provider: Option<&dyn crate::TimeProvider>,
+        ) -> Result<(Bytes, Option<ValueType>)> {
+            self.merge_calls.fetch_add(1, Ordering::Relaxed);
+            let mut merged = existing_value.to_vec();
+            merged.extend_from_slice(&value);
+            Ok((merged.into(), None))
+        }
+
+        fn merge_batch(
+            &self,
+            existing_value: Bytes,
+            operands: Vec<Bytes>,
+            _time_provider: Option<&dyn crate::TimeProvider>,
+        ) -> Result<(Bytes, Option<ValueType>)> {
+            self.merge_batch_calls.fetch_add(1, Ordering::Relaxed);
+            let mut merged = existing_value.to_vec();
+            for operand in operands {
+                merged.extend_from_slice(&operand);
+            }
+            Ok((merged.into(), None))
+        }
+    }
 
     fn make_value_bytes(columns: Vec<Option<Column>>, num_columns: usize) -> Vec<u8> {
         let value = Value::new(columns);
@@ -645,6 +686,68 @@ mod tests {
             decoded.columns()[0].as_ref().unwrap().data().as_ref(),
             b"123"
         );
+    }
+
+    #[test]
+    fn test_deduplicating_uses_one_batch_merge_without_callback() {
+        let merge_calls = Arc::new(AtomicUsize::new(0));
+        let merge_batch_calls = Arc::new(AtomicUsize::new(0));
+        let schema = Schema::new(
+            0,
+            1,
+            vec![Arc::new(CountingMergeOperator {
+                merge_calls: Arc::clone(&merge_calls),
+                merge_batch_calls: Arc::clone(&merge_batch_calls),
+            })],
+        );
+        let entries = vec![
+            (
+                b"a".as_slice(),
+                make_value_bytes(
+                    vec![Some(Column::new(ValueType::Merge, b"-3".as_slice()))],
+                    1,
+                ),
+            ),
+            (
+                b"a".as_slice(),
+                make_value_bytes(
+                    vec![Some(Column::new(ValueType::Merge, b"-2".as_slice()))],
+                    1,
+                ),
+            ),
+            (
+                b"a".as_slice(),
+                make_value_bytes(
+                    vec![Some(Column::new(ValueType::Merge, b"-1".as_slice()))],
+                    1,
+                ),
+            ),
+            (
+                b"a".as_slice(),
+                make_value_bytes(
+                    vec![Some(Column::new(ValueType::Put, b"base".as_slice()))],
+                    1,
+                ),
+            ),
+        ];
+        let mut dedup = DeduplicatingIterator::new(
+            MockIterator::new(entries),
+            Some(1),
+            Arc::new(TTLProvider::disabled()),
+            None,
+            Arc::new(schema),
+        );
+
+        dedup.seek_to_first().unwrap();
+        let (key, value) = dedup.take_current().unwrap().unwrap();
+        let value = value.into_decoded(1).unwrap();
+        assert_eq!(key.as_ref(), b"a");
+        assert_eq!(
+            value.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"base-1-2-3"
+        );
+        assert_eq!(merge_batch_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(merge_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

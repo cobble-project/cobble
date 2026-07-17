@@ -18,8 +18,9 @@ use crate::snapshot::{
     SnapshotManifestInfo, load_manifest_for_snapshot, snapshot_manifest_name,
 };
 use crate::sst::row_codec::{decode_value, decode_value_masked};
-use crate::r#type::decode_merge_separated_array;
-use crate::r#type::{Column, RefColumn, RefKey, RefValue, Value, ValueType};
+use crate::r#type::{
+    Column, RefColumn, RefKey, RefValue, Value, ValueType, decode_merge_separated_array,
+};
 use crate::vlog::{VlogPointer, VlogStore};
 use crate::write_batch::{WriteBatch, WriteOp};
 use crate::writer_options::WriterOptions;
@@ -118,6 +119,7 @@ where
         ValueType::MergeSeparatedArray | ValueType::PutSeparatedArray => {
             let items = decode_merge_separated_array(column.data())?;
             let mut merged = Bytes::new();
+            let mut operands = Vec::with_capacity(items.len());
             for item in items {
                 let item_value = match item.value_type {
                     ValueType::Put | ValueType::Merge => Bytes::copy_from_slice(item.data()),
@@ -137,14 +139,22 @@ where
                 match item.value_type {
                     ValueType::Put | ValueType::PutSeparated => {
                         merged = item_value;
+                        // A Put replaces prior operands; batch the remaining payload once.
+                        operands.clear();
                     }
                     ValueType::Merge | ValueType::MergeSeparated => {
-                        merged = merge_operator.merge(merged, item_value, time_provider)?.0;
+                        operands.push(item_value);
                     }
                     ValueType::Delete
                     | ValueType::MergeSeparatedArray
                     | ValueType::PutSeparatedArray => unreachable!(),
                 }
+            }
+            // One final batch merge avoids repeatedly concatenating the separated payload.
+            if !operands.is_empty() {
+                merged = merge_operator
+                    .merge_batch(merged, operands, time_provider)?
+                    .0;
             }
             Ok(Some(merged))
         }
@@ -1437,6 +1447,7 @@ mod tests {
     use crate::db_state::full_bucket_range;
     use crate::paths::{GOVERNANCE_MANIFEST_POINTER_NAME, snapshot_active_data_relative_path};
     use crate::snapshot::SnapshotLifecycleState;
+    use crate::r#type::encode_merge_separated_array;
     use crate::{
         DbBuilder, DbGovernance, GovernanceMode, ReadOptions, ScanOptions, U32CounterMergeOperator,
         U64CounterMergeOperator, VolumeDescriptor, WriteOptions,
@@ -1980,6 +1991,46 @@ mod tests {
         assert_eq!(operator.merge_batch_calls.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(operator.merge_calls.load(AtomicOrdering::Relaxed), 0);
         cleanup_test_root(root);
+    }
+
+    #[test]
+    fn test_resolve_separated_array_batches_merges_and_resets_on_put() {
+        let operator = Arc::new(BatchCountingMergeOperator::default());
+        let first_pointer = VlogPointer::new(1, 10).to_bytes();
+        let second_pointer = VlogPointer::new(1, 20).to_bytes();
+        let items = [
+            Column::new(ValueType::Merge, b"-discarded".to_vec()),
+            Column::new(ValueType::MergeSeparated, first_pointer.to_vec()),
+            Column::new(ValueType::Put, b"reset".to_vec()),
+            Column::new(ValueType::MergeSeparated, second_pointer.to_vec()),
+            Column::new(ValueType::Merge, b"-last".to_vec()),
+        ];
+        let refs: Vec<_> = items
+            .iter()
+            .map(|item| RefColumn::new(item.value_type, item.data()))
+            .collect();
+        let encoded = encode_merge_separated_array(&refs).unwrap();
+        let column = Column::new(ValueType::PutSeparatedArray, encoded);
+
+        let resolved = resolve_column_with_vlog(
+            column,
+            &mut |pointer| {
+                if pointer.offset() == 10 {
+                    Ok(Bytes::from_static(b"-first"))
+                } else {
+                    assert_eq!(pointer.offset(), 20);
+                    Ok(Bytes::from_static(b"-second"))
+                }
+            },
+            operator.as_ref(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(resolved.as_ref(), b"reset-second-last");
+        assert_eq!(operator.merge_batch_calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(operator.merge_calls.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[test]
