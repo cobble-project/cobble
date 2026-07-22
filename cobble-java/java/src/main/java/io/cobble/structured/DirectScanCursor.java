@@ -47,6 +47,33 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
         return DirectScanRow.decode(resultBuffer, Math.abs(encodedLength));
     }
 
+    /**
+     * Returns up to {@code maxRows} rows in one native call.
+     *
+     * <p>The returned rows remain valid only until the next cursor advance or close.
+     */
+    public DirectScanBatch nextBatch(int maxRows) {
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("direct scan cursor is disposed");
+        }
+        if (maxRows <= 0) {
+            throw new IllegalArgumentException("maxRows must be > 0");
+        }
+        int encodedLength =
+                nextBatchDirectInternal(
+                        nativeHandle,
+                        DirectIoUtils.directAddress(ioBuffer),
+                        ioBuffer.capacity(),
+                        maxRows);
+        if (encodedLength == 0) {
+            return DirectScanBatch.empty();
+        }
+        ByteBuffer resultBuffer =
+                DirectIoUtils.resolveEncodedBuffer(
+                        ioBuffer, encodedLength, Db::getLastDirectOverflowBuffer);
+        return DirectScanBatch.decode(resultBuffer, Math.abs(encodedLength));
+    }
+
     @Override
     public Iterator<DirectScanRow> iterator() {
         if (iteratorCreated) {
@@ -95,4 +122,7 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
 
     private static native int nextRowDirectInternal(
             long nativeHandle, long ioAddress, int ioCapacity);
+
+    private static native int nextBatchDirectInternal(
+            long nativeHandle, long ioAddress, int ioCapacity, int maxRows);
 }

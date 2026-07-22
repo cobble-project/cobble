@@ -2828,6 +2828,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_shrinkBucket(
 pub(crate) struct StructuredScanCursorHandle {
     iter: StructuredScanCursorIter,
     exhausted: bool,
+    batch_buffer: Vec<u8>,
 }
 
 pub(crate) enum StructuredScanCursorIter {
@@ -2840,6 +2841,7 @@ impl StructuredScanCursorHandle {
         Self {
             iter: StructuredScanCursorIter::Db(Box::new(iter)),
             exhausted: false,
+            batch_buffer: Vec::new(),
         }
     }
 
@@ -2847,6 +2849,7 @@ impl StructuredScanCursorHandle {
         Self {
             iter: StructuredScanCursorIter::Split(Box::new(scanner)),
             exhausted: false,
+            batch_buffer: Vec::new(),
         }
     }
 
@@ -2874,6 +2877,69 @@ impl StructuredScanCursorHandle {
             return 0;
         };
         encoded
+    }
+
+    fn next_batch_direct<'local>(
+        &mut self,
+        env: &mut JNIEnv<'local>,
+        io_addr: *mut u8,
+        io_capacity: usize,
+        max_rows: usize,
+    ) -> jint {
+        if self.exhausted {
+            return 0;
+        }
+        let mut encoded = std::mem::take(&mut self.batch_buffer);
+        encoded.clear();
+        encoded.extend_from_slice(&0u32.to_be_bytes());
+        let mut row_count = 0u32;
+        while row_count < max_rows as u32 {
+            let row = self.consume_next_row_with_bucket(|bucket, key, cols| {
+                let row_len = encoded_direct_scan_row_payload_size(bucket, key.as_ref(), cols)
+                    .map_err(cobble::Error::IoError)?;
+                let row_len = u32::try_from(row_len).map_err(|_| {
+                    cobble::Error::IoError("structured direct scan row too large".to_string())
+                })?;
+                encoded.extend_from_slice(&row_len.to_be_bytes());
+                let row_offset = encoded.len();
+                encoded.resize(row_offset + row_len as usize, 0);
+                encode_direct_scan_row_payload_into(
+                    bucket,
+                    key.as_ref(),
+                    cols,
+                    &mut encoded[row_offset..],
+                )
+                .map_err(cobble::Error::IoError)?;
+                Ok(())
+            });
+            match row {
+                Ok(Some(())) => row_count += 1,
+                Ok(None) => {
+                    self.exhausted = true;
+                    break;
+                }
+                Err(err) => {
+                    self.batch_buffer = encoded;
+                    throw_illegal_state(env, err.to_string());
+                    return 0;
+                }
+            }
+        }
+        if row_count == 0 {
+            self.batch_buffer = encoded;
+            return 0;
+        }
+        encoded[0..4].copy_from_slice(&row_count.to_be_bytes());
+        let result =
+            match write_payload_to_io_or_cached_overflow(env, io_addr, io_capacity, &encoded) {
+                Ok(encoded_len) => encoded_len,
+                Err(err) => {
+                    throw_illegal_state(env, err);
+                    0
+                }
+            };
+        self.batch_buffer = encoded;
+        result
     }
 
     fn consume_next_row_with_bucket<T, F>(&mut self, mut consumer: F) -> cobble::Result<Option<T>>
@@ -3023,6 +3089,42 @@ pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_nextRowDirectI
         }
     };
     cursor.next_row_direct(&mut env, io_address, io_capacity)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_nextBatchDirectInternal(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    io_address: jlong,
+    io_capacity: jint,
+    max_rows: jint,
+) -> jint {
+    let Some(cursor) = structured_scan_cursor_from_handle(&mut env, native_handle) else {
+        return 0;
+    };
+    let io_capacity = match usize::try_from(io_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "ioCapacity must be >= 0".to_string());
+            return 0;
+        }
+    };
+    let io_address = match usize::try_from(io_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "ioAddress must be > 0".to_string());
+            return 0;
+        }
+    };
+    let max_rows = match usize::try_from(max_rows) {
+        Ok(v) if v > 0 => v,
+        _ => {
+            throw_illegal_argument(&mut env, "maxRows must be > 0".to_string());
+            return 0;
+        }
+    };
+    cursor.next_batch_direct(&mut env, io_address, io_capacity, max_rows)
 }
 
 pub(crate) fn decode_priority_queue_batch_size(

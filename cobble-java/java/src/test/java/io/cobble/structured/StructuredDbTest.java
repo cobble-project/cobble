@@ -1223,7 +1223,7 @@ class StructuredDbTest {
                     DirectScanCursor cursor =
                             db.scanDirectWithOptions(
                                     0, startBuffer, start.length, endBuffer, end.length, options)) {
-                java.util.List<String> seen = new ArrayList<>();
+                List<String> seen = new ArrayList<>();
                 while (true) {
                     DirectScanRow row = cursor.nextRow();
                     if (row == null) {
@@ -1245,6 +1245,72 @@ class StructuredDbTest {
                 assertEquals("encoded-scan-04=encoded-scan-value-4", seen.get(4));
             }
         }
+    }
+
+    @Test
+    void structuredDirectScanCursorSupportsBatchedTraversalAndOverflow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-direct-batch-scan-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config)) {
+            for (int i = 0; i < 8; i++) {
+                byte[] key = String.format("batch-scan-%02d", i).getBytes(StandardCharsets.UTF_8);
+                byte[] value =
+                        i == 4
+                                ? largeValueBytes("batch-scan-large", i, 4096)
+                                : ("batch-scan-value-" + i).getBytes(StandardCharsets.UTF_8);
+                db.put(0, key, 0, ColumnValue.ofBytes(value));
+            }
+
+            byte[] start = "batch-scan-00".getBytes(StandardCharsets.UTF_8);
+            byte[] end = "batch-scan-08".getBytes(StandardCharsets.UTF_8);
+            ByteBuffer startBuffer = directBufferOf(start);
+            ByteBuffer endBuffer = directBufferOf(end);
+
+            try (ScanOptions options = new ScanOptions().columns(0);
+                    DirectScanCursor cursor =
+                            db.scanDirectWithOptions(
+                                    0, startBuffer, start.length, endBuffer, end.length, options)) {
+                List<String> seen = new ArrayList<>();
+                int[] expectedBatchSizes = {3, 3, 2};
+                for (int expectedBatchSize : expectedBatchSizes) {
+                    DirectScanBatch batch = cursor.nextBatch(3);
+                    assertEquals(expectedBatchSize, batch.size());
+                    for (DirectScanRow row : batch) {
+                        String key =
+                                new String(readDirectBytes(row.getKey()), StandardCharsets.UTF_8);
+                        byte[] value =
+                                row.decodeBytesColumn(0, StructuredDbTest::readInputStreamBytes);
+                        seen.add(key + "=" + value.length);
+                    }
+                }
+                assertTrue(cursor.nextBatch(3).isEmpty());
+                assertEquals(8, seen.size());
+                assertEquals("batch-scan-00=18", seen.get(0));
+                assertEquals("batch-scan-04=4096", seen.get(4));
+                assertEquals("batch-scan-07=18", seen.get(7));
+            }
+        }
+    }
+
+    @Test
+    void structuredDirectScanCursorRejectsInvalidBatchSize() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-direct-batch-invalid-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+
+        try (Db db = Db.open(config);
+                DirectScanCursor cursor = db.scanDirectWithOptions(0, null, 0, null, 0, null)) {
+            assertThrows(IllegalArgumentException.class, () -> cursor.nextBatch(0));
+        }
+    }
+
+    @Test
+    void structuredDirectScanBatchRejectsImpossibleRowCount() {
+        ByteBuffer encoded = ByteBuffer.allocateDirect(2 * Integer.BYTES);
+        encoded.putInt(0, Integer.MAX_VALUE);
+        assertThrows(
+                IllegalStateException.class,
+                () -> DirectScanBatch.decode(encoded, encoded.capacity()));
     }
 
     @Test
