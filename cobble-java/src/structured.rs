@@ -3140,7 +3140,7 @@ fn encode_priority_queue_rows_payload_into(
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-fn db_from_handle(env: &mut JNIEnv, handle: jlong) -> Option<&'static DataStructureDb> {
+pub(crate) fn db_from_handle(env: &mut JNIEnv, handle: jlong) -> Option<&'static DataStructureDb> {
     if handle == 0 {
         throw_illegal_state(env, "structured db handle is disposed".to_string());
         return None;

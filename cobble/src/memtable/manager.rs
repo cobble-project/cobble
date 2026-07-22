@@ -1455,6 +1455,75 @@ impl MemtableManager {
         }
     }
 
+    /// Puts caller-validated rows while retaining the active lock between successful entries.
+    pub(crate) fn put_validated_batch<'a, I>(&self, entries: I, num_columns: usize) -> Result<()>
+    where
+        I: IntoIterator<Item = (RefKey<'a>, RefValue<'a>)>,
+    {
+        let mut entries = entries.into_iter();
+        loop {
+            if self.put_batch_into_active(&mut entries, num_columns)? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn put_batch_into_active<'a, I>(&self, entries: &mut I, num_columns: usize) -> Result<bool>
+    where
+        I: Iterator<Item = (RefKey<'a>, RefValue<'a>)>,
+    {
+        if self.db_state.load().active.is_none() {
+            let mut state = self.state.lock().unwrap();
+            while self.db_state.load().active.is_none() {
+                self.db_lifecycle.ensure_open()?;
+                state = self.buffer_ready.wait(state).unwrap();
+            }
+        }
+        let active = self
+            .db_state
+            .load()
+            .active
+            .clone()
+            .expect("active memtable exists");
+        let mut active = active.lock().unwrap();
+        if active.memtable.is_none() {
+            return Ok(false);
+        }
+        let latest_schema = self.schema_manager.latest_schema();
+        if active.schema.version() != latest_schema.version() {
+            let is_empty = active
+                .memtable
+                .as_ref()
+                .map(|memtable| memtable.is_empty())
+                .unwrap_or(true);
+            if is_empty {
+                active.schema = latest_schema;
+            } else {
+                drop(active);
+                let _ = self.flush_active()?;
+                return Ok(false);
+            }
+        }
+
+        for (key, value) in entries {
+            debug_assert_eq!(
+                active.schema.num_columns_in_family(key.column_family()),
+                Some(num_columns)
+            );
+            let put_result = active
+                .memtable
+                .as_mut()
+                .expect("active memtable exists")
+                .put_ref(&key, &value, num_columns);
+            if let Err(err) = put_result {
+                self.handle_memtable_put_error(&err, active, &key, &value)?;
+                self.put(&key, &value)?;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn allocate_one_key_value_special_vec_memtable_as_active(
         &self,
         key: &RefKey<'_>,

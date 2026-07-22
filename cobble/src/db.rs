@@ -536,6 +536,49 @@ impl Db {
         self.write_ref(bucket, key, column, ValueType::Put, value, options)
     }
 
+    /// Inserts byte values into one bucket and column using one database access.
+    pub fn put_column_batch_with_options<'a, I>(
+        &self,
+        bucket: u16,
+        column: u16,
+        entries: I,
+        options: &WriteOptions,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    {
+        let _access = self.begin_access()?;
+        let schema = self.schema_manager.latest_schema();
+        self.ensure_multi_lsm_scopes_for_schema_if_dirty(schema.as_ref())?;
+        let column_family_id = options.resolve_column_family_id_cached(schema.as_ref())?;
+        let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
+        let column_idx = column as usize;
+        if column_idx >= num_columns {
+            return Err(Error::IoError(format!(
+                "Column index {} exceeds num_columns {}",
+                column_idx, num_columns
+            )));
+        }
+        let expired_at = self.ttl_provider.get_expiration_timestamp(
+            if schema.value_has_ttl_in_family(column_family_id) {
+                options.ttl_seconds
+            } else {
+                None
+            },
+        );
+
+        let entries = entries.into_iter().map(|(key, value)| {
+            let mut columns = vec![None; num_columns];
+            columns[column_idx] = Some(RefColumn::new(ValueType::Put, value));
+            (
+                RefKey::new_with_column_family(bucket, column_family_id, key),
+                RefValue::new_with_expired_at(columns, expired_at),
+            )
+        });
+        self.memtable_manager
+            .put_validated_batch(entries, num_columns)
+    }
+
     /// Delete a single column value in the given bucket.
     pub fn delete<K>(&self, bucket: u16, key: K, column: u16) -> Result<()>
     where
@@ -1797,6 +1840,38 @@ mod tests {
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"new");
 
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_column_batch_rotates_memtables_without_losing_entries() {
+        let root = "/tmp/db_column_batch_rotation";
+        cleanup_test_root(root);
+        let db = open_db(config_with_small_memtable(root));
+        let entries = (0..20)
+            .map(|index| {
+                (
+                    format!("key-{index}").into_bytes(),
+                    vec![b'a' + (index % 20) as u8; 48],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        db.put_column_batch_with_options(
+            0,
+            0,
+            entries
+                .iter()
+                .map(|(key, value)| (key.as_slice(), value.as_slice())),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+
+        for (key, expected) in &entries {
+            let value = db.get(0, key).unwrap().expect("batch value present");
+            assert_eq!(value[0].as_ref().unwrap().as_ref(), expected.as_slice());
+        }
         cleanup_test_root(root);
     }
 

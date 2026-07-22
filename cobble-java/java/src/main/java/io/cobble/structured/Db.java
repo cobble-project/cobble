@@ -405,6 +405,28 @@ public final class Db extends NativeObject {
                 woh);
     }
 
+    /** Writes a reusable batch of byte-column puts with one native call. */
+    public void putDirectBatchWithOptions(
+            int bucket, int column, DirectWriteBatch batch, WriteOptions options) {
+        if (batch == null) {
+            throw new NullPointerException("batch");
+        }
+        if (batch.isEmpty()) {
+            return;
+        }
+        ByteBuffer encoded = batch.encodedBuffer();
+        long woh = options == null ? 0L : options.getNativeHandle();
+        putBytesDirectBatchWithOptions(
+                nativeHandle,
+                bucket,
+                column,
+                DirectIoUtils.directAddress(encoded),
+                encoded.capacity(),
+                batch.encodedLength(),
+                batch.size(),
+                woh);
+    }
+
     /**
      * Merge one bytes column value with direct ByteBuffer input.
      *
@@ -1102,6 +1124,16 @@ public final class Db extends NativeObject {
             long valueAddress,
             int valueCapacity,
             int valueLength,
+            long writeOptionsHandle);
+
+    private static native void putBytesDirectBatchWithOptions(
+            long nativeHandle,
+            int bucket,
+            int column,
+            long encodedAddress,
+            int encodedCapacity,
+            int encodedLength,
+            int entryCount,
             long writeOptionsHandle);
 
     private static native void mergeBytes(

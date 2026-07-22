@@ -1263,6 +1263,37 @@ impl StructuredDb {
             .put_with_options(bucket, key, column, encoded, options.as_cobble())
     }
 
+    /// Writes byte-column entries through the core put-batch fast path.
+    pub fn put_bytes_batch_with_options<'a, I>(
+        &self,
+        bucket: u16,
+        column: u16,
+        entries: I,
+        options: &StructuredWriteOptions,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    {
+        let column_family_id = self
+            .structured_schema
+            .resolve_column_family_id(options.column_family())?;
+        if !matches!(
+            self.structured_schema
+                .column_families
+                .get(&column_family_id)
+                .map(|family| family.structured_column_type(column))
+                .unwrap_or(&StructuredColumnType::Bytes),
+            StructuredColumnType::Bytes
+        ) {
+            return Err(Error::InputError(format!(
+                "column {} expects a different type of value",
+                column,
+            )));
+        }
+        self.db
+            .put_column_batch_with_options(bucket, column, entries, options.as_cobble())
+    }
+
     pub fn put_encoded_list<K, B>(&self, bucket: u16, key: K, column: u16, encoded: B) -> Result<()>
     where
         K: AsRef<[u8]>,
