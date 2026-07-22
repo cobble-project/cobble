@@ -455,6 +455,7 @@ impl CompactionExecutor {
                             bloom_filter_enabled: options.bloom_filter_enabled,
                             read_metadata_cache_mode: options.read_metadata_cache_mode,
                             pin_metadata,
+                            pin_metadata_partitions: options.pinned_metadata_partitions_enabled,
                             cache_namespace: single_bucket_in_range(&file.effective_bucket_range)
                                 .map(|bucket| {
                                     bucket_scoped_cache_namespace(base_cache_namespace, bucket)

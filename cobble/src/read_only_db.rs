@@ -211,6 +211,9 @@ impl ReadOnlyDb {
         );
         lsm_tree.set_sst_read_metadata_cache_mode(config.sst_read_metadata_cache_mode);
         lsm_tree.set_sst_pinned_metadata_max_level(config.sst_pinned_metadata_max_level);
+        lsm_tree.set_sst_pinned_metadata_partitions_enabled(
+            config.sst_pinned_metadata_partitions_enabled,
+        );
         if let Some(block_cache) = block_cache {
             lsm_tree.set_block_cache(Some(block_cache));
         } else if block_cache_size > 0 {

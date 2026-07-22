@@ -67,6 +67,7 @@ pub(crate) struct LSMTree {
     sst_metrics: Arc<SSTIteratorMetrics>,
     sst_read_metadata_cache_mode: SstReadMetadataCacheMode,
     sst_pinned_metadata_max_level: Option<u8>,
+    sst_pinned_metadata_partitions_enabled: bool,
     cache_namespace: u64,
     scan_hot_blocks: Arc<ScanHotBlockRegistry>,
     block_cache_preload_worker: Arc<BlockCachePreloadWorker>,
@@ -166,6 +167,7 @@ impl LSMTree {
             sst_metrics: metrics_manager.sst_iterator_metrics(),
             sst_read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
             sst_pinned_metadata_max_level: None,
+            sst_pinned_metadata_partitions_enabled: false,
             cache_namespace,
             scan_hot_blocks: Arc::new(ScanHotBlockRegistry::new()),
             block_cache_preload_worker,
@@ -463,6 +465,10 @@ impl LSMTree {
 
     pub(crate) fn set_sst_pinned_metadata_max_level(&mut self, max_level: Option<u8>) {
         self.sst_pinned_metadata_max_level = max_level;
+    }
+
+    pub(crate) fn set_sst_pinned_metadata_partitions_enabled(&mut self, enabled: bool) {
+        self.sst_pinned_metadata_partitions_enabled = enabled;
     }
 
     pub(crate) fn sst_metrics(&self) -> Arc<SSTIteratorMetrics> {
@@ -1076,6 +1082,7 @@ impl LSMTree {
         let preload_scan_cursor_block = preload_scan_cursor_block && self.block_cache.is_some();
         let read_metadata_cache_mode = self.sst_read_metadata_cache_mode;
         let pinned_metadata_max_level = self.sst_pinned_metadata_max_level;
+        let pin_metadata_partitions = self.sst_pinned_metadata_partitions_enabled;
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let mut runs: Vec<SortedRun> = Vec::new();
         let target_num_columns = target_schema
@@ -1143,6 +1150,7 @@ impl LSMTree {
                             bloom_filter_enabled: true,
                             read_metadata_cache_mode,
                             pin_metadata,
+                            pin_metadata_partitions,
                             cache_namespace,
                             preload_next_data_block: preload_scan_cursor_block,
                             hot_block_registry: preload_scan_cursor_block
@@ -1269,6 +1277,7 @@ impl LSMTree {
                     pin_metadata: self
                         .sst_pinned_metadata_max_level
                         .is_some_and(|max_level| level_ordinal <= max_level),
+                    pin_metadata_partitions: self.sst_pinned_metadata_partitions_enabled,
                     cache_namespace,
                     ..SSTIteratorOptions::default()
                 },

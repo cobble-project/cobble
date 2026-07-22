@@ -41,6 +41,9 @@ class DbBindingTest {
 
         config.sstPinnedMetadataMaxLevel = -1;
         assertTrue(config.toJson().contains("\"sst_pinned_metadata_max_level\":-1"));
+
+        config.sstPinnedMetadataPartitionsEnabled = true;
+        assertTrue(config.toJson().contains("\"sst_pinned_metadata_partitions_enabled\":true"));
     }
 
     @Test

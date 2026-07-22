@@ -17,9 +17,9 @@ use std::sync::Arc;
 pub(crate) struct PinnedSstReadMetadata {
     read_metadata: Arc<SstReadMetadata>,
     index_top: Arc<Block>,
-    index_partitions: Arc<[Arc<Block>]>,
+    index_partitions: Option<Arc<[Arc<Block>]>>,
     filter_index: Option<Arc<Block>>,
-    filter_partitions: Arc<[Arc<BloomFilter>]>,
+    filter_partitions: Option<Arc<[Arc<BloomFilter>]>>,
 }
 
 impl PinnedSstReadMetadata {
@@ -27,6 +27,7 @@ impl PinnedSstReadMetadata {
         file: &dyn RandomAccessFile,
         data_file: &DataFile,
         pin_eligible: bool,
+        pin_partitions: bool,
     ) -> Result<Option<Arc<Self>>> {
         if let Some(metadata) = data_file.pinned_sst_read_metadata() {
             return Ok(Some(metadata));
@@ -37,41 +38,56 @@ impl PinnedSstReadMetadata {
 
         // The file is immutable. Competing first readers may duplicate this work, but OnceLock
         // publishes only one fully-built Arc and failures never become visible as a pin.
-        let metadata = Arc::new(Self::load(file, data_file)?);
+        let metadata = Arc::new(Self::load(file, data_file, pin_partitions)?);
         data_file.set_pinned_sst_read_metadata(metadata);
         Ok(data_file.pinned_sst_read_metadata())
     }
 
-    fn load(file: &dyn RandomAccessFile, data_file: &DataFile) -> Result<Self> {
+    fn load(
+        file: &dyn RandomAccessFile,
+        data_file: &DataFile,
+        pin_partitions: bool,
+    ) -> Result<Self> {
         let (footer, cached_footer) = SSTIterator::decode_footer(data_file.meta_bytes(), file)?;
         let index_top = read_index_block(file, &footer, u32::MAX)?;
         let read_metadata = Arc::new(SstReadMetadata::from_index_block(
             footer.clone(),
             &index_top,
         )?);
-        let index_partitions = if footer.partitioned_index {
-            read_metadata
-                .index_partitions()
-                .iter()
-                .enumerate()
-                .map(|(idx, &(offset, size))| read_metadata_block(file, offset, size, idx as u32))
-                .collect::<Result<Vec<_>>>()?
-                .into()
+        let index_partitions = if footer.partitioned_index && pin_partitions {
+            Some(
+                read_metadata
+                    .index_partitions()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &(offset, size))| {
+                        read_metadata_block(file, offset, size, idx as u32)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into(),
+            )
         } else {
-            vec![Arc::clone(&index_top)].into()
+            None
         };
         let (filter_index, filter_partitions) = if !footer.filter_present {
-            (None, Vec::new().into())
+            (None, None)
         } else if footer.partitioned_index {
             let filter_index = read_filter_index(file, &footer)?;
-            let filters = (0..filter_index.offsets_len())
-                .map(|idx| {
-                    let (offset, size) =
-                        indexed_block_location(&filter_index, idx, "filter partition")?;
-                    read_bloom_filter(file, offset, size)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            (Some(filter_index), filters.into())
+            let filters = if pin_partitions {
+                Some(
+                    (0..filter_index.offsets_len())
+                        .map(|idx| {
+                            let (offset, size) =
+                                indexed_block_location(&filter_index, idx, "filter partition")?;
+                            read_bloom_filter(file, offset, size)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .into(),
+                )
+            } else {
+                None
+            };
+            (Some(filter_index), filters)
         } else {
             validate_filter(&footer)?;
             let filter = read_bloom_filter(
@@ -79,7 +95,7 @@ impl PinnedSstReadMetadata {
                 footer.filter_block_offset,
                 footer.filter_block_size as usize,
             )?;
-            (None, vec![filter].into())
+            (None, Some(vec![filter].into()))
         };
         if let Some(bytes) = cached_footer {
             data_file.set_meta_bytes(bytes);
@@ -101,10 +117,14 @@ impl PinnedSstReadMetadata {
         Arc::clone(&self.index_top)
     }
 
-    pub(crate) fn index_partition(&self, partition_idx: usize) -> Result<Arc<Block>> {
-        self.index_partitions
+    pub(crate) fn index_partition(&self, partition_idx: usize) -> Result<Option<Arc<Block>>> {
+        let Some(partitions) = &self.index_partitions else {
+            return Ok(None);
+        };
+        partitions
             .get(partition_idx)
             .cloned()
+            .map(Some)
             .ok_or_else(|| {
                 Error::IoError(format!(
                     "Pinned index partition out of bounds: {partition_idx}"
@@ -112,20 +132,23 @@ impl PinnedSstReadMetadata {
             })
     }
 
-    pub(crate) fn filter_index(&self) -> Result<Arc<Block>> {
-        self.filter_index
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| Error::IoError("Pinned SST has no filter index".to_string()))
+    pub(crate) fn filter_index(&self) -> Option<Arc<Block>> {
+        self.filter_index.as_ref().cloned()
     }
 
-    pub(crate) fn filter_partition(&self, partition_idx: usize) -> Result<Arc<BloomFilter>> {
+    pub(crate) fn filter_partition(
+        &self,
+        partition_idx: usize,
+    ) -> Result<Option<Arc<BloomFilter>>> {
+        let Some(partitions) = &self.filter_partitions else {
+            return Ok(None);
+        };
         let index = if self.read_metadata.footer().partitioned_index {
             partition_idx
         } else {
             0
         };
-        self.filter_partitions.get(index).cloned().ok_or_else(|| {
+        partitions.get(index).cloned().map(Some).ok_or_else(|| {
             Error::IoError(format!(
                 "Pinned filter partition out of bounds: {partition_idx}"
             ))
@@ -146,9 +169,12 @@ impl SSTPointReader {
         key: &[u8],
     ) -> Result<Option<Bytes>> {
         let metrics = SSTIterator::metrics_for(&options);
-        if let Some(metadata) =
-            PinnedSstReadMetadata::get_or_load(file.as_ref(), data_file, options.pin_metadata)?
-        {
+        if let Some(metadata) = PinnedSstReadMetadata::get_or_load(
+            file.as_ref(),
+            data_file,
+            options.pin_metadata,
+            options.pin_metadata_partitions,
+        )? {
             return Self::get_with_pinned(
                 file.as_ref(),
                 data_file.file_id,
@@ -219,13 +245,42 @@ impl SSTPointReader {
             return Ok(None);
         }
         let partition_idx = find_partition(footer, &index_top, key)?;
-        if should_check_bloom(options, footer)
-            && !metadata.filter_partition(partition_idx)?.may_contain(key)
-        {
-            return Ok(None);
+        if should_check_bloom(options, footer) {
+            let filter = match metadata.filter_partition(partition_idx)? {
+                Some(filter) => filter,
+                None => load_cached_filter(
+                    file,
+                    file_id,
+                    options,
+                    block_cache,
+                    metrics,
+                    footer,
+                    partition_idx,
+                    metadata.filter_index().as_deref(),
+                )?,
+            };
+            if !filter.may_contain(key) {
+                return Ok(None);
+            }
         }
         let partition = if footer.partitioned_index {
-            metadata.index_partition(partition_idx)?
+            match metadata.index_partition(partition_idx)? {
+                Some(partition) => partition,
+                None => {
+                    let (offset, size) = metadata.read_metadata().index_partitions()[partition_idx];
+                    load_cached_block(
+                        file,
+                        file_id,
+                        options,
+                        block_cache,
+                        metrics,
+                        offset,
+                        size,
+                        partition_idx as u32,
+                        BlockCacheKind::IndexPartition,
+                    )?
+                }
+            }
         } else {
             index_top
         };
@@ -266,6 +321,7 @@ impl SSTPointReader {
                 metrics,
                 footer,
                 partition_idx,
+                None,
             )?
             .may_contain(key)
         {
@@ -434,21 +490,28 @@ fn load_cached_filter(
     metrics: &SSTIteratorMetrics,
     footer: &Footer,
     partition_idx: usize,
+    pinned_filter_index: Option<&Block>,
 ) -> Result<Arc<BloomFilter>> {
     let (offset, size, kind) = if footer.partitioned_index {
-        let filter_index = load_cached_block(
-            file,
-            file_id,
-            options,
-            block_cache,
-            metrics,
-            footer.filter_block_offset,
-            footer.filter_block_size,
-            u32::MAX - 1,
-            BlockCacheKind::FilterIndex,
-        )?;
+        let cached_filter_index;
+        let filter_index = if let Some(filter_index) = pinned_filter_index {
+            filter_index
+        } else {
+            cached_filter_index = load_cached_block(
+                file,
+                file_id,
+                options,
+                block_cache,
+                metrics,
+                footer.filter_block_offset,
+                footer.filter_block_size,
+                u32::MAX - 1,
+                BlockCacheKind::FilterIndex,
+            )?;
+            cached_filter_index.as_ref()
+        };
         let (offset, size) =
-            indexed_block_location(&filter_index, partition_idx, "filter partition")?;
+            indexed_block_location(filter_index, partition_idx, "filter partition")?;
         (offset, size, BlockCacheKind::FilterPartition)
     } else {
         (
@@ -587,10 +650,11 @@ mod tests {
         write_sst(true)
     }
 
-    fn options(pin_metadata: bool) -> SSTIteratorOptions {
+    fn options(pin_metadata: bool, pin_metadata_partitions: bool) -> SSTIteratorOptions {
         SSTIteratorOptions {
             bloom_filter_enabled: true,
             pin_metadata,
+            pin_metadata_partitions,
             ..SSTIteratorOptions::default()
         }
     }
@@ -609,7 +673,7 @@ mod tests {
             SSTPointReader::get_exact(
                 fs.open_read("point-read.sst").unwrap(),
                 &data_file,
-                options(false),
+                options(false, false),
                 None,
                 b"key002",
             )
@@ -621,7 +685,7 @@ mod tests {
             SSTPointReader::get_exact(
                 fs.open_read("point-read.sst").unwrap(),
                 &data_file,
-                options(false),
+                options(false, false),
                 None,
                 b"missing",
             )
@@ -638,7 +702,7 @@ mod tests {
             SSTPointReader::get_exact(
                 fs.open_read("point-read.sst").unwrap(),
                 &data_file,
-                options(true),
+                options(true, false),
                 None,
                 b"key001",
             )
@@ -659,7 +723,7 @@ mod tests {
             SSTPointReader::get_exact(
                 fs.open_read("point-read.sst").unwrap(),
                 &data_file,
-                options(true),
+                options(true, true),
                 Some(block_cache.clone()),
                 b"key002",
             )
@@ -674,7 +738,7 @@ mod tests {
         let mut scan_iter = SSTIterator::with_cache_and_file(
             fs.open_read("point-read.sst").unwrap(),
             &data_file,
-            options(false),
+            options(false, true),
             Some(block_cache.clone()),
         )
         .unwrap();
@@ -688,7 +752,7 @@ mod tests {
             &data_file,
             SSTIteratorOptions {
                 observe_hot_blocks: true,
-                ..options(false)
+                ..options(false, true)
             },
             Some(block_cache),
         )
@@ -707,7 +771,7 @@ mod tests {
         let mut scan_iter = SSTIterator::with_cache_and_file(
             fs.open_read("point-read.sst").unwrap(),
             &data_file,
-            options(true),
+            options(true, true),
             Some(block_cache.clone()),
         )
         .unwrap();
@@ -732,7 +796,7 @@ mod tests {
             SSTPointReader::get_exact(
                 fs.open_read("point-read.sst").unwrap(),
                 &data_file,
-                options(false),
+                options(false, true),
                 Some(block_cache),
                 b"key002",
             )
@@ -749,14 +813,14 @@ mod tests {
         let reader = fs.open_read("point-read.sst").unwrap();
 
         assert!(
-            PinnedSstReadMetadata::get_or_load(reader.as_ref(), &data_file, false,)
+            PinnedSstReadMetadata::get_or_load(reader.as_ref(), &data_file, false, false)
                 .unwrap()
                 .is_none()
         );
         assert!(data_file.pinned_sst_read_metadata().is_none());
         let reader = fs.open_read("point-read.sst").unwrap();
         assert!(
-            PinnedSstReadMetadata::get_or_load(reader.as_ref(), &data_file, true,)
+            PinnedSstReadMetadata::get_or_load(reader.as_ref(), &data_file, true, false)
                 .unwrap()
                 .is_some()
         );
@@ -766,14 +830,54 @@ mod tests {
     fn existing_pin_wins_over_a_later_ineligible_path() {
         let (_directory, fs, data_file) = write_partitioned_sst();
         let reader = fs.open_read("point-read.sst").unwrap();
-        let pin = PinnedSstReadMetadata::get_or_load(reader.as_ref(), &data_file, true)
+        let pin = PinnedSstReadMetadata::get_or_load(reader.as_ref(), &data_file, true, false)
             .unwrap()
             .unwrap();
         let reader = fs.open_read("point-read.sst").unwrap();
-        let reused = PinnedSstReadMetadata::get_or_load(reader.as_ref(), &data_file, false)
+        let reused = PinnedSstReadMetadata::get_or_load(reader.as_ref(), &data_file, false, true)
             .unwrap()
             .unwrap();
 
         assert!(Arc::ptr_eq(&pin, &reused));
+    }
+
+    #[test]
+    fn top_level_pin_keeps_partition_metadata_in_the_block_cache() {
+        let (_directory, fs, data_file) = write_partitioned_sst();
+        let recording_cache = Arc::new(RecordingCache::default());
+        let block_cache: BlockCache = recording_cache.clone();
+
+        assert_eq!(
+            SSTPointReader::get_exact(
+                fs.open_read("point-read.sst").unwrap(),
+                &data_file,
+                options(true, false),
+                Some(block_cache.clone()),
+                b"key002",
+            )
+            .unwrap()
+            .as_deref(),
+            Some(b"value".as_slice())
+        );
+
+        let kinds = recording_cache.requested_kinds();
+        assert!(kinds.contains(&BlockCacheKind::IndexPartition));
+        assert!(kinds.contains(&BlockCacheKind::FilterPartition));
+        assert!(kinds.contains(&BlockCacheKind::Data));
+        assert!(!kinds.contains(&BlockCacheKind::FilterIndex));
+
+        recording_cache.clear_history();
+        let mut scan_iter = SSTIterator::with_cache_and_file(
+            fs.open_read("point-read.sst").unwrap(),
+            &data_file,
+            options(false, false),
+            Some(block_cache),
+        )
+        .unwrap();
+        scan_iter.seek_to_first().unwrap();
+        assert!(scan_iter.valid());
+        let kinds = recording_cache.requested_kinds();
+        assert!(kinds.contains(&BlockCacheKind::IndexPartition));
+        assert!(!kinds.contains(&BlockCacheKind::FilterIndex));
     }
 }

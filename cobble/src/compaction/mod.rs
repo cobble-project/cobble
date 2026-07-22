@@ -304,6 +304,7 @@ pub(crate) fn build_compaction_config(
         partitioned_index: config.sst_partitioned_index,
         read_metadata_cache_mode: config.sst_read_metadata_cache_mode,
         pinned_metadata_max_level: config.sst_pinned_metadata_max_level,
+        pinned_metadata_partitions_enabled: config.sst_pinned_metadata_partitions_enabled,
         read_ahead_enabled: config.compaction_read_ahead_enabled,
         max_threads: config.compaction_threads,
         split_trigger_level: config.lsm_split_trigger_level,

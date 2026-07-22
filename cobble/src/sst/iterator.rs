@@ -35,6 +35,8 @@ pub(crate) struct SSTIteratorOptions {
     pub read_metadata_cache_mode: SstReadMetadataCacheMode,
     /// Build DataFile-level pinned metadata on first read when it is absent.
     pub pin_metadata: bool,
+    /// Include second-level index and filter partitions in a newly-built metadata pin.
+    pub pin_metadata_partitions: bool,
     /// Namespace used to isolate block-cache keys across shards/dbs.
     pub cache_namespace: u64,
     /// Preload the data block after the current one during scan iteration.
@@ -137,6 +139,7 @@ impl Default for SSTIteratorOptions {
             bloom_filter_enabled: false,
             read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
             pin_metadata: false,
+            pin_metadata_partitions: false,
             cache_namespace: 0,
             preload_next_data_block: false,
             hot_block_registry: None,
@@ -239,9 +242,12 @@ impl SSTIterator {
         options: SSTIteratorOptions,
         block_cache: Option<BlockCache>,
     ) -> Result<Self> {
-        if let Some(metadata) =
-            crate::sst::PinnedSstReadMetadata::get_or_load(&*file, data_file, options.pin_metadata)?
-        {
+        if let Some(metadata) = crate::sst::PinnedSstReadMetadata::get_or_load(
+            &*file,
+            data_file,
+            options.pin_metadata,
+            options.pin_metadata_partitions,
+        )? {
             let metrics = Self::metrics_for(&options);
             return Ok(Self::from_pinned_metadata(
                 file,
@@ -533,8 +539,9 @@ impl SSTIterator {
     }
 
     fn load_index_partition(&mut self, partition_idx: usize) -> Result<Arc<Block>> {
-        if let Some(metadata) = &self.pinned_metadata {
-            let block = metadata.index_partition(partition_idx)?;
+        if let Some(metadata) = &self.pinned_metadata
+            && let Some(block) = metadata.index_partition(partition_idx)?
+        {
             self.current_index_partition_idx = partition_idx;
             self.current_index_partition = Some(Arc::clone(&block));
             return Ok(block);
@@ -742,8 +749,10 @@ impl SSTIterator {
     /// Load the filter index block.
     /// Used for partitioned filter index.
     fn load_filter_index(&mut self) -> Result<Arc<Block>> {
-        if let Some(metadata) = &self.pinned_metadata {
-            return metadata.filter_index();
+        if let Some(metadata) = &self.pinned_metadata
+            && let Some(filter_index) = metadata.filter_index()
+        {
+            return Ok(filter_index);
         }
         let cache_key = BlockCacheKey {
             namespace: self.options.cache_namespace,
@@ -790,8 +799,10 @@ impl SSTIterator {
     /// Load the bloom filter for the given partition index.
     /// If the SST file does not use partitioned filters, the same filter is returned for any partition index.
     fn load_filter_partition(&mut self, partition_idx: usize) -> Result<Arc<BloomFilter>> {
-        if let Some(metadata) = &self.pinned_metadata {
-            return metadata.filter_partition(partition_idx);
+        if let Some(metadata) = &self.pinned_metadata
+            && let Some(filter) = metadata.filter_partition(partition_idx)?
+        {
+            return Ok(filter);
         }
         if self.footer.partitioned_index {
             let filter_index = self.load_filter_index()?;

@@ -763,6 +763,8 @@ pub struct Config {
     /// `None` keeps all metadata in the normal block-cache path.
     #[serde(deserialize_with = "deserialize_optional_sst_level")]
     pub sst_pinned_metadata_max_level: Option<u8>,
+    /// Whether pinned metadata also includes second-level index and filter partitions.
+    pub sst_pinned_metadata_partitions_enabled: bool,
     /// Number of entries between restart points in SST data-block encoding.
     /// Values > 1 enable prefix compression; value 1 disables prefix compression.
     pub sst_data_block_restart_interval: usize,
@@ -859,6 +861,7 @@ impl Default for Config {
             sst_partitioned_index: false,
             sst_read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
             sst_pinned_metadata_max_level: Some(2),
+            sst_pinned_metadata_partitions_enabled: false,
             sst_data_block_restart_interval: 16,
             data_file_type: DataFileType::SSTable,
             block_checksum_enabled: true,
@@ -1405,6 +1408,7 @@ mod tests {
             sst_partitioned_index: true,
             sst_read_metadata_cache_mode: SstReadMetadataCacheMode::Off,
             sst_pinned_metadata_max_level: Some(2),
+            sst_pinned_metadata_partitions_enabled: true,
             sst_data_block_restart_interval: 32,
             data_file_type: DataFileType::Parquet,
             block_checksum_enabled: false,
@@ -1479,6 +1483,7 @@ mod tests {
             SstReadMetadataCacheMode::Off
         );
         assert_eq!(decoded.sst_pinned_metadata_max_level, Some(2));
+        assert!(decoded.sst_pinned_metadata_partitions_enabled);
         assert_eq!(decoded.time_provider, crate::time::TimeProviderKind::Manual);
         assert_eq!(decoded.log_max_file_size, Size::from_mib(16));
         assert_eq!(decoded.log_keep_files, 5);

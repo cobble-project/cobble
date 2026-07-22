@@ -102,6 +102,9 @@ public final class Config {
     /** Highest SST level whose index and filter metadata is pinned outside the block cache. */
     public Integer sstPinnedMetadataMaxLevel;
 
+    /** Whether to also pin second-level index and filter partitions. */
+    public Boolean sstPinnedMetadataPartitionsEnabled;
+
     /** Data-file format for flush/compaction output. */
     public DataFileType dataFileType;
 

@@ -81,7 +81,8 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 | `sst_bloom_bits_per_key` | `u32` | 10 | Bits per key for bloom filter |
 | `sst_partitioned_index` | `bool` | `false` | Enable two-level partitioned index |
 | `sst_read_metadata_cache_mode` | `SstReadMetadataCacheMode` | `Eager` | Cache decoded SST footer and index-partition metadata: `Eager`, `Lazy`, or `Off` |
-| `sst_pinned_metadata_max_level` | `Option<u8>` | `Some(2)` | Pin immutable SST index and bloom-filter metadata for L0 through this level. Pinned metadata is shared by point reads, scans, and compactions and does not count against the block-cache budget. |
+| `sst_pinned_metadata_max_level` | `Option<u8>` | `Some(2)` | Pin immutable top-level SST index and bloom-filter metadata for L0 through this level. Pinned metadata is shared by point reads, scans, and compactions and does not count against the block-cache budget. |
+| `sst_pinned_metadata_partitions_enabled` | `bool` | `false` | Also pin second-level index and filter partitions for partitioned SST files. |
 | `sst_data_block_restart_interval` | `usize` | 16 | Restart interval in SST data blocks (`>1` enables prefix compression, `1` disables; range `1..=65535`) |
 | `block_checksum_enabled` | `bool` | `true` | Record CRC32 checksums for new SST data blocks; SST reads verify existing checksums automatically |
 | `sst_compression_by_level` | `Vec<SstCompressionAlgorithm>` | `[None, None, Lz4]` | Compression per level |
@@ -89,6 +90,8 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 `sst_read_metadata_cache_mode` accepts `eager`, `lazy`, and `off`. `eager` attaches metadata when a new SST is written, `lazy` caches it on the first read, and `off` rebuilds it for each reader.
 
 Set `sst_pinned_metadata_max_level` to `0` to pin L0 metadata, or `N` to pin L0 through LN. Set it to `-1` in JSON/JVM configuration, or `None` through the Rust API, to use the normal block-cache path for metadata.
+
+By default, partitioned SST files pin only their top-level index and filter index. Set `sst_pinned_metadata_partitions_enabled` to `true` to pin the second-level index and filter partitions as well.
 
 ### Parquet
 

@@ -131,7 +131,8 @@ All capacity/size fields in `Config` (such as `memtable_capacity`, `l1_base_byte
 | `sst_bloom_bits_per_key` | 10 | Bits per key for bloom filters |
 | `sst_partitioned_index` | `false` | Enable two-level index for large files |
 | `sst_read_metadata_cache_mode` | `Eager` | Cache decoded SST metadata eagerly, lazily on first read, or not at all |
-| `sst_pinned_metadata_max_level` | 2 | Pin immutable SST index and bloom-filter metadata for L0 through this level, outside the block-cache budget; set `-1` to disable |
+| `sst_pinned_metadata_max_level` | 2 | Pin immutable top-level SST index and bloom-filter metadata for L0 through this level, outside the block-cache budget; set `-1` to disable |
+| `sst_pinned_metadata_partitions_enabled` | `false` | Also pin second-level index and filter partitions for partitioned SST files |
 | `block_checksum_enabled` | `true` | Record CRC32 checksums for new SST data blocks; SST reads verify checksums automatically |
 | `sst_compression_by_level` | `[None, None, Lz4]` | Compression algorithm per level |
 | `parquet_row_group_size_bytes` | 256 KB | Parquet row group size |
