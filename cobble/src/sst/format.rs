@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::file::SequentialWriteFile;
+use crate::util::unsafe_bytes;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::sync::Arc;
 
@@ -18,6 +19,21 @@ const FOOTER_FLAG_FILTER_PRESENT: u32 = 0x1;
 const FOOTER_FLAG_PARTITIONED_INDEX: u32 = 0x2;
 const FOOTER_FLAG_VALUE_WITHOUT_TTL: u32 = 0x4;
 const FOOTER_FLAG_BLOCK_CHECKSUMS: u32 = 0x8;
+// Covers common encoded state keys without imposing a key-size limit on the format.
+const PREFIX_SEARCH_STACK_BYTES: usize = 128;
+
+#[inline]
+fn with_prefix_search_scratch<T>(
+    target_len: usize,
+    search: impl FnOnce(&mut [u8]) -> Result<T>,
+) -> Result<T> {
+    let mut stack_scratch = [0u8; PREFIX_SEARCH_STACK_BYTES];
+    if target_len <= stack_scratch.len() {
+        return search(&mut stack_scratch[..target_len]);
+    }
+    let mut heap_scratch = vec![0u8; target_len];
+    search(heap_scratch.as_mut_slice())
+}
 
 #[derive(Debug, Clone)]
 pub struct Footer {
@@ -442,6 +458,71 @@ impl Block {
         Ok(left)
     }
 
+    /// Returns the encoded value for an exact key match without materializing a scan cursor.
+    pub(crate) fn get_exact(&self, target: &[u8]) -> Result<Option<Bytes>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        if !self.prefix_compressed {
+            let target = unsafe_bytes(target);
+            let idx = self.find_equal_or_greater_idx(&target)?;
+            if idx >= self.offsets_len() || self.key(idx)?.as_ref() != target.as_ref() {
+                return Ok(None);
+            }
+            return self.value(idx).map(Some);
+        }
+
+        with_prefix_search_scratch(target.len(), |scratch| {
+            self.get_exact_prefix(target, scratch)
+        })
+    }
+
+    fn get_exact_prefix(&self, target: &[u8], key_prefix: &mut [u8]) -> Result<Option<Bytes>> {
+        let target_len = target.len();
+        let (start_idx, end_idx) = self.prefix_restart_search_window(target)?;
+        let data = self.data.as_ref();
+        let mut key_len = 0usize;
+        for entry_idx in start_idx..end_idx {
+            let offset = self.offsets[entry_idx] as usize;
+            if offset + 10 > data.len() {
+                return Err(Error::IoError("Corrupted prefix entry header".to_string()));
+            }
+            let shared = u16::from_le_bytes(
+                data[offset..offset + 2]
+                    .try_into()
+                    .expect("prefix entry header checked"),
+            ) as usize;
+            let (suffix_start, suffix_end) = self.decode_prefix_suffix_bounds(entry_idx)?;
+            if entry_idx == start_idx && shared != 0 {
+                return Err(Error::IoError(
+                    "Corrupted prefix restart entry (shared != 0)".to_string(),
+                ));
+            }
+            if shared > key_len {
+                return Err(Error::IoError(
+                    "Corrupted prefix key (shared prefix out of bounds)".to_string(),
+                ));
+            }
+            let compare_len = Self::update_prefix_search_buffer(
+                key_prefix,
+                target_len,
+                &mut key_len,
+                shared,
+                &data[suffix_start..suffix_end],
+            );
+            match key_prefix[..compare_len].cmp(&target[..compare_len]) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal if key_len == target_len => {
+                    return self.value(entry_idx).map(Some);
+                }
+                std::cmp::Ordering::Equal if key_len < target_len => {}
+                std::cmp::Ordering::Equal => return Ok(None),
+                std::cmp::Ordering::Greater => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
     pub(crate) fn size_in_bytes(&self) -> usize {
         self.size_in_bytes
     }
@@ -571,8 +652,25 @@ impl Block {
         if start_idx == end_idx {
             return Ok(0);
         }
+        with_prefix_search_scratch(target_len, |scratch| {
+            self.find_equal_or_greater_idx_prefix_in_window(
+                target_bytes,
+                start_idx,
+                end_idx,
+                scratch,
+            )
+        })
+    }
+
+    fn find_equal_or_greater_idx_prefix_in_window(
+        &self,
+        target_bytes: &[u8],
+        start_idx: usize,
+        end_idx: usize,
+        key_prefix: &mut [u8],
+    ) -> Result<usize> {
+        let target_len = target_bytes.len();
         let data = self.data.as_ref();
-        let mut key_prefix = vec![0u8; target_len];
         let mut key_len = 0usize;
 
         for entry_idx in start_idx..end_idx {
@@ -597,7 +695,7 @@ impl Block {
                 ));
             }
             let compare_len = Self::update_prefix_search_buffer(
-                &mut key_prefix,
+                key_prefix,
                 target_len,
                 &mut key_len,
                 shared,
@@ -622,8 +720,20 @@ impl Block {
         if start_idx == end_idx {
             return Ok(0);
         }
+        with_prefix_search_scratch(target_len, |scratch| {
+            self.find_lower_or_equal_idx_prefix_in_window(target_bytes, start_idx, end_idx, scratch)
+        })
+    }
+
+    fn find_lower_or_equal_idx_prefix_in_window(
+        &self,
+        target_bytes: &[u8],
+        start_idx: usize,
+        end_idx: usize,
+        key_prefix: &mut [u8],
+    ) -> Result<usize> {
+        let target_len = target_bytes.len();
         let data = self.data.as_ref();
-        let mut key_prefix = vec![0u8; target_len];
         let mut key_len = 0usize;
 
         for entry_idx in start_idx..end_idx {
@@ -648,7 +758,7 @@ impl Block {
                 ));
             }
             let compare_len = Self::update_prefix_search_buffer(
-                &mut key_prefix,
+                key_prefix,
                 target_len,
                 &mut key_len,
                 shared,
@@ -1048,6 +1158,30 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn test_block_exact_lookup() {
+        for prefix_compressed in [false, true] {
+            let mut builder = BlockBuilder::new_with_prefix(4096, 2, prefix_compressed);
+            builder.add(b"map:key:0001", b"v1");
+            builder.add(b"map:key:0002", b"v2");
+            builder.add(b"map:key:0003", b"v3");
+            let long_key = vec![b'z'; PREFIX_SEARCH_STACK_BYTES + 1];
+            builder.add(long_key.as_slice(), b"long");
+            let block = Block::decode(builder.build().encode()).unwrap();
+
+            assert_eq!(
+                block.get_exact(b"map:key:0002").unwrap().as_deref(),
+                Some(b"v2".as_slice())
+            );
+            assert!(block.get_exact(b"map:key:0002a").unwrap().is_none());
+            assert!(block.get_exact(b"map:key:9999").unwrap().is_none());
+            assert_eq!(
+                block.get_exact(long_key.as_slice()).unwrap().as_deref(),
+                Some(b"long".as_slice())
+            );
+        }
     }
 
     #[test]

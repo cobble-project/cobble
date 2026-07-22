@@ -429,6 +429,9 @@ impl CompactionExecutor {
             let target_schema = Arc::clone(&target_schema);
             let scan_hot_blocks = task.scan_hot_blocks.as_ref().map(Arc::clone);
             let base_cache_namespace = task.cache_namespace;
+            let pin_metadata = options
+                .pinned_metadata_max_level
+                .is_some_and(|max_level| run.level() <= max_level);
             let run_iter = run.iter(move |file| {
                 let source_schema = schema_manager.schema(file.schema_id)?;
                 let source_num_columns = source_schema
@@ -451,6 +454,7 @@ impl CompactionExecutor {
                             num_columns: source_num_columns,
                             bloom_filter_enabled: options.bloom_filter_enabled,
                             read_metadata_cache_mode: options.read_metadata_cache_mode,
+                            pin_metadata,
                             cache_namespace: single_bucket_in_range(&file.effective_bucket_range)
                                 .map(|bucket| {
                                     bucket_scoped_cache_namespace(base_cache_namespace, bucket)
@@ -1012,6 +1016,9 @@ mod tests {
         )
         .unwrap();
 
+        let file1_handle = Arc::clone(&file1);
+        let file2_handle = Arc::clone(&file2);
+
         // Create sorted runs
         let run1 = SortedRun::new(0, vec![file1]);
         let run2 = SortedRun::new(1, vec![file2]);
@@ -1021,6 +1028,7 @@ mod tests {
             target_file_size: 1024 * 1024, // 1MB - all entries fit in one file
             bloom_filter_enabled: true,
             bloom_bits_per_key: 10,
+            pinned_metadata_max_level: Some(0),
             ..Default::default()
         };
 
@@ -1058,6 +1066,8 @@ mod tests {
         let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
 
         let result = executor.execute_blocking(task, None).unwrap();
+        assert!(file1_handle.pinned_sst_read_metadata().is_some());
+        assert!(file2_handle.pinned_sst_read_metadata().is_none());
         assert_eq!(result.edit().level_edits.len(), 2);
         assert!(
             result

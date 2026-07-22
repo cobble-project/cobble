@@ -1,5 +1,5 @@
 use crate::file::{FileId, TrackedFileId};
-use crate::sst::SstReadMetadata;
+use crate::sst::{PinnedSstReadMetadata, SstReadMetadata};
 use crate::r#type::key_bucket;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,8 @@ pub struct DataFile {
     pub meta_bytes: OnceLock<Bytes>,
     /// Decoded SST footer and index partition descriptors for this immutable file.
     pub(crate) sst_read_metadata: OnceLock<Arc<SstReadMetadata>>,
+    /// Pinned SST metadata shared by point reads, scans, and compactions.
+    pub(crate) pinned_sst_read_metadata: OnceLock<Arc<PinnedSstReadMetadata>>,
 }
 
 impl DataFile {
@@ -101,6 +103,7 @@ impl DataFile {
             snapshot_data_file: Default::default(),
             meta_bytes: Default::default(),
             sst_read_metadata: Default::default(),
+            pinned_sst_read_metadata: Default::default(),
         }
     }
 
@@ -136,6 +139,7 @@ impl DataFile {
             ),
             meta_bytes: Default::default(),
             sst_read_metadata: Default::default(),
+            pinned_sst_read_metadata: Default::default(),
         };
         data_file.copy_meta_from(self);
         data_file
@@ -186,6 +190,9 @@ impl DataFile {
         if let Some(metadata) = source.sst_read_metadata() {
             self.set_sst_read_metadata(metadata);
         }
+        if let Some(metadata) = source.pinned_sst_read_metadata() {
+            self.set_pinned_sst_read_metadata(metadata);
+        }
     }
 
     pub(crate) fn needs_bucket_filter(&self) -> bool {
@@ -207,6 +214,14 @@ impl DataFile {
 
     pub(crate) fn set_sst_read_metadata(&self, metadata: Arc<SstReadMetadata>) {
         let _ = self.sst_read_metadata.set(metadata);
+    }
+
+    pub(crate) fn pinned_sst_read_metadata(&self) -> Option<Arc<PinnedSstReadMetadata>> {
+        self.pinned_sst_read_metadata.get().cloned()
+    }
+
+    pub(crate) fn set_pinned_sst_read_metadata(&self, metadata: Arc<PinnedSstReadMetadata>) {
+        let _ = self.pinned_sst_read_metadata.set(metadata);
     }
 
     pub fn has_separated_values(&self) -> bool {

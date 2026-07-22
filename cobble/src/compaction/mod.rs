@@ -303,6 +303,7 @@ pub(crate) fn build_compaction_config(
         bloom_bits_per_key: config.sst_bloom_bits_per_key,
         partitioned_index: config.sst_partitioned_index,
         read_metadata_cache_mode: config.sst_read_metadata_cache_mode,
+        pinned_metadata_max_level: config.sst_pinned_metadata_max_level,
         read_ahead_enabled: config.compaction_read_ahead_enabled,
         max_threads: config.compaction_threads,
         split_trigger_level: config.lsm_split_trigger_level,

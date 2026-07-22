@@ -23,7 +23,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::parquet::ParquetIterator;
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaManager};
 use crate::sst::row_codec::{decode_value, decode_value_masked};
-use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
+use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions, SSTPointReader};
 use crate::r#type::{Value, key_bucket, key_column_family};
 use log::{debug, warn};
 use std::collections::{BTreeMap, HashMap};
@@ -66,6 +66,7 @@ pub(crate) struct LSMTree {
     ttl_provider: Arc<crate::ttl::TTLProvider>,
     sst_metrics: Arc<SSTIteratorMetrics>,
     sst_read_metadata_cache_mode: SstReadMetadataCacheMode,
+    sst_pinned_metadata_max_level: Option<u8>,
     cache_namespace: u64,
     scan_hot_blocks: Arc<ScanHotBlockRegistry>,
     block_cache_preload_worker: Arc<BlockCachePreloadWorker>,
@@ -164,6 +165,7 @@ impl LSMTree {
             ttl_provider,
             sst_metrics: metrics_manager.sst_iterator_metrics(),
             sst_read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
+            sst_pinned_metadata_max_level: None,
             cache_namespace,
             scan_hot_blocks: Arc::new(ScanHotBlockRegistry::new()),
             block_cache_preload_worker,
@@ -457,6 +459,10 @@ impl LSMTree {
 
     pub(crate) fn set_sst_read_metadata_cache_mode(&mut self, mode: SstReadMetadataCacheMode) {
         self.sst_read_metadata_cache_mode = mode;
+    }
+
+    pub(crate) fn set_sst_pinned_metadata_max_level(&mut self, max_level: Option<u8>) {
+        self.sst_pinned_metadata_max_level = max_level;
     }
 
     pub(crate) fn sst_metrics(&self) -> Arc<SSTIteratorMetrics> {
@@ -1003,6 +1009,7 @@ impl LSMTree {
                 for file in level.files.iter().rev() {
                     let should_continue = self.get_values_in_one_file(
                         file,
+                        level.ordinal,
                         file_manager,
                         encoded_key,
                         target_schema,
@@ -1027,6 +1034,7 @@ impl LSMTree {
                     }
                     let should_continue = self.get_values_in_one_file(
                         file,
+                        level.ordinal,
                         file_manager,
                         encoded_key,
                         target_schema,
@@ -1067,6 +1075,7 @@ impl LSMTree {
         let selected_columns = selected_columns.map(|columns| columns.to_vec());
         let preload_scan_cursor_block = preload_scan_cursor_block && self.block_cache.is_some();
         let read_metadata_cache_mode = self.sst_read_metadata_cache_mode;
+        let pinned_metadata_max_level = self.sst_pinned_metadata_max_level;
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let mut runs: Vec<SortedRun> = Vec::new();
         let target_num_columns = target_schema
@@ -1108,6 +1117,8 @@ impl LSMTree {
             let schema_manager = Arc::clone(&schema_manager);
             let selected_columns = selected_columns.clone();
             let scan_hot_blocks = Arc::clone(&self.scan_hot_blocks);
+            let pin_metadata =
+                pinned_metadata_max_level.is_some_and(|max_level| run.level() <= max_level);
             let run_iter = run.iter(move |file| {
                 let source_schema = schema_manager.schema(file.schema_id)?;
                 let source_num_columns = source_schema
@@ -1131,6 +1142,7 @@ impl LSMTree {
                             num_columns: source_num_columns,
                             bloom_filter_enabled: true,
                             read_metadata_cache_mode,
+                            pin_metadata,
                             cache_namespace,
                             preload_next_data_block: preload_scan_cursor_block,
                             hot_block_registry: preload_scan_cursor_block
@@ -1215,6 +1227,7 @@ impl LSMTree {
     fn get_values_in_one_file(
         &self,
         file: &Arc<DataFile>,
+        level_ordinal: u8,
         file_manager: &Arc<FileManager>,
         encoded_key: &[u8],
         target_schema: &Schema,
@@ -1245,34 +1258,23 @@ impl LSMTree {
             .map(|bucket| bucket_scoped_cache_namespace(self.cache_namespace, bucket))
             .unwrap_or(self.cache_namespace);
         let value_bytes_opt = match file.file_type {
-            DataFileType::SSTable => {
-                let mut iter = SSTIterator::with_cache_and_file(
-                    Box::new(reader),
-                    file.as_ref(),
-                    SSTIteratorOptions {
-                        num_columns: source_num_columns,
-                        metrics: Some(Arc::clone(&self.sst_metrics)),
-                        bloom_filter_enabled: true,
-                        read_metadata_cache_mode: self.sst_read_metadata_cache_mode,
-                        cache_namespace,
-                        ..SSTIteratorOptions::default()
-                    },
-                    self.block_cache.clone(),
-                )?;
-                if iter.may_contain(encoded_key)? {
-                    iter.seek(encoded_key)?;
-                    if iter.valid()
-                        && let Some(current_key) = iter.key()?
-                        && current_key.as_ref() == encoded_key
-                    {
-                        iter.value()?
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
+            DataFileType::SSTable => SSTPointReader::get_exact(
+                Box::new(reader),
+                file.as_ref(),
+                SSTIteratorOptions {
+                    num_columns: source_num_columns,
+                    metrics: Some(Arc::clone(&self.sst_metrics)),
+                    bloom_filter_enabled: true,
+                    read_metadata_cache_mode: self.sst_read_metadata_cache_mode,
+                    pin_metadata: self
+                        .sst_pinned_metadata_max_level
+                        .is_some_and(|max_level| level_ordinal <= max_level),
+                    cache_namespace,
+                    ..SSTIteratorOptions::default()
+                },
+                self.block_cache.clone(),
+                encoded_key,
+            )?,
             DataFileType::Parquet => {
                 let parquet_read_columns = if file.schema_id == target_schema_id {
                     selected_columns

@@ -33,6 +33,17 @@ class DbBindingTest {
     }
 
     @Test
+    void configSerializesPinnedMetadataLevel() {
+        Config config = new Config();
+        config.sstPinnedMetadataMaxLevel = 2;
+
+        assertTrue(config.toJson().contains("\"sst_pinned_metadata_max_level\":2"));
+
+        config.sstPinnedMetadataMaxLevel = -1;
+        assertTrue(config.toJson().contains("\"sst_pinned_metadata_max_level\":-1"));
+    }
+
+    @Test
     void nativeMetricsAreExposedAsTypedImmutableSamples() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-metrics-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);

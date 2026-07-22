@@ -10,6 +10,7 @@ use crate::iterator::KvIterator;
 use crate::sst::bloom::BloomFilter;
 use crate::sst::compression::{decode_block_bytes, verify_block_checksum};
 use crate::sst::format::{Block, FOOTER_SIZE, Footer, SstReadMetadata};
+use crate::sst::read::read_metadata_block;
 use crate::sst::row_codec::{decode_key, decode_value, encode_key};
 use crate::r#type::{Key, KvValue, Value};
 use crate::util::unsafe_bytes;
@@ -32,6 +33,8 @@ pub(crate) struct SSTIteratorOptions {
     pub bloom_filter_enabled: bool,
     /// Caching policy for decoded footer and index-partition descriptors.
     pub read_metadata_cache_mode: SstReadMetadataCacheMode,
+    /// Build DataFile-level pinned metadata on first read when it is absent.
+    pub pin_metadata: bool,
     /// Namespace used to isolate block-cache keys across shards/dbs.
     pub cache_namespace: u64,
     /// Preload the data block after the current one during scan iteration.
@@ -94,6 +97,30 @@ impl SSTIteratorMetrics {
             ),
         }
     }
+
+    pub(crate) fn record_index_hit(&self) {
+        self.index_hits.increment(1);
+    }
+
+    pub(crate) fn record_index_miss(&self) {
+        self.index_misses.increment(1);
+    }
+
+    pub(crate) fn record_data_hit(&self) {
+        self.data_hits.increment(1);
+    }
+
+    pub(crate) fn record_data_miss(&self) {
+        self.data_misses.increment(1);
+    }
+
+    pub(crate) fn record_filter_hit(&self) {
+        self.filter_hits.increment(1);
+    }
+
+    pub(crate) fn record_filter_miss(&self) {
+        self.filter_misses.increment(1);
+    }
 }
 
 #[cfg(test)]
@@ -109,6 +136,7 @@ impl Default for SSTIteratorOptions {
             metrics: None,
             bloom_filter_enabled: false,
             read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
+            pin_metadata: false,
             cache_namespace: 0,
             preload_next_data_block: false,
             hot_block_registry: None,
@@ -133,6 +161,7 @@ pub(crate) struct SSTIterator {
     current_entry_idx: usize,
     options: SSTIteratorOptions,
     block_cache: Option<BlockCache>,
+    pinned_metadata: Option<Arc<crate::sst::PinnedSstReadMetadata>>,
     hot_block_handle: Option<ScanHotBlockHandle>,
     metrics: Arc<SSTIteratorMetrics>,
     cached_key_entry_idx: Cell<Option<usize>>,
@@ -210,6 +239,19 @@ impl SSTIterator {
         options: SSTIteratorOptions,
         block_cache: Option<BlockCache>,
     ) -> Result<Self> {
+        if let Some(metadata) =
+            crate::sst::PinnedSstReadMetadata::get_or_load(&*file, data_file, options.pin_metadata)?
+        {
+            let metrics = Self::metrics_for(&options);
+            return Ok(Self::from_pinned_metadata(
+                file,
+                data_file.file_id,
+                options,
+                block_cache,
+                metrics,
+                metadata,
+            ));
+        }
         let cached_metadata = options
             .read_metadata_cache_mode
             .caches_reads()
@@ -279,14 +321,14 @@ impl SSTIterator {
         ))
     }
 
-    fn metrics_for(options: &SSTIteratorOptions) -> Arc<SSTIteratorMetrics> {
+    pub(crate) fn metrics_for(options: &SSTIteratorOptions) -> Arc<SSTIteratorMetrics> {
         options
             .metrics
             .clone()
             .unwrap_or_else(|| Arc::new(SSTIteratorMetrics::new("unknown")))
     }
 
-    fn decode_footer(
+    pub(crate) fn decode_footer(
         footer_bytes: Option<Bytes>,
         file: &dyn RandomAccessFile,
     ) -> Result<(Footer, Option<Bytes>)> {
@@ -299,7 +341,7 @@ impl SSTIterator {
         }
     }
 
-    fn load_index_block(
+    pub(crate) fn load_index_block(
         file: &dyn RandomAccessFile,
         file_id: u64,
         options: &SSTIteratorOptions,
@@ -331,24 +373,22 @@ impl SSTIterator {
                 }
             } else {
                 metrics.index_misses.increment(1);
-                let index_data = file.read_at(
-                    footer.index_block_offset as usize,
-                    footer.index_block_size as usize,
+                let index_block = read_metadata_block(
+                    file,
+                    footer.index_block_offset,
+                    footer.index_block_size,
+                    u32::MAX,
                 )?;
-                let mut index_block = Block::decode(index_data)?;
-                index_block.set_block_id(u32::MAX);
-                let index_block = Arc::new(index_block);
                 cache.insert(cache_key, CachedBlock::Block(index_block.clone()));
                 index_block
             }
         } else {
-            let index_data = file.read_at(
-                footer.index_block_offset as usize,
-                footer.index_block_size as usize,
-            )?;
-            let mut index_block = Block::decode(index_data)?;
-            index_block.set_block_id(u32::MAX);
-            Arc::new(index_block)
+            read_metadata_block(
+                file,
+                footer.index_block_offset,
+                footer.index_block_size,
+                u32::MAX,
+            )?
         };
         Ok(index_block)
     }
@@ -382,6 +422,7 @@ impl SSTIterator {
             current_entry_idx: 0,
             options,
             block_cache,
+            pinned_metadata: None,
             hot_block_handle,
             metrics,
             cached_key_entry_idx: Cell::new(None),
@@ -394,6 +435,27 @@ impl SSTIterator {
             should_stop_at_block_boundary: false,
             boundary_state: BoundaryState::None,
         }
+    }
+
+    fn from_pinned_metadata(
+        file: Box<dyn RandomAccessFile>,
+        file_id: u64,
+        options: SSTIteratorOptions,
+        block_cache: Option<BlockCache>,
+        metrics: Arc<SSTIteratorMetrics>,
+        metadata: Arc<crate::sst::PinnedSstReadMetadata>,
+    ) -> Self {
+        let mut iter = Self::from_read_metadata(
+            file,
+            file_id,
+            options,
+            block_cache,
+            metrics,
+            metadata.index_top(),
+            metadata.read_metadata(),
+        );
+        iter.pinned_metadata = Some(metadata);
+        iter
     }
 
     #[cfg(test)]
@@ -460,32 +522,6 @@ impl SSTIterator {
         Ok(())
     }
 
-    pub(crate) fn may_contain(&mut self, key: &[u8]) -> Result<bool> {
-        if !self.options.bloom_filter_enabled
-            || !self.footer.filter_present
-            || self.footer.filter_block_size == 0
-        {
-            return Ok(true);
-        }
-        if self.index_partitions.is_empty() {
-            return Ok(true);
-        }
-        let partition_idx = if self.footer.partitioned_index {
-            if self.index_block.is_empty() {
-                return Ok(true);
-            }
-            let key = unsafe_bytes(key);
-            self.index_block.find_lower_or_equal_idx(&key)?
-        } else {
-            0
-        };
-        self.ensure_bloom_filter_loaded(partition_idx)?;
-        Ok(self
-            .bloom_filter
-            .as_ref()
-            .is_some_and(|filter| filter.may_contain(key)))
-    }
-
     fn ensure_bloom_filter_loaded(&mut self, partition_idx: usize) -> Result<()> {
         if self.bloom_filter_partition_idx == Some(partition_idx) {
             return Ok(());
@@ -497,6 +533,12 @@ impl SSTIterator {
     }
 
     fn load_index_partition(&mut self, partition_idx: usize) -> Result<Arc<Block>> {
+        if let Some(metadata) = &self.pinned_metadata {
+            let block = metadata.index_partition(partition_idx)?;
+            self.current_index_partition_idx = partition_idx;
+            self.current_index_partition = Some(Arc::clone(&block));
+            return Ok(block);
+        }
         if partition_idx >= self.index_partitions.len() {
             return Err(Error::IoError(format!(
                 "Index partition out of bounds: {}",
@@ -700,6 +742,9 @@ impl SSTIterator {
     /// Load the filter index block.
     /// Used for partitioned filter index.
     fn load_filter_index(&mut self) -> Result<Arc<Block>> {
+        if let Some(metadata) = &self.pinned_metadata {
+            return metadata.filter_index();
+        }
         let cache_key = BlockCacheKey {
             namespace: self.options.cache_namespace,
             file_id: self.file_id,
@@ -745,6 +790,9 @@ impl SSTIterator {
     /// Load the bloom filter for the given partition index.
     /// If the SST file does not use partitioned filters, the same filter is returned for any partition index.
     fn load_filter_partition(&mut self, partition_idx: usize) -> Result<Arc<BloomFilter>> {
+        if let Some(metadata) = &self.pinned_metadata {
+            return metadata.filter_partition(partition_idx);
+        }
         if self.footer.partitioned_index {
             let filter_index = self.load_filter_index()?;
             if partition_idx >= filter_index.offsets_len() {
@@ -1234,7 +1282,6 @@ mod tests {
     use crate::data_file::DataFileType;
     use crate::file::{File, FileSystemRegistry};
     use crate::format::FileBuildResult;
-    use crate::sst::bloom::{BloomFilter, BloomFilterBuilder};
     use crate::sst::format::{BlockBuilder, Footer};
     use crate::sst::writer::{SSTWriter, SSTWriterOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -1443,24 +1490,6 @@ mod tests {
         assert!(data_file.sst_read_metadata().is_none());
     }
 
-    fn build_filter(bits_per_key: u32, keys: &[&[u8]]) -> BloomFilter {
-        let mut builder = BloomFilterBuilder::new(bits_per_key);
-        for key in keys {
-            builder.add(key);
-        }
-        builder.finish()
-    }
-
-    fn find_missing_key(prefix: &str, filter: &BloomFilter) -> Vec<u8> {
-        for idx in 0..1000 {
-            let candidate = format!("{}{}", prefix, idx);
-            if !filter.may_contain(candidate.as_bytes()) {
-                return candidate.into_bytes();
-            }
-        }
-        panic!("unable to find missing key not in filter");
-    }
-
     #[test]
     #[serial_test::serial(file)]
     fn test_sst_data_block_checksum_detects_corruption() {
@@ -1643,126 +1672,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all("/tmp/sst_compressed_test");
-    }
-
-    #[test]
-    #[serial_test::serial(file)]
-    fn test_sst_iterator_may_contain_single_level() {
-        let _ = std::fs::remove_dir_all("/tmp/sst_filter_single_test");
-        let registry = FileSystemRegistry::new();
-        let fs = registry
-            .get_or_register("file:///tmp/sst_filter_single_test")
-            .unwrap();
-
-        let keys: [&[u8]; 3] = [b"key1", b"key2", b"key3"];
-        let bits_per_key = 100;
-        let filter = build_filter(bits_per_key, &keys);
-        let missing_key = find_missing_key("missing_", &filter);
-
-        {
-            let writer_file = fs.open_write("filter_single.sst").unwrap();
-            let mut writer = SSTWriter::new(
-                writer_file,
-                SSTWriterOptions {
-                    bloom_filter_enabled: true,
-                    bloom_bits_per_key: bits_per_key,
-                    partitioned_index: false,
-                    read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
-                    ..SSTWriterOptions::default()
-                },
-            );
-
-            for key in keys {
-                writer.add(key, b"value").unwrap();
-            }
-
-            writer.finish().unwrap();
-        }
-
-        {
-            let reader_file = fs.open_read("filter_single.sst").unwrap();
-            let mut iter = SSTIterator::with_cache(
-                reader_file,
-                0,
-                SSTIteratorOptions {
-                    bloom_filter_enabled: true,
-                    ..SSTIteratorOptions::default()
-                },
-                None,
-                None,
-            )
-            .unwrap();
-
-            assert!(iter.may_contain(b"key2").unwrap());
-            assert!(!iter.may_contain(&missing_key).unwrap());
-        }
-
-        let _ = std::fs::remove_dir_all("/tmp/sst_filter_single_test");
-    }
-
-    #[test]
-    #[serial_test::serial(file)]
-    fn test_sst_iterator_may_contain_partitioned() {
-        let _ = std::fs::remove_dir_all("/tmp/sst_filter_partitioned_test");
-        let registry = FileSystemRegistry::new();
-        let fs = registry
-            .get_or_register("file:///tmp/sst_filter_partitioned_test")
-            .unwrap();
-
-        let keys: [&[u8]; 4] = [b"key000", b"key001", b"key002", b"key003"];
-        let bits_per_key = 100;
-        let partition0_filter = build_filter(bits_per_key, &[keys[0]]);
-        assert!(!partition0_filter.may_contain(keys[3]));
-        let partition3_filter = build_filter(bits_per_key, &[keys[3]]);
-        let missing_key = find_missing_key("key003_missing_", &partition3_filter);
-
-        let value = vec![b'v'; 64];
-        {
-            let writer_file = fs.open_write("filter_partitioned.sst").unwrap();
-            let mut writer = SSTWriter::new(
-                writer_file,
-                SSTWriterOptions {
-                    metrics: None,
-                    block_size: 32,
-                    buffer_size: 8192,
-                    num_columns: 1,
-                    bloom_filter_enabled: true,
-                    bloom_bits_per_key: bits_per_key,
-                    partitioned_index: true,
-                    read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
-                    data_block_restart_interval: 16,
-                    compression: crate::SstCompressionAlgorithm::None,
-                    value_has_ttl: true,
-                    block_checksum_enabled: false,
-                },
-            );
-
-            for key in keys {
-                writer.add(key, &value).unwrap();
-            }
-
-            writer.finish().unwrap();
-        }
-
-        {
-            let reader_file = fs.open_read("filter_partitioned.sst").unwrap();
-            let mut iter = SSTIterator::with_cache(
-                reader_file,
-                0,
-                SSTIteratorOptions {
-                    bloom_filter_enabled: true,
-                    ..SSTIteratorOptions::default()
-                },
-                None,
-                None,
-            )
-            .unwrap();
-
-            assert!(iter.may_contain(b"key003").unwrap());
-            assert!(!iter.may_contain(&missing_key).unwrap());
-        }
-
-        let _ = std::fs::remove_dir_all("/tmp/sst_filter_partitioned_test");
     }
 
     #[test]

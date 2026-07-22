@@ -18,6 +18,19 @@ use url::Url;
 
 const DEFAULT_READ_PROXY_RELOAD_TOLERANCE_SECONDS: u64 = 10;
 
+fn deserialize_optional_sst_level<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<i16>::deserialize(deserializer)? {
+        None | Some(-1) => Ok(None),
+        Some(level @ 0..=255) => Ok(Some(level as u8)),
+        Some(level) => Err(serde::de::Error::custom(format!(
+            "SST level must be between -1 and 255, but was {level}"
+        ))),
+    }
+}
+
 fn deserialize_volume_kinds<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -746,6 +759,10 @@ pub struct Config {
     pub sst_partitioned_index: bool,
     /// Caching policy for decoded SST footer and index-partition descriptors.
     pub sst_read_metadata_cache_mode: SstReadMetadataCacheMode,
+    /// Highest LSM level whose SST read metadata stays pinned for the file lifetime.
+    /// `None` keeps all metadata in the normal block-cache path.
+    #[serde(deserialize_with = "deserialize_optional_sst_level")]
+    pub sst_pinned_metadata_max_level: Option<u8>,
     /// Number of entries between restart points in SST data-block encoding.
     /// Values > 1 enable prefix compression; value 1 disables prefix compression.
     pub sst_data_block_restart_interval: usize,
@@ -841,6 +858,7 @@ impl Default for Config {
             sst_bloom_bits_per_key: 10,
             sst_partitioned_index: false,
             sst_read_metadata_cache_mode: SstReadMetadataCacheMode::Eager,
+            sst_pinned_metadata_max_level: Some(2),
             sst_data_block_restart_interval: 16,
             data_file_type: DataFileType::SSTable,
             block_checksum_enabled: true,
@@ -1333,6 +1351,14 @@ mod tests {
     fn test_default_memtable_type_is_skiplist() {
         assert_eq!(MemtableType::default(), MemtableType::Skiplist);
         assert_eq!(Config::default().memtable_type, MemtableType::Skiplist);
+        assert_eq!(Config::default().sst_pinned_metadata_max_level, Some(2));
+    }
+
+    #[test]
+    fn test_pinned_metadata_level_minus_one_disables_pinning() {
+        let config = Config::from_json_str(r#"{"sst_pinned_metadata_max_level":-1}"#).unwrap();
+
+        assert_eq!(config.sst_pinned_metadata_max_level, None);
     }
 
     #[test]
@@ -1378,6 +1404,7 @@ mod tests {
             sst_bloom_bits_per_key: 11,
             sst_partitioned_index: true,
             sst_read_metadata_cache_mode: SstReadMetadataCacheMode::Off,
+            sst_pinned_metadata_max_level: Some(2),
             sst_data_block_restart_interval: 32,
             data_file_type: DataFileType::Parquet,
             block_checksum_enabled: false,
@@ -1451,6 +1478,7 @@ mod tests {
             decoded.sst_read_metadata_cache_mode,
             SstReadMetadataCacheMode::Off
         );
+        assert_eq!(decoded.sst_pinned_metadata_max_level, Some(2));
         assert_eq!(decoded.time_provider, crate::time::TimeProviderKind::Manual);
         assert_eq!(decoded.log_max_file_size, Size::from_mib(16));
         assert_eq!(decoded.log_keep_files, 5);
