@@ -66,6 +66,10 @@ pub struct CompactionTask {
     truncation_cursors: TruncationCursorMap,
     cache_namespace: u64,
     scan_hot_blocks: Option<Arc<ScanHotBlockRegistry>>,
+    /// Optional output path prefix (relative to the file manager base dir) for output files.
+    /// When set, output files are written under `{base_dir}/{prefix}/` instead of
+    /// `{base_dir}/data/`. Used by the dedicated compactor to isolate per-job outputs.
+    output_path_prefix: Option<String>,
 }
 
 #[derive(Clone)]
@@ -138,6 +142,7 @@ impl CompactionTask {
             truncation_cursors: TruncationCursorMap::new(),
             cache_namespace: 0,
             scan_hot_blocks: None,
+            output_path_prefix: None,
         }
     }
 
@@ -188,6 +193,14 @@ impl CompactionTask {
     ) -> Self {
         self.cache_namespace = cache_namespace;
         self.scan_hot_blocks = Some(scan_hot_blocks);
+        self
+    }
+
+    /// Sets a prefix for output file paths (relative to the file manager base dir).
+    /// When set, output files are written under `{base_dir}/{prefix}/` instead of
+    /// `{base_dir}/data/`. Used by the dedicated compactor to isolate per-job outputs.
+    pub fn with_output_path_prefix(mut self, prefix: String) -> Self {
+        self.output_path_prefix = Some(prefix);
         self
     }
 
@@ -588,7 +601,9 @@ impl CompactionExecutor {
 
             // Check if we need to start a new file
             if current_builder.is_none() {
-                let (file_id, writer) = if task.output_files_readonly {
+                let (file_id, writer) = if let Some(prefix) = &task.output_path_prefix {
+                    task.file_manager.create_data_file_with_prefix(prefix)?
+                } else if task.output_files_readonly {
                     task.file_manager.create_data_file()?
                 } else {
                     task.file_manager.create_data_file_with_offload()?

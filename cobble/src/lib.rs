@@ -134,10 +134,11 @@ mod write_batch;
 mod writer_options;
 
 pub use compaction::RemoteCompactionServer;
+pub use compaction::dedicated_compactor::DedicatedCompactor;
 pub use config::{
-    CompactionPolicyKind, Config, GovernanceMode, MemtableType, PrimaryVolumeOffloadPolicyKind,
-    ReadOptions, RemoteCompactionFailureMode, ScanOptions, SstReadMetadataCacheMode,
-    VolumeDescriptor, VolumeUsageKind, WriteOptions,
+    CompactionMode, CompactionPolicyKind, Config, GovernanceMode, MemtableType,
+    PrimaryVolumeOffloadPolicyKind, ReadOptions, RemoteCompactionFailureMode, ScanOptions,
+    SstReadMetadataCacheMode, VolumeDescriptor, VolumeUsageKind, WriteOptions,
 };
 pub use coordinator::{
     CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef,

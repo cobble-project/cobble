@@ -1,6 +1,6 @@
 //! Snapshot manager and manifest encoding for LSM state.
 mod manager;
-mod manifest;
+pub(crate) mod manifest;
 mod memtable;
 
 use crate::db_state::LSMTreeScope;

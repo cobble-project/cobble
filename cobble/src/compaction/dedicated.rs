@@ -1,0 +1,560 @@
+//! Dedicated compaction result protocol.
+//!
+//! A dedicated compactor is a separate process that compacts SST files and publishes the result
+//! as a delta file on the shared volume. The writer process polls for result files, validates
+//! them, applies the compaction edit to its in-memory LSM state, commits a new manifest
+//! snapshot, and then deletes the result file.
+//!
+//! The result is **not** a full LSM snapshot - it is a delta describing one compaction
+//! operation (rewrite, trivial move, or drop). The manifest written by the writer remains the
+//! sole commit record.
+//!
+//! Key design decisions (see the dedicated compactor technical plan):
+//! - The result distinguishes operation types because trivial move must not be represented as
+//!   new output files (the writer would wrongly allocate new file ids for them).
+//! - Input/output file descriptors carry the complete set of immutable metadata fields (the
+//!   same 13 fields as `ManifestFile`) so the writer can detect fingerprint mismatches.
+//! - The result is atomically published via temp-file + crc32 trailer + rename.
+use crate::db_state::LSMTreeScope;
+use crate::error::{Error, Result};
+use crate::file::FileManager;
+use crate::file::{File, MetadataReader};
+use crate::snapshot::manifest::{ManifestFile, from_hex, to_hex};
+use log::debug;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// Current version of the dedicated compaction result format.
+pub(crate) const DEDICATED_COMPACTION_RESULT_VERSION: u32 = 1;
+
+/// Directory (relative to the db base dir) where result files live.
+pub(crate) const DEDICATED_COMPACTION_RESULTS_DIR: &str = "compaction/results";
+
+/// Directory (relative to the db base dir) where per-job output files live.
+pub(crate) const DEDICATED_COMPACTION_JOBS_DIR: &str = "compaction/jobs";
+
+/// Prefix for result file names.
+pub(crate) const DEDICATED_COMPACTION_RESULT_PREFIX: &str = "COMPACTION-";
+
+/// Returns the relative metadata path for a result file: `compaction/results/COMPACTION-<job_id>`.
+pub(crate) fn dedicated_compaction_result_name(job_id: &str) -> String {
+    format!(
+        "{}/{}{}",
+        DEDICATED_COMPACTION_RESULTS_DIR, DEDICATED_COMPACTION_RESULT_PREFIX, job_id
+    )
+}
+
+/// Returns the relative path prefix for a job's output data files:
+/// `compaction/jobs/<job_id>/data`.
+pub(crate) fn dedicated_compaction_job_output_prefix(job_id: &str) -> String {
+    format!("{}/{}/data", DEDICATED_COMPACTION_JOBS_DIR, job_id)
+}
+
+/// Parses a job id from a result file name (the basename within `compaction/results/`).
+pub(crate) fn parse_dedicated_compaction_job_id(name: &str) -> Option<String> {
+    let name = name.rsplit('/').next().unwrap_or(name);
+    name.strip_prefix(DEDICATED_COMPACTION_RESULT_PREFIX)
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Complete immutable descriptor for a data file, covering the same 13 fields as `ManifestFile`.
+///
+/// For inputs this is the writer's canonical file id and path. For outputs the `file_id` is the
+/// compactor's process-local id; the writer remaps it to a canonical id on apply.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DedicatedDataFile {
+    pub file_id: u64,
+    pub file_type: String,
+    pub path: String,
+    pub schema_id: u64,
+    pub size: usize,
+    pub start_key: String,
+    pub end_key: String,
+    pub has_separated_values: bool,
+    pub bucket_range_start: u16,
+    pub bucket_range_end: u16,
+    pub effective_bucket_range_start: u16,
+    pub effective_bucket_range_end: u16,
+    pub vlog_file_seq_offset: u32,
+}
+
+impl From<&ManifestFile> for DedicatedDataFile {
+    fn from(file: &ManifestFile) -> Self {
+        Self {
+            file_id: file.file_id,
+            file_type: file.file_type.clone(),
+            path: file.path.clone(),
+            schema_id: file.schema_id,
+            size: file.size,
+            start_key: file.start_key.clone(),
+            end_key: file.end_key.clone(),
+            has_separated_values: file.has_separated_values,
+            bucket_range_start: file.bucket_range_start,
+            bucket_range_end: file.bucket_range_end,
+            effective_bucket_range_start: file.effective_bucket_range_start,
+            effective_bucket_range_end: file.effective_bucket_range_end,
+            vlog_file_seq_offset: file.vlog_file_seq_offset,
+        }
+    }
+}
+
+impl DedicatedDataFile {
+    /// Builds a descriptor from a live `DataFile`, resolving its physical path via the
+    /// `FileManager`. Keys are hex-encoded to match the `ManifestFile` representation.
+    pub(crate) fn from_data_file(
+        file: &crate::data_file::DataFile,
+        file_manager: &Arc<FileManager>,
+    ) -> Result<Self> {
+        let path = file_manager
+            .get_data_file_full_path(file.file_id)
+            .ok_or_else(|| {
+                Error::IoError(format!(
+                    "Missing data file path for file_id={}",
+                    file.file_id
+                ))
+            })?;
+        Ok(Self::from_data_file_with_path(file, path))
+    }
+
+    /// Builds a descriptor from a live `DataFile` with an explicit path.
+    pub(crate) fn from_data_file_with_path(
+        file: &crate::data_file::DataFile,
+        path: String,
+    ) -> Self {
+        Self {
+            file_id: file.file_id,
+            file_type: file.file_type.to_string(),
+            path,
+            schema_id: file.schema_id,
+            size: file.size,
+            start_key: to_hex(&file.start_key),
+            end_key: to_hex(&file.end_key),
+            has_separated_values: file.has_separated_values,
+            bucket_range_start: *file.bucket_range.start(),
+            bucket_range_end: *file.bucket_range.end(),
+            effective_bucket_range_start: *file.effective_bucket_range.start(),
+            effective_bucket_range_end: *file.effective_bucket_range.end(),
+            vlog_file_seq_offset: file.vlog_file_seq_offset,
+        }
+    }
+
+    /// Decodes hex-encoded key fields back to bytes, returning all fields needed to construct
+    /// or verify a `DataFile`.
+    pub(crate) fn decode_keys(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        Ok((from_hex(&self.start_key)?, from_hex(&self.end_key)?))
+    }
+
+    /// Compares this descriptor against a `ManifestFile` for full fingerprint equality.
+    pub(crate) fn matches_manifest_file(&self, file: &ManifestFile) -> bool {
+        self.file_id == file.file_id
+            && self.file_type == file.file_type
+            && self.path == file.path
+            && self.schema_id == file.schema_id
+            && self.size == file.size
+            && self.start_key == file.start_key
+            && self.end_key == file.end_key
+            && self.has_separated_values == file.has_separated_values
+            && self.bucket_range_start == file.bucket_range_start
+            && self.bucket_range_end == file.bucket_range_end
+            && self.effective_bucket_range_start == file.effective_bucket_range_start
+            && self.effective_bucket_range_end == file.effective_bucket_range_end
+            && self.vlog_file_seq_offset == file.vlog_file_seq_offset
+    }
+}
+
+/// An input file for a dedicated compaction, tagged with its source level.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DedicatedCompactionInput {
+    pub level: u8,
+    pub file: DedicatedDataFile,
+}
+
+/// The kind of compaction operation a result represents.
+///
+/// `TrivialMove` and `Drop` must be distinct from `Rewrite` so the writer does not allocate
+/// new canonical file ids for files that are merely relocated or removed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum DedicatedCompactionOperation {
+    /// A normal rewrite compaction. The writer allocates canonical file ids for `outputs`.
+    Rewrite {
+        inputs: Vec<DedicatedCompactionInput>,
+        output_level: u8,
+        outputs: Vec<DedicatedDataFile>,
+    },
+    /// A trivial move: the same canonical file (same Arc, same file id, same physical file) is
+    /// moved from its source level to `output_level`. No new physical file is produced and no
+    /// file-id remap occurs.
+    TrivialMove {
+        input: DedicatedCompactionInput,
+        output_level: u8,
+    },
+    /// A truncated drop: only input removals (and optional vlog deltas) are produced.
+    Drop {
+        inputs: Vec<DedicatedCompactionInput>,
+    },
+}
+
+impl DedicatedCompactionOperation {
+    /// Returns all input descriptors in this operation.
+    pub(crate) fn inputs(&self) -> Vec<&DedicatedCompactionInput> {
+        match self {
+            DedicatedCompactionOperation::Rewrite { inputs, .. } => inputs.iter().collect(),
+            DedicatedCompactionOperation::TrivialMove { input, .. } => vec![input],
+            DedicatedCompactionOperation::Drop { inputs } => inputs.iter().collect(),
+        }
+    }
+
+    /// Returns the output level, if the operation produces placement into a level.
+    pub(crate) fn output_level(&self) -> Option<u8> {
+        match self {
+            DedicatedCompactionOperation::Rewrite { output_level, .. }
+            | DedicatedCompactionOperation::TrivialMove { output_level, .. } => Some(*output_level),
+            DedicatedCompactionOperation::Drop { .. } => None,
+        }
+    }
+
+    /// Returns the output file descriptors, if any.
+    pub(crate) fn outputs(&self) -> &[DedicatedDataFile] {
+        match self {
+            DedicatedCompactionOperation::Rewrite { outputs, .. } => outputs,
+            _ => &[],
+        }
+    }
+}
+
+/// A dedicated compaction result: a delta describing one compaction, published by the
+/// compactor process and consumed by the writer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DedicatedCompactionResult {
+    pub version: u32,
+    pub job_id: String,
+    /// The snapshot id the compactor based its plan on. Observational only - the writer does
+    /// not require it to still be the latest, since the writer may flush new L0 files while the
+    /// compactor runs.
+    pub base_snapshot_id: u64,
+    /// Hint only; the writer uses `tree_scope` to locate the current tree.
+    pub lsm_tree_idx: usize,
+    pub tree_scope: LSMTreeScope,
+    pub operation: DedicatedCompactionOperation,
+    /// Per-vlog-file entry count deltas (file_seq, delta). Shared across all operation types.
+    pub vlog_entry_deltas: Vec<(u32, i64)>,
+    pub created_at_ms: u64,
+}
+
+impl DedicatedCompactionResult {
+    /// Serializes the result as JSON bytes.
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|err| {
+            Error::IoError(format!(
+                "Failed to encode dedicated compaction result: {}",
+                err
+            ))
+        })
+    }
+
+    /// Deserializes a result from JSON bytes.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        let result: DedicatedCompactionResult = serde_json::from_slice(bytes).map_err(|err| {
+            Error::IoError(format!(
+                "Failed to decode dedicated compaction result: {}",
+                err
+            ))
+        })?;
+        if result.version != DEDICATED_COMPACTION_RESULT_VERSION {
+            return Err(Error::IoError(format!(
+                "Unsupported dedicated compaction result version: {} (expected {})",
+                result.version, DEDICATED_COMPACTION_RESULT_VERSION
+            )));
+        }
+        Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Result file I/O: atomic publish, read, scan, delete
+// ---------------------------------------------------------------------------
+
+/// Atomically publishes a result to `compaction/results/COMPACTION-<job_id>`.
+///
+/// Writes to a temp file with a crc32 trailer, then renames to the final name.
+pub(crate) fn publish_dedicated_compaction_result(
+    file_manager: &Arc<FileManager>,
+    result: &DedicatedCompactionResult,
+) -> Result<()> {
+    use crate::file::BufferedWriter;
+    let name = dedicated_compaction_result_name(&result.job_id);
+    let payload = result.encode()?;
+    // create_metadata_file returns an AtomicMetadataWriter that writes to a temp path and
+    // renames on close, appending a crc32 trailer.
+    let writer = file_manager.create_metadata_file(&name)?;
+    let mut buffered = BufferedWriter::new(writer, 8192);
+    buffered.write(&payload)?;
+    buffered.close()?;
+    Ok(())
+}
+
+/// Reads and decodes a result by job id. Verifies the crc32 trailer.
+pub(crate) fn read_dedicated_compaction_result(
+    file_manager: &Arc<FileManager>,
+    job_id: &str,
+) -> Result<DedicatedCompactionResult> {
+    let name = dedicated_compaction_result_name(job_id);
+    let reader = file_manager.open_metadata_file_reader_untracked(&name)?;
+    let bytes = MetadataReader::new(reader).read_all()?;
+    DedicatedCompactionResult::decode(bytes.as_ref())
+}
+
+/// Lists all job ids whose result files are currently present in `compaction/results/`.
+///
+/// This scans the underlying filesystem directly (not the in-memory metadata index) so it works
+/// across processes.
+pub(crate) fn list_dedicated_compaction_result_job_ids(
+    file_manager: &Arc<FileManager>,
+) -> Result<Vec<String>> {
+    let names = file_manager.list_metadata_names(DEDICATED_COMPACTION_RESULTS_DIR)?;
+    let mut job_ids: Vec<String> = names
+        .into_iter()
+        .filter_map(|name| parse_dedicated_compaction_job_id(&name))
+        .collect();
+    job_ids.sort();
+    job_ids.dedup();
+    Ok(job_ids)
+}
+
+/// Deletes a result file by job id. Works even if the file is not tracked in this process's
+/// in-memory metadata index.
+pub(crate) fn delete_dedicated_compaction_result(
+    file_manager: &Arc<FileManager>,
+    job_id: &str,
+) -> Result<()> {
+    let name = dedicated_compaction_result_name(job_id);
+    file_manager.remove_metadata_file(&name)
+}
+
+/// Removes all files under a job's output directory, then the job directory itself.
+/// Used to clean up after a terminal-invalid result or a conflict.
+pub(crate) fn cleanup_job_dir(file_manager: &Arc<FileManager>, job_id: &str) -> Result<()> {
+    let data_prefix = dedicated_compaction_job_output_prefix(job_id);
+    let files = file_manager.list_metadata_names(&data_prefix)?;
+    for file_name in files {
+        let path = format!("{}/{}", data_prefix, file_name);
+        let _ = file_manager.remove_metadata_file(&path);
+    }
+    // Remove the data subdir and the job dir itself.
+    let _ = file_manager.remove_metadata_file(&data_prefix);
+    let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
+    let _ = file_manager.remove_metadata_file(&job_dir);
+    Ok(())
+}
+
+/// Returns true if a result file for the given job id exists on the shared volume.
+pub(crate) fn dedicated_compaction_result_exists(
+    file_manager: &Arc<FileManager>,
+    job_id: &str,
+) -> Result<bool> {
+    let name = dedicated_compaction_result_name(job_id);
+    file_manager.metadata_file_exists_untracked(&name)
+}
+
+// ---------------------------------------------------------------------------
+// Orphan sweep: clean up stale job directories
+// ---------------------------------------------------------------------------
+
+/// Sweeps `compaction/jobs/` for orphaned job directories and removes them.
+///
+/// A job directory is an orphan if:
+/// - It has no corresponding result file in `compaction/results/`.
+/// - No file within it is referenced by the latest manifest.
+/// - It is older than `min_age_ms` (to avoid racing with an active compactor).
+///
+/// This is called periodically by the writer's poller and on startup to reclaim
+/// space left by crashed compactor processes.
+pub(crate) fn sweep_orphan_job_dirs(
+    file_manager: &Arc<FileManager>,
+    manifest_paths: &std::collections::HashSet<String>,
+    min_age_ms: u64,
+) -> Result<usize> {
+    let job_dir_names = file_manager.list_metadata_names(DEDICATED_COMPACTION_JOBS_DIR)?;
+    let active_result_job_ids = list_dedicated_compaction_result_job_ids(file_manager)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let mut swept = 0;
+    for job_name in &job_dir_names {
+        // job_name is the basename of the job directory.
+        let job_id = job_name.rsplit('/').next().unwrap_or(job_name);
+        // Skip if there's an active result for this job.
+        if active_result_job_ids.iter().any(|id| id == job_id) {
+            continue;
+        }
+        // Check age via the job directory's last_modified time.
+        let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
+        let last_modified = match file_manager.last_modified_untracked(&job_dir)? {
+            Some(ts) => ts,
+            None => continue, // Can't determine age; skip.
+        };
+        if now_ms.saturating_sub(last_modified) < min_age_ms {
+            continue;
+        }
+        // Check if any file in this job dir is referenced by the latest manifest.
+        let job_data_prefix = dedicated_compaction_job_output_prefix(job_id);
+        let job_files = file_manager.list_metadata_names(&job_data_prefix)?;
+        let referenced = job_files.iter().any(|file_name| {
+            let full_path = format!("{}/{}", job_data_prefix, file_name);
+            manifest_paths.contains(&full_path)
+        });
+        if referenced {
+            continue;
+        }
+        // Delete all files in the job directory, then the directory itself.
+        debug!("sweeping orphan job directory {}", job_id);
+        for file_name in &job_files {
+            let path = format!("{}/{}", job_data_prefix, file_name);
+            let _ = file_manager.remove_metadata_file(&path);
+        }
+        // Remove the data subdir and the job dir itself.
+        let _ = file_manager.remove_metadata_file(&job_data_prefix);
+        let _ = file_manager.remove_metadata_file(&job_dir);
+        swept += 1;
+    }
+    Ok(swept)
+}
+
+/// Collects all file paths referenced by a manifest snapshot's tree levels.
+pub(crate) fn collect_manifest_file_paths(
+    manifest: &crate::snapshot::manifest::ManifestSnapshot,
+) -> std::collections::HashSet<String> {
+    let mut paths = std::collections::HashSet::new();
+    for tree_levels in &manifest.tree_levels {
+        for level in tree_levels {
+            for file in &level.files {
+                paths.insert(file.path.clone());
+            }
+        }
+    }
+    paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_result_round_trip() {
+        let result = DedicatedCompactionResult {
+            version: DEDICATED_COMPACTION_RESULT_VERSION,
+            job_id: "test-job-123".to_string(),
+            base_snapshot_id: 42,
+            lsm_tree_idx: 0,
+            tree_scope: LSMTreeScope::new(0u16..=0u16, 0),
+            operation: DedicatedCompactionOperation::Rewrite {
+                inputs: vec![DedicatedCompactionInput {
+                    level: 0,
+                    file: DedicatedDataFile {
+                        file_id: 1,
+                        file_type: "SSTable".to_string(),
+                        path: "data/abc.sst".to_string(),
+                        schema_id: 1,
+                        size: 100,
+                        start_key: "00".to_string(),
+                        end_key: "ff".to_string(),
+                        has_separated_values: false,
+                        bucket_range_start: 0,
+                        bucket_range_end: 0,
+                        effective_bucket_range_start: 0,
+                        effective_bucket_range_end: 0,
+                        vlog_file_seq_offset: 0,
+                    },
+                }],
+                output_level: 1,
+                outputs: vec![],
+            },
+            vlog_entry_deltas: vec![(5, -3)],
+            created_at_ms: 1234567890,
+        };
+        let bytes = result.encode().unwrap();
+        let decoded = DedicatedCompactionResult::decode(&bytes).unwrap();
+        assert_eq!(decoded.job_id, result.job_id);
+        assert_eq!(decoded.operation, result.operation);
+        assert_eq!(decoded.vlog_entry_deltas, result.vlog_entry_deltas);
+    }
+
+    #[test]
+    fn test_result_version_rejected() {
+        let bytes = serde_json::json!({
+            "version": 999,
+            "job_id": "x",
+            "base_snapshot_id": 0,
+            "lsm_tree_idx": 0,
+            "tree_scope": { "bucket_range": [0, 0], "column_family_id": 0 },
+            "operation": { "Drop": { "inputs": [] } },
+            "vlog_entry_deltas": [],
+            "created_at_ms": 0,
+        })
+        .to_string()
+        .into_bytes();
+        assert!(DedicatedCompactionResult::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_parse_job_id() {
+        assert_eq!(
+            parse_dedicated_compaction_job_id("COMPACTION-abc-123"),
+            Some("abc-123".to_string())
+        );
+        assert_eq!(parse_dedicated_compaction_job_id("COMPACTION-"), None);
+        assert_eq!(parse_dedicated_compaction_job_id("SNAPSHOT-5"), None);
+        assert_eq!(
+            parse_dedicated_compaction_job_id("compaction/results/COMPACTION-xyz"),
+            Some("xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_operation_helpers() {
+        let input = DedicatedCompactionInput {
+            level: 0,
+            file: DedicatedDataFile {
+                file_id: 1,
+                file_type: "SSTable".to_string(),
+                path: "data/a.sst".to_string(),
+                schema_id: 1,
+                size: 10,
+                start_key: "00".to_string(),
+                end_key: "ff".to_string(),
+                has_separated_values: false,
+                bucket_range_start: 0,
+                bucket_range_end: 0,
+                effective_bucket_range_start: 0,
+                effective_bucket_range_end: 0,
+                vlog_file_seq_offset: 0,
+            },
+        };
+        let rewrite = DedicatedCompactionOperation::Rewrite {
+            inputs: vec![input.clone()],
+            output_level: 1,
+            outputs: Vec::new(),
+        };
+        assert_eq!(rewrite.inputs().len(), 1);
+        assert_eq!(rewrite.output_level(), Some(1));
+        assert!(rewrite.outputs().is_empty());
+
+        let mv = DedicatedCompactionOperation::TrivialMove {
+            input: input.clone(),
+            output_level: 2,
+        };
+        assert_eq!(mv.inputs().len(), 1);
+        assert_eq!(mv.output_level(), Some(2));
+        assert!(mv.outputs().is_empty());
+
+        let drop_op = DedicatedCompactionOperation::Drop {
+            inputs: vec![input],
+        };
+        assert_eq!(drop_op.inputs().len(), 1);
+        assert_eq!(drop_op.output_level(), None);
+        assert!(drop_op.outputs().is_empty());
+    }
+}

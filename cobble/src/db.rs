@@ -52,7 +52,7 @@ pub struct Db {
     config: Config,
     file_manager: Arc<FileManager>,
     lsm_tree: Arc<LSMTree>,
-    memtable_manager: MemtableManager,
+    memtable_manager: Arc<MemtableManager>,
     vlog_store: Arc<VlogStore>,
     snapshot_manager: SnapshotManager,
     schema_manager: Arc<SchemaManager>,
@@ -62,6 +62,8 @@ pub struct Db {
     default_scan_options: ScanOptions,
     time_provider: Arc<dyn TimeProvider>,
     ttl_provider: Arc<TTLProvider>,
+    /// Dedicated compaction result poller. Only active in `CompactionMode::Dedicated`.
+    dedicated_poller: Option<crate::compaction::dedicated_poller::DedicatedCompactionPollerHandle>,
 }
 
 pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<Bytes>>>> {
@@ -717,6 +719,9 @@ impl Db {
     }
 
     pub(crate) fn force_close(&self) {
+        if let Some(poller) = &self.dedicated_poller {
+            poller.stop();
+        }
         self.memtable_manager.force_close();
         self.lsm_tree.shutdown_compaction();
         self.snapshot_manager.force_close();
@@ -753,6 +758,13 @@ impl Db {
             return Err(err);
         }
         self.lsm_tree.shutdown_compaction();
+        // Stop the dedicated compaction poller before closing the snapshot manager so the
+        // poller does not race with snapshot shutdown (e.g. trying to materialize a snapshot
+        // while the materializer worker is being torn down).
+        if let Some(poller) = &self.dedicated_poller {
+            poller.stop();
+            poller.join();
+        }
         if let Err(err) = self.snapshot_manager.close() {
             self.force_close();
             return Err(err);
@@ -959,8 +971,15 @@ impl Db {
         // Compaction setup
         let compaction_options =
             crate::compaction::build_compaction_config(&config, runtime_num_columns)?;
-        let compaction_worker: Arc<dyn crate::compaction::CompactionWorker> =
-            if let Some(addr) = config.compaction_remote_addr.clone() {
+        let compaction_worker: Option<Arc<dyn crate::compaction::CompactionWorker>> =
+            if config.compaction_mode == crate::config::CompactionMode::Dedicated {
+                // Dedicated compaction mode: no in-process compaction worker. A separate
+                // dedicated compactor process publishes results to the shared volume; the
+                // writer's poller (started below) discovers, validates, and applies them.
+                // Setting the worker to None disables compaction triggers and auto-split.
+                info!("db compaction mode: dedicated (no in-process worker)");
+                None
+            } else if let Some(addr) = config.compaction_remote_addr.clone() {
                 // Remote compaction with a local fallback. The remote worker is constructed
                 // without connecting (capabilities are fetched lazily on the first compaction), so
                 // `Db::open` succeeds even when the compactor is down. The local worker backs
@@ -989,14 +1008,16 @@ impl Db {
                     Arc::clone(&metrics_manager),
                     Arc::clone(&schema_manager),
                 );
-                Arc::new(crate::compaction::ResilientRemoteCompactionWorker::new(
-                    remote,
-                    local,
-                    config.compaction_remote_failure_mode,
-                    Arc::clone(&db_lifecycle),
+                Some(Arc::new(
+                    crate::compaction::ResilientRemoteCompactionWorker::new(
+                        remote,
+                        local,
+                        config.compaction_remote_failure_mode,
+                        Arc::clone(&db_lifecycle),
+                    ),
                 ))
             } else {
-                Arc::new(crate::compaction::LocalCompactionWorker::new(
+                Some(Arc::new(crate::compaction::LocalCompactionWorker::new(
                     crate::compaction::CompactionExecutor::new(
                         compaction_options,
                         Arc::clone(&db_lifecycle),
@@ -1007,7 +1028,7 @@ impl Db {
                     Arc::clone(&db_lifecycle),
                     Arc::clone(&metrics_manager),
                     Arc::clone(&schema_manager),
-                ))
+                )))
             };
         info!(
             "db compaction configured: l0_limit={} l1_base={} multiplier={} max_level={} target_file_size={}",
@@ -1017,7 +1038,7 @@ impl Db {
             compaction_options.max_level,
             compaction_options.target_file_size
         );
-        lsm_tree.configure_compaction(compaction_options, Some(Arc::clone(&compaction_worker)));
+        lsm_tree.configure_compaction(compaction_options, compaction_worker.clone());
 
         let snapshot_manager = SnapshotManager::new(
             Arc::clone(&file_manager),
@@ -1030,7 +1051,7 @@ impl Db {
         );
 
         // Memtable manager setup
-        let memtable_manager = MemtableManager::new(
+        let memtable_manager = Arc::new(MemtableManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&lsm_tree),
             MemtableManagerOptions {
@@ -1041,7 +1062,9 @@ impl Db {
                 num_columns: runtime_num_columns,
                 write_stall_limit: config.resolved_write_stall_limit(),
                 schema_manager: Some(Arc::clone(&schema_manager)),
-                auto_snapshot_manager: if config.snapshot_on_flush {
+                auto_snapshot_manager: if config.snapshot_on_flush
+                    || config.compaction_mode == crate::config::CompactionMode::Dedicated
+                {
                     Some(snapshot_manager.clone())
                 } else {
                     None
@@ -1052,7 +1075,31 @@ impl Db {
                     .active_memtable_incremental_snapshot_ratio,
                 db_lifecycle: Some(Arc::clone(&db_lifecycle)),
             },
-        )?;
+        )?);
+
+        // Mark the DB as open before starting the dedicated poller so the poller's
+        // `ensure_open()` check passes immediately.
+        db_lifecycle.mark_open()?;
+
+        // Start the dedicated compaction result poller if in dedicated mode.
+        let dedicated_poller = if config.compaction_mode == crate::config::CompactionMode::Dedicated
+        {
+            let poller =
+                crate::compaction::dedicated_poller::DedicatedCompactionPollerHandle::start(
+                    Arc::clone(&file_manager),
+                    Arc::clone(&lsm_tree),
+                    snapshot_manager.clone(),
+                    Arc::clone(&memtable_manager),
+                    Arc::clone(&schema_manager),
+                    Arc::clone(&db_lifecycle),
+                    Arc::clone(&db_state),
+                    Duration::from_millis(config.compaction_dedicated_poll_interval_ms),
+                    config.clone(),
+                );
+            Some(poller)
+        } else {
+            None
+        };
 
         Ok(Self {
             id,
@@ -1072,6 +1119,7 @@ impl Db {
             default_scan_options: ScanOptions::default(),
             time_provider,
             ttl_provider,
+            dedicated_poller,
         })
     }
 
@@ -1405,7 +1453,7 @@ impl Db {
                     .map(|cursor| encode_scan_key(bucket, column_family_id, cursor)),
                 max_rows: options.max_rows(),
                 snapshot,
-                memtable_manager: Some(&self.memtable_manager),
+                memtable_manager: Some(self.memtable_manager.as_ref()),
                 access_guard: Some(access_guard),
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),

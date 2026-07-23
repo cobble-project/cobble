@@ -4,6 +4,10 @@
 //! Compaction merges data from multiple SortedRuns using MergingIterator and
 //! DeduplicatingIterator, producing a set of new SST files with sorted key ranges.
 
+pub(crate) mod dedicated;
+pub(crate) mod dedicated_apply;
+pub mod dedicated_compactor;
+pub(crate) mod dedicated_poller;
 mod executor;
 mod policy;
 mod remote;

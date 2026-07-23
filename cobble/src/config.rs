@@ -128,6 +128,22 @@ pub enum RemoteCompactionFailureMode {
     Skip,
 }
 
+/// Compaction execution mode.
+///
+/// - `Embedded` (default): compaction runs in-process via a local or remote worker.
+/// - `Dedicated`: compaction is performed by a separate dedicated compactor process. The writer
+///   disables all in-process compaction (local and remote) and auto-split, and instead polls the
+///   shared volume for compaction result files produced by the compactor. Dedicated mode
+///   implicitly enables `snapshot_on_flush` so the compactor can observe the writer's latest LSM
+///   state via manifest files. `Dedicated` and `compaction_remote_addr` are mutually exclusive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    #[default]
+    Embedded,
+    Dedicated,
+}
+
 /// Primary-volume offload policy selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -740,6 +756,14 @@ pub struct Config {
     pub compaction_server_max_concurrent: usize,
     /// Maximum number of queued requests before the server rejects new connections.
     pub compaction_server_max_queued: usize,
+    /// Compaction execution mode. `Dedicated` disables in-process compaction and uses a separate
+    /// compactor process that communicates via the shared volume.
+    pub compaction_mode: CompactionMode,
+    /// Poll interval (milliseconds) for the writer's dedicated compaction result poller.
+    pub compaction_dedicated_poll_interval_ms: u64,
+    /// Minimum age (milliseconds) for orphan compaction job directories before they can be
+    /// swept by the writer.
+    pub compaction_orphan_min_age_ms: u64,
     /// Size of the block cache in bytes. If zero, cache is disabled.
     pub block_cache_size: Size,
     /// Enable foyer hybrid block cache (memory + local disk).
@@ -851,6 +875,9 @@ impl Default for Config {
             compaction_remote_failure_mode: RemoteCompactionFailureMode::FallbackLocal,
             compaction_server_max_concurrent: 4,
             compaction_server_max_queued: 64,
+            compaction_mode: CompactionMode::Embedded,
+            compaction_dedicated_poll_interval_ms: 1_000,
+            compaction_orphan_min_age_ms: 300_000,
             block_cache_size: Size::from_mib(64),
             block_cache_hybrid_enabled: false,
             block_cache_hybrid_disk_size: None,
@@ -1286,6 +1313,13 @@ impl Config {
                     .map_err(Error::ConfigError)?;
             }
         }
+        if self.compaction_mode == CompactionMode::Dedicated
+            && self.compaction_remote_addr.is_some()
+        {
+            return Err(Error::ConfigError(
+                "compaction_mode=dedicated cannot be used with compaction_remote_addr".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -1446,6 +1480,9 @@ mod tests {
             compaction_remote_failure_mode: RemoteCompactionFailureMode::Skip,
             compaction_server_max_concurrent: 8,
             compaction_server_max_queued: 32,
+            compaction_mode: super::CompactionMode::Embedded,
+            compaction_dedicated_poll_interval_ms: 1_000,
+            compaction_orphan_min_age_ms: 300_000,
         };
 
         let serialized = serde_json::to_string(&config).expect("Cannot serialize config");

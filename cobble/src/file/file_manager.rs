@@ -1085,6 +1085,40 @@ impl FileManager {
         Ok((file_id, writer))
     }
 
+    /// Creates a new data file under a custom path prefix (relative to the base dir) instead
+    /// of the default `data/` directory. The prefix directory is created if needed.
+    pub fn create_data_file_with_prefix(
+        &self,
+        path_prefix: &str,
+    ) -> Result<(FileId, TrackedWriter)> {
+        let file_id = self.allocate_file_id();
+        let volume = self.select_data_volume(None)?;
+        let dir = if self.options.base_dir.is_empty() {
+            path_prefix.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, path_prefix)
+        };
+        // Ensure the prefix directory exists on the selected volume's fs.
+        if !volume.fs().exists(&dir)? {
+            volume.fs().create_dir(&dir)?;
+        }
+        let path = format!(
+            "{}/{}.{}",
+            dir,
+            Uuid::new_v4(),
+            self.options.data_file_extension
+        );
+        let tracked = Arc::new(TrackedFile::new(
+            path,
+            Arc::clone(volume.fs()),
+            Some(Arc::clone(volume)),
+        ));
+        self.data_files.insert(file_id, Arc::clone(&tracked));
+        self.report_data_files_gauge();
+        let writer = volume.fs().open_write(tracked.path())?;
+        Ok((file_id, TrackedWriter::new(writer, tracked)))
+    }
+
     /// Creates a new data file with a specific file ID.
     ///
     /// This is useful when recovering files or when the ID is known in advance.
@@ -1773,6 +1807,61 @@ impl FileManager {
             format!("{}/{}", self.options.base_dir, SNAPSHOT_DIR)
         };
         self.meta_volume.fs().list(&snapshot_dir)
+    }
+
+    /// Lists metadata file names under an arbitrary directory relative to the DB base dir.
+    ///
+    /// Unlike `list_snapshot_metadata_names` this scans any subdirectory and bypasses the
+    /// in-memory `metadata_files` index, so it works across processes (e.g. a writer
+    /// discovering result files published by a separate compactor process).
+    pub fn list_metadata_names(&self, relative_dir: &str) -> Result<Vec<String>> {
+        let dir = if self.options.base_dir.is_empty() {
+            relative_dir.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, relative_dir)
+        };
+        // Ensure the directory exists; list on a missing dir is treated as empty.
+        match self.meta_volume.fs().list(&dir) {
+            Ok(names) => Ok(names),
+            Err(Error::IoError(_)) => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Returns true if a metadata file exists on disk, bypassing the in-memory index.
+    pub fn metadata_file_exists_untracked(&self, name: &str) -> Result<bool> {
+        let path = self.metadata_file_path(name);
+        self.meta_volume.fs().exists(&path)
+    }
+
+    /// Returns the last-modified time (unix millis) of a metadata file on disk, bypassing
+    /// the in-memory index. Returns `Ok(None)` if the file does not exist.
+    pub(crate) fn last_modified_untracked(&self, name: &str) -> Result<Option<u64>> {
+        let path = self.metadata_file_path(name);
+        self.meta_volume.fs().last_modified(&path)
+    }
+
+    /// Ensures a directory (relative to the DB base dir) exists on the metadata volume,
+    /// creating it and any missing parents if needed.
+    pub(crate) fn ensure_metadata_dir(&self, relative_dir: &str) -> Result<()> {
+        let dir = if self.options.base_dir.is_empty() {
+            relative_dir.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, relative_dir)
+        };
+        // Create parent directories first.
+        let mut current = String::new();
+        for part in dir.split('/') {
+            if current.is_empty() {
+                current = part.to_string();
+            } else {
+                current = format!("{}/{}", current, part);
+            }
+            if !self.meta_volume.fs().exists(&current)? {
+                self.meta_volume.fs().create_dir(&current)?;
+            }
+        }
+        Ok(())
     }
 }
 
