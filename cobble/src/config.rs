@@ -1327,6 +1327,50 @@ impl Config {
                     .to_string(),
             ));
         }
+        self.validate_dedicated_compaction()?;
+        Ok(())
+    }
+
+    /// Validates dedicated-compaction-specific config constraints.
+    ///
+    /// This is `pub` so that the `DedicatedCompactor` (in a different crate) can re-validate
+    /// after CLI overrides (e.g. `--poll-interval`) that bypass `Config::from_path`.
+    pub fn validate_dedicated_compaction(&self) -> Result<()> {
+        if self.compaction_mode != CompactionMode::Dedicated {
+            return Ok(());
+        }
+        // Reject zero poll interval - the poller would busy-loop.
+        if self.compaction_dedicated_poll_interval_ms == 0 {
+            return Err(Error::ConfigError(
+                "compaction_dedicated_poll_interval_ms must be > 0 in dedicated mode".to_string(),
+            ));
+        }
+        // Reject zero orphan min age - the sweep would delete active jobs.
+        if self.compaction_orphan_min_age_ms == 0 {
+            return Err(Error::ConfigError(
+                "compaction_orphan_min_age_ms must be > 0 in dedicated mode".to_string(),
+            ));
+        }
+        // The compactor's lease heartbeat refreshes at heartbeat_interval (derived from
+        // orphan_min_age / 3, capped at poll_interval). If poll_interval is not significantly
+        // shorter than orphan_min_age, a long compaction could have its outputs swept before
+        // the heartbeat refreshes. Require at least a 3x margin.
+        //
+        // Note: the orphan sweep compares age in seconds (filesystem mtime granularity),
+        // so we compare in seconds here too. poll_interval must be < orphan_min_age / 3.
+        let poll_secs = self.compaction_dedicated_poll_interval_ms.div_ceil(1000);
+        let min_age_secs = self.compaction_orphan_min_age_ms.div_ceil(1000);
+        if poll_secs * 3 >= min_age_secs {
+            return Err(Error::ConfigError(format!(
+                "compaction_dedicated_poll_interval_ms ({}) must be significantly shorter \
+                 than compaction_orphan_min_age_ms ({}) in dedicated mode; require \
+                 poll_interval < orphan_min_age / 3 (in seconds: {} * 3 < {})",
+                self.compaction_dedicated_poll_interval_ms,
+                self.compaction_orphan_min_age_ms,
+                poll_secs,
+                min_age_secs,
+            )));
+        }
         Ok(())
     }
 }

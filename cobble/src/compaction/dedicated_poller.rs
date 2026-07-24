@@ -14,7 +14,7 @@ use crate::compaction::dedicated::{
     read_dedicated_compaction_result, sweep_orphan_job_dirs,
 };
 use crate::compaction::dedicated_apply::{
-    ExternalCompactionApplyResult, apply_external_compaction_result,
+    ExternalCompactionApplyResult, apply_external_compaction_result, is_transient_error,
 };
 use crate::config::Config;
 use crate::db_state::DbStateHandle;
@@ -313,19 +313,22 @@ fn read_with_retries(
                 delay *= 2;
             }
             Err(Error::ChecksumMismatch(_)) => return Err(ReadResultError::Checksum),
-            Err(Error::IoError(_)) if attempt < max_retries => {
+            Err(err) if is_transient_error(&err) && attempt < max_retries => {
                 debug!(
-                    "transient I/O error reading result {} (attempt {}); retrying",
+                    "transient error reading result {} (attempt {}): {}; retrying",
                     job_id,
-                    attempt + 1
+                    attempt + 1,
+                    err
                 );
                 std::thread::sleep(delay);
                 delay *= 2;
             }
             Err(err) => {
-                if matches!(err, Error::IoError(_)) {
+                if is_transient_error(&err) {
+                    // Exhausted retries on a transient error; preserve the result for later.
                     return Err(ReadResultError::Transient(err));
                 }
+                // Structural/protocol error (bad JSON, version mismatch, etc.) - terminal.
                 return Err(ReadResultError::Decode(err));
             }
         }
@@ -340,32 +343,37 @@ fn wait_with_timeout(ctx: &PollerContext) {
 
 /// Runs an orphan sweep of stale job directories on the shared volume.
 ///
-/// Collects file paths referenced by the latest manifest so the sweep does not delete
-/// outputs that have been committed but whose job directory was not yet cleaned up.
+/// Collects file paths referenced by **all** existing manifest snapshots (not just the latest)
+/// so the sweep does not delete outputs that are still referenced by an older, unexpired
+/// snapshot.
+///
+/// **Fail-closed**: if listing snapshots or loading any manifest fails, the sweep is cancelled
+/// for this round. This prevents a transient storage failure from causing the sweep to treat
+/// committed outputs as orphans (an empty manifest set would delete everything stale).
 fn run_orphan_sweep(ctx: &PollerContext) -> Result<()> {
-    let manifest_paths = match list_snapshot_manifest_ids(&ctx.file_manager) {
-        Ok(ids) => {
-            if let Some(&latest_id) = ids.last() {
-                match load_manifest_for_snapshot(&ctx.file_manager, latest_id) {
-                    Ok(manifest) => collect_manifest_file_paths(&manifest),
-                    Err(err) => {
-                        debug!("orphan sweep: could not load latest manifest: {}", err);
-                        std::collections::HashSet::new()
-                    }
-                }
-            } else {
-                std::collections::HashSet::new()
-            }
-        }
-        Err(err) => {
-            debug!("orphan sweep: could not list snapshots: {}", err);
-            std::collections::HashSet::new()
-        }
-    };
+    let manifest_paths = collect_all_manifest_paths(&ctx.file_manager)?;
     let min_age_ms = ctx.config.compaction_orphan_min_age_ms;
     let swept = sweep_orphan_job_dirs(&ctx.file_manager, &manifest_paths, min_age_ms)?;
     if swept > 0 {
         info!("orphan sweep removed {} stale job directories", swept);
     }
     Ok(())
+}
+
+/// Collects the union of all data-file paths referenced by every existing manifest snapshot.
+///
+/// Returns an error if the snapshot list cannot be retrieved or any manifest cannot be loaded,
+/// so the caller can cancel the sweep rather than risk deleting committed outputs.
+fn collect_all_manifest_paths(
+    file_manager: &Arc<FileManager>,
+) -> Result<std::collections::HashSet<String>> {
+    let snapshot_ids = list_snapshot_manifest_ids(file_manager)?;
+    let mut paths = std::collections::HashSet::new();
+    for snapshot_id in &snapshot_ids {
+        let manifest = load_manifest_for_snapshot(file_manager, *snapshot_id)?;
+        for path in collect_manifest_file_paths(&manifest) {
+            paths.insert(path);
+        }
+    }
+    Ok(paths)
 }

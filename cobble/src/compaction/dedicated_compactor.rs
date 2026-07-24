@@ -57,6 +57,11 @@ pub struct DedicatedCompactor {
     /// operators remain functional across manifest refreshes.
     resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
     poll_interval: Duration,
+    /// Interval at which the lease heartbeat is refreshed. Independently computed from
+    /// `orphan_min_age / 3` (capped at `poll_interval`) so the lease is always refreshed well
+    /// before the writer's orphan sweep would consider it stale, even if `poll_interval` is
+    /// later changed to an unsafe value.
+    heartbeat_interval: Duration,
     executor: CompactionExecutor,
     db_lifecycle: Arc<DbLifecycle>,
     compaction_metrics: Arc<CompactionTaskMetrics>,
@@ -80,6 +85,9 @@ impl DedicatedCompactor {
         db_id: impl Into<String>,
         resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
     ) -> Result<Self> {
+        // Re-validate dedicated compaction constraints. This catches unsafe overrides
+        // (e.g. CLI --poll-interval) applied after Config::from_path.
+        config.validate_dedicated_compaction()?;
         let db_id = db_id.into();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         let file_manager = Arc::new(FileManager::from_config(
@@ -94,6 +102,17 @@ impl DedicatedCompactor {
         let executor = CompactionExecutor::new(compaction_config, Arc::clone(&db_lifecycle))?;
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new(&db_id));
         let poll_interval = Duration::from_millis(config.compaction_dedicated_poll_interval_ms);
+        // Compute the heartbeat interval as orphan_min_age / 3 (in ms), capped at poll_interval.
+        // This ensures the lease is refreshed well before the orphan sweep considers it stale,
+        // regardless of the poll interval. Config validation already enforces poll_interval <
+        // orphan_min_age / 3, so this normally equals poll_interval, but the cap protects
+        // against future config changes.
+        let heartbeat_interval = {
+            let min_age = config.compaction_orphan_min_age_ms;
+            let heartbeat = min_age / 3;
+            let heartbeat = heartbeat.max(1); // at least 1ms
+            Duration::from_millis(heartbeat.min(config.compaction_dedicated_poll_interval_ms))
+        };
         Ok(Self {
             db_id,
             config,
@@ -102,6 +121,7 @@ impl DedicatedCompactor {
             metrics_manager,
             resolver,
             poll_interval,
+            heartbeat_interval,
             executor,
             db_lifecycle,
             compaction_metrics,
@@ -317,13 +337,13 @@ impl DedicatedCompactor {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let file_manager = Arc::clone(&self.file_manager);
-        let poll_interval = self.poll_interval;
+        let heartbeat_interval = self.heartbeat_interval;
         let job_id = job_id.to_string();
         let handle = std::thread::Builder::new()
             .name("dedicated-lease-heartbeat".to_string())
             .spawn(move || {
                 while !stop_clone.load(Ordering::SeqCst) {
-                    std::thread::sleep(poll_interval);
+                    std::thread::sleep(heartbeat_interval);
                     if stop_clone.load(Ordering::SeqCst) {
                         break;
                     }

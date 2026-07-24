@@ -732,30 +732,49 @@ mod tests {
         assert!(drop_op.outputs().is_empty());
     }
 
-    /// Builds a FileManager backed by a single local volume with `db_id` as the base dir,
-    /// matching the layout used by `FileManager::from_config`.
-    fn build_fm_with_base_dir(test_root: &str, db_id: &str) -> Arc<FileManager> {
-        use crate::config::{Config, VolumeDescriptor};
+    /// Builds a FileManager backed by **separate** metadata and data volumes, each under a
+    /// unique tempfile directory. The metadata volume holds leases/manifests; the data volume
+    /// holds compaction output files. This mirrors a multi-volume production setup and verifies
+    /// the sweep correctly checks the lease on the metadata volume while deleting output files
+    /// on the data volume.
+    fn build_fm_multi_volume(
+        db_id: &str,
+    ) -> (Arc<FileManager>, tempfile::TempDir, tempfile::TempDir) {
+        use crate::config::{Config, VolumeDescriptor, VolumeUsageKind};
         use crate::metrics_manager::MetricsManager;
-        let _ = std::fs::remove_dir_all(test_root);
+        let meta_dir = tempfile::tempdir_in("/tmp").expect("create meta tempdir");
+        let data_dir = tempfile::tempdir_in("/tmp").expect("create data tempdir");
         let config = Config {
-            volumes: VolumeDescriptor::single_volume(format!("file://{}", test_root)),
+            volumes: vec![
+                VolumeDescriptor::new(
+                    format!("file://{}", meta_dir.path().display()),
+                    vec![VolumeUsageKind::Meta, VolumeUsageKind::Snapshot],
+                ),
+                VolumeDescriptor::new(
+                    format!("file://{}", data_dir.path().display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+            ],
             ..Config::default()
         };
         let metrics = std::sync::Arc::new(MetricsManager::new("sweep-test"));
-        Arc::new(FileManager::from_config(&config, db_id, metrics).unwrap())
+        let fm = Arc::new(FileManager::from_config(&config, db_id, metrics).unwrap());
+        (fm, meta_dir, data_dir)
     }
 
     /// The orphan sweep must not delete:
     /// - Job directories with a fresh lease (active compactor).
-    /// - Job directories whose outputs are referenced by the latest manifest (committed).
+    /// - Job directories whose outputs are referenced by the manifest (committed).
     /// And must delete:
     /// - Job directories with an expired lease, no result, and no manifest reference (crashed).
+    ///
+    /// This test uses separate metadata and data volumes to verify the lease (on the metadata
+    /// volume) is correctly checked while output files (on the data volume) are correctly
+    /// matched against manifest paths and deleted.
     #[test]
     fn test_orphan_sweep_preserves_active_and_committed() {
-        let test_root = "/tmp/dedicated_sweep_test";
         let db_id = "sweep-db";
-        let fm = build_fm_with_base_dir(test_root, db_id);
+        let (fm, _meta_dir, _data_dir) = build_fm_multi_volume(db_id);
 
         // --- Active job: fresh lease, no result, not referenced. Should survive. ---
         let active_job = "job-active";
@@ -830,7 +849,5 @@ mod tests {
             !fm.data_volume_path_exists(&crashed_dir).unwrap(),
             "crashed job directory should be swept"
         );
-
-        let _ = std::fs::remove_dir_all(test_root);
     }
 }

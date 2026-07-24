@@ -233,35 +233,38 @@ fn apply_operation(
     ctx: &PollerContext,
     result: &DedicatedCompactionResult,
 ) -> Result<(ApplyOutcome, HashMap<String, u64>)> {
-    let outcome = match &result.operation {
+    match &result.operation {
         DedicatedCompactionOperation::Rewrite {
             inputs,
             output_level,
             outputs,
-        } => apply_rewrite(ctx, result, inputs, *output_level, outputs)?,
+        } => apply_rewrite(ctx, result, inputs, *output_level, outputs),
         DedicatedCompactionOperation::TrivialMove {
             input,
             output_level,
-        } => apply_trivial_move(ctx, result, input, *output_level)?,
-        DedicatedCompactionOperation::Drop { inputs } => apply_drop(ctx, result, inputs)?,
-    };
-    // Build the path->id mapping from the result's outputs. For non-Rewrite operations
-    // (TrivialMove, Drop) there are no outputs so the map is empty. For Rewrite where we
-    // actually allocated ids, the mapping is built inside apply_rewrite and returned via
-    // the ApplyOutcome. However, since the outcome is an enum, we reconstruct the map here
-    // for the AlreadyApplied cases by matching the output paths against tracked files.
-    let path_to_id = build_output_path_to_id_map(ctx, result)?;
-    Ok((outcome, path_to_id))
+        } => {
+            let outcome = apply_trivial_move(ctx, result, input, *output_level)?;
+            // TrivialMove has no outputs; the map is always empty.
+            Ok((outcome, HashMap::new()))
+        }
+        DedicatedCompactionOperation::Drop { inputs } => {
+            let outcome = apply_drop(ctx, result, inputs)?;
+            // Drop has no outputs; the map is always empty.
+            Ok((outcome, HashMap::new()))
+        }
+    }
 }
 
-/// Builds a mapping from compactor output path to writer canonical file id.
+/// Builds a mapping from compactor output path to writer canonical file id by matching
+/// output paths against the FileManager's tracked data files.
 ///
-/// For a freshly-applied Rewrite, the outputs were just registered with known canonical ids.
-/// For AlreadyApplied cases, we match by path against the FileManager's tracked data files.
+/// Used for `AlreadyApplied` cases where the outputs were registered in a previous apply
+/// attempt. **Every** output must be mapped; if any output path cannot be matched, this
+/// returns an `InvalidState` error (terminal) so the poller cleans up and deletes the result.
 ///
-/// **Every** output must be mapped. If any output path cannot be matched, this returns an
-/// `InvalidState` error (terminal) so the poller cleans up and deletes the result rather than
-/// silently leaving outputs unowned (which would leak files or, worse, delete committed data).
+/// This is safe to call for AlreadyApplied cases because no LSM modification occurs - the
+/// outputs are already in the LSM. It must NOT be called after a fresh `apply_edit` for a
+/// Pending Rewrite (use the mapping returned by `prepare_outputs` instead).
 fn build_output_path_to_id_map(
     ctx: &PollerContext,
     result: &DedicatedCompactionResult,
@@ -284,14 +287,20 @@ fn build_output_path_to_id_map(
     Ok(map)
 }
 
-/// Applies a Rewrite operation. Returns the apply outcome.
+/// Applies a Rewrite operation. Returns the apply outcome and the output path->id mapping.
+///
+/// For `Pending`: the mapping is built inside `prepare_outputs` (before `apply_edit`), so any
+/// failure leaves the LSM unmodified.
+/// For `AlreadyApplied`/`AlreadyAppliedInMemory`: no LSM modification occurs, so the mapping
+/// is built by matching against tracked files.
+/// For `Conflict`: no outputs to map (returns empty).
 fn apply_rewrite(
     ctx: &PollerContext,
     result: &DedicatedCompactionResult,
     inputs: &[crate::compaction::dedicated::DedicatedCompactionInput],
     output_level: u8,
     outputs: &[DedicatedDataFile],
-) -> Result<ApplyOutcome> {
+) -> Result<(ApplyOutcome, HashMap<String, u64>)> {
     let tree_idx = find_tree_by_scope(ctx, &result.tree_scope)?;
     let db_state = ctx.db_state.load();
     let tree_version = db_state.multi_lsm_version.version_of_index(tree_idx);
@@ -308,20 +317,32 @@ fn apply_rewrite(
     match status {
         OperationStatus::Pending => {
             // Allocate canonical file ids for outputs and register them readonly.
-            let prepared_outputs = prepare_outputs(ctx, outputs, output_level)?;
+            // prepare_outputs returns the path->id mapping so we have it before apply_edit.
+            let (prepared_outputs, path_to_id) = prepare_outputs(ctx, outputs, output_level)?;
             // Resolve real input Arcs from the current LSM.
             let input_arcs = resolve_input_arcs(tree_version, inputs, &ctx.file_manager)?;
             // Build VersionEdit.
             let edit = build_rewrite_edit(input_arcs, inputs, &prepared_outputs, output_level);
             // Build VlogEdit.
             let vlog_edit = build_vlog_edit(&result.vlog_entry_deltas);
-            // Apply.
+            // Apply. At this point all outputs are mapped and registered; the LSM edit is safe.
             ctx.lsm_tree.apply_edit(tree_idx, edit, vlog_edit);
-            Ok(ApplyOutcome::Applied)
+            Ok((ApplyOutcome::Applied, path_to_id))
         }
-        OperationStatus::AlreadyApplied => Ok(ApplyOutcome::AlreadyAppliedAndCommitted),
-        OperationStatus::AlreadyAppliedInMemory => Ok(ApplyOutcome::AlreadyAppliedInMemory),
-        OperationStatus::Conflict => Ok(ApplyOutcome::Conflict),
+        OperationStatus::AlreadyApplied => {
+            // No LSM modification; safe to build mapping from tracked files.
+            let path_to_id = build_output_path_to_id_map(ctx, result)?;
+            Ok((ApplyOutcome::AlreadyAppliedAndCommitted, path_to_id))
+        }
+        OperationStatus::AlreadyAppliedInMemory => {
+            // No LSM modification; safe to build mapping from tracked files.
+            let path_to_id = build_output_path_to_id_map(ctx, result)?;
+            Ok((ApplyOutcome::AlreadyAppliedInMemory, path_to_id))
+        }
+        OperationStatus::Conflict => {
+            // No outputs applied; empty mapping.
+            Ok((ApplyOutcome::Conflict, HashMap::new()))
+        }
     }
 }
 
@@ -557,13 +578,19 @@ fn resolve_input_arcs(
 /// Each output is registered with a **real** `TrackedFileId::new` (not detached) so that when
 /// the file is eventually removed from the LSM, the FileManager's tracking is cleaned up and
 /// the physical file is deleted (once `make_data_file_owned` has been called).
+///
+/// Returns the prepared `DataFile` Arcs **and** a mapping from each output's compactor path to
+/// the writer's canonical file id. Building the mapping here (before `apply_edit`) ensures that
+/// if any output cannot be registered or resolved, we fail **before** the LSM is modified.
+#[allow(clippy::type_complexity)]
 fn prepare_outputs(
     ctx: &PollerContext,
     outputs: &[DedicatedDataFile],
     output_level: u8,
-) -> Result<Vec<Arc<DataFile>>> {
+) -> Result<(Vec<Arc<DataFile>>, HashMap<String, u64>)> {
     let local_ids = ctx.file_manager.reserve_data_file_ids(outputs.len());
     let mut prepared = Vec::with_capacity(outputs.len());
+    let mut path_to_id = HashMap::with_capacity(outputs.len());
     for (output, local_id) in outputs.iter().zip(local_ids.iter()) {
         let local_id = *local_id;
         // Register the output as readonly (delete_on_drop = false) so it survives until
@@ -602,9 +629,12 @@ fn prepare_outputs(
             local_id,
             crate::file::lsm_file_priority_for_level(output_level),
         );
+        // Record the mapping now, before apply_edit, so that any failure in prepare_outputs
+        // leaves the LSM unmodified.
+        path_to_id.insert(output.path.clone(), local_id);
         prepared.push(Arc::new(data_file));
     }
-    Ok(prepared)
+    Ok((prepared, path_to_id))
 }
 
 /// Builds a VersionEdit for a Rewrite operation.
@@ -869,6 +899,6 @@ fn cleanup_uncommitted_outputs(
 /// Protocol-parsing failures (bad hex keys, unknown file type, bad paths, duplicate ids,
 /// scope mismatch) are deliberately produced as `InvalidState` so they fall into the terminal
 /// bucket here.
-fn is_transient_error(err: &Error) -> bool {
+pub(crate) fn is_transient_error(err: &Error) -> bool {
     matches!(err, Error::IoError(_) | Error::FileSystemError(_))
 }
