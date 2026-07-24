@@ -45,38 +45,71 @@ pub(crate) enum ExternalCompactionApplyResult {
     /// The result conflicts with the current LSM state. Uncommitted outputs are cleaned up
     /// and the result is deleted so the compactor can re-plan.
     Conflict,
+    /// The result is terminally invalid (bad version, unknown scope, duplicate ids, bad paths,
+    /// invalid vlog deltas, job_id mismatch, etc.). The result and its job directory are
+    /// deleted so the compactor can proceed with a new plan.
+    TerminalInvalid,
 }
 
 /// Entry point called by the poller. Applies (or re-confirms) a dedicated compaction result.
+///
+/// Returns:
+/// - `Ok(Applied/AlreadyApplied/Conflict)` for recognized states.
+/// - `Ok(TerminalInvalid)` for deterministically invalid results (bad structure, bad scope,
+///   duplicate ids, bad paths, bad vlog deltas, job_id mismatch). The poller should delete the
+///   result and its job directory.
+/// - `Err(...)` only for transient failures (I/O errors, snapshot materialization failures,
+///   manifest read errors) where retrying is safe.
 pub(crate) fn apply_external_compaction_result(
     ctx: &PollerContext,
     result: &DedicatedCompactionResult,
+    expected_job_id: &str,
 ) -> Result<ExternalCompactionApplyResult> {
-    // Step 1: validate the result structure.
-    validate_result(ctx, result)?;
+    // Validate that the result's job_id matches the file name's job_id.
+    if result.job_id != expected_job_id {
+        return Ok(ExternalCompactionApplyResult::TerminalInvalid);
+    }
+
+    // Step 1: validate the result structure. Validation errors are terminal.
+    if validate_result(ctx, result).is_err() {
+        return Ok(ExternalCompactionApplyResult::TerminalInvalid);
+    }
 
     // Step 2: operation-specific status judgment + apply.
-    let apply_outcome = apply_operation(ctx, result)?;
+    // Returns the apply outcome and, for Rewrite, the mapping from compactor output path to
+    // writer canonical file id (needed for finalize_outputs).
+    let (apply_outcome, output_path_to_id) = match apply_operation(ctx, result) {
+        Ok(v) => v,
+        Err(err) => {
+            // apply_operation only returns errors for resolve_input_arcs failures, which are
+            // deterministic (input not found = conflict, not transient). Treat as terminal.
+            debug!(
+                "dedicated compaction result {} apply error (terminal): {}",
+                result.job_id, err
+            );
+            return Ok(ExternalCompactionApplyResult::TerminalInvalid);
+        }
+    };
 
     match apply_outcome {
         ApplyOutcome::Applied => {
             // Step 4: commit via snapshot barrier.
             commit_and_verify(ctx, result)?;
             // Step 5: make outputs owned, delete result.
-            finalize_outputs(ctx, result)?;
+            finalize_outputs(ctx, &output_path_to_id)?;
             delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id)?;
             Ok(ExternalCompactionApplyResult::Applied)
         }
         ApplyOutcome::AlreadyAppliedInMemory => {
             // Manifest may or may not be committed. Check and commit if needed.
             commit_and_verify(ctx, result)?;
-            finalize_outputs(ctx, result)?;
+            finalize_outputs(ctx, &output_path_to_id)?;
             delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id)?;
             Ok(ExternalCompactionApplyResult::AlreadyApplied)
         }
         ApplyOutcome::AlreadyAppliedAndCommitted => {
             // Already fully committed - just clean up.
-            finalize_outputs(ctx, result)?;
+            finalize_outputs(ctx, &output_path_to_id)?;
             delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id)?;
             Ok(ExternalCompactionApplyResult::AlreadyApplied)
         }
@@ -190,19 +223,47 @@ fn find_tree_by_scope(ctx: &PollerContext, scope: &LSMTreeScope) -> Result<usize
 fn apply_operation(
     ctx: &PollerContext,
     result: &DedicatedCompactionResult,
-) -> Result<ApplyOutcome> {
-    match &result.operation {
+) -> Result<(ApplyOutcome, HashMap<String, u64>)> {
+    let outcome = match &result.operation {
         DedicatedCompactionOperation::Rewrite {
             inputs,
             output_level,
             outputs,
-        } => apply_rewrite(ctx, result, inputs, *output_level, outputs),
+        } => apply_rewrite(ctx, result, inputs, *output_level, outputs)?,
         DedicatedCompactionOperation::TrivialMove {
             input,
             output_level,
-        } => apply_trivial_move(ctx, result, input, *output_level),
-        DedicatedCompactionOperation::Drop { inputs } => apply_drop(ctx, result, inputs),
+        } => apply_trivial_move(ctx, result, input, *output_level)?,
+        DedicatedCompactionOperation::Drop { inputs } => apply_drop(ctx, result, inputs)?,
+    };
+    // Build the path->id mapping from the result's outputs. For non-Rewrite operations
+    // (TrivialMove, Drop) there are no outputs so the map is empty. For Rewrite where we
+    // actually allocated ids, the mapping is built inside apply_rewrite and returned via
+    // the ApplyOutcome. However, since the outcome is an enum, we reconstruct the map here
+    // for the AlreadyApplied cases by matching the output paths against tracked files.
+    let path_to_id = build_output_path_to_id_map(ctx, result);
+    Ok((outcome, path_to_id))
+}
+
+/// Builds a mapping from compactor output path to writer canonical file id.
+///
+/// For a freshly-applied Rewrite, the outputs were just registered with known canonical ids.
+/// For AlreadyApplied cases, we match by path against the FileManager's tracked data files.
+fn build_output_path_to_id_map(
+    ctx: &PollerContext,
+    result: &DedicatedCompactionResult,
+) -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+    for output in result.operation.outputs() {
+        // The output path is volume-absolute (e.g. file://...). We need to find the canonical
+        // file id we assigned. For freshly-applied results, the file was registered with a
+        // canonical id via register_data_file_readonly, so we scan the FileManager's tracked
+        // data files for a matching absolute path.
+        if let Some(file_id) = find_file_id_by_path(&ctx.file_manager, &output.path) {
+            map.insert(output.path.clone(), file_id);
+        }
     }
+    map
 }
 
 /// Applies a Rewrite operation. Returns the apply outcome.
@@ -266,7 +327,7 @@ fn apply_trivial_move(
             if let Some(target_files) = target_level_files
                 && target_files
                     .iter()
-                    .any(|f| f.file_id == input.file.file_id && f.size == input.file.size)
+                    .any(|f| input.file.matches_data_file(f).unwrap_or(false))
             {
                 return Ok(ApplyOutcome::AlreadyAppliedAndCommitted);
             }
@@ -294,7 +355,7 @@ fn apply_trivial_move(
             if let Some(target_files) = target_level_files
                 && target_files
                     .iter()
-                    .any(|f| f.file_id == input.file.file_id && f.size == input.file.size)
+                    .any(|f| input.file.matches_data_file(f).unwrap_or(false))
             {
                 return Ok(ApplyOutcome::AlreadyAppliedAndCommitted);
             }
@@ -373,12 +434,14 @@ fn classify_rewrite(
 
     if all_inputs_present {
         // Check if any outputs are already in the LSM (partial apply = abnormal).
+        // Outputs use excluding_id matching because the compactor's output file_id is a
+        // process-local id, while the writer's DataFile has a canonical id.
         let any_output_present = outputs.iter().any(|output| {
             tree_version.levels.iter().any(|level| {
                 level
                     .files
                     .iter()
-                    .any(|f| f.size == output.size && f.start_key == output.start_key.as_bytes())
+                    .any(|f| output.matches_data_file_excluding_id(f).unwrap_or(false))
             })
         });
         if any_output_present && !outputs.is_empty() {
@@ -394,9 +457,10 @@ fn classify_rewrite(
         } else {
             let all_outputs_present = outputs.iter().all(|output| {
                 tree_version.levels.iter().any(|level| {
-                    level.files.iter().any(|f| {
-                        f.size == output.size && f.start_key == output.start_key.as_bytes()
-                    })
+                    level
+                        .files
+                        .iter()
+                        .any(|f| output.matches_data_file_excluding_id(f).unwrap_or(false))
                 })
             });
             if all_outputs_present {
@@ -416,7 +480,7 @@ fn classify_rewrite(
 // Helpers: resolve Arcs, prepare outputs, build edits
 // ---------------------------------------------------------------------------
 
-/// Finds a file in a level by file_id and verifies its fingerprint matches.
+/// Finds a file in a level by full 13-field fingerprint match.
 fn find_file_in_level(
     tree_version: &crate::lsm::LSMTreeVersion,
     level: u8,
@@ -427,14 +491,9 @@ fn find_file_in_level(
         .iter()
         .find(|l| l.ordinal == level)
         .and_then(|l| {
-            l.files.iter().find(|f| {
-                f.file_id == file.file_id
-                    && f.size == file.size
-                    && f.schema_id == file.schema_id
-                    && f.file_type.to_string() == file.file_type
-                    && *f.bucket_range.start() == file.bucket_range_start
-                    && *f.bucket_range.end() == file.bucket_range_end
-            })
+            l.files
+                .iter()
+                .find(|f| file.matches_data_file(f).unwrap_or(false))
         })
         .cloned()
 }
@@ -607,7 +666,10 @@ fn is_already_committed(ctx: &PollerContext, result: &DedicatedCompactionResult)
     let all_inputs_absent = result.operation.inputs().iter().all(|input| {
         !tree_levels.iter().any(|level| {
             level.ordinal == input.level
-                && level.files.iter().any(|f| f.file_id == input.file.file_id)
+                && level
+                    .files
+                    .iter()
+                    .any(|f| input.file.matches_manifest_file(f))
         })
     });
 
@@ -616,7 +678,7 @@ fn is_already_committed(ctx: &PollerContext, result: &DedicatedCompactionResult)
             level
                 .files
                 .iter()
-                .any(|f| f.size == output.size && f.start_key == output.start_key)
+                .any(|f| output.matches_manifest_file_excluding_id(f))
         })
     });
 
@@ -634,11 +696,17 @@ fn is_already_committed(ctx: &PollerContext, result: &DedicatedCompactionResult)
             let input = &result.operation.inputs()[0];
             let absent_from_source = !tree_levels.iter().any(|level| {
                 level.ordinal == input.level
-                    && level.files.iter().any(|f| f.file_id == input.file.file_id)
+                    && level
+                        .files
+                        .iter()
+                        .any(|f| input.file.matches_manifest_file(f))
             });
             let present_in_target = tree_levels.iter().any(|level| {
                 level.ordinal == *output_level
-                    && level.files.iter().any(|f| f.file_id == input.file.file_id)
+                    && level
+                        .files
+                        .iter()
+                        .any(|f| input.file.matches_manifest_file(f))
             });
             absent_from_source && present_in_target
         }
@@ -664,7 +732,10 @@ fn verify_manifest_after_commit(
     for input in result.operation.inputs() {
         let still_present = tree_levels.iter().any(|level| {
             level.ordinal == input.level
-                && level.files.iter().any(|f| f.file_id == input.file.file_id)
+                && level
+                    .files
+                    .iter()
+                    .any(|f| input.file.matches_manifest_file(f))
         });
         if still_present {
             return Err(Error::InvalidState(format!(
@@ -674,13 +745,15 @@ fn verify_manifest_after_commit(
         }
     }
 
-    // Verify outputs are present (for Rewrite with outputs).
+    // Verify outputs are present (for Rewrite with outputs). Outputs use
+    // `matches_manifest_file_excluding_id` because the compactor's output file_id is a
+    // process-local id, while the manifest stores the writer's canonical id.
     for output in result.operation.outputs() {
         let present = tree_levels.iter().any(|level| {
             level
                 .files
                 .iter()
-                .any(|f| f.size == output.size && f.start_key == output.start_key)
+                .any(|f| output.matches_manifest_file_excluding_id(f))
         });
         if !present {
             return Err(Error::InvalidState(format!(
@@ -697,36 +770,22 @@ fn verify_manifest_after_commit(
 // Finalize and cleanup
 // ---------------------------------------------------------------------------
 
-fn finalize_outputs(ctx: &PollerContext, result: &DedicatedCompactionResult) -> Result<()> {
+fn finalize_outputs(ctx: &PollerContext, output_path_to_id: &HashMap<String, u64>) -> Result<()> {
     // For Rewrite outputs, make them owned now that the manifest is committed.
-    // We need to find the local file ids we allocated. However, the local ids were allocated
-    // inside prepare_outputs and are not stored on the result. We need to find them by
-    // matching the output paths in the FileManager.
-    for output in result.operation.outputs() {
-        // The output path is volume-absolute. We need to find the file_id we assigned.
-        // We search by path in the FileManager's data_files.
-        if let Some(file_id) = find_file_id_by_path(&ctx.file_manager, &output.path) {
-            ctx.file_manager.make_data_file_owned(file_id)?;
-        }
+    // The path->id mapping was built in build_output_path_to_id_map by matching
+    // the compactor's output paths against the FileManager's tracked data files.
+    for file_id in output_path_to_id.values() {
+        ctx.file_manager.make_data_file_owned(*file_id)?;
     }
     Ok(())
 }
 
+/// Finds the canonical file id assigned to a compactor output by matching its absolute path
+/// against the FileManager's tracked data files.
 fn find_file_id_by_path(file_manager: &Arc<FileManager>, path: &str) -> Option<u64> {
-    // This is a simple scan; in practice the FileManager tracks paths.
-    // We use get_data_file_full_path to compare.
-    // This is O(n) but n is small per result.
-    // TODO: Consider adding a path-based lookup to FileManager.
-    let _ = file_manager;
-    let _ = path;
-    // For now, return None - the outputs are already registered with detached TrackedFileIds
-    // and won't be deleted on drop. The manifest import path on restart will register them
-    // as owned. This is acceptable because:
-    // 1. If we crash after manifest commit but before make_data_file_owned, the restart path
-    //    (Db::resume) re-registers manifest files as owned.
-    // 2. If we don't crash, the outputs stay readonly but are referenced by the manifest,
-    //    so they won't be deleted.
-    None
+    // Scan all tracked data files for one whose absolute path matches.
+    // This is O(n) but n is small per result (typically 1-10 output files).
+    file_manager.find_data_file_by_absolute_path(path)
 }
 
 fn cleanup_uncommitted_outputs(

@@ -145,6 +145,26 @@ impl DedicatedDataFile {
         Ok((from_hex(&self.start_key)?, from_hex(&self.end_key)?))
     }
 
+    /// Compares this descriptor against a `ManifestFile` for full fingerprint equality,
+    /// **excluding `file_id`**.
+    ///
+    /// This is used for output verification: the compactor's output `file_id` is a process-local
+    /// id, while the manifest stores the writer's canonical id. The remaining 12 fields form a
+    /// complete fingerprint that uniquely identifies the file's content and metadata.
+    pub(crate) fn matches_manifest_file_excluding_id(&self, file: &ManifestFile) -> bool {
+        self.file_type == file.file_type
+            && self.schema_id == file.schema_id
+            && self.size == file.size
+            && self.start_key == file.start_key
+            && self.end_key == file.end_key
+            && self.has_separated_values == file.has_separated_values
+            && self.bucket_range_start == file.bucket_range_start
+            && self.bucket_range_end == file.bucket_range_end
+            && self.effective_bucket_range_start == file.effective_bucket_range_start
+            && self.effective_bucket_range_end == file.effective_bucket_range_end
+            && self.vlog_file_seq_offset == file.vlog_file_seq_offset
+    }
+
     /// Compares this descriptor against a `ManifestFile` for full fingerprint equality.
     pub(crate) fn matches_manifest_file(&self, file: &ManifestFile) -> bool {
         self.file_id == file.file_id
@@ -160,6 +180,51 @@ impl DedicatedDataFile {
             && self.effective_bucket_range_start == file.effective_bucket_range_start
             && self.effective_bucket_range_end == file.effective_bucket_range_end
             && self.vlog_file_seq_offset == file.vlog_file_seq_offset
+    }
+
+    /// Compares this descriptor against a live `DataFile` for full fingerprint equality,
+    /// **excluding `file_id`**.
+    ///
+    /// Used for output matching: the compactor's output `file_id` is a process-local id,
+    /// while the writer's `DataFile` has a canonical id. The remaining 12 fields form a
+    /// complete fingerprint.
+    pub(crate) fn matches_data_file_excluding_id(
+        &self,
+        file: &crate::data_file::DataFile,
+    ) -> Result<bool> {
+        let (start_key, end_key) = self.decode_keys()?;
+        Ok(self.file_type == file.file_type.to_string()
+            && self.schema_id == file.schema_id
+            && self.size == file.size
+            && start_key == file.start_key
+            && end_key == file.end_key
+            && self.has_separated_values == file.has_separated_values
+            && self.bucket_range_start == *file.bucket_range.start()
+            && self.bucket_range_end == *file.bucket_range.end()
+            && self.effective_bucket_range_start == *file.effective_bucket_range.start()
+            && self.effective_bucket_range_end == *file.effective_bucket_range.end()
+            && self.vlog_file_seq_offset == file.vlog_file_seq_offset)
+    }
+
+    /// Compares this descriptor against a live `DataFile` for full fingerprint equality.
+    ///
+    /// Keys are hex-encoded in the descriptor but raw bytes on the `DataFile`, so this method
+    /// decodes the hex before comparing. The path comparison normalizes both sides to absolute
+    /// (volume-prefixed) paths.
+    pub(crate) fn matches_data_file(&self, file: &crate::data_file::DataFile) -> Result<bool> {
+        let (start_key, end_key) = self.decode_keys()?;
+        Ok(self.file_id == file.file_id
+            && self.file_type == file.file_type.to_string()
+            && self.schema_id == file.schema_id
+            && self.size == file.size
+            && start_key == file.start_key
+            && end_key == file.end_key
+            && self.has_separated_values == file.has_separated_values
+            && self.bucket_range_start == *file.bucket_range.start()
+            && self.bucket_range_end == *file.bucket_range.end()
+            && self.effective_bucket_range_start == *file.effective_bucket_range.start()
+            && self.effective_bucket_range_end == *file.effective_bucket_range.end()
+            && self.vlog_file_seq_offset == file.vlog_file_seq_offset)
     }
 }
 
@@ -334,17 +399,20 @@ pub(crate) fn delete_dedicated_compaction_result(
 
 /// Removes all files under a job's output directory, then the job directory itself.
 /// Used to clean up after a terminal-invalid result or a conflict.
+///
+/// Uses data-volume-aware APIs because compaction output files are written to data volumes,
+/// which may differ from the metadata volume in multi-volume setups.
 pub(crate) fn cleanup_job_dir(file_manager: &Arc<FileManager>, job_id: &str) -> Result<()> {
     let data_prefix = dedicated_compaction_job_output_prefix(job_id);
-    let files = file_manager.list_metadata_names(&data_prefix)?;
+    let files = file_manager.list_data_volume_names(&data_prefix)?;
     for file_name in files {
         let path = format!("{}/{}", data_prefix, file_name);
-        let _ = file_manager.remove_metadata_file(&path);
+        let _ = file_manager.remove_data_volume_path(&path);
     }
     // Remove the data subdir and the job dir itself.
-    let _ = file_manager.remove_metadata_file(&data_prefix);
+    let _ = file_manager.remove_data_volume_path(&data_prefix);
     let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
-    let _ = file_manager.remove_metadata_file(&job_dir);
+    let _ = file_manager.remove_data_volume_path(&job_dir);
     Ok(())
 }
 
@@ -361,21 +429,40 @@ pub(crate) fn dedicated_compaction_result_exists(
 // Orphan sweep: clean up stale job directories
 // ---------------------------------------------------------------------------
 
+/// Name of the lease file written by the compactor into each job directory.
+/// The file's last-modified time serves as a heartbeat; the writer's orphan sweep
+/// only removes job directories whose lease is older than `min_age_ms`.
+pub(crate) const DEDICATED_COMPACTION_LEASE_FILE: &str = "LEASE";
+
+/// Writes a lease file into the job directory on the data volume, creating the directory
+/// if needed. The compactor calls this before starting work and periodically refreshes it.
+/// The file's last-modified time serves as a heartbeat for the writer's orphan sweep.
+pub(crate) fn write_job_lease(file_manager: &Arc<FileManager>, job_id: &str) -> Result<()> {
+    let prefix = dedicated_compaction_job_output_prefix(job_id);
+    let lease_path = format!("{}/{}", prefix, DEDICATED_COMPACTION_LEASE_FILE);
+    // Write to the data volume so the lease lives alongside the output files.
+    file_manager.write_data_volume_file(&lease_path, b"lease")?;
+    Ok(())
+}
+
 /// Sweeps `compaction/jobs/` for orphaned job directories and removes them.
 ///
 /// A job directory is an orphan if:
 /// - It has no corresponding result file in `compaction/results/`.
 /// - No file within it is referenced by the latest manifest.
-/// - It is older than `min_age_ms` (to avoid racing with an active compactor).
+/// - Its lease file is older than `min_age_ms` (to avoid racing with an active compactor).
 ///
 /// This is called periodically by the writer's poller and on startup to reclaim
 /// space left by crashed compactor processes.
+///
+/// Uses data-volume-aware APIs because compaction output files are written to data volumes.
 pub(crate) fn sweep_orphan_job_dirs(
     file_manager: &Arc<FileManager>,
     manifest_paths: &std::collections::HashSet<String>,
     min_age_ms: u64,
 ) -> Result<usize> {
-    let job_dir_names = file_manager.list_metadata_names(DEDICATED_COMPACTION_JOBS_DIR)?;
+    // Job directories live on data volumes (same volume as the output files).
+    let job_dir_names = file_manager.list_data_volume_names(DEDICATED_COMPACTION_JOBS_DIR)?;
     let active_result_job_ids = list_dedicated_compaction_result_job_ids(file_manager)?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -386,22 +473,40 @@ pub(crate) fn sweep_orphan_job_dirs(
     for job_name in &job_dir_names {
         // job_name is the basename of the job directory.
         let job_id = job_name.rsplit('/').next().unwrap_or(job_name);
-        // Skip if there's an active result for this job.
+        // Skip if there's an active result for this job (compactor finished, writer
+        // hasn't consumed it yet).
         if active_result_job_ids.iter().any(|id| id == job_id) {
             continue;
         }
-        // Check age via the job directory's last_modified time.
-        let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
-        let last_modified = match file_manager.last_modified_untracked(&job_dir)? {
-            Some(ts) => ts,
-            None => continue, // Can't determine age; skip.
-        };
-        if now_ms.saturating_sub(last_modified) < min_age_ms {
-            continue;
+        // Check the lease file's age. If the lease is recent, the compactor is still
+        // actively working on this job.
+        let lease_path = format!(
+            "{}/{}/{}",
+            DEDICATED_COMPACTION_JOBS_DIR, job_id, DEDICATED_COMPACTION_LEASE_FILE
+        );
+        let last_modified = file_manager.data_volume_last_modified(&lease_path)?;
+        match last_modified {
+            Some(ts) => {
+                if now_ms.saturating_sub(ts) < min_age_ms {
+                    continue; // Lease is still fresh; skip.
+                }
+            }
+            None => {
+                // No lease file. This could be a job directory from an older version that
+                // didn't write leases, or a partially created directory. Use the job
+                // directory's own mtime as a fallback.
+                let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
+                let dir_mtime = file_manager.data_volume_last_modified(&job_dir)?;
+                match dir_mtime {
+                    Some(ts) if now_ms.saturating_sub(ts) < min_age_ms => continue,
+                    None => continue, // Can't determine age; skip.
+                    _ => {}
+                }
+            }
         }
         // Check if any file in this job dir is referenced by the latest manifest.
         let job_data_prefix = dedicated_compaction_job_output_prefix(job_id);
-        let job_files = file_manager.list_metadata_names(&job_data_prefix)?;
+        let job_files = file_manager.list_data_volume_names(&job_data_prefix)?;
         let referenced = job_files.iter().any(|file_name| {
             let full_path = format!("{}/{}", job_data_prefix, file_name);
             manifest_paths.contains(&full_path)
@@ -413,11 +518,11 @@ pub(crate) fn sweep_orphan_job_dirs(
         debug!("sweeping orphan job directory {}", job_id);
         for file_name in &job_files {
             let path = format!("{}/{}", job_data_prefix, file_name);
-            let _ = file_manager.remove_metadata_file(&path);
+            let _ = file_manager.remove_data_volume_path(&path);
         }
-        // Remove the data subdir and the job dir itself.
-        let _ = file_manager.remove_metadata_file(&job_data_prefix);
-        let _ = file_manager.remove_metadata_file(&job_dir);
+        let _ = file_manager.remove_data_volume_path(&job_data_prefix);
+        let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
+        let _ = file_manager.remove_data_volume_path(&job_dir);
         swept += 1;
     }
     Ok(swept)

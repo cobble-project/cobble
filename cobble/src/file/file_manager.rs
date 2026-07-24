@@ -1566,6 +1566,18 @@ impl FileManager {
         self.data_files.get(&file_id).map(|f| f.absolute_path())
     }
 
+    /// Finds a tracked data file by its absolute (volume-prefixed) path.
+    ///
+    /// This is used by the dedicated compaction apply path to map a compactor output path
+    /// (e.g. `file://.../compaction/jobs/<id>/data/<uuid>.sst`) back to the canonical file id
+    /// the writer assigned when registering the output.
+    pub(crate) fn find_data_file_by_absolute_path(&self, absolute_path: &str) -> Option<FileId> {
+        self.data_files
+            .iter()
+            .find(|entry| entry.absolute_path() == absolute_path)
+            .map(|entry| *entry.key())
+    }
+
     /// Returns the path for a metadata file.
     pub fn get_metadata_file_path(&self, name: &str) -> Option<String> {
         self.metadata_files.get(name).map(|f| f.path().to_string())
@@ -1826,6 +1838,101 @@ impl FileManager {
             Err(Error::IoError(_)) => Ok(Vec::new()),
             Err(err) => Err(err),
         }
+    }
+
+    /// Lists file names under a directory relative to the DB base dir, using **data volumes**
+    /// rather than the metadata volume. This is necessary for cleaning up compaction output
+    /// files that were written to data volumes (which may differ from the metadata volume in
+    /// multi-volume setups).
+    ///
+    /// Returns the union of files found across all data volumes.
+    pub(crate) fn list_data_volume_names(&self, relative_dir: &str) -> Result<Vec<String>> {
+        let dir = if self.options.base_dir.is_empty() {
+            relative_dir.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, relative_dir)
+        };
+        let mut all_names = Vec::new();
+        for volume in &self.data_volumes {
+            match volume.fs().list(&dir) {
+                Ok(names) => all_names.extend(names),
+                Err(Error::IoError(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(all_names)
+    }
+
+    /// Deletes a file by its path relative to the DB base dir from **all data volumes**.
+    /// Used to clean up compaction output files that may live on any data volume.
+    pub(crate) fn remove_data_volume_path(&self, relative_path: &str) -> Result<()> {
+        let path = if self.options.base_dir.is_empty() {
+            relative_path.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, relative_path)
+        };
+        for volume in &self.data_volumes {
+            if volume.fs().exists(&path)? {
+                volume.fs().delete(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks if a file exists on any data volume by its path relative to the DB base dir.
+    pub(crate) fn data_volume_path_exists(&self, relative_path: &str) -> Result<bool> {
+        let path = if self.options.base_dir.is_empty() {
+            relative_path.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, relative_path)
+        };
+        for volume in &self.data_volumes {
+            if volume.fs().exists(&path)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Writes a small file to the first data volume, creating parent directories as needed.
+    /// Used for lease/marker files that must live alongside compaction output files.
+    pub(crate) fn write_data_volume_file(&self, relative_path: &str, content: &[u8]) -> Result<()> {
+        let path = if self.options.base_dir.is_empty() {
+            relative_path.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, relative_path)
+        };
+        // Create parent directories.
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let parent_str = parent.to_string_lossy().to_string();
+            if !parent_str.is_empty() {
+                for volume in &self.data_volumes {
+                    if !volume.fs().exists(&parent_str)? {
+                        volume.fs().create_dir(&parent_str)?;
+                    }
+                }
+            }
+        }
+        let volume = self.select_data_volume(None)?;
+        let mut writer = volume.fs().open_write(&path)?;
+        writer.write(content)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    /// Returns the last-modified time (unix millis) of a path on any data volume.
+    pub(crate) fn data_volume_last_modified(&self, relative_path: &str) -> Result<Option<u64>> {
+        let path = if self.options.base_dir.is_empty() {
+            relative_path.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, relative_path)
+        };
+        for volume in &self.data_volumes {
+            if let Some(ts) = volume.fs().last_modified(&path)? {
+                return Ok(Some(ts));
+            }
+        }
+        Ok(None)
     }
 
     /// Returns true if a metadata file exists on disk, bypassing the in-memory index.

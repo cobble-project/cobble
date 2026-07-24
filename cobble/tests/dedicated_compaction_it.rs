@@ -204,7 +204,6 @@ fn test_dedicated_compaction_basic() {
     );
 
     let initial_snapshots = count_snapshots(root);
-    let initial_files = count_data_files(root);
 
     // Start the compactor (it waits for snapshots internally).
     let (stop, handle) = spawn_compactor(config.clone(), db_id.clone());

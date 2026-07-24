@@ -1320,6 +1320,13 @@ impl Config {
                 "compaction_mode=dedicated cannot be used with compaction_remote_addr".to_string(),
             ));
         }
+        if self.compaction_mode == CompactionMode::Dedicated && self.ttl_enabled {
+            return Err(Error::ConfigError(
+                "compaction_mode=dedicated does not yet support TTL; \
+                 disable ttl_enabled or use compaction_mode=embedded"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }

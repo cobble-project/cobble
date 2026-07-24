@@ -13,7 +13,7 @@
 use crate::compaction::dedicated::{
     DEDICATED_COMPACTION_RESULT_VERSION, DedicatedCompactionInput, DedicatedCompactionOperation,
     DedicatedCompactionResult, DedicatedDataFile, dedicated_compaction_job_output_prefix,
-    publish_dedicated_compaction_result,
+    publish_dedicated_compaction_result, write_job_lease,
 };
 use crate::compaction::policy::{
     CompactionPolicy, CompactionPolicyContext, MinOverlapPolicy, RoundRobinPolicy,
@@ -53,6 +53,9 @@ pub struct DedicatedCompactor {
     file_manager: Arc<FileManager>,
     schema_manager: Arc<SchemaManager>,
     metrics_manager: Arc<MetricsManager>,
+    /// Saved merge operator resolver, passed to every schema reload so custom merge
+    /// operators remain functional across manifest refreshes.
+    resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
     poll_interval: Duration,
     executor: CompactionExecutor,
     db_lifecycle: Arc<DbLifecycle>,
@@ -85,7 +88,7 @@ impl DedicatedCompactor {
             Arc::clone(&metrics_manager),
         )?);
         // Load the latest manifest to bootstrap schemas.
-        let schema_manager = Self::load_schema_manager(&file_manager, resolver)?;
+        let schema_manager = Self::load_schema_manager(&file_manager, resolver.clone())?;
         let db_lifecycle = Arc::new(DbLifecycle::new_open());
         let compaction_config = build_compaction_config(&config, config.num_columns)?;
         let executor = CompactionExecutor::new(compaction_config, Arc::clone(&db_lifecycle))?;
@@ -97,6 +100,7 @@ impl DedicatedCompactor {
             file_manager,
             schema_manager,
             metrics_manager,
+            resolver,
             poll_interval,
             executor,
             db_lifecycle,
@@ -176,11 +180,12 @@ impl DedicatedCompactor {
         let manifest = load_manifest_for_snapshot(&self.file_manager, latest_id)?;
 
         // Step 3: Rebuild read-only LSM state, schema, truncation cursors.
-        // Reload schemas in case the writer evolved the schema.
+        // Reload schemas in case the writer evolved the schema. Pass the saved resolver so
+        // custom merge operators remain functional.
         let schema_manager = Arc::new(SchemaManager::from_manifest(
             &self.file_manager,
             &manifest,
-            None,
+            self.resolver.clone(),
         )?);
         let tree_versions = build_tree_versions_from_manifest(
             &self.file_manager,
@@ -259,6 +264,10 @@ impl DedicatedCompactor {
         base_snapshot_id: u64,
         job_id: &str,
     ) -> Result<()> {
+        // Write a lease file so the writer's orphan sweep doesn't delete our outputs
+        // while we're still working.
+        write_job_lease(&self.file_manager, job_id)?;
+
         // Handle trivial move and drop without executing a full compaction task.
         if plan.drop_truncated {
             return self.publish_drop_result(

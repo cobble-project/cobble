@@ -241,7 +241,7 @@ fn poll_once(
         result.job_id, result.operation
     );
 
-    match apply_external_compaction_result(ctx, &result) {
+    match apply_external_compaction_result(ctx, &result, job_id) {
         Ok(ExternalCompactionApplyResult::Applied) => {
             debug!(
                 "dedicated compaction result job={} applied successfully",
@@ -263,6 +263,15 @@ fn poll_once(
             );
             // Cleanup of uncommitted outputs is handled inside apply_external_compaction_result.
             // Delete the result so the compactor can proceed.
+            let _ = delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id);
+            Ok(PollOutcome::Processed)
+        }
+        Ok(ExternalCompactionApplyResult::TerminalInvalid) => {
+            warn!(
+                "dedicated compaction result job={} is terminally invalid; cleaning up and deleting",
+                result.job_id
+            );
+            let _ = cleanup_job_dir(&ctx.file_manager, &result.job_id);
             let _ = delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id);
             Ok(PollOutcome::Processed)
         }
