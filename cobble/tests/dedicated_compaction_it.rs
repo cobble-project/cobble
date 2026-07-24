@@ -326,6 +326,16 @@ fn test_dedicated_compaction_restart_recovery() {
     let _ = handle.join();
     assert!(compaction_done, "compaction should have completed");
 
+    // Force a final snapshot to flush any remaining memtable data before close.
+    // Without this, keys that were written but not yet flushed to L0 SST would be lost
+    // on restart (close flushes the memtable, but the snapshot ensures the manifest
+    // references the flushed SST).
+    db.snapshot().expect("final snapshot");
+    // Wait for the snapshot to be materialized.
+    wait_for(Duration::from_secs(10), Duration::from_millis(100), || {
+        count_snapshots(root) > initial_snapshots + 2
+    });
+
     // Close the DB and reopen it with the same db_id.
     db.close().expect("close");
 

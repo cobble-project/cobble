@@ -1863,6 +1863,20 @@ impl FileManager {
         Ok(all_names)
     }
 
+    /// Resolves a relative path (relative to the DB base dir) to the set of absolute
+    /// (volume-prefixed) paths across all data volumes. Used by the orphan sweep to compare
+    /// against manifest paths (which are stored as absolute volume-prefixed paths).
+    pub(crate) fn data_volume_absolute_paths(&self, relative_path: &str) -> Vec<String> {
+        self.data_volumes
+            .iter()
+            .filter_map(|volume| {
+                volume
+                    .base_dir()
+                    .map(|bd| format!("{}/{}", bd, relative_path))
+            })
+            .collect()
+    }
+
     /// Deletes a file by its path relative to the DB base dir from **all data volumes**.
     /// Used to clean up compaction output files that may live on any data volume.
     pub(crate) fn remove_data_volume_path(&self, relative_path: &str) -> Result<()> {

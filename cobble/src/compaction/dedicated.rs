@@ -153,6 +153,7 @@ impl DedicatedDataFile {
     /// complete fingerprint that uniquely identifies the file's content and metadata.
     pub(crate) fn matches_manifest_file_excluding_id(&self, file: &ManifestFile) -> bool {
         self.file_type == file.file_type
+            && self.path == file.path
             && self.schema_id == file.schema_id
             && self.size == file.size
             && self.start_key == file.start_key
@@ -186,14 +187,22 @@ impl DedicatedDataFile {
     /// **excluding `file_id`**.
     ///
     /// Used for output matching: the compactor's output `file_id` is a process-local id,
-    /// while the writer's `DataFile` has a canonical id. The remaining 12 fields form a
-    /// complete fingerprint.
+    /// while the writer's `DataFile` has a canonical id. The remaining 12 fields (including
+    /// path) form a complete fingerprint. The `FileManager` is needed to resolve the
+    /// `DataFile`'s absolute path for comparison.
     pub(crate) fn matches_data_file_excluding_id(
         &self,
         file: &crate::data_file::DataFile,
+        file_manager: &Arc<FileManager>,
     ) -> Result<bool> {
         let (start_key, end_key) = self.decode_keys()?;
-        Ok(self.file_type == file.file_type.to_string()
+        let file_path = file_manager.get_data_file_full_path(file.file_id);
+        let path_matches = match &file_path {
+            Some(p) => *p == self.path,
+            None => false,
+        };
+        Ok(path_matches
+            && self.file_type == file.file_type.to_string()
             && self.schema_id == file.schema_id
             && self.size == file.size
             && start_key == file.start_key
@@ -505,11 +514,14 @@ pub(crate) fn sweep_orphan_job_dirs(
             }
         }
         // Check if any file in this job dir is referenced by the latest manifest.
+        // Manifest paths are absolute (volume-prefixed, e.g. file://.../compaction/jobs/.../data/...),
+        // so we must resolve the relative paths to absolute for comparison.
         let job_data_prefix = dedicated_compaction_job_output_prefix(job_id);
         let job_files = file_manager.list_data_volume_names(&job_data_prefix)?;
         let referenced = job_files.iter().any(|file_name| {
-            let full_path = format!("{}/{}", job_data_prefix, file_name);
-            manifest_paths.contains(&full_path)
+            let relative_path = format!("{}/{}", job_data_prefix, file_name);
+            let absolute_paths = file_manager.data_volume_absolute_paths(&relative_path);
+            absolute_paths.iter().any(|p| manifest_paths.contains(p))
         });
         if referenced {
             continue;

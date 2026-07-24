@@ -258,27 +258,29 @@ fn poll_once(
         }
         Ok(ExternalCompactionApplyResult::Conflict) => {
             warn!(
-                "dedicated compaction result job={} rejected (conflict); cleaning up and deleting",
-                result.job_id
+                "dedicated compaction result job={} (file={}) rejected (conflict); cleaning up and deleting",
+                result.job_id, job_id
             );
             // Cleanup of uncommitted outputs is handled inside apply_external_compaction_result.
-            // Delete the result so the compactor can proceed.
-            let _ = delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id);
+            // Delete the result using the filename-parsed job_id.
+            let _ = delete_dedicated_compaction_result(&ctx.file_manager, job_id);
             Ok(PollOutcome::Processed)
         }
         Ok(ExternalCompactionApplyResult::TerminalInvalid) => {
             warn!(
-                "dedicated compaction result job={} is terminally invalid; cleaning up and deleting",
-                result.job_id
+                "dedicated compaction result job={} (file={}) is terminally invalid; cleaning up and deleting",
+                result.job_id, job_id
             );
-            let _ = cleanup_job_dir(&ctx.file_manager, &result.job_id);
-            let _ = delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id);
+            // Always clean up using the filename-parsed job_id, not result.job_id, which
+            // may differ if the payload was tampered or corrupted.
+            let _ = cleanup_job_dir(&ctx.file_manager, job_id);
+            let _ = delete_dedicated_compaction_result(&ctx.file_manager, job_id);
             Ok(PollOutcome::Processed)
         }
         Err(err) => {
             warn!(
-                "failed to apply dedicated compaction result job={}: {}; will retry",
-                result.job_id, err
+                "failed to apply dedicated compaction result job={} (file={}): {}; will retry",
+                result.job_id, job_id, err
             );
             Ok(PollOutcome::RetryDeferred)
         }

@@ -70,8 +70,13 @@ pub(crate) fn apply_external_compaction_result(
         return Ok(ExternalCompactionApplyResult::TerminalInvalid);
     }
 
-    // Step 1: validate the result structure. Validation errors are terminal.
-    if validate_result(ctx, result).is_err() {
+    // Step 1: validate the result structure. Most validation errors are terminal
+    // (structural), but I/O errors (e.g. remote storage temporarily unavailable)
+    // should be retried.
+    if let Err(err) = validate_result(ctx, result) {
+        if is_transient_error(&err) {
+            return Err(err);
+        }
         return Ok(ExternalCompactionApplyResult::TerminalInvalid);
     }
 
@@ -81,8 +86,12 @@ pub(crate) fn apply_external_compaction_result(
     let (apply_outcome, output_path_to_id) = match apply_operation(ctx, result) {
         Ok(v) => v,
         Err(err) => {
-            // apply_operation only returns errors for resolve_input_arcs failures, which are
-            // deterministic (input not found = conflict, not transient). Treat as terminal.
+            // Classify the error: I/O errors (file open, registration, remote storage)
+            // are transient and should be retried. Structural errors (input not found,
+            // hex decode) are terminal.
+            if is_transient_error(&err) {
+                return Err(err);
+            }
             debug!(
                 "dedicated compaction result {} apply error (terminal): {}",
                 result.job_id, err
@@ -249,18 +258,22 @@ fn apply_operation(
 ///
 /// For a freshly-applied Rewrite, the outputs were just registered with known canonical ids.
 /// For AlreadyApplied cases, we match by path against the FileManager's tracked data files.
+/// If an output path cannot be matched, it is omitted from the map; `finalize_outputs` will
+/// then fail because not all outputs were mapped.
 fn build_output_path_to_id_map(
     ctx: &PollerContext,
     result: &DedicatedCompactionResult,
 ) -> HashMap<String, u64> {
     let mut map = HashMap::new();
     for output in result.operation.outputs() {
-        // The output path is volume-absolute (e.g. file://...). We need to find the canonical
-        // file id we assigned. For freshly-applied results, the file was registered with a
-        // canonical id via register_data_file_readonly, so we scan the FileManager's tracked
-        // data files for a matching absolute path.
         if let Some(file_id) = find_file_id_by_path(&ctx.file_manager, &output.path) {
             map.insert(output.path.clone(), file_id);
+        } else {
+            log::warn!(
+                "dedicated compaction result {}: could not map output path {} to canonical file id",
+                result.job_id,
+                output.path
+            );
         }
     }
     map
@@ -280,7 +293,13 @@ fn apply_rewrite(
     let tree_version = &*tree_version;
 
     // Classify the operation status.
-    let status = classify_rewrite(tree_version, inputs, outputs, output_level);
+    let status = classify_rewrite(
+        tree_version,
+        inputs,
+        outputs,
+        output_level,
+        &ctx.file_manager,
+    );
     match status {
         OperationStatus::Pending => {
             // Allocate canonical file ids for outputs and register them readonly.
@@ -424,6 +443,7 @@ fn classify_rewrite(
     inputs: &[crate::compaction::dedicated::DedicatedCompactionInput],
     outputs: &[DedicatedDataFile],
     _output_level: u8,
+    file_manager: &Arc<FileManager>,
 ) -> OperationStatus {
     let all_inputs_present = inputs
         .iter()
@@ -438,10 +458,11 @@ fn classify_rewrite(
         // process-local id, while the writer's DataFile has a canonical id.
         let any_output_present = outputs.iter().any(|output| {
             tree_version.levels.iter().any(|level| {
-                level
-                    .files
-                    .iter()
-                    .any(|f| output.matches_data_file_excluding_id(f).unwrap_or(false))
+                level.files.iter().any(|f| {
+                    output
+                        .matches_data_file_excluding_id(f, file_manager)
+                        .unwrap_or(false)
+                })
             })
         });
         if any_output_present && !outputs.is_empty() {
@@ -457,10 +478,11 @@ fn classify_rewrite(
         } else {
             let all_outputs_present = outputs.iter().all(|output| {
                 tree_version.levels.iter().any(|level| {
-                    level
-                        .files
-                        .iter()
-                        .any(|f| output.matches_data_file_excluding_id(f).unwrap_or(false))
+                    level.files.iter().any(|f| {
+                        output
+                            .matches_data_file_excluding_id(f, file_manager)
+                            .unwrap_or(false)
+                    })
                 })
             });
             if all_outputs_present {
@@ -517,6 +539,10 @@ fn resolve_input_arcs(
 }
 
 /// Allocates canonical file ids for outputs, registers them readonly, and builds DataFile Arcs.
+///
+/// Each output is registered with a **real** `TrackedFileId::new` (not detached) so that when
+/// the file is eventually removed from the LSM, the FileManager's tracking is cleaned up and
+/// the physical file is deleted (once `make_data_file_owned` has been called).
 fn prepare_outputs(
     ctx: &PollerContext,
     outputs: &[DedicatedDataFile],
@@ -532,12 +558,17 @@ fn prepare_outputs(
             .register_data_file_readonly(local_id, &output.path)?;
         let file_type = DataFileType::from_str(&output.file_type).map_err(Error::IoError)?;
         let (start_key, end_key) = output.decode_keys()?;
+        // Use a real TrackedFileId (not detached) so the FileManager tracks the file's
+        // lifecycle. When the DataFile is dropped from the LSM, the TrackedFileId's Drop
+        // impl calls remove_data_file, which removes the TrackedFile from the FileManager.
+        // If make_data_file_owned was called (delete_on_drop=true), the TrackedFile's Drop
+        // then deletes the physical file.
         let data_file = DataFile::new(
             file_type,
             start_key,
             end_key,
             local_id,
-            TrackedFileId::detached(local_id),
+            TrackedFileId::new(&ctx.file_manager, local_id),
             output.schema_id,
             output.size,
             output.bucket_range_start..=output.bucket_range_end,
@@ -772,10 +803,17 @@ fn verify_manifest_after_commit(
 
 fn finalize_outputs(ctx: &PollerContext, output_path_to_id: &HashMap<String, u64>) -> Result<()> {
     // For Rewrite outputs, make them owned now that the manifest is committed.
-    // The path->id mapping was built in build_output_path_to_id_map by matching
-    // the compactor's output paths against the FileManager's tracked data files.
-    for file_id in output_path_to_id.values() {
-        ctx.file_manager.make_data_file_owned(*file_id)?;
+    // Every output must be mapped to a canonical file id. If any is missing, the path
+    // mapping failed, which is a programming error (not transient).
+    for (path, file_id) in output_path_to_id {
+        ctx.file_manager
+            .make_data_file_owned(*file_id)
+            .map_err(|e| {
+                Error::InvalidState(format!(
+                    "failed to make output owned (path={}, file_id={}): {}",
+                    path, file_id, e
+                ))
+            })?;
     }
     Ok(())
 }
@@ -798,4 +836,13 @@ fn cleanup_uncommitted_outputs(
         result.job_id
     );
     Ok(())
+}
+
+/// Classifies an error as transient (retryable) or terminal (delete the result).
+///
+/// I/O errors (file open failures, remote storage unavailable) are transient - the
+/// underlying file might become available on retry. All other errors (InvalidState,
+/// ConfigError, ChecksumMismatch) are structural/terminal - retrying won't help.
+fn is_transient_error(err: &Error) -> bool {
+    matches!(err, Error::IoError(_))
 }

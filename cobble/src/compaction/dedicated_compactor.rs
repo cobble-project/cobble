@@ -265,12 +265,14 @@ impl DedicatedCompactor {
         job_id: &str,
     ) -> Result<()> {
         // Write a lease file so the writer's orphan sweep doesn't delete our outputs
-        // while we're still working.
+        // while we're still working. We also start a heartbeat thread to refresh the lease
+        // periodically, in case the compaction takes longer than min_age_ms.
         write_job_lease(&self.file_manager, job_id)?;
+        let heartbeat_handle = self.start_lease_heartbeat(job_id);
 
         // Handle trivial move and drop without executing a full compaction task.
-        if plan.drop_truncated {
-            return self.publish_drop_result(
+        let result = if plan.drop_truncated {
+            self.publish_drop_result(
                 tree_idx,
                 tree_scope,
                 levels,
@@ -278,20 +280,79 @@ impl DedicatedCompactor {
                 truncation_cursors,
                 base_snapshot_id,
                 job_id,
-            );
-        }
-        if plan.trivial_move {
-            return self.publish_trivial_move_result(
+            )
+        } else if plan.trivial_move {
+            self.publish_trivial_move_result(
                 tree_idx,
                 tree_scope,
                 levels,
                 plan,
                 base_snapshot_id,
                 job_id,
-            );
-        }
+            )
+        } else {
+            self.execute_rewrite_and_publish(
+                tree_idx,
+                tree_scope,
+                levels,
+                plan,
+                compaction_config,
+                truncation_cursors,
+                schema_manager,
+                base_snapshot_id,
+                job_id,
+            )
+        };
 
-        // Normal rewrite compaction.
+        // Stop the heartbeat thread.
+        heartbeat_handle.stop();
+        heartbeat_handle.join();
+
+        result
+    }
+
+    /// Starts a background thread that periodically refreshes the lease file for a job.
+    /// Returns a handle that can be used to stop and join the thread.
+    fn start_lease_heartbeat(&self, job_id: &str) -> LeaseHeartbeatHandle {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let file_manager = Arc::clone(&self.file_manager);
+        let poll_interval = self.poll_interval;
+        let job_id = job_id.to_string();
+        let handle = std::thread::Builder::new()
+            .name("dedicated-lease-heartbeat".to_string())
+            .spawn(move || {
+                while !stop_clone.load(Ordering::SeqCst) {
+                    std::thread::sleep(poll_interval);
+                    if stop_clone.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if let Err(err) = write_job_lease(&file_manager, &job_id) {
+                        debug!("failed to refresh lease for job {}: {}", job_id, err);
+                    }
+                }
+            })
+            .expect("failed to spawn lease heartbeat thread");
+        LeaseHeartbeatHandle {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// Executes a normal rewrite compaction and publishes the result.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_rewrite_and_publish(
+        &self,
+        tree_idx: usize,
+        tree_scope: &LSMTreeScope,
+        levels: &[Level],
+        plan: &crate::compaction::policy::CompactionPlan,
+        compaction_config: &CompactionConfig,
+        truncation_cursors: &crate::db_state::TruncationCursorMap,
+        schema_manager: &Arc<SchemaManager>,
+        base_snapshot_id: u64,
+        job_id: &str,
+    ) -> Result<()> {
         let runs = build_runs_for_plan(levels, plan, compaction_config);
         if runs.is_empty() {
             return Err(Error::InvalidState(format!(
@@ -552,6 +613,24 @@ impl DedicatedCompactor {
             crate::config::CompactionPolicyKind::ScorePriority => {
                 Box::new(ScorePriorityPolicy::new())
             }
+        }
+    }
+}
+
+/// Handle for the lease heartbeat thread. Stops and joins the thread when dropped.
+struct LeaseHeartbeatHandle {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LeaseHeartbeatHandle {
+    fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    fn join(mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
