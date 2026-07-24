@@ -250,7 +250,7 @@ fn apply_operation(
     // actually allocated ids, the mapping is built inside apply_rewrite and returned via
     // the ApplyOutcome. However, since the outcome is an enum, we reconstruct the map here
     // for the AlreadyApplied cases by matching the output paths against tracked files.
-    let path_to_id = build_output_path_to_id_map(ctx, result);
+    let path_to_id = build_output_path_to_id_map(ctx, result)?;
     Ok((outcome, path_to_id))
 }
 
@@ -258,25 +258,30 @@ fn apply_operation(
 ///
 /// For a freshly-applied Rewrite, the outputs were just registered with known canonical ids.
 /// For AlreadyApplied cases, we match by path against the FileManager's tracked data files.
-/// If an output path cannot be matched, it is omitted from the map; `finalize_outputs` will
-/// then fail because not all outputs were mapped.
+///
+/// **Every** output must be mapped. If any output path cannot be matched, this returns an
+/// `InvalidState` error (terminal) so the poller cleans up and deletes the result rather than
+/// silently leaving outputs unowned (which would leak files or, worse, delete committed data).
 fn build_output_path_to_id_map(
     ctx: &PollerContext,
     result: &DedicatedCompactionResult,
-) -> HashMap<String, u64> {
-    let mut map = HashMap::new();
-    for output in result.operation.outputs() {
-        if let Some(file_id) = find_file_id_by_path(&ctx.file_manager, &output.path) {
-            map.insert(output.path.clone(), file_id);
-        } else {
-            log::warn!(
-                "dedicated compaction result {}: could not map output path {} to canonical file id",
-                result.job_id,
-                output.path
-            );
+) -> Result<HashMap<String, u64>> {
+    let outputs = result.operation.outputs();
+    let mut map = HashMap::with_capacity(outputs.len());
+    for output in outputs {
+        match find_file_id_by_path(&ctx.file_manager, &output.path) {
+            Some(file_id) => {
+                map.insert(output.path.clone(), file_id);
+            }
+            None => {
+                return Err(Error::InvalidState(format!(
+                    "dedicated compaction result {} could not map output path {} to canonical file id",
+                    result.job_id, output.path
+                )));
+            }
         }
     }
-    map
+    Ok(map)
 }
 
 /// Applies a Rewrite operation. Returns the apply outcome.
@@ -305,7 +310,7 @@ fn apply_rewrite(
             // Allocate canonical file ids for outputs and register them readonly.
             let prepared_outputs = prepare_outputs(ctx, outputs, output_level)?;
             // Resolve real input Arcs from the current LSM.
-            let input_arcs = resolve_input_arcs(tree_version, inputs)?;
+            let input_arcs = resolve_input_arcs(tree_version, inputs, &ctx.file_manager)?;
             // Build VersionEdit.
             let edit = build_rewrite_edit(input_arcs, inputs, &prepared_outputs, output_level);
             // Build VlogEdit.
@@ -333,7 +338,7 @@ fn apply_trivial_move(
     let tree_version = &*tree_version;
 
     // Find the input in its source level.
-    let input_arc = find_file_in_level(tree_version, input.level, &input.file);
+    let input_arc = find_file_in_level(tree_version, input.level, &input.file, &ctx.file_manager);
     let target_level_files = tree_version
         .levels
         .iter()
@@ -344,9 +349,12 @@ fn apply_trivial_move(
         Some(arc) => {
             // Check if it's already in the target level (AlreadyApplied).
             if let Some(target_files) = target_level_files
-                && target_files
-                    .iter()
-                    .any(|f| input.file.matches_data_file(f).unwrap_or(false))
+                && target_files.iter().any(|f| {
+                    input
+                        .file
+                        .matches_data_file(f, &ctx.file_manager)
+                        .unwrap_or(false)
+                })
             {
                 return Ok(ApplyOutcome::AlreadyAppliedAndCommitted);
             }
@@ -372,9 +380,12 @@ fn apply_trivial_move(
         None => {
             // Input not in source level. Check if it's already in the target level.
             if let Some(target_files) = target_level_files
-                && target_files
-                    .iter()
-                    .any(|f| input.file.matches_data_file(f).unwrap_or(false))
+                && target_files.iter().any(|f| {
+                    input
+                        .file
+                        .matches_data_file(f, &ctx.file_manager)
+                        .unwrap_or(false)
+                })
             {
                 return Ok(ApplyOutcome::AlreadyAppliedAndCommitted);
             }
@@ -395,15 +406,15 @@ fn apply_drop(
     let tree_version = &*tree_version;
 
     // Check if all inputs are still present (Pending) or all gone (AlreadyApplied).
-    let all_present = inputs
-        .iter()
-        .all(|input| find_file_in_level(tree_version, input.level, &input.file).is_some());
-    let all_gone = inputs
-        .iter()
-        .all(|input| find_file_in_level(tree_version, input.level, &input.file).is_none());
+    let all_present = inputs.iter().all(|input| {
+        find_file_in_level(tree_version, input.level, &input.file, &ctx.file_manager).is_some()
+    });
+    let all_gone = inputs.iter().all(|input| {
+        find_file_in_level(tree_version, input.level, &input.file, &ctx.file_manager).is_none()
+    });
 
     if all_present {
-        let input_arcs = resolve_input_arcs(tree_version, inputs)?;
+        let input_arcs = resolve_input_arcs(tree_version, inputs, &ctx.file_manager)?;
         // Group removals by level.
         let mut level_edits: HashMap<u8, LevelEdit> = HashMap::new();
         for (input, arc) in inputs.iter().zip(input_arcs.iter()) {
@@ -445,12 +456,12 @@ fn classify_rewrite(
     _output_level: u8,
     file_manager: &Arc<FileManager>,
 ) -> OperationStatus {
-    let all_inputs_present = inputs
-        .iter()
-        .all(|input| find_file_in_level(tree_version, input.level, &input.file).is_some());
-    let all_inputs_gone = inputs
-        .iter()
-        .all(|input| find_file_in_level(tree_version, input.level, &input.file).is_none());
+    let all_inputs_present = inputs.iter().all(|input| {
+        find_file_in_level(tree_version, input.level, &input.file, file_manager).is_some()
+    });
+    let all_inputs_gone = inputs.iter().all(|input| {
+        find_file_in_level(tree_version, input.level, &input.file, file_manager).is_none()
+    });
 
     if all_inputs_present {
         // Check if any outputs are already in the LSM (partial apply = abnormal).
@@ -502,11 +513,12 @@ fn classify_rewrite(
 // Helpers: resolve Arcs, prepare outputs, build edits
 // ---------------------------------------------------------------------------
 
-/// Finds a file in a level by full 13-field fingerprint match.
+/// Finds a file in a level by full 13-field fingerprint match (including path).
 fn find_file_in_level(
     tree_version: &crate::lsm::LSMTreeVersion,
     level: u8,
     file: &DedicatedDataFile,
+    file_manager: &Arc<FileManager>,
 ) -> Option<Arc<DataFile>> {
     tree_version
         .levels
@@ -515,7 +527,7 @@ fn find_file_in_level(
         .and_then(|l| {
             l.files
                 .iter()
-                .find(|f| file.matches_data_file(f).unwrap_or(false))
+                .find(|f| file.matches_data_file(f, file_manager).unwrap_or(false))
         })
         .cloned()
 }
@@ -524,15 +536,17 @@ fn find_file_in_level(
 fn resolve_input_arcs(
     tree_version: &crate::lsm::LSMTreeVersion,
     inputs: &[crate::compaction::dedicated::DedicatedCompactionInput],
+    file_manager: &Arc<FileManager>,
 ) -> Result<Vec<Arc<DataFile>>> {
     let mut arcs = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let arc = find_file_in_level(tree_version, input.level, &input.file).ok_or_else(|| {
-            Error::InvalidState(format!(
-                "dedicated compaction input file {} not found in level {}",
-                input.file.file_id, input.level
-            ))
-        })?;
+        let arc = find_file_in_level(tree_version, input.level, &input.file, file_manager)
+            .ok_or_else(|| {
+                Error::InvalidState(format!(
+                    "dedicated compaction input file {} not found in level {}",
+                    input.file.file_id, input.level
+                ))
+            })?;
         arcs.push(arc);
     }
     Ok(arcs)
@@ -556,7 +570,14 @@ fn prepare_outputs(
         // make_data_file_owned is called after manifest commit.
         ctx.file_manager
             .register_data_file_readonly(local_id, &output.path)?;
-        let file_type = DataFileType::from_str(&output.file_type).map_err(Error::IoError)?;
+        // Unknown file type is a protocol-level error (corrupt result), not transient I/O.
+        // Map it to InvalidState so the poller treats it as terminal and deletes the result.
+        let file_type = DataFileType::from_str(&output.file_type).map_err(|e| {
+            Error::InvalidState(format!(
+                "dedicated compaction output {} has unknown file type '{}': {}",
+                local_id, output.file_type, e
+            ))
+        })?;
         let (start_key, end_key) = output.decode_keys()?;
         // Use a real TrackedFileId (not detached) so the FileManager tracks the file's
         // lifecycle. When the DataFile is dropped from the LSM, the TrackedFileId's Drop
@@ -840,9 +861,14 @@ fn cleanup_uncommitted_outputs(
 
 /// Classifies an error as transient (retryable) or terminal (delete the result).
 ///
-/// I/O errors (file open failures, remote storage unavailable) are transient - the
-/// underlying file might become available on retry. All other errors (InvalidState,
-/// ConfigError, ChecksumMismatch) are structural/terminal - retrying won't help.
+/// Storage access errors (`IoError`, `FileSystemError`) are transient: the underlying file or
+/// remote storage might become available on retry. All other errors (`InvalidState`,
+/// `ConfigError`, `ChecksumMismatch`, `FileFormatError`) are structural/protocol-level:
+/// retrying won't help, so the poller should delete the poison result.
+///
+/// Protocol-parsing failures (bad hex keys, unknown file type, bad paths, duplicate ids,
+/// scope mismatch) are deliberately produced as `InvalidState` so they fall into the terminal
+/// bucket here.
 fn is_transient_error(err: &Error) -> bool {
-    matches!(err, Error::IoError(_))
+    matches!(err, Error::IoError(_) | Error::FileSystemError(_))
 }

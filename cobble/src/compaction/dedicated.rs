@@ -141,8 +141,24 @@ impl DedicatedDataFile {
 
     /// Decodes hex-encoded key fields back to bytes, returning all fields needed to construct
     /// or verify a `DataFile`.
+    ///
+    /// A malformed hex string is a **protocol-level** error (the result file is corrupt), not a
+    /// transient I/O error. It is mapped to `InvalidState` so the poller classifies it as
+    /// terminal and deletes the poison result instead of retrying forever.
     pub(crate) fn decode_keys(&self) -> Result<(Vec<u8>, Vec<u8>)> {
-        Ok((from_hex(&self.start_key)?, from_hex(&self.end_key)?))
+        let start = from_hex(&self.start_key).map_err(|e| {
+            Error::InvalidState(format!(
+                "dedicated compaction file {} has invalid start_key hex: {}",
+                self.file_id, e
+            ))
+        })?;
+        let end = from_hex(&self.end_key).map_err(|e| {
+            Error::InvalidState(format!(
+                "dedicated compaction file {} has invalid end_key hex: {}",
+                self.file_id, e
+            ))
+        })?;
+        Ok((start, end))
     }
 
     /// Compares this descriptor against a `ManifestFile` for full fingerprint equality,
@@ -215,14 +231,25 @@ impl DedicatedDataFile {
             && self.vlog_file_seq_offset == file.vlog_file_seq_offset)
     }
 
-    /// Compares this descriptor against a live `DataFile` for full fingerprint equality.
+    /// Compares this descriptor against a live `DataFile` for full fingerprint equality (all
+    /// 13 fields, including `file_id` and `path`).
     ///
     /// Keys are hex-encoded in the descriptor but raw bytes on the `DataFile`, so this method
-    /// decodes the hex before comparing. The path comparison normalizes both sides to absolute
-    /// (volume-prefixed) paths.
-    pub(crate) fn matches_data_file(&self, file: &crate::data_file::DataFile) -> Result<bool> {
+    /// decodes the hex before comparing. The `FileManager` is needed to resolve the `DataFile`'s
+    /// absolute path for comparison (the descriptor stores the volume-absolute path).
+    pub(crate) fn matches_data_file(
+        &self,
+        file: &crate::data_file::DataFile,
+        file_manager: &Arc<FileManager>,
+    ) -> Result<bool> {
         let (start_key, end_key) = self.decode_keys()?;
-        Ok(self.file_id == file.file_id
+        let file_path = file_manager.get_data_file_full_path(file.file_id);
+        let path_matches = match &file_path {
+            Some(p) => *p == self.path,
+            None => false,
+        };
+        Ok(path_matches
+            && self.file_id == file.file_id
             && self.file_type == file.file_type.to_string()
             && self.schema_id == file.schema_id
             && self.size == file.size
@@ -328,15 +355,20 @@ impl DedicatedCompactionResult {
     }
 
     /// Deserializes a result from JSON bytes.
+    ///
+    /// Both JSON parse failures and version mismatches are **protocol-level** errors (the result
+    /// file is corrupt or from an incompatible version). They are mapped to `InvalidState` so
+    /// the poller classifies them as terminal and deletes the poison result instead of retrying
+    /// forever.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         let result: DedicatedCompactionResult = serde_json::from_slice(bytes).map_err(|err| {
-            Error::IoError(format!(
+            Error::InvalidState(format!(
                 "Failed to decode dedicated compaction result: {}",
                 err
             ))
         })?;
         if result.version != DEDICATED_COMPACTION_RESULT_VERSION {
-            return Err(Error::IoError(format!(
+            return Err(Error::InvalidState(format!(
                 "Unsupported dedicated compaction result version: {} (expected {})",
                 result.version, DEDICATED_COMPACTION_RESULT_VERSION
             )));
@@ -409,8 +441,9 @@ pub(crate) fn delete_dedicated_compaction_result(
 /// Removes all files under a job's output directory, then the job directory itself.
 /// Used to clean up after a terminal-invalid result or a conflict.
 ///
-/// Uses data-volume-aware APIs because compaction output files are written to data volumes,
-/// which may differ from the metadata volume in multi-volume setups.
+/// Output files are written to data volumes, so they are removed via data-volume-aware APIs.
+/// The lease file lives on the metadata volume (see `write_job_lease`), so it is removed
+/// separately.
 pub(crate) fn cleanup_job_dir(file_manager: &Arc<FileManager>, job_id: &str) -> Result<()> {
     let data_prefix = dedicated_compaction_job_output_prefix(job_id);
     let files = file_manager.list_data_volume_names(&data_prefix)?;
@@ -418,10 +451,14 @@ pub(crate) fn cleanup_job_dir(file_manager: &Arc<FileManager>, job_id: &str) -> 
         let path = format!("{}/{}", data_prefix, file_name);
         let _ = file_manager.remove_data_volume_path(&path);
     }
-    // Remove the data subdir and the job dir itself.
+    // Remove the data subdir and the job dir itself on data volumes.
     let _ = file_manager.remove_data_volume_path(&data_prefix);
     let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
     let _ = file_manager.remove_data_volume_path(&job_dir);
+    // Remove the lease file and job directory from the metadata volume.
+    let lease_path = format!("{}/{}", job_dir, DEDICATED_COMPACTION_LEASE_FILE);
+    let _ = file_manager.remove_metadata_volume_path(&lease_path);
+    let _ = file_manager.remove_metadata_volume_path(&job_dir);
     Ok(())
 }
 
@@ -443,14 +480,22 @@ pub(crate) fn dedicated_compaction_result_exists(
 /// only removes job directories whose lease is older than `min_age_ms`.
 pub(crate) const DEDICATED_COMPACTION_LEASE_FILE: &str = "LEASE";
 
-/// Writes a lease file into the job directory on the data volume, creating the directory
-/// if needed. The compactor calls this before starting work and periodically refreshes it.
-/// The file's last-modified time serves as a heartbeat for the writer's orphan sweep.
+/// Writes a lease file into the job directory on the **metadata volume**, creating the
+/// directory if needed. The compactor calls this before starting work and periodically
+/// refreshes it. The file's last-modified time serves as a heartbeat for the writer's orphan
+/// sweep.
+///
+/// The lease lives on the metadata volume (not a data volume) because:
+/// - The metadata volume is a single, deterministic volume, so the writer's sweep always finds
+///   the lease regardless of which data volume the compactor happened to write outputs to.
+/// - This avoids the multi-volume problem where a heartbeat refresh could pick a different
+///   data volume than the initial write, leaving a stale lease behind.
 pub(crate) fn write_job_lease(file_manager: &Arc<FileManager>, job_id: &str) -> Result<()> {
-    let prefix = dedicated_compaction_job_output_prefix(job_id);
-    let lease_path = format!("{}/{}", prefix, DEDICATED_COMPACTION_LEASE_FILE);
-    // Write to the data volume so the lease lives alongside the output files.
-    file_manager.write_data_volume_file(&lease_path, b"lease")?;
+    let lease_path = format!(
+        "{}/{}/{}",
+        DEDICATED_COMPACTION_JOBS_DIR, job_id, DEDICATED_COMPACTION_LEASE_FILE
+    );
+    file_manager.write_metadata_volume_file(&lease_path, b"lease")?;
     Ok(())
 }
 
@@ -473,10 +518,15 @@ pub(crate) fn sweep_orphan_job_dirs(
     // Job directories live on data volumes (same volume as the output files).
     let job_dir_names = file_manager.list_data_volume_names(DEDICATED_COMPACTION_JOBS_DIR)?;
     let active_result_job_ids = list_dedicated_compaction_result_job_ids(file_manager)?;
-    let now_ms = std::time::SystemTime::now()
+    // The filesystem's `last_modified` returns unix timestamps in **seconds** (see
+    // `posix_fs.rs` / `opendal_fs.rs`), so we compute `now` in seconds for the age comparison.
+    // `min_age_ms` is in milliseconds; convert it to seconds (rounding up so a sub-second
+    // min age still requires at least 1 second of staleness).
+    let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|d| d.as_secs())
         .unwrap_or(0);
+    let min_age_secs = min_age_ms.div_ceil(1000);
 
     let mut swept = 0;
     for job_name in &job_dir_names {
@@ -488,26 +538,28 @@ pub(crate) fn sweep_orphan_job_dirs(
             continue;
         }
         // Check the lease file's age. If the lease is recent, the compactor is still
-        // actively working on this job.
+        // actively working on this job. The lease lives on the metadata volume (see
+        // `write_job_lease`), so we read it from there.
         let lease_path = format!(
             "{}/{}/{}",
             DEDICATED_COMPACTION_JOBS_DIR, job_id, DEDICATED_COMPACTION_LEASE_FILE
         );
-        let last_modified = file_manager.data_volume_last_modified(&lease_path)?;
+        let last_modified = file_manager.metadata_volume_last_modified(&lease_path)?;
         match last_modified {
             Some(ts) => {
-                if now_ms.saturating_sub(ts) < min_age_ms {
+                if now_secs.saturating_sub(ts) < min_age_secs {
                     continue; // Lease is still fresh; skip.
                 }
             }
             None => {
-                // No lease file. This could be a job directory from an older version that
-                // didn't write leases, or a partially created directory. Use the job
-                // directory's own mtime as a fallback.
+                // No lease file on the metadata volume. This could be a job directory from
+                // an older version that wrote leases to data volumes, or a partially created
+                // directory. Fall back to checking the job directory's own mtime on data
+                // volumes.
                 let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
                 let dir_mtime = file_manager.data_volume_last_modified(&job_dir)?;
                 match dir_mtime {
-                    Some(ts) if now_ms.saturating_sub(ts) < min_age_ms => continue,
+                    Some(ts) if now_secs.saturating_sub(ts) < min_age_secs => continue,
                     None => continue, // Can't determine age; skip.
                     _ => {}
                 }
@@ -526,7 +578,8 @@ pub(crate) fn sweep_orphan_job_dirs(
         if referenced {
             continue;
         }
-        // Delete all files in the job directory, then the directory itself.
+        // Delete all files in the job directory, then the directory itself. Output files live
+        // on data volumes; the lease file lives on the metadata volume.
         debug!("sweeping orphan job directory {}", job_id);
         for file_name in &job_files {
             let path = format!("{}/{}", job_data_prefix, file_name);
@@ -535,6 +588,10 @@ pub(crate) fn sweep_orphan_job_dirs(
         let _ = file_manager.remove_data_volume_path(&job_data_prefix);
         let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
         let _ = file_manager.remove_data_volume_path(&job_dir);
+        // Also clean up the lease file and job directory on the metadata volume.
+        let lease_path = format!("{}/{}", job_dir, DEDICATED_COMPACTION_LEASE_FILE);
+        let _ = file_manager.remove_metadata_volume_path(&lease_path);
+        let _ = file_manager.remove_metadata_volume_path(&job_dir);
         swept += 1;
     }
     Ok(swept)
@@ -673,5 +730,107 @@ mod tests {
         assert_eq!(drop_op.inputs().len(), 1);
         assert_eq!(drop_op.output_level(), None);
         assert!(drop_op.outputs().is_empty());
+    }
+
+    /// Builds a FileManager backed by a single local volume with `db_id` as the base dir,
+    /// matching the layout used by `FileManager::from_config`.
+    fn build_fm_with_base_dir(test_root: &str, db_id: &str) -> Arc<FileManager> {
+        use crate::config::{Config, VolumeDescriptor};
+        use crate::metrics_manager::MetricsManager;
+        let _ = std::fs::remove_dir_all(test_root);
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", test_root)),
+            ..Config::default()
+        };
+        let metrics = std::sync::Arc::new(MetricsManager::new("sweep-test"));
+        Arc::new(FileManager::from_config(&config, db_id, metrics).unwrap())
+    }
+
+    /// The orphan sweep must not delete:
+    /// - Job directories with a fresh lease (active compactor).
+    /// - Job directories whose outputs are referenced by the latest manifest (committed).
+    /// And must delete:
+    /// - Job directories with an expired lease, no result, and no manifest reference (crashed).
+    #[test]
+    fn test_orphan_sweep_preserves_active_and_committed() {
+        let test_root = "/tmp/dedicated_sweep_test";
+        let db_id = "sweep-db";
+        let fm = build_fm_with_base_dir(test_root, db_id);
+
+        // --- Active job: fresh lease, no result, not referenced. Should survive. ---
+        let active_job = "job-active";
+        write_job_lease(&fm, active_job).unwrap();
+        // Create a dummy output file under the job's data dir on the data volume.
+        fm.create_data_file_with_prefix(&format!(
+            "{}/{}/data",
+            DEDICATED_COMPACTION_JOBS_DIR, active_job
+        ))
+        .unwrap();
+
+        // --- Crashed job: stale lease (written then we sleep past min_age), no result,
+        //     not referenced. Should be deleted. ---
+        let crashed_job = "job-crashed";
+        write_job_lease(&fm, crashed_job).unwrap();
+        fm.create_data_file_with_prefix(&format!(
+            "{}/{}/data",
+            DEDICATED_COMPACTION_JOBS_DIR, crashed_job
+        ))
+        .unwrap();
+
+        // --- Committed job: stale lease, no result, but output is referenced by manifest.
+        //     Should survive. ---
+        let committed_job = "job-committed";
+        write_job_lease(&fm, committed_job).unwrap();
+        let (committed_file_id, _writer) = fm
+            .create_data_file_with_prefix(&format!(
+                "{}/{}/data",
+                DEDICATED_COMPACTION_JOBS_DIR, committed_job
+            ))
+            .unwrap();
+        // Build the manifest path set that includes the committed job's output.
+        let committed_path = fm
+            .get_data_file_full_path(committed_file_id)
+            .expect("committed file path");
+        let mut manifest_paths = std::collections::HashSet::new();
+        manifest_paths.insert(committed_path);
+
+        // The filesystem's `last_modified` returns timestamps in seconds, so the sweep
+        // compares age in seconds. Sleep 2 seconds so the crashed and committed leases are
+        // stale (>= 1s old with min_age_ms=100 -> min_age_secs=1), then refresh the active
+        // job's lease so it's fresh (< 1s old).
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        write_job_lease(&fm, active_job).unwrap();
+
+        // Sweep with a 100ms min age (rounds up to 1s). The active job's lease is fresh,
+        // so it survives. The crashed and committed jobs have stale leases. The committed
+        // job survives because its output is referenced by the manifest. Only the crashed
+        // job is swept.
+        let swept = sweep_orphan_job_dirs(&fm, &manifest_paths, 100).unwrap();
+
+        // Only the crashed job should have been swept.
+        assert_eq!(swept, 1, "exactly the crashed job should be swept");
+
+        // Active job dir should still exist (lease is fresh).
+        let active_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, active_job);
+        assert!(
+            fm.data_volume_path_exists(&active_dir).unwrap(),
+            "active job directory should survive (fresh lease)"
+        );
+
+        // Committed job dir should still exist (output referenced by manifest).
+        let committed_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, committed_job);
+        assert!(
+            fm.data_volume_path_exists(&committed_dir).unwrap(),
+            "committed job directory should survive (referenced by manifest)"
+        );
+
+        // Crashed job dir should be gone.
+        let crashed_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, crashed_job);
+        assert!(
+            !fm.data_volume_path_exists(&crashed_dir).unwrap(),
+            "crashed job directory should be swept"
+        );
+
+        let _ = std::fs::remove_dir_all(test_root);
     }
 }

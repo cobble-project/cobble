@@ -1865,14 +1865,23 @@ impl FileManager {
 
     /// Resolves a relative path (relative to the DB base dir) to the set of absolute
     /// (volume-prefixed) paths across all data volumes. Used by the orphan sweep to compare
-    /// against manifest paths (which are stored as absolute volume-prefixed paths).
+    /// against manifest paths (which are stored as absolute volume-prefixed paths produced by
+    /// `TrackedFile::absolute_path`, i.e. `{volume_base_dir}/{options.base_dir}/{relative_path}`).
     pub(crate) fn data_volume_absolute_paths(&self, relative_path: &str) -> Vec<String> {
+        // The manifest path is `{volume_base_dir}/{options.base_dir}/{relative_path}` because
+        // `TrackedFile.path` already includes `options.base_dir` (the db_id) as a prefix, and
+        // `absolute_path` prepends the volume base_dir. We must replicate that structure here.
+        let full_relative = if self.options.base_dir.is_empty() {
+            relative_path.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, relative_path)
+        };
         self.data_volumes
             .iter()
             .filter_map(|volume| {
                 volume
                     .base_dir()
-                    .map(|bd| format!("{}/{}", bd, relative_path))
+                    .map(|bd| format!("{}/{}", bd, full_relative))
             })
             .collect()
     }
@@ -1908,33 +1917,7 @@ impl FileManager {
         Ok(false)
     }
 
-    /// Writes a small file to the first data volume, creating parent directories as needed.
-    /// Used for lease/marker files that must live alongside compaction output files.
-    pub(crate) fn write_data_volume_file(&self, relative_path: &str, content: &[u8]) -> Result<()> {
-        let path = if self.options.base_dir.is_empty() {
-            relative_path.to_string()
-        } else {
-            format!("{}/{}", self.options.base_dir, relative_path)
-        };
-        // Create parent directories.
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let parent_str = parent.to_string_lossy().to_string();
-            if !parent_str.is_empty() {
-                for volume in &self.data_volumes {
-                    if !volume.fs().exists(&parent_str)? {
-                        volume.fs().create_dir(&parent_str)?;
-                    }
-                }
-            }
-        }
-        let volume = self.select_data_volume(None)?;
-        let mut writer = volume.fs().open_write(&path)?;
-        writer.write(content)?;
-        writer.close()?;
-        Ok(())
-    }
-
-    /// Returns the last-modified time (unix millis) of a path on any data volume.
+    /// Returns the last-modified time (unix seconds) of a path on any data volume.
     pub(crate) fn data_volume_last_modified(&self, relative_path: &str) -> Result<Option<u64>> {
         let path = if self.options.base_dir.is_empty() {
             relative_path.to_string()
@@ -1981,6 +1964,75 @@ impl FileManager {
             if !self.meta_volume.fs().exists(&current)? {
                 self.meta_volume.fs().create_dir(&current)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Writes a small untracked file to the **metadata volume** at a path relative to the DB
+    /// base dir, creating parent directories as needed.
+    ///
+    /// This is used for compaction job lease files. The metadata volume is a single,
+    /// deterministic volume (unlike data volumes which may be multiple and randomly selected),
+    /// so both the writer and compactor always agree on where the lease lives. This avoids
+    /// heartbeat files jumping between volumes and the writer's sweep missing a fresh lease.
+    pub(crate) fn write_metadata_volume_file(
+        &self,
+        relative_path: &str,
+        content: &[u8],
+    ) -> Result<()> {
+        let path = if self.options.base_dir.is_empty() {
+            relative_path.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, relative_path)
+        };
+        // Create parent directories.
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let parent_str = parent.to_string_lossy().to_string();
+            if !parent_str.is_empty() {
+                let mut current = String::new();
+                for part in parent_str.split('/') {
+                    if current.is_empty() {
+                        current = part.to_string();
+                    } else {
+                        current = format!("{}/{}", current, part);
+                    }
+                    if !self.meta_volume.fs().exists(&current)? {
+                        self.meta_volume.fs().create_dir(&current)?;
+                    }
+                }
+            }
+        }
+        let mut writer = self.meta_volume.fs().open_write(&path)?;
+        writer.write(content)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    /// Returns the last-modified time (unix seconds) of a file on the **metadata volume** at a
+    /// path relative to the DB base dir. Returns `Ok(None)` if the file does not exist.
+    ///
+    /// Used by the orphan sweep to check the age of compaction job lease files.
+    pub(crate) fn metadata_volume_last_modified(&self, relative_path: &str) -> Result<Option<u64>> {
+        let path = if self.options.base_dir.is_empty() {
+            relative_path.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, relative_path)
+        };
+        self.meta_volume.fs().last_modified(&path)
+    }
+
+    /// Deletes a file (or empty directory) on the **metadata volume** at a path relative to the
+    /// DB base dir. No-op if the path does not exist.
+    ///
+    /// Used to clean up compaction job lease files and job directories from the metadata volume.
+    pub(crate) fn remove_metadata_volume_path(&self, relative_path: &str) -> Result<()> {
+        let path = if self.options.base_dir.is_empty() {
+            relative_path.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, relative_path)
+        };
+        if self.meta_volume.fs().exists(&path)? {
+            self.meta_volume.fs().delete(&path)?;
         }
         Ok(())
     }

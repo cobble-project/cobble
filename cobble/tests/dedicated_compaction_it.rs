@@ -145,6 +145,32 @@ fn count_snapshots(root: &str) -> usize {
     walk(std::path::Path::new(root))
 }
 
+/// Returns true if a manifest file for the given snapshot id exists under the root directory.
+fn snapshot_exists(root: &str, snapshot_id: u64) -> bool {
+    let target = format!("SNAPSHOT-{}", snapshot_id);
+    fn walk(dir: &std::path::Path, target: &str) -> bool {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if walk(&path, target) {
+                        return true;
+                    }
+                } else if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n == target)
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    walk(std::path::Path::new(root), &target)
+}
+
 /// Counts compaction result files recursively under the root directory.
 fn count_compaction_results(root: &str) -> usize {
     fn walk(dir: &std::path::Path) -> usize {
@@ -326,15 +352,20 @@ fn test_dedicated_compaction_restart_recovery() {
     let _ = handle.join();
     assert!(compaction_done, "compaction should have completed");
 
-    // Force a final snapshot to flush any remaining memtable data before close.
-    // Without this, keys that were written but not yet flushed to L0 SST would be lost
-    // on restart (close flushes the memtable, but the snapshot ensures the manifest
-    // references the flushed SST).
-    db.snapshot().expect("final snapshot");
-    // Wait for the snapshot to be materialized.
-    wait_for(Duration::from_secs(10), Duration::from_millis(100), || {
-        count_snapshots(root) > initial_snapshots + 2
-    });
+    // Db::close() does not flush the active memtable or create a snapshot. Any data
+    // remaining in the active memtable would be lost on restart. Call snapshot() to
+    // force a flush + manifest commit before close, matching the pattern used in db_it.rs.
+    let final_snapshot_id = db.snapshot().expect("final snapshot");
+    // Wait for the specific snapshot to be materialized (flush + manifest write to disk).
+    // Waiting by count is unreliable because async snapshots from the poller could satisfy
+    // a count-based condition without the final snapshot being durable.
+    assert!(
+        wait_for(Duration::from_secs(10), Duration::from_millis(100), || {
+            snapshot_exists(root, final_snapshot_id)
+        },),
+        "final snapshot {} should be materialized before close",
+        final_snapshot_id
+    );
 
     // Close the DB and reopen it with the same db_id.
     db.close().expect("close");
