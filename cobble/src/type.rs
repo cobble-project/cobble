@@ -445,24 +445,57 @@ impl Column {
         }
     }
 
-    /// Applies a contiguous run of ordinary inline merge operands.
+    /// Applies a contiguous run of merge operands.
     ///
-    /// Separated values and tombstones are deliberately excluded by the caller: their existing
-    /// pairwise handling preserves the lazy separated-array representation and delete semantics.
+    /// Inline-only runs use the merge operator directly. If the base or any operand uses separated
+    /// storage, the complete run is encoded once as a flat separated array.
     fn merge_batch(
         self,
         operands: Vec<Column>,
         merge_operator: &dyn MergeOperator,
         time_provider: Option<&dyn TimeProvider>,
     ) -> Result<Column> {
-        debug_assert!(matches!(self.value_type, ValueType::Put | ValueType::Merge));
+        debug_assert!(matches!(
+            self.value_type,
+            ValueType::Put
+                | ValueType::Merge
+                | ValueType::PutSeparated
+                | ValueType::MergeSeparated
+                | ValueType::PutSeparatedArray
+                | ValueType::MergeSeparatedArray
+        ));
         debug_assert!(!self.data.is_empty());
+        debug_assert!(operands.iter().all(|operand| matches!(
+            operand.value_type,
+            ValueType::Merge | ValueType::MergeSeparated | ValueType::MergeSeparatedArray
+        )));
+
+        if self.value_type.uses_separated_storage()
+            || operands
+                .iter()
+                .any(|operand| operand.value_type.uses_separated_storage())
+        {
+            let value_type = if self.value_type.is_terminal() {
+                ValueType::PutSeparatedArray
+            } else {
+                ValueType::MergeSeparatedArray
+            };
+            let columns: Vec<_> = std::iter::once(&self)
+                .chain(operands.iter())
+                .map(Column::as_ref_column)
+                .collect();
+            return Ok(Column::new(
+                value_type,
+                encode_merge_separated_array(&columns)?,
+            ));
+        }
+
+        debug_assert!(matches!(self.value_type, ValueType::Put | ValueType::Merge));
         debug_assert!(
             operands
                 .iter()
                 .all(|operand| operand.value_type == ValueType::Merge)
         );
-
         let fallback_value_type = self.value_type;
         let operands = operands.into_iter().map(Bytes::from).collect();
         let (merged_value, override_value_type) =
@@ -621,8 +654,10 @@ impl Value {
         )
     }
 
-    /// Merges values ordered from oldest to newest, batching contiguous ordinary `Merge` values
-    /// per column. Separated values, deletes, and terminal puts remain pairwise boundaries.
+    /// Merges values ordered from oldest to newest, batching each contiguous merge run per column.
+    ///
+    /// A terminal value starts a new run. Inline-only runs use the merge operator once, while runs
+    /// containing separated storage are flattened into one separated array encoding.
     pub(crate) fn merge_all_in_column_family(
         values: impl IntoIterator<Item = Value>,
         schema: &Schema,
@@ -646,25 +681,9 @@ impl Value {
                 let Some(newer) = newer else {
                     continue;
                 };
-                let operator = schema.operator_in_family(column_family_id, column_idx);
-
-                if newer.value_type != ValueType::Merge {
-                    Self::flush_pending_merges(
-                        &mut merged_columns[column_idx],
-                        &mut pending_operands[column_idx],
-                        operator,
-                        time_provider,
-                    )?;
-                    if newer.value_type.is_terminal() {
-                        merged_columns[column_idx] = Some(newer);
-                    } else {
-                        let older = merged_columns[column_idx].take();
-                        merged_columns[column_idx] = match older {
-                            Some(older) if older.data().is_empty() => Some(newer),
-                            Some(older) => Some(older.merge(newer, operator, time_provider)?),
-                            None => Some(newer),
-                        };
-                    }
+                if newer.value_type.is_terminal() {
+                    merged_columns[column_idx] = Some(newer);
+                    pending_operands[column_idx].clear();
                     continue;
                 }
 
@@ -673,26 +692,7 @@ impl Value {
                     Some(existing) if existing.data().is_empty() => {
                         // Preserve `merge_with_callback`'s no-operator fast path for an empty base.
                         merged_columns[column_idx] = Some(newer);
-                    }
-                    Some(existing) if existing.value_type.uses_separated_storage() => {
-                        Self::flush_pending_merges(
-                            &mut merged_columns[column_idx],
-                            &mut pending_operands[column_idx],
-                            operator,
-                            time_provider,
-                        )?;
-                        let older = merged_columns[column_idx]
-                            .take()
-                            .expect("existing column checked");
-                        merged_columns[column_idx] =
-                            Some(older.merge(newer, operator, time_provider)?);
-                    }
-                    Some(existing) if existing.value_type == ValueType::Delete => {
-                        let older = merged_columns[column_idx]
-                            .take()
-                            .expect("existing column checked");
-                        merged_columns[column_idx] =
-                            Some(older.merge(newer, operator, time_provider)?);
+                        pending_operands[column_idx].clear();
                     }
                     Some(_) => pending_operands[column_idx].push(newer),
                 }
@@ -847,7 +847,7 @@ mod tests {
             _value: Bytes,
             _time_provider: Option<&dyn TimeProvider>,
         ) -> Result<(Bytes, Option<ValueType>)> {
-            panic!("merge operator should not be invoked for empty old value");
+            panic!("merge operator should not be invoked");
         }
     }
 
@@ -913,6 +913,29 @@ mod tests {
                 .unwrap();
         assert_eq!(value_signature(&batched), value_signature(&pairwise));
         assert_eq!(batched.expired_at(), pairwise.expired_at());
+    }
+
+    fn merge_single_column(values: Vec<Value>, schema: &Schema) -> Column {
+        Value::merge_all_in_column_family(values, schema, DEFAULT_COLUMN_FAMILY_ID, None)
+            .unwrap()
+            .columns
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("merged column")
+    }
+
+    fn assert_separated_array(
+        column: &Column,
+        expected_type: ValueType,
+        expected_items: &[(ValueType, &[u8])],
+    ) {
+        assert_eq!(column.value_type, expected_type);
+        let items = decode_merge_separated_array(column.data()).unwrap();
+        assert_eq!(items.len(), expected_items.len());
+        for (item, expected) in items.iter().zip(expected_items) {
+            assert_eq!((item.value_type, item.data()), *expected);
+        }
     }
 
     #[test]
@@ -1006,30 +1029,127 @@ mod tests {
     }
 
     #[test]
-    fn test_value_merge_all_keeps_separated_values_pairwise() {
+    fn test_value_merge_all_accumulates_inline_and_separated_merges_once() {
+        let values = vec![
+            Value::new(vec![Some(Column::new(ValueType::Put, b"base".as_slice()))]),
+            Value::new(vec![Some(Column::new(
+                ValueType::Merge,
+                b"-inline".as_slice(),
+            ))]),
+            Value::new(vec![Some(Column::new(
+                ValueType::MergeSeparated,
+                b"separated".as_slice(),
+            ))]),
+            Value::new(vec![Some(Column::new(
+                ValueType::Merge,
+                b"-tail".as_slice(),
+            ))]),
+        ];
+        let schema = Schema::new(0, 1, vec![Arc::new(PanicMergeOperator)]);
+        let column = merge_single_column(values, &schema);
+        assert_separated_array(
+            &column,
+            ValueType::PutSeparatedArray,
+            &[
+                (ValueType::Put, b"base".as_slice()),
+                (ValueType::Merge, b"-inline".as_slice()),
+                (ValueType::MergeSeparated, b"separated".as_slice()),
+                (ValueType::Merge, b"-tail".as_slice()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_value_merge_all_flattens_nested_separated_arrays() {
+        let nested_columns = [
+            Column::new(ValueType::MergeSeparated, b"separated-a".as_slice()),
+            Column::new(ValueType::Merge, b"-inline".as_slice()),
+        ];
+        let nested_refs: Vec<_> = nested_columns.iter().map(Column::as_ref_column).collect();
+        let nested = encode_merge_separated_array(&nested_refs).unwrap();
         let values = vec![
             Value::new(vec![Some(Column::new(
                 ValueType::PutSeparated,
-                b"p".as_slice(),
+                b"base".as_slice(),
             ))]),
-            Value::new(vec![Some(Column::new(ValueType::Merge, b"m".as_slice()))]),
+            Value::new(vec![Some(Column::new(
+                ValueType::MergeSeparatedArray,
+                nested,
+            ))]),
             Value::new(vec![Some(Column::new(
                 ValueType::MergeSeparated,
-                b"s".as_slice(),
+                b"separated-b".as_slice(),
             ))]),
         ];
-        let schema = Schema::empty();
-        let batched = Value::merge_all_in_column_family(
-            values.clone(),
-            schema.as_ref(),
-            DEFAULT_COLUMN_FAMILY_ID,
-            None,
-        )
-        .unwrap();
-        assert_batch_matches_pairwise(values, schema.as_ref());
-        assert_eq!(
-            batched.columns()[0].as_ref().unwrap().value_type,
-            ValueType::PutSeparatedArray
+
+        let column = merge_single_column(values, Schema::empty().as_ref());
+        assert_separated_array(
+            &column,
+            ValueType::PutSeparatedArray,
+            &[
+                (ValueType::PutSeparated, b"base".as_slice()),
+                (ValueType::MergeSeparated, b"separated-a".as_slice()),
+                (ValueType::Merge, b"-inline".as_slice()),
+                (ValueType::MergeSeparated, b"separated-b".as_slice()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_value_merge_all_terminal_put_resets_pending_separated_chain() {
+        let values = vec![
+            Value::new(vec![Some(Column::new(
+                ValueType::PutSeparated,
+                b"old-base".as_slice(),
+            ))]),
+            Value::new(vec![Some(Column::new(
+                ValueType::MergeSeparated,
+                b"old-merge".as_slice(),
+            ))]),
+            Value::new(vec![Some(Column::new(
+                ValueType::Put,
+                b"new-base".as_slice(),
+            ))]),
+            Value::new(vec![Some(Column::new(
+                ValueType::MergeSeparated,
+                b"new-merge".as_slice(),
+            ))]),
+        ];
+
+        let column = merge_single_column(values, Schema::empty().as_ref());
+        assert_separated_array(
+            &column,
+            ValueType::PutSeparatedArray,
+            &[
+                (ValueType::Put, b"new-base".as_slice()),
+                (ValueType::MergeSeparated, b"new-merge".as_slice()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_value_merge_all_merge_after_delete_keeps_empty_base_semantics() {
+        let values = vec![
+            Value::new(vec![Some(Column::new(ValueType::Put, b"old".as_slice()))]),
+            Value::new(vec![Some(Column::new(ValueType::Delete, Bytes::new()))]),
+            Value::new(vec![Some(Column::new(
+                ValueType::MergeSeparated,
+                b"after-delete".as_slice(),
+            ))]),
+            Value::new(vec![Some(Column::new(
+                ValueType::Merge,
+                b"-tail".as_slice(),
+            ))]),
+        ];
+
+        let column = merge_single_column(values, Schema::empty().as_ref());
+        assert_separated_array(
+            &column,
+            ValueType::MergeSeparatedArray,
+            &[
+                (ValueType::MergeSeparated, b"after-delete".as_slice()),
+                (ValueType::Merge, b"-tail".as_slice()),
+            ],
         );
     }
 
