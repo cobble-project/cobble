@@ -58,7 +58,13 @@ fn main() {
         return;
     }
 
-    let npm = env::var("NPM").unwrap_or_else(|_| "npm".to_string());
+    let npm = env::var("NPM").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "npm.cmd".to_string()
+        } else {
+            "npm".to_string()
+        }
+    });
     prepare_ui_workspace(&ui_dir, &ui_work_dir);
     if package_lock.exists() {
         run_npm(
