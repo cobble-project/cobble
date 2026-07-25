@@ -7,6 +7,9 @@ use crate::file::{
     VLOG_FILE_PRIORITY, lsm_file_priority_for_level,
 };
 use crate::lsm::{LSMTreeVersion, Level};
+pub(crate) use crate::manifest_model::{
+    ManifestFile, ManifestLevel, ManifestTruncationCursor, ManifestVlogFile,
+};
 use crate::paths::sibling_snapshot_manifest_path;
 use crate::vlog::VlogVersion;
 use serde::{Deserialize, Serialize};
@@ -56,13 +59,6 @@ pub(crate) struct ManifestIncrementalSnapshot {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-pub(crate) struct ManifestTruncationCursor {
-    pub(crate) bucket: u16,
-    pub(crate) column_family_id: u8,
-    pub(crate) key: String,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestTreeLevelEdit {
     pub(crate) tree_idx: usize,
     pub(crate) level_edits: Vec<ManifestLevelEdit>,
@@ -102,43 +98,11 @@ fn validate_manifest_version(version: u32) -> Result<()> {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-pub(crate) struct ManifestLevel {
-    pub(crate) ordinal: u8,
-    pub(crate) tiered: bool,
-    pub(crate) files: Vec<ManifestFile>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub(crate) struct ManifestFile {
-    pub(crate) file_id: u64,
-    pub(crate) file_type: String,
-    pub(crate) schema_id: u64,
-    pub(crate) size: usize,
-    pub(crate) start_key: String,
-    pub(crate) end_key: String,
-    pub(crate) path: String,
-    pub(crate) has_separated_values: bool,
-    pub(crate) bucket_range_start: u16,
-    pub(crate) bucket_range_end: u16,
-    pub(crate) effective_bucket_range_start: u16,
-    pub(crate) effective_bucket_range_end: u16,
-    pub(crate) vlog_file_seq_offset: u32,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestLevelEdit {
     pub(crate) level: u8,
     pub(crate) tiered: bool,
     pub(crate) removed_file_ids: Vec<u64>,
     pub(crate) new_files: Vec<ManifestFile>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub(crate) struct ManifestVlogFile {
-    pub(crate) file_seq: u32,
-    pub(crate) file_id: u64,
-    pub(crate) path: String,
-    pub(crate) valid_entries: u64,
 }
 
 pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<ManifestPayload> {
