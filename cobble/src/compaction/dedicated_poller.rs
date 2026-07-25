@@ -249,13 +249,6 @@ fn poll_once(
             );
             Ok(PollOutcome::Processed)
         }
-        Ok(ExternalCompactionApplyResult::AlreadyApplied) => {
-            debug!(
-                "dedicated compaction result job={} already applied",
-                result.job_id
-            );
-            Ok(PollOutcome::Processed)
-        }
         Ok(ExternalCompactionApplyResult::Conflict) => {
             warn!(
                 "dedicated compaction result job={} (file={}) rejected (conflict); cleaning up and deleting",

@@ -7,10 +7,10 @@
 //! 1. Validate the result (operation type, complete fingerprints, output files exist/readable,
 //!    output paths in job namespace, no duplicate file ids, key ranges in tree scope, vlog
 //!    deltas valid).
-//! 2. Operation-specific status judgment: Pending / AlreadyAppliedInMemory / Conflict.
+//! 2. Operation-specific status judgment: Pending / AppliedInMemory / Conflict.
 //! 3. If Pending: allocate canonical file ids for Rewrite outputs, register them readonly,
 //!    resolve real input Arcs from the current LSM, apply VersionEdit + VlogEdit.
-//! 4. If Pending or AlreadyAppliedInMemory: check if the latest manifest already proves the
+//! 4. If Pending or AppliedInMemory: check if the latest manifest already proves the
 //!    operation committed; if not, run a snapshot barrier (flush + materialize with callback)
 //!    and verify the manifest.
 //! 5. Once the manifest is proven: make outputs owned, delete the result.
@@ -38,10 +38,9 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExternalCompactionApplyResult {
     /// The result was applied to the in-memory LSM state and committed via a new manifest.
+    /// This covers both the fresh-apply path (Pending -> apply_edit -> commit) and the
+    /// re-apply path (AppliedInMemory -> commit_and_verify confirms or creates the manifest).
     Applied,
-    /// The result was already applied (in-memory and manifest both confirm it). Just needs
-    /// cleanup.
-    AlreadyApplied,
     /// The result conflicts with the current LSM state. Uncommitted outputs are cleaned up
     /// and the result is deleted so the compactor can re-plan.
     Conflict,
@@ -54,12 +53,17 @@ pub(crate) enum ExternalCompactionApplyResult {
 /// Entry point called by the poller. Applies (or re-confirms) a dedicated compaction result.
 ///
 /// Returns:
-/// - `Ok(Applied/AlreadyApplied/Conflict)` for recognized states.
+/// - `Ok(Applied)` when the operation was applied (or re-confirmed) and the manifest is
+///   committed. The result has been deleted.
+/// - `Ok(Conflict)` when the operation conflicts with the current LSM state. Uncommitted
+///   outputs are cleaned up and the result is deleted.
 /// - `Ok(TerminalInvalid)` for deterministically invalid results (bad structure, bad scope,
 ///   duplicate ids, bad paths, bad vlog deltas, job_id mismatch). The poller should delete the
 ///   result and its job directory.
-/// - `Err(...)` only for transient failures (I/O errors, snapshot materialization failures,
-///   manifest read errors) where retrying is safe.
+/// - `Err(...)` for failures where retrying is safe and cleanup must **not** happen: transient
+///   I/O errors (remote storage unavailable), snapshot materialization failures, manifest read
+///   errors, and internal consistency errors (`PreserveAndRetry`) where the LSM may still
+///   reference the output files. The poller retries without cleaning up the job directory.
 pub(crate) fn apply_external_compaction_result(
     ctx: &PollerContext,
     result: &DedicatedCompactionResult,
@@ -1002,8 +1006,8 @@ mod tests {
         }
     }
 
-    /// When all inputs are gone, classify_rewrite must return AppliedInMemory (not
-    /// AlreadyApplied/Committed), regardless of whether outputs are in the LSM. This ensures
+    /// When all inputs are gone, classify_rewrite must return AppliedInMemory (not a
+    /// "Committed" state), regardless of whether outputs are in the LSM. This ensures
     /// commit_and_verify always runs - the in-memory LSM alone cannot prove manifest durability.
     #[test]
     fn test_classify_rewrite_inputs_gone_is_applied_in_memory() {
