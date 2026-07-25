@@ -968,6 +968,14 @@ impl Config {
         }
     }
 
+    /// Returns whether a standalone dedicated compactor must use runtime manifests.
+    ///
+    /// The compactor process is dedicated by definition, so `Auto` resolves independently of
+    /// the writer's `compaction_mode` value in the shared config file.
+    pub(crate) fn runtime_manifests_enabled_for_dedicated_compactor(&self) -> bool {
+        self.runtime_manifest_mode != RuntimeManifestMode::Disabled
+    }
+
     pub fn from_json_str(contents: &str) -> Result<Self> {
         let provided = serde_json::from_str::<JsonValue>(contents)
             .map_err(|err| Error::ConfigError(err.to_string()))?;
@@ -1364,6 +1372,11 @@ impl Config {
         if self.compaction_mode != CompactionMode::Dedicated {
             return Ok(());
         }
+        self.validate_dedicated_compactor()
+    }
+
+    /// Validates settings required by a standalone dedicated compactor.
+    pub fn validate_dedicated_compactor(&self) -> Result<()> {
         // Reject zero poll interval - the poller would busy-loop.
         if self.compaction_dedicated_poll_interval_ms == 0 {
             return Err(Error::ConfigError(
@@ -1471,16 +1484,19 @@ mod tests {
     fn test_runtime_manifest_mode_resolution() {
         let mut config = Config::default();
         assert!(!config.runtime_manifests_enabled());
+        assert!(config.runtime_manifests_enabled_for_dedicated_compactor());
 
         config.compaction_mode = super::CompactionMode::Dedicated;
         assert!(config.runtime_manifests_enabled());
 
         config.runtime_manifest_mode = super::RuntimeManifestMode::Disabled;
         assert!(!config.runtime_manifests_enabled());
+        assert!(!config.runtime_manifests_enabled_for_dedicated_compactor());
 
         config.compaction_mode = super::CompactionMode::Embedded;
         config.runtime_manifest_mode = super::RuntimeManifestMode::Enabled;
         assert!(config.runtime_manifests_enabled());
+        assert!(config.runtime_manifests_enabled_for_dedicated_compactor());
     }
 
     #[test]

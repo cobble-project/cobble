@@ -41,6 +41,7 @@ struct RuntimeManifestPublisher {
 #[derive(Default)]
 struct PublicationState {
     current: Option<LoadedRuntimeManifest>,
+    suspended_job_id: Option<String>,
 }
 
 impl RuntimeManifestPublisherHandle {
@@ -61,7 +62,10 @@ impl RuntimeManifestPublisherHandle {
             schema_manager,
             db_state,
             lifecycle,
-            publication: Mutex::new(PublicationState { current }),
+            publication: Mutex::new(PublicationState {
+                current,
+                suspended_job_id: None,
+            }),
             stop: AtomicBool::new(false),
         });
         publisher.publish_initial()?;
@@ -94,6 +98,37 @@ impl RuntimeManifestPublisherHandle {
     /// installs an LSM edit.
     pub(crate) fn publish_at_least(&self, seq_id: u64) -> Result<()> {
         self.publisher.publish_at_least(seq_id)
+    }
+
+    /// Suspends background publication before a dedicated compaction may edit the LSM.
+    ///
+    /// Locking `publication` waits for any publication already in progress. The flag persists
+    /// across failed result attempts and repeated calls are intentionally idempotent.
+    pub(crate) fn suspend_for_dedicated_apply(&self, job_id: &str) -> Result<bool> {
+        self.publisher.suspend_for_dedicated_apply(job_id)
+    }
+
+    /// Clears a suspension after an attempt proved that no edit was applied.
+    pub(crate) fn resume_without_publish(&self, job_id: &str) -> Result<()> {
+        self.publisher.resume_without_publish(job_id)
+    }
+
+    /// Publishes a snapshot-proven state and clears suspension only after publication succeeds.
+    pub(crate) fn publish_at_least_and_resume(&self, job_id: &str, seq_id: u64) -> Result<()> {
+        self.publisher.publish_at_least_and_resume(job_id, seq_id)
+    }
+
+    pub(crate) fn owns_dedicated_apply_suspension(&self, job_id: &str) -> bool {
+        self.dedicated_apply_suspension_owner().as_deref() == Some(job_id)
+    }
+
+    pub(crate) fn dedicated_apply_suspension_owner(&self) -> Option<String> {
+        self.publisher
+            .publication
+            .lock()
+            .unwrap()
+            .suspended_job_id
+            .clone()
     }
 
     pub(crate) fn stop(&self) {
@@ -136,7 +171,7 @@ impl RuntimeManifestPublisher {
             if !notified && Arc::ptr_eq(&observed, &current) {
                 continue;
             }
-            if let Err(err) = self.publish_current() {
+            if let Err(err) = self.publish_background_current() {
                 self.lifecycle.mark_error(err);
                 self.db_state.notify_changed();
                 return;
@@ -153,28 +188,113 @@ impl RuntimeManifestPublisher {
                 state.seq_id
             )));
         }
-        self.publish_state(state, true)
+        let mut publication = self.publication.lock().unwrap();
+        if let Some(job_id) = &publication.suspended_job_id {
+            return Err(suspended_publication_error(job_id));
+        }
+        self.publish_state_locked(&mut publication, state, true)
     }
 
     fn publish_current(&self) -> Result<()> {
-        self.publish_state(self.db_state.load(), false)
+        let state = self.db_state.load();
+        let mut publication = self.publication.lock().unwrap();
+        if let Some(job_id) = &publication.suspended_job_id {
+            return Err(suspended_publication_error(job_id));
+        }
+        self.publish_state_locked(&mut publication, state, false)
     }
 
     fn publish_initial(&self) -> Result<()> {
-        self.publish_state(self.db_state.load(), true)
+        let state = self.db_state.load();
+        let mut publication = self.publication.lock().unwrap();
+        self.publish_state_locked(&mut publication, state, true)
     }
 
-    fn publish_state(&self, state: Arc<DbState>, force: bool) -> Result<()> {
+    fn publish_background_current(&self) -> Result<()> {
+        let state = self.db_state.load();
         let mut publication = self.publication.lock().unwrap();
+        if publication.suspended_job_id.is_some() {
+            return Ok(());
+        }
+        self.publish_state_locked(&mut publication, state, false)
+    }
+
+    fn suspend_for_dedicated_apply(&self, job_id: &str) -> Result<bool> {
+        let mut publication = self.publication.lock().unwrap();
+        match publication.suspended_job_id.as_deref() {
+            None => {
+                publication.suspended_job_id = Some(job_id.to_string());
+                Ok(true)
+            }
+            Some(owner) if owner == job_id => Ok(false),
+            Some(owner) => Err(Error::InvalidState(format!(
+                "Runtime manifest publication is suspended for dedicated compaction job {owner}, not {job_id}"
+            ))),
+        }
+    }
+
+    fn resume_without_publish(&self, job_id: &str) -> Result<()> {
+        let mut publication = self.publication.lock().unwrap();
+        match publication.suspended_job_id.as_deref() {
+            Some(owner) if owner == job_id => {
+                publication.suspended_job_id = None;
+                drop(publication);
+                self.db_state.notify_changed();
+                Ok(())
+            }
+            None => Ok(()),
+            Some(owner) => Err(Error::InvalidState(format!(
+                "Dedicated compaction job {job_id} cannot resume runtime publication owned by {owner}"
+            ))),
+        }
+    }
+
+    fn publish_at_least_and_resume(&self, job_id: &str, seq_id: u64) -> Result<()> {
+        let mut publication = self.publication.lock().unwrap();
+        if publication.suspended_job_id.as_deref() != Some(job_id) {
+            return Err(Error::InvalidState(match &publication.suspended_job_id {
+                Some(owner) => format!(
+                    "Dedicated compaction job {job_id} cannot publish runtime state owned by {owner}"
+                ),
+                None => {
+                    "Runtime manifest publisher is not suspended for dedicated apply".to_string()
+                }
+            }));
+        }
+        let state = self.db_state.load();
+        if state.seq_id < seq_id {
+            return Err(Error::InvalidState(format!(
+                "Runtime manifest requested sequence {seq_id}, but DbState is only at {}",
+                state.seq_id
+            )));
+        }
+        self.publish_state_locked(&mut publication, state, true)?;
+        publication.suspended_job_id = None;
+        drop(publication);
+        self.db_state.notify_changed();
+        Ok(())
+    }
+
+    fn publish_state_locked(
+        &self,
+        publication: &mut PublicationState,
+        state: Arc<DbState>,
+        force: bool,
+    ) -> Result<()> {
         let generation = publication
             .current
             .as_ref()
             .map_or(1, |current| current.generation.saturating_add(1));
+        let latest_schema_id = self.schema_manager.latest_schema().version();
+        // CURRENT is the runtime reader's commit point. Persist schema files first so it never
+        // makes a layout visible before that layout's schema can be reconstructed.
+        self.schema_manager
+            .persist_schemas_up_to(self.file_manager.as_ref(), latest_schema_id)?;
         let manifest = runtime_manifest_from_state(
             state.as_ref(),
-            self.schema_manager.as_ref(),
             self.file_manager.as_ref(),
             generation,
+            latest_schema_id,
         )?;
 
         if !force
@@ -195,6 +315,12 @@ impl RuntimeManifestPublisher {
         )?);
         Ok(())
     }
+}
+
+fn suspended_publication_error(job_id: &str) -> Error {
+    Error::InvalidState(format!(
+        "Runtime manifest publication is suspended for unproven dedicated compaction job {job_id}"
+    ))
 }
 
 /// Advances the in-process publication state after `RuntimeManifestStore::publish` succeeds.
@@ -241,15 +367,15 @@ fn published_manifest_state(
 
 fn runtime_manifest_from_state(
     state: &DbState,
-    schema_manager: &SchemaManager,
     file_manager: &FileManager,
     generation: u64,
+    latest_schema_id: u64,
 ) -> Result<RuntimeManifest> {
     let tree_versions = state.multi_lsm_version.tree_versions_cloned();
     Ok(RuntimeManifest {
         generation,
         seq_id: state.seq_id,
-        latest_schema_id: schema_manager.latest_schema().version(),
+        latest_schema_id,
         bucket_ranges: state.bucket_ranges.clone(),
         lsm_tree_bucket_ranges: state.multi_lsm_version.bucket_ranges(),
         tree_scopes: state.multi_lsm_version.tree_scopes(),

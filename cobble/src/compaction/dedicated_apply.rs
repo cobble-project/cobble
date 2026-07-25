@@ -1,7 +1,8 @@
 //! Apply logic for dedicated compaction results.
 //!
 //! This module implements the writer-side application of a dedicated compaction result to the
-//! in-memory LSM state, followed by manifest commit and result cleanup.
+//! in-memory LSM state, followed by snapshot proof, runtime publication when enabled, and
+//! result cleanup.
 //!
 //! The apply flow (see the dedicated compactor technical plan):
 //! 1. Validate the result (operation type, complete fingerprints, output files exist/readable,
@@ -13,8 +14,9 @@
 //! 4. If Pending or AppliedInMemory: check if the latest manifest already proves the
 //!    operation committed; if not, run a snapshot barrier (flush + materialize with callback)
 //!    and verify the manifest.
-//! 5. Once the manifest is proven: make outputs owned, delete the result.
-//! 6. If Conflict: clean up uncommitted outputs, delete the result.
+//! 5. When runtime manifests are enabled, publish the applied DbState after the snapshot proof.
+//! 6. Once durability is proven: make outputs owned, delete the result.
+//! 7. If Conflict: clean up uncommitted outputs, delete the result.
 use crate::compaction::dedicated::{
     DedicatedCompactionOperation, DedicatedCompactionResult, DedicatedDataFile, cleanup_job_dir,
     dedicated_compaction_job_output_prefix, delete_dedicated_compaction_result,
@@ -69,8 +71,18 @@ pub(crate) fn apply_external_compaction_result(
     result: &DedicatedCompactionResult,
     expected_job_id: &str,
 ) -> Result<ExternalCompactionApplyResult> {
+    let owns_existing_suspension = ctx
+        .runtime_manifest_publisher
+        .as_ref()
+        .is_some_and(|publisher| publisher.owns_dedicated_apply_suspension(expected_job_id));
+
     // Validate that the result's job_id matches the file name's job_id.
     if result.job_id != expected_job_id {
+        if owns_existing_suspension {
+            return Err(Error::InvalidState(format!(
+                "Suspended dedicated compaction job {expected_job_id} changed its payload job id"
+            )));
+        }
         return Ok(ExternalCompactionApplyResult::TerminalInvalid);
     }
 
@@ -78,10 +90,17 @@ pub(crate) fn apply_external_compaction_result(
     // (structural), but I/O errors (e.g. remote storage temporarily unavailable)
     // should be retried.
     if let Err(err) = validate_result(ctx, result) {
-        if is_transient_error(&err) {
+        if owns_existing_suspension || is_transient_error(&err) {
             return Err(err);
         }
         return Ok(ExternalCompactionApplyResult::TerminalInvalid);
+    }
+
+    // Serialize against the background runtime publisher before apply_operation can mutate the
+    // LSM. The suspension is persistent so a failed attempt cannot expose an unproven edit when
+    // its stack unwinds; the next retry resumes from the same state.
+    if let Some(publisher) = &ctx.runtime_manifest_publisher {
+        publisher.suspend_for_dedicated_apply(expected_job_id)?;
     }
 
     // Step 2: operation-specific status judgment + apply.
@@ -90,6 +109,12 @@ pub(crate) fn apply_external_compaction_result(
     let (apply_outcome, output_path_to_id) = match apply_operation(ctx, result) {
         Ok(v) => v,
         Err(ApplyError::Terminal(err)) => {
+            if owns_existing_suspension {
+                return Err(err);
+            }
+            if let Some(publisher) = &ctx.runtime_manifest_publisher {
+                publisher.resume_without_publish(expected_job_id)?;
+            }
             debug!(
                 "dedicated compaction result {} apply error (terminal): {}",
                 result.job_id, err
@@ -109,17 +134,32 @@ pub(crate) fn apply_external_compaction_result(
 
     match apply_outcome {
         ApplyOutcome::Applied | ApplyOutcome::AppliedInMemory => {
+            let applied_seq_id = ctx.db_state.load().seq_id;
             // Commit via snapshot barrier (or confirm the manifest already proves it).
             // This is required for BOTH outcomes: Applied needs a fresh manifest;
             // AppliedInMemory may or may not have a committed manifest from a prior attempt.
             // Only commit_and_verify (which reads the manifest from disk) can prove durability.
             commit_and_verify(ctx, result)?;
+            // A runtime manifest may only describe an edit after the snapshot barrier made the
+            // edit durable. If this publication fails, preserve the result and readonly outputs
+            // so a retry can prove the snapshot again and advance runtime CURRENT later.
+            if let Some(publisher) = &ctx.runtime_manifest_publisher {
+                publisher.publish_at_least_and_resume(expected_job_id, applied_seq_id)?;
+            }
             // Make outputs owned now that the manifest is committed, then delete the result.
             finalize_outputs(ctx, &output_path_to_id)?;
             delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id)?;
             Ok(ExternalCompactionApplyResult::Applied)
         }
         ApplyOutcome::Conflict => {
+            if owns_existing_suspension {
+                return Err(Error::InvalidState(format!(
+                    "Suspended dedicated compaction job {expected_job_id} became conflicting before its durable publication completed"
+                )));
+            }
+            if let Some(publisher) = &ctx.runtime_manifest_publisher {
+                publisher.resume_without_publish(expected_job_id)?;
+            }
             // Clean up uncommitted outputs and delete result.
             cleanup_uncommitted_outputs(ctx, result)?;
             delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id)?;

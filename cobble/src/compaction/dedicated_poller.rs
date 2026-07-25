@@ -3,7 +3,8 @@
 //! In `CompactionMode::Dedicated`, the writer does not run any in-process compaction. Instead, a
 //! separate dedicated compactor process publishes compaction result files to the shared volume.
 //! This poller discovers those results, validates them, applies the compaction edit to the
-//! writer's in-memory LSM state, commits a new manifest snapshot, and then deletes the result.
+//! writer's in-memory LSM state, commits a new snapshot proof, advances runtime CURRENT when
+//! enabled, and then deletes the result.
 //!
 //! The poller is a managed background worker: it has a stop signal, a join handle, and is
 //! stopped/joined during `Db::close` before the snapshot manager shuts down. It registers an
@@ -66,6 +67,8 @@ pub(crate) struct PollerContext {
     pub(crate) schema_manager: Arc<SchemaManager>,
     pub(crate) db_lifecycle: Arc<DbLifecycle>,
     pub(crate) db_state: Arc<DbStateHandle>,
+    pub(crate) runtime_manifest_publisher:
+        Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
     pub(crate) poll_interval: Duration,
     pub(crate) config: Config,
     pub(crate) stop: Arc<AtomicBool>,
@@ -84,6 +87,9 @@ impl DedicatedCompactionPollerHandle {
         schema_manager: Arc<SchemaManager>,
         db_lifecycle: Arc<DbLifecycle>,
         db_state: Arc<DbStateHandle>,
+        runtime_manifest_publisher: Option<
+            Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>,
+        >,
         poll_interval: Duration,
         config: Config,
     ) -> Self {
@@ -112,6 +118,7 @@ impl DedicatedCompactionPollerHandle {
             schema_manager,
             db_lifecycle,
             db_state,
+            runtime_manifest_publisher,
             poll_interval,
             config,
             stop: Arc::clone(&stop),
@@ -202,13 +209,37 @@ fn poll_once(
         );
     }
 
-    // Process one result at a time, in sorted order.
-    let job_id = &job_ids[0];
+    // A suspended job owns an unproven in-memory edit and must remain the only result processed
+    // until its durability barrier completes. If its file is temporarily absent, preserve the
+    // suspension instead of moving on to unrelated work.
+    let suspended_job_id = ctx
+        .runtime_manifest_publisher
+        .as_ref()
+        .and_then(|publisher| publisher.dedicated_apply_suspension_owner());
+    let job_id = if let Some(owner) = suspended_job_id.as_deref() {
+        let Some(job_id) = job_ids.iter().find(|job_id| job_id.as_str() == owner) else {
+            warn!(
+                "suspended dedicated compaction result {} is absent; waiting for its retry record",
+                owner
+            );
+            return Ok(PollOutcome::RetryDeferred);
+        };
+        job_id
+    } else {
+        &job_ids[0]
+    };
 
     // Read and decode the result, with limited retries for transient I/O.
     let result = match read_with_retries(ctx, job_id, max_retries, retry_base_delay) {
         Ok(result) => result,
         Err(ReadResultError::Checksum) => {
+            if result_job_owns_suspension(ctx, job_id) {
+                warn!(
+                    "suspended dedicated compaction result {} has a checksum error; preserving it for retry",
+                    job_id
+                );
+                return Ok(PollOutcome::RetryDeferred);
+            }
             // After retries, checksum still fails - terminal invalid. Delete result and job dir.
             warn!(
                 "dedicated compaction result {} has persistent checksum mismatch; deleting as terminal invalid",
@@ -226,6 +257,13 @@ fn poll_once(
             return Ok(PollOutcome::RetryDeferred);
         }
         Err(ReadResultError::Decode(err)) => {
+            if result_job_owns_suspension(ctx, job_id) {
+                warn!(
+                    "suspended dedicated compaction result {} failed to decode: {}; preserving it for retry",
+                    job_id, err
+                );
+                return Ok(PollOutcome::RetryDeferred);
+            }
             warn!(
                 "dedicated compaction result {} failed to decode: {}; deleting as terminal invalid",
                 job_id, err
@@ -260,6 +298,13 @@ fn poll_once(
             Ok(PollOutcome::Processed)
         }
         Ok(ExternalCompactionApplyResult::TerminalInvalid) => {
+            if result_job_owns_suspension(ctx, job_id) {
+                warn!(
+                    "suspended dedicated compaction result {} became terminally invalid; preserving it for retry",
+                    job_id
+                );
+                return Ok(PollOutcome::RetryDeferred);
+            }
             warn!(
                 "dedicated compaction result job={} (file={}) is terminally invalid; cleaning up and deleting",
                 result.job_id, job_id
@@ -278,6 +323,12 @@ fn poll_once(
             Ok(PollOutcome::RetryDeferred)
         }
     }
+}
+
+fn result_job_owns_suspension(ctx: &PollerContext, job_id: &str) -> bool {
+    ctx.runtime_manifest_publisher
+        .as_ref()
+        .is_some_and(|publisher| publisher.owns_dedicated_apply_suspension(job_id))
 }
 
 enum ReadResultError {

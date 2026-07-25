@@ -701,7 +701,21 @@ impl SchemaManager {
         for manifest in manifests {
             collect_schema_ids_from_manifest(manifest, &mut schema_ids);
         }
+        Self::from_persisted_schema_ids(file_manager, schema_ids, resolver)
+    }
+
+    /// Rebuilds schemas referenced by a persisted runtime or snapshot layout.
+    pub(crate) fn from_persisted_schema_ids<I>(
+        file_manager: &Arc<FileManager>,
+        schema_ids: I,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = u64>,
+    {
         let schemas = schema_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>()
             .into_iter()
             .map(|schema_id| load_schema(file_manager, schema_id, resolver.as_ref()))
             .collect::<Result<Vec<_>>>()?;

@@ -66,7 +66,7 @@ pub struct Db {
     dedicated_poller: Option<crate::compaction::dedicated_poller::DedicatedCompactionPollerHandle>,
     /// Durable runtime-manifest publisher for external observers.
     runtime_manifest_publisher:
-        Option<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>,
+        Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
 }
 
 pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<Bytes>>>> {
@@ -1087,7 +1087,8 @@ impl Db {
                 write_stall_limit: config.resolved_write_stall_limit(),
                 schema_manager: Some(Arc::clone(&schema_manager)),
                 auto_snapshot_manager: if config.snapshot_on_flush
-                    || config.compaction_mode == crate::config::CompactionMode::Dedicated
+                    || (config.compaction_mode == crate::config::CompactionMode::Dedicated
+                        && !config.runtime_manifests_enabled())
                 {
                     Some(snapshot_manager.clone())
                 } else {
@@ -1102,14 +1103,14 @@ impl Db {
         )?);
 
         let runtime_manifest_publisher = if config.runtime_manifests_enabled() {
-            Some(
+            Some(Arc::new(
                 crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle::open(
                     Arc::clone(&file_manager),
                     Arc::clone(&schema_manager),
                     Arc::clone(&db_state),
                     Arc::clone(&db_lifecycle),
                 )?,
-            )
+            ))
         } else {
             None
         };
@@ -1134,6 +1135,7 @@ impl Db {
                     Arc::clone(&schema_manager),
                     Arc::clone(&db_lifecycle),
                     Arc::clone(&db_state),
+                    runtime_manifest_publisher.as_ref().map(Arc::clone),
                     Duration::from_millis(config.compaction_dedicated_poll_interval_ms),
                     config.clone(),
                 );
@@ -2000,6 +2002,94 @@ mod tests {
 
     #[test]
     #[serial(file)]
+    fn runtime_manifest_dedicated_suspension_survives_failure_and_resumes_after_publish() {
+        let root = "/tmp/db_runtime_manifest_dedicated_suspension";
+        cleanup_test_root(root);
+        let mut config = config_with_small_memtable(root);
+        config.runtime_manifest_mode = RuntimeManifestMode::Enabled;
+        config.governance_mode = GovernanceMode::Noop;
+        let db = open_db(config);
+        let store = runtime_manifest_store(&db);
+        let initial = store.load_current().unwrap().unwrap();
+        let publisher = db
+            .runtime_manifest_publisher
+            .as_ref()
+            .expect("enabled runtime manifest publisher");
+
+        assert!(publisher.suspend_for_dedicated_apply("test-job").unwrap());
+        assert!(
+            !publisher.suspend_for_dedicated_apply("test-job").unwrap(),
+            "same-job retry must reuse the existing suspension"
+        );
+        assert!(
+            publisher.suspend_for_dedicated_apply("other-job").is_err(),
+            "another job cannot take over an unproven edit"
+        );
+        db.put(0, b"suspended-key", 0, vec![b'x'; 96]).unwrap();
+        db.memtable_manager.flush_active().unwrap();
+        db.memtable_manager.wait_for_flushes();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            store.load_current().unwrap().unwrap().generation,
+            initial.generation,
+            "background publication must stay suspended after the persisted state changes"
+        );
+
+        assert!(
+            publisher
+                .publish_at_least_and_resume("test-job", u64::MAX)
+                .is_err()
+        );
+        assert!(
+            publisher.publish_current().is_err(),
+            "a failed barrier publish must leave suspension active"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            store.load_current().unwrap().unwrap().generation,
+            initial.generation
+        );
+
+        let current_seq_id = db.db_state.load().seq_id;
+        publisher
+            .publish_at_least_and_resume("test-job", current_seq_id)
+            .unwrap();
+        let published =
+            wait_for_runtime_generation_at_least(&store, initial.generation.saturating_add(1));
+        assert!(published.manifest.seq_id >= current_seq_id);
+        publisher
+            .publish_current()
+            .expect("successful barrier publication must clear suspension");
+
+        db.close().unwrap();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn runtime_manifest_close_rejects_suspended_dedicated_apply() {
+        let root = "/tmp/db_runtime_manifest_suspended_close";
+        cleanup_test_root(root);
+        let mut config = config_with_small_memtable(root);
+        config.runtime_manifest_mode = RuntimeManifestMode::Enabled;
+        config.governance_mode = GovernanceMode::Noop;
+        let db = open_db(config);
+        db.runtime_manifest_publisher
+            .as_ref()
+            .unwrap()
+            .suspend_for_dedicated_apply("close-test-job")
+            .unwrap();
+
+        let err = db.close().expect_err("close must reject suspended publish");
+        assert!(
+            err.to_string()
+                .contains("suspended for unproven dedicated compaction job close-test-job")
+        );
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
     fn runtime_manifest_auto_mode_only_enables_dedicated_compaction() {
         let embedded_root = "/tmp/db_runtime_manifest_auto_embedded";
         cleanup_test_root(embedded_root);
@@ -2045,6 +2135,78 @@ mod tests {
         );
         db.close().unwrap();
         cleanup_test_root(disabled_root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn dedicated_runtime_mode_publishes_flush_without_auto_snapshot() {
+        let root = "/tmp/db_runtime_manifest_dedicated_flush";
+        cleanup_test_root(root);
+        let mut config = config_with_small_memtable(root);
+        config.governance_mode = GovernanceMode::Noop;
+        config.compaction_mode = CompactionMode::Dedicated;
+        let db = open_db(config);
+
+        db.put(0, b"runtime-flush", 0, vec![b'x'; 96]).unwrap();
+        db.memtable_manager.flush_active().unwrap();
+        db.memtable_manager.wait_for_flushes();
+
+        let store = runtime_manifest_store(&db);
+        let runtime = wait_for_runtime_generation_at_least(&store, 2);
+        assert!(
+            runtime
+                .manifest
+                .tree_levels
+                .iter()
+                .flat_map(|levels| levels.iter())
+                .any(|level| !level.files.is_empty())
+        );
+        assert!(
+            crate::snapshot::manifest::list_snapshot_manifest_ids(&db.file_manager)
+                .unwrap()
+                .is_empty()
+        );
+        db.close().unwrap();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn dedicated_snapshot_mode_keeps_flush_snapshot_compatibility() {
+        let root = "/tmp/db_runtime_manifest_dedicated_snapshot";
+        cleanup_test_root(root);
+        let mut config = config_with_small_memtable(root);
+        config.governance_mode = GovernanceMode::Noop;
+        config.compaction_mode = CompactionMode::Dedicated;
+        config.runtime_manifest_mode = RuntimeManifestMode::Disabled;
+        let db = open_db(config);
+
+        db.put(0, b"snapshot-flush", 0, vec![b'x'; 96]).unwrap();
+        db.memtable_manager.flush_active().unwrap();
+        db.memtable_manager.wait_for_flushes();
+        for _ in 0..100 {
+            if !crate::snapshot::manifest::list_snapshot_manifest_ids(&db.file_manager)
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            crate::snapshot::manifest::list_snapshot_manifest_ids(&db.file_manager)
+                .unwrap()
+                .len()
+                > 0
+        );
+        assert!(
+            runtime_manifest_store(&db)
+                .load_current()
+                .unwrap()
+                .is_none()
+        );
+        db.close().unwrap();
+        cleanup_test_root(root);
     }
 
     #[test]

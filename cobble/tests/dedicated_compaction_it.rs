@@ -3,8 +3,8 @@
 //! These tests exercise the end-to-end flow in-process:
 //! - The writer opens in `CompactionMode::Dedicated`, which disables in-process compaction
 //!   and starts the result poller.
-//! - A `DedicatedCompactor` runs in the same process (on a background thread), reading the
-//!   writer's snapshots, executing compaction plans, and publishing result files.
+//! - A `DedicatedCompactor` runs in the same process (on a background thread), reading runtime
+//!   manifests by default, executing compaction plans, and publishing result files.
 //! - The writer's poller discovers the results, applies them, commits a new manifest, and
 //!   deletes the result.
 //!
@@ -13,7 +13,10 @@
 //! - Compaction results are consumed (deleted) by the writer.
 //! - The manifest reflects the compacted state.
 //! - Restart after compaction preserves all data.
-use cobble::{CompactionMode, CompactionPolicyKind, Config, Db, DbBuilder, DedicatedCompactor};
+use cobble::{
+    CompactionMode, CompactionPolicyKind, Config, Db, DbBuilder, DedicatedCompactor,
+    RuntimeManifestMode,
+};
 use serial_test::serial;
 use size::Size;
 use std::sync::Arc;
@@ -61,23 +64,14 @@ fn open_db_with_id(config: Config, db_id: &str) -> Db {
 }
 
 /// Runs a `DedicatedCompactor` on a background thread, calling `run_once` in a loop until
-/// `stop` is set. Retries `open` until snapshots appear.
+/// `stop` is set. The compactor can start before a writer; it idles until runtime CURRENT exists.
 fn spawn_compactor(config: Config, db_id: String) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop);
     let handle = std::thread::Builder::new()
         .name("test-dedicated-compactor".to_string())
         .spawn(move || {
-            // Wait for the writer to produce at least one snapshot before opening the compactor.
-            let compactor = loop {
-                if stop_clone.load(Ordering::SeqCst) {
-                    return;
-                }
-                match DedicatedCompactor::open(config.clone(), db_id.clone()) {
-                    Ok(c) => break c,
-                    Err(_) => std::thread::sleep(Duration::from_millis(200)),
-                }
-            };
+            let compactor = DedicatedCompactor::open(config, db_id).expect("open compactor");
             while !stop_clone.load(Ordering::SeqCst) {
                 if let Err(err) = compactor.run_once() {
                     // Expected when no plan is found.
@@ -145,6 +139,48 @@ fn count_snapshots(root: &str) -> usize {
     walk(std::path::Path::new(root))
 }
 
+/// Returns whether the writer published a runtime CURRENT pointer.
+fn runtime_current_exists(root: &str) -> bool {
+    fn walk(dir: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            path.is_dir().then(|| walk(&path)).unwrap_or_else(|| {
+                path.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
+                    && path
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|name| name.to_str())
+                        == Some("runtime")
+            })
+        })
+    }
+    walk(std::path::Path::new(root))
+}
+
+fn find_file(root: &str, predicate: impl Fn(&std::path::Path) -> bool) -> std::path::PathBuf {
+    fn walk(
+        dir: &std::path::Path,
+        predicate: &impl Fn(&std::path::Path) -> bool,
+    ) -> Option<std::path::PathBuf> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk(&path, predicate) {
+                    return Some(found);
+                }
+            } else if predicate(&path) {
+                return Some(path);
+            }
+        }
+        None
+    }
+    walk(std::path::Path::new(root), &predicate).expect("matching test file")
+}
+
 /// Returns true if a manifest file for the given snapshot id exists under the root directory.
 fn snapshot_exists(root: &str, snapshot_id: u64) -> bool {
     let target = format!("SNAPSHOT-{}", snapshot_id);
@@ -210,6 +246,9 @@ fn test_dedicated_compaction_basic() {
     let db_id = "dedicated-compaction-basic".to_string();
 
     let config = dedicated_config(root);
+    // A runtime-driven compactor may start before its writer. It must idle while CURRENT is
+    // absent rather than requiring a bootstrap snapshot or falling back to snapshots.
+    let (stop, handle) = spawn_compactor(config.clone(), db_id.clone());
     let db = open_db_with_id(config.clone(), &db_id);
 
     // Write enough data to trigger flush and produce L0 files.
@@ -219,30 +258,28 @@ fn test_dedicated_compaction_basic() {
         db.put(0, &key, 0, &value).expect("put");
     }
 
-    // Wait for flush to produce SST files and snapshots.
+    // Dedicated Auto publishes runtime manifests but does not create flush snapshots.
     assert!(
         wait_for(Duration::from_secs(10), Duration::from_millis(100), || {
-            count_data_files(root) > 0 && count_snapshots(root) > 0
+            count_data_files(root) > 0 && runtime_current_exists(root)
         }),
-        "flush should produce SST files and snapshots (files={}, snapshots={})",
+        "flush should produce SST files and a runtime manifest (files={}, snapshots={})",
         count_data_files(root),
         count_snapshots(root)
+    );
+    assert_eq!(
+        count_snapshots(root),
+        0,
+        "flush must not auto-snapshot in runtime mode"
     );
 
     let initial_snapshots = count_snapshots(root);
 
-    // Start the compactor (it waits for snapshots internally).
-    let (stop, handle) = spawn_compactor(config.clone(), db_id.clone());
-
-    // Wait for compaction: new snapshots from poller manifest commit, and results consumed.
-    // We require snapshots to increase BEYOND what flushes produce (at least 2 new snapshots:
-    // one from flush, one from compaction commit), and no pending results.
+    // Result application creates a durable snapshot proof, then advances runtime CURRENT.
     let compaction_done = wait_for(Duration::from_secs(60), Duration::from_millis(500), || {
         let snapshots = count_snapshots(root);
         let results = count_compaction_results(root);
-        // Compaction produces at least 2 new snapshots beyond the initial flush snapshots.
-        // Also require no pending results (writer consumed them).
-        snapshots > initial_snapshots + 1 && results == 0
+        snapshots > initial_snapshots && runtime_current_exists(root) && results == 0
     });
 
     // Stop the compactor.
@@ -269,6 +306,233 @@ fn test_dedicated_compaction_basic() {
 
 #[test]
 #[serial(file)]
+fn dedicated_compaction_disabled_runtime_manifests_uses_snapshots() {
+    let root = "/tmp/dedicated_compaction_snapshot_mode";
+    cleanup_test_root(root);
+    let db_id = "dedicated-compaction-snapshot-mode".to_string();
+    let mut config = dedicated_config(root);
+    config.runtime_manifest_mode = RuntimeManifestMode::Disabled;
+
+    // Explicitly disabled runtime manifests retain the snapshot-driven compatibility path.
+    let (stop, handle) = spawn_compactor(config.clone(), db_id.clone());
+    let db = open_db_with_id(config, &db_id);
+    let value = vec![b'v'; 1024];
+    for i in 0..40u32 {
+        db.put(0, format!("snapshot-{i:08}").as_bytes(), 0, &value)
+            .expect("put");
+    }
+
+    assert!(
+        wait_for(Duration::from_secs(10), Duration::from_millis(100), || {
+            count_data_files(root) > 0 && count_snapshots(root) > 0
+        }),
+        "snapshot mode should publish a flush snapshot"
+    );
+    assert!(
+        !runtime_current_exists(root),
+        "disabled runtime manifests must not create runtime CURRENT"
+    );
+
+    let initial_snapshots = count_snapshots(root);
+    assert!(
+        wait_for(Duration::from_secs(60), Duration::from_millis(500), || {
+            count_snapshots(root) > initial_snapshots && count_compaction_results(root) == 0
+        }),
+        "snapshot-driven compaction did not complete"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
+    for i in 0..40u32 {
+        verify_get(&db, 0, format!("snapshot-{i:08}").as_bytes(), &value);
+    }
+    db.close().expect("close");
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn dedicated_runtime_publish_failure_preserves_result_until_retry() {
+    let root = "/tmp/dedicated_compaction_runtime_retry";
+    cleanup_test_root(root);
+    let db_id = "dedicated-compaction-runtime-retry".to_string();
+    let mut config = dedicated_config(root);
+    // Leave a deterministic window between result publication and writer polling.
+    config.compaction_dedicated_poll_interval_ms = 5_000;
+    let db = open_db_with_id(config.clone(), &db_id);
+    let value = vec![b'v'; 1024];
+    for i in 0..40u32 {
+        db.put(0, format!("retry-{i:08}").as_bytes(), 0, &value)
+            .expect("put");
+    }
+    assert!(wait_for(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || count_data_files(root) > 0 && runtime_current_exists(root)
+    ));
+
+    let current = find_file(root, |path| {
+        path.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
+            && path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                == Some("runtime")
+    });
+    let valid_current = std::fs::read(&current).unwrap();
+    let initial_snapshots = count_snapshots(root);
+    let (stop, handle) = spawn_compactor(config, db_id);
+    assert!(
+        wait_for(Duration::from_secs(10), Duration::from_millis(20), || {
+            count_compaction_results(root) == 1
+        }),
+        "compactor should publish a result before the writer's delayed poll"
+    );
+    let result_file = find_file(root, |path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("COMPACTION-"))
+    });
+    let valid_result = std::fs::read(&result_file).unwrap();
+
+    // The LSM edit and snapshot proof may complete, but the corrupted CURRENT makes the runtime
+    // barrier fail. The result and outputs must remain available for the next attempt.
+    std::fs::write(&current, b"corrupt runtime current\n").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(15), Duration::from_millis(100), || {
+            count_snapshots(root) > initial_snapshots && count_compaction_results(root) == 1
+        }),
+        "failed runtime publication should retain the compaction result"
+    );
+
+    // Once this job owns the suspension, even terminal read and validation failures must retain
+    // its only retry record rather than clean up an edit whose durability is still unproven.
+    std::fs::write(&result_file, b"corrupt result").unwrap();
+    std::thread::sleep(Duration::from_secs(9));
+    assert!(
+        result_file.exists(),
+        "checksum failure must retain the suspended result"
+    );
+
+    let payload =
+        cobble::test_utils::read_metadata_payload_from_path_for_test(&result_file).unwrap_err();
+    assert!(
+        payload.to_string().to_lowercase().contains("checksum"),
+        "test fixture should be checksum-invalid"
+    );
+    std::fs::write(&result_file, &valid_result).unwrap();
+    let payload =
+        cobble::test_utils::read_metadata_payload_from_path_for_test(&result_file).unwrap();
+    let mut terminal_result: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    terminal_result["tree_scope"]["column_family_id"] = serde_json::json!(255);
+    let terminal_result = cobble::test_utils::encode_metadata_payload_for_test(
+        &serde_json::to_vec(&terminal_result).unwrap(),
+    );
+    std::fs::write(&result_file, terminal_result).unwrap();
+    std::thread::sleep(Duration::from_secs(6));
+    assert!(
+        result_file.exists(),
+        "terminal validation failure must retain the suspended result"
+    );
+
+    // Restore the last valid pointer and mutate persisted state while suspension is still active.
+    // The background publisher must not advance CURRENT before result retry proves durability.
+    std::fs::write(&result_file, &valid_result).unwrap();
+    std::fs::write(&current, &valid_current).unwrap();
+    for i in 0..16u32 {
+        db.put(0, format!("post-failure-{i:08}").as_bytes(), 0, &value)
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        std::fs::read(&current).unwrap(),
+        valid_current,
+        "background publication must remain suspended after a failed result barrier"
+    );
+
+    assert!(
+        wait_for(Duration::from_secs(15), Duration::from_millis(100), || {
+            count_compaction_results(root) == 0
+                && std::fs::read(&current)
+                    .map(|bytes| bytes != valid_current)
+                    .unwrap_or(false)
+        }),
+        "successful retry should advance runtime CURRENT and delete the result"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
+    for i in 0..40u32 {
+        verify_get(&db, 0, format!("retry-{i:08}").as_bytes(), &value);
+    }
+    for i in 0..16u32 {
+        verify_get(&db, 0, format!("post-failure-{i:08}").as_bytes(), &value);
+    }
+    db.close().expect("close");
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn dedicated_compactor_runtime_missing_corrupt_and_inaccessible_fail_loud() {
+    let root = "/tmp/dedicated_compaction_runtime_errors";
+    cleanup_test_root(root);
+    let db_id = "dedicated-compaction-runtime-errors".to_string();
+    let config = dedicated_config(root);
+
+    // No writer has started: runtime mode is Idle rather than snapshot fallback or open failure.
+    let compactor = DedicatedCompactor::open(config.clone(), db_id.clone()).expect("open idle");
+    compactor
+        .run_once()
+        .expect("missing runtime manifest is idle");
+
+    let db = open_db_with_id(config.clone(), &db_id);
+    let current = find_file(root, |path| {
+        path.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
+            && path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                == Some("runtime")
+    });
+    let valid_current = std::fs::read(&current).unwrap();
+    db.close().unwrap();
+
+    // A corrupt runtime pointer is a hard observation error, never a snapshot fallback.
+    std::fs::write(&current, b"corrupt runtime current\n").unwrap();
+    let compactor = DedicatedCompactor::open(config.clone(), db_id.clone()).expect("open corrupt");
+    assert!(compactor.run_once().is_err());
+    std::fs::write(&current, valid_current).unwrap();
+
+    // Restore a valid runtime manifest, then remove a referenced SST. Rebuilding the read-only
+    // layout must surface that dangling reference before a plan is executed.
+    let db = open_db_with_id(config.clone(), &db_id);
+    for i in 0..16 {
+        db.put(
+            0,
+            format!("missing-file-{i}").as_bytes(),
+            0,
+            vec![b'x'; 1024],
+        )
+        .unwrap();
+    }
+    assert!(wait_for(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || { count_data_files(root) > 0 && runtime_current_exists(root) }
+    ));
+    db.close().unwrap();
+    let data_file = find_file(root, |path| {
+        path.extension().and_then(|ext| ext.to_str()) == Some("sst")
+    });
+    std::fs::remove_file(data_file).unwrap();
+    let compactor = DedicatedCompactor::open(config, db_id).expect("open dangling");
+    assert!(compactor.run_once().is_err());
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
 fn test_dedicated_compaction_multiple_rounds() {
     let root = "/tmp/dedicated_compaction_multi";
     cleanup_test_root(root);
@@ -287,6 +551,13 @@ fn test_dedicated_compaction_multiple_rounds() {
         for i in 0..10u32 {
             let key = format!("r{}k{:06}", round, i).into_bytes();
             db.put(0, &key, 0, &value).expect("put");
+        }
+        if round == 0 {
+            // The next runtime manifest must carry schema 1 alongside the existing schema 0
+            // files. The compactor reloads both schema files without a bootstrap snapshot.
+            let mut schema = db.update_schema();
+            schema.add_column(1, None, None, None).unwrap();
+            let _ = schema.commit();
         }
         // Give the compactor time to process.
         std::thread::sleep(Duration::from_secs(2));
@@ -332,12 +603,12 @@ fn test_dedicated_compaction_restart_recovery() {
         db.put(0, &key, 0, &value).expect("put");
     }
 
-    // Wait for flush to produce SST files and snapshots.
+    // Dedicated runtime mode publishes on flush without creating a snapshot.
     assert!(
         wait_for(Duration::from_secs(10), Duration::from_millis(100), || {
-            count_data_files(root) > 0 && count_snapshots(root) > 0
+            count_data_files(root) > 0 && runtime_current_exists(root)
         }),
-        "flush should produce SST files and snapshots"
+        "flush should produce SST files and a runtime manifest"
     );
 
     // Start compactor and wait for compaction.

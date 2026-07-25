@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Current version of the dedicated compaction result format.
-pub(crate) const DEDICATED_COMPACTION_RESULT_VERSION: u32 = 1;
+pub(crate) const DEDICATED_COMPACTION_RESULT_VERSION: u32 = 2;
 
 /// Directory (relative to the db base dir) where result files live.
 pub(crate) const DEDICATED_COMPACTION_RESULTS_DIR: &str = "compaction/results";
@@ -324,16 +324,24 @@ impl DedicatedCompactionOperation {
     }
 }
 
+/// Durable writer observation used to plan a dedicated compaction result.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum DedicatedCompactionSource {
+    Runtime { generation: u64, seq_id: u64 },
+    Snapshot { snapshot_id: u64, seq_id: u64 },
+}
+
 /// A dedicated compaction result: a delta describing one compaction, published by the
 /// compactor process and consumed by the writer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct DedicatedCompactionResult {
     pub version: u32,
     pub job_id: String,
-    /// The snapshot id the compactor based its plan on. Observational only - the writer does
-    /// not require it to still be the latest, since the writer may flush new L0 files while the
-    /// compactor runs.
-    pub base_snapshot_id: u64,
+    /// The durable layout the compactor used to plan this operation. This is diagnostic only:
+    /// the writer applies against its current LSM fingerprints, not a requirement that this
+    /// source is still the latest when the result arrives.
+    pub source: DedicatedCompactionSource,
     /// Hint only; the writer uses `tree_scope` to locate the current tree.
     pub lsm_tree_idx: usize,
     pub tree_scope: LSMTreeScope,
@@ -621,7 +629,10 @@ mod tests {
         let result = DedicatedCompactionResult {
             version: DEDICATED_COMPACTION_RESULT_VERSION,
             job_id: "test-job-123".to_string(),
-            base_snapshot_id: 42,
+            source: DedicatedCompactionSource::Runtime {
+                generation: 42,
+                seq_id: 99,
+            },
             lsm_tree_idx: 0,
             tree_scope: LSMTreeScope::new(0u16..=0u16, 0),
             operation: DedicatedCompactionOperation::Rewrite {
@@ -652,6 +663,7 @@ mod tests {
         let bytes = result.encode().unwrap();
         let decoded = DedicatedCompactionResult::decode(&bytes).unwrap();
         assert_eq!(decoded.job_id, result.job_id);
+        assert_eq!(decoded.source, result.source);
         assert_eq!(decoded.operation, result.operation);
         assert_eq!(decoded.vlog_entry_deltas, result.vlog_entry_deltas);
     }
@@ -661,7 +673,7 @@ mod tests {
         let bytes = serde_json::json!({
             "version": 999,
             "job_id": "x",
-            "base_snapshot_id": 0,
+            "source": { "kind": "runtime", "generation": 0, "seq_id": 0 },
             "lsm_tree_idx": 0,
             "tree_scope": { "bucket_range": [0, 0], "column_family_id": 0 },
             "operation": { "Drop": { "inputs": [] } },

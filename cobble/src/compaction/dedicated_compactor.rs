@@ -2,18 +2,18 @@
 //!
 //! The dedicated compactor is a separate process that compacts SST files and publishes the
 //! result as a delta file on the shared volume. It does not call `Db::open`, does not create
-//! memtables, and does not enter the writer/WAL path. It only reads writer snapshots, schemas,
-//! and input data files, and only writes output data files and compaction result files.
+//! memtables, and does not enter the writer/WAL path. It reads durable writer observations,
+//! schemas, and input data files, and only writes output data files and compaction result files.
 //!
 //! Communication with the writer is entirely through the shared volume:
-//! - The compactor reads `SNAPSHOT-*` manifests to observe the writer's latest LSM state.
+//! - The compactor reads runtime manifests by default, or snapshots when explicitly configured.
 //! - The compactor publishes `compaction/results/COMPACTION-<job_id>` result files.
 //! - The writer polls for results, applies them, commits a new manifest, and deletes the result.
 //! - The result file's disappearance signals the compactor to proceed to the next plan.
 use crate::compaction::dedicated::{
     DEDICATED_COMPACTION_RESULT_VERSION, DedicatedCompactionInput, DedicatedCompactionOperation,
-    DedicatedCompactionResult, DedicatedDataFile, dedicated_compaction_job_output_prefix,
-    publish_dedicated_compaction_result, write_job_lease,
+    DedicatedCompactionResult, DedicatedCompactionSource, DedicatedDataFile,
+    dedicated_compaction_job_output_prefix, publish_dedicated_compaction_result, write_job_lease,
 };
 use crate::compaction::policy::{
     CompactionPolicy, CompactionPolicyContext, MinOverlapPolicy, RoundRobinPolicy,
@@ -29,12 +29,14 @@ use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::FileManager;
 use crate::lsm::Level;
-use crate::metrics_manager::MetricsManager;
-use crate::schema::SchemaManager;
-use crate::snapshot::manifest::{
-    build_tree_versions_from_manifest, build_truncation_cursors_from_manifest,
-    list_snapshot_manifest_ids, load_manifest_for_snapshot,
+use crate::manifest_model::{
+    build_tree_versions_from_levels, build_truncation_cursors, build_vlog_version_from_files,
+    ensure_persisted_files_readable, manifest_schema_ids,
 };
+use crate::metrics_manager::MetricsManager;
+use crate::runtime_manifest::{LoadedRuntimeManifest, RuntimeManifestStore};
+use crate::schema::SchemaManager;
+use crate::snapshot::manifest::{list_snapshot_manifest_ids, load_manifest_for_snapshot};
 use crate::writer_options::WriterOptionsFactory;
 use log::{debug, error, info, warn};
 use std::sync::Arc;
@@ -51,7 +53,6 @@ pub struct DedicatedCompactor {
     db_id: String,
     config: Config,
     file_manager: Arc<FileManager>,
-    schema_manager: Arc<SchemaManager>,
     metrics_manager: Arc<MetricsManager>,
     /// Saved merge operator resolver, passed to every schema reload so custom merge
     /// operators remain functional across manifest refreshes.
@@ -68,12 +69,55 @@ pub struct DedicatedCompactor {
     stop: Arc<AtomicBool>,
 }
 
+struct DedicatedObservation {
+    source: DedicatedCompactionSource,
+    latest_schema_id: u64,
+    tree_scopes: Vec<LSMTreeScope>,
+    tree_levels: Vec<Vec<crate::manifest_model::ManifestLevel>>,
+    vlog_files: Vec<crate::manifest_model::ManifestVlogFile>,
+    truncation_cursors: Vec<crate::manifest_model::ManifestTruncationCursor>,
+}
+
+impl DedicatedObservation {
+    fn from_runtime(loaded: LoadedRuntimeManifest) -> Self {
+        let manifest = loaded.manifest;
+        Self {
+            source: DedicatedCompactionSource::Runtime {
+                generation: loaded.generation,
+                seq_id: manifest.seq_id,
+            },
+            latest_schema_id: manifest.latest_schema_id,
+            tree_scopes: manifest.tree_scopes,
+            tree_levels: manifest.tree_levels,
+            vlog_files: manifest.vlog_files,
+            truncation_cursors: manifest.truncation_cursors,
+        }
+    }
+
+    fn from_snapshot(
+        snapshot_id: u64,
+        manifest: crate::snapshot::manifest::ManifestSnapshot,
+    ) -> Self {
+        Self {
+            source: DedicatedCompactionSource::Snapshot {
+                snapshot_id,
+                seq_id: manifest.seq_id,
+            },
+            latest_schema_id: manifest.latest_schema_id,
+            tree_scopes: manifest.tree_scopes,
+            tree_levels: manifest.tree_levels,
+            vlog_files: manifest.vlog_files,
+            truncation_cursors: manifest.truncation_cursors,
+        }
+    }
+}
+
 impl DedicatedCompactor {
     /// Opens a dedicated compactor for the given config and db_id.
     ///
     /// The db_id must match the writer's db_id so both processes point at the same shared
-    /// volume. This does NOT call `Db::open` - it constructs an independent `FileManager` and
-    /// `SchemaManager` that read from the shared volume.
+    /// volume. This does NOT call `Db::open`; it constructs an independent `FileManager` and
+    /// rebuilds schemas lazily from each durable observation.
     pub fn open(config: Config, db_id: impl Into<String>) -> Result<Self> {
         Self::open_with_resolver(config, db_id, None)
     }
@@ -87,7 +131,7 @@ impl DedicatedCompactor {
     ) -> Result<Self> {
         // Re-validate dedicated compaction constraints. This catches unsafe overrides
         // (e.g. CLI --poll-interval) applied after Config::from_path.
-        config.validate_dedicated_compaction()?;
+        config.validate_dedicated_compactor()?;
         let db_id = db_id.into();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
         let file_manager = Arc::new(FileManager::from_config(
@@ -95,8 +139,6 @@ impl DedicatedCompactor {
             &db_id,
             Arc::clone(&metrics_manager),
         )?);
-        // Load the latest manifest to bootstrap schemas.
-        let schema_manager = Self::load_schema_manager(&file_manager, resolver.clone())?;
         let db_lifecycle = Arc::new(DbLifecycle::new_open());
         let compaction_config = build_compaction_config(&config, config.num_columns)?;
         let executor = CompactionExecutor::new(compaction_config, Arc::clone(&db_lifecycle))?;
@@ -117,7 +159,6 @@ impl DedicatedCompactor {
             db_id,
             config,
             file_manager,
-            schema_manager,
             metrics_manager,
             resolver,
             poll_interval,
@@ -127,27 +168,6 @@ impl DedicatedCompactor {
             compaction_metrics,
             stop: Arc::new(AtomicBool::new(false)),
         })
-    }
-
-    /// Loads the schema manager from the latest manifest on the shared volume.
-    fn load_schema_manager(
-        file_manager: &Arc<FileManager>,
-        resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
-    ) -> Result<Arc<SchemaManager>> {
-        let snapshot_ids = list_snapshot_manifest_ids(file_manager)?;
-        if snapshot_ids.is_empty() {
-            return Err(Error::InvalidState(
-                "No snapshots found on shared volume; writer must create at least one snapshot before starting the compactor".to_string(),
-            ));
-        }
-        let latest_id = *snapshot_ids.last().unwrap();
-        let manifest = load_manifest_for_snapshot(file_manager, latest_id)?;
-        let schema_manager = Arc::new(SchemaManager::from_manifest(
-            file_manager,
-            &manifest,
-            resolver,
-        )?);
-        Ok(schema_manager)
     }
 
     /// Signals the compactor to stop its main loop.
@@ -189,31 +209,39 @@ impl DedicatedCompactor {
             return Ok(());
         }
 
-        // Step 2: Read the writer's latest snapshot.
-        let snapshot_ids = list_snapshot_manifest_ids(&self.file_manager)?;
-        if snapshot_ids.is_empty() {
-            debug!("no snapshots found; waiting for writer to flush");
+        // Step 2: Read the configured durable writer observation source. Runtime manifests are
+        // authoritative whenever enabled; a missing runtime CURRENT means the writer has not
+        // started yet, not that we should silently fall back to a snapshot.
+        let Some(observation) = self.load_observation()? else {
+            debug!("no dedicated compaction observation is available; waiting for writer");
             std::thread::sleep(self.poll_interval);
             return Ok(());
-        }
-        let latest_id = *snapshot_ids.last().unwrap();
-        let manifest = load_manifest_for_snapshot(&self.file_manager, latest_id)?;
+        };
 
         // Step 3: Rebuild read-only LSM state, schema, truncation cursors.
         // Reload schemas in case the writer evolved the schema. Pass the saved resolver so
         // custom merge operators remain functional.
-        let schema_manager = Arc::new(SchemaManager::from_manifest(
+        ensure_persisted_files_readable(
             &self.file_manager,
-            &manifest,
+            &observation.tree_levels,
+            &observation.vlog_files,
+        )?;
+        let schema_manager = Arc::new(SchemaManager::from_persisted_schema_ids(
+            &self.file_manager,
+            manifest_schema_ids(observation.latest_schema_id, &observation.tree_levels),
             self.resolver.clone(),
         )?);
-        let tree_versions = build_tree_versions_from_manifest(
+        let tree_versions = build_tree_versions_from_levels(
             &self.file_manager,
-            &manifest,
+            &observation.tree_levels,
             true, // read_only
         )?;
-        let truncation_cursors = build_truncation_cursors_from_manifest(&manifest)?;
-        let tree_scopes = manifest.tree_scopes.clone();
+        // Rebuild the VLOG too, even though plan selection currently only needs LSM levels.
+        // This validates the complete persisted layout and keeps the observation boundary shared.
+        let _vlog_version =
+            build_vlog_version_from_files(&self.file_manager, &observation.vlog_files, true)?;
+        let truncation_cursors = build_truncation_cursors(&observation.truncation_cursors)?;
+        let tree_scopes = observation.tree_scopes;
 
         // Advance the compactor's file-id allocator past all file ids in the manifest.
         // The compactor's FileManager is a separate instance from the writer's, so its
@@ -223,7 +251,7 @@ impl DedicatedCompactor {
         // `register_data_file` to silently keep the old path (via `or_insert_with`), so the
         // compactor would publish input descriptors with the wrong (output) paths, and the
         // writer's fingerprint matching would fail.
-        let max_manifest_file_id = manifest
+        let max_manifest_file_id = observation
             .tree_levels
             .iter()
             .flat_map(|levels| levels.iter())
@@ -268,7 +296,7 @@ impl DedicatedCompactor {
                 &compaction_config,
                 &truncation_cursors,
                 &schema_manager,
-                latest_id,
+                &observation.source,
                 &job_id,
             ) {
                 Ok(()) => {
@@ -291,6 +319,30 @@ impl DedicatedCompactor {
         Ok(())
     }
 
+    fn load_observation(&self) -> Result<Option<DedicatedObservation>> {
+        if self
+            .config
+            .runtime_manifests_enabled_for_dedicated_compactor()
+        {
+            let Some(loaded) =
+                RuntimeManifestStore::new(Arc::clone(&self.file_manager)).load_current()?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(DedicatedObservation::from_runtime(loaded)));
+        }
+
+        let snapshot_ids = list_snapshot_manifest_ids(&self.file_manager)?;
+        let Some(snapshot_id) = snapshot_ids.last().copied() else {
+            return Ok(None);
+        };
+        let manifest = load_manifest_for_snapshot(&self.file_manager, snapshot_id)?;
+        Ok(Some(DedicatedObservation::from_snapshot(
+            snapshot_id,
+            manifest,
+        )))
+    }
+
     /// Executes a compaction plan and publishes the result.
     #[allow(clippy::too_many_arguments)]
     fn execute_and_publish(
@@ -302,7 +354,7 @@ impl DedicatedCompactor {
         compaction_config: &CompactionConfig,
         truncation_cursors: &crate::db_state::TruncationCursorMap,
         schema_manager: &Arc<SchemaManager>,
-        base_snapshot_id: u64,
+        source: &DedicatedCompactionSource,
         job_id: &str,
     ) -> Result<()> {
         // Write a lease file so the writer's orphan sweep doesn't delete our outputs
@@ -319,18 +371,11 @@ impl DedicatedCompactor {
                 levels,
                 plan,
                 truncation_cursors,
-                base_snapshot_id,
+                source,
                 job_id,
             )
         } else if plan.trivial_move {
-            self.publish_trivial_move_result(
-                tree_idx,
-                tree_scope,
-                levels,
-                plan,
-                base_snapshot_id,
-                job_id,
-            )
+            self.publish_trivial_move_result(tree_idx, tree_scope, levels, plan, source, job_id)
         } else {
             self.execute_rewrite_and_publish(
                 tree_idx,
@@ -340,7 +385,7 @@ impl DedicatedCompactor {
                 compaction_config,
                 truncation_cursors,
                 schema_manager,
-                base_snapshot_id,
+                source,
                 job_id,
             )
         };
@@ -391,7 +436,7 @@ impl DedicatedCompactor {
         compaction_config: &CompactionConfig,
         truncation_cursors: &crate::db_state::TruncationCursorMap,
         schema_manager: &Arc<SchemaManager>,
-        base_snapshot_id: u64,
+        source: &DedicatedCompactionSource,
         job_id: &str,
     ) -> Result<()> {
         let runs = build_runs_for_plan(levels, plan, compaction_config);
@@ -461,7 +506,7 @@ impl DedicatedCompactor {
         let result_struct = DedicatedCompactionResult {
             version: DEDICATED_COMPACTION_RESULT_VERSION,
             job_id: job_id.to_string(),
-            base_snapshot_id,
+            source: source.clone(),
             lsm_tree_idx: tree_idx,
             tree_scope: tree_scope.clone(),
             operation,
@@ -487,7 +532,7 @@ impl DedicatedCompactor {
         tree_scope: &LSMTreeScope,
         levels: &[Level],
         plan: &crate::compaction::policy::CompactionPlan,
-        base_snapshot_id: u64,
+        source: &DedicatedCompactionSource,
         job_id: &str,
     ) -> Result<()> {
         let input_file = Self::find_plan_file(levels, plan)?;
@@ -502,7 +547,7 @@ impl DedicatedCompactor {
         let result = DedicatedCompactionResult {
             version: DEDICATED_COMPACTION_RESULT_VERSION,
             job_id: job_id.to_string(),
-            base_snapshot_id,
+            source: source.clone(),
             lsm_tree_idx: tree_idx,
             tree_scope: tree_scope.clone(),
             operation,
@@ -529,7 +574,7 @@ impl DedicatedCompactor {
         levels: &[Level],
         plan: &crate::compaction::policy::CompactionPlan,
         truncation_cursors: &crate::db_state::TruncationCursorMap,
-        base_snapshot_id: u64,
+        source: &DedicatedCompactionSource,
         job_id: &str,
     ) -> Result<()> {
         let input_file = Self::find_plan_file(levels, plan)?;
@@ -554,7 +599,7 @@ impl DedicatedCompactor {
         let result = DedicatedCompactionResult {
             version: DEDICATED_COMPACTION_RESULT_VERSION,
             job_id: job_id.to_string(),
-            base_snapshot_id,
+            source: source.clone(),
             lsm_tree_idx: tree_idx,
             tree_scope: tree_scope.clone(),
             operation,

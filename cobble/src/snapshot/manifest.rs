@@ -1,20 +1,20 @@
 use super::{ActiveMemtableSnapshotData, DbSnapshot};
 use crate::data_file::{DataFile, DataFileType};
-use crate::db_state::{LSMTreeScope, TruncationCursorId, TruncationCursorMap};
+use crate::db_state::{LSMTreeScope, TruncationCursorMap};
 use crate::error::{Error, Result};
 use crate::file::{
     BufferedWriter, FileManager, MetadataReader, SequentialWriteFile, TrackedFile, TrackedFileId,
-    VLOG_FILE_PRIORITY, lsm_file_priority_for_level,
 };
 use crate::lsm::{LSMTreeVersion, Level};
-pub(crate) use crate::manifest_model::to_hex;
 pub(crate) use crate::manifest_model::{
     ManifestFile, ManifestLevel, ManifestTruncationCursor, ManifestVlogFile,
 };
 use crate::manifest_model::{
+    build_tree_versions_from_levels, build_truncation_cursors, build_vlog_version_from_files,
     manifest_file_from_data_file as manifest_file_from_data_file_at_path,
     manifest_truncation_cursors, manifest_vlog_files,
 };
+pub(crate) use crate::manifest_model::{from_hex, to_hex};
 use crate::paths::sibling_snapshot_manifest_path;
 use crate::vlog::VlogVersion;
 use serde::{Deserialize, Serialize};
@@ -417,50 +417,10 @@ fn manifest_levels_apply_edits(
     Ok(())
 }
 
-pub(crate) fn from_hex(hex: &str) -> Result<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(Error::IoError(format!(
-            "Invalid hex string length: {}",
-            hex.len()
-        )));
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    let mut idx = 0;
-    while idx < bytes.len() {
-        let hi = hex_value(bytes[idx])?;
-        let lo = hex_value(bytes[idx + 1])?;
-        out.push((hi << 4) | lo);
-        idx += 2;
-    }
-    Ok(out)
-}
-
 pub(crate) fn build_truncation_cursors_from_manifest(
     manifest: &ManifestSnapshot,
 ) -> Result<TruncationCursorMap> {
-    manifest
-        .truncation_cursors
-        .iter()
-        .map(|cursor| {
-            Ok((
-                TruncationCursorId::new(cursor.bucket, cursor.column_family_id),
-                from_hex(&cursor.key)?,
-            ))
-        })
-        .collect()
-}
-
-fn hex_value(byte: u8) -> Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(10 + (byte - b'a')),
-        b'A'..=b'F' => Ok(10 + (byte - b'A')),
-        _ => Err(Error::IoError(format!(
-            "Invalid hex character: {}",
-            byte as char
-        ))),
-    }
+    build_truncation_cursors(&manifest.truncation_cursors)
 }
 
 pub(crate) fn snapshot_manifest_name(id: u64) -> String {
@@ -809,41 +769,7 @@ pub(crate) fn build_tree_versions_from_manifest(
     manifest: &ManifestSnapshot,
     read_only: bool,
 ) -> Result<Vec<LSMTreeVersion>> {
-    build_tree_versions_internal(manifest, |file, ordinal| {
-        let file_type = DataFileType::from_str(&file.file_type).map_err(Error::IoError)?;
-        let start_key = from_hex(&file.start_key)?;
-        let end_key = from_hex(&file.end_key)?;
-        let tracked_id = if read_only {
-            file_manager.register_data_file_readonly(file.file_id, &file.path)?;
-            file_manager
-                .set_data_file_priority(file.file_id, lsm_file_priority_for_level(ordinal))?;
-            TrackedFileId::detached(file.file_id)
-        } else {
-            if !file_manager.has_data_file(file.file_id) {
-                return Err(Error::IoError(format!(
-                    "Restored file {} is not tracked by FileManager",
-                    file.file_id
-                )));
-            }
-            file_manager
-                .set_data_file_priority(file.file_id, lsm_file_priority_for_level(ordinal))?;
-            TrackedFileId::new(file_manager, file.file_id)
-        };
-        let data_file = DataFile::new(
-            file_type,
-            start_key,
-            end_key,
-            file.file_id,
-            tracked_id,
-            file.schema_id,
-            file.size,
-            file.bucket_range_start..=file.bucket_range_end,
-            file.effective_bucket_range_start..=file.effective_bucket_range_end,
-        )
-        .with_vlog_offset(file.vlog_file_seq_offset)
-        .with_separated_values(file.has_separated_values);
-        Ok(Arc::new(data_file))
-    })
+    build_tree_versions_from_levels(file_manager, &manifest.tree_levels, read_only)
 }
 
 /// Build tree scopes from a manifest.
@@ -881,25 +807,7 @@ pub(crate) fn build_vlog_version_from_manifest(
     manifest: &ManifestSnapshot,
     read_only: bool,
 ) -> Result<VlogVersion> {
-    let mut files = Vec::with_capacity(manifest.vlog_files.len());
-    for vlog_file in &manifest.vlog_files {
-        let tracked_id = if read_only {
-            file_manager.register_data_file_readonly(vlog_file.file_id, &vlog_file.path)?;
-            file_manager.set_data_file_priority(vlog_file.file_id, VLOG_FILE_PRIORITY)?;
-            TrackedFileId::detached(vlog_file.file_id)
-        } else {
-            if !file_manager.has_data_file(vlog_file.file_id) {
-                return Err(Error::IoError(format!(
-                    "Restored VLOG file {} is not tracked by FileManager",
-                    vlog_file.file_id
-                )));
-            }
-            file_manager.set_data_file_priority(vlog_file.file_id, VLOG_FILE_PRIORITY)?;
-            TrackedFileId::new(file_manager, vlog_file.file_id)
-        };
-        files.push((vlog_file.file_seq, tracked_id, vlog_file.valid_entries));
-    }
-    Ok(VlogVersion::from_files_with_entries(files))
+    build_vlog_version_from_files(file_manager, &manifest.vlog_files, read_only)
 }
 
 #[cfg(test)]
