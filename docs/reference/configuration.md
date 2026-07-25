@@ -123,6 +123,10 @@ Parquet output.
 | `compaction_remote_failure_mode` | `RemoteCompactionFailureMode` | `FallbackLocal` | Behavior for transient remote compaction failures |
 | `compaction_server_max_concurrent` | `usize` | 4 | Max concurrent tasks on remote server |
 | `compaction_server_max_queued` | `usize` | 64 | Max queued tasks before rejecting |
+| `compaction_mode` | `CompactionMode` | `Embedded` | Run compaction in the writer (`Embedded`) or through a standalone shared-storage process (`Dedicated`) |
+| `runtime_manifest_mode` | `RuntimeManifestMode` | `Auto` | Publish persisted-layout observations: `Auto`, `Enabled`, or `Disabled` |
+| `compaction_dedicated_poll_interval_ms` | `u64` | 1,000 | Poll interval for dedicated compaction results |
+| `compaction_orphan_min_age_ms` | `u64` | 300,000 | Minimum age before abandoned dedicated-compaction job files may be removed |
 
 `compaction_policy` accepts:
 
@@ -137,6 +141,11 @@ Parquet output.
 
 Only transient remote failures use this setting. Permanent protocol, schema, and configuration errors are surfaced to the DB.
 
+`runtime_manifest_mode=auto` enables runtime manifests for a dedicated writer and for
+`cobble-cli compact`; embedded writers leave them disabled. Set it to `disabled` to use the
+snapshot-driven dedicated-compaction path, or `enabled` to publish observations from an embedded
+writer. Runtime manifests describe the latest persisted LSM layout; snapshots remain the recovery
+point and the durability proof for an applied dedicated-compaction result.
 
 ### Value Separation
 

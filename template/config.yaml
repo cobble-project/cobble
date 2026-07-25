@@ -62,8 +62,16 @@ compaction_read_ahead_enabled: true
 compaction_remote_addr: null             # "host:port" to enable remote compaction
 compaction_threads: 4
 compaction_remote_timeout_ms: 300000
+compaction_remote_failure_mode: fallback_local  # fallback_local | skip
 compaction_server_max_concurrent: 4
 compaction_server_max_queued: 64
+
+# Compaction process placement.
+# dedicated uses `cobble-cli compact` with the same db_id and shared volumes as the writer.
+compaction_mode: embedded                  # embedded | dedicated
+runtime_manifest_mode: auto               # auto | enabled | disabled
+compaction_dedicated_poll_interval_ms: 1000
+compaction_orphan_min_age_ms: 300000
 
 # Block cache.
 block_cache_size: "64MiB"                # "0" also disables cache

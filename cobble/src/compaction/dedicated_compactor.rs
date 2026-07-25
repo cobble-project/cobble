@@ -47,7 +47,7 @@ use uuid::Uuid;
 /// A standalone dedicated compactor process.
 ///
 /// Created via [`DedicatedCompactor::open`], it runs a main loop that polls for the writer's
-/// latest snapshot, selects a compaction plan, executes the compaction, publishes the result,
+/// latest persisted-layout observation, selects a compaction plan, publishes the result,
 /// and waits for the writer to consume it.
 pub struct DedicatedCompactor {
     db_id: String,
@@ -302,7 +302,7 @@ impl DedicatedCompactor {
                 Ok(()) => {
                     // Step 12: Wait for the writer to delete the result.
                     self.wait_for_result_consumed(&job_id)?;
-                    return Ok(()); // Re-read latest snapshot on next iteration.
+                    return Ok(()); // Re-read the latest observation on the next iteration.
                 }
                 Err(err) => {
                     warn!(

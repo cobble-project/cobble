@@ -2,8 +2,8 @@
 //!
 //! Runtime manifests describe the writer's current persisted LSM layout. They
 //! are intentionally separate from snapshot manifests: snapshots are recovery
-//! points, while runtime manifests are a compact, replaceable observation
-//! stream for services such as a dedicated compactor.
+//! points, while runtime manifests are a compact, append-only observation stream
+//! for services such as a dedicated compactor.
 
 use crate::db_state::LSMTreeScope;
 use crate::error::{Error, Result};
@@ -22,6 +22,7 @@ pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 1;
 pub(crate) const MAX_RUNTIME_MANIFEST_CHAIN_DEPTH: usize = 64;
 const RUNTIME_MANIFEST_DIR: &str = "runtime";
 const RUNTIME_CURRENT_NAME: &str = "runtime/CURRENT";
+const RUNTIME_MANIFEST_PREFIX: &str = "MANIFEST-";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct RuntimeManifest {
@@ -116,7 +117,8 @@ pub(crate) fn build_runtime_manifest(
         return Ok(full);
     };
     validate_runtime_manifest(&base.manifest)?;
-    if base.chain_depth >= MAX_RUNTIME_MANIFEST_CHAIN_DEPTH
+    if current.seq_id < base.manifest.seq_id
+        || base.chain_depth >= MAX_RUNTIME_MANIFEST_CHAIN_DEPTH
         || !has_same_runtime_topology(&base.manifest, &current)
     {
         return Ok(full);
@@ -227,6 +229,39 @@ impl RuntimeManifestStore {
         )
     }
 
+    /// Returns a generation that has never been used in this runtime-manifest namespace.
+    ///
+    /// A generation file is durable before `CURRENT` advances. If publication is interrupted
+    /// between those writes, the generation is intentionally orphaned rather than overwritten
+    /// by a retry. Runtime manifests remain append-only until a reader-lease protocol can make
+    /// cross-process garbage collection provably safe.
+    pub(crate) fn allocate_next_generation(&self) -> Result<u64> {
+        self.file_manager
+            .ensure_metadata_dir(RUNTIME_MANIFEST_DIR)?;
+        let mut highest_generation = self.current_generation()?.unwrap_or(0);
+        for name in self
+            .file_manager
+            .list_metadata_names(RUNTIME_MANIFEST_DIR)?
+        {
+            if let Some(generation) = parse_runtime_manifest_generation(&name) {
+                highest_generation = highest_generation.max(generation);
+            }
+        }
+
+        let mut generation = highest_generation.checked_add(1).ok_or_else(|| {
+            Error::InvalidState("Runtime manifest generation space is exhausted".to_string())
+        })?;
+        while self
+            .file_manager
+            .metadata_file_exists_untracked(&runtime_manifest_name(generation))?
+        {
+            generation = generation.checked_add(1).ok_or_else(|| {
+                Error::InvalidState("Runtime manifest generation space is exhausted".to_string())
+            })?;
+        }
+        Ok(generation)
+    }
+
     pub(crate) fn load_current(&self) -> Result<Option<LoadedRuntimeManifest>> {
         self.current_generation()?
             .map(|generation| self.load_generation(generation))
@@ -331,7 +366,14 @@ impl RuntimeManifestStore {
 }
 
 fn runtime_manifest_name(generation: u64) -> String {
-    format!("{RUNTIME_MANIFEST_DIR}/MANIFEST-{generation}")
+    format!("{RUNTIME_MANIFEST_DIR}/{RUNTIME_MANIFEST_PREFIX}{generation}")
+}
+
+fn parse_runtime_manifest_generation(name: &str) -> Option<u64> {
+    name.rsplit('/')
+        .next()
+        .and_then(|name| name.strip_prefix(RUNTIME_MANIFEST_PREFIX))
+        .and_then(|generation| generation.parse().ok())
 }
 
 fn write_metadata_file(file_manager: &FileManager, name: &str, bytes: &[u8]) -> Result<()> {
@@ -822,6 +864,54 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_publish_keeps_current_and_retry_skips_orphan_generation() {
+        let (_dir, store) = test_store();
+        let base = manifest(1, vec![levels(&[1], &[])]);
+        store
+            .publish(&RuntimeManifestEnvelope::full(base.clone()))
+            .unwrap();
+        let loaded_base = store.load_current().unwrap().unwrap();
+
+        // Simulate a crash after MANIFEST-2 is durable but before CURRENT is replaced.
+        let orphan = manifest(2, vec![levels(&[1, 2], &[])]);
+        let orphan_envelope =
+            build_runtime_manifest(orphan, Some(&loaded_base)).expect("build orphan");
+        write_raw(&store, 2, &orphan_envelope);
+        assert_eq!(
+            store.load_current().unwrap().unwrap().manifest,
+            base,
+            "an unpublished generation must not change the authoritative state"
+        );
+
+        let retry_generation = store.allocate_next_generation().unwrap();
+        assert_eq!(retry_generation, 3);
+        let retry = manifest(retry_generation, vec![levels(&[1, 3], &[])]);
+        let retry_envelope =
+            build_runtime_manifest(retry.clone(), Some(&loaded_base)).expect("build retry");
+        store.publish(&retry_envelope).unwrap();
+
+        let loaded = store.load_current().unwrap().unwrap();
+        assert_eq!(loaded.generation, 3);
+        assert_eq!(loaded.manifest, retry);
+        assert_eq!(
+            store
+                .load_chain(3)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.generation)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(
+            store
+                .file_manager
+                .metadata_file_exists_untracked(&runtime_manifest_name(2))
+                .unwrap(),
+            "unreachable generations remain until reader-safe GC exists"
+        );
+    }
+
+    #[test]
     fn l0_append_uses_incremental_and_preserves_order() {
         let (_dir, store) = test_store();
         let base = manifest(1, vec![levels(&[1], &[])]);
@@ -983,6 +1073,21 @@ mod tests {
             )
             .unwrap()
             .manifest,
+            RuntimeManifestPayload::Full(_)
+        ));
+    }
+
+    #[test]
+    fn sequence_rewind_starts_a_new_full_chain() {
+        let mut base = manifest(1, vec![levels(&[1], &[])]);
+        base.seq_id = 10;
+        let mut restored = manifest(2, vec![levels(&[1], &[])]);
+        restored.seq_id = 9;
+
+        assert!(matches!(
+            build_runtime_manifest(restored, Some(&loaded(base, 1)))
+                .unwrap()
+                .manifest,
             RuntimeManifestPayload::Full(_)
         ));
     }

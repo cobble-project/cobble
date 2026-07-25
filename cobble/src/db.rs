@@ -1971,6 +1971,11 @@ mod tests {
             .publish_at_least(current_seq_id)
             .unwrap();
         let barrier = wait_for_runtime_generation_at_least(&store, initial.generation + 1);
+        assert_eq!(
+            barrier.generation,
+            initial.generation + 1,
+            "coalesced no-op observations must not consume generations"
+        );
         assert!(barrier.manifest.seq_id >= current_seq_id);
 
         db.put(0, b"runtime-key", 0, vec![b'x'; 96]).unwrap();
@@ -2172,7 +2177,7 @@ mod tests {
 
     #[test]
     #[serial(file)]
-    fn dedicated_snapshot_mode_keeps_flush_snapshot_compatibility() {
+    fn dedicated_snapshot_mode_publishes_on_flush() {
         let root = "/tmp/db_runtime_manifest_dedicated_snapshot";
         cleanup_test_root(root);
         let mut config = config_with_small_memtable(root);
@@ -2194,10 +2199,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            crate::snapshot::manifest::list_snapshot_manifest_ids(&db.file_manager)
+            !crate::snapshot::manifest::list_snapshot_manifest_ids(&db.file_manager)
                 .unwrap()
-                .len()
-                > 0
+                .is_empty()
         );
         assert!(
             runtime_manifest_store(&db)

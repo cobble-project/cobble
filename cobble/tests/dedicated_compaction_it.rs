@@ -147,14 +147,16 @@ fn runtime_current_exists(root: &str) -> bool {
         };
         entries.flatten().any(|entry| {
             let path = entry.path();
-            path.is_dir().then(|| walk(&path)).unwrap_or_else(|| {
+            if path.is_dir() {
+                walk(&path)
+            } else {
                 path.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
                     && path
                         .parent()
                         .and_then(|parent| parent.file_name())
                         .and_then(|name| name.to_str())
                         == Some("runtime")
-            })
+            }
         })
     }
     walk(std::path::Path::new(root))
@@ -313,7 +315,7 @@ fn dedicated_compaction_disabled_runtime_manifests_uses_snapshots() {
     let mut config = dedicated_config(root);
     config.runtime_manifest_mode = RuntimeManifestMode::Disabled;
 
-    // Explicitly disabled runtime manifests retain the snapshot-driven compatibility path.
+    // Explicitly disabled runtime manifests select the snapshot-driven path.
     let (stop, handle) = spawn_compactor(config.clone(), db_id.clone());
     let db = open_db_with_id(config, &db_id);
     let value = vec![b'v'; 1024];
@@ -437,7 +439,6 @@ fn dedicated_runtime_publish_failure_preserves_result_until_retry() {
 
     // Restore the last valid pointer and mutate persisted state while suspension is still active.
     // The background publisher must not advance CURRENT before result retry proves durability.
-    std::fs::write(&result_file, &valid_result).unwrap();
     std::fs::write(&current, &valid_current).unwrap();
     for i in 0..16u32 {
         db.put(0, format!("post-failure-{i:08}").as_bytes(), 0, &value)
@@ -450,6 +451,7 @@ fn dedicated_runtime_publish_failure_preserves_result_until_retry() {
         "background publication must remain suspended after a failed result barrier"
     );
 
+    std::fs::write(&result_file, &valid_result).unwrap();
     assert!(
         wait_for(Duration::from_secs(15), Duration::from_millis(100), || {
             count_compaction_results(root) == 0
@@ -469,6 +471,93 @@ fn dedicated_runtime_publish_failure_preserves_result_until_retry() {
         verify_get(&db, 0, format!("post-failure-{i:08}").as_bytes(), &value);
     }
     db.close().expect("close");
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn pending_result_and_output_survive_writer_restart() {
+    let root = "/tmp/dedicated_compaction_pending_restart";
+    cleanup_test_root(root);
+    let db_id = "dedicated-compaction-pending-restart".to_string();
+    let mut config = dedicated_config(root);
+    // Leave enough time to stop the first writer after the compactor publishes its result.
+    config.compaction_dedicated_poll_interval_ms = 90_000;
+    let db = open_db_with_id(config.clone(), &db_id);
+    let value = vec![b'v'; 1024];
+    for i in 0..40u32 {
+        db.put(0, format!("restart-{i:08}").as_bytes(), 0, &value)
+            .expect("put");
+    }
+    assert!(wait_for(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || count_data_files(root) > 0 && runtime_current_exists(root)
+    ));
+
+    // Establish the recovery point that the restarted writer will load before it sees the
+    // still-pending result.
+    let recovery_snapshot = db.snapshot().expect("recovery snapshot");
+    assert!(wait_for(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || snapshot_exists(root, recovery_snapshot)
+    ));
+
+    let mut compactor_config = config.clone();
+    compactor_config.compaction_dedicated_poll_interval_ms = 100;
+    let compactor = Arc::new(
+        DedicatedCompactor::open(compactor_config, db_id.clone()).expect("open compactor"),
+    );
+    let compactor_worker = Arc::clone(&compactor);
+    let handle = std::thread::spawn(move || compactor_worker.run_once());
+    let result_published = wait_for(Duration::from_secs(15), Duration::from_millis(20), || {
+        count_compaction_results(root) == 1
+    });
+    compactor.stop();
+    handle.join().unwrap().expect("compactor iteration");
+    assert!(
+        result_published,
+        "compactor should publish a result before the delayed writer poll"
+    );
+    let output_file = find_file(root, |path| {
+        path.extension().and_then(|ext| ext.to_str()) == Some("sst")
+            && path.to_string_lossy().contains("/compaction/jobs/")
+    });
+
+    db.close().expect("close writer with pending result");
+    assert_eq!(count_compaction_results(root), 1);
+    assert!(
+        output_file.exists(),
+        "pending output must survive writer close"
+    );
+
+    let snapshots_before_apply = count_snapshots(root);
+    let mut resume_config = config.clone();
+    resume_config.compaction_dedicated_poll_interval_ms = 100;
+    let resumed = Db::resume(resume_config.clone(), &db_id).expect("resume writer");
+    assert!(
+        wait_for(Duration::from_secs(20), Duration::from_millis(50), || {
+            count_compaction_results(root) == 0 && count_snapshots(root) > snapshots_before_apply
+        }),
+        "resumed writer should durably apply and consume the pending result"
+    );
+    assert!(
+        output_file.exists(),
+        "applied output must remain owned after result consumption"
+    );
+    for i in 0..40u32 {
+        verify_get(&resumed, 0, format!("restart-{i:08}").as_bytes(), &value);
+    }
+    resumed.close().expect("close resumed writer");
+
+    // A second recovery proves the applied output is present in the durable snapshot manifest,
+    // not merely retained by the previous process's in-memory FileManager.
+    let reopened = Db::resume(resume_config, &db_id).expect("reopen applied writer");
+    for i in 0..40u32 {
+        verify_get(&reopened, 0, format!("restart-{i:08}").as_bytes(), &value);
+    }
+    reopened.close().expect("close reopened writer");
     cleanup_test_root(root);
 }
 

@@ -38,6 +38,27 @@ In distributed deployments, compaction can consume significant CPU and I/O on wr
 
 When remote compaction is enabled, the writer serializes the compaction task and sends it to a remote server. The server reads the input files from shared storage, performs the merge, writes output files, and returns the result metadata. The writer then applies the version edit to update its LSM tree. This keeps writer nodes focused on ingestion while background maintenance runs elsewhere.
 
+## Dedicated Compaction
+
+Dedicated compaction uses a standalone process and shared storage instead of a network request.
+Configure the writer with `compaction_mode: dedicated`, then run:
+
+```bash
+cobble-cli compact --config ./config.yaml --db-id <writer-db-id>
+```
+
+The writer and compactor must use the same `db_id` and must both access every configured metadata
+and data volume. The compactor may start before the writer; it waits until the writer publishes its
+first runtime manifest.
+
+With `runtime_manifest_mode: auto` (the default), a dedicated writer publishes the current
+persisted LSM layout and the compactor observes it. Set the mode to `disabled` to use snapshot
+manifests instead. Runtime manifests are observations, not recovery points: snapshots still provide
+recovery and prove that an applied compaction result is durable.
+
+Runtime manifest generations are retained. Safe reclamation is deferred until readers can hold a
+cross-process lease on the chain they opened.
+
 ## Tuning Compaction Behavior
 
 Several configuration parameters let you control how aggressively compaction runs and how it shapes the LSM tree:
@@ -49,6 +70,8 @@ Several configuration parameters let you control how aggressively compaction run
 | `level_size_multiplier` | How much larger each level is than the previous one (default: 10×). Higher values mean fewer levels but more data per compaction. |
 | `base_file_size` | Target output file size. Larger files mean fewer files to manage but coarser-grained compaction. |
 | `compaction_policy` | `RoundRobin` for steady-state or `MinOverlap` for write-optimized workloads. |
+| `compaction_mode` | `Embedded` runs compaction in the writer; `Dedicated` uses `cobble-cli compact`. |
+| `runtime_manifest_mode` | Controls persisted-layout publication for dedicated compaction. |
 
 ## Write Amplification and Space Amplification
 

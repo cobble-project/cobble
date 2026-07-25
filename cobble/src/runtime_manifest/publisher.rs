@@ -38,9 +38,9 @@ struct RuntimeManifestPublisher {
     stop: AtomicBool,
 }
 
-#[derive(Default)]
 struct PublicationState {
     current: Option<LoadedRuntimeManifest>,
+    next_generation: u64,
     suspended_job_id: Option<String>,
 }
 
@@ -56,6 +56,7 @@ impl RuntimeManifestPublisherHandle {
     ) -> Result<Self> {
         let store = RuntimeManifestStore::new(Arc::clone(&file_manager));
         let current = store.load_current()?;
+        let next_generation = store.allocate_next_generation()?;
         let publisher = Arc::new(RuntimeManifestPublisher {
             store,
             file_manager,
@@ -64,6 +65,7 @@ impl RuntimeManifestPublisherHandle {
             lifecycle,
             publication: Mutex::new(PublicationState {
                 current,
+                next_generation,
                 suspended_job_id: None,
             }),
             stop: AtomicBool::new(false),
@@ -181,6 +183,10 @@ impl RuntimeManifestPublisher {
     }
 
     fn publish_at_least(&self, seq_id: u64) -> Result<()> {
+        let mut publication = self.publication.lock().unwrap();
+        if let Some(job_id) = &publication.suspended_job_id {
+            return Err(suspended_publication_error(job_id));
+        }
         let state = self.db_state.load();
         if state.seq_id < seq_id {
             return Err(Error::InvalidState(format!(
@@ -188,34 +194,30 @@ impl RuntimeManifestPublisher {
                 state.seq_id
             )));
         }
-        let mut publication = self.publication.lock().unwrap();
-        if let Some(job_id) = &publication.suspended_job_id {
-            return Err(suspended_publication_error(job_id));
-        }
         self.publish_state_locked(&mut publication, state, true)
     }
 
     fn publish_current(&self) -> Result<()> {
-        let state = self.db_state.load();
         let mut publication = self.publication.lock().unwrap();
         if let Some(job_id) = &publication.suspended_job_id {
             return Err(suspended_publication_error(job_id));
         }
+        let state = self.db_state.load();
         self.publish_state_locked(&mut publication, state, false)
     }
 
     fn publish_initial(&self) -> Result<()> {
-        let state = self.db_state.load();
         let mut publication = self.publication.lock().unwrap();
+        let state = self.db_state.load();
         self.publish_state_locked(&mut publication, state, true)
     }
 
     fn publish_background_current(&self) -> Result<()> {
-        let state = self.db_state.load();
         let mut publication = self.publication.lock().unwrap();
         if publication.suspended_job_id.is_some() {
             return Ok(());
         }
+        let state = self.db_state.load();
         self.publish_state_locked(&mut publication, state, false)
     }
 
@@ -281,10 +283,7 @@ impl RuntimeManifestPublisher {
         state: Arc<DbState>,
         force: bool,
     ) -> Result<()> {
-        let generation = publication
-            .current
-            .as_ref()
-            .map_or(1, |current| current.generation.saturating_add(1));
+        let generation = publication.next_generation;
         let latest_schema_id = self.schema_manager.latest_schema().version();
         // CURRENT is the runtime reader's commit point. Persist schema files first so it never
         // makes a layout visible before that layout's schema can be reconstructed.
@@ -307,6 +306,10 @@ impl RuntimeManifestPublisher {
         }
 
         let envelope = build_runtime_manifest(manifest.clone(), publication.current.as_ref())?;
+        publication.next_generation =
+            publication.next_generation.checked_add(1).ok_or_else(|| {
+                Error::InvalidState("Runtime manifest generation space is exhausted".to_string())
+            })?;
         self.store.publish(&envelope)?;
         publication.current = Some(published_manifest_state(
             manifest,
