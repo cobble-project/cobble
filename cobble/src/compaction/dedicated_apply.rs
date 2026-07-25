@@ -101,26 +101,16 @@ pub(crate) fn apply_external_compaction_result(
     };
 
     match apply_outcome {
-        ApplyOutcome::Applied => {
-            // Step 4: commit via snapshot barrier.
+        ApplyOutcome::Applied | ApplyOutcome::AppliedInMemory => {
+            // Commit via snapshot barrier (or confirm the manifest already proves it).
+            // This is required for BOTH outcomes: Applied needs a fresh manifest;
+            // AppliedInMemory may or may not have a committed manifest from a prior attempt.
+            // Only commit_and_verify (which reads the manifest from disk) can prove durability.
             commit_and_verify(ctx, result)?;
-            // Step 5: make outputs owned, delete result.
+            // Make outputs owned now that the manifest is committed, then delete the result.
             finalize_outputs(ctx, &output_path_to_id)?;
             delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id)?;
             Ok(ExternalCompactionApplyResult::Applied)
-        }
-        ApplyOutcome::AlreadyAppliedInMemory => {
-            // Manifest may or may not be committed. Check and commit if needed.
-            commit_and_verify(ctx, result)?;
-            finalize_outputs(ctx, &output_path_to_id)?;
-            delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id)?;
-            Ok(ExternalCompactionApplyResult::AlreadyApplied)
-        }
-        ApplyOutcome::AlreadyAppliedAndCommitted => {
-            // Already fully committed - just clean up.
-            finalize_outputs(ctx, &output_path_to_id)?;
-            delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id)?;
-            Ok(ExternalCompactionApplyResult::AlreadyApplied)
         }
         ApplyOutcome::Conflict => {
             // Clean up uncommitted outputs and delete result.
@@ -132,10 +122,23 @@ pub(crate) fn apply_external_compaction_result(
 }
 
 /// Internal outcome of the apply step.
+///
+/// The state machine is intentionally simple:
+/// - `Applied`: we just executed `apply_edit` and the in-memory LSM now reflects the operation.
+///   The manifest has **not** been proven committed yet.
+/// - `AppliedInMemory`: the in-memory LSM already reflects the operation (from a previous
+///   attempt that crashed after `apply_edit` but before manifest commit). We do **not** repeat
+///   the edit. The manifest has **not** been proven committed yet.
+/// - `Conflict`: the operation conflicts with the current LSM state. No edit was applied.
+///
+/// In both `Applied` and `AppliedInMemory`, the caller must run `commit_and_verify` to ensure
+/// the manifest is durable before finalizing outputs and deleting the result. Only
+/// `commit_and_verify` (which checks the manifest on disk) can prove the operation is
+/// `Committed` - the in-memory LSM state alone cannot, because a crash after `apply_edit` but
+/// before manifest write would leave the LSM reflecting the operation with no durable record.
 enum ApplyOutcome {
     Applied,
-    AlreadyAppliedInMemory,
-    AlreadyAppliedAndCommitted,
+    AppliedInMemory,
     Conflict,
 }
 
@@ -255,31 +258,48 @@ fn apply_operation(
     }
 }
 
-/// Builds a mapping from compactor output path to writer canonical file id by matching
-/// output paths against the FileManager's tracked data files.
+/// Builds a mapping from compactor output path to writer canonical file id by finding each
+/// output's matching `Arc<DataFile>` in the LSM and using its `file_id` directly.
 ///
-/// Used for `AlreadyApplied` cases where the outputs were registered in a previous apply
-/// attempt. **Every** output must be mapped; if any output path cannot be matched, this
-/// returns an `InvalidState` error (terminal) so the poller cleans up and deletes the result.
+/// This is used for `AppliedInMemory` cases where the outputs are already in the LSM from a
+/// previous apply attempt. By taking the canonical ID from the LSM `DataFile` itself (rather
+/// than from FileManager tracking), we avoid the risk of a tracking inconsistency causing us
+/// to clean up files the LSM still references.
 ///
-/// This is safe to call for AlreadyApplied cases because no LSM modification occurs - the
-/// outputs are already in the LSM. It must NOT be called after a fresh `apply_edit` for a
-/// Pending Rewrite (use the mapping returned by `prepare_outputs` instead).
-fn build_output_path_to_id_map(
-    ctx: &PollerContext,
-    result: &DedicatedCompactionResult,
+/// If an output cannot be found in the LSM, this returns an `Err` (not `TerminalInvalid`) so
+/// the poller preserves the files and retries, rather than deleting them.
+fn build_path_to_id_from_lsm(
+    tree_version: &crate::lsm::LSMTreeVersion,
+    outputs: &[DedicatedDataFile],
+    file_manager: &Arc<FileManager>,
 ) -> Result<HashMap<String, u64>> {
-    let outputs = result.operation.outputs();
     let mut map = HashMap::with_capacity(outputs.len());
     for output in outputs {
-        match find_file_id_by_path(&ctx.file_manager, &output.path) {
+        let found = tree_version.levels.iter().find_map(|level| {
+            level.files.iter().find_map(|f| {
+                if output
+                    .matches_data_file_excluding_id(f, file_manager)
+                    .unwrap_or(false)
+                {
+                    Some(f.file_id)
+                } else {
+                    None
+                }
+            })
+        });
+        match found {
             Some(file_id) => {
                 map.insert(output.path.clone(), file_id);
             }
             None => {
+                // The output is not in the LSM. This is an internal consistency error:
+                // classify_rewrite said inputs are gone (implying the operation was applied),
+                // but the outputs are not in the LSM. Return an error so the poller retries
+                // rather than cleaning up - the files may still be referenced.
                 return Err(Error::InvalidState(format!(
-                    "dedicated compaction result {} could not map output path {} to canonical file id",
-                    result.job_id, output.path
+                    "dedicated compaction result {}: output path {} not found in LSM \
+                     (AppliedInMemory but output missing - consistency error, preserving files)",
+                    output.path, output.path
                 )));
             }
         }
@@ -291,8 +311,10 @@ fn build_output_path_to_id_map(
 ///
 /// For `Pending`: the mapping is built inside `prepare_outputs` (before `apply_edit`), so any
 /// failure leaves the LSM unmodified.
-/// For `AlreadyApplied`/`AlreadyAppliedInMemory`: no LSM modification occurs, so the mapping
-/// is built by matching against tracked files.
+/// For `AppliedInMemory`: no LSM modification occurs. The mapping is built by finding each
+/// output's matching `Arc<DataFile>` in the LSM and using its `file_id` directly. This avoids
+/// relying on FileManager tracking (which may be inconsistent) and prevents unsafe cleanup of
+/// files the LSM still references.
 /// For `Conflict`: no outputs to map (returns empty).
 fn apply_rewrite(
     ctx: &PollerContext,
@@ -329,15 +351,14 @@ fn apply_rewrite(
             ctx.lsm_tree.apply_edit(tree_idx, edit, vlog_edit);
             Ok((ApplyOutcome::Applied, path_to_id))
         }
-        OperationStatus::AlreadyApplied => {
-            // No LSM modification; safe to build mapping from tracked files.
-            let path_to_id = build_output_path_to_id_map(ctx, result)?;
-            Ok((ApplyOutcome::AlreadyAppliedAndCommitted, path_to_id))
-        }
-        OperationStatus::AlreadyAppliedInMemory => {
-            // No LSM modification; safe to build mapping from tracked files.
-            let path_to_id = build_output_path_to_id_map(ctx, result)?;
-            Ok((ApplyOutcome::AlreadyAppliedInMemory, path_to_id))
+        OperationStatus::AppliedInMemory => {
+            // The LSM already reflects this operation. Build the path->id mapping directly
+            // from the matching Arc<DataFile> in the LSM, NOT from FileManager tracking.
+            // If an output can't be found in the LSM, this is an internal consistency error
+            // - we preserve the files (return Err) rather than cleaning up, since the LSM
+            // may still reference them.
+            let path_to_id = build_path_to_id_from_lsm(tree_version, outputs, &ctx.file_manager)?;
+            Ok((ApplyOutcome::AppliedInMemory, path_to_id))
         }
         OperationStatus::Conflict => {
             // No outputs applied; empty mapping.
@@ -347,6 +368,9 @@ fn apply_rewrite(
 }
 
 /// Applies a TrivialMove operation.
+///
+/// TrivialMove has no new output files (the same file Arc is moved between levels), so the
+/// path->id mapping is always empty.
 fn apply_trivial_move(
     ctx: &PollerContext,
     result: &DedicatedCompactionResult,
@@ -366,18 +390,20 @@ fn apply_trivial_move(
         .find(|l| l.ordinal == output_level)
         .map(|l| &l.files);
 
+    let in_target = |f: &Arc<DataFile>| {
+        input
+            .file
+            .matches_data_file(f, &ctx.file_manager)
+            .unwrap_or(false)
+    };
+
     match input_arc {
         Some(arc) => {
-            // Check if it's already in the target level (AlreadyApplied).
+            // Check if it's already in the target level (AppliedInMemory from a prior attempt).
             if let Some(target_files) = target_level_files
-                && target_files.iter().any(|f| {
-                    input
-                        .file
-                        .matches_data_file(f, &ctx.file_manager)
-                        .unwrap_or(false)
-                })
+                && target_files.iter().any(in_target)
             {
-                return Ok(ApplyOutcome::AlreadyAppliedAndCommitted);
+                return Ok(ApplyOutcome::AppliedInMemory);
             }
             // Build the trivial move edit: remove from source, add same Arc to target.
             let edit = VersionEdit {
@@ -401,14 +427,10 @@ fn apply_trivial_move(
         None => {
             // Input not in source level. Check if it's already in the target level.
             if let Some(target_files) = target_level_files
-                && target_files.iter().any(|f| {
-                    input
-                        .file
-                        .matches_data_file(f, &ctx.file_manager)
-                        .unwrap_or(false)
-                })
+                && target_files.iter().any(in_target)
             {
-                return Ok(ApplyOutcome::AlreadyAppliedAndCommitted);
+                // The move is reflected in the LSM but the manifest may not be committed.
+                return Ok(ApplyOutcome::AppliedInMemory);
             }
             Ok(ApplyOutcome::Conflict)
         }
@@ -426,7 +448,7 @@ fn apply_drop(
     let tree_version = db_state.multi_lsm_version.version_of_index(tree_idx);
     let tree_version = &*tree_version;
 
-    // Check if all inputs are still present (Pending) or all gone (AlreadyApplied).
+    // Check if all inputs are still present (Pending) or all gone (AppliedInMemory).
     let all_present = inputs.iter().all(|input| {
         find_file_in_level(tree_version, input.level, &input.file, &ctx.file_manager).is_some()
     });
@@ -453,7 +475,9 @@ fn apply_drop(
         ctx.lsm_tree.apply_edit(tree_idx, edit, vlog_edit);
         Ok(ApplyOutcome::Applied)
     } else if all_gone {
-        Ok(ApplyOutcome::AlreadyAppliedAndCommitted)
+        // Inputs are gone from the LSM. The drop was either applied in a previous attempt
+        // (in-memory) or fully committed. commit_and_verify will check the manifest.
+        Ok(ApplyOutcome::AppliedInMemory)
     } else {
         Ok(ApplyOutcome::Conflict)
     }
@@ -465,8 +489,9 @@ fn apply_drop(
 
 enum OperationStatus {
     Pending,
-    AlreadyApplied,
-    AlreadyAppliedInMemory,
+    /// The in-memory LSM already reflects the operation (inputs gone, outputs present).
+    /// The manifest may or may not be committed - `commit_and_verify` must still run.
+    AppliedInMemory,
     Conflict,
 }
 
@@ -503,28 +528,10 @@ fn classify_rewrite(
         }
         OperationStatus::Pending
     } else if all_inputs_gone {
-        // Check if outputs are present in the LSM (AlreadyApplied) or not (in-memory only).
-        if outputs.is_empty() {
-            // Outputless rewrite: inputs gone = already applied.
-            OperationStatus::AlreadyApplied
-        } else {
-            let all_outputs_present = outputs.iter().all(|output| {
-                tree_version.levels.iter().any(|level| {
-                    level.files.iter().any(|f| {
-                        output
-                            .matches_data_file_excluding_id(f, file_manager)
-                            .unwrap_or(false)
-                    })
-                })
-            });
-            if all_outputs_present {
-                OperationStatus::AlreadyApplied
-            } else {
-                // Inputs gone but outputs not in LSM - was applied in-memory but manifest
-                // not yet committed. The in-memory state has moved on.
-                OperationStatus::AlreadyAppliedInMemory
-            }
-        }
+        // Inputs are gone from the LSM. The operation was either applied in a previous
+        // attempt (in-memory) or fully committed. We cannot tell from the LSM alone -
+        // commit_and_verify will check the manifest. Treat as AppliedInMemory either way.
+        OperationStatus::AppliedInMemory
     } else {
         OperationStatus::Conflict
     }
@@ -867,14 +874,6 @@ fn finalize_outputs(ctx: &PollerContext, output_path_to_id: &HashMap<String, u64
             })?;
     }
     Ok(())
-}
-
-/// Finds the canonical file id assigned to a compactor output by matching its absolute path
-/// against the FileManager's tracked data files.
-fn find_file_id_by_path(file_manager: &Arc<FileManager>, path: &str) -> Option<u64> {
-    // Scan all tracked data files for one whose absolute path matches.
-    // This is O(n) but n is small per result (typically 1-10 output files).
-    file_manager.find_data_file_by_absolute_path(path)
 }
 
 fn cleanup_uncommitted_outputs(
