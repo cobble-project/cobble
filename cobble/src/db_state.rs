@@ -626,10 +626,25 @@ impl DbStateHandle {
     ) -> bool {
         let _guard = self.lock();
         let snapshot = self.load();
-        snapshot
-            .truncation_cursors
-            .advance(bucket, column_family_id, key);
-        self.changed.notify_all();
+        let id = TruncationCursorId::new(bucket, column_family_id);
+        let mut cursors = snapshot.truncation_cursors_snapshot();
+        if cursors
+            .get(&id)
+            .is_some_and(|current| key <= current.as_slice())
+        {
+            return true;
+        }
+        cursors.insert(id, key.to_vec());
+        self.store(DbState {
+            seq_id: self.allocate_seq_id(),
+            bucket_ranges: snapshot.bucket_ranges.clone(),
+            multi_lsm_version: snapshot.multi_lsm_version.clone(),
+            vlog_version: snapshot.vlog_version.clone(),
+            active: snapshot.active.clone(),
+            immutables: snapshot.immutables.clone(),
+            truncation_cursors: new_truncation_cursors_with(cursors),
+            suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+        });
         true
     }
 

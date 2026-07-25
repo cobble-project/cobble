@@ -7,8 +7,13 @@ use crate::file::{
     VLOG_FILE_PRIORITY, lsm_file_priority_for_level,
 };
 use crate::lsm::{LSMTreeVersion, Level};
+pub(crate) use crate::manifest_model::to_hex;
 pub(crate) use crate::manifest_model::{
     ManifestFile, ManifestLevel, ManifestTruncationCursor, ManifestVlogFile,
+};
+use crate::manifest_model::{
+    manifest_file_from_data_file as manifest_file_from_data_file_at_path,
+    manifest_truncation_cursors, manifest_vlog_files,
 };
 use crate::paths::sibling_snapshot_manifest_path;
 use crate::vlog::VlogVersion;
@@ -625,59 +630,26 @@ fn manifest_file_from_data_file(
     file_manager: &FileManager,
 ) -> ManifestFile {
     let path_file_id = file.snapshot_data_file_id().unwrap_or(file.file_id);
-    ManifestFile {
-        file_id: file.file_id,
-        file_type: file.file_type.as_str().to_string(),
-        schema_id: file.schema_id,
-        size: file.size,
-        start_key: to_hex(&file.start_key),
-        end_key: to_hex(&file.end_key),
-        path: tracked_data_files
-            .get(&file.file_id)
-            .map(|tracked| tracked.absolute_path())
-            .or_else(|| file_manager.get_data_file_full_path(path_file_id))
-            .expect("Unknown file ID"),
-        has_separated_values: file.has_separated_values,
-        bucket_range_start: *file.bucket_range.start(),
-        bucket_range_end: *file.bucket_range.end(),
-        effective_bucket_range_start: *file.effective_bucket_range.start(),
-        effective_bucket_range_end: *file.effective_bucket_range.end(),
-        vlog_file_seq_offset: file.vlog_file_seq_offset,
-    }
+    let path = tracked_data_files
+        .get(&file.file_id)
+        .map(|tracked| tracked.absolute_path())
+        .or_else(|| file_manager.get_data_file_full_path(path_file_id))
+        .expect("Unknown file ID");
+    manifest_file_from_data_file_at_path(file, path)
 }
 
 fn manifest_vlog_files_from_snapshot(
     snapshot: &DbSnapshot,
     file_manager: &FileManager,
 ) -> Vec<ManifestVlogFile> {
-    snapshot
-        .vlog_version
-        .files_with_entries()
-        .into_iter()
-        .map(|(file_seq, tracked_id, valid_entries)| ManifestVlogFile {
-            file_seq,
-            file_id: tracked_id.file_id(),
-            path: file_manager
-                .get_data_file_full_path(tracked_id.file_id())
-                .expect("Unknown file ID"),
-            valid_entries,
-        })
-        .collect()
+    manifest_vlog_files(&snapshot.vlog_version, file_manager)
+        .expect("Snapshot references an unknown value-log file")
 }
 
 fn manifest_truncation_cursors_from_snapshot(
     snapshot: &DbSnapshot,
 ) -> Vec<ManifestTruncationCursor> {
-    let mut cursors: Vec<_> = snapshot.truncation_cursors.iter().collect();
-    cursors.sort_by_key(|(id, _)| (id.bucket, id.column_family_id));
-    cursors
-        .into_iter()
-        .map(|(id, key)| ManifestTruncationCursor {
-            bucket: id.bucket,
-            column_family_id: id.column_family_id,
-            key: to_hex(key),
-        })
-        .collect()
+    manifest_truncation_cursors(&snapshot.truncation_cursors)
 }
 
 /// Attempt to build incremental level edits from the base snapshot to the current snapshot.
@@ -769,15 +741,6 @@ fn build_incremental_tree_level_edits(
     } else {
         Some(tree_edits)
     }
-}
-
-pub(crate) fn to_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{:02x}", b);
-    }
-    out
 }
 
 /// Extract the file ID and path references for all data files in the manifest, deduplicating by file ID.

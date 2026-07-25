@@ -64,6 +64,9 @@ pub struct Db {
     ttl_provider: Arc<TTLProvider>,
     /// Dedicated compaction result poller. Only active in `CompactionMode::Dedicated`.
     dedicated_poller: Option<crate::compaction::dedicated_poller::DedicatedCompactionPollerHandle>,
+    /// Durable runtime-manifest publisher for external observers.
+    runtime_manifest_publisher:
+        Option<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>,
 }
 
 pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<Bytes>>>> {
@@ -287,19 +290,25 @@ impl Db {
         let db_lifecycle = Arc::new(DbLifecycle::new_initializing());
         // Fresh open starts from an empty DbState, so bucket-range layout must be initialized here.
         db_state.configure_multi_lsm(config.total_buckets, &bucket_ranges)?;
-        let db = Self::open_with_state(
+        let db = match Self::open_with_state(
             config,
             file_manager,
             db_state,
             Arc::clone(&db_lifecycle),
-            id,
-            Some(db_governance),
+            id.clone(),
+            Some(Arc::clone(&db_governance)),
             bucket_ranges,
             0,
             hybrid_cache_plan,
             metrics_manager,
             schema_manager,
-        )?;
+        ) {
+            Ok(db) => db,
+            Err(err) => {
+                let _ = db_governance.unregister_db(&id);
+                return Err(err);
+            }
+        };
         db.memtable_manager.open()?;
         db.db_lifecycle.mark_open()?;
         Ok(db)
@@ -719,6 +728,10 @@ impl Db {
     }
 
     pub(crate) fn force_close(&self) {
+        if let Some(publisher) = &self.runtime_manifest_publisher {
+            publisher.stop();
+            publisher.join();
+        }
         if let Some(poller) = &self.dedicated_poller {
             poller.stop();
         }
@@ -764,6 +777,17 @@ impl Db {
         if let Some(poller) = &self.dedicated_poller {
             poller.stop();
             poller.join();
+        }
+        if let Some(publisher) = &self.runtime_manifest_publisher
+            && let Err(err) = publisher.publish_current()
+        {
+            self.db_lifecycle.mark_error(err.clone());
+            self.force_close();
+            return Err(err);
+        }
+        if let Some(publisher) = &self.runtime_manifest_publisher {
+            publisher.stop();
+            publisher.join();
         }
         if let Err(err) = self.snapshot_manager.close() {
             self.force_close();
@@ -1077,9 +1101,26 @@ impl Db {
             },
         )?);
 
-        // Mark the DB as open before starting the dedicated poller so the poller's
-        // `ensure_open()` check passes immediately.
+        let runtime_manifest_publisher = if config.runtime_manifests_enabled() {
+            Some(
+                crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle::open(
+                    Arc::clone(&file_manager),
+                    Arc::clone(&schema_manager),
+                    Arc::clone(&db_state),
+                    Arc::clone(&db_lifecycle),
+                )?,
+            )
+        } else {
+            None
+        };
+
+        // Mark the DB as open before starting background observers so their
+        // `ensure_open()` checks pass immediately.
         db_lifecycle.mark_open()?;
+
+        if let Some(publisher) = &runtime_manifest_publisher {
+            publisher.start();
+        }
 
         // Start the dedicated compaction result poller if in dedicated mode.
         let dedicated_poller = if config.compaction_mode == crate::config::CompactionMode::Dedicated
@@ -1120,6 +1161,7 @@ impl Db {
             time_provider,
             ttl_provider,
             dedicated_poller,
+            runtime_manifest_publisher,
         })
     }
 
@@ -1542,12 +1584,14 @@ mod tests {
     use super::*;
     use crate::MergeOperator;
     use crate::db_state::full_bucket_range;
+    use crate::file::{File, SequentialWriteFile};
     use crate::paths::{GOVERNANCE_MANIFEST_POINTER_NAME, snapshot_active_data_relative_path};
     use crate::snapshot::SnapshotLifecycleState;
     use crate::r#type::encode_merge_separated_array;
     use crate::{
-        DbBuilder, DbGovernance, GovernanceMode, ReadOptions, ScanOptions, U32CounterMergeOperator,
-        U64CounterMergeOperator, VolumeDescriptor, WriteOptions,
+        CompactionMode, DbBuilder, DbGovernance, GovernanceMode, ReadOptions, RuntimeManifestMode,
+        ScanOptions, U32CounterMergeOperator, U64CounterMergeOperator, VolumeDescriptor,
+        WriteOptions,
     };
     use bytes::BytesMut;
     use serial_test::serial;
@@ -1578,6 +1622,25 @@ mod tests {
             std::iter::once(full_bucket_range(total_buckets)).collect(),
         )
         .unwrap()
+    }
+
+    fn runtime_manifest_store(db: &Db) -> crate::runtime_manifest::RuntimeManifestStore {
+        crate::runtime_manifest::RuntimeManifestStore::new(Arc::clone(&db.file_manager))
+    }
+
+    fn wait_for_runtime_generation_at_least(
+        store: &crate::runtime_manifest::RuntimeManifestStore,
+        generation: u64,
+    ) -> crate::runtime_manifest::LoadedRuntimeManifest {
+        for _ in 0..100 {
+            if let Some(current) = store.load_current().unwrap()
+                && current.generation >= generation
+            {
+                return current;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("runtime manifest did not reach generation {generation}");
     }
 
     type GovernanceCall = (String, Vec<RangeInclusive<u16>>, u32);
@@ -1864,6 +1927,201 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(db.lsm_tree.level_files(0).len(), 2);
 
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn runtime_manifest_embedded_mode_publishes_initial_flush_and_final_state() {
+        let root = "/tmp/db_runtime_manifest_embedded";
+        cleanup_test_root(root);
+        let mut config = config_with_small_memtable(root);
+        config.runtime_manifest_mode = RuntimeManifestMode::Enabled;
+        config.governance_mode = GovernanceMode::Noop;
+        let db = open_db(config);
+        let store = runtime_manifest_store(&db);
+
+        let initial = store
+            .load_current()
+            .unwrap()
+            .expect("initial runtime manifest");
+        assert!(
+            initial
+                .manifest
+                .tree_levels
+                .iter()
+                .all(|levels| { levels.iter().all(|level| level.files.is_empty()) })
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            store
+                .load_current()
+                .unwrap()
+                .expect("unchanged manifest")
+                .generation,
+            initial.generation
+        );
+
+        let current_seq_id = db.db_state.load().seq_id;
+        db.runtime_manifest_publisher
+            .as_ref()
+            .expect("enabled runtime manifest publisher")
+            .publish_at_least(current_seq_id)
+            .unwrap();
+        let barrier = wait_for_runtime_generation_at_least(&store, initial.generation + 1);
+        assert!(barrier.manifest.seq_id >= current_seq_id);
+
+        db.put(0, b"runtime-key", 0, vec![b'x'; 96]).unwrap();
+        db.memtable_manager.flush_active().unwrap();
+        db.memtable_manager.wait_for_flushes();
+        let flushed = wait_for_runtime_generation_at_least(&store, barrier.generation + 1);
+        assert!(
+            flushed
+                .manifest
+                .tree_levels
+                .iter()
+                .flat_map(|levels| levels.iter())
+                .any(|level| !level.files.is_empty())
+        );
+
+        db.advance_truncation_cursor_by_id(0, DEFAULT_COLUMN_FAMILY_ID, b"runtime-key")
+            .unwrap();
+        let with_cursor = wait_for_runtime_generation_at_least(&store, flushed.generation + 1);
+        assert_eq!(with_cursor.manifest.truncation_cursors.len(), 1);
+
+        db.close().unwrap();
+        let final_manifest = store
+            .load_current()
+            .unwrap()
+            .expect("final runtime manifest");
+        assert!(final_manifest.generation >= with_cursor.generation);
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn runtime_manifest_auto_mode_only_enables_dedicated_compaction() {
+        let embedded_root = "/tmp/db_runtime_manifest_auto_embedded";
+        cleanup_test_root(embedded_root);
+        let mut embedded = config_with_small_memtable(embedded_root);
+        embedded.governance_mode = GovernanceMode::Noop;
+        let db = open_db(embedded);
+        assert!(
+            runtime_manifest_store(&db)
+                .load_current()
+                .unwrap()
+                .is_none()
+        );
+        db.close().unwrap();
+        cleanup_test_root(embedded_root);
+
+        let dedicated_root = "/tmp/db_runtime_manifest_auto_dedicated";
+        cleanup_test_root(dedicated_root);
+        let mut dedicated = config_with_small_memtable(dedicated_root);
+        dedicated.governance_mode = GovernanceMode::Noop;
+        dedicated.compaction_mode = CompactionMode::Dedicated;
+        let db = open_db(dedicated);
+        assert!(
+            runtime_manifest_store(&db)
+                .load_current()
+                .unwrap()
+                .is_some()
+        );
+        db.close().unwrap();
+        cleanup_test_root(dedicated_root);
+
+        let disabled_root = "/tmp/db_runtime_manifest_dedicated_disabled";
+        cleanup_test_root(disabled_root);
+        let mut disabled = config_with_small_memtable(disabled_root);
+        disabled.governance_mode = GovernanceMode::Noop;
+        disabled.compaction_mode = CompactionMode::Dedicated;
+        disabled.runtime_manifest_mode = RuntimeManifestMode::Disabled;
+        let db = open_db(disabled);
+        assert!(
+            runtime_manifest_store(&db)
+                .load_current()
+                .unwrap()
+                .is_none()
+        );
+        db.close().unwrap();
+        cleanup_test_root(disabled_root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn runtime_manifest_generation_continues_on_reopen() {
+        let root = "/tmp/db_runtime_manifest_reopen";
+        cleanup_test_root(root);
+        let mut config = config_with_small_memtable(root);
+        config.runtime_manifest_mode = RuntimeManifestMode::Enabled;
+        config.governance_mode = GovernanceMode::Noop;
+        let ranges = vec![full_bucket_range(config.total_buckets)];
+
+        let db = DbBuilder::new(config.clone())
+            .bucket_ranges(ranges.clone())
+            .db_id("runtime-manifest-reopen")
+            .open()
+            .unwrap();
+        let first_generation = runtime_manifest_store(&db)
+            .load_current()
+            .unwrap()
+            .expect("initial manifest")
+            .generation;
+        db.close().unwrap();
+
+        let reopened = DbBuilder::new(config)
+            .bucket_ranges(ranges)
+            .db_id("runtime-manifest-reopen")
+            .open()
+            .unwrap();
+        let second_generation = runtime_manifest_store(&reopened)
+            .load_current()
+            .unwrap()
+            .expect("reopened manifest")
+            .generation;
+        assert!(second_generation > first_generation);
+        reopened.close().unwrap();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn runtime_manifest_enabled_open_rejects_corrupt_current_without_overwriting_it() {
+        let root = "/tmp/db_runtime_manifest_corrupt_current";
+        cleanup_test_root(root);
+        let mut config = config_with_small_memtable(root);
+        config.runtime_manifest_mode = RuntimeManifestMode::Enabled;
+        config.governance_mode = GovernanceMode::Noop;
+        let ranges = vec![full_bucket_range(config.total_buckets)];
+        let db_id = "runtime-manifest-corrupt-current";
+
+        let db = DbBuilder::new(config.clone())
+            .bucket_ranges(ranges.clone())
+            .db_id(db_id)
+            .open()
+            .unwrap();
+        let file_manager = Arc::clone(&db.file_manager);
+        db.close().unwrap();
+        let mut writer = file_manager
+            .create_metadata_file("runtime/CURRENT")
+            .unwrap();
+        writer.write(b"not-a-generation\n").unwrap();
+        writer.close().unwrap();
+
+        let error = match DbBuilder::new(config)
+            .bucket_ranges(ranges)
+            .db_id(db_id)
+            .open()
+        {
+            Ok(_) => panic!("corrupt runtime CURRENT unexpectedly opened the DB"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Runtime CURRENT"));
+        assert!(
+            crate::runtime_manifest::RuntimeManifestStore::new(file_manager)
+                .load_current()
+                .is_err()
+        );
         cleanup_test_root(root);
     }
 

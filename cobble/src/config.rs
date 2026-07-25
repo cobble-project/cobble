@@ -133,15 +133,28 @@ pub enum RemoteCompactionFailureMode {
 /// - `Embedded` (default): compaction runs in-process via a local or remote worker.
 /// - `Dedicated`: compaction is performed by a separate dedicated compactor process. The writer
 ///   disables all in-process compaction (local and remote) and auto-split, and instead polls the
-///   shared volume for compaction result files produced by the compactor. Dedicated mode
-///   implicitly enables `snapshot_on_flush` so the compactor can observe the writer's latest LSM
-///   state via manifest files. `Dedicated` and `compaction_remote_addr` are mutually exclusive.
+///   shared volume for compaction result files. Runtime manifests are enabled by default; when
+///   disabled, the existing snapshot-driven publication path remains available. `Dedicated` and
+///   `compaction_remote_addr` are mutually exclusive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionMode {
     #[default]
     Embedded,
     Dedicated,
+}
+
+/// Controls publication of durable manifests for the persisted runtime LSM state.
+///
+/// `Auto` enables them for dedicated compaction and leaves them off for embedded compaction.
+/// `Enabled` and `Disabled` explicitly override that default.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeManifestMode {
+    #[default]
+    Auto,
+    Enabled,
+    Disabled,
 }
 
 /// Primary-volume offload policy selection.
@@ -759,6 +772,8 @@ pub struct Config {
     /// Compaction execution mode. `Dedicated` disables in-process compaction and uses a separate
     /// compactor process that communicates via the shared volume.
     pub compaction_mode: CompactionMode,
+    /// Controls durable runtime-manifest publication for external observers.
+    pub runtime_manifest_mode: RuntimeManifestMode,
     /// Poll interval (milliseconds) for the writer's dedicated compaction result poller.
     pub compaction_dedicated_poll_interval_ms: u64,
     /// Minimum age (milliseconds) for orphan compaction job directories before they can be
@@ -876,6 +891,7 @@ impl Default for Config {
             compaction_server_max_concurrent: 4,
             compaction_server_max_queued: 64,
             compaction_mode: CompactionMode::Embedded,
+            runtime_manifest_mode: RuntimeManifestMode::Auto,
             compaction_dedicated_poll_interval_ms: 1_000,
             compaction_orphan_min_age_ms: 300_000,
             block_cache_size: Size::from_mib(64),
@@ -943,6 +959,15 @@ impl Config {
 }
 
 impl Config {
+    /// Returns whether this DB should publish runtime manifests.
+    pub fn runtime_manifests_enabled(&self) -> bool {
+        match self.runtime_manifest_mode {
+            RuntimeManifestMode::Auto => self.compaction_mode == CompactionMode::Dedicated,
+            RuntimeManifestMode::Enabled => true,
+            RuntimeManifestMode::Disabled => false,
+        }
+    }
+
     pub fn from_json_str(contents: &str) -> Result<Self> {
         let provided = serde_json::from_str::<JsonValue>(contents)
             .map_err(|err| Error::ConfigError(err.to_string()))?;
@@ -1443,6 +1468,22 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_manifest_mode_resolution() {
+        let mut config = Config::default();
+        assert!(!config.runtime_manifests_enabled());
+
+        config.compaction_mode = super::CompactionMode::Dedicated;
+        assert!(config.runtime_manifests_enabled());
+
+        config.runtime_manifest_mode = super::RuntimeManifestMode::Disabled;
+        assert!(!config.runtime_manifests_enabled());
+
+        config.compaction_mode = super::CompactionMode::Embedded;
+        config.runtime_manifest_mode = super::RuntimeManifestMode::Enabled;
+        assert!(config.runtime_manifests_enabled());
+    }
+
+    #[test]
     fn test_pinned_metadata_level_minus_one_disables_pinning() {
         let config = Config::from_json_str(r#"{"sst_pinned_metadata_max_level":-1}"#).unwrap();
 
@@ -1532,6 +1573,7 @@ mod tests {
             compaction_server_max_concurrent: 8,
             compaction_server_max_queued: 32,
             compaction_mode: super::CompactionMode::Embedded,
+            runtime_manifest_mode: super::RuntimeManifestMode::Enabled,
             compaction_dedicated_poll_interval_ms: 1_000,
             compaction_orphan_min_age_ms: 300_000,
         };

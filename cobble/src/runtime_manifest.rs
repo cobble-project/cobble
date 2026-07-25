@@ -16,6 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
+pub(crate) mod publisher;
+
 pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 1;
 pub(crate) const MAX_RUNTIME_MANIFEST_CHAIN_DEPTH: usize = 64;
 const RUNTIME_MANIFEST_DIR: &str = "runtime";
@@ -91,7 +93,7 @@ impl RuntimeManifestEnvelope {
         }
     }
 
-    fn generation(&self) -> u64 {
+    pub(super) fn generation(&self) -> u64 {
         match &self.manifest {
             RuntimeManifestPayload::Full(manifest) => manifest.generation,
             RuntimeManifestPayload::Incremental(manifest) => manifest.generation,
