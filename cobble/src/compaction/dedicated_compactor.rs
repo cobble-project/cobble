@@ -215,6 +215,27 @@ impl DedicatedCompactor {
         let truncation_cursors = build_truncation_cursors_from_manifest(&manifest)?;
         let tree_scopes = manifest.tree_scopes.clone();
 
+        // Advance the compactor's file-id allocator past all file ids in the manifest.
+        // The compactor's FileManager is a separate instance from the writer's, so its
+        // `next_file_id` starts at 1. Without this, the executor would allocate output file
+        // ids (1, 2, ...) that collide with the writer's canonical ids already registered
+        // readonly via `build_tree_versions_from_manifest`. A collision causes
+        // `register_data_file` to silently keep the old path (via `or_insert_with`), so the
+        // compactor would publish input descriptors with the wrong (output) paths, and the
+        // writer's fingerprint matching would fail.
+        let max_manifest_file_id = manifest
+            .tree_levels
+            .iter()
+            .flat_map(|levels| levels.iter())
+            .flat_map(|level| level.files.iter())
+            .map(|f| f.file_id)
+            .max()
+            .unwrap_or(0);
+        let next = self.file_manager.peek_next_file_id();
+        if next <= max_manifest_file_id {
+            self.file_manager.set_next_file_id(max_manifest_file_id + 1);
+        }
+
         // Step 4: For each tree, try to select a compaction plan.
         let compaction_config = build_compaction_config(&self.config, self.config.num_columns)?;
         for (tree_idx, tree_version) in tree_versions.iter().enumerate() {

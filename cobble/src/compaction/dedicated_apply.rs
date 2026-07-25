@@ -28,7 +28,7 @@ use crate::lsm::{LevelEdit, VersionEdit};
 use crate::snapshot::manifest::load_manifest_for_snapshot;
 use crate::snapshot::{SnapshotCallback, SnapshotManifestInfo};
 use crate::vlog::VlogEdit;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -85,18 +85,21 @@ pub(crate) fn apply_external_compaction_result(
     // writer canonical file id (needed for finalize_outputs).
     let (apply_outcome, output_path_to_id) = match apply_operation(ctx, result) {
         Ok(v) => v,
-        Err(err) => {
-            // Classify the error: I/O errors (file open, registration, remote storage)
-            // are transient and should be retried. Structural errors (input not found,
-            // hex decode) are terminal.
-            if is_transient_error(&err) {
-                return Err(err);
-            }
+        Err(ApplyError::Terminal(err)) => {
             debug!(
                 "dedicated compaction result {} apply error (terminal): {}",
                 result.job_id, err
             );
             return Ok(ExternalCompactionApplyResult::TerminalInvalid);
+        }
+        Err(ApplyError::PreserveAndRetry(err)) => {
+            // Internal consistency error. The LSM may still reference the output files, so
+            // we must NOT clean up the job directory. Return Err so the poller retries.
+            warn!(
+                "dedicated compaction result {} apply error (preserve and retry): {}",
+                result.job_id, err
+            );
+            return Err(err);
         }
     };
 
@@ -232,10 +235,39 @@ fn find_tree_by_scope(ctx: &PollerContext, scope: &LSMTreeScope) -> Result<usize
 // Operation apply
 // ---------------------------------------------------------------------------
 
+/// Classifies an apply-phase error.
+///
+/// - `Terminal`: the result is structurally invalid (bad hex, unknown file type, bad paths,
+///   duplicate ids, scope mismatch). The poller should delete the result and clean up the job
+///   directory.
+/// - `PreserveAndRetry`: an internal consistency error where the in-memory LSM state doesn't
+///   match expectations, but files may still be referenced by the LSM. The poller must **not**
+///   clean up the job directory - it should preserve the files and retry later. This must never
+///   be confused with `Terminal`, which would delete files the LSM still references.
+#[derive(Debug)]
+enum ApplyError {
+    Terminal(Error),
+    PreserveAndRetry(Error),
+}
+
+/// Classifies an error from the apply phase's helper functions (prepare_outputs,
+/// resolve_input_arcs, find_tree_by_scope) into a terminal or preserve-and-retry error.
+///
+/// Storage access errors (`IoError`, `FileSystemError`) are **PreserveAndRetry**: the file or
+/// remote storage might become available on retry, and we must not clean up files that may be
+/// referenced. All other errors (`InvalidState` from bad hex/scope, etc.) are **Terminal**.
+fn classify_apply_error(err: Error) -> ApplyError {
+    if is_transient_error(&err) {
+        ApplyError::PreserveAndRetry(err)
+    } else {
+        ApplyError::Terminal(err)
+    }
+}
+
 fn apply_operation(
     ctx: &PollerContext,
     result: &DedicatedCompactionResult,
-) -> Result<(ApplyOutcome, HashMap<String, u64>)> {
+) -> std::result::Result<(ApplyOutcome, HashMap<String, u64>), ApplyError> {
     match &result.operation {
         DedicatedCompactionOperation::Rewrite {
             inputs,
@@ -272,6 +304,7 @@ fn build_path_to_id_from_lsm(
     tree_version: &crate::lsm::LSMTreeVersion,
     outputs: &[DedicatedDataFile],
     file_manager: &Arc<FileManager>,
+    job_id: &str,
 ) -> Result<HashMap<String, u64>> {
     let mut map = HashMap::with_capacity(outputs.len());
     for output in outputs {
@@ -294,12 +327,13 @@ fn build_path_to_id_from_lsm(
             None => {
                 // The output is not in the LSM. This is an internal consistency error:
                 // classify_rewrite said inputs are gone (implying the operation was applied),
-                // but the outputs are not in the LSM. Return an error so the poller retries
-                // rather than cleaning up - the files may still be referenced.
+                // but the outputs are not in the LSM. The caller maps this to
+                // PreserveAndRetry so the poller preserves files and retries, rather than
+                // cleaning up files the LSM may still reference.
                 return Err(Error::InvalidState(format!(
                     "dedicated compaction result {}: output path {} not found in LSM \
                      (AppliedInMemory but output missing - consistency error, preserving files)",
-                    output.path, output.path
+                    job_id, output.path
                 )));
             }
         }
@@ -322,8 +356,8 @@ fn apply_rewrite(
     inputs: &[crate::compaction::dedicated::DedicatedCompactionInput],
     output_level: u8,
     outputs: &[DedicatedDataFile],
-) -> Result<(ApplyOutcome, HashMap<String, u64>)> {
-    let tree_idx = find_tree_by_scope(ctx, &result.tree_scope)?;
+) -> std::result::Result<(ApplyOutcome, HashMap<String, u64>), ApplyError> {
+    let tree_idx = find_tree_by_scope(ctx, &result.tree_scope).map_err(classify_apply_error)?;
     let db_state = ctx.db_state.load();
     let tree_version = db_state.multi_lsm_version.version_of_index(tree_idx);
     let tree_version = &*tree_version;
@@ -340,9 +374,11 @@ fn apply_rewrite(
         OperationStatus::Pending => {
             // Allocate canonical file ids for outputs and register them readonly.
             // prepare_outputs returns the path->id mapping so we have it before apply_edit.
-            let (prepared_outputs, path_to_id) = prepare_outputs(ctx, outputs, output_level)?;
+            let (prepared_outputs, path_to_id) =
+                prepare_outputs(ctx, outputs, output_level).map_err(classify_apply_error)?;
             // Resolve real input Arcs from the current LSM.
-            let input_arcs = resolve_input_arcs(tree_version, inputs, &ctx.file_manager)?;
+            let input_arcs = resolve_input_arcs(tree_version, inputs, &ctx.file_manager)
+                .map_err(classify_apply_error)?;
             // Build VersionEdit.
             let edit = build_rewrite_edit(input_arcs, inputs, &prepared_outputs, output_level);
             // Build VlogEdit.
@@ -355,9 +391,11 @@ fn apply_rewrite(
             // The LSM already reflects this operation. Build the path->id mapping directly
             // from the matching Arc<DataFile> in the LSM, NOT from FileManager tracking.
             // If an output can't be found in the LSM, this is an internal consistency error
-            // - we preserve the files (return Err) rather than cleaning up, since the LSM
-            // may still reference them.
-            let path_to_id = build_path_to_id_from_lsm(tree_version, outputs, &ctx.file_manager)?;
+            // - we preserve the files (PreserveAndRetry) rather than cleaning up, since the
+            // LSM may still reference them.
+            let path_to_id =
+                build_path_to_id_from_lsm(tree_version, outputs, &ctx.file_manager, &result.job_id)
+                    .map_err(ApplyError::PreserveAndRetry)?;
             Ok((ApplyOutcome::AppliedInMemory, path_to_id))
         }
         OperationStatus::Conflict => {
@@ -376,8 +414,8 @@ fn apply_trivial_move(
     result: &DedicatedCompactionResult,
     input: &crate::compaction::dedicated::DedicatedCompactionInput,
     output_level: u8,
-) -> Result<ApplyOutcome> {
-    let tree_idx = find_tree_by_scope(ctx, &result.tree_scope)?;
+) -> std::result::Result<ApplyOutcome, ApplyError> {
+    let tree_idx = find_tree_by_scope(ctx, &result.tree_scope).map_err(classify_apply_error)?;
     let db_state = ctx.db_state.load();
     let tree_version = db_state.multi_lsm_version.version_of_index(tree_idx);
     let tree_version = &*tree_version;
@@ -399,11 +437,14 @@ fn apply_trivial_move(
 
     match input_arc {
         Some(arc) => {
-            // Check if it's already in the target level (AppliedInMemory from a prior attempt).
+            // If the file is also in the target level, this is an abnormal partial state
+            // (the file exists in both source and target). This is a Conflict, not
+            // AppliedInMemory - otherwise commit_and_verify would wait forever for the
+            // manifest to show "absent from source" while the LSM still has it there.
             if let Some(target_files) = target_level_files
                 && target_files.iter().any(in_target)
             {
-                return Ok(ApplyOutcome::AppliedInMemory);
+                return Ok(ApplyOutcome::Conflict);
             }
             // Build the trivial move edit: remove from source, add same Arc to target.
             let edit = VersionEdit {
@@ -429,7 +470,8 @@ fn apply_trivial_move(
             if let Some(target_files) = target_level_files
                 && target_files.iter().any(in_target)
             {
-                // The move is reflected in the LSM but the manifest may not be committed.
+                // The move is reflected in the LSM (input absent from source, present in
+                // target) but the manifest may not be committed yet.
                 return Ok(ApplyOutcome::AppliedInMemory);
             }
             Ok(ApplyOutcome::Conflict)
@@ -442,8 +484,8 @@ fn apply_drop(
     ctx: &PollerContext,
     result: &DedicatedCompactionResult,
     inputs: &[crate::compaction::dedicated::DedicatedCompactionInput],
-) -> Result<ApplyOutcome> {
-    let tree_idx = find_tree_by_scope(ctx, &result.tree_scope)?;
+) -> std::result::Result<ApplyOutcome, ApplyError> {
+    let tree_idx = find_tree_by_scope(ctx, &result.tree_scope).map_err(classify_apply_error)?;
     let db_state = ctx.db_state.load();
     let tree_version = db_state.multi_lsm_version.version_of_index(tree_idx);
     let tree_version = &*tree_version;
@@ -457,7 +499,8 @@ fn apply_drop(
     });
 
     if all_present {
-        let input_arcs = resolve_input_arcs(tree_version, inputs, &ctx.file_manager)?;
+        let input_arcs = resolve_input_arcs(tree_version, inputs, &ctx.file_manager)
+            .map_err(classify_apply_error)?;
         // Group removals by level.
         let mut level_edits: HashMap<u8, LevelEdit> = HashMap::new();
         for (input, arc) in inputs.iter().zip(input_arcs.iter()) {
@@ -487,6 +530,7 @@ fn apply_drop(
 // Status classification
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, PartialEq, Eq)]
 enum OperationStatus {
     Pending,
     /// The in-memory LSM already reflects the operation (inputs gone, outputs present).
@@ -900,4 +944,187 @@ fn cleanup_uncommitted_outputs(
 /// bucket here.
 pub(crate) fn is_transient_error(err: &Error) -> bool {
     matches!(err, Error::IoError(_) | Error::FileSystemError(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compaction::dedicated::DedicatedCompactionInput;
+    use crate::data_file::{DataFile, DataFileType};
+    use crate::file::TrackedFileId;
+    use crate::lsm::{LSMTreeVersion, Level};
+
+    /// Builds a `DedicatedDataFile` with the given path and key range (hex-encoded keys).
+    fn make_dedicated_file(file_id: u64, path: &str, start: &str, end: &str) -> DedicatedDataFile {
+        DedicatedDataFile {
+            file_id,
+            file_type: "sst".to_string(),
+            path: path.to_string(),
+            schema_id: 1,
+            size: 100,
+            start_key: start.to_string(),
+            end_key: end.to_string(),
+            has_separated_values: false,
+            bucket_range_start: 0,
+            bucket_range_end: 0,
+            effective_bucket_range_start: 0,
+            effective_bucket_range_end: 0,
+            vlog_file_seq_offset: 0,
+        }
+    }
+
+    /// Builds a live `DataFile` Arc for LSM construction.
+    fn make_live_file(file_manager: &Arc<FileManager>, file_id: u64) -> Arc<DataFile> {
+        Arc::new(
+            DataFile::new(
+                DataFileType::SSTable,
+                vec![0u8],
+                vec![255u8],
+                file_id,
+                TrackedFileId::new(file_manager, file_id),
+                1,
+                100,
+                0u16..=0u16,
+                0u16..=0u16,
+            )
+            .with_separated_values(false),
+        )
+    }
+
+    /// Builds an `LSMTreeVersion` with the given files in the specified level.
+    fn make_tree_version(level: u8, files: Vec<Arc<DataFile>>) -> LSMTreeVersion {
+        LSMTreeVersion {
+            levels: vec![Level {
+                ordinal: level,
+                tiered: false,
+                files,
+            }],
+        }
+    }
+
+    /// When all inputs are gone, classify_rewrite must return AppliedInMemory (not
+    /// AlreadyApplied/Committed), regardless of whether outputs are in the LSM. This ensures
+    /// commit_and_verify always runs - the in-memory LSM alone cannot prove manifest durability.
+    #[test]
+    fn test_classify_rewrite_inputs_gone_is_applied_in_memory() {
+        use crate::config::{Config, VolumeDescriptor};
+        use crate::metrics_manager::MetricsManager;
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let base = format!("file://{}", dir.path().display());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(base.clone()),
+            ..Config::default()
+        };
+        let metrics = Arc::new(MetricsManager::new("test"));
+        let fm = Arc::new(FileManager::from_config(&config, "test-db", metrics).unwrap());
+
+        // Create real files on disk so registration succeeds.
+        let (input_id, _) = fm.create_data_file_with_prefix("data").unwrap();
+        let (output_id, _) = fm.create_data_file_with_prefix("data").unwrap();
+        let input_path = fm.get_data_file_full_path(input_id).unwrap();
+        let output_path = fm.get_data_file_full_path(output_id).unwrap();
+
+        let input_file = make_dedicated_file(input_id, &input_path, "00", "ff");
+        let output_file = make_dedicated_file(output_id, &output_path, "00", "ff");
+        let inputs = vec![DedicatedCompactionInput {
+            level: 0,
+            file: input_file,
+        }];
+        let outputs = vec![output_file];
+
+        // Case 1: inputs gone, outputs present in LSM -> AppliedInMemory (not Committed).
+        let live_output = make_live_file(&fm, output_id);
+        let tree_version = make_tree_version(1, vec![live_output]);
+        let status = classify_rewrite(&tree_version, &inputs, &outputs, 1, &fm);
+        assert_eq!(status, OperationStatus::AppliedInMemory);
+
+        // Case 2: inputs gone, outputs NOT in LSM -> still AppliedInMemory (not Conflict).
+        let empty_tree = LSMTreeVersion { levels: vec![] };
+        let status = classify_rewrite(&empty_tree, &inputs, &outputs, 1, &fm);
+        assert_eq!(status, OperationStatus::AppliedInMemory);
+    }
+
+    /// When inputs are present and no outputs exist, classify_rewrite must return Pending.
+    #[test]
+    fn test_classify_rewrite_inputs_present_is_pending() {
+        use crate::config::{Config, VolumeDescriptor};
+        use crate::metrics_manager::MetricsManager;
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let base = format!("file://{}", dir.path().display());
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(base.clone()),
+            ..Config::default()
+        };
+        let metrics = Arc::new(MetricsManager::new("test"));
+        let fm = Arc::new(FileManager::from_config(&config, "test-db", metrics).unwrap());
+
+        // Create a real file so registration and path resolution work.
+        let (input_id, _) = fm.create_data_file_with_prefix("data").unwrap();
+        let (output_id, _) = fm.create_data_file_with_prefix("data").unwrap();
+        let input_path = fm.get_data_file_full_path(input_id).unwrap();
+        let output_path = fm.get_data_file_full_path(output_id).unwrap();
+
+        let input_file = make_dedicated_file(input_id, &input_path, "00", "ff");
+        let live_input = make_live_file(&fm, input_id);
+        let inputs = vec![DedicatedCompactionInput {
+            level: 0,
+            file: input_file,
+        }];
+        let outputs = vec![make_dedicated_file(output_id, &output_path, "00", "ff")];
+        let tree_version = make_tree_version(0, vec![live_input]);
+        let status = classify_rewrite(&tree_version, &inputs, &outputs, 1, &fm);
+        assert_eq!(status, OperationStatus::Pending);
+    }
+
+    /// classify_apply_error must map storage errors to PreserveAndRetry (not Terminal),
+    /// so the poller preserves files instead of cleaning them up.
+    #[test]
+    fn test_classify_apply_error_storage_is_preserve() {
+        let io_err = Error::IoError("disk unavailable".to_string());
+        assert!(matches!(
+            classify_apply_error(io_err),
+            ApplyError::PreserveAndRetry(_)
+        ));
+
+        let fs_err = Error::FileSystemError("s3 down".to_string());
+        assert!(matches!(
+            classify_apply_error(fs_err),
+            ApplyError::PreserveAndRetry(_)
+        ));
+    }
+
+    /// classify_apply_error must map structural errors to Terminal.
+    #[test]
+    fn test_classify_apply_error_structural_is_terminal() {
+        let state_err = Error::InvalidState("bad hex".to_string());
+        assert!(matches!(
+            classify_apply_error(state_err),
+            ApplyError::Terminal(_)
+        ));
+    }
+
+    /// build_path_to_id_from_lsm must return an error (not silently succeed) when an output
+    /// is not found in the LSM. The caller maps this to PreserveAndRetry, ensuring files are
+    /// preserved rather than cleaned up.
+    #[test]
+    fn test_build_path_to_id_from_lsm_missing_output_errors() {
+        use crate::config::{Config, VolumeDescriptor};
+        use crate::metrics_manager::MetricsManager;
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", dir.path().display())),
+            ..Config::default()
+        };
+        let metrics = Arc::new(MetricsManager::new("test"));
+        let fm = Arc::new(FileManager::from_config(&config, "test-db", metrics).unwrap());
+
+        let output = make_dedicated_file(2, "file:///tmp/test/data/b.sst", "00", "ff");
+        let empty_tree = LSMTreeVersion { levels: vec![] };
+        let result = build_path_to_id_from_lsm(&empty_tree, &[output], &fm, "job-1");
+        assert!(result.is_err(), "missing output must produce an error");
+        // The error must NOT be a transient I/O error - it's a structural InvalidState that
+        // the caller maps to PreserveAndRetry.
+        let err = result.unwrap_err();
+        assert!(!is_transient_error(&err));
+    }
 }
