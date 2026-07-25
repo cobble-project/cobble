@@ -4,14 +4,109 @@ on:
   workflow_dispatch:
   release:
     types: [published]
+  workflow_run:
+    workflows: ["Java CI"]
+    types: [completed]
+    branches: [main, "release-*"]
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: false
+
+env:
+  EXPECTED_NATIVE_FILES: |
+    native/macos-aarch64/debug/libcobblejni.dylib
+    native/macos-aarch64/debug/cobble-cli
+    native/macos-aarch64/release/libcobblejni.dylib
+    native/macos-aarch64/release/cobble-cli
+    native/macos-x86_64/debug/libcobblejni.dylib
+    native/macos-x86_64/debug/cobble-cli
+    native/macos-x86_64/release/libcobblejni.dylib
+    native/macos-x86_64/release/cobble-cli
+    native/linux-x86_64/debug/libcobblejni.so
+    native/linux-x86_64/debug/cobble-cli
+    native/linux-x86_64/release/libcobblejni.so
+    native/linux-x86_64/release/cobble-cli
+    native/linux-aarch64/debug/libcobblejni.so
+    native/linux-aarch64/debug/cobble-cli
+    native/linux-aarch64/release/libcobblejni.so
+    native/linux-aarch64/release/cobble-cli
+    native/windows-x86_64/debug/cobblejni.dll
+    native/windows-x86_64/debug/cobble-cli.exe
+    native/windows-x86_64/release/cobblejni.dll
+    native/windows-x86_64/release/cobble-cli.exe
+
 jobs:
+  prepare:
+    name: Prepare build
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        (
+          github.event.workflow_run.head_branch == 'main' ||
+          startsWith(github.event.workflow_run.head_branch, 'release-')
+        ) &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      checkout_sha: ${{ steps.prepare.outputs.checkout_sha }}
+      version: ${{ steps.prepare.outputs.version }}
+      should_build: ${{ steps.prepare.outputs.should_build }}
+      publish_snapshot: ${{ steps.prepare.outputs.publish_snapshot }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Read project version
+        id: prepare
+        shell: bash
+        env:
+          CHECKOUT_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          version="$(
+            python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("cobble-java/java/pom.xml").getroot()
+          namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
+          version = root.findtext("m:version", namespaces=namespace)
+          if not version:
+              raise SystemExit("Missing project version in cobble-java/java/pom.xml")
+          print(version.strip())
+          PY
+          )"
+
+          should_build=true
+          publish_snapshot=false
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+            should_build=false
+            if [[ "${version}" == *-SNAPSHOT ]]; then
+              should_build=true
+              publish_snapshot=true
+            fi
+          fi
+
+          {
+            echo "checkout_sha=${CHECKOUT_SHA}"
+            echo "version=${version}"
+            echo "should_build=${should_build}"
+            echo "publish_snapshot=${publish_snapshot}"
+          } >> "${GITHUB_OUTPUT}"
+
   build-native:
     name: Build native ${{ matrix.platform }}
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ${{ matrix.runner }}
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -20,26 +115,31 @@ jobs:
             runner: macos-26
             target: aarch64-apple-darwin
             lib_file: libcobblejni.dylib
+            cli_file: cobble-cli
             build_features: storage-all
           - platform: macos-x86_64
             runner: macos-26-intel
             target: x86_64-apple-darwin
             lib_file: libcobblejni.dylib
+            cli_file: cobble-cli
             build_features: storage-all
           - platform: linux-x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             lib_file: libcobblejni.so
+            cli_file: cobble-cli
             build_features: storage-all
           - platform: linux-aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             lib_file: libcobblejni.so
+            cli_file: cobble-cli
             build_features: storage-all
           - platform: windows-x86_64
             runner: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
             lib_file: cobblejni.dll
+            cli_file: cobble-cli.exe
             # Windows currently doesn't support these OpenDAL backends in our build:
             # - storage-sftp (openssh crate is unix-only)
             # - storage-hdfs (depends on unix-only libc constants)
@@ -48,18 +148,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_sha }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build debug + release JNI library
+      - name: Build debug + release native binaries
         shell: bash
         run: |
           set -euo pipefail
           cargo build -p cobble-java --features "${{ matrix.build_features }}" --target "${{ matrix.target }}"
+          cargo build -p cobble-cli --features "${{ matrix.build_features }}" --target "${{ matrix.target }}"
           cargo build -p cobble-java --features "${{ matrix.build_features }}" --target "${{ matrix.target }}" --release
+          cargo build -p cobble-cli --features "${{ matrix.build_features }}" --target "${{ matrix.target }}" --release
 
       - name: Stage native artifact
         shell: bash
@@ -68,7 +172,9 @@ jobs:
           mkdir -p "native/${{ matrix.platform }}/debug"
           mkdir -p "native/${{ matrix.platform }}/release"
           cp "target/${{ matrix.target }}/debug/${{ matrix.lib_file }}" "native/${{ matrix.platform }}/debug/${{ matrix.lib_file }}"
+          cp "target/${{ matrix.target }}/debug/${{ matrix.cli_file }}" "native/${{ matrix.platform }}/debug/${{ matrix.cli_file }}"
           cp "target/${{ matrix.target }}/release/${{ matrix.lib_file }}" "native/${{ matrix.platform }}/release/${{ matrix.lib_file }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.cli_file }}" "native/${{ matrix.platform }}/release/${{ matrix.cli_file }}"
 
       - name: Archive native artifact with prefix
         shell: bash
@@ -76,7 +182,10 @@ jobs:
           set -euo pipefail
           archive="native-archive-${{ matrix.platform }}.tar.gz"
           tar -czf "${archive}" "native/${{ matrix.platform }}"
-          tar -tzf "${archive}" | grep -E "^native/${{ matrix.platform }}/(debug|release)/${{ matrix.lib_file }}$"
+          for profile in debug release; do
+            tar -tzf "${archive}" | grep -Fx "native/${{ matrix.platform }}/${profile}/${{ matrix.lib_file }}"
+            tar -tzf "${archive}" | grep -Fx "native/${{ matrix.platform }}/${profile}/${{ matrix.cli_file }}"
+          done
 
       - name: Upload native artifact
         uses: actions/upload-artifact@v5
@@ -87,11 +196,14 @@ jobs:
 
   build-jar:
     name: Assemble multi-platform jar
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-latest
-    needs: build-native
+    needs: [prepare, build-native]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_sha }}
 
       - name: Clean staged native resources
         run: rm -rf cobble-java/java/src/main/resources/native
@@ -118,25 +230,14 @@ jobs:
             tar -xzf "${archive}" -C cobble-java/java/src/main/resources
           done
 
-          expected=(
-            "native/macos-aarch64/debug/libcobblejni.dylib"
-            "native/macos-aarch64/release/libcobblejni.dylib"
-            "native/macos-x86_64/debug/libcobblejni.dylib"
-            "native/macos-x86_64/release/libcobblejni.dylib"
-            "native/linux-x86_64/debug/libcobblejni.so"
-            "native/linux-x86_64/release/libcobblejni.so"
-            "native/linux-aarch64/debug/libcobblejni.so"
-            "native/linux-aarch64/release/libcobblejni.so"
-            "native/windows-x86_64/debug/cobblejni.dll"
-            "native/windows-x86_64/release/cobblejni.dll"
-          )
-          for file in "${expected[@]}"; do
+          while IFS= read -r file; do
+            [[ -z "${file}" ]] && continue
             full_path="cobble-java/java/src/main/resources/${file}"
             if [[ ! -s "${full_path}" ]]; then
               echo "Missing or empty native artifact: ${full_path}" >&2
               exit 1
             fi
-          done
+          done <<< "${EXPECTED_NATIVE_FILES}"
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -148,6 +249,24 @@ jobs:
         working-directory: cobble-java/java
         run: ./mvnw --quiet -DskipTests -Dexec.skip=true -Dcobble.skip.local.native.copy=true package
 
+      - name: Verify packaged native resources
+        working-directory: cobble-java/java
+        shell: bash
+        run: |
+          set -euo pipefail
+          jar_file="$(find target -maxdepth 1 -type f -name 'cobble-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' | head -n 1)"
+          if [[ -z "${jar_file}" ]]; then
+            echo "Missing assembled Cobble Java jar." >&2
+            exit 1
+          fi
+          jar_contents="$(mktemp)"
+          trap 'rm -f "${jar_contents}"' EXIT
+          jar tf "${jar_file}" > "${jar_contents}"
+          while IFS= read -r file; do
+            [[ -z "${file}" ]] && continue
+            grep -Fx "${file}" "${jar_contents}"
+          done <<< "${EXPECTED_NATIVE_FILES}"
+
       - name: Upload jar artifact
         uses: actions/upload-artifact@v5
         with:
@@ -156,10 +275,15 @@ jobs:
           if-no-files-found: error
 
   publish-packages:
-    name: Publish Maven packages
-    if: github.event_name == 'release'
+    name: Publish Maven package
+    if: >-
+      github.event_name == 'release' ||
+      (
+        github.event_name == 'workflow_run' &&
+        needs.prepare.outputs.publish_snapshot == 'true'
+      )
     runs-on: ubuntu-latest
-    needs: build-native
+    needs: [prepare, build-jar]
     env:
       MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
       MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
@@ -168,6 +292,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_sha }}
 
       - name: Clean staged native resources
         run: rm -rf cobble-java/java/src/main/resources/native
@@ -194,25 +320,14 @@ jobs:
             tar -xzf "${archive}" -C cobble-java/java/src/main/resources
           done
 
-          expected=(
-            "native/macos-aarch64/debug/libcobblejni.dylib"
-            "native/macos-aarch64/release/libcobblejni.dylib"
-            "native/macos-x86_64/debug/libcobblejni.dylib"
-            "native/macos-x86_64/release/libcobblejni.dylib"
-            "native/linux-x86_64/debug/libcobblejni.so"
-            "native/linux-x86_64/release/libcobblejni.so"
-            "native/linux-aarch64/debug/libcobblejni.so"
-            "native/linux-aarch64/release/libcobblejni.so"
-            "native/windows-x86_64/debug/cobblejni.dll"
-            "native/windows-x86_64/release/cobblejni.dll"
-          )
-          for file in "${expected[@]}"; do
+          while IFS= read -r file; do
+            [[ -z "${file}" ]] && continue
             full_path="cobble-java/java/src/main/resources/${file}"
             if [[ ! -s "${full_path}" ]]; then
               echo "Missing or empty native artifact: ${full_path}" >&2
               exit 1
             fi
-          done
+          done <<< "${EXPECTED_NATIVE_FILES}"
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -238,10 +353,22 @@ jobs:
           EOF
 
       - name: Set release version from tag
+        if: github.event_name == 'release'
         working-directory: cobble-java/java
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           ./mvnw --quiet versions:set -DnewVersion="${TAG}" -DgenerateBackupPoms=false
+
+      - name: Verify SNAPSHOT version
+        if: github.event_name == 'workflow_run'
+        working-directory: cobble-java/java
+        run: |
+          set -euo pipefail
+          version="$(./mvnw --quiet help:evaluate -Dexpression=project.version -DforceStdout)"
+          if [[ "${version}" != *-SNAPSHOT ]]; then
+            echo "Refusing to publish non-SNAPSHOT version: ${version}" >&2
+            exit 1
+          fi
 
       - name: Import GPG key
         shell: bash

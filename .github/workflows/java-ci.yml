@@ -2,18 +2,20 @@ name: Java CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, "release-*"]
     paths:
       - ".github/workflows/java-ci.yml"
+      - ".github/workflows/java-multi-platform-jar.yml"
       - "cobble-java/**"
       - "cobble/**"
       - "cobble-data-structure/**"
       - "Cargo.toml"
       - "Cargo.lock"
   pull_request:
-    branches: [main, master]
+    branches: [main, master, "release-*"]
     paths:
       - ".github/workflows/java-ci.yml"
+      - ".github/workflows/java-multi-platform-jar.yml"
       - "cobble-java/**"
       - "cobble/**"
       - "cobble-data-structure/**"
