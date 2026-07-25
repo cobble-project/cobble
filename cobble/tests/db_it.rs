@@ -12,6 +12,10 @@ use serde_json::Value as JsonValue;
 use size::Size;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const ASYNC_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const ASYNC_TEST_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 fn cleanup_test_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
@@ -23,18 +27,22 @@ fn wait_for_manifest_in_db(root: &str, db_id: &str, snapshot_id: u64) -> String 
         root,
         bucket_snapshot_manifest_path(db_id, snapshot_id)
     );
-    for _ in 0..50 {
-        if let Ok(payload) = read_metadata_payload_from_path_for_test(&full_path)
-            && let Ok(contents) = std::str::from_utf8(&payload)
-        {
-            return contents.to_string();
+    let deadline = Instant::now() + ASYNC_TEST_TIMEOUT;
+    loop {
+        let last_error = match read_metadata_payload_from_path_for_test(&full_path) {
+            Ok(payload) => match std::str::from_utf8(&payload) {
+                Ok(contents) => return contents.to_string(),
+                Err(error) => format!("manifest is not valid UTF-8: {error}"),
+            },
+            Err(error) => error.to_string(),
+        };
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for snapshot manifest at {full_path}; last error: {last_error}"
+            );
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(ASYNC_TEST_POLL_INTERVAL);
     }
-    let payload = read_metadata_payload_from_path_for_test(full_path).expect("read manifest");
-    std::str::from_utf8(&payload)
-        .expect("manifest utf8")
-        .to_string()
 }
 
 fn wait_for_missing(path: &str) {

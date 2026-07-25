@@ -3,6 +3,7 @@ use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::{CompactionPolicyKind, Config, Db, MetricValue, ReadOptions, VolumeDescriptor};
 use size::Size;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const BASE_KEYS: usize = 6000;
 const UPDATED_START: usize = 2000;
@@ -10,6 +11,8 @@ const UPDATED_END: usize = 5200;
 const MEMTABLE_ONLY_START: usize = BASE_KEYS;
 const MEMTABLE_ONLY_END: usize = BASE_KEYS + 80;
 const DEFAULT_COL1: &[u8] = b"default-col1";
+const ASYNC_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const ASYNC_TEST_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 fn cleanup_test_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
@@ -21,17 +24,17 @@ fn wait_for_manifest_in_db(root: &str, db_id: &str, snapshot_id: u64) {
         root,
         bucket_snapshot_manifest_path(db_id, snapshot_id)
     );
-    for _ in 0..80 {
+    let deadline = Instant::now() + ASYNC_TEST_TIMEOUT;
+    loop {
         if Path::new(&full_path).exists() {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for snapshot manifest at {full_path}"
+        );
+        std::thread::sleep(ASYNC_TEST_POLL_INTERVAL);
     }
-    assert!(
-        Path::new(&full_path).exists(),
-        "snapshot manifest missing at {}",
-        full_path
-    );
 }
 
 fn wait_for_compaction_in_db(db: &Db) {
