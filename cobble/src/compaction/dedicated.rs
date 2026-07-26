@@ -777,6 +777,7 @@ mod tests {
     /// The orphan sweep must not delete:
     /// - Job directories with a fresh lease (active compactor).
     /// - Job directories whose outputs are referenced by the manifest (committed).
+    ///
     /// And must delete:
     /// - Job directories with an expired lease, no result, and no manifest reference (crashed).
     ///

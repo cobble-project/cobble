@@ -284,6 +284,16 @@ where
     }
 }
 
+impl<K, V> Default for MockCache<K, V>
+where
+    K: Eq + Hash + Clone,
+    V: Clone,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CacheHandle, FoyerCache, FoyerCacheBackend};
@@ -340,15 +350,5 @@ mod tests {
         assert!(backend.inner.memory().get(&key).is_none());
 
         assert_eq!(cache.get(&key), Some(value));
-    }
-}
-
-impl<K, V> Default for MockCache<K, V>
-where
-    K: Eq + Hash + Clone,
-    V: Clone,
-{
-    fn default() -> Self {
-        Self::new()
     }
 }

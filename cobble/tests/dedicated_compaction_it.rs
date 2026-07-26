@@ -14,8 +14,8 @@
 //! - The manifest reflects the compacted state.
 //! - Restart after compaction preserves all data.
 use cobble::{
-    CompactionMode, CompactionPolicyKind, Config, Db, DbBuilder, DedicatedCompactor,
-    RuntimeManifestMode,
+    CompactionMode, CompactionPolicyKind, Config, Db, DbBuilder, DedicatedCompactionService,
+    DedicatedCompactor, RuntimeManifestMode,
 };
 use serial_test::serial;
 use size::Size;
@@ -303,6 +303,84 @@ fn test_dedicated_compaction_basic() {
     }
 
     db.close().expect("close");
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn dedicated_service_compacts_multiple_discovered_db_directories() {
+    let root = "/tmp/dedicated_compaction_service_multi_db";
+    cleanup_test_root(root);
+    let parent_a = format!("{root}/cluster-a");
+    let parent_b = format!("{root}/cluster-b");
+    std::fs::create_dir_all(&parent_a).expect("create service scan root A");
+    std::fs::create_dir_all(&parent_b).expect("create service scan root B");
+    let db_a_id = "service-shard-a";
+    let db_b_id = "service-shard-b";
+    let config_a = dedicated_config(&parent_a);
+    let config_b = dedicated_config(&parent_b);
+
+    // The same shard is provided both through its parent and as a direct path. Discovery must
+    // deduplicate it, and the service must also discover a direct DB path under another root.
+    let service = Arc::new(
+        DedicatedCompactionService::open(
+            config_a.clone(),
+            vec![
+                std::path::PathBuf::from(&parent_a),
+                std::path::PathBuf::from(&parent_a).join(db_a_id),
+                std::path::PathBuf::from(&parent_b).join(db_b_id),
+            ],
+            2,
+            Duration::from_millis(100),
+        )
+        .expect("open multi-DB compaction service"),
+    );
+    let service_thread = {
+        let service = Arc::clone(&service);
+        std::thread::Builder::new()
+            .name("test-dedicated-service-scanner".to_string())
+            .spawn(move || service.run().expect("run compaction service"))
+            .expect("spawn compaction service")
+    };
+
+    let db_a = open_db_with_id(config_a, db_a_id);
+    let db_b = open_db_with_id(config_b, db_b_id);
+    let value_a = vec![b'a'; 1024];
+    let value_b = vec![b'b'; 1024];
+    for i in 0..40u32 {
+        db_a.put(0, format!("a-{i:08}").as_bytes(), 0, &value_a)
+            .expect("put shard A");
+        db_b.put(0, format!("b-{i:08}").as_bytes(), 0, &value_b)
+            .expect("put shard B");
+    }
+
+    let db_a_root = format!("{parent_a}/{db_a_id}");
+    let db_b_root = format!("{parent_b}/{db_b_id}");
+    let both_compacted = wait_for(Duration::from_secs(60), Duration::from_millis(200), || {
+        count_snapshots(&db_a_root) > 0
+            && count_snapshots(&db_b_root) > 0
+            && count_compaction_results(&db_a_root) == 0
+            && count_compaction_results(&db_b_root) == 0
+    });
+
+    service.stop();
+    service_thread.join().expect("join compaction service");
+    assert!(
+        both_compacted,
+        "both discovered shards should compact (a snapshots={}, a results={}, \
+         b snapshots={}, b results={})",
+        count_snapshots(&db_a_root),
+        count_compaction_results(&db_a_root),
+        count_snapshots(&db_b_root),
+        count_compaction_results(&db_b_root)
+    );
+
+    for i in 0..40u32 {
+        verify_get(&db_a, 0, format!("a-{i:08}").as_bytes(), &value_a);
+        verify_get(&db_b, 0, format!("b-{i:08}").as_bytes(), &value_b);
+    }
+    db_a.close().expect("close shard A");
+    db_b.close().expect("close shard B");
     cleanup_test_root(root);
 }
 

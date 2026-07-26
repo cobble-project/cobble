@@ -44,11 +44,20 @@ Dedicated compaction uses a standalone process and shared storage instead of a n
 Configure the writer with `compaction_mode: dedicated`, then run:
 
 ```bash
-cobble-cli compact --config ./config.yaml --db-id <writer-db-id>
+cobble-cli compact \
+  --config ./config.yaml \
+  --workers 4 \
+  /var/lib/cobble/orders \
+  /var/lib/cobble/customers/shard-0
 ```
 
-The writer and compactor must use the same `db_id` and must both access every configured metadata
-and data volume. The compactor may start before the writer; it waits until the writer publishes its
+Each directory may be a DB directory or an immediate parent of multiple DB directories. The
+compactor derives the DB ID from each DB directory name, so startup does not require a DB ID list.
+One scanner thread continuously discovers and validates shards; a bounded worker pool compacts
+different shards concurrently while preserving one in-flight job per shard.
+
+The writers and compactor must access every configured metadata and data volume. The compactor may
+start before the writers; it keeps scanning and each shard waits until its writer publishes its
 first runtime manifest.
 
 With `runtime_manifest_mode: auto` (the default), a dedicated writer publishes the current

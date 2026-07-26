@@ -25,7 +25,7 @@ cargo run -p cobble-cli -- --help
 | Command | Description | Required args |
 |---------|-------------|---------------|
 | `remote-compactor` | Start a remote compaction server process | none |
-| `compact` | Run a shared-storage dedicated compactor | `--config <path> --db-id <db-id>` |
+| `compact` | Run a multi-DB shared-storage dedicated compactor | `--config <path> <directory>...` |
 | `web-monitor` | Start the monitor HTTP server/UI | `--config <path>` |
 
 ### `remote-compactor`
@@ -40,16 +40,29 @@ cobble-cli remote-compactor --config ./config.yaml --bind 127.0.0.1:18888
 ### `compact`
 
 ```bash
-cobble-cli compact --config ./config.yaml --db-id orders-shard-0
+cobble-cli compact \
+  --config ./config.yaml \
+  --workers 4 \
+  /var/lib/cobble/orders \
+  /var/lib/cobble/customers/shard-0
 ```
 
 - `--config <path>`: writer-compatible Cobble configuration with access to the same metadata and
   data volumes.
-- `--db-id <db-id>`: the writer database ID.
-- `--poll-interval <ms>`: optional result/observation poll interval override.
+- Each positional directory can be either a DB directory or a parent whose immediate child
+  directories are DBs. Repeat directories as needed; canonical duplicates are ignored.
+- `--workers <n>`: maximum number of DB shards compacted concurrently. Defaults to
+  `compaction_threads`.
+- `--scan-interval <ms>`: directory scan and result/observation poll interval. Defaults to
+  `compaction_dedicated_poll_interval_ms`.
 
-The process can start before its writer. With the default `runtime_manifest_mode: auto`, it waits
-for the writer's first runtime manifest.
+The process derives each `db_id` from the DB directory name; no DB ID argument is required. One
+scanner validates manifests and referenced files, then dispatches eligible shards to the worker
+pool. A shard has at most one in-flight compaction.
+
+The process can start before its writers. It keeps scanning unavailable paths and parent
+directories. With the default `runtime_manifest_mode: auto`, a discovered shard waits for its
+writer's first runtime manifest.
 
 ### `web-monitor`
 

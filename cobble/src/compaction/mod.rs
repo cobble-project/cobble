@@ -8,6 +8,7 @@ pub(crate) mod dedicated;
 pub(crate) mod dedicated_apply;
 pub mod dedicated_compactor;
 pub(crate) mod dedicated_poller;
+pub mod dedicated_service;
 mod executor;
 mod policy;
 mod remote;

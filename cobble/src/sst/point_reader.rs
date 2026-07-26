@@ -584,7 +584,7 @@ mod tests {
 
     impl CacheHandle<BlockCacheKey, CachedBlock> for RecordingCache {
         fn get(&self, key: &BlockCacheKey) -> Option<CachedBlock> {
-            self.gets.lock().unwrap().push(key.kind.clone());
+            self.gets.lock().unwrap().push(key.kind);
             self.entries.lock().unwrap().get(key).cloned()
         }
 

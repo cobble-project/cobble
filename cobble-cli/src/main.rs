@@ -1,7 +1,9 @@
-use cobble::{Config, DedicatedCompactor, RemoteCompactionServer};
+use cobble::{Config, DedicatedCompactionService, RemoteCompactionServer};
 use cobble_web_monitor::{MonitorConfig, MonitorConfigSource, MonitorServer};
 use log::LevelFilter::Info;
 use std::error::Error;
+use std::path::PathBuf;
+use std::time::Duration;
 
 fn main() {
     if let Err(err) = run() {
@@ -116,45 +118,76 @@ fn print_usage() {
         "Usage:\n  \
          cobble-cli remote-compactor [--config <path>] [--bind <host:port>]\n  \
          cobble-cli web-monitor --config <path> [--bind <host:port>]\n  \
-         cobble-cli compact --config <path> --db-id <db-id> [--poll-interval <ms>]\n"
+         cobble-cli compact --config <path> [--workers <n>] [--scan-interval <ms>] \
+<directory> [<directory> ...]\n"
     );
 }
 
 fn run_compact(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut config_path: Option<String> = None;
-    let mut db_id: Option<String> = None;
-    let mut poll_interval_ms: Option<u64> = None;
+    let mut worker_count: Option<usize> = None;
+    let mut scan_interval_ms: Option<u64> = None;
+    let mut paths = Vec::<PathBuf>::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {
-                config_path = args.next();
+                config_path = Some(
+                    args.next()
+                        .ok_or("compact --config requires a path argument")?,
+                );
             }
-            "--db-id" => {
-                db_id = args.next();
+            "--path" => {
+                paths.push(PathBuf::from(
+                    args.next()
+                        .ok_or("compact --path requires a directory argument")?,
+                ));
             }
-            "--poll-interval" => {
-                poll_interval_ms = args.next().and_then(|s| s.parse().ok());
+            "--workers" => {
+                let value = args
+                    .next()
+                    .ok_or("compact --workers requires a positive integer")?;
+                worker_count = Some(
+                    value
+                        .parse()
+                        .map_err(|_| "compact --workers requires a positive integer")?,
+                );
+            }
+            "--scan-interval" | "--poll-interval" => {
+                let value = args
+                    .next()
+                    .ok_or("compact --scan-interval requires milliseconds")?;
+                scan_interval_ms = Some(
+                    value
+                        .parse()
+                        .map_err(|_| "compact --scan-interval requires milliseconds")?,
+                );
             }
             "--help" | "-h" => {
                 print_usage();
                 return Ok(());
             }
-            _ => {
+            _ if arg.starts_with('-') => {
                 return Err(format!("Unknown argument: {}", arg).into());
             }
+            _ => paths.push(PathBuf::from(arg)),
         }
     }
 
     let config_path = config_path.ok_or("compact requires --config <path>")?;
-    let db_id = db_id.ok_or("compact requires --db-id <db-id>")?;
+    if paths.is_empty() {
+        return Err("compact requires at least one DB directory or parent directory".into());
+    }
 
     let mut config = Config::from_path(&config_path)?;
     config.log_console = true;
-    if let Some(ms) = poll_interval_ms {
+    if let Some(ms) = scan_interval_ms {
         config.compaction_dedicated_poll_interval_ms = ms;
     }
-
-    let compactor = DedicatedCompactor::open(config, &db_id)?;
-    compactor.run()?;
+    let worker_count = worker_count.unwrap_or(config.compaction_threads.max(1));
+    let scan_interval = Duration::from_millis(
+        scan_interval_ms.unwrap_or(config.compaction_dedicated_poll_interval_ms),
+    );
+    let service = DedicatedCompactionService::open(config, paths, worker_count, scan_interval)?;
+    service.run()?;
     Ok(())
 }

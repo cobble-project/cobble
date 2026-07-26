@@ -137,6 +137,7 @@ mod writer_options;
 
 pub use compaction::RemoteCompactionServer;
 pub use compaction::dedicated_compactor::DedicatedCompactor;
+pub use compaction::dedicated_service::DedicatedCompactionService;
 pub use config::{
     CompactionMode, CompactionPolicyKind, Config, GovernanceMode, MemtableType,
     PrimaryVolumeOffloadPolicyKind, ReadOptions, RemoteCompactionFailureMode, RuntimeManifestMode,

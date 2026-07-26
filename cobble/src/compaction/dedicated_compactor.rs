@@ -69,6 +69,30 @@ pub struct DedicatedCompactor {
     stop: Arc<AtomicBool>,
 }
 
+/// Lightweight availability result used by the multi-DB service scanner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DedicatedCompactorProbe {
+    /// A durable writer observation exists and its referenced files and schemas are readable.
+    Ready,
+    /// The writer has not published its first configured observation yet.
+    WaitingForObservation,
+    /// A previously published result is still waiting for the writer to consume it.
+    WaitingForResult,
+}
+
+/// Result of one non-blocking scheduling step.
+///
+/// Unlike [`DedicatedCompactor::run_once`], this API never sleeps and never waits for a
+/// published result to disappear. It is intended for a shared worker pool whose scanner owns
+/// retry timing and result-consumption polling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DedicatedCompactionStep {
+    ResultPublished { job_id: String },
+    WaitingForObservation,
+    WaitingForResult,
+    NoPlan,
+}
+
 struct DedicatedObservation {
     source: DedicatedCompactionSource,
     latest_schema_id: u64,
@@ -141,7 +165,10 @@ impl DedicatedCompactor {
         )?);
         let db_lifecycle = Arc::new(DbLifecycle::new_open());
         let compaction_config = build_compaction_config(&config, config.num_columns)?;
-        let executor = CompactionExecutor::new(compaction_config, Arc::clone(&db_lifecycle))?;
+        // Dedicated compaction is driven synchronously by either this instance's run loop or by
+        // a service worker. It must not allocate a private Tokio runtime per DB shard.
+        let executor =
+            CompactionExecutor::new_without_runtime(compaction_config, Arc::clone(&db_lifecycle));
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new(&db_id));
         let poll_interval = Duration::from_millis(config.compaction_dedicated_poll_interval_ms);
         // Compute the heartbeat interval as orphan_min_age / 3 (in ms), capped at poll_interval.
@@ -196,6 +223,40 @@ impl DedicatedCompactor {
     /// Exposed so callers (e.g. tests) can drive the compactor one step at a time instead of
     /// entering the blocking [`run`](Self::run) loop.
     pub fn run_once(&self) -> Result<()> {
+        match self.run_once_step()? {
+            DedicatedCompactionStep::ResultPublished { job_id } => {
+                self.wait_for_result_consumed(&job_id)?;
+            }
+            DedicatedCompactionStep::WaitingForObservation
+            | DedicatedCompactionStep::WaitingForResult
+            | DedicatedCompactionStep::NoPlan => {
+                std::thread::sleep(self.poll_interval);
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates that this shard is ready to be scheduled without executing compaction.
+    ///
+    /// This is intentionally more than a directory probe: the scanner verifies the selected
+    /// runtime/snapshot manifest, all referenced files, schemas, VLOG descriptors, and
+    /// truncation cursors before consuming a worker slot.
+    pub(crate) fn probe(&self) -> Result<DedicatedCompactorProbe> {
+        let existing_jobs = crate::compaction::dedicated::list_dedicated_compaction_result_job_ids(
+            &self.file_manager,
+        )?;
+        if !existing_jobs.is_empty() {
+            return Ok(DedicatedCompactorProbe::WaitingForResult);
+        }
+        let Some(observation) = self.load_observation()? else {
+            return Ok(DedicatedCompactorProbe::WaitingForObservation);
+        };
+        self.validate_observation(&observation)?;
+        Ok(DedicatedCompactorProbe::Ready)
+    }
+
+    /// Executes one scheduling step without sleeping or waiting for writer acknowledgement.
+    pub(crate) fn run_once_step(&self) -> Result<DedicatedCompactionStep> {
         // Step 1: Check if there's an unprocessed result. If so, wait for the writer to delete it.
         let existing_jobs = crate::compaction::dedicated::list_dedicated_compaction_result_job_ids(
             &self.file_manager,
@@ -205,8 +266,7 @@ impl DedicatedCompactor {
                 "waiting for writer to consume {} existing result(s)",
                 existing_jobs.len()
             );
-            std::thread::sleep(self.poll_interval);
-            return Ok(());
+            return Ok(DedicatedCompactionStep::WaitingForResult);
         }
 
         // Step 2: Read the configured durable writer observation source. Runtime manifests are
@@ -214,8 +274,7 @@ impl DedicatedCompactor {
         // started yet, not that we should silently fall back to a snapshot.
         let Some(observation) = self.load_observation()? else {
             debug!("no dedicated compaction observation is available; waiting for writer");
-            std::thread::sleep(self.poll_interval);
-            return Ok(());
+            return Ok(DedicatedCompactionStep::WaitingForObservation);
         };
 
         // Step 3: Rebuild read-only LSM state, schema, truncation cursors.
@@ -300,22 +359,39 @@ impl DedicatedCompactor {
                 &job_id,
             ) {
                 Ok(()) => {
-                    // Step 12: Wait for the writer to delete the result.
-                    self.wait_for_result_consumed(&job_id)?;
-                    return Ok(()); // Re-read the latest observation on the next iteration.
+                    return Ok(DedicatedCompactionStep::ResultPublished { job_id });
                 }
                 Err(err) => {
                     warn!(
                         "compaction job {} failed: {}; will retry on next iteration",
                         job_id, err
                     );
-                    return Ok(());
+                    return Err(err);
                 }
             }
         }
 
-        // No plan found for any tree; sleep before retrying.
-        std::thread::sleep(self.poll_interval);
+        Ok(DedicatedCompactionStep::NoPlan)
+    }
+
+    fn validate_observation(&self, observation: &DedicatedObservation) -> Result<()> {
+        ensure_persisted_files_readable(
+            &self.file_manager,
+            &observation.tree_levels,
+            &observation.vlog_files,
+        )?;
+        let schema_manager = Arc::new(SchemaManager::from_persisted_schema_ids(
+            &self.file_manager,
+            manifest_schema_ids(observation.latest_schema_id, &observation.tree_levels),
+            self.resolver.clone(),
+        )?);
+        let _tree_versions =
+            build_tree_versions_from_levels(&self.file_manager, &observation.tree_levels, true)?;
+        let _vlog_version =
+            build_vlog_version_from_files(&self.file_manager, &observation.vlog_files, true)?;
+        let _truncation_cursors = build_truncation_cursors(&observation.truncation_cursors)?;
+        // Keep the schema manager alive through all descriptor reconstruction above.
+        drop(schema_manager);
         Ok(())
     }
 
