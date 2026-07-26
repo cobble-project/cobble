@@ -118,6 +118,7 @@ mod metrics_manager;
 mod metrics_registry;
 mod parquet;
 pub mod paths;
+mod properties;
 mod read_only_db;
 mod reader;
 mod runtime_manifest;

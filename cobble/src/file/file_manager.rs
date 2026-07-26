@@ -1651,6 +1651,37 @@ impl FileManager {
         ))
     }
 
+    /// Atomically writes a plain, untracked metadata file without the checksum envelope used by
+    /// manifests. Use this for human-readable metadata formats such as TOML.
+    pub(crate) fn write_plain_metadata_file_atomic(
+        &self,
+        name: &str,
+        content: &[u8],
+    ) -> Result<()> {
+        let final_path = self.metadata_file_path(name);
+        let temp_path = format!("{}.tmp-{}", final_path, Uuid::new_v4());
+        let mut writer = self.meta_volume.fs().open_write(&temp_path)?;
+        let write_result = (|| {
+            let mut written = 0;
+            while written < content.len() {
+                let count = writer.write(&content[written..])?;
+                if count == 0 {
+                    return Err(Error::IoError(format!(
+                        "write returned zero bytes for metadata file {name}"
+                    )));
+                }
+                written += count;
+            }
+            writer.close()?;
+            self.meta_volume.fs().rename(&temp_path, &final_path)
+        })();
+        drop(writer);
+        if write_result.is_err() {
+            let _ = self.meta_volume.fs().delete(&temp_path);
+        }
+        write_result
+    }
+
     /// Registers an existing metadata file with the FileManager.
     pub fn register_metadata_file(&self, name: &str, path: &str) -> Result<()> {
         // Verify the file exists

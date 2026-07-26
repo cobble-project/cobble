@@ -14,7 +14,12 @@ Remote compaction offloads the CPU and IO cost of LSM compaction from writer nod
 2. The remote server executes the compaction (reading input files, merging, writing output files).
 3. The result (new file metadata) is sent back to the writer, which applies the version edit to its LSM tree.
 
-Both the writer and the remote compaction server must have access to the same storage volumes.
+Both the writer and the remote compaction server must have access to the same storage volumes. The
+writer publishes `<metadata-volume>/<db-id>/PROPERTIES` as plain TOML. The server reads the
+file for every DB, and the writer atomically refreshes it during startup whenever the sanitized
+configuration changes. The server uses the writer's volume layout from this file for each request
+instead of using its own volume ordering.
+AK/SK and related volume credentials are not persisted; configure them on the server process.
 
 ## Setting Up the Server
 
@@ -22,7 +27,7 @@ Both the writer and the remote compaction server must have access to the same st
 use cobble::{Config, RemoteCompactionServer};
 
 let mut server_config = Config::default();
-server_config.volumes = /* same volumes as writers */;
+server_config.volumes = /* metadata/data access and credentials for writer volumes */;
 
 let server = RemoteCompactionServer::new(server_config)?;
 server.serve("0.0.0.0:9000")?;
@@ -77,7 +82,8 @@ server.serve("0.0.0.0:9000")?;
 
 ## Deployment Notes
 
-- The remote compaction server is **stateless** — it only needs access to the shared storage volumes.
+- The remote compaction server keeps no DB state locally. It reads each DB's shared `PROPERTIES`
+  file and must be configured with the credentials needed to access the referenced volumes.
 - Multiple compaction servers can run behind a load balancer (each writer connects to one server).
 - If the remote server is unavailable, compaction attempts wait up to `compaction_remote_timeout_ms`, then follow `compaction_remote_failure_mode`.
 - Monitor compaction lag on writers to ensure the remote server keeps up with the compaction demand.

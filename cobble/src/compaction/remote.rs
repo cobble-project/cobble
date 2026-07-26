@@ -10,7 +10,7 @@ use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{TruncationCursorId, TruncationCursorMap};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
-use crate::file::{DataVolume, FileId, FileManager, FileManagerOptions, TrackedFileId};
+use crate::file::{FileId, FileManager, TrackedFileId};
 use crate::iterator::SortedRun;
 use crate::lsm::{LSMTree, LevelEdit, VersionEdit};
 use crate::merge_operator::{
@@ -1001,7 +1001,6 @@ pub struct RemoteCompactionServer {
     config: Config,
     runtime: Arc<Runtime>,
     executor: Arc<CompactionExecutor>,
-    data_volumes: Arc<Vec<DataVolume>>,
     request_id: Arc<AtomicU64>,
     metrics_manager: Arc<MetricsManager>,
     merge_operator_map: Arc<Mutex<HashMap<String, Arc<dyn MergeOperator>>>>,
@@ -1023,7 +1022,6 @@ impl RemoteCompactionServer {
             runtime.clone(),
             Arc::new(DbLifecycle::new_open()),
         )?;
-        let data_volumes = FileManager::data_volumes_from_config(&config)?;
         let metrics_manager = Arc::new(MetricsManager::new(Uuid::new_v4().to_string()));
         let mut merge_operator_map: HashMap<String, Arc<dyn MergeOperator>> = HashMap::new();
         for operator in [
@@ -1042,7 +1040,6 @@ impl RemoteCompactionServer {
             config,
             runtime,
             executor: Arc::new(executor),
-            data_volumes: Arc::new(data_volumes),
             request_id: Arc::new(AtomicU64::new(1)),
             metrics_manager,
             merge_operator_map: Arc::new(Mutex::new(merge_operator_map)),
@@ -1130,7 +1127,6 @@ impl RemoteCompactionServer {
         }
         let config = self.config.clone();
         let executor = Arc::clone(&self.executor);
-        let data_volumes = Arc::clone(&self.data_volumes);
         let request_id_counter = Arc::clone(&self.request_id);
         let metrics_manager = Arc::clone(&self.metrics_manager);
         let merge_operator_map = Arc::clone(&self.merge_operator_map);
@@ -1182,7 +1178,6 @@ impl RemoteCompactionServer {
                     let response = match Self::handle_request_with(
                         &config,
                         executor.as_ref(),
-                        data_volumes.clone(),
                         Arc::clone(&metrics_manager),
                         Arc::clone(&merge_operator_map),
                         merge_operator_resolver.clone(),
@@ -1224,14 +1219,12 @@ impl RemoteCompactionServer {
     fn handle_request_with(
         config: &Config,
         executor: &CompactionExecutor,
-        data_volumes: Arc<Vec<DataVolume>>,
         metrics_manager: Arc<MetricsManager>,
         merge_operator_map: Arc<Mutex<HashMap<String, Arc<dyn MergeOperator>>>>,
         merge_operator_resolver: Option<Arc<dyn MergeOperatorResolver>>,
         request: RemoteCompactionRequest,
     ) -> Result<RemoteCompactionOutput> {
-        let file_manager =
-            Self::file_manager_for_with(config, &data_volumes, &request.db_id, &metrics_manager)?;
+        let file_manager = Self::file_manager_for_with(config, &request.db_id, &metrics_manager)?;
         let data_file_type = request.writer_options.data_file_type();
         let num_columns = request.writer_options.num_columns();
         let column_family_id = request.column_family_id;
@@ -1359,18 +1352,18 @@ impl RemoteCompactionServer {
     }
 
     fn file_manager_for_with(
-        config: &Config,
-        data_volumes: &Arc<Vec<DataVolume>>,
+        process_config: &Config,
         db_id: &str,
         metrics_manager: &Arc<MetricsManager>,
     ) -> Result<Arc<FileManager>> {
-        let options = FileManagerOptions {
-            base_dir: db_id.to_string(),
-            base_file_size: config.base_file_size_bytes()?,
-            ..FileManagerOptions::default()
-        };
-        let file_manager =
-            FileManager::new(data_volumes.to_vec(), options, Arc::clone(metrics_manager))?;
+        let bootstrap_file_manager =
+            FileManager::from_config(process_config, db_id, Arc::clone(metrics_manager))?;
+        let config = crate::properties::load_compactor_config(
+            &bootstrap_file_manager,
+            db_id,
+            process_config,
+        )?;
+        let file_manager = FileManager::from_config(&config, db_id, Arc::clone(metrics_manager))?;
         file_manager.set_next_file_id(REMOTE_FILE_ID_START);
         Ok(Arc::new(file_manager))
     }
@@ -1666,19 +1659,19 @@ pub(crate) fn execute_compaction_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::VolumeDescriptor;
     use crate::cache::{
         BlockCache, BlockCacheKind, CachedBlock, MockCache, bucket_scoped_cache_namespace,
     };
     use crate::compaction::{build_sst_writer_options, make_data_file_builder_factory};
     use crate::db_state::{DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion};
-    use crate::file::RandomAccessFile;
+    use crate::file::{File, RandomAccessFile, SequentialWriteFile};
     use crate::format::FileBuildResult;
     use crate::lsm::{LSMTree, LSMTreeVersion, Level};
     use crate::parquet::{ParquetIterator, RandomAccessChunkReader, parquet_row_group_cache_keys};
     use crate::sst::row_codec::{decode_value, encode_key, encode_value};
     use crate::r#type::{Column, Key, KvValue, Value, ValueType};
     use crate::writer_options::WriterOptions;
+    use crate::{VolumeDescriptor, VolumeUsageKind};
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
     use serial_test::serial;
@@ -1688,6 +1681,68 @@ mod tests {
 
     fn cleanup_test_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn test_file_manager(
+        config: &Config,
+        db_id: &str,
+        metrics_manager: &Arc<MetricsManager>,
+    ) -> Arc<FileManager> {
+        let file_manager =
+            Arc::new(FileManager::from_config(config, db_id, Arc::clone(metrics_manager)).unwrap());
+        crate::properties::persist_db_properties(file_manager.as_ref(), db_id, config).unwrap();
+        file_manager
+    }
+
+    #[test]
+    fn remote_file_manager_uses_writer_property_volumes() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let writer_data_dir = tempfile::tempdir().unwrap();
+        let server_data_dir = tempfile::tempdir().unwrap();
+        let db_id = "remote-properties-volume";
+        let writer_config = Config {
+            volumes: vec![
+                VolumeDescriptor::new(
+                    format!("file://{}", meta_dir.path().display()),
+                    vec![VolumeUsageKind::Meta],
+                ),
+                VolumeDescriptor::new(
+                    format!("file://{}", writer_data_dir.path().display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+            ],
+            ..Config::default()
+        };
+        let metrics = Arc::new(MetricsManager::new(db_id));
+        let writer_file_manager =
+            FileManager::from_config(&writer_config, db_id, Arc::clone(&metrics)).unwrap();
+        crate::properties::persist_db_properties(&writer_file_manager, db_id, &writer_config)
+            .unwrap();
+
+        let server_config = Config {
+            volumes: vec![
+                VolumeDescriptor::new(
+                    format!("file://{}", meta_dir.path().display()),
+                    vec![VolumeUsageKind::Meta],
+                ),
+                VolumeDescriptor::new(
+                    format!("file://{}", server_data_dir.path().display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+            ],
+            ..Config::default()
+        };
+        let remote_file_manager =
+            RemoteCompactionServer::file_manager_for_with(&server_config, db_id, &metrics).unwrap();
+        let (file_id, mut writer) = remote_file_manager.create_data_file().unwrap();
+        writer.write(b"property-selected").unwrap();
+        writer.close().unwrap();
+        let output_path = remote_file_manager
+            .get_data_file_full_path(file_id)
+            .unwrap();
+
+        assert!(output_path.starts_with(&format!("file://{}", writer_data_dir.path().display())));
+        assert!(!output_path.starts_with(&format!("file://{}", server_data_dir.path().display())));
     }
 
     fn make_typed_value_bytes(value_type: ValueType, data: &[u8], num_columns: usize) -> Vec<u8> {
@@ -1828,9 +1883,7 @@ mod tests {
         };
         let db_id = "remote-compaction-roundtrip".to_string();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
-        let file_manager = Arc::new(
-            FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
-        );
+        let file_manager = test_file_manager(&config, &db_id, &metrics_manager);
         let mut sst_options = build_sst_writer_options(&config, 0, config.num_columns);
         sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
         let value_payload = vec![b'x'; 128];
@@ -2000,9 +2053,7 @@ mod tests {
         };
         let db_id = "remote-compaction-schema-request".to_string();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
-        let file_manager = Arc::new(
-            FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
-        );
+        let file_manager = test_file_manager(&config, &db_id, &metrics_manager);
 
         // Evolve the schema to version 2, mimicking a writer that registers two column families.
         // Each commit bumps the schema version, exactly like the Flink state backend does when it
@@ -2280,9 +2331,7 @@ mod tests {
         };
         let db_id = "remote-compaction-u64-counter".to_string();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
-        let file_manager = Arc::new(
-            FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
-        );
+        let file_manager = test_file_manager(&config, &db_id, &metrics_manager);
         let mut sst_options = build_sst_writer_options(&config, 0, num_columns);
         sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
 
@@ -2454,9 +2503,7 @@ mod tests {
         };
         let db_id = "remote-compaction-roundtrip-parquet".to_string();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
-        let file_manager = Arc::new(
-            FileManager::from_config(&config, &db_id, Arc::clone(&metrics_manager)).unwrap(),
-        );
+        let file_manager = test_file_manager(&config, &db_id, &metrics_manager);
         let num_columns = config.num_columns;
         let entries_a = (0..40)
             .map(|idx| {

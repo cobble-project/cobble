@@ -71,7 +71,16 @@ fn spawn_compactor(config: Config, db_id: String) -> (Arc<AtomicBool>, JoinHandl
     let handle = std::thread::Builder::new()
         .name("test-dedicated-compactor".to_string())
         .spawn(move || {
-            let compactor = DedicatedCompactor::open(config, db_id).expect("open compactor");
+            let compactor = loop {
+                match DedicatedCompactor::open(config.clone(), db_id.clone()) {
+                    Ok(compactor) => break compactor,
+                    Err(err) if !stop_clone.load(Ordering::SeqCst) => {
+                        eprintln!("waiting to open compactor: {}", err);
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    Err(_) => return,
+                }
+            };
             while !stop_clone.load(Ordering::SeqCst) {
                 if let Err(err) = compactor.run_once() {
                     // Expected when no plan is found.
@@ -647,11 +656,9 @@ fn dedicated_compactor_runtime_missing_corrupt_and_inaccessible_fail_loud() {
     let db_id = "dedicated-compaction-runtime-errors".to_string();
     let config = dedicated_config(root);
 
-    // No writer has started: runtime mode is Idle rather than snapshot fallback or open failure.
-    let compactor = DedicatedCompactor::open(config.clone(), db_id.clone()).expect("open idle");
-    compactor
-        .run_once()
-        .expect("missing runtime manifest is idle");
+    // The writer publishes PROPERTIES before runtime observations. A direct per-DB compactor
+    // cannot open until that volume contract exists; the multi-DB service retries discovery.
+    assert!(DedicatedCompactor::open(config.clone(), db_id.clone()).is_err());
 
     let db = open_db_with_id(config.clone(), &db_id);
     let current = find_file(root, |path| {

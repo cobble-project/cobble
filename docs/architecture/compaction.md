@@ -38,6 +38,14 @@ In distributed deployments, compaction can consume significant CPU and I/O on wr
 
 When remote compaction is enabled, the writer serializes the compaction task and sends it to a remote server. The server reads the input files from shared storage, performs the merge, writes output files, and returns the result metadata. The writer then applies the version edit to update its LSM tree. This keeps writer nodes focused on ingestion while background maintenance runs elsewhere.
 
+Every writable DB publishes a plain TOML `PROPERTIES` file at the root of its metadata directory.
+The writer checks it on every startup and atomically refreshes it when the sanitized configuration
+has changed.
+It records the writer's configuration and authoritative volume layout. Volume credentials are
+removed, including credentials carried through the descriptor fields, URL, or common backend
+options. The remote compactor reads this file per DB when choosing an output volume and restores
+credentials only from its own process configuration.
+
 ## Dedicated Compaction
 
 Dedicated compaction uses a standalone process and shared storage instead of a network request.
@@ -57,8 +65,9 @@ One scanner thread continuously discovers and validates shards; a bounded worker
 different shards concurrently while preserving one in-flight job per shard.
 
 The writers and compactor must access every configured metadata and data volume. The compactor may
-start before the writers; it keeps scanning and each shard waits until its writer publishes its
-first runtime manifest.
+start before the writers; it keeps scanning and each shard waits until its writer publishes
+`PROPERTIES` and its first runtime manifest. Volume order, usage kinds, priorities, paths, and
+limits come from `PROPERTIES`; credentials come only from the compactor process configuration.
 
 With `runtime_manifest_mode: auto` (the default), a dedicated writer publishes the current
 persisted LSM layout and the compactor observes it. Set the mode to `disabled` to use snapshot

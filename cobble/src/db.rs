@@ -940,6 +940,7 @@ impl Db {
         metrics_manager: Arc<MetricsManager>,
         schema_manager: Arc<SchemaManager>,
     ) -> Result<Self> {
+        crate::properties::refresh_db_properties(file_manager.as_ref(), &id, &config)?;
         let time_provider = config.time_provider.create();
         let ttl_config = TtlConfig {
             enabled: config.ttl_enabled,
@@ -1628,6 +1629,57 @@ mod tests {
 
     fn runtime_manifest_store(db: &Db) -> crate::runtime_manifest::RuntimeManifestStore {
         crate::runtime_manifest::RuntimeManifestStore::new(Arc::clone(&db.file_manager))
+    }
+
+    #[test]
+    #[serial(file)]
+    fn writer_persists_plain_db_properties_without_volume_credentials() {
+        let root = "/tmp/db_writer_properties";
+        cleanup_test_root(root);
+        let mut volume = VolumeDescriptor::single_volume(format!("file://{root}")).remove(0);
+        volume.access_id = Some("writer-ak".to_string());
+        volume.secret_key = Some("writer-sk".to_string());
+        let config = Config {
+            volumes: vec![volume],
+            l0_file_limit: 9,
+            ..Config::default()
+        };
+        let db = DbBuilder::new(config.clone())
+            .bucket_ranges(vec![0..=0])
+            .db_id("properties-shard")
+            .open()
+            .unwrap();
+        let properties_path = format!("{root}/properties-shard/PROPERTIES");
+        let contents = std::fs::read_to_string(&properties_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&contents).unwrap();
+
+        assert_eq!(parsed["db_id"].as_str(), Some("properties-shard"));
+        assert_eq!(parsed["config"]["l0_file_limit"].as_integer(), Some(9));
+        assert!(parsed["config"]["volumes"][0].get("access_id").is_none());
+        assert!(parsed["config"]["volumes"][0].get("secret_key").is_none());
+        assert!(!contents.contains("writer-ak"));
+        assert!(!contents.contains("writer-sk"));
+
+        db.close().unwrap();
+
+        let mut restarted_config = config;
+        restarted_config.l0_file_limit = 15;
+        restarted_config.volumes[0].access_id = Some("rotated-ak".to_string());
+        restarted_config.volumes[0].secret_key = Some("rotated-sk".to_string());
+        let restarted = DbBuilder::new(restarted_config)
+            .bucket_ranges(vec![0..=0])
+            .db_id("properties-shard")
+            .open()
+            .unwrap();
+        let refreshed_contents = std::fs::read_to_string(&properties_path).unwrap();
+        let refreshed: toml::Value = toml::from_str(&refreshed_contents).unwrap();
+
+        assert_eq!(refreshed["config"]["l0_file_limit"].as_integer(), Some(15));
+        assert!(!refreshed_contents.contains("rotated-ak"));
+        assert!(!refreshed_contents.contains("rotated-sk"));
+
+        restarted.close().unwrap();
+        cleanup_test_root(root);
     }
 
     fn wait_for_runtime_generation_at_least(

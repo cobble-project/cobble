@@ -16,17 +16,15 @@ pub(crate) use self::file_manager::VLOG_FILE_PRIORITY;
 pub(crate) use self::file_manager::lsm_file_priority_for_level;
 #[cfg(test)]
 pub(crate) use self::file_manager::test_utils;
-pub use self::file_manager::{
-    FileId, FileManager, FileManagerOptions, TrackedFile, TrackedFileId, TrackedWriter,
-};
+pub use self::file_manager::{FileId, FileManager, TrackedFile, TrackedFileId, TrackedWriter};
 pub use self::file_system::{
     FileSystem, FileSystemRegistry, ProcessFileSystemRegistry, ProcessFileSystemRequest,
     clear_process_custom_file_system_registry, register_process_custom_file_system_registry,
 };
-pub(crate) use self::files::read_ahead_runtime;
 pub use self::files::{
     BufferedReader, BufferedWriter, File, RandomAccessFile, ReadAheadBufferedReader,
     SequentialWriteFile,
 };
+pub(crate) use self::files::{ReadAllFile, read_ahead_runtime};
 pub(crate) use self::metadata_io::{MetadataReader, MetadataWriter};
 pub(crate) use self::offload::{PrimaryOffloadFileRef, compare_primary_offload_file_refs};

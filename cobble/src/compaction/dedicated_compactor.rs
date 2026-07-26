@@ -149,15 +149,23 @@ impl DedicatedCompactor {
     /// Opens a dedicated compactor with an optional merge operator resolver.
     #[allow(clippy::too_many_arguments)]
     pub fn open_with_resolver(
-        config: Config,
+        process_config: Config,
         db_id: impl Into<String>,
         resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
     ) -> Result<Self> {
         // Re-validate dedicated compaction constraints. This catches unsafe overrides
         // (e.g. CLI --poll-interval) applied after Config::from_path.
-        config.validate_dedicated_compactor()?;
+        process_config.validate_dedicated_compactor()?;
         let db_id = db_id.into();
         let metrics_manager = Arc::new(MetricsManager::new(&db_id));
+        let bootstrap_file_manager =
+            FileManager::from_config(&process_config, &db_id, Arc::clone(&metrics_manager))?;
+        let config = crate::properties::load_compactor_config(
+            &bootstrap_file_manager,
+            &db_id,
+            &process_config,
+        )?;
+        config.validate_dedicated_compactor()?;
         let file_manager = Arc::new(FileManager::from_config(
             &config,
             &db_id,
@@ -794,5 +802,67 @@ impl LeaseHeartbeatHandle {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CompactionMode, VolumeDescriptor, VolumeUsageKind};
+    use crate::file::{File, SequentialWriteFile};
+
+    #[test]
+    fn dedicated_compactor_uses_writer_property_volumes() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let writer_data_dir = tempfile::tempdir().unwrap();
+        let process_data_dir = tempfile::tempdir().unwrap();
+        let db_id = "dedicated-properties-volume";
+        let writer_config = Config {
+            volumes: vec![
+                VolumeDescriptor::new(
+                    format!("file://{}", meta_dir.path().display()),
+                    vec![VolumeUsageKind::Meta],
+                ),
+                VolumeDescriptor::new(
+                    format!("file://{}", writer_data_dir.path().display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+            ],
+            compaction_mode: CompactionMode::Dedicated,
+            ..Config::default()
+        };
+        let metrics = Arc::new(MetricsManager::new(db_id));
+        let writer_file_manager = FileManager::from_config(&writer_config, db_id, metrics).unwrap();
+        crate::properties::persist_db_properties(&writer_file_manager, db_id, &writer_config)
+            .unwrap();
+
+        let process_config = Config {
+            volumes: vec![
+                VolumeDescriptor::new(
+                    format!("file://{}", meta_dir.path().display()),
+                    vec![VolumeUsageKind::Meta],
+                ),
+                VolumeDescriptor::new(
+                    format!("file://{}", process_data_dir.path().display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+            ],
+            compaction_mode: CompactionMode::Dedicated,
+            ..Config::default()
+        };
+        let compactor = DedicatedCompactor::open(process_config, db_id).unwrap();
+        let (file_id, mut writer) = compactor
+            .file_manager
+            .create_data_file_with_prefix("compaction/jobs/test/data")
+            .unwrap();
+        writer.write(b"property-selected").unwrap();
+        writer.close().unwrap();
+        let output_path = compactor
+            .file_manager
+            .get_data_file_full_path(file_id)
+            .unwrap();
+
+        assert!(output_path.starts_with(&format!("file://{}", writer_data_dir.path().display())));
+        assert!(!output_path.starts_with(&format!("file://{}", process_data_dir.path().display())));
     }
 }
