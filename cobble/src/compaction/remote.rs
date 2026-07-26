@@ -1922,6 +1922,7 @@ mod tests {
             SortedRun::new(0, vec![file_a]),
             SortedRun::new(0, vec![file_b]),
         ];
+        lsm_tree.on_compaction_started(0);
         let handle = worker
             .submit_runs(
                 0,
@@ -2137,6 +2138,7 @@ mod tests {
             SortedRun::new(0, vec![file_a]),
             SortedRun::new(0, vec![file_b]),
         ];
+        lsm_tree.on_compaction_started(0);
         let handle = worker
             .submit_runs(
                 0,
@@ -2396,6 +2398,7 @@ mod tests {
             SortedRun::new(0, vec![newer_file]),
             SortedRun::new(0, vec![older_file]),
         ];
+        lsm_tree.on_compaction_started(0);
         let handle = worker
             .submit_runs(
                 0,
@@ -2554,6 +2557,7 @@ mod tests {
             SortedRun::new(0, vec![file_a]),
             SortedRun::new(0, vec![file_b]),
         ];
+        lsm_tree.on_compaction_started(0);
         let handle = worker
             .submit_runs(
                 0,

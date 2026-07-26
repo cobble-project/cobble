@@ -488,6 +488,7 @@ mod tests {
             Arc::clone(&schema_manager),
         );
 
+        lsm_tree.on_compaction_started(0);
         let handle = worker
             .submit_runs(
                 0,

@@ -765,7 +765,7 @@ impl LSMTree {
         state: &mut LSMTreeState,
         tree_idx: usize,
     ) -> Option<usize> {
-        let expected_scope = state.pending_compaction.remove(&tree_idx).flatten();
+        let expected_scope = state.pending_compaction.remove(&tree_idx)?;
         if self.db_lifecycle.ensure_open().is_err() {
             return None;
         }
@@ -2310,6 +2310,80 @@ mod tests {
         let files = &db_state.load().multi_lsm_version.version_of_index(0).levels[0].files;
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].file_id, replacement.file_id);
+    }
+
+    #[test]
+    fn test_duplicate_compaction_result_does_not_reinstall_non_tiered_output() {
+        let db_state = Arc::new(DbStateHandle::new());
+        let input = create_data_file_with_size(b"m", b"n", 1);
+        let before = create_data_file_with_size(b"a", b"b", 1);
+        let output = create_data_file_with_size(b"m", b"n", 1);
+        let after = create_data_file_with_size(b"t", b"z", 1);
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion {
+                levels: vec![
+                    Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: vec![Arc::clone(&input)],
+                    },
+                    Level {
+                        ordinal: 1,
+                        tiered: false,
+                        files: vec![Arc::clone(&before), Arc::clone(&after)],
+                    },
+                ],
+            }),
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
+            suggested_base_snapshot_id: None,
+        });
+        let lsm_tree = LSMTree::with_state(
+            Arc::clone(&db_state),
+            Arc::new(MetricsManager::new("lsm-test")),
+        );
+        lsm_tree.on_compaction_started(0);
+        let edit = VersionEdit {
+            level_edits: vec![
+                LevelEdit {
+                    level: 0,
+                    removed_files: vec![input],
+                    new_files: Vec::new(),
+                },
+                LevelEdit {
+                    level: 1,
+                    removed_files: Vec::new(),
+                    new_files: vec![Arc::clone(&output)],
+                },
+            ],
+        };
+
+        assert_eq!(
+            lsm_tree.apply_compaction_result(0, edit.clone(), None),
+            Some(0)
+        );
+        assert_eq!(lsm_tree.apply_compaction_result(0, edit, None), None);
+
+        let level = &db_state.load().multi_lsm_version.version_of_index(0).levels[1];
+        assert_eq!(
+            level
+                .files
+                .iter()
+                .map(|file| file.file_id)
+                .collect::<Vec<_>>(),
+            vec![before.file_id, output.file_id, after.file_id]
+        );
+        assert!(
+            level
+                .files
+                .windows(2)
+                .all(|files| files[0].end_key < files[1].start_key),
+            "non-tiered compaction output must remain sorted and non-overlapping"
+        );
     }
 
     #[test]
