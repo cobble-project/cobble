@@ -40,6 +40,17 @@ enum BoundaryState {
     ReadyToResume,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputMode {
+    /// Query and point-read consumers need a logical value. A lone merge operand must therefore
+    /// be resolved into a materialized `Value` before it leaves this iterator.
+    Materialize,
+    /// Flush and compaction are writing another versioned SST. If only one non-terminal encoded
+    /// value survives, forwarding its original bytes preserves the merge operand for future reads
+    /// and avoids a decode-then-encode cycle.
+    PreserveSingleValueForSst,
+}
+
 /// A deduplicating iterator that wraps another iterator and merges
 /// values with the same key.
 ///
@@ -71,6 +82,8 @@ pub struct DeduplicatingIterator<I> {
     on_merge: Option<MergeCallback>,
     /// Whether to allow terminal fast-path that skips collecting older versions.
     allow_terminal_shortcut: bool,
+    /// Representation contract for a lone non-terminal value after deduplication.
+    output_mode: OutputMode,
     /// Merge operators used for column merge semantics.
     schema: Arc<Schema>,
 }
@@ -117,6 +130,45 @@ impl<I> DeduplicatingIterator<I> {
         on_merge: Option<MergeCallback>,
         schema: Arc<Schema>,
     ) -> Self {
+        Self::new_with_output_mode(
+            inner,
+            num_columns,
+            ttl_provider,
+            on_merge,
+            schema,
+            OutputMode::Materialize,
+        )
+    }
+
+    /// Creates an iterator for SST construction.
+    ///
+    /// Unlike a read result, an SST may retain an unresolved merge operand. This constructor lets
+    /// the iterator forward a lone encoded operand when no merge callback needs decoded columns.
+    pub(crate) fn new_for_sst_build(
+        inner: I,
+        num_columns: Option<usize>,
+        ttl_provider: Arc<TTLProvider>,
+        on_merge: Option<MergeCallback>,
+        schema: Arc<Schema>,
+    ) -> Self {
+        Self::new_with_output_mode(
+            inner,
+            num_columns,
+            ttl_provider,
+            on_merge,
+            schema,
+            OutputMode::PreserveSingleValueForSst,
+        )
+    }
+
+    fn new_with_output_mode(
+        inner: I,
+        num_columns: Option<usize>,
+        ttl_provider: Arc<TTLProvider>,
+        on_merge: Option<MergeCallback>,
+        schema: Arc<Schema>,
+        output_mode: OutputMode,
+    ) -> Self {
         let allow_terminal_shortcut = on_merge.is_none();
         Self {
             inner,
@@ -127,6 +179,7 @@ impl<I> DeduplicatingIterator<I> {
             ttl_provider,
             on_merge,
             allow_terminal_shortcut,
+            output_mode,
             schema,
         }
     }
@@ -240,6 +293,17 @@ impl<I> DeduplicatingIterator<I> {
                 continue;
             }
 
+            if self.output_mode == OutputMode::PreserveSingleValueForSst
+                && self.on_merge.is_none()
+                && values.len() == 1
+            {
+                // No older value participates in this key, so preserving the operand is equivalent
+                // to rewriting it after materialization while avoiding both codec passes.
+                self.current_key = Some(current_key);
+                self.current_value = values.pop();
+                return Ok(());
+            }
+
             let column_family_id =
                 key_column_family(current_key.as_ref()).unwrap_or(DEFAULT_COLUMN_FAMILY_ID);
             if let Some(callback) = self.on_merge.as_deref_mut() {
@@ -269,15 +333,12 @@ impl<I> DeduplicatingIterator<I> {
                 }
                 self.current_value = Some(KvValue::Decoded(merged_value));
             } else {
-                // The non-callback path can retain decoded values and batch all merge operands in
-                // Value::merge_all_in_column_family, avoiding pairwise Column::merge calls.
-                let decoded_values: Vec<Value> = values
-                    .into_iter()
-                    .rev()
-                    .map(|value| value.into_decoded(num_columns))
-                    .collect::<Result<Vec<_>>>()?;
-                let merged_value = Value::merge_all_in_column_family(
-                    decoded_values,
+                // Decode directly into the batch merge so the value chain is held only once.
+                let merged_value = Value::try_merge_all_in_column_family(
+                    values
+                        .into_iter()
+                        .rev()
+                        .map(|value| value.into_decoded(num_columns)),
                     &self.schema,
                     column_family_id,
                     Some(self.ttl_provider.time_provider()),
@@ -485,6 +546,84 @@ mod tests {
         assert_eq!(results[0].0.as_ref(), b"a");
         assert_eq!(results[1].0.as_ref(), b"b");
         assert_eq!(results[2].0.as_ref(), b"c");
+    }
+
+    #[test]
+    fn test_deduplicating_materializes_single_merge_by_default() {
+        let encoded = make_value_bytes(
+            vec![Some(Column::new(ValueType::Merge, b"value".as_slice()))],
+            1,
+        );
+        let mut dedup = DeduplicatingIterator::new(
+            MockIterator::new(vec![(b"key".as_slice(), encoded)]),
+            Some(1),
+            Arc::new(TTLProvider::disabled()),
+            None,
+            Schema::empty(),
+        );
+
+        dedup.seek_to_first().unwrap();
+        let (key, value) = dedup.take_current().unwrap().unwrap();
+        assert_eq!(key.as_ref(), b"key");
+        assert!(!value.is_encoded());
+        assert_eq!(
+            value.into_decoded(1).unwrap().columns()[0]
+                .as_ref()
+                .unwrap()
+                .data()
+                .as_ref(),
+            b"value"
+        );
+    }
+
+    #[test]
+    fn test_deduplicating_sst_build_preserves_single_encoded_value() {
+        let encoded = make_value_bytes(
+            vec![Some(Column::new(ValueType::Merge, b"value".as_slice()))],
+            1,
+        );
+        let mut dedup = DeduplicatingIterator::new_for_sst_build(
+            MockIterator::new(vec![(b"key".as_slice(), encoded.as_slice())]),
+            Some(1),
+            Arc::new(TTLProvider::disabled()),
+            None,
+            Schema::empty(),
+        );
+
+        dedup.seek_to_first().unwrap();
+        let (key, value) = dedup.take_current().unwrap().unwrap();
+        assert_eq!(key.as_ref(), b"key");
+        assert!(value.is_encoded());
+        assert_eq!(value.unwrap_encoded().as_ref(), encoded.as_slice());
+    }
+
+    #[test]
+    fn test_deduplicating_single_value_still_invokes_callback() {
+        let encoded = make_value_bytes(
+            vec![Some(Column::new(
+                ValueType::PutSeparated,
+                b"value".as_slice(),
+            ))],
+            1,
+        );
+        let observed = Arc::new(AtomicUsize::new(0));
+        let observed_for_callback = Arc::clone(&observed);
+        let mut dedup = DeduplicatingIterator::new_for_sst_build(
+            MockIterator::new(vec![(b"key".as_slice(), encoded)]),
+            Some(1),
+            Arc::new(TTLProvider::disabled()),
+            Some(Box::new(move |old_column, new_column| {
+                assert!(old_column.is_none());
+                assert!(new_column.is_some());
+                observed_for_callback.fetch_add(1, Ordering::Relaxed);
+            })),
+            Schema::empty(),
+        );
+
+        dedup.seek_to_first().unwrap();
+        let (_, value) = dedup.take_current().unwrap().unwrap();
+        assert!(!value.is_encoded());
+        assert_eq!(observed.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -94,13 +94,16 @@ pub(crate) struct RefValue<'a> {
     pub(crate) expired_at: Option<u32>,
 }
 
-/// A value in the iterator pipeline that can be either raw encoded bytes
-/// or a decoded structured value. This avoids unnecessary encode/decode
-/// cycles when passing data between iterators, compaction, and file writers.
+/// Value representation carried through the storage iterator pipeline.
+///
+/// SST and memtable iterators naturally produce row-codec bytes, while schema evolution, merge
+/// operators, and Parquet may require structured columns. Keeping the representation explicit lets
+/// pass-through paths retain the original bytes and confines conversion to the first consumer that
+/// actually needs the other form.
 pub(crate) enum KvValue {
-    /// Raw encoded bytes (from SST files, memtables, etc.)
+    /// Complete row-codec bytes, including the TTL header when the source format stores one.
     Encoded(Bytes),
-    /// Decoded structured value with per-column data (from parquet, after merge, etc.)
+    /// Structured columns after decoding, schema evolution, or merge evaluation.
     Decoded(Value),
 }
 
@@ -664,13 +667,45 @@ impl Value {
         column_family_id: u8,
         time_provider: Option<&dyn TimeProvider>,
     ) -> Result<Value> {
-        let mut merged_columns: Vec<Option<Column>> = Vec::new();
-        let mut pending_operands: Vec<Vec<Column>> = Vec::new();
-        let mut latest_expired_at = None;
-        let mut saw_value = false;
+        Self::try_merge_all_in_column_family(
+            values.into_iter().map(Ok),
+            schema,
+            column_family_id,
+            time_provider,
+        )
+    }
+
+    /// Merges a fallible stream of values ordered from oldest to newest.
+    ///
+    /// Deduplication retains encoded values until this point. Accepting a fallible iterator lets
+    /// decoding feed the batch merge directly, avoiding a second `Vec<Value>` containing the same
+    /// chain and stopping immediately at the first malformed value.
+    pub(crate) fn try_merge_all_in_column_family(
+        values: impl IntoIterator<Item = Result<Value>>,
+        schema: &Schema,
+        column_family_id: u8,
+        time_provider: Option<&dyn TimeProvider>,
+    ) -> Result<Value> {
+        let mut values = values.into_iter();
+        let (lower, upper) = values.size_hint();
+        let exact_value_count = (upper == Some(lower)).then_some(lower);
+        let first = values
+            .next()
+            .expect("merge_all requires at least one value")?;
+        let first_column_count = first.columns.len();
+        let single_column_operand_capacity = if first_column_count == 1 {
+            exact_value_count.unwrap_or_default().saturating_sub(1)
+        } else {
+            0
+        };
+        let mut merged_columns = first.columns;
+        let mut pending_operands = (0..first_column_count)
+            .map(|_| Vec::with_capacity(single_column_operand_capacity))
+            .collect::<Vec<Vec<Column>>>();
+        let mut latest_expired_at = first.expired_at;
 
         for value in values {
-            saw_value = true;
+            let value = value?;
             latest_expired_at = value.expired_at;
             if merged_columns.len() < value.columns.len() {
                 merged_columns.resize_with(value.columns.len(), || None);
@@ -699,7 +734,6 @@ impl Value {
             }
         }
 
-        assert!(saw_value, "merge_all requires at least one value");
         for column_idx in 0..merged_columns.len() {
             Self::flush_pending_merges(
                 &mut merged_columns[column_idx],
@@ -836,7 +870,9 @@ impl<'a> RefValue<'a> {
 mod tests {
     use super::*;
     use crate::merge_operator::{MergeOperator, default_merge_operator_ref};
+    use crate::sst::row_codec::encode_value;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct PanicMergeOperator;
 
@@ -915,6 +951,19 @@ mod tests {
         assert_eq!(batched.expired_at(), pairwise.expired_at());
     }
 
+    fn assert_fallible_batch_matches_pairwise(values: Vec<Value>, schema: &Schema) {
+        let pairwise = merge_values_pairwise(values.clone(), schema);
+        let batched = Value::try_merge_all_in_column_family(
+            values.into_iter().map(Ok),
+            schema,
+            DEFAULT_COLUMN_FAMILY_ID,
+            None,
+        )
+        .unwrap();
+        assert_eq!(value_signature(&batched), value_signature(&pairwise));
+        assert_eq!(batched.expired_at(), pairwise.expired_at());
+    }
+
     fn merge_single_column(values: Vec<Value>, schema: &Schema) -> Column {
         Value::merge_all_in_column_family(values, schema, DEFAULT_COLUMN_FAMILY_ID, None)
             .unwrap()
@@ -947,7 +996,8 @@ mod tests {
             Value::new(vec![Some(Column::new(ValueType::Merge, b"-c".as_slice()))]),
         ];
         let schema = Schema::empty();
-        assert_batch_matches_pairwise(values, schema.as_ref());
+        assert_batch_matches_pairwise(values.clone(), schema.as_ref());
+        assert_fallible_batch_matches_pairwise(values, schema.as_ref());
     }
 
     #[test]
@@ -1025,7 +1075,56 @@ mod tests {
             ]),
         ];
         let schema = Schema::empty();
-        assert_batch_matches_pairwise(values, schema.as_ref());
+        assert_batch_matches_pairwise(values.clone(), schema.as_ref());
+        assert_fallible_batch_matches_pairwise(values, schema.as_ref());
+    }
+
+    #[test]
+    fn test_value_try_merge_all_stops_after_decode_error() {
+        struct DecodingValues {
+            values: std::vec::IntoIter<KvValue>,
+            next_calls: Arc<AtomicUsize>,
+        }
+
+        impl Iterator for DecodingValues {
+            type Item = Result<Value>;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                let value = self.values.next()?;
+                self.next_calls.fetch_add(1, Ordering::Relaxed);
+                Some(value.into_decoded(1))
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                self.values.size_hint()
+            }
+        }
+
+        let encoded = |value_type, data: &'static [u8]| {
+            KvValue::Encoded(encode_value(
+                &Value::new(vec![Some(Column::new(value_type, data))]),
+                1,
+            ))
+        };
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let values = DecodingValues {
+            values: vec![
+                encoded(ValueType::Put, b"base"),
+                KvValue::Encoded(Bytes::from_static(&[0])),
+                encoded(ValueType::Merge, b"-unread"),
+            ]
+            .into_iter(),
+            next_calls: Arc::clone(&next_calls),
+        };
+
+        let result = Value::try_merge_all_in_column_family(
+            values,
+            Schema::empty().as_ref(),
+            DEFAULT_COLUMN_FAMILY_ID,
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(next_calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -1116,7 +1215,18 @@ mod tests {
             ))]),
         ];
 
-        let column = merge_single_column(values, Schema::empty().as_ref());
+        let column = Value::try_merge_all_in_column_family(
+            values.into_iter().map(Ok),
+            Schema::empty().as_ref(),
+            DEFAULT_COLUMN_FAMILY_ID,
+            None,
+        )
+        .unwrap()
+        .columns
+        .into_iter()
+        .next()
+        .flatten()
+        .expect("merged column");
         assert_separated_array(
             &column,
             ValueType::PutSeparatedArray,

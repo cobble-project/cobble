@@ -651,7 +651,7 @@ impl CompactionExecutor {
         let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
 
         // Create deduplicating iterator
-        let mut dedup_iter = DeduplicatingIterator::new(
+        let mut dedup_iter = DeduplicatingIterator::new_for_sst_build(
             merging_iter,
             Some(num_columns),
             task.ttl_provider(),

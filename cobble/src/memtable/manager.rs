@@ -2179,7 +2179,7 @@ fn flush_memtable(
     let truncation_cursors = truncation_cursors
         .map(TruncationCursorSnapshot::to_map)
         .unwrap_or_default();
-    let mut dedup_iter = DeduplicatingIterator::new(
+    let mut dedup_iter = DeduplicatingIterator::new_for_sst_build(
         PrimedIterator::new(memtable.iter()),
         None,
         ttl_provider,
