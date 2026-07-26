@@ -64,10 +64,6 @@ impl CompactionWorker for ResilientRemoteCompactionWorker {
         if sorted_runs.is_empty() {
             return None;
         }
-        let Some(handle) = self.remote.runtime_handle() else {
-            warn!("resilient remote compaction worker is shutdown, cannot submit new tasks");
-            return None;
-        };
         let remote = Arc::clone(&self.remote);
         let local = Arc::clone(&self.local);
         let failure_mode = self.failure_mode;
@@ -79,7 +75,7 @@ impl CompactionWorker for ResilientRemoteCompactionWorker {
         let address = remote.address().to_string();
         let remote_timeout = remote.remote_timeout();
         let compaction_metrics = remote.compaction_metrics();
-        Some(handle.spawn_blocking(move || {
+        self.remote.spawn_blocking(move || {
             let lsm_tree = match lsm_tree_weak.upgrade() {
                 Some(tree) => tree,
                 None => {
@@ -144,7 +140,7 @@ impl CompactionWorker for ResilientRemoteCompactionWorker {
                     ttl_provider,
                 ),
             }
-        }))
+        })
     }
 
     fn shutdown(&self) {

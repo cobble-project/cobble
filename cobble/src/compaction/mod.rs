@@ -15,7 +15,8 @@ mod resilient;
 
 #[allow(unused_imports)]
 pub(crate) use executor::{
-    CompactionExecutor, CompactionResult, CompactionTask, CompactionTaskMetrics,
+    BlockingTaskTracker, CompactionExecutor, CompactionResult, CompactionTask,
+    CompactionTaskMetrics, build_compaction_runtime,
 };
 pub(crate) use policy::{
     CompactionConfig, CompactionPlan, CompactionPolicy, CompactionPolicyContext, MinOverlapPolicy,
@@ -96,9 +97,10 @@ impl LocalCompactionWorker {
         let on_complete = Arc::new(
             move |lsm_tree_idx: usize, edit: VersionEdit, vlog_edit, preload_block_keys| {
                 if let Some(lsm_tree) = lsm_tree.upgrade()
-                    && let Some(apply_tree_idx) = lsm_tree.on_compaction_complete(lsm_tree_idx)
+                    && lsm_tree
+                        .apply_compaction_result(lsm_tree_idx, edit, vlog_edit)
+                        .is_some()
                 {
-                    lsm_tree.apply_edit(apply_tree_idx, edit, vlog_edit);
                     // Final local handoff for the hot-block flow documented on
                     // `ScanHotBlockRegistry`: after new files are visible in the
                     // local FileManager, load the writer-produced output block keys

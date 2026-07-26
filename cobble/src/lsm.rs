@@ -500,12 +500,15 @@ impl LSMTree {
 
     pub(crate) fn shutdown_compaction(&self) {
         self.block_cache_preload_worker.shutdown();
-        let mut state = self.state.lock().unwrap();
-        if let Some(worker) = state.compaction_worker.take() {
+        let worker = {
+            let mut state = self.state.lock().unwrap();
+            let worker = state.compaction_worker.take();
+            state.pending_compaction.clear();
+            worker
+        };
+        if let Some(worker) = worker {
             worker.shutdown();
         }
-        state.compaction_worker = None;
-        state.pending_compaction.clear();
     }
 
     fn make_policy(kind: crate::config::CompactionPolicyKind) -> Box<dyn CompactionPolicy> {
@@ -730,9 +733,38 @@ impl LSMTree {
         Some(tree_idx..tree_idx + split_tree_count)
     }
 
-    /// Returns Some(tree_idx) if the compaction result for the tree index can be applied.
+    /// Releases a pending compaction that produced no edit.
     pub(crate) fn on_compaction_complete(&self, tree_idx: usize) -> Option<usize> {
         let mut state = self.state.lock().unwrap();
+        self.resolve_completed_compaction_locked(&mut state, tree_idx)
+    }
+
+    /// Applies a successful compaction while holding the pending-compaction lock.
+    ///
+    /// Removing the pending marker and installing the edit must be atomic. Otherwise a flush can
+    /// schedule another compaction from the old version in between, and both results can install
+    /// overlapping files into a non-tiered level.
+    pub(crate) fn apply_compaction_result(
+        &self,
+        tree_idx: usize,
+        edit: VersionEdit,
+        vlog_edit: Option<VlogEdit>,
+    ) -> Option<usize> {
+        let mut state = self.state.lock().unwrap();
+        let apply_tree_idx = self.resolve_completed_compaction_locked(&mut state, tree_idx)?;
+        self.apply_edit_locked(&mut state, vec![(apply_tree_idx, edit)], move |db_state| {
+            if let Some(vlog_edit) = vlog_edit {
+                db_state.vlog_version = db_state.vlog_version.apply_edit(vlog_edit);
+            }
+        });
+        Some(apply_tree_idx)
+    }
+
+    fn resolve_completed_compaction_locked(
+        &self,
+        state: &mut LSMTreeState,
+        tree_idx: usize,
+    ) -> Option<usize> {
         let expected_scope = state.pending_compaction.remove(&tree_idx).flatten();
         if self.db_lifecycle.ensure_open().is_err() {
             return None;
@@ -1523,22 +1555,30 @@ mod tests {
     struct RecordingCompactionWorker {
         submitted_tree_idxs: Mutex<Vec<usize>>,
         submitted_data_file_types: Mutex<Vec<DataFileType>>,
+        submitted_file_ids: Mutex<Vec<Vec<FileId>>>,
     }
 
     impl CompactionWorker for RecordingCompactionWorker {
         fn submit_runs(
             &self,
             lsm_tree_idx: usize,
-            _sorted_runs: Vec<SortedRun>,
+            sorted_runs: Vec<SortedRun>,
             _output_level: u8,
-            _data_file_type: DataFileType,
+            data_file_type: DataFileType,
             _ttl_provider: Arc<TTLProvider>,
         ) -> Option<tokio::task::JoinHandle<Result<crate::compaction::CompactionResult>>> {
             self.submitted_tree_idxs.lock().unwrap().push(lsm_tree_idx);
+            self.submitted_file_ids.lock().unwrap().push(
+                sorted_runs
+                    .iter()
+                    .flat_map(|run| run.files())
+                    .map(|file| file.file_id)
+                    .collect(),
+            );
             self.submitted_data_file_types
                 .lock()
                 .unwrap()
-                .push(_data_file_type);
+                .push(data_file_type);
             None
         }
 
@@ -2205,6 +2245,71 @@ mod tests {
             vec![0, 0],
             "both compaction triggers must reach the worker (declining worker leaves no stale pending)"
         );
+    }
+
+    #[test]
+    fn test_compaction_result_is_visible_before_next_compaction_is_submitted() {
+        let db_state = Arc::new(DbStateHandle::new());
+        let old_file = create_data_file_with_size(b"a", b"z", 1);
+        let replacement = create_data_file_with_size(b"a", b"z", 1);
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion {
+                levels: vec![
+                    Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: vec![Arc::clone(&old_file)],
+                    },
+                    Level {
+                        ordinal: 1,
+                        tiered: false,
+                        files: Vec::new(),
+                    },
+                ],
+            }),
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
+            suggested_base_snapshot_id: None,
+        });
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-test"));
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+        let worker = Arc::new(RecordingCompactionWorker::default());
+        let worker_dyn: Arc<dyn CompactionWorker> = worker.clone();
+        lsm_tree.configure_compaction(
+            crate::compaction::CompactionConfig {
+                l0_file_limit: 0,
+                ..crate::compaction::CompactionConfig::default()
+            },
+            Some(worker_dyn),
+        );
+        lsm_tree.on_compaction_started(0);
+
+        assert_eq!(
+            lsm_tree.apply_compaction_result(
+                0,
+                VersionEdit {
+                    level_edits: vec![LevelEdit {
+                        level: 0,
+                        removed_files: vec![Arc::clone(&old_file)],
+                        new_files: vec![Arc::clone(&replacement)],
+                    }],
+                },
+                None,
+            ),
+            Some(0)
+        );
+
+        assert_eq!(
+            worker.submitted_file_ids.lock().unwrap().as_slice(),
+            &[vec![replacement.file_id]]
+        );
+        let files = &db_state.load().multi_lsm_version.version_of_index(0).levels[0].files;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_id, replacement.file_id);
     }
 
     #[test]

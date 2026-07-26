@@ -705,6 +705,7 @@ pub(crate) struct RemoteCompactionWorker {
     config: Config,
     ttl_config: TtlConfig,
     runtime: Mutex<Option<Runtime>>,
+    tasks: Arc<super::BlockingTaskTracker>,
     remote_timeout: Duration,
     metrics_manager: Arc<MetricsManager>,
     schema_manager: Arc<SchemaManager>,
@@ -728,12 +729,8 @@ impl RemoteCompactionWorker {
         metrics_manager: Arc<MetricsManager>,
         schema_manager: Arc<SchemaManager>,
     ) -> Result<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .thread_name("cobble-remote-compaction")
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|e| Error::IoError(e.to_string()))?;
+        let runtime =
+            super::build_compaction_runtime("cobble-remote-compaction", config.compaction_threads)?;
         info!(
             "Cobble remote compactor ({}, Rev:{}) configured for addr: {}.",
             build_version_string(),
@@ -747,6 +744,7 @@ impl RemoteCompactionWorker {
             config,
             ttl_config,
             runtime: Mutex::new(Some(runtime)),
+            tasks: Arc::new(super::BlockingTaskTracker::new()),
             remote_timeout,
             metrics_manager,
             schema_manager,
@@ -754,9 +752,13 @@ impl RemoteCompactionWorker {
         })
     }
 
-    pub(crate) fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+    pub(crate) fn spawn_blocking<F, T>(&self, task: F) -> Option<tokio::task::JoinHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
         let guard = self.runtime.lock().unwrap();
-        guard.as_ref().map(|runtime| runtime.handle().clone())
+        self.tasks.spawn(guard.as_ref()?, task)
     }
 
     pub(crate) fn compaction_metrics(&self) -> Arc<super::CompactionTaskMetrics> {
@@ -926,10 +928,6 @@ impl CompactionWorker for RemoteCompactionWorker {
         if sorted_runs.is_empty() {
             return None;
         }
-        let Some(handle) = self.runtime_handle() else {
-            warn!("remote compaction worker is shutdown, cannot submit new tasks");
-            return None;
-        };
         let request = match self.build_request(
             lsm_tree_idx,
             &sorted_runs,
@@ -940,12 +938,12 @@ impl CompactionWorker for RemoteCompactionWorker {
             Ok(request) => request,
             Err(err) => {
                 let lsm_tree = self.lsm_tree.clone();
-                return Some(handle.spawn_blocking(move || {
+                return self.spawn_blocking(move || {
                     if let Some(lsm_tree) = lsm_tree.upgrade() {
                         let _ = lsm_tree.on_compaction_complete(lsm_tree_idx);
                     }
                     Err(err)
-                }));
+                });
             }
         };
         // Execute via the shared "execute request and apply" core. On success it releases the
@@ -957,7 +955,7 @@ impl CompactionWorker for RemoteCompactionWorker {
         let address = self.address.clone();
         let remote_timeout = self.remote_timeout;
         let compaction_metrics = self.metrics_manager.compaction_metrics();
-        Some(handle.spawn_blocking(move || {
+        self.spawn_blocking(move || {
             let result = (|| -> Result<CompactionResult> {
                 let lsm_tree = worker_lsm_tree.upgrade().ok_or_else(|| {
                     Error::IoError("lsm tree dropped during compaction".to_string())
@@ -982,7 +980,7 @@ impl CompactionWorker for RemoteCompactionWorker {
                 let _ = lsm_tree.on_compaction_complete(lsm_tree_idx);
             }
             result
-        }))
+        })
     }
 
     fn shutdown(&self) {
@@ -991,8 +989,9 @@ impl CompactionWorker for RemoteCompactionWorker {
             build_version_string(),
             build_commit_short_id()
         );
+        self.tasks.close_and_wait();
         if let Some(runtime) = self.runtime.lock().unwrap().take() {
-            runtime.shutdown_timeout(Duration::from_millis(500));
+            drop(runtime);
         }
     }
 }
@@ -1015,14 +1014,10 @@ pub struct RemoteCompactionServer {
 impl RemoteCompactionServer {
     pub fn new(config: Config) -> Result<Self> {
         let compaction_config = super::build_compaction_config(&config, 1)?;
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .thread_name("cobble-compaction")
-                .worker_threads(compaction_config.max_threads.max(1))
-                .enable_all()
-                .build()
-                .map_err(|e| Error::IoError(e.to_string()))?,
-        );
+        let runtime = Arc::new(super::build_compaction_runtime(
+            "cobble-compaction",
+            compaction_config.max_threads,
+        )?);
         let executor = CompactionExecutor::new_with_runtime(
             compaction_config,
             runtime.clone(),
@@ -1642,9 +1637,10 @@ pub(crate) fn execute_compaction_request(
             (!edit.is_empty()).then_some(edit)
         };
         // Success path: release the pending slot and apply the edit exactly once.
-        let apply_tree_idx = lsm_tree.on_compaction_complete(lsm_tree_idx);
-        if let Some(apply_tree_idx) = apply_tree_idx {
-            lsm_tree.apply_edit(apply_tree_idx, edit.clone(), vlog_edit.clone());
+        if lsm_tree
+            .apply_compaction_result(lsm_tree_idx, edit.clone(), vlog_edit.clone())
+            .is_some()
+        {
             lsm_tree
                 .submit_block_cache_preload(Arc::clone(file_manager), preload_block_keys.clone());
             compaction_metrics.record_read_bytes(input_bytes);

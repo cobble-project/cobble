@@ -29,11 +29,98 @@ use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::trace;
 use metrics::{Counter, counter};
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 
 type CompactionCompleteCallback =
     Arc<dyn Fn(usize, VersionEdit, Option<VlogEdit>, Vec<BlockCachePreload>) + Send + Sync>;
+
+pub(crate) fn build_compaction_runtime(thread_name: &str, max_threads: usize) -> Result<Runtime> {
+    let max_threads = max_threads.max(1);
+    // Compaction runs through `spawn_blocking`; Tokio's `worker_threads` setting alone does not
+    // limit that pool. Cap both pools so `compaction_threads` is the actual concurrency bound.
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_name(thread_name)
+        .worker_threads(max_threads)
+        .max_blocking_threads(max_threads)
+        .enable_all()
+        .build()
+        .map_err(|e| crate::error::Error::IoError(e.to_string()))
+}
+
+/// Tracks compaction work accepted by a runtime so shutdown can drain it before LSM teardown.
+///
+/// Tokio may keep queued blocking tasks beyond a timeout-based runtime shutdown. Those tasks own
+/// output files and invoke completion callbacks, so letting them outlive the LSM can lose an edit
+/// or race resource cleanup.
+pub(crate) struct BlockingTaskTracker {
+    state: Mutex<BlockingTaskState>,
+    idle: Condvar,
+}
+
+struct BlockingTaskState {
+    accepting: bool,
+    pending: usize,
+}
+
+impl BlockingTaskTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(BlockingTaskState {
+                accepting: true,
+                pending: 0,
+            }),
+            idle: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn spawn<F, T>(self: &Arc<Self>, runtime: &Runtime, task: F) -> Option<JoinHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut state = self.state.lock().unwrap();
+        if !state.accepting {
+            return None;
+        }
+        state.pending += 1;
+        drop(state);
+
+        let tracker = Arc::clone(self);
+        Some(runtime.spawn_blocking(move || {
+            let _guard = BlockingTaskGuard(tracker);
+            task()
+        }))
+    }
+
+    pub(crate) fn close_and_wait(&self) {
+        let mut state = self.state.lock().unwrap();
+        // Close admission before waiting so the pending count can only move toward zero.
+        state.accepting = false;
+        while state.pending != 0 {
+            state = self.idle.wait(state).unwrap();
+        }
+    }
+}
+
+impl Default for BlockingTaskTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct BlockingTaskGuard(Arc<BlockingTaskTracker>);
+
+impl Drop for BlockingTaskGuard {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.pending -= 1;
+        if state.pending == 0 {
+            self.0.idle.notify_all();
+        }
+    }
+}
 
 fn single_bucket_in_range(range: &std::ops::RangeInclusive<u16>) -> Option<u16> {
     let start = *range.start();
@@ -277,6 +364,7 @@ impl CompactionResult {
 /// The executor uses tokio's runtime for async task execution in a thread pool.
 pub struct CompactionExecutor {
     runtime: Option<Arc<Runtime>>,
+    tasks: Arc<BlockingTaskTracker>,
     options: CompactionConfig,
     db_lifecycle: Arc<DbLifecycle>,
 }
@@ -286,14 +374,10 @@ impl CompactionExecutor {
     pub fn new(options: CompactionConfig, db_lifecycle: Arc<DbLifecycle>) -> Result<Self> {
         Self::new_with_runtime(
             options,
-            Arc::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    .thread_name("cobble-compaction")
-                    .worker_threads(options.max_threads.max(1))
-                    .enable_all()
-                    .build()
-                    .map_err(|e| crate::error::Error::IoError(e.to_string()))?,
-            ),
+            Arc::new(build_compaction_runtime(
+                "cobble-compaction",
+                options.max_threads,
+            )?),
             db_lifecycle,
         )
     }
@@ -306,6 +390,7 @@ impl CompactionExecutor {
     ) -> Result<Self> {
         Ok(Self {
             runtime: Some(runtime),
+            tasks: Arc::new(BlockingTaskTracker::new()),
             options,
             db_lifecycle,
         })
@@ -328,6 +413,7 @@ impl CompactionExecutor {
     pub fn new_without_runtime(options: CompactionConfig, db_lifecycle: Arc<DbLifecycle>) -> Self {
         Self {
             runtime: None,
+            tasks: Arc::new(BlockingTaskTracker::new()),
             options,
             db_lifecycle,
         }
@@ -358,26 +444,28 @@ impl CompactionExecutor {
         let options = self.options;
         let db_lifecycle = Arc::clone(&self.db_lifecycle);
 
-        runtime.spawn_blocking(move || {
-            let result = Self::run_compaction(task, options);
-            match result {
-                Ok(result) => {
-                    if let Some(callback) = on_complete {
-                        callback(
-                            result.lsm_tree_idx,
-                            result.edit.clone(),
-                            result.vlog_edit.clone(),
-                            result.preload_block_keys.clone(),
-                        );
+        self.tasks
+            .spawn(runtime, move || {
+                let result = Self::run_compaction(task, options);
+                match result {
+                    Ok(result) => {
+                        if let Some(callback) = on_complete {
+                            callback(
+                                result.lsm_tree_idx,
+                                result.edit.clone(),
+                                result.vlog_edit.clone(),
+                                result.preload_block_keys.clone(),
+                            );
+                        }
+                        Ok(result)
                     }
-                    Ok(result)
+                    Err(err) => {
+                        db_lifecycle.mark_error(err.clone());
+                        Err(err)
+                    }
                 }
-                Err(err) => {
-                    db_lifecycle.mark_error(err.clone());
-                    Err(err)
-                }
-            }
-        })
+            })
+            .expect("Executor has been shutdown.")
     }
 
     /// Executes a compaction task synchronously and blocks until completion.
@@ -407,10 +495,11 @@ impl CompactionExecutor {
     }
 
     pub fn shutdown(&mut self) {
+        self.tasks.close_and_wait();
         if let Some(runtime) = self.runtime.take()
             && let Ok(runtime) = Arc::try_unwrap(runtime)
         {
-            runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+            drop(runtime);
         }
     }
 
@@ -867,6 +956,119 @@ mod tests {
     use bytes::Bytes;
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex as StdMutex};
+    use std::time::Duration;
+
+    #[test]
+    fn compaction_runtime_caps_blocking_tasks() {
+        const MAX_THREADS: usize = 2;
+        const TASKS: usize = 8;
+
+        let runtime = build_compaction_runtime("cobble-compaction-cap-test", MAX_THREADS).unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((StdMutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut handles = Vec::with_capacity(TASKS);
+
+        for _ in 0..TASKS {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let gate = Arc::clone(&gate);
+            let started_tx = started_tx.clone();
+            handles.push(runtime.spawn_blocking(move || {
+                let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(current, Ordering::AcqRel);
+                started_tx.send(()).unwrap();
+
+                let (lock, condition) = &*gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+                active.fetch_sub(1, Ordering::AcqRel);
+            }));
+        }
+        drop(started_tx);
+
+        for _ in 0..MAX_THREADS {
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        assert!(
+            started_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "more than {MAX_THREADS} blocking tasks started before the gate was released"
+        );
+
+        {
+            let (lock, condition) = &*gate;
+            *lock.lock().unwrap() = true;
+            condition.notify_all();
+        }
+        runtime.block_on(async {
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        });
+
+        assert_eq!(peak.load(Ordering::Acquire), MAX_THREADS);
+    }
+
+    #[test]
+    fn compaction_runtime_shutdown_drains_queued_blocking_tasks() {
+        const TASKS: usize = 4;
+
+        let mut executor = CompactionExecutor::new(
+            CompactionConfig {
+                max_threads: 1,
+                ..CompactionConfig::default()
+            },
+            Arc::new(DbLifecycle::new_open()),
+        )
+        .unwrap();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((StdMutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+        for _ in 0..TASKS {
+            let completed = Arc::clone(&completed);
+            let gate = Arc::clone(&gate);
+            let started_tx = started_tx.clone();
+            executor
+                .tasks
+                .spawn(executor.runtime.as_ref().unwrap(), move || {
+                    started_tx.send(()).unwrap();
+                    let (lock, condition) = &*gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = condition.wait(released).unwrap();
+                    }
+                    completed.fetch_add(1, Ordering::AcqRel);
+                })
+                .unwrap();
+        }
+        drop(started_tx);
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            executor.shutdown();
+            drained_tx.send(()).unwrap();
+        });
+        assert!(
+            drained_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "shutdown returned while a blocking task was still queued"
+        );
+
+        {
+            let (lock, condition) = &*gate;
+            *lock.lock().unwrap() = true;
+            condition.notify_all();
+        }
+        drained_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        shutdown.join().unwrap();
+        assert_eq!(completed.load(Ordering::Acquire), TASKS);
+    }
 
     fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {
         let value = Value::new(vec![Some(Column::new(ValueType::Put, data.to_vec()))]);
