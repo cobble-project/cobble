@@ -116,7 +116,7 @@ All capacity/size fields in `Config` (such as `memtable_capacity`, `l1_base_byte
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `l0_file_limit` | 4 | L0 file count that triggers compaction |
-| `write_stall_limit` | `None` | Max immutable + L0 files before write stall (auto-calculated if unset) |
+| `write_stall_limit` | `None` | Max immutable + L0 files before write stall. Defaults to `max(l0_file_limit + 2, 32)`. |
 | `l1_base_bytes` | 64 MB | Target size for level 1 |
 | `level_size_multiplier` | 10 | Size multiplier per level (L2 = 640MB, L3 = 6.4GB, ...) |
 | `max_level` | 6 | Maximum number of levels |

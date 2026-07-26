@@ -67,7 +67,7 @@ Supported units: `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `KiB`, `MiB`, `GiB`, `TiB`, 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `l0_file_limit` | `usize` | 4 | L0 file count that triggers compaction |
-| `write_stall_limit` | `Option<usize>` | `None` | Max immutable+L0 files before stall. Auto: `min(l0+4, l0×2)` |
+| `write_stall_limit` | `Option<usize>` | `None` | Max immutable+L0 files before stall. Auto: `max(l0+2, 32)` |
 | `l1_base_bytes` | `Size` | `64MiB` | Target size for level 1 |
 | `level_size_multiplier` | `usize` | 10 | Size multiplier per level |
 | `max_level` | `u8` | 6 | Maximum number of LSM levels |

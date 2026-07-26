@@ -743,7 +743,7 @@ pub struct Config {
     /// Maximum number of L0 files before triggering compaction.
     pub l0_file_limit: usize,
     /// Maximum number of immutables + L0 files before write stall.
-    /// If None, uses min(l0_file_limit + 4, l0_file_limit * 2).
+    /// If None, uses max(l0_file_limit + 2, 32).
     pub write_stall_limit: Option<usize>,
     /// Base size for level 1.
     pub l1_base_bytes: Size,
@@ -1262,10 +1262,7 @@ impl Config {
     }
 
     pub(crate) fn resolved_write_stall_limit(&self) -> usize {
-        let default_limit = self
-            .l0_file_limit
-            .saturating_add(4)
-            .min(self.l0_file_limit.saturating_mul(2));
+        let default_limit = self.l0_file_limit.saturating_add(2).max(32);
         match self.write_stall_limit {
             Some(limit) => {
                 if limit > self.l0_file_limit.saturating_add(1) {
@@ -1478,6 +1475,21 @@ mod tests {
         assert_eq!(MemtableType::default(), MemtableType::Skiplist);
         assert_eq!(Config::default().memtable_type, MemtableType::Skiplist);
         assert_eq!(Config::default().sst_pinned_metadata_max_level, Some(2));
+    }
+
+    #[test]
+    fn test_resolved_write_stall_limit() {
+        let mut config = Config::default();
+        assert_eq!(config.resolved_write_stall_limit(), 32);
+
+        config.l0_file_limit = 64;
+        assert_eq!(config.resolved_write_stall_limit(), 66);
+
+        config.write_stall_limit = Some(65);
+        assert_eq!(config.resolved_write_stall_limit(), 66);
+
+        config.write_stall_limit = Some(80);
+        assert_eq!(config.resolved_write_stall_limit(), 80);
     }
 
     #[test]

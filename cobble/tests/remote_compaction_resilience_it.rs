@@ -223,9 +223,8 @@ fn remote_compaction_skip_mode_releases_pending_without_db_error() {
     drop(listener);
     let mut config = base_config(root, Some(dead_addr));
     config.compaction_remote_failure_mode = RemoteCompactionFailureMode::Skip;
-    // In skip mode L0 files pile up (compactions are abandoned), which would trip the default
-    // write-stall limit (min(l0+4, l0*2) = 2 for l0_file_limit=1) and stall writes. Lift the
-    // limit well above the number of files this test produces.
+    // In skip mode L0 files pile up because compactions are abandoned. This test produces more
+    // files than the derived write-stall limit, so lift it above the expected file count.
     config.write_stall_limit = Some(64);
     let db = open_db(config);
     // Write enough to trigger several compaction attempts (each is skipped). Stay well under the
