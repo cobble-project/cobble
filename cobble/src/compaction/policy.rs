@@ -5,6 +5,7 @@ use crate::db_state::{LSMTreeScope, TruncationCursorMap};
 use crate::file::FileId;
 use crate::iterator::SortedRun;
 use crate::lsm::Level;
+use crate::sst::SSTWriterOptions;
 use crate::r#type::{key_bucket, key_column_family};
 use std::cmp::Ordering;
 use std::fmt;
@@ -43,7 +44,7 @@ impl Default for CompactionConfig {
             level_size_multiplier: 10,
             max_level: 6,
             block_size: 4096,
-            buffer_size: 8192,
+            buffer_size: SSTWriterOptions::default().buffer_size,
             read_buffer_size: 64 * 1024,
             read_ahead_enabled: true,
             num_columns: 1,
@@ -879,6 +880,14 @@ mod tests {
     use crate::sst::row_codec::encode_key;
     use crate::r#type::Key;
     use std::collections::HashMap;
+
+    #[test]
+    fn default_compaction_uses_sst_write_buffer_size() {
+        assert_eq!(
+            CompactionConfig::default().buffer_size,
+            SSTWriterOptions::default().buffer_size
+        );
+    }
 
     fn make_file(id: FileId, start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
         let bucket_range = DataFile::bucket_range_from_keys(start, end);

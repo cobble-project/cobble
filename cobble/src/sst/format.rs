@@ -19,8 +19,25 @@ const FOOTER_FLAG_FILTER_PRESENT: u32 = 0x1;
 const FOOTER_FLAG_PARTITIONED_INDEX: u32 = 0x2;
 const FOOTER_FLAG_VALUE_WITHOUT_TTL: u32 = 0x4;
 const FOOTER_FLAG_BLOCK_CHECKSUMS: u32 = 0x8;
+const BLOCK_HEADER_SIZE: usize = 6;
 // Covers common encoded state keys without imposing a key-size limit on the format.
 const PREFIX_SEARCH_STACK_BYTES: usize = 128;
+
+fn block_header(
+    prefix_compressed: bool,
+    restart_interval: usize,
+    num_entries: usize,
+) -> [u8; BLOCK_HEADER_SIZE] {
+    let restart_interval = if prefix_compressed {
+        restart_interval.max(2).min(u16::MAX as usize) as u16
+    } else {
+        1
+    };
+    let mut header = [0; BLOCK_HEADER_SIZE];
+    header[..2].copy_from_slice(&restart_interval.to_le_bytes());
+    header[2..].copy_from_slice(&(num_entries as u32).to_le_bytes());
+    header
+}
 
 #[inline]
 fn with_prefix_search_scratch<T>(
@@ -215,15 +232,13 @@ pub struct Block {
 impl Block {
     pub(crate) fn encode(&self) -> Bytes {
         let offsets_size = self.offsets.len() * 4;
-        let total_size = 6 + self.data.len() + offsets_size;
+        let total_size = BLOCK_HEADER_SIZE + self.data.len() + offsets_size;
         let mut buf = BytesMut::with_capacity(total_size);
-        let restart_interval = if self.prefix_compressed {
-            self.restart_interval.max(2).min(u16::MAX as u32) as u16
-        } else {
-            1u16
-        };
-        buf.put_u16_le(restart_interval);
-        buf.put_u32_le(self.offsets.len() as u32);
+        buf.put_slice(&block_header(
+            self.prefix_compressed,
+            self.restart_interval as usize,
+            self.offsets.len(),
+        ));
         buf.put_slice(&self.data);
         for offset in &self.offsets {
             buf.put_u32_le(*offset);
@@ -232,7 +247,7 @@ impl Block {
     }
 
     pub(crate) fn decode(data: Bytes) -> Result<Self> {
-        if data.len() < 6 {
+        if data.len() < BLOCK_HEADER_SIZE {
             return Err(Error::IoError("Block too small".to_string()));
         }
 
@@ -241,15 +256,15 @@ impl Block {
         let restart_interval_raw = buf.get_u16_le();
         let num_entries = buf.get_u32_le() as usize;
         let offsets_size = num_entries * 4;
-        if data.len() < 6 + offsets_size {
+        if data.len() < BLOCK_HEADER_SIZE + offsets_size {
             return Err(Error::IoError("Block data corrupted".to_string()));
         }
 
-        let data_size = data.len() - 6 - offsets_size;
-        let block_data = data.slice(6..6 + data_size);
+        let data_size = data.len() - BLOCK_HEADER_SIZE - offsets_size;
+        let block_data = data.slice(BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + data_size);
 
         let mut offsets = Vec::with_capacity(num_entries);
-        let mut offset_buf = data.slice(6 + data_size..);
+        let mut offset_buf = data.slice(BLOCK_HEADER_SIZE + data_size..);
         for _ in 0..num_entries {
             offsets.push(offset_buf.get_u32_le());
         }
@@ -869,8 +884,10 @@ impl BlockBuilder {
         restart_interval: usize,
         prefix_compressed: bool,
     ) -> Self {
+        let mut data = BytesMut::with_capacity(target_size.max(BLOCK_HEADER_SIZE));
+        data.resize(BLOCK_HEADER_SIZE, 0);
         Self {
-            data: BytesMut::new(),
+            data,
             offsets: Vec::new(),
             target_size,
             prefix_compressed,
@@ -881,7 +898,7 @@ impl BlockBuilder {
     }
 
     pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) {
-        let offset = self.data.len() as u32;
+        let offset = (self.data.len() - BLOCK_HEADER_SIZE) as u32;
         self.offsets.push(offset);
         if self.prefix_compressed {
             let is_restart = self.entries_since_restart == 0;
@@ -916,7 +933,7 @@ impl BlockBuilder {
     }
 
     pub(crate) fn estimated_size(&self) -> usize {
-        6 + self.data.len() + self.offsets.len() * 4
+        self.data.len() + self.offsets.len() * 4
     }
 
     pub(crate) fn should_finish(&self) -> bool {
@@ -925,14 +942,12 @@ impl BlockBuilder {
 
     pub(crate) fn write_to<W: SequentialWriteFile>(&self, writer: &mut W) -> Result<usize> {
         let size = self.estimated_size();
-        let restart_interval = if self.prefix_compressed {
-            self.restart_interval.max(2).min(u16::MAX as usize) as u16
-        } else {
-            1u16
-        };
-        writer.write(&restart_interval.to_le_bytes())?;
-        writer.write(&(self.offsets.len() as u32).to_le_bytes())?;
-        let data_bytes = self.data.as_ref();
+        writer.write(&block_header(
+            self.prefix_compressed,
+            self.restart_interval,
+            self.offsets.len(),
+        ))?;
+        let data_bytes = &self.data[BLOCK_HEADER_SIZE..];
         if !data_bytes.is_empty() {
             writer.write(data_bytes)?;
         }
@@ -943,9 +958,10 @@ impl BlockBuilder {
     }
 
     pub(crate) fn build(self) -> Block {
-        let size_in_bytes = 6 + self.data.len() + self.offsets.len() * 4;
+        let size_in_bytes = self.estimated_size();
+        let data = self.data.freeze();
         Block {
-            data: self.data.freeze(),
+            data: data.slice(BLOCK_HEADER_SIZE..),
             offsets: self.offsets,
             block_id: 0,
             size_in_bytes,
@@ -954,8 +970,24 @@ impl BlockBuilder {
         }
     }
 
+    pub(crate) fn build_encoded(mut self) -> Bytes {
+        // The builder reserves the header at construction time. Finalizing it in place and
+        // appending offsets avoids building a `Block` and copying its data into a second buffer.
+        let header = block_header(
+            self.prefix_compressed,
+            self.restart_interval,
+            self.offsets.len(),
+        );
+        self.data[..BLOCK_HEADER_SIZE].copy_from_slice(&header);
+        for offset in self.offsets {
+            self.data.put_u32_le(offset);
+        }
+        self.data.freeze()
+    }
+
     pub(crate) fn clear(&mut self) {
         self.data.clear();
+        self.data.resize(BLOCK_HEADER_SIZE, 0);
         self.offsets.clear();
         self.last_key.clear();
         self.entries_since_restart = 0;
@@ -1124,6 +1156,57 @@ mod tests {
         let (key, value) = decoded.get(2).unwrap();
         assert_eq!(&key[..], b"key3");
         assert_eq!(&value[..], b"value3");
+    }
+
+    #[test]
+    fn test_block_builder_encoded_matches_block_encoding() {
+        for prefix_compressed in [false, true] {
+            let populate = |builder: &mut BlockBuilder| {
+                builder.add(b"map:key:0001", b"value1");
+                builder.add(b"map:key:0002", b"value2");
+                builder.add(b"map:key:0010", b"value3");
+            };
+            let mut block_builder = BlockBuilder::new_with_prefix(4096, 2, prefix_compressed);
+            let mut encoded_builder = BlockBuilder::new_with_prefix(4096, 2, prefix_compressed);
+            populate(&mut block_builder);
+            populate(&mut encoded_builder);
+
+            let expected = block_builder.build().encode();
+            let actual = encoded_builder.build_encoded();
+            assert_eq!(actual, expected);
+
+            let decoded = Block::decode(actual).unwrap();
+            assert_eq!(decoded.offsets_len(), 3);
+            assert_eq!(decoded.get(1).unwrap().0.as_ref(), b"map:key:0002");
+            assert_eq!(decoded.get(1).unwrap().1.as_ref(), b"value2");
+        }
+    }
+
+    #[test]
+    fn test_empty_block_builder_encoded_round_trip() {
+        let builder = BlockBuilder::new(32);
+        assert!(builder.is_empty());
+        assert_eq!(builder.estimated_size(), BLOCK_HEADER_SIZE);
+
+        let encoded = builder.build_encoded();
+        assert_eq!(encoded.len(), BLOCK_HEADER_SIZE);
+        let decoded = Block::decode(encoded).unwrap();
+        assert_eq!(decoded.offsets_len(), 0);
+        assert_eq!(decoded.size_in_bytes(), BLOCK_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_block_builder_size_boundary_includes_header_and_offsets() {
+        let entry_size = 4 + b"key".len() + 4 + b"value".len();
+        let encoded_size = BLOCK_HEADER_SIZE + entry_size + 4;
+        let mut builder = BlockBuilder::new(encoded_size);
+        assert_eq!(builder.estimated_size(), BLOCK_HEADER_SIZE);
+        assert!(!builder.should_finish());
+
+        builder.add(b"key", b"value");
+        assert_eq!(builder.estimated_size(), encoded_size);
+        assert!(builder.should_finish());
+        assert_eq!(builder.build_encoded().len(), encoded_size);
     }
 
     #[test]

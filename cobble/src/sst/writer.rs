@@ -8,8 +8,9 @@ use crate::sst::compression::{SstCompressionAlgorithm, write_block};
 use crate::sst::format::{BlockBuilder, Footer, SstReadMetadata};
 use crate::sst::row_codec::{encode_key, encode_value};
 use crate::r#type::{Key, KvValue, Value, key_bucket};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 use metrics::{Histogram, histogram};
+
 #[derive(Clone)]
 struct DataBlockMeta {
     first_key: Vec<u8>,
@@ -40,6 +41,7 @@ pub struct SSTWriterOptions {
     /// Optional metrics handles to reuse across writers.
     pub metrics: Option<SSTWriterMetrics>,
     pub block_size: usize,
+    /// Buffered file-output size. This is independent of the SST data-block size.
     pub buffer_size: usize,
     /// Number of columns in the value schema.
     /// Used for encoding values with the row codec.
@@ -67,7 +69,7 @@ impl Default for SSTWriterOptions {
         Self {
             metrics: None,
             block_size: 4096,
-            buffer_size: 8192,
+            buffer_size: 256 * 1024,
             num_columns: 1,
             bloom_filter_enabled: false,
             bloom_bits_per_key: 10,
@@ -167,7 +169,7 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
         }
 
         let normalized_value = if self.options.value_has_ttl {
-            Bytes::copy_from_slice(value)
+            value
         } else {
             if value.len() < 4 {
                 return Err(Error::IoError(format!(
@@ -175,11 +177,11 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
                     value.len()
                 )));
             }
-            Bytes::copy_from_slice(&value[4..])
+            &value[4..]
         };
 
         // Add to current data block
-        self.data_block_builder.add(key, normalized_value.as_ref());
+        self.data_block_builder.add(key, normalized_value);
         if let Some(builder) = &mut self.bloom_filter_builder {
             builder.add(key);
         }
@@ -221,11 +223,8 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
                 self.options.data_block_restart_interval > 1,
             ),
         );
-        let mut block = old_builder.build();
-        let block_id = self.pending_data_blocks.len() as u32;
-        block.set_block_id(block_id);
         let offset = self.writer.offset();
-        let encoded = block.encode();
+        let encoded = old_builder.build_encoded();
         let raw_len = encoded.len();
 
         // Write the block
@@ -554,6 +553,12 @@ impl<W: SequentialWriteFile + 'static> FileBuilder for SSTWriter<W> {
 mod tests {
     use super::*;
     use crate::file::FileSystemRegistry;
+    use crate::sst::{SSTIterator, SSTIteratorOptions};
+
+    #[test]
+    fn test_sst_writer_default_buffer_size() {
+        assert_eq!(SSTWriterOptions::default().buffer_size, 256 * 1024);
+    }
 
     #[test]
     #[serial_test::serial(file)]
@@ -648,6 +653,20 @@ mod tests {
         writer.finish().unwrap();
 
         assert!(fs.exists("test_blocks.sst").unwrap());
+
+        let reader_file = fs.open_read("test_blocks.sst").unwrap();
+        let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+        iter.seek_to_first().unwrap();
+        for i in 0..20 {
+            assert!(iter.valid());
+            let key = format!("key{:03}", i);
+            let value = format!("value{:03}_with_some_extra_data_to_fill_space", i);
+            let (actual_key, actual_value) = iter.current().unwrap().unwrap();
+            assert_eq!(actual_key.as_ref(), key.as_bytes());
+            assert_eq!(actual_value.as_ref(), value.as_bytes());
+            iter.next().unwrap();
+        }
+        assert!(!iter.valid());
 
         let _ = std::fs::remove_dir_all("/tmp/sst_writer_test");
     }
