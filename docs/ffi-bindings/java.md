@@ -493,7 +493,12 @@ To produce a **single multi-platform jar** (including `debug` + `release` JNI li
 
 - Workflow: `.github/workflows/java-multi-platform-jar.yml`
 - Trigger: **Actions -> Build Java Multi-platform JAR -> Run workflow**
+- Branch: choose the branch with GitHub Actions' **Use workflow from** selector
 - Output: downloadable jar artifact from the workflow run
+
+Manual runs require the selected branch to use a `-SNAPSHOT` Maven version and publish that
+multi-platform snapshot package to Maven Central. Pushes and successful Java CI runs do not publish
+snapshot packages automatically.
 
 The platforms included in the multi-platform jar are:
 
