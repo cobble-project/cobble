@@ -200,6 +200,7 @@ Named column families are created later through schema evolution. Reopen, restor
 |-----------|---------|-------------|
 | `primary_volume_write_stop_watermark` | 0.95 | Volume usage ratio to stop writes |
 | `primary_volume_offload_trigger_watermark` | 0.85 | Volume usage ratio to trigger file offload |
+| `primary_volume_backfill_trigger_watermark` | 0.40 | Backfill trigger ratio, up to 0.80 and kept below the offload watermark |
 | `primary_volume_offload_policy` | `Priority` | Offload policy: `LargestFile` or `Priority` |
 
 ### Logging

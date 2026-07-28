@@ -109,11 +109,11 @@ The encoded size includes block framing and an optional checksum trailer, so the
 
 | Metric | Type | Additional labels | Description |
 |--------|------|-------------------|-------------|
-| `offload_jobs_scheduled_total` | Counter | None | Offload jobs accepted for background execution. |
-| `offload_jobs_completed_total` | Counter | None | Offload jobs completed by either copying a file or promoting an existing replica. |
-| `offload_jobs_failed_total` | Counter | None | Offload jobs that failed during execution. |
-| `offload_jobs_noop_total` | Counter | None | Scheduled jobs that completed without moving a file because it was no longer eligible. |
-| `offload_bytes_moved_total` | Counter | None | Cumulative bytes physically copied by completed offload jobs. |
-| `offload_promotions_total` | Counter | None | Completed offloads that reused and promoted an existing snapshot replica instead of copying data. |
+| `offload_jobs_scheduled_total` | Counter | None | Primary-tiering jobs accepted for background execution, including backfill. |
+| `offload_jobs_completed_total` | Counter | None | Primary-tiering jobs completed by either copying a file or promoting an existing replica. |
+| `offload_jobs_failed_total` | Counter | None | Primary-tiering jobs that failed during execution. |
+| `offload_jobs_noop_total` | Counter | None | Scheduled jobs that completed without moving a file because it was no longer eligible or referenced. |
+| `offload_bytes_moved_total` | Counter | None | Cumulative bytes physically copied by completed primary-tiering jobs. |
+| `offload_promotions_total` | Counter | None | Completed tiering jobs that reused and promoted an existing snapshot replica instead of copying data. |
 
 Promotion jobs increment `offload_jobs_completed_total` and `offload_promotions_total`, but not `offload_bytes_moved_total`.

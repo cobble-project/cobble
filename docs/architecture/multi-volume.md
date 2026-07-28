@@ -27,13 +27,13 @@ A single volume can serve multiple roles. For example, a local SSD can be both `
 
 New data always lands on the highest-priority primary volume — this is where [memtable flushes](memtable) write SST/Parquet files and where [VLOG](key-value-separation) segments are created.
 
-When that volume approaches its configured `size_limit`, Cobble's **offload runtime** automatically migrates files to the next lower-priority primary volume. The migration is asynchronous and non-blocking — reads continue from the original file until the copy is confirmed, at which point the file reference is atomically swapped.
+When that volume approaches its configured `size_limit`, Cobble's **primary tiering runtime** automatically migrates files to the next lower-priority primary volume. When a higher-priority volume later falls below `primary_volume_backfill_trigger_watermark`, the same background runtime pulls live files back from lower tiers. The backfill watermark may be configured up to 80% and is kept slightly below the offload watermark to prevent immediate reversal. A higher-priority volume without a `size_limit` can backfill every eligible file. Migration is asynchronous and non-blocking — reads continue from the original file until the copy is confirmed, at which point the file reference is atomically swapped.
 
 ```
-Writes → High-priority SSD → (offload when full) → Medium-priority SSD → Low-priority storage
+Writes → High-priority SSD ⇄ Medium-priority SSD ⇄ Low-priority storage
 ```
 
-This tiered approach means your hottest data stays on the fastest storage, while colder data naturally migrates to cheaper, larger volumes without any application-level management.
+Backfill considers only files referenced by the current LSM or VLOG state. Lower LSM levels have higher backfill priority, deeper levels have lower priority, and VLOG files are last. Snapshot-only replicas, orphan outputs, and other unreferenced tracked files are not pulled back.
 
 ## Offload Behavior
 
@@ -42,6 +42,8 @@ The offload system is designed to be safe and unobtrusive:
 - **Non-blocking reads**: A file being migrated remains readable from its original location until the copy completes.
 - **Backpressure**: Only a limited number of migrations run concurrently. New migrations are not scheduled while prior ones are in flight.
 - **Snapshot awareness**: Files that exist only as [snapshot](snapshot) replicas are never migrated. If a snapshot replica already exists on the target volume, the offload promotes the existing copy instead of making a new one.
+- **Snapshot lifecycle safety**: Moving a live file back to a higher tier does not delete its lower-tier source while a snapshot still references that source.
+- **Hysteresis**: Backfill starts below its own low watermark and stops before the offload watermark, avoiding immediate movement back to a lower tier.
 
 ## Snapshot Volumes
 

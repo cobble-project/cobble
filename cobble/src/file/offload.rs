@@ -1,14 +1,26 @@
 use super::file_manager::FileId;
 use crate::Error;
 use crate::config::PrimaryVolumeOffloadPolicyKind;
+use crate::db_state::DbStateHandle;
 use crate::file::{DataVolume, FileManager, TrackedFile, TrackedWriter};
 use dashmap::{DashMap, Entry};
 use log::warn;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
+
+const PRIMARY_TIERING_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_BACKFILL_TRIGGER_WATERMARK: f64 = 0.80;
+const MIN_OFFLOAD_BACKFILL_GAP: f64 = 0.01;
+
+fn effective_backfill_trigger_watermark(requested: f64, offload_trigger: f64) -> f64 {
+    requested
+        .min(MAX_BACKFILL_TRIGGER_WATERMARK)
+        .min((offload_trigger - MIN_OFFLOAD_BACKFILL_GAP).max(0.0))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VolumePressure {
@@ -62,6 +74,7 @@ type OffloadJobFn = dyn Fn(FileId) + Send + Sync + 'static;
 #[derive(Clone)]
 struct OffloadJobPlan {
     source_volume: Arc<DataVolume>,
+    target_volume: Arc<DataVolume>,
     estimated_bytes: u64,
 }
 
@@ -190,6 +203,14 @@ impl OffloadRuntime {
         source_volume.projected_offload_bytes()
     }
 
+    fn projected_target_incoming_bytes(&self, target_volume: &Arc<DataVolume>) -> u64 {
+        self.planned_jobs
+            .iter()
+            .filter(|entry| Arc::ptr_eq(&entry.value().target_volume, target_volume))
+            .map(|entry| entry.value().estimated_bytes)
+            .sum()
+    }
+
     fn start_worker(self: &Arc<Self>) -> Result<(), String> {
         let mut tx_guard = self.tx.lock().unwrap();
         if tx_guard.is_some() {
@@ -269,6 +290,77 @@ impl OffloadRuntime {
         if let Some(worker) = worker {
             let _ = worker.join();
         }
+    }
+}
+
+pub(crate) struct PrimaryTieringWorkerHandle {
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl PrimaryTieringWorkerHandle {
+    fn start(
+        file_manager: &Arc<FileManager>,
+        db_state: &Arc<DbStateHandle>,
+    ) -> crate::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(()), Condvar::new()));
+        let weak_file_manager = Arc::downgrade(file_manager);
+        let weak_db_state = Arc::downgrade(db_state);
+        let stop_for_worker = Arc::clone(&stop);
+        let wake_for_worker = Arc::clone(&wake);
+        let worker = std::thread::Builder::new()
+            .name("cobble-primary-tiering".to_string())
+            .spawn(move || {
+                while !stop_for_worker.load(AtomicOrdering::Acquire) {
+                    let Some(file_manager) = weak_file_manager.upgrade() else {
+                        return;
+                    };
+                    let Some(db_state) = weak_db_state.upgrade() else {
+                        return;
+                    };
+                    if let Err(err) = file_manager.trigger_primary_tiering_if_needed(&db_state) {
+                        warn!("primary volume tiering scan failed: {}", err);
+                    }
+                    drop(db_state);
+                    drop(file_manager);
+
+                    let (lock, condvar) = wake_for_worker.as_ref();
+                    let guard = lock.lock().unwrap();
+                    let _ = condvar
+                        .wait_timeout_while(guard, PRIMARY_TIERING_SCAN_INTERVAL, |_| {
+                            !stop_for_worker.load(AtomicOrdering::Acquire)
+                        })
+                        .unwrap();
+                }
+            })
+            .map_err(|err| {
+                Error::IoError(format!("Failed to start primary tiering worker: {err}"))
+            })?;
+        Ok(Self {
+            stop,
+            wake,
+            worker: Mutex::new(Some(worker)),
+        })
+    }
+
+    pub(crate) fn stop(&self) {
+        self.stop.store(true, AtomicOrdering::Release);
+        self.wake.1.notify_all();
+    }
+
+    pub(crate) fn join(&self) {
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for PrimaryTieringWorkerHandle {
+    fn drop(&mut self) {
+        self.stop();
+        self.join();
     }
 }
 
@@ -357,6 +449,22 @@ impl FileManager {
         self.offload_runtime.stop();
     }
 
+    pub(crate) fn start_primary_tiering_worker(
+        self: &Arc<Self>,
+        db_state: &Arc<DbStateHandle>,
+    ) -> crate::Result<Option<PrimaryTieringWorkerHandle>> {
+        let distinct_primary_ranks = self
+            .data_volumes
+            .iter()
+            .filter(|volume| volume.supports_primary_data)
+            .map(|volume| volume.priority.rank())
+            .collect::<HashSet<_>>();
+        if distinct_primary_ranks.len() < 2 {
+            return Ok(None);
+        }
+        PrimaryTieringWorkerHandle::start(self, db_state).map(Some)
+    }
+
     #[cfg(test)]
     fn wait_for_offload_idle(&self, timeout: Duration) -> bool {
         self.offload_runtime.wait_idle(timeout)
@@ -437,6 +545,105 @@ impl FileManager {
         Ok(scheduled)
     }
 
+    pub(crate) fn trigger_primary_tiering_if_needed(
+        self: &Arc<Self>,
+        db_state: &Arc<DbStateHandle>,
+    ) -> crate::Result<usize> {
+        let offloaded = self.trigger_offload_if_needed()?;
+        if offloaded != 0 {
+            return Ok(offloaded);
+        }
+        self.trigger_backfill_if_needed(db_state)
+    }
+
+    fn trigger_backfill_if_needed(
+        self: &Arc<Self>,
+        db_state: &Arc<DbStateHandle>,
+    ) -> crate::Result<usize> {
+        let referenced_priorities = referenced_primary_file_priorities(db_state);
+        if referenced_priorities.is_empty() {
+            return Ok(0);
+        }
+
+        let backfill_trigger_watermark = effective_backfill_trigger_watermark(
+            self.options.primary_volume_backfill_trigger_watermark,
+            self.options.primary_volume_offload_trigger_watermark,
+        );
+        if backfill_trigger_watermark <= 0.0 {
+            return Ok(0);
+        }
+
+        let mut scheduled = 0usize;
+        for target_volume in &self.data_volumes {
+            if !target_volume.supports_primary_data || target_volume.readonly_source {
+                continue;
+            }
+            let target_rank = target_volume.priority.rank();
+            if !self
+                .data_volumes
+                .iter()
+                .any(|volume| volume.supports_primary_data && volume.priority.rank() < target_rank)
+            {
+                continue;
+            }
+            let used_bytes = target_volume
+                .used_bytes
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let already_planned = self
+                .offload_runtime
+                .projected_target_incoming_bytes(target_volume);
+            let mut projected_used = used_bytes.saturating_add(already_planned);
+            let (refill_target_bytes, offload_trigger_bytes) = if let Some(size_limit) =
+                target_volume.size_limit
+            {
+                let trigger_bytes = (size_limit as f64 * backfill_trigger_watermark).floor() as u64;
+                if projected_used >= trigger_bytes {
+                    continue;
+                }
+                // Fill only to the midpoint between the backfill and offload thresholds.
+                // This hysteresis keeps a completed batch from immediately moving down again.
+                let refill_target_ratio = (backfill_trigger_watermark
+                    + self.options.primary_volume_offload_trigger_watermark)
+                    / 2.0;
+                (
+                    (size_limit as f64 * refill_target_ratio).floor() as u64,
+                    (size_limit as f64 * self.options.primary_volume_offload_trigger_watermark)
+                        .floor() as u64,
+                )
+            } else {
+                // An unlimited higher-priority volume can absorb every referenced file from
+                // lower tiers, so it does not need a usage-ratio trigger or refill target.
+                (u64::MAX, u64::MAX)
+            };
+            let mut attempted = HashSet::new();
+            while projected_used < refill_target_bytes {
+                let remaining_before_offload = offload_trigger_bytes.saturating_sub(projected_used);
+                let Some(file_id) = self.select_backfill_candidate_with_exclusions(
+                    target_volume,
+                    &referenced_priorities,
+                    &attempted,
+                    remaining_before_offload,
+                ) else {
+                    break;
+                };
+                attempted.insert(file_id);
+                let estimated_bytes = self
+                    .data_files
+                    .get(&file_id)
+                    .map(|entry| entry.value().size_bytes())
+                    .unwrap_or(0);
+                if estimated_bytes == 0 {
+                    continue;
+                }
+                if self.schedule_backfill_move(file_id, target_volume, db_state)? {
+                    scheduled += 1;
+                    projected_used = projected_used.saturating_add(estimated_bytes);
+                }
+            }
+        }
+        Ok(scheduled)
+    }
+
     pub(crate) fn create_data_file_with_offload(
         self: &Arc<Self>,
     ) -> crate::Result<(FileId, TrackedWriter)> {
@@ -449,7 +656,26 @@ impl FileManager {
         file_id: FileId,
         target_volume: &Arc<DataVolume>,
     ) -> crate::Result<bool> {
+        self.schedule_primary_move(file_id, target_volume, None)
+    }
+
+    fn schedule_backfill_move(
+        self: &Arc<Self>,
+        file_id: FileId,
+        target_volume: &Arc<DataVolume>,
+        db_state: &Arc<DbStateHandle>,
+    ) -> crate::Result<bool> {
+        self.schedule_primary_move(file_id, target_volume, Some(Arc::downgrade(db_state)))
+    }
+
+    fn schedule_primary_move(
+        self: &Arc<Self>,
+        file_id: FileId,
+        target_volume: &Arc<DataVolume>,
+        referenced_state: Option<std::sync::Weak<DbStateHandle>>,
+    ) -> crate::Result<bool> {
         let target_volume = Arc::clone(target_volume);
+        let target_volume_for_job = Arc::clone(&target_volume);
         let source_volume = self
             .data_files
             .get(&file_id)
@@ -471,8 +697,19 @@ impl FileManager {
         let manager = Arc::downgrade(self);
         let handler = Arc::new(move |scheduled_file_id| {
             if let Some(manager) = manager.upgrade() {
-                match manager
-                    .offload_file_to_lower_priority_primary(scheduled_file_id, &target_volume)
+                if let Some(referenced_state) = &referenced_state {
+                    let Some(db_state) = referenced_state.upgrade() else {
+                        manager.record_offload_noop();
+                        return;
+                    };
+                    if !referenced_primary_file_priorities(&db_state)
+                        .contains_key(&scheduled_file_id)
+                    {
+                        manager.record_offload_noop();
+                        return;
+                    }
+                }
+                match manager.move_file_to_primary_volume(scheduled_file_id, &target_volume_for_job)
                 {
                     Ok(true) => {}
                     Ok(false) => manager.record_offload_noop(),
@@ -481,7 +718,7 @@ impl FileManager {
                         warn!(
                             "offload move failed for file_id={} target_rank={}: {}",
                             scheduled_file_id,
-                            target_volume.priority.rank(),
+                            target_volume_for_job.priority.rank(),
                             err
                         );
                     }
@@ -494,6 +731,7 @@ impl FileManager {
                 file_id,
                 OffloadJobPlan {
                     source_volume,
+                    target_volume: Arc::clone(&target_volume),
                     estimated_bytes,
                 },
                 handler,
@@ -572,12 +810,55 @@ impl FileManager {
             .select_candidate(&candidates, &source_pressure, &target_pressure)
     }
 
+    fn select_backfill_candidate_with_exclusions(
+        &self,
+        target_volume: &Arc<DataVolume>,
+        referenced_priorities: &HashMap<FileId, u8>,
+        excluded_file_ids: &HashSet<FileId>,
+        max_size_bytes: u64,
+    ) -> Option<FileId> {
+        if max_size_bytes == 0 || target_volume.readonly_source {
+            return None;
+        }
+        self.data_files
+            .iter()
+            .filter_map(|entry| {
+                let file_id = *entry.key();
+                if excluded_file_ids.contains(&file_id)
+                    || self.offload_runtime.is_queued_or_running(file_id)
+                {
+                    return None;
+                }
+                let priority = *referenced_priorities.get(&file_id)?;
+                let tracked = entry.value();
+                let source_volume = tracked.volume.as_ref()?;
+                if !source_volume.supports_primary_data
+                    || source_volume.priority.rank() >= target_volume.priority.rank()
+                    || Arc::ptr_eq(source_volume, target_volume)
+                {
+                    return None;
+                }
+                let size_bytes = tracked.size_bytes();
+                if size_bytes == 0 || size_bytes > max_size_bytes {
+                    return None;
+                }
+                Some((file_id, priority, size_bytes))
+            })
+            .max_by(|left, right| {
+                left.1
+                    .cmp(&right.1)
+                    .then_with(|| left.2.cmp(&right.2))
+                    .then_with(|| right.0.cmp(&left.0))
+            })
+            .map(|candidate| candidate.0)
+    }
+
     #[cfg(test)]
     fn primary_volume_by_rank(&self, rank: u8) -> Option<Arc<DataVolume>> {
         self.offload_runtime.primary_volume_by_rank(rank)
     }
 
-    pub(crate) fn offload_file_to_lower_priority_primary(
+    pub(crate) fn move_file_to_primary_volume(
         &self,
         file_id: FileId,
         target_volume: &Arc<DataVolume>,
@@ -646,6 +927,28 @@ impl FileManager {
     }
 }
 
+fn referenced_primary_file_priorities(db_state: &DbStateHandle) -> HashMap<FileId, u8> {
+    let state = db_state.load();
+    let mut priorities = HashMap::<FileId, u8>::new();
+    for tree_version in state.multi_lsm_version.tree_versions_cloned() {
+        for level in &tree_version.levels {
+            let priority = crate::file::lsm_file_priority_for_level(level.ordinal);
+            for file in &level.files {
+                priorities
+                    .entry(file.file_id)
+                    .and_modify(|current| *current = (*current).max(priority))
+                    .or_insert(priority);
+            }
+        }
+    }
+    for (_, tracked_id, _) in state.vlog_version.files_with_entries() {
+        priorities
+            .entry(tracked_id.file_id())
+            .or_insert(crate::file::VLOG_FILE_PRIORITY);
+    }
+    priorities
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,6 +964,13 @@ mod tests {
             used_bytes: 1,
             size_limit: Some(2),
         }
+    }
+
+    #[test]
+    fn backfill_watermark_can_exceed_half_offload_but_never_eighty_percent() {
+        assert_eq!(effective_backfill_trigger_watermark(0.70, 0.85), 0.70);
+        assert_eq!(effective_backfill_trigger_watermark(0.90, 0.95), 0.80);
+        assert!((effective_backfill_trigger_watermark(0.70, 0.60) - 0.59).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -990,7 +1300,7 @@ mod tests {
 
         let target_volume = fm.primary_volume_by_rank(1).unwrap();
         let promoted = fm
-            .offload_file_to_lower_priority_primary(source_file_id, &target_volume)
+            .move_file_to_primary_volume(source_file_id, &target_volume)
             .unwrap();
         assert!(promoted);
         assert_eq!(
@@ -1003,6 +1313,279 @@ mod tests {
             Some(snapshot_replica_file_id)
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_backfill_preserves_source_until_snapshot_reference_is_released() {
+        let root = "/tmp/file_manager_backfill_snapshot_lifecycle";
+        let _ = std::fs::remove_dir_all(root);
+        let high_url = format!("file://{root}/high");
+        let low_url = format!("file://{root}/low");
+        let registry = FileSystemRegistry::new();
+        let low_fs = registry.get_or_register(low_url.clone()).unwrap();
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    high_url,
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    low_url,
+                    vec![
+                        VolumeUsageKind::PrimaryDataPriorityLow,
+                        VolumeUsageKind::Snapshot,
+                    ],
+                ),
+            ],
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new(
+            "file-manager-backfill-snapshot-lifecycle",
+        ));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+        let low_volume = fm.primary_volume_by_rank(1).unwrap();
+        let high_volume = fm.primary_volume_by_rank(3).unwrap();
+
+        let (file_id, mut writer) = fm.create_data_file().unwrap();
+        writer.write(b"snapshot-retained").unwrap();
+        writer.close().unwrap();
+        assert!(
+            fm.move_file_to_primary_volume(file_id, &low_volume)
+                .unwrap()
+        );
+        let low_path = fm.get_data_file_path(file_id).unwrap();
+        let snapshot_ref = fm.data_file_ref(file_id).unwrap();
+
+        assert!(
+            fm.move_file_to_primary_volume(file_id, &high_volume)
+                .unwrap()
+        );
+        assert!(
+            low_fs.exists(&low_path).unwrap(),
+            "backfill must retain the low-tier source while a snapshot references it"
+        );
+
+        snapshot_ref.dereference();
+        assert!(low_fs.exists(&low_path).unwrap());
+        drop(snapshot_ref);
+        test_utils::wait_for_file_deletion(&low_fs, &low_path);
+        assert!(
+            !low_fs.exists(&low_path).unwrap(),
+            "the source may be deleted only after the snapshot reference is released"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_backfill_prefers_low_lsm_levels_and_skips_unreferenced_files() {
+        let root = "/tmp/file_manager_backfill_priority";
+        let _ = std::fs::remove_dir_all(root);
+        let mut high = crate::VolumeDescriptor::new(
+            format!("file://{root}/high"),
+            vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+        );
+        high.size_limit = Some(Size::from_kib(8));
+        let low = crate::VolumeDescriptor::new(
+            format!("file://{root}/low"),
+            vec![VolumeUsageKind::PrimaryDataPriorityLow],
+        );
+        let config = Config {
+            volumes: vec![high, low],
+            base_file_size: Size::from_const(64),
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-backfill-priority"));
+        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
+        let low_volume = fm.primary_volume_by_rank(1).unwrap();
+        let high_volume = fm.primary_volume_by_rank(3).unwrap();
+
+        let create_on_low = |size: usize| {
+            let (file_id, mut writer) = fm.create_data_file().unwrap();
+            writer.write(&vec![b'x'; size]).unwrap();
+            writer.close().unwrap();
+            assert!(
+                fm.move_file_to_primary_volume(file_id, &low_volume)
+                    .unwrap()
+            );
+            file_id
+        };
+        let l0_file = create_on_low(128);
+        let l3_file = create_on_low(256);
+        let vlog_file = create_on_low(384);
+        let unreferenced_file = create_on_low(512);
+
+        let referenced_priorities = HashMap::from([
+            (l0_file, crate::file::lsm_file_priority_for_level(0)),
+            (l3_file, crate::file::lsm_file_priority_for_level(3)),
+            (vlog_file, crate::file::VLOG_FILE_PRIORITY),
+        ]);
+        let mut excluded = HashSet::new();
+        assert_eq!(
+            fm.select_backfill_candidate_with_exclusions(
+                &high_volume,
+                &referenced_priorities,
+                &excluded,
+                u64::MAX,
+            ),
+            Some(l0_file)
+        );
+        excluded.insert(l0_file);
+        assert_eq!(
+            fm.select_backfill_candidate_with_exclusions(
+                &high_volume,
+                &referenced_priorities,
+                &excluded,
+                u64::MAX,
+            ),
+            Some(l3_file)
+        );
+        excluded.insert(l3_file);
+        assert_eq!(
+            fm.select_backfill_candidate_with_exclusions(
+                &high_volume,
+                &referenced_priorities,
+                &excluded,
+                u64::MAX,
+            ),
+            Some(vlog_file)
+        );
+        excluded.insert(vlog_file);
+        assert_eq!(
+            fm.select_backfill_candidate_with_exclusions(
+                &high_volume,
+                &referenced_priorities,
+                &excluded,
+                u64::MAX,
+            ),
+            None
+        );
+        assert!(!referenced_priorities.contains_key(&unreferenced_file));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_primary_tiering_worker_backfills_only_current_lsm_files() {
+        let root = "/tmp/file_manager_backfill_worker";
+        let _ = std::fs::remove_dir_all(root);
+        let high = crate::VolumeDescriptor::new(
+            format!("file://{root}/high"),
+            vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+        );
+        let low = crate::VolumeDescriptor::new(
+            format!("file://{root}/low"),
+            vec![VolumeUsageKind::PrimaryDataPriorityLow],
+        );
+        let config = Config {
+            volumes: vec![high, low],
+            base_file_size: Size::from_const(64),
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-backfill-worker"));
+        let fm = Arc::new(FileManager::from_config(&config, "db", metrics_manager).unwrap());
+        let low_volume = fm.primary_volume_by_rank(1).unwrap();
+
+        let create_on_low = |size: usize| {
+            let (file_id, mut writer) = fm.create_data_file().unwrap();
+            writer.write(&vec![b'x'; size]).unwrap();
+            writer.close().unwrap();
+            assert!(
+                fm.move_file_to_primary_volume(file_id, &low_volume)
+                    .unwrap()
+            );
+            file_id
+        };
+        let l0_file_id = create_on_low(256);
+        let vlog_file_id = create_on_low(256);
+        let unreferenced_file_id = create_on_low(256);
+
+        let data_file = Arc::new(crate::data_file::DataFile::new(
+            crate::data_file::DataFileType::SSTable,
+            vec![0],
+            vec![1],
+            l0_file_id,
+            crate::file::TrackedFileId::new(&fm, l0_file_id),
+            0,
+            256,
+            0u16..=0u16,
+            0u16..=0u16,
+        ));
+        let db_state = Arc::new(crate::db_state::DbStateHandle::new());
+        let current = db_state.load();
+        db_state.store(crate::db_state::DbState {
+            seq_id: current.seq_id,
+            bucket_ranges: vec![0u16..=0u16],
+            multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
+                crate::lsm::LSMTreeVersion {
+                    levels: vec![crate::lsm::Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: vec![data_file],
+                    }],
+                },
+            ),
+            vlog_version: crate::vlog::VlogVersion::from_files_with_entries(vec![(
+                0,
+                crate::file::TrackedFileId::new(&fm, vlog_file_id),
+                1,
+            )]),
+            active: current.active.clone(),
+            immutables: current.immutables.clone(),
+            truncation_cursors: current.truncation_cursors.clone(),
+            suggested_base_snapshot_id: None,
+        });
+        let referenced_priorities = referenced_primary_file_priorities(&db_state);
+        assert_eq!(
+            referenced_priorities.get(&l0_file_id),
+            Some(&crate::file::lsm_file_priority_for_level(0))
+        );
+        assert_eq!(
+            referenced_priorities.get(&vlog_file_id),
+            Some(&crate::file::VLOG_FILE_PRIORITY)
+        );
+        assert!(!referenced_priorities.contains_key(&unreferenced_file_id));
+
+        let worker = fm.start_primary_tiering_worker(&db_state).unwrap().unwrap();
+        let moved = (0..100).any(|_| {
+            let on_high = fm
+                .data_files
+                .get(&l0_file_id)
+                .and_then(|tracked| {
+                    tracked
+                        .volume
+                        .as_ref()
+                        .map(|volume| volume.priority.rank() == 3)
+                })
+                .unwrap_or(false);
+            if !on_high {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            on_high
+        });
+        worker.stop();
+        worker.join();
+        assert!(fm.wait_for_offload_idle(Duration::from_secs(20)));
+
+        assert!(moved, "the current L0 file should be backfilled");
+        assert_eq!(
+            fm.data_files.get(&vlog_file_id).and_then(|tracked| {
+                tracked.volume.as_ref().map(|volume| volume.priority.rank())
+            }),
+            Some(3),
+            "a referenced VLOG file should be eligible after LSM files"
+        );
+        assert_eq!(
+            fm.data_files
+                .get(&unreferenced_file_id)
+                .and_then(|tracked| {
+                    tracked.volume.as_ref().map(|volume| volume.priority.rank())
+                }),
+            Some(1),
+            "an unreferenced tracked file must remain on the low-priority volume"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

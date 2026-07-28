@@ -69,6 +69,8 @@ pub struct Db {
     ttl_provider: Arc<TTLProvider>,
     /// Dedicated compaction result poller. Only active in `CompactionMode::Dedicated`.
     dedicated_poller: Option<crate::compaction::dedicated_poller::DedicatedCompactionPollerHandle>,
+    /// Periodically moves files between primary volume tiers in both directions.
+    primary_tiering_worker: Option<crate::file::PrimaryTieringWorkerHandle>,
     /// Durable runtime-manifest publisher for external observers.
     runtime_manifest_publisher:
         Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
@@ -741,6 +743,10 @@ impl Db {
     }
 
     pub(crate) fn force_close(&self) {
+        if let Some(worker) = &self.primary_tiering_worker {
+            worker.stop();
+            worker.join();
+        }
         if let Some(publisher) = &self.runtime_manifest_publisher {
             publisher.stop();
             publisher.join();
@@ -774,6 +780,10 @@ impl Db {
         if let Some(err) = self.lifecycle_error() {
             self.force_close();
             return Err(err);
+        }
+        if let Some(worker) = &self.primary_tiering_worker {
+            worker.stop();
+            worker.join();
         }
         if let Err(err) = self.memtable_manager.close() {
             self.force_close();
@@ -1129,6 +1139,7 @@ impl Db {
         } else {
             None
         };
+        let primary_tiering_worker = file_manager.start_primary_tiering_worker(&db_state)?;
 
         // Mark the DB as open before starting background observers so their
         // `ensure_open()` checks pass immediately.
@@ -1180,6 +1191,7 @@ impl Db {
             time_provider,
             ttl_provider,
             dedicated_poller,
+            primary_tiering_worker,
             runtime_manifest_publisher,
         })
     }

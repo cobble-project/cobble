@@ -197,6 +197,7 @@ Named column families are added later through schema evolution. Reopen, restore,
 |-----------|------|---------|-------------|
 | `primary_volume_write_stop_watermark` | `f64` | 0.95 | Usage ratio to stop writes |
 | `primary_volume_offload_trigger_watermark` | `f64` | 0.85 | Usage ratio to trigger offload |
+| `primary_volume_backfill_trigger_watermark` | `f64` | 0.40 | Backfill trigger ratio (maximum 0.80 and kept below the offload watermark) |
 | `primary_volume_offload_policy` | `PrimaryVolumeOffloadPolicyKind` | `Priority` | Policy: `LargestFile` or `Priority` |
 
 ### LSM Splitting

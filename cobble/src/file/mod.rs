@@ -27,4 +27,6 @@ pub use self::files::{
 };
 pub(crate) use self::files::{ReadAllFile, read_ahead_runtime};
 pub(crate) use self::metadata_io::{MetadataReader, MetadataWriter};
-pub(crate) use self::offload::{PrimaryOffloadFileRef, compare_primary_offload_file_refs};
+pub(crate) use self::offload::{
+    PrimaryOffloadFileRef, PrimaryTieringWorkerHandle, compare_primary_offload_file_refs,
+};

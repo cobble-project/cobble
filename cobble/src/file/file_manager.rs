@@ -292,6 +292,8 @@ pub struct FileManagerOptions {
     pub primary_volume_write_stop_watermark: f64,
     /// Usage ratio watermark for triggering background offload from a primary volume.
     pub primary_volume_offload_trigger_watermark: f64,
+    /// Usage ratio below which higher-priority primary volumes are backfilled.
+    pub primary_volume_backfill_trigger_watermark: f64,
     /// Offload policy for selecting candidate files.
     pub primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind,
 }
@@ -304,6 +306,7 @@ impl Default for FileManagerOptions {
             base_file_size: DEFAULT_BASE_FILE_SIZE,
             primary_volume_write_stop_watermark: 0.95,
             primary_volume_offload_trigger_watermark: 0.85,
+            primary_volume_backfill_trigger_watermark: 0.40,
             primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::Priority,
         }
     }
@@ -852,6 +855,11 @@ impl FileManager {
                     .to_string(),
             ));
         }
+        if !(0.0..=0.80).contains(&options.primary_volume_backfill_trigger_watermark) {
+            return Err(Error::ConfigError(
+                "primary_volume_backfill_trigger_watermark must be in [0.0, 0.80]".to_string(),
+            ));
+        }
         if data_volumes.is_empty() {
             return Err(Error::ConfigError(
                 "No data volumes configured for FileManager".to_string(),
@@ -925,6 +933,8 @@ impl FileManager {
             primary_volume_write_stop_watermark: config.primary_volume_write_stop_watermark,
             primary_volume_offload_trigger_watermark: config
                 .primary_volume_offload_trigger_watermark,
+            primary_volume_backfill_trigger_watermark: config
+                .primary_volume_backfill_trigger_watermark,
             primary_volume_offload_policy: config.primary_volume_offload_policy,
             ..FileManagerOptions::default()
         };

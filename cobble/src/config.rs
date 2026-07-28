@@ -853,6 +853,10 @@ pub struct Config {
     /// Usage ratio watermark for triggering background offload from a primary volume.
     /// Range: [0.0, 1.0], and should be <= write-stop watermark.
     pub primary_volume_offload_trigger_watermark: f64,
+    /// Usage ratio below which a higher-priority primary volume pulls referenced files back
+    /// from lower-priority volumes. Maximum: 0.80. The effective value also remains below the
+    /// offload trigger watermark to prevent immediate movement back to a lower tier.
+    pub primary_volume_backfill_trigger_watermark: f64,
     /// Offload policy for selecting candidate files on pressured primary volumes.
     pub primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind,
     /// Auto-expire snapshots after this many newer snapshots are completed.
@@ -930,6 +934,7 @@ impl Default for Config {
             lsm_split_trigger_level: None,
             primary_volume_write_stop_watermark: 0.95,
             primary_volume_offload_trigger_watermark: 0.85,
+            primary_volume_backfill_trigger_watermark: 0.40,
             primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::Priority,
             snapshot_retention: None,
             snapshot_only_track: false,
@@ -1588,6 +1593,7 @@ mod tests {
             lsm_split_trigger_level: Some(2),
             primary_volume_write_stop_watermark: 0.93,
             primary_volume_offload_trigger_watermark: 0.82,
+            primary_volume_backfill_trigger_watermark: 0.41,
             primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::LargestFile,
             snapshot_retention: Some(3),
             snapshot_only_track: false,
@@ -1653,6 +1659,7 @@ mod tests {
         assert_eq!(decoded.lsm_split_trigger_level, Some(2));
         assert_eq!(decoded.primary_volume_write_stop_watermark, 0.93);
         assert_eq!(decoded.primary_volume_offload_trigger_watermark, 0.82);
+        assert_eq!(decoded.primary_volume_backfill_trigger_watermark, 0.41);
         assert_eq!(
             decoded.primary_volume_offload_policy,
             PrimaryVolumeOffloadPolicyKind::LargestFile
