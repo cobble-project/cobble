@@ -5,7 +5,7 @@
 //!
 //! ## Key Format
 //! ```text
-//! [group: u16][cf: u8][data: bytes]
+//! [bucket: u16 big-endian][cf: u8][data: bytes]
 //! ```
 //! Note: The key's data length is stored by the SST block format, not in the key itself.
 //!
@@ -23,7 +23,10 @@
 //! - Last present column: `[value_type: u8][data: bytes]` (data_len is omitted and calculated from remaining bytes)
 
 use crate::error::{Error, Result};
-use crate::r#type::{Column, Key, RefColumn, RefKey, RefValue, Value, ValueType};
+use crate::r#type::{
+    Column, ENCODED_KEY_BUCKET_BYTES, ENCODED_KEY_PREFIX_BYTES, Key, RefColumn, RefKey, RefValue,
+    Value, ValueType, decode_bucket_prefix, encode_bucket_prefix,
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Encodes a ValueType to a single byte.
@@ -63,10 +66,10 @@ impl<'a> ColumnRef for RefColumn<'a> {
 
 /// Encodes a Key to bytes.
 ///
-/// Layout: `[group: u16][cf: u8][data: bytes]`
+/// Layout: `[bucket: u16 big-endian][cf: u8][data: bytes]`
 /// Note: The key's data length is stored by the SST block format, not encoded here.
 pub(crate) fn encode_key(key: &Key) -> Bytes {
-    let size = 3 + key.data().len();
+    let size = ENCODED_KEY_PREFIX_BYTES + key.data().len();
     let mut buf = BytesMut::with_capacity(size);
     encode_key_ref_into(
         &RefKey::new_with_column_family(key.bucket(), key.column_family(), key.data()),
@@ -76,7 +79,7 @@ pub(crate) fn encode_key(key: &Key) -> Bytes {
 }
 
 pub(crate) fn encode_key_ref_into(key: &RefKey<'_>, buf: &mut impl BufMut) {
-    buf.put_u16_le(key.bucket());
+    buf.put_slice(&encode_bucket_prefix(key.bucket()));
     buf.put_u8(key.column_family());
     buf.put_slice(key.data());
 }
@@ -84,22 +87,25 @@ pub(crate) fn encode_key_ref_into(key: &RefKey<'_>, buf: &mut impl BufMut) {
 /// Decodes a Key from bytes.
 /// The full key data is provided (length is known from SST block format).
 pub(crate) fn decode_key(data: &mut Bytes) -> Result<Key> {
-    if data.len() < 3 {
+    if data.len() < ENCODED_KEY_PREFIX_BYTES {
         return Err(Error::IoError(format!(
-            "Key data too small: expected at least 3 bytes, got {}",
-            data.len()
+            "Key data too small: expected at least {} bytes, got {}",
+            ENCODED_KEY_PREFIX_BYTES,
+            data.len(),
         )));
     }
 
-    let group = data.get_u16_le();
+    let bucket =
+        decode_bucket_prefix(&data[..ENCODED_KEY_BUCKET_BYTES]).expect("key length was checked");
+    data.advance(ENCODED_KEY_BUCKET_BYTES);
     let column_family = data.get_u8();
     let key_data = data.split_to(data.len());
-    Ok(Key::new_with_column_family(group, column_family, key_data))
+    Ok(Key::new_with_column_family(bucket, column_family, key_data))
 }
 
 /// Returns the encoded size of a Key in bytes.
 pub(crate) fn key_encoded_size(key: &Key) -> usize {
-    3 + key.data().len()
+    ENCODED_KEY_PREFIX_BYTES + key.data().len()
 }
 
 /// Returns the size of the presence bitmap for the given number of columns.
@@ -549,11 +555,21 @@ mod tests {
     }
 
     #[test]
+    fn encoded_bucket_prefixes_sort_across_255_256_boundary() {
+        let key_255 = encode_key(&Key::new(255, b"key".to_vec()));
+        let key_256 = encode_key(&Key::new(256, b"key".to_vec()));
+
+        assert_eq!(&key_255[..ENCODED_KEY_BUCKET_BYTES], &[0, 255]);
+        assert_eq!(&key_256[..ENCODED_KEY_BUCKET_BYTES], &[1, 0]);
+        assert!(key_255 < key_256);
+    }
+
+    #[test]
     fn test_key_empty_data() {
         let key = Key::new(0, Vec::new());
         let encoded = encode_key(&key);
 
-        assert_eq!(encoded.len(), 3);
+        assert_eq!(encoded.len(), ENCODED_KEY_PREFIX_BYTES);
 
         let mut encoded_for_decode = encoded.clone();
         let decoded = decode_key(&mut encoded_for_decode).unwrap();

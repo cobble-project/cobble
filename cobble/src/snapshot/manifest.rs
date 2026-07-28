@@ -23,7 +23,8 @@ use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::Arc;
 
-pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 1;
+/// Snapshot manifests version 2 require SST row keys with big-endian bucket prefixes.
+pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 2;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
@@ -859,6 +860,32 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Unsupported snapshot manifest version")
+        );
+    }
+
+    #[test]
+    fn decode_manifest_rejects_previous_physical_key_format() {
+        let previous = r#"{
+            "version": 1,
+            "id": 1,
+            "seq_id": 2,
+            "latest_schema_id": 3,
+            "data_size_bytes": 0,
+            "incremental_data_size_bytes": 0,
+            "bucket_ranges": [],
+            "lsm_tree_bucket_ranges": [],
+            "tree_scopes": [],
+            "tree_levels": [],
+            "vlog_files": [],
+            "active_memtable_data": []
+        }"#;
+        let err = match decode_manifest(previous.as_bytes()) {
+            Ok(_) => panic!("version 1 must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("Unsupported snapshot manifest version: 1 (expected 2)")
         );
     }
 }

@@ -19,7 +19,8 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) const GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT: u32 = 1;
+/// Global manifests version 2 reference shard snapshots with big-endian bucket prefixes.
+pub(crate) const GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT: u32 = 2;
 
 /// Bucket snapshot reference input.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -490,6 +491,24 @@ mod tests {
         }"#;
         let err = decode_global_manifest(raw).unwrap_err();
         assert!(err.to_string().contains("Failed to decode global manifest"));
+    }
+
+    #[test]
+    fn test_global_snapshot_manifest_rejects_previous_physical_key_format() {
+        let previous = GlobalSnapshotManifest {
+            version: 1,
+            id: 1,
+            total_buckets: 4,
+            column_family_ids: default_column_family_ids(),
+            shard_snapshots: Vec::new(),
+            watermark_seconds: 0,
+        };
+        let raw = serde_json::to_vec(&previous).unwrap();
+        let err = decode_global_manifest(&raw).expect_err("version 1 must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Unsupported global snapshot manifest version: 1 (expected 2)")
+        );
     }
 
     #[test]

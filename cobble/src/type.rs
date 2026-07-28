@@ -4,6 +4,28 @@ use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema};
 use crate::time::TimeProvider;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+/// Size of the physical bucket prefix in every encoded storage key.
+pub(crate) const ENCODED_KEY_BUCKET_BYTES: usize = 2;
+/// Size of the bucket and column-family prefix in every encoded storage key.
+pub(crate) const ENCODED_KEY_PREFIX_BYTES: usize = ENCODED_KEY_BUCKET_BYTES + 1;
+
+/// Encodes a bucket so lexicographic encoded-key order matches numeric bucket order.
+///
+/// This is part of Cobble's physical key format. Snapshot manifests version 2 reference SSTs
+/// written with this big-endian prefix.
+#[inline]
+pub(crate) fn encode_bucket_prefix(bucket: u16) -> [u8; ENCODED_KEY_BUCKET_BYTES] {
+    bucket.to_be_bytes()
+}
+
+/// Decodes the bucket prefix from an encoded storage key.
+#[inline]
+pub(crate) fn decode_bucket_prefix(bytes: &[u8]) -> Option<u16> {
+    bytes
+        .get(..ENCODED_KEY_BUCKET_BYTES)
+        .map(|prefix| u16::from_be_bytes([prefix[0], prefix[1]]))
+}
+
 pub(crate) struct Key {
     /// Logical namespace / group identifier.
     /// Used to partition the keyspace (e.g., different logical groups or column families).
@@ -217,11 +239,14 @@ impl Key {
 }
 
 pub(crate) fn key_bucket(key: &[u8]) -> Option<u16> {
-    (key.len() >= 3).then(|| u16::from_le_bytes([key[0], key[1]]))
+    if key.len() < ENCODED_KEY_PREFIX_BYTES {
+        return None;
+    }
+    decode_bucket_prefix(key)
 }
 
 pub(crate) fn key_column_family(key: &[u8]) -> Option<u8> {
-    (key.len() >= 3).then(|| key[2])
+    (key.len() >= ENCODED_KEY_PREFIX_BYTES).then(|| key[ENCODED_KEY_BUCKET_BYTES])
 }
 
 impl ValueType {
@@ -364,7 +389,7 @@ impl<'a> RefKey<'a> {
     }
 
     pub(crate) fn encoded_len(&self) -> usize {
-        3 + self.data.len()
+        ENCODED_KEY_PREFIX_BYTES + self.data.len()
     }
 }
 

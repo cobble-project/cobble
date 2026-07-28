@@ -6,7 +6,9 @@ use crate::file::FileId;
 use crate::iterator::SortedRun;
 use crate::lsm::Level;
 use crate::sst::SSTWriterOptions;
-use crate::r#type::{key_bucket, key_column_family};
+use crate::r#type::{
+    ENCODED_KEY_PREFIX_BYTES, encode_bucket_prefix, key_bucket, key_column_family,
+};
 use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
@@ -194,8 +196,8 @@ pub(crate) fn file_fully_covered_by_truncation_cursor(
         if !file.effective_bucket_range.contains(&cursor_id.bucket) {
             return false;
         }
-        let mut encoded_cursor = Vec::with_capacity(3 + cursor.len());
-        encoded_cursor.extend_from_slice(&cursor_id.bucket.to_le_bytes());
+        let mut encoded_cursor = Vec::with_capacity(ENCODED_KEY_PREFIX_BYTES + cursor.len());
+        encoded_cursor.extend_from_slice(&encode_bucket_prefix(cursor_id.bucket));
         encoded_cursor.push(cursor_id.column_family_id);
         encoded_cursor.extend_from_slice(cursor);
         encoded_cursor.as_slice() >= file.end_key.as_slice()

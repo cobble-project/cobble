@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 pub(crate) mod publisher;
 
-pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 1;
+/// Runtime manifests version 2 describe SSTs with big-endian bucket prefixes.
+pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 2;
 pub(crate) const MAX_RUNTIME_MANIFEST_CHAIN_DEPTH: usize = 64;
 const RUNTIME_MANIFEST_DIR: &str = "runtime";
 const RUNTIME_CURRENT_NAME: &str = "runtime/CURRENT";
@@ -861,6 +862,20 @@ mod tests {
         let loaded = store.load_current().unwrap().unwrap();
         assert_eq!(loaded.chain_depth, 1);
         assert_eq!(loaded.manifest, current);
+    }
+
+    #[test]
+    fn decode_rejects_previous_physical_key_format() {
+        let previous = RuntimeManifestEnvelope {
+            version: 1,
+            manifest: RuntimeManifestPayload::Full(manifest(1, vec![levels(&[], &[])])),
+        };
+        let raw = serde_json::to_vec(&previous).unwrap();
+        let err = decode_runtime_manifest(&raw).expect_err("version 1 must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Unsupported runtime manifest version: 1 (expected 2)")
+        );
     }
 
     #[test]

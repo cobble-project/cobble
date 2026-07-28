@@ -2463,7 +2463,7 @@ mod tests {
                 .unwrap_or_default();
             assert_eq!(level1_files.len(), 1);
             assert_eq!(
-                u16::from_le_bytes([level1_files[0].start_key[0], level1_files[0].start_key[1]]),
+                key_bucket(&level1_files[0].start_key).expect("encoded test key bucket"),
                 bucket
             );
         }

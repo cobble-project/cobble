@@ -98,8 +98,8 @@ mod tests {
     use crate::format::FileBuildResult;
     use crate::metrics_manager::MetricsManager;
     use crate::parquet::ParquetWriter;
-    use crate::sst::row_codec::encode_value;
-    use crate::r#type::{Column, Value, ValueType};
+    use crate::sst::row_codec::{encode_key, encode_value};
+    use crate::r#type::{Column, Key, Value, ValueType};
 
     fn cleanup_test_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
@@ -133,8 +133,10 @@ mod tests {
             &Value::new(vec![Some(Column::new(ValueType::Put, b"v2".to_vec()))]),
             1,
         );
-        writer.add(&[1, 0, b'a'], &encoded_v1).unwrap();
-        writer.add(&[2, 0, b'b'], &encoded_v2).unwrap();
+        let key_a = encode_key(&Key::new(1, b"a".to_vec()));
+        let key_b = encode_key(&Key::new(2, b"b".to_vec()));
+        writer.add(&key_a, &encoded_v1).unwrap();
+        writer.add(&key_b, &encoded_v2).unwrap();
         let FileBuildResult {
             first_key: start_key,
             last_key: end_key,
@@ -161,7 +163,7 @@ mod tests {
         iter.seek_to_first().unwrap();
         assert!(iter.valid());
         let key = iter.key().unwrap().unwrap();
-        assert_eq!(key, &[2, 0, b'b']);
+        assert_eq!(key, key_b);
         let decoded = iter.take_value().unwrap().unwrap().into_decoded(1).unwrap();
         assert_eq!(
             decoded.columns()[0].as_ref().unwrap().data().as_ref(),

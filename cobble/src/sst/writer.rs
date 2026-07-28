@@ -552,6 +552,7 @@ impl<W: SequentialWriteFile + 'static> FileBuilder for SSTWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_file::DataFile;
     use crate::file::FileSystemRegistry;
     use crate::sst::{SSTIterator, SSTIteratorOptions};
 
@@ -614,6 +615,38 @@ mod tests {
         assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all("/tmp/sst_writer_test");
+    }
+
+    #[test]
+    fn test_sst_writer_orders_bucket_255_before_256_and_preserves_range_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let root_url = url::Url::from_directory_path(root.path())
+            .unwrap()
+            .to_string();
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(&root_url).unwrap();
+        let key_255 = encode_key(&Key::new(255, b"key".to_vec()));
+        let key_256 = encode_key(&Key::new(256, b"key".to_vec()));
+
+        let writer_file = fs.open_write("bucket-boundary.sst").unwrap();
+        let mut writer = SSTWriter::new(writer_file, SSTWriterOptions::default());
+        writer.add(&key_255, b"value-255").unwrap();
+        writer.add(&key_256, b"value-256").unwrap();
+        let result = writer.finish_with_range().unwrap();
+
+        assert_eq!(result.first_key, key_255);
+        assert_eq!(result.last_key, key_256);
+        assert_eq!(
+            DataFile::bucket_range_from_keys(&result.first_key, &result.last_key),
+            255..=256
+        );
+
+        let reader_file = fs.open_read("bucket-boundary.sst").unwrap();
+        let mut iter = SSTIterator::new(reader_file, SSTIteratorOptions::default()).unwrap();
+        iter.seek_to_first().unwrap();
+        assert_eq!(iter.current().unwrap().unwrap().0, key_255);
+        iter.next().unwrap();
+        assert_eq!(iter.current().unwrap().unwrap().0, key_256);
     }
 
     #[test]

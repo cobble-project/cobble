@@ -28,7 +28,9 @@ use crate::paths::snapshot_active_data_relative_path;
 use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotManager};
 use crate::sst::{SSTWriter, SSTWriterOptions};
-use crate::r#type::{KvValue, RefKey, RefValue, ValueType, key_bucket, key_column_family};
+use crate::r#type::{
+    ENCODED_KEY_PREFIX_BYTES, KvValue, RefKey, RefValue, ValueType, key_bucket, key_column_family,
+};
 use crate::vlog::{VlogEdit, VlogStore};
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::{debug, trace, warn};
@@ -2309,12 +2311,12 @@ fn key_is_truncated_by_cursor_map(
     column_family_id: u8,
     encoded_key: &[u8],
 ) -> bool {
-    if cursors.is_empty() || encoded_key.len() < 3 {
+    if cursors.is_empty() || encoded_key.len() < ENCODED_KEY_PREFIX_BYTES {
         return false;
     }
     cursors
         .get(&TruncationCursorId::new(bucket, column_family_id))
-        .is_some_and(|cursor| &encoded_key[3..] <= cursor.as_slice())
+        .is_some_and(|cursor| &encoded_key[ENCODED_KEY_PREFIX_BYTES..] <= cursor.as_slice())
 }
 
 fn decode_active_snapshot_segments_into_memtable(

@@ -23,7 +23,7 @@ use crate::iterator::{
 use crate::lsm::{LevelEdit, VersionEdit};
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, SchemaManager};
 use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions, SSTWriter};
-use crate::r#type::{key_bucket, key_column_family};
+use crate::r#type::{ENCODED_KEY_PREFIX_BYTES, key_bucket, key_column_family};
 use crate::vlog::{VlogEdit, VlogMergeCollector};
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::trace;
@@ -923,7 +923,7 @@ impl CompactionExecutor {
 }
 
 fn key_is_truncated_by_cursor_map(cursors: &TruncationCursorMap, encoded_key: &[u8]) -> bool {
-    if cursors.is_empty() || encoded_key.len() < 3 {
+    if cursors.is_empty() || encoded_key.len() < ENCODED_KEY_PREFIX_BYTES {
         return false;
     }
     let Some(bucket) = key_bucket(encoded_key) else {
@@ -934,7 +934,7 @@ fn key_is_truncated_by_cursor_map(cursors: &TruncationCursorMap, encoded_key: &[
     };
     cursors
         .get(&TruncationCursorId::new(bucket, column_family_id))
-        .is_some_and(|cursor| &encoded_key[3..] <= cursor.as_slice())
+        .is_some_and(|cursor| &encoded_key[ENCODED_KEY_PREFIX_BYTES..] <= cursor.as_slice())
 }
 
 #[cfg(test)]
