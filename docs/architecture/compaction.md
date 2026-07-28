@@ -69,6 +69,11 @@ start before the writers; it keeps scanning and each shard waits until its write
 `PROPERTIES` and its first runtime manifest. Volume order, usage kinds, priorities, paths, and
 limits come from `PROPERTIES`; credentials come only from the compactor process configuration.
 
+Expand, shrink, and column-family tree creation are serialized with dedicated result application.
+Results and snapshot proofs locate trees by stable scope rather than by the mutable tree index. A
+writer rejects expand/shrink while an unconsumed result or unproven in-memory edit exists; retry the
+rescale after the result has been consumed.
+
 With `runtime_manifest_mode: auto` (the default), a dedicated writer publishes the current
 persisted LSM layout and the compactor observes it. Set the mode to `disabled` to use snapshot
 manifests instead. Runtime manifests are observations, not recovery points: snapshots still provide

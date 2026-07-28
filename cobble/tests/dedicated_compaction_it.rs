@@ -63,6 +63,18 @@ fn open_db_with_id(config: Config, db_id: &str) -> Db {
         .expect("open db")
 }
 
+fn open_db_with_ranges(
+    config: Config,
+    db_id: &str,
+    bucket_ranges: Vec<std::ops::RangeInclusive<u16>>,
+) -> Db {
+    DbBuilder::new(config)
+        .bucket_ranges(bucket_ranges)
+        .db_id(db_id)
+        .open()
+        .expect("open ranged db")
+}
+
 /// Runs a `DedicatedCompactor` on a background thread, calling `run_once` in a loop until
 /// `stop` is set. The compactor can start before a writer; it idles until runtime CURRENT exists.
 fn spawn_compactor(config: Config, db_id: String) -> (Arc<AtomicBool>, JoinHandle<()>) {
@@ -390,6 +402,107 @@ fn dedicated_service_compacts_multiple_discovered_db_directories() {
     }
     db_a.close().expect("close shard A");
     db_b.close().expect("close shard B");
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn dedicated_compaction_tracks_expand_and_shrink_tree_scopes() {
+    let root = "/tmp/dedicated_compaction_rescale";
+    cleanup_test_root(root);
+    let source_id = "dedicated-rescale-source";
+    let target_id = "dedicated-rescale-target";
+    let mut config = dedicated_config(root);
+    config.total_buckets = 4;
+    let source = open_db_with_ranges(config.clone(), source_id, vec![2u16..=3u16]);
+    let target = open_db_with_ranges(config.clone(), target_id, vec![0u16..=1u16]);
+    let value = vec![b'r'; 1024];
+
+    // Keep several L0 files in the source (no compactor is running for it), then publish the
+    // snapshot that expand imports.
+    for i in 0..40u32 {
+        source
+            .put(2, format!("import-{i:08}").as_bytes(), 0, &value)
+            .expect("write source");
+    }
+    let source_snapshot = source.snapshot().expect("snapshot source");
+    let source_root = format!("{root}/{source_id}");
+    assert!(
+        wait_for(Duration::from_secs(15), Duration::from_millis(100), || {
+            snapshot_exists(&source_root, source_snapshot)
+        }),
+        "source snapshot should materialize"
+    );
+
+    // Ensure the target has an older one-tree manifest. The expanded tree will not exist in this
+    // manifest, which exercises scope-based manifest lookup during dedicated result commit.
+    let target_snapshot = target.snapshot().expect("snapshot target before expand");
+    let target_root = format!("{root}/{target_id}");
+    assert!(
+        wait_for(Duration::from_secs(15), Duration::from_millis(100), || {
+            snapshot_exists(&target_root, target_snapshot)
+        }),
+        "target bootstrap snapshot should materialize"
+    );
+
+    target
+        .expand_bucket(source_id, Some(source_snapshot), None)
+        .expect("expand target");
+    verify_get(&target, 2, b"import-00000000", &value);
+
+    let snapshots_before_expand_compaction = count_snapshots(&target_root);
+    let (expand_stop, expand_handle) = spawn_compactor(config.clone(), target_id.to_string());
+    let expanded_tree_compacted =
+        wait_for(Duration::from_secs(60), Duration::from_millis(200), || {
+            count_snapshots(&target_root) > snapshots_before_expand_compaction
+                && count_compaction_results(&target_root) == 0
+        });
+    expand_stop.store(true, Ordering::SeqCst);
+    expand_handle.join().expect("join expand compactor");
+    assert!(
+        expanded_tree_compacted,
+        "expanded tree should compact (snapshots={}, results={})",
+        count_snapshots(&target_root),
+        count_compaction_results(&target_root)
+    );
+
+    // Remove the first scope so the imported 2..=3 tree moves from index 1 to index 0. The
+    // pre-shrink snapshot retains the old ordering; subsequent result proof must resolve both
+    // current and persisted trees by scope rather than by index.
+    let shrink_snapshot = target
+        .shrink_bucket(vec![0u16..=1u16])
+        .expect("shrink target");
+    assert!(snapshot_exists(&target_root, shrink_snapshot));
+    for i in 0..40u32 {
+        target
+            .put(2, format!("after-shrink-{i:08}").as_bytes(), 0, &value)
+            .expect("write after shrink");
+    }
+
+    let snapshots_before_shrink_compaction = count_snapshots(&target_root);
+    let (shrink_stop, shrink_handle) = spawn_compactor(config.clone(), target_id.to_string());
+    let shifted_tree_compacted =
+        wait_for(Duration::from_secs(60), Duration::from_millis(200), || {
+            count_snapshots(&target_root) > snapshots_before_shrink_compaction
+                && count_compaction_results(&target_root) == 0
+        });
+    shrink_stop.store(true, Ordering::SeqCst);
+    shrink_handle.join().expect("join shrink compactor");
+    assert!(
+        shifted_tree_compacted,
+        "shifted tree should compact (snapshots={}, results={})",
+        count_snapshots(&target_root),
+        count_compaction_results(&target_root)
+    );
+    verify_get(&target, 2, b"import-00000000", &value);
+    verify_get(&target, 2, b"after-shrink-00000000", &value);
+
+    target.close().expect("close target");
+    let resumed = Db::resume(config, target_id).expect("resume rescaled target");
+    verify_get(&resumed, 2, b"import-00000000", &value);
+    verify_get(&resumed, 2, b"after-shrink-00000000", &value);
+    resumed.close().expect("close resumed target");
+    source.close().expect("close source");
     cleanup_test_root(root);
 }
 

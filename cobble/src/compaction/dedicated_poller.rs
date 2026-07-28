@@ -69,6 +69,7 @@ pub(crate) struct PollerContext {
     pub(crate) db_state: Arc<DbStateHandle>,
     pub(crate) runtime_manifest_publisher:
         Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
+    pub(crate) lsm_topology_lock: Arc<Mutex<()>>,
     pub(crate) poll_interval: Duration,
     pub(crate) config: Config,
     pub(crate) stop: Arc<AtomicBool>,
@@ -90,6 +91,7 @@ impl DedicatedCompactionPollerHandle {
         runtime_manifest_publisher: Option<
             Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>,
         >,
+        lsm_topology_lock: Arc<Mutex<()>>,
         poll_interval: Duration,
         config: Config,
     ) -> Self {
@@ -119,6 +121,7 @@ impl DedicatedCompactionPollerHandle {
             db_lifecycle,
             db_state,
             runtime_manifest_publisher,
+            lsm_topology_lock,
             poll_interval,
             config,
             stop: Arc::clone(&stop),

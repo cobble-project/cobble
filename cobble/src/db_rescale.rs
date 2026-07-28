@@ -34,6 +34,31 @@ fn filter_truncation_cursors(
 }
 
 impl Db {
+    fn ensure_dedicated_rescale_can_start(&self) -> Result<()> {
+        if self.config.compaction_mode != crate::config::CompactionMode::Dedicated {
+            return Ok(());
+        }
+        if let Some(job_id) = self
+            .runtime_manifest_publisher
+            .as_ref()
+            .and_then(|publisher| publisher.dedicated_apply_suspension_owner())
+        {
+            return Err(Error::InvalidState(format!(
+                "cannot change LSM topology while dedicated compaction job {job_id} has an unproven in-memory edit"
+            )));
+        }
+        let pending = crate::compaction::dedicated::list_dedicated_compaction_result_job_ids(
+            &self.file_manager,
+        )?;
+        if !pending.is_empty() {
+            return Err(Error::InvalidState(format!(
+                "cannot change LSM topology while dedicated compaction result {} is pending; retry after the writer consumes it",
+                pending[0]
+            )));
+        }
+        Ok(())
+    }
+
     /// Expands owned bucket ranges by importing LSM tree and VLOG state from a snapshot of another db, while
     /// keeping source files read-only and remapping file IDs to avoid collisions in local tracking. The source
     /// snapshot must have bucket ranges that are fully covered by the requested expand ranges, and the target db
@@ -51,6 +76,8 @@ impl Db {
     ) -> Result<u64> {
         let source_db_id = source_db_id.into();
         let _access = self.begin_access()?;
+        let _topology_guard = self.lsm_topology_lock.lock().unwrap();
+        self.ensure_dedicated_rescale_can_start()?;
         if source_db_id == self.id {
             return Err(Error::ConfigError(
                 "cannot expand bucket from the same db".to_string(),
@@ -356,6 +383,8 @@ impl Db {
     /// and returns the snapshot ID of that snapshot.
     pub fn shrink_bucket(&self, ranges: Vec<RangeInclusive<u16>>) -> Result<u64> {
         let _access = self.begin_access()?;
+        let _topology_guard = self.lsm_topology_lock.lock().unwrap();
+        self.ensure_dedicated_rescale_can_start()?;
         if ranges.is_empty() {
             return Err(Error::ConfigError(
                 "shrink ranges must not be empty".to_string(),
@@ -480,7 +509,7 @@ mod tests {
     use crate::db_state::full_bucket_range;
     use crate::file::FileManager;
     use crate::metrics_manager::MetricsManager;
-    use crate::{Config, VolumeDescriptor};
+    use crate::{Config, DbBuilder, VolumeDescriptor};
     use serial_test::serial;
     use size::Size;
     use std::sync::Arc;
@@ -740,6 +769,63 @@ mod tests {
         let err = db.shrink_bucket(vec![0u16..=1u16]).unwrap_err();
         assert!(matches!(err, Error::ConfigError(_)));
         drop(db);
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn dedicated_rescale_rejects_pending_compaction_result() {
+        let root = "/tmp/db_dedicated_rescale_pending_result";
+        cleanup_test_root(root);
+        let mut config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            compaction_mode: crate::config::CompactionMode::Dedicated,
+            compaction_dedicated_poll_interval_ms: 1_000,
+            ..Config::default()
+        };
+        config.total_buckets = 4;
+        let db = DbBuilder::new(config)
+            .bucket_ranges(vec![0u16..=3u16])
+            .db_id("dedicated-rescale-pending")
+            .open()
+            .unwrap();
+        if let Some(poller) = &db.dedicated_poller {
+            poller.stop();
+            poller.join();
+        }
+        let result = crate::compaction::dedicated::DedicatedCompactionResult {
+            version: crate::compaction::dedicated::DEDICATED_COMPACTION_RESULT_VERSION,
+            job_id: "pending-rescale".to_string(),
+            source: crate::compaction::dedicated::DedicatedCompactionSource::Runtime {
+                generation: 1,
+                seq_id: db.db_state.load().seq_id,
+            },
+            lsm_tree_idx: 0,
+            tree_scope: LSMTreeScope::new(0u16..=3u16, 0),
+            operation: crate::compaction::dedicated::DedicatedCompactionOperation::Drop {
+                inputs: Vec::new(),
+            },
+            vlog_entry_deltas: Vec::new(),
+            created_at_ms: 0,
+        };
+        crate::compaction::dedicated::publish_dedicated_compaction_result(
+            &db.file_manager,
+            &result,
+        )
+        .unwrap();
+
+        let err = db.shrink_bucket(vec![0u16..=0u16]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("result pending-rescale is pending")
+        );
+
+        crate::compaction::dedicated::delete_dedicated_compaction_result(
+            &db.file_manager,
+            &result.job_id,
+        )
+        .unwrap();
+        db.close().unwrap();
         cleanup_test_root(root);
     }
 }

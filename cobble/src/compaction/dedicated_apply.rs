@@ -11,9 +11,9 @@
 //! 2. Operation-specific status judgment: Pending / AppliedInMemory / Conflict.
 //! 3. If Pending: allocate canonical file ids for Rewrite outputs, register them readonly,
 //!    resolve real input Arcs from the current LSM, apply VersionEdit + VlogEdit.
-//! 4. If Pending or AppliedInMemory: check if the latest manifest already proves the
-//!    operation committed; if not, run a snapshot barrier (flush + materialize with callback)
-//!    and verify the manifest.
+//! 4. If freshly applied, run a snapshot barrier (flush + materialize with callback). On retry,
+//!    reuse an existing manifest only when it contains positive evidence for the operation;
+//!    otherwise create a new snapshot. Verify the resulting manifest in either case.
 //! 5. When runtime manifests are enabled, publish the applied DbState after the snapshot proof.
 //! 6. Once durability is proven: make outputs owned, delete the result.
 //! 7. If Conflict: clean up uncommitted outputs, delete the result.
@@ -86,6 +86,13 @@ pub(crate) fn apply_external_compaction_result(
         return Ok(ExternalCompactionApplyResult::TerminalInvalid);
     }
 
+    // Tree indices are not stable across expand/shrink or column-family topology changes.
+    // Hold the writer's topology lock from scope validation through the durable snapshot proof,
+    // so the exact scope resolved below remains attached to the same logical tree throughout
+    // apply and manifest verification. File-level flushes remain independently serialized by
+    // DbState/LSM locks and may continue.
+    let _topology_guard = ctx.lsm_topology_lock.lock().unwrap();
+
     // Step 1: validate the result structure. Most validation errors are terminal
     // (structural), but I/O errors (e.g. remote storage temporarily unavailable)
     // should be retried.
@@ -132,6 +139,7 @@ pub(crate) fn apply_external_compaction_result(
         }
     };
 
+    let freshly_applied = matches!(apply_outcome, ApplyOutcome::Applied);
     match apply_outcome {
         ApplyOutcome::Applied | ApplyOutcome::AppliedInMemory => {
             let applied_seq_id = ctx.db_state.load().seq_id;
@@ -139,7 +147,7 @@ pub(crate) fn apply_external_compaction_result(
             // This is required for BOTH outcomes: Applied needs a fresh manifest;
             // AppliedInMemory may or may not have a committed manifest from a prior attempt.
             // Only commit_and_verify (which reads the manifest from disk) can prove durability.
-            commit_and_verify(ctx, result)?;
+            commit_and_verify(ctx, result, freshly_applied)?;
             // A runtime manifest may only describe an edit after the snapshot barrier made the
             // edit durable. If this publication fails, preserve the result and readonly outputs
             // so a retry can prove the snapshot again and advance runtime CURRENT later.
@@ -183,6 +191,7 @@ pub(crate) fn apply_external_compaction_result(
 /// `commit_and_verify` (which checks the manifest on disk) can prove the operation is
 /// `Committed` - the in-memory LSM state alone cannot, because a crash after `apply_edit` but
 /// before manifest write would leave the LSM reflecting the operation with no durable record.
+#[derive(Clone, Copy)]
 enum ApplyOutcome {
     Applied,
     AppliedInMemory,
@@ -273,6 +282,25 @@ fn find_tree_by_scope(ctx: &PollerContext, scope: &LSMTreeScope) -> Result<usize
         "dedicated compaction result tree scope {:?} no longer exists",
         scope
     )))
+}
+
+fn manifest_tree_levels_by_scope<'a>(
+    manifest: &'a crate::snapshot::manifest::ManifestSnapshot,
+    scope: &LSMTreeScope,
+) -> Result<Option<&'a [crate::manifest_model::ManifestLevel]>> {
+    if manifest.tree_scopes.len() != manifest.tree_levels.len() {
+        return Err(Error::InvalidState(format!(
+            "snapshot {} has {} tree scopes but {} tree level sets",
+            manifest.id,
+            manifest.tree_scopes.len(),
+            manifest.tree_levels.len()
+        )));
+    }
+    Ok(manifest
+        .tree_scopes
+        .iter()
+        .position(|candidate| candidate == scope)
+        .map(|tree_idx| manifest.tree_levels[tree_idx].as_slice()))
 }
 
 // ---------------------------------------------------------------------------
@@ -783,9 +811,18 @@ fn build_vlog_edit(deltas: &[(u32, i64)]) -> Option<VlogEdit> {
 // Manifest commit via snapshot barrier
 // ---------------------------------------------------------------------------
 
-fn commit_and_verify(ctx: &PollerContext, result: &DedicatedCompactionResult) -> Result<()> {
-    // Check if the latest manifest already proves this operation committed.
-    if is_already_committed(ctx, result)? {
+fn commit_and_verify(
+    ctx: &PollerContext,
+    result: &DedicatedCompactionResult,
+    freshly_applied: bool,
+) -> Result<()> {
+    // A result applied in this call always needs a new snapshot proof. On retry/restart, an
+    // existing manifest is reusable only when it contains positive evidence: job-unique rewrite
+    // outputs or a trivial-move file in its target level. Absence-only operations (Drop and
+    // empty-output Rewrite) cannot distinguish a committed removal from a snapshot that predates
+    // the input, so they deliberately create another snapshot.
+    let has_positive_commit_evidence = operation_has_positive_manifest_evidence(&result.operation);
+    if !freshly_applied && has_positive_commit_evidence && is_already_committed(ctx, result)? {
         debug!(
             "dedicated compaction result job={} already committed in manifest",
             result.job_id
@@ -823,6 +860,13 @@ fn commit_and_verify(ctx: &PollerContext, result: &DedicatedCompactionResult) ->
     Ok(())
 }
 
+fn operation_has_positive_manifest_evidence(operation: &DedicatedCompactionOperation) -> bool {
+    matches!(
+        operation,
+        DedicatedCompactionOperation::Rewrite { outputs, .. } if !outputs.is_empty()
+    ) || matches!(operation, DedicatedCompactionOperation::TrivialMove { .. })
+}
+
 /// Checks if the latest manifest on disk already reflects this operation being applied.
 fn is_already_committed(ctx: &PollerContext, result: &DedicatedCompactionResult) -> Result<bool> {
     let snapshot_ids = crate::snapshot::manifest::list_snapshot_manifest_ids(&ctx.file_manager)?;
@@ -831,14 +875,11 @@ fn is_already_committed(ctx: &PollerContext, result: &DedicatedCompactionResult)
     };
     let manifest = load_manifest_for_snapshot(&ctx.file_manager, latest_id)?;
 
-    // Check if all inputs are absent and all outputs are present in the manifest.
-    let tree_idx = find_tree_by_scope(ctx, &result.tree_scope)?;
-    let tree_levels = manifest.tree_levels.get(tree_idx).ok_or_else(|| {
-        Error::InvalidState(format!(
-            "tree index {} not found in manifest {}",
-            tree_idx, latest_id
-        ))
-    })?;
+    // Resolve against the manifest's own topology. The latest snapshot may predate an expand or
+    // shrink, so a current tree index cannot safely index this older manifest.
+    let Some(tree_levels) = manifest_tree_levels_by_scope(&manifest, &result.tree_scope)? else {
+        return Ok(false);
+    };
 
     let all_inputs_absent = result.operation.inputs().iter().all(|input| {
         !tree_levels.iter().any(|level| {
@@ -897,13 +938,13 @@ fn verify_manifest_after_commit(
     result: &DedicatedCompactionResult,
 ) -> Result<()> {
     let manifest = load_manifest_for_snapshot(&ctx.file_manager, manifest_info.id)?;
-    let tree_idx = find_tree_by_scope(ctx, &result.tree_scope)?;
-    let tree_levels = manifest.tree_levels.get(tree_idx).ok_or_else(|| {
-        Error::InvalidState(format!(
-            "tree index {} not found in manifest {}",
-            tree_idx, manifest_info.id
-        ))
-    })?;
+    let tree_levels =
+        manifest_tree_levels_by_scope(&manifest, &result.tree_scope)?.ok_or_else(|| {
+            Error::InvalidState(format!(
+                "tree scope {:?} not found in manifest {}",
+                result.tree_scope, manifest_info.id
+            ))
+        })?;
 
     // Verify inputs are removed.
     for input in result.operation.inputs() {
@@ -1170,5 +1211,80 @@ mod tests {
         // the caller maps to PreserveAndRetry.
         let err = result.unwrap_err();
         assert!(!is_transient_error(&err));
+    }
+
+    #[test]
+    fn snapshot_tree_lookup_uses_scope_instead_of_current_index() {
+        let first_scope = LSMTreeScope::new(0u16..=1u16, 0);
+        let shifted_scope = LSMTreeScope::new(2u16..=3u16, 0);
+        let manifest = crate::snapshot::manifest::ManifestSnapshot {
+            version: crate::snapshot::manifest::MANIFEST_VERSION_CURRENT,
+            id: 7,
+            seq_id: 11,
+            latest_schema_id: 0,
+            data_size_bytes: 0,
+            incremental_data_size_bytes: 0,
+            bucket_ranges: vec![0u16..=3u16],
+            lsm_tree_bucket_ranges: vec![0u16..=1u16, 2u16..=3u16],
+            tree_scopes: vec![first_scope, shifted_scope.clone()],
+            tree_levels: vec![
+                vec![crate::manifest_model::ManifestLevel {
+                    ordinal: 1,
+                    tiered: false,
+                    files: Vec::new(),
+                }],
+                vec![crate::manifest_model::ManifestLevel {
+                    ordinal: 7,
+                    tiered: false,
+                    files: Vec::new(),
+                }],
+            ],
+            vlog_files: Vec::new(),
+            active_memtable_data: Vec::new(),
+            truncation_cursors: Vec::new(),
+        };
+
+        let levels = manifest_tree_levels_by_scope(&manifest, &shifted_scope)
+            .unwrap()
+            .unwrap();
+        assert_eq!(levels[0].ordinal, 7);
+        assert!(
+            manifest_tree_levels_by_scope(&manifest, &LSMTreeScope::new(4u16..=5u16, 0))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn absence_only_operations_require_a_new_snapshot_proof() {
+        let input = DedicatedCompactionInput {
+            level: 0,
+            file: make_dedicated_file(1, "file:///tmp/input.sst", "00", "ff"),
+        };
+        assert!(!operation_has_positive_manifest_evidence(
+            &DedicatedCompactionOperation::Drop {
+                inputs: vec![input.clone()],
+            }
+        ));
+        assert!(!operation_has_positive_manifest_evidence(
+            &DedicatedCompactionOperation::Rewrite {
+                inputs: vec![input.clone()],
+                output_level: 1,
+                outputs: Vec::new(),
+            }
+        ));
+        assert!(operation_has_positive_manifest_evidence(
+            &DedicatedCompactionOperation::Rewrite {
+                inputs: vec![input.clone()],
+                output_level: 1,
+                outputs: vec![make_dedicated_file(2, "file:///tmp/output.sst", "00", "ff",)],
+            }
+        ));
+        assert!(operation_has_positive_manifest_evidence(
+            &DedicatedCompactionOperation::TrivialMove {
+                input,
+                output_level: 1,
+            }
+        ));
     }
 }

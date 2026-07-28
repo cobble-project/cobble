@@ -284,6 +284,7 @@ impl DedicatedCompactor {
             debug!("no dedicated compaction observation is available; waiting for writer");
             return Ok(DedicatedCompactionStep::WaitingForObservation);
         };
+        self.validate_observation_topology(&observation)?;
 
         // Step 3: Rebuild read-only LSM state, schema, truncation cursors.
         // Reload schemas in case the writer evolved the schema. Pass the saved resolver so
@@ -383,6 +384,7 @@ impl DedicatedCompactor {
     }
 
     fn validate_observation(&self, observation: &DedicatedObservation) -> Result<()> {
+        self.validate_observation_topology(observation)?;
         ensure_persisted_files_readable(
             &self.file_manager,
             &observation.tree_levels,
@@ -400,6 +402,27 @@ impl DedicatedCompactor {
         let _truncation_cursors = build_truncation_cursors(&observation.truncation_cursors)?;
         // Keep the schema manager alive through all descriptor reconstruction above.
         drop(schema_manager);
+        Ok(())
+    }
+
+    fn validate_observation_topology(&self, observation: &DedicatedObservation) -> Result<()> {
+        if observation.tree_scopes.len() != observation.tree_levels.len() {
+            return Err(Error::InvalidState(format!(
+                "dedicated compaction observation has {} tree scopes but {} tree level sets",
+                observation.tree_scopes.len(),
+                observation.tree_levels.len()
+            )));
+        }
+        let empty_versions = observation
+            .tree_scopes
+            .iter()
+            .map(|_| Arc::new(crate::lsm::LSMTreeVersion { levels: Vec::new() }))
+            .collect();
+        crate::db_state::MultiLSMTreeVersion::from_scopes_with_tree_versions(
+            self.config.total_buckets,
+            &observation.tree_scopes,
+            empty_versions,
+        )?;
         Ok(())
     }
 

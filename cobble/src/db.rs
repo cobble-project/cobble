@@ -28,8 +28,8 @@ use crate::{Config, ReadOptions, ScanOptions, TimeProvider, WriteOptions};
 use bytes::Bytes;
 use log::{error, info, warn};
 use std::ops::{ControlFlow, Range, RangeInclusive};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -56,6 +56,11 @@ pub struct Db {
     vlog_store: Arc<VlogStore>,
     snapshot_manager: SnapshotManager,
     schema_manager: Arc<SchemaManager>,
+    /// Serializes LSM topology changes with dedicated-compaction result application.
+    ///
+    /// File-level flushes may continue concurrently, but tree scope/index changes must not occur
+    /// between a dedicated result's scope validation and its durable snapshot proof.
+    lsm_topology_lock: Arc<Mutex<()>>,
     last_scope_synced_schema_version: AtomicU64,
     default_write_options: WriteOptions,
     default_read_options: ReadOptions,
@@ -467,6 +472,14 @@ impl Db {
 
     fn ensure_multi_lsm_scopes_for_schema_if_dirty(&self, schema: &Schema) -> Result<()> {
         let schema_version = schema.version();
+        if self
+            .last_scope_synced_schema_version
+            .load(Ordering::Acquire)
+            == schema_version
+        {
+            return Ok(());
+        }
+        let _topology_guard = self.lsm_topology_lock.lock().unwrap();
         if self
             .last_scope_synced_schema_version
             .load(Ordering::Acquire)
@@ -972,6 +985,7 @@ impl Db {
         }
         let latest_schema = schema_manager.latest_schema();
         Self::ensure_multi_lsm_scopes_for_schema(&db_state, latest_schema.as_ref())?;
+        let lsm_topology_lock = Arc::new(Mutex::new(()));
         let last_scope_synced_schema_version = AtomicU64::new(latest_schema.version());
         let lsm_tree = Arc::new(lsm_tree);
         let mut memtable_writer_options = crate::compaction::build_writer_options(
@@ -1137,6 +1151,7 @@ impl Db {
                     Arc::clone(&db_lifecycle),
                     Arc::clone(&db_state),
                     runtime_manifest_publisher.as_ref().map(Arc::clone),
+                    Arc::clone(&lsm_topology_lock),
                     Duration::from_millis(config.compaction_dedicated_poll_interval_ms),
                     config.clone(),
                 );
@@ -1157,6 +1172,7 @@ impl Db {
             vlog_store,
             snapshot_manager,
             schema_manager,
+            lsm_topology_lock,
             last_scope_synced_schema_version,
             default_write_options: WriteOptions::default(),
             default_read_options: ReadOptions::default(),
