@@ -294,6 +294,8 @@ pub struct FileManagerOptions {
     pub primary_volume_offload_trigger_watermark: f64,
     /// Usage ratio below which higher-priority primary volumes are backfilled.
     pub primary_volume_backfill_trigger_watermark: f64,
+    /// Maximum number of background file transfers executed concurrently.
+    pub file_transfer_concurrency: usize,
     /// Offload policy for selecting candidate files.
     pub primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind,
 }
@@ -307,6 +309,7 @@ impl Default for FileManagerOptions {
             primary_volume_write_stop_watermark: 0.95,
             primary_volume_offload_trigger_watermark: 0.85,
             primary_volume_backfill_trigger_watermark: 0.40,
+            file_transfer_concurrency: 4,
             primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::Priority,
         }
     }
@@ -860,6 +863,11 @@ impl FileManager {
                 "primary_volume_backfill_trigger_watermark must be in [0.0, 0.80]".to_string(),
             ));
         }
+        if options.file_transfer_concurrency == 0 {
+            return Err(Error::ConfigError(
+                "file_transfer_concurrency must be greater than zero".to_string(),
+            ));
+        }
         if data_volumes.is_empty() {
             return Err(Error::ConfigError(
                 "No data volumes configured for FileManager".to_string(),
@@ -885,6 +893,7 @@ impl FileManager {
         let offload_runtime = Arc::new(OffloadRuntime::new_with_policy_kind(
             &data_volumes,
             options.primary_volume_offload_policy,
+            options.file_transfer_concurrency,
         ));
         Ok(Self {
             metrics: metrics_manager.file_manager_metrics(),
@@ -935,6 +944,7 @@ impl FileManager {
                 .primary_volume_offload_trigger_watermark,
             primary_volume_backfill_trigger_watermark: config
                 .primary_volume_backfill_trigger_watermark,
+            file_transfer_concurrency: config.file_transfer_concurrency,
             primary_volume_offload_policy: config.primary_volume_offload_policy,
             ..FileManagerOptions::default()
         };
@@ -1236,7 +1246,12 @@ impl FileManager {
         source: &dyn RandomAccessFile,
         writer: &mut TrackedWriter,
     ) -> Result<()> {
-        self.copy_reader_to_tracked_writer_with_cancel(source, writer, None)
+        self.copy_reader_to_tracked_writer_with_cancel_and_progress(
+            source,
+            writer,
+            None,
+            &mut |_| {},
+        )
     }
 
     pub(crate) fn copy_reader_to_tracked_writer_with_cancel(
@@ -1244,6 +1259,30 @@ impl FileManager {
         source: &dyn RandomAccessFile,
         writer: &mut TrackedWriter,
         lifecycle_state: Option<&AtomicU8>,
+    ) -> Result<()> {
+        self.copy_reader_to_tracked_writer_with_cancel_and_progress(
+            source,
+            writer,
+            lifecycle_state,
+            &mut |_| {},
+        )
+    }
+
+    pub(crate) fn copy_reader_to_tracked_writer_with_progress(
+        &self,
+        source: &dyn RandomAccessFile,
+        writer: &mut TrackedWriter,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<()> {
+        self.copy_reader_to_tracked_writer_with_cancel_and_progress(source, writer, None, progress)
+    }
+
+    fn copy_reader_to_tracked_writer_with_cancel_and_progress(
+        &self,
+        source: &dyn RandomAccessFile,
+        writer: &mut TrackedWriter,
+        lifecycle_state: Option<&AtomicU8>,
+        progress: &mut dyn FnMut(u64),
     ) -> Result<()> {
         let source_size = source.size();
         let mut offset = 0usize;
@@ -1255,7 +1294,8 @@ impl FileManager {
             }
             let chunk = SNAPSHOT_COPY_CHUNK_BYTES.min(source_size - offset);
             let bytes = source.read_at(offset, chunk)?;
-            writer.write(bytes.as_ref())?;
+            let written = writer.write(bytes.as_ref())?;
+            progress(written as u64);
             offset += bytes.len();
         }
         if lifecycle_state.is_some_and(SnapshotLifecycleState::is_cancelled_raw) {

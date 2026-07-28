@@ -132,6 +132,8 @@ lsm_split_trigger_level: null
 # Primary-volume pressure/offload behavior.
 primary_volume_write_stop_watermark: 0.95
 primary_volume_offload_trigger_watermark: 0.85
+primary_volume_backfill_trigger_watermark: 0.40
+file_transfer_concurrency: 4
 primary_volume_offload_policy: priority  # priority | largest_file
 
 # Value-log separation threshold.

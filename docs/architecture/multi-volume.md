@@ -40,7 +40,9 @@ Backfill considers only files referenced by the current LSM or VLOG state. Lower
 The offload system is designed to be safe and unobtrusive:
 
 - **Non-blocking reads**: A file being migrated remains readable from its original location until the copy completes.
-- **Backpressure**: Only a limited number of migrations run concurrently. New migrations are not scheduled while prior ones are in flight.
+- **Bounded concurrency**: Up to `file_transfer_concurrency` files migrate in parallel per database. The scheduler does not queue work beyond the available worker slots.
+- **Shared runtime**: Volume scans and task supervision use a process-wide Tokio runtime. Synchronous file copies run through its blocking pool, with a separate semaphore enforcing each database's concurrency limit.
+- **In-flight accounting**: Capacity decisions use bytes already present on each volume plus the not-yet-written portion of incoming migrations. Bytes retained by snapshots remain part of actual usage and are not treated as reclaimed space.
 - **Snapshot awareness**: Files that exist only as [snapshot](snapshot) replicas are never migrated. If a snapshot replica already exists on the target volume, the offload promotes the existing copy instead of making a new one.
 - **Snapshot lifecycle safety**: Moving a live file back to a higher tier does not delete its lower-tier source while a snapshot still references that source.
 - **Hysteresis**: Backfill starts below its own low watermark and stops before the offload watermark, avoiding immediate movement back to a lower tier.

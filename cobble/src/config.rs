@@ -857,6 +857,8 @@ pub struct Config {
     /// from lower-priority volumes. Maximum: 0.80. The effective value also remains below the
     /// offload trigger watermark to prevent immediate movement back to a lower tier.
     pub primary_volume_backfill_trigger_watermark: f64,
+    /// Maximum number of background file transfers executed concurrently for this database.
+    pub file_transfer_concurrency: usize,
     /// Offload policy for selecting candidate files on pressured primary volumes.
     pub primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind,
     /// Auto-expire snapshots after this many newer snapshots are completed.
@@ -935,6 +937,7 @@ impl Default for Config {
             primary_volume_write_stop_watermark: 0.95,
             primary_volume_offload_trigger_watermark: 0.85,
             primary_volume_backfill_trigger_watermark: 0.40,
+            file_transfer_concurrency: 4,
             primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::Priority,
             snapshot_retention: None,
             snapshot_only_track: false,
@@ -1594,6 +1597,7 @@ mod tests {
             primary_volume_write_stop_watermark: 0.93,
             primary_volume_offload_trigger_watermark: 0.82,
             primary_volume_backfill_trigger_watermark: 0.41,
+            file_transfer_concurrency: 3,
             primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::LargestFile,
             snapshot_retention: Some(3),
             snapshot_only_track: false,
@@ -1660,6 +1664,7 @@ mod tests {
         assert_eq!(decoded.primary_volume_write_stop_watermark, 0.93);
         assert_eq!(decoded.primary_volume_offload_trigger_watermark, 0.82);
         assert_eq!(decoded.primary_volume_backfill_trigger_watermark, 0.41);
+        assert_eq!(decoded.file_transfer_concurrency, 3);
         assert_eq!(
             decoded.primary_volume_offload_policy,
             PrimaryVolumeOffloadPolicyKind::LargestFile

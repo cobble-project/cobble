@@ -43,7 +43,7 @@ opendal = { version = "0.55.0", default-features = false, features = ["services-
 rand = "0.8.5"
 serial_test = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 url = "2.5.7"
 uuid = { workspace = true, features = ["v4"] }
 serde = { workspace = true, features = ["derive"] }
