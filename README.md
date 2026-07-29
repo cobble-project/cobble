@@ -42,7 +42,7 @@ Add `cobble` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cobble = "0.2.2"
+cobble = "0.3.0"
 ```
 
 Cobble uses Apache OpenDAL for volume backends.
