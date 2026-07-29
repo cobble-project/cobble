@@ -1,8 +1,10 @@
 use super::file_manager::FileId;
 use crate::Error;
 use crate::config::PrimaryVolumeOffloadPolicyKind;
+use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::DbStateHandle;
 use crate::file::{DataVolume, FileManager, TrackedFile, TrackedWriter};
+use crate::sst::PinnedSstReadMetadata;
 use dashmap::{DashMap, Entry};
 use log::warn;
 use std::cmp::Ordering;
@@ -100,6 +102,27 @@ fn primary_tiering_runtime() -> &'static Runtime {
 enum PrimaryTieringDirection {
     Offload,
     Backfill,
+    ReadonlyLoad,
+}
+
+enum PrimaryMoveGuard {
+    Backfill {
+        db_state: std::sync::Weak<DbStateHandle>,
+        max_target_used_bytes: u64,
+    },
+    ReadonlyLoad {
+        db_state: std::sync::Weak<DbStateHandle>,
+        max_target_used_bytes: u64,
+        pin_metadata: bool,
+        pin_partitions: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimaryMoveGuardStatus {
+    Valid,
+    Retry,
+    Stale,
 }
 
 #[derive(Clone)]
@@ -112,10 +135,31 @@ struct OffloadJobPlan {
     direction: PrimaryTieringDirection,
 }
 
+/// Immutable scheduling data for one READONLY file promotion.
+///
+/// The pin decision is made while traversing LSM levels, where level ordinal is available. The
+/// worker must not infer it from file priority because one physical file may be referenced by
+/// more than one logical level.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReadonlyLoadRequest {
+    priority: u8,
+    pin_metadata: bool,
+    pin_partitions: bool,
+}
+
+impl ReadonlyLoadRequest {
+    fn merge(&mut self, other: Self) {
+        self.priority = self.priority.max(other.priority);
+        self.pin_metadata |= other.pin_metadata;
+        self.pin_partitions = (self.pin_partitions || other.pin_partitions) && self.pin_metadata;
+    }
+}
+
 pub(crate) struct OffloadRuntime {
     accepting: AtomicBool,
     semaphore: Arc<Semaphore>,
     planned_jobs: Arc<DashMap<FileId, OffloadJobPlan>>,
+    pending_readonly_loads: DashMap<FileId, ReadonlyLoadRequest>,
     lifecycle: Mutex<()>,
     planning: Mutex<()>,
     idle: Arc<Mutex<()>>,
@@ -164,6 +208,7 @@ impl OffloadRuntime {
             accepting: AtomicBool::new(true),
             semaphore: Arc::new(Semaphore::new(concurrency.max(1))),
             planned_jobs: Arc::new(DashMap::new()),
+            pending_readonly_loads: DashMap::new(),
             lifecycle: Mutex::new(()),
             planning: Mutex::new(()),
             idle: Arc::new(Mutex::new(())),
@@ -282,6 +327,17 @@ impl OffloadRuntime {
         self.planned_jobs
             .iter()
             .any(|entry| entry.value().direction == PrimaryTieringDirection::Offload)
+    }
+
+    fn mark_readonly_load(&self, file_id: FileId, request: ReadonlyLoadRequest) {
+        self.pending_readonly_loads
+            .entry(file_id)
+            .and_modify(|current| current.merge(request))
+            .or_insert(request);
+    }
+
+    fn complete_readonly_load(&self, file_id: FileId) {
+        self.pending_readonly_loads.remove(&file_id);
     }
 
     fn has_available_worker_slot(&self) -> bool {
@@ -427,6 +483,10 @@ impl PrimaryTieringWorkerHandle {
         self.wake.notify_one();
     }
 
+    pub(crate) fn wake(&self) {
+        self.wake.notify_one();
+    }
+
     pub(crate) fn join(&self) {
         let (lock, condvar) = self.finished.as_ref();
         let guard = lock.lock().unwrap();
@@ -537,7 +597,11 @@ impl FileManager {
             .filter(|volume| volume.supports_primary_data)
             .map(|volume| volume.priority.rank())
             .collect::<HashSet<_>>();
-        if distinct_primary_ranks.len() < 2 {
+        let has_readonly_source = self
+            .data_volumes
+            .iter()
+            .any(|volume| volume.readonly_source);
+        if distinct_primary_ranks.len() < 2 && !has_readonly_source {
             return Ok(None);
         }
         PrimaryTieringWorkerHandle::start(self, db_state).map(Some)
@@ -644,7 +708,140 @@ impl FileManager {
         if offloaded != 0 || self.offload_runtime.has_offload_jobs() {
             return Ok(offloaded);
         }
+        let loaded = self.trigger_readonly_loads_locked(db_state)?;
+        if loaded != 0 {
+            return Ok(loaded);
+        }
         self.trigger_backfill_if_needed_locked(db_state)
+    }
+
+    pub(crate) fn mark_readonly_files_for_primary_load(
+        &self,
+        db_state: &DbStateHandle,
+        pinned_metadata_max_level: Option<u8>,
+        pin_metadata_partitions: bool,
+    ) -> usize {
+        let referenced_files = referenced_readonly_load_requests(
+            db_state,
+            pinned_metadata_max_level,
+            pin_metadata_partitions,
+        );
+        let mut marked = 0usize;
+        for (file_id, request) in referenced_files {
+            let is_readonly = self.data_files.get(&file_id).is_some_and(|tracked| {
+                tracked
+                    .volume
+                    .as_ref()
+                    .is_some_and(|volume| volume.readonly_source)
+            });
+            if is_readonly {
+                self.offload_runtime.mark_readonly_load(file_id, request);
+                marked += 1;
+            }
+        }
+        marked
+    }
+
+    fn trigger_readonly_loads_locked(
+        self: &Arc<Self>,
+        db_state: &Arc<DbStateHandle>,
+    ) -> crate::Result<usize> {
+        if !self.offload_runtime.has_available_worker_slot() {
+            return Ok(0);
+        }
+        let referenced_priorities = referenced_primary_file_priorities(db_state);
+        let mut stale = Vec::new();
+        let mut candidates = Vec::new();
+        for entry in &self.offload_runtime.pending_readonly_loads {
+            let file_id = *entry.key();
+            if !referenced_priorities.contains_key(&file_id) {
+                stale.push(file_id);
+                continue;
+            }
+            let request = *entry.value();
+            if self.offload_runtime.is_queued_or_running(file_id) {
+                continue;
+            }
+            let Some((size_bytes, true)) = self.data_files.get(&file_id).and_then(|tracked| {
+                tracked
+                    .volume
+                    .as_ref()
+                    .map(|volume| (tracked.size_bytes(), volume.readonly_source))
+            }) else {
+                stale.push(file_id);
+                continue;
+            };
+            if size_bytes == 0 {
+                continue;
+            }
+            candidates.push((file_id, request, size_bytes));
+        }
+        for file_id in stale {
+            self.offload_runtime.complete_readonly_load(file_id);
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .1
+                .priority
+                .cmp(&left.1.priority)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+
+        let mut scheduled = 0usize;
+        for (file_id, request, size_bytes) in candidates {
+            if !self.offload_runtime.has_available_worker_slot() {
+                break;
+            }
+            let Some(target_volume) = self.select_readonly_load_target(file_id, size_bytes) else {
+                continue;
+            };
+            if self.schedule_readonly_load_move(file_id, &target_volume, db_state, request)? {
+                scheduled += 1;
+            }
+        }
+        Ok(scheduled)
+    }
+
+    fn select_readonly_load_target(
+        &self,
+        file_id: FileId,
+        size_bytes: u64,
+    ) -> Option<Arc<DataVolume>> {
+        self.data_volumes
+            .iter()
+            .filter(|volume| volume.supports_primary_data && !volume.readonly_source)
+            .filter(|volume| {
+                let reserved_incoming_bytes =
+                    if self.has_snapshot_replica_on_primary_volume(file_id, volume) {
+                        0
+                    } else {
+                        size_bytes
+                    };
+                let max_target_used_bytes = self.max_readonly_load_target_used_bytes(volume);
+                self.offload_runtime
+                    .projected_target_physical_bytes(volume)
+                    .saturating_add(reserved_incoming_bytes)
+                    <= max_target_used_bytes
+            })
+            .max_by_key(|volume| volume.priority.rank())
+            .map(Arc::clone)
+    }
+
+    fn max_readonly_load_target_used_bytes(&self, target_volume: &Arc<DataVolume>) -> u64 {
+        let has_lower_primary_tier = self.data_volumes.iter().any(|volume| {
+            volume.supports_primary_data && volume.priority.rank() < target_volume.priority.rank()
+        });
+        let watermark = if has_lower_primary_tier {
+            // Do not explicitly load above the offload trigger, otherwise the next scan can
+            // immediately send the same bytes back down to a lower tier.
+            self.options.primary_volume_offload_trigger_watermark
+        } else {
+            self.options.primary_volume_write_stop_watermark
+        };
+        target_volume
+            .size_limit
+            .map(|size_limit| (size_limit as f64 * watermark).floor() as u64)
+            .unwrap_or(u64::MAX)
     }
 
     fn trigger_backfill_if_needed_locked(
@@ -768,7 +965,30 @@ impl FileManager {
         self.schedule_primary_move(
             file_id,
             target_volume,
-            Some((Arc::downgrade(db_state), max_target_used_bytes)),
+            Some(PrimaryMoveGuard::Backfill {
+                db_state: Arc::downgrade(db_state),
+                max_target_used_bytes,
+            }),
+        )
+    }
+
+    fn schedule_readonly_load_move(
+        self: &Arc<Self>,
+        file_id: FileId,
+        target_volume: &Arc<DataVolume>,
+        db_state: &Arc<DbStateHandle>,
+        request: ReadonlyLoadRequest,
+    ) -> crate::Result<bool> {
+        let max_target_used_bytes = self.max_readonly_load_target_used_bytes(target_volume);
+        self.schedule_primary_move(
+            file_id,
+            target_volume,
+            Some(PrimaryMoveGuard::ReadonlyLoad {
+                db_state: Arc::downgrade(db_state),
+                max_target_used_bytes,
+                pin_metadata: request.pin_metadata,
+                pin_partitions: request.pin_partitions,
+            }),
         )
     }
 
@@ -776,7 +996,7 @@ impl FileManager {
         self: &Arc<Self>,
         file_id: FileId,
         target_volume: &Arc<DataVolume>,
-        backfill_guard: Option<(std::sync::Weak<DbStateHandle>, u64)>,
+        move_guard: Option<PrimaryMoveGuard>,
     ) -> crate::Result<bool> {
         let target_volume = Arc::clone(target_volume);
         let target_volume_for_job = Arc::clone(&target_volume);
@@ -794,10 +1014,12 @@ impl FileManager {
         if estimated_bytes == 0 {
             return Ok(false);
         }
-        let direction = if source_volume.priority.rank() > target_volume.priority.rank() {
-            PrimaryTieringDirection::Offload
-        } else {
-            PrimaryTieringDirection::Backfill
+        let direction = match &move_guard {
+            Some(PrimaryMoveGuard::ReadonlyLoad { .. }) => PrimaryTieringDirection::ReadonlyLoad,
+            _ if source_volume.priority.rank() > target_volume.priority.rank() => {
+                PrimaryTieringDirection::Offload
+            }
+            _ => PrimaryTieringDirection::Backfill,
         };
         let projected_source_release_bytes =
             projected_source_release_bytes(source_tracked.as_ref());
@@ -807,9 +1029,18 @@ impl FileManager {
             } else {
                 estimated_bytes
             };
-        let max_target_used_bytes = backfill_guard
+        let max_target_used_bytes = move_guard
             .as_ref()
-            .map(|(_, max_target_used_bytes)| *max_target_used_bytes)
+            .map(|guard| match guard {
+                PrimaryMoveGuard::Backfill {
+                    max_target_used_bytes,
+                    ..
+                } => *max_target_used_bytes,
+                PrimaryMoveGuard::ReadonlyLoad {
+                    max_target_used_bytes,
+                    ..
+                } => *max_target_used_bytes,
+            })
             .or_else(|| {
                 target_volume.size_limit.map(|size_limit| {
                     (size_limit as f64 * self.options.primary_volume_write_stop_watermark).floor()
@@ -826,27 +1057,32 @@ impl FileManager {
             return Ok(false);
         }
         let manager = Arc::downgrade(self);
+        let readonly_pin = match &move_guard {
+            Some(PrimaryMoveGuard::ReadonlyLoad {
+                db_state,
+                pin_metadata,
+                pin_partitions,
+                ..
+            }) if *pin_metadata => Some((std::sync::Weak::clone(db_state), *pin_partitions)),
+            _ => None,
+        };
         let handler = Arc::new(move |scheduled_file_id| {
             if let Some(manager) = manager.upgrade() {
-                if let Some((referenced_state, max_target_used_bytes)) = &backfill_guard {
-                    let Some(db_state) = referenced_state.upgrade() else {
-                        manager.record_offload_noop();
-                        return;
-                    };
-                    if !referenced_primary_file_priorities(&db_state)
-                        .contains_key(&scheduled_file_id)
+                let guard_status = manager.primary_move_guard_status(
+                    scheduled_file_id,
+                    &target_volume_for_job,
+                    move_guard.as_ref(),
+                );
+                if guard_status != PrimaryMoveGuardStatus::Valid {
+                    if guard_status == PrimaryMoveGuardStatus::Stale
+                        && matches!(&move_guard, Some(PrimaryMoveGuard::ReadonlyLoad { .. }))
                     {
-                        manager.record_offload_noop();
-                        return;
+                        manager
+                            .offload_runtime
+                            .complete_readonly_load(scheduled_file_id);
                     }
-                    if manager
-                        .offload_runtime
-                        .projected_target_physical_bytes(&target_volume_for_job)
-                        > *max_target_used_bytes
-                    {
-                        manager.record_offload_noop();
-                        return;
-                    }
+                    manager.record_offload_noop();
+                    return;
                 }
                 let runtime = Arc::clone(&manager.offload_runtime);
                 let mut progress = |bytes| runtime.record_copy_progress(scheduled_file_id, bytes);
@@ -857,7 +1093,20 @@ impl FileManager {
                     &mut progress,
                     &mut rollback,
                 ) {
-                    Ok(true) => {}
+                    Ok(true) => {
+                        if let Some((db_state, pin_partitions)) = &readonly_pin
+                            && let Some(db_state) = db_state.upgrade()
+                        {
+                            manager.pin_promoted_readonly_sst_metadata(
+                                scheduled_file_id,
+                                &db_state,
+                                *pin_partitions,
+                            );
+                        }
+                        if matches!(&move_guard, Some(PrimaryMoveGuard::ReadonlyLoad { .. })) {
+                            runtime.complete_readonly_load(scheduled_file_id);
+                        }
+                    }
                     Ok(false) => {
                         runtime.reset_copy_progress(scheduled_file_id);
                         manager.record_offload_noop();
@@ -895,6 +1144,92 @@ impl FileManager {
             self.record_offload_scheduled();
         }
         Ok(scheduled)
+    }
+
+    fn primary_move_guard_status(
+        &self,
+        file_id: FileId,
+        target_volume: &Arc<DataVolume>,
+        move_guard: Option<&PrimaryMoveGuard>,
+    ) -> PrimaryMoveGuardStatus {
+        let Some(move_guard) = move_guard else {
+            return PrimaryMoveGuardStatus::Valid;
+        };
+        match move_guard {
+            PrimaryMoveGuard::Backfill {
+                db_state,
+                max_target_used_bytes,
+            } => {
+                let Some(db_state) = db_state.upgrade() else {
+                    return PrimaryMoveGuardStatus::Stale;
+                };
+                if !referenced_primary_file_priorities(&db_state).contains_key(&file_id) {
+                    return PrimaryMoveGuardStatus::Stale;
+                }
+                if self
+                    .offload_runtime
+                    .projected_target_physical_bytes(target_volume)
+                    > *max_target_used_bytes
+                {
+                    return PrimaryMoveGuardStatus::Retry;
+                }
+                PrimaryMoveGuardStatus::Valid
+            }
+            PrimaryMoveGuard::ReadonlyLoad {
+                db_state,
+                max_target_used_bytes,
+                ..
+            } => {
+                let Some(db_state) = db_state.upgrade() else {
+                    return PrimaryMoveGuardStatus::Stale;
+                };
+                if !referenced_primary_file_priorities(&db_state).contains_key(&file_id)
+                    || !self.data_files.get(&file_id).is_some_and(|tracked| {
+                        tracked
+                            .volume
+                            .as_ref()
+                            .is_some_and(|volume| volume.readonly_source)
+                    })
+                {
+                    return PrimaryMoveGuardStatus::Stale;
+                }
+                if self
+                    .offload_runtime
+                    .projected_target_physical_bytes(target_volume)
+                    > *max_target_used_bytes
+                {
+                    return PrimaryMoveGuardStatus::Retry;
+                }
+                PrimaryMoveGuardStatus::Valid
+            }
+        }
+    }
+
+    /// Builds the existing immutable SST pin after a READONLY file has become readable from a
+    /// primary volume. Pinning is deliberately best-effort: the promotion is already durable and
+    /// a later foreground read can retry the same `get_or_load` path.
+    fn pin_promoted_readonly_sst_metadata(
+        &self,
+        file_id: FileId,
+        db_state: &DbStateHandle,
+        pin_partitions: bool,
+    ) {
+        let Some(data_file) = find_sst_data_file(db_state, file_id) else {
+            return;
+        };
+        if data_file.pinned_sst_read_metadata().is_some() {
+            return;
+        }
+        let result = self.open_data_file_reader(file_id).and_then(|reader| {
+            PinnedSstReadMetadata::get_or_load(&reader, data_file.as_ref(), true, pin_partitions)
+                .map(|_| ())
+        });
+        if let Err(err) = result {
+            warn!(
+                "readonly promotion completed but pinned SST metadata could not be loaded for \
+                 file_id={file_id}: {err}"
+            );
+        }
     }
 
     pub(crate) fn select_offload_candidate(
@@ -1057,7 +1392,9 @@ impl FileManager {
         let Some(source_volume) = &source_tracked.volume else {
             return Ok(false);
         };
-        if !source_volume.supports_primary_data || !target_volume.supports_primary_data {
+        if (!source_volume.supports_primary_data && !source_volume.readonly_source)
+            || !target_volume.supports_primary_data
+        {
             return Ok(false);
         }
         if Arc::ptr_eq(source_volume, target_volume) {
@@ -1124,6 +1461,61 @@ impl FileManager {
     }
 }
 
+fn referenced_readonly_load_requests(
+    db_state: &DbStateHandle,
+    pinned_metadata_max_level: Option<u8>,
+    pin_metadata_partitions: bool,
+) -> HashMap<FileId, ReadonlyLoadRequest> {
+    let state = db_state.load();
+    let mut requests = HashMap::<FileId, ReadonlyLoadRequest>::new();
+    for tree_version in state.multi_lsm_version.tree_versions_cloned() {
+        for level in &tree_version.levels {
+            let priority = crate::file::lsm_file_priority_for_level(level.ordinal);
+            for file in &level.files {
+                let pin_metadata = file.file_type == DataFileType::SSTable
+                    && pinned_metadata_max_level
+                        .is_some_and(|max_level| level.ordinal <= max_level);
+                let request = ReadonlyLoadRequest {
+                    priority,
+                    pin_metadata,
+                    pin_partitions: pin_metadata && pin_metadata_partitions,
+                };
+                requests
+                    .entry(file.file_id)
+                    .and_modify(|current| current.merge(request))
+                    .or_insert(request);
+            }
+        }
+    }
+    for (_, tracked_id, _) in state.vlog_version.files_with_entries() {
+        let request = ReadonlyLoadRequest {
+            priority: crate::file::VLOG_FILE_PRIORITY,
+            pin_metadata: false,
+            pin_partitions: false,
+        };
+        requests
+            .entry(tracked_id.file_id())
+            .and_modify(|current| current.merge(request))
+            .or_insert(request);
+    }
+    requests
+}
+
+fn find_sst_data_file(db_state: &DbStateHandle, file_id: FileId) -> Option<Arc<DataFile>> {
+    for tree_version in db_state.load().multi_lsm_version.tree_versions_cloned() {
+        for level in &tree_version.levels {
+            if let Some(file) = level
+                .files
+                .iter()
+                .find(|file| file.file_id == file_id && file.file_type == DataFileType::SSTable)
+            {
+                return Some(Arc::clone(file));
+            }
+        }
+    }
+    None
+}
+
 fn referenced_primary_file_priorities(db_state: &DbStateHandle) -> HashMap<FileId, u8> {
     let state = db_state.load();
     let mut priorities = HashMap::<FileId, u8>::new();
@@ -1152,7 +1544,11 @@ mod tests {
     use crate::file::{
         File, FileSystemRegistry, RandomAccessFile, SequentialWriteFile, test_utils,
     };
+    use crate::sst::{
+        PinnedSstReadMetadata, SSTIteratorOptions, SSTPointReader, SSTWriter, SSTWriterOptions,
+    };
     use crate::{Config, MetricsManager, VolumeUsageKind};
+    use bytes::Bytes;
     use size::Size;
 
     fn pressure(rank: u8) -> VolumePressure {
@@ -1160,6 +1556,103 @@ mod tests {
             priority_rank: rank,
             used_bytes: 1,
             size_limit: Some(2),
+        }
+    }
+
+    fn register_readonly_sst(
+        file_manager: &Arc<FileManager>,
+        readonly_root: &std::path::Path,
+        file_id: FileId,
+        partitioned_index: bool,
+    ) -> Arc<DataFile> {
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", readonly_root.display()))
+            .unwrap();
+        fs.create_dir("db").unwrap();
+        fs.create_dir("db/data").unwrap();
+        let relative_path = format!("db/data/{file_id}.sst");
+        let mut writer = SSTWriter::new(
+            fs.open_write(&relative_path).unwrap(),
+            SSTWriterOptions {
+                block_size: 32,
+                bloom_filter_enabled: true,
+                partitioned_index,
+                block_checksum_enabled: false,
+                ..SSTWriterOptions::default()
+            },
+        );
+        for key in [b"key000".as_slice(), b"key001", b"key002", b"key003"] {
+            writer.add(key, b"value").unwrap();
+        }
+        let result = writer.finish_with_range().unwrap();
+        let path = readonly_root.join(&relative_path);
+        file_manager
+            .register_data_file_readonly(file_id, &format!("file://{}", path.display()))
+            .unwrap();
+        let data_file = DataFile::new(
+            DataFileType::SSTable,
+            result.first_key,
+            result.last_key,
+            file_id,
+            crate::file::TrackedFileId::new(file_manager, file_id),
+            0,
+            result.file_size,
+            0u16..=0u16,
+            0u16..=0u16,
+        );
+        data_file.set_meta_bytes(result.meta_bytes);
+        if let Some(metadata) = result.sst_read_metadata {
+            data_file.set_sst_read_metadata(metadata);
+        }
+        Arc::new(data_file)
+    }
+
+    fn store_readonly_sst_state(
+        db_state: &Arc<DbStateHandle>,
+        level_ordinal: u8,
+        data_file: Arc<DataFile>,
+    ) {
+        let current = db_state.load();
+        db_state.store(crate::db_state::DbState {
+            seq_id: current.seq_id,
+            bucket_ranges: vec![0u16..=0u16],
+            multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
+                crate::lsm::LSMTreeVersion {
+                    levels: vec![crate::lsm::Level {
+                        ordinal: level_ordinal,
+                        tiered: level_ordinal == 0,
+                        files: vec![data_file],
+                    }],
+                },
+            ),
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: current.active.clone(),
+            immutables: current.immutables.clone(),
+            truncation_cursors: current.truncation_cursors.clone(),
+            suggested_base_snapshot_id: None,
+        });
+    }
+
+    struct FailingReader {
+        size: usize,
+    }
+
+    impl File for FailingReader {
+        fn close(&mut self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> usize {
+            self.size
+        }
+    }
+
+    impl RandomAccessFile for FailingReader {
+        fn read_at(&self, _offset: usize, _size: usize) -> crate::Result<Bytes> {
+            Err(Error::IoError(
+                "injected pinned metadata read failure".to_string(),
+            ))
         }
     }
 
@@ -1306,7 +1799,7 @@ mod tests {
         let metrics = Arc::new(MetricsManager::new("tiering-source-accounting"));
         let fm = FileManager::from_config(&config, "db", metrics).unwrap();
         let (file_id, mut writer) = fm.create_data_file().unwrap();
-        writer.write(&vec![b'x'; 128]).unwrap();
+        writer.write(&[b'x'; 128]).unwrap();
         writer.close().unwrap();
 
         let tracked = fm.data_files.get(&file_id).unwrap();
@@ -1813,6 +2306,621 @@ mod tests {
         );
         assert!(!referenced_priorities.contains_key(&unreferenced_file));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_readonly_load_prefers_high_priority_target_when_low_precedes_high() {
+        let dir = tempfile::tempdir().unwrap();
+        let high_root = dir.path().join("high");
+        let low_root = dir.path().join("low");
+        let readonly_root = dir.path().join("readonly");
+        std::fs::create_dir_all(readonly_root.join("db/data")).unwrap();
+
+        let mut high = crate::VolumeDescriptor::new(
+            format!("file://{}", high_root.display()),
+            vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+        );
+        high.size_limit = Some(Size::from_const(200));
+        let low = crate::VolumeDescriptor::new(
+            format!("file://{}", low_root.display()),
+            vec![VolumeUsageKind::PrimaryDataPriorityLow],
+        );
+        let readonly = crate::VolumeDescriptor::new(
+            format!("file://{}", readonly_root.display()),
+            vec![VolumeUsageKind::Readonly],
+        );
+        let config = Config {
+            // Flink puts the checkpoint-backed low tier before the local high tier. Target
+            // selection must follow priority, not this descriptor order.
+            volumes: vec![low, high, readonly],
+            file_transfer_concurrency: 1,
+            base_file_size: Size::from_const(64),
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("file-manager-readonly-load"));
+        let fm = Arc::new(FileManager::from_config(&config, "db", metrics_manager).unwrap());
+
+        let register_readonly = |file_id: FileId, size: usize| {
+            let path = readonly_root.join(format!("db/data/{file_id}.sst"));
+            std::fs::write(&path, vec![b'x'; size]).unwrap();
+            fm.register_data_file_readonly(file_id, &format!("file://{}", path.display()))
+                .unwrap();
+            Arc::new(crate::data_file::DataFile::new(
+                crate::data_file::DataFileType::SSTable,
+                vec![file_id as u8],
+                vec![file_id as u8 + 1],
+                file_id,
+                crate::file::TrackedFileId::new(&fm, file_id),
+                0,
+                size,
+                0u16..=0u16,
+                0u16..=0u16,
+            ))
+        };
+        let l0_file = register_readonly(101, 256);
+        let l3_file = register_readonly(102, 64);
+        let added_after_mark = register_readonly(103, 32);
+        let vlog_file = register_readonly(104, 32);
+        let old_l0_readonly_tracking = fm
+            .data_files
+            .get(&101)
+            .map(|tracked| Arc::clone(tracked.value()))
+            .unwrap();
+        let source_paths = [101, 102, 103, 104].map(|file_id| {
+            (
+                file_id,
+                readonly_root.join(format!("db/data/{file_id}.sst")),
+            )
+        });
+
+        let db_state = Arc::new(crate::db_state::DbStateHandle::new());
+        let initial = db_state.load();
+        db_state.store(crate::db_state::DbState {
+            seq_id: initial.seq_id,
+            bucket_ranges: vec![0u16..=0u16],
+            multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
+                crate::lsm::LSMTreeVersion {
+                    levels: vec![
+                        crate::lsm::Level {
+                            ordinal: 0,
+                            tiered: true,
+                            files: vec![Arc::clone(&l0_file)],
+                        },
+                        crate::lsm::Level {
+                            ordinal: 3,
+                            tiered: false,
+                            files: vec![Arc::clone(&l3_file)],
+                        },
+                    ],
+                },
+            ),
+            vlog_version: crate::vlog::VlogVersion::from_files_with_entries(vec![(
+                0,
+                crate::file::TrackedFileId::new(&fm, vlog_file.file_id),
+                1,
+            )]),
+            active: initial.active.clone(),
+            immutables: initial.immutables.clone(),
+            truncation_cursors: initial.truncation_cursors.clone(),
+            suggested_base_snapshot_id: None,
+        });
+        assert_eq!(
+            fm.mark_readonly_files_for_primary_load(&db_state, None, false),
+            3
+        );
+
+        let marked = db_state.load();
+        db_state.store(crate::db_state::DbState {
+            seq_id: marked.seq_id,
+            bucket_ranges: marked.bucket_ranges.clone(),
+            multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
+                crate::lsm::LSMTreeVersion {
+                    levels: vec![
+                        crate::lsm::Level {
+                            ordinal: 0,
+                            tiered: true,
+                            files: vec![l0_file, added_after_mark],
+                        },
+                        crate::lsm::Level {
+                            ordinal: 3,
+                            tiered: false,
+                            files: vec![l3_file],
+                        },
+                    ],
+                },
+            ),
+            vlog_version: marked.vlog_version.clone(),
+            active: marked.active.clone(),
+            immutables: marked.immutables.clone(),
+            truncation_cursors: marked.truncation_cursors.clone(),
+            suggested_base_snapshot_id: None,
+        });
+
+        assert_eq!(fm.trigger_primary_tiering_if_needed(&db_state).unwrap(), 1);
+        assert!(fm.wait_for_offload_idle(Duration::from_secs(5)));
+        assert_eq!(
+            fm.data_files.get(&101).and_then(|tracked| {
+                tracked.volume.as_ref().map(|volume| volume.priority.rank())
+            }),
+            Some(1),
+            "the highest-priority L0 file should fall back to low when high cannot fit it"
+        );
+        assert!(
+            fm.data_files
+                .iter()
+                .all(|tracked| !Arc::ptr_eq(tracked.value(), &old_l0_readonly_tracking)),
+            "the old READONLY TrackedFile must no longer be present in canonical tracking"
+        );
+
+        assert_eq!(fm.trigger_primary_tiering_if_needed(&db_state).unwrap(), 1);
+        assert!(fm.wait_for_offload_idle(Duration::from_secs(5)));
+        assert_eq!(
+            fm.data_files.get(&102).and_then(|tracked| {
+                tracked.volume.as_ref().map(|volume| volume.priority.rank())
+            }),
+            Some(3),
+            "the next marked file should use high when it fits"
+        );
+        assert_eq!(fm.trigger_primary_tiering_if_needed(&db_state).unwrap(), 1);
+        assert!(fm.wait_for_offload_idle(Duration::from_secs(5)));
+        assert_eq!(
+            fm.data_files.get(&104).and_then(|tracked| {
+                tracked.volume.as_ref().map(|volume| volume.priority.rank())
+            }),
+            Some(3),
+            "the VLog file should load only after all marked LSM files"
+        );
+        assert!(
+            fm.data_files.get(&103).is_some_and(|tracked| {
+                tracked
+                    .volume
+                    .as_ref()
+                    .is_some_and(|volume| volume.readonly_source)
+            }),
+            "a file that became current after marking must remain unmarked"
+        );
+        for (_, path) in source_paths {
+            assert!(
+                path.exists(),
+                "loading must never delete the original READONLY file"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_load_pins_eligible_sst_after_promotion_and_reuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary_root = dir.path().join("primary");
+        let readonly_root = dir.path().join("readonly");
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    format!("file://{}", primary_root.display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    format!("file://{}", readonly_root.display()),
+                    vec![VolumeUsageKind::Readonly],
+                ),
+            ],
+            sst_pinned_metadata_max_level: Some(0),
+            sst_pinned_metadata_partitions_enabled: true,
+            ..Config::default()
+        };
+        let fm = Arc::new(
+            FileManager::from_config(
+                &config,
+                "readonly-load-pin",
+                Arc::new(MetricsManager::new("readonly-load-pin")),
+            )
+            .unwrap(),
+        );
+        let data_file = register_readonly_sst(&fm, &readonly_root, 301, true);
+        let db_state = Arc::new(DbStateHandle::new());
+        store_readonly_sst_state(&db_state, 0, Arc::clone(&data_file));
+
+        assert_eq!(
+            fm.mark_readonly_files_for_primary_load(
+                &db_state,
+                config.sst_pinned_metadata_max_level,
+                config.sst_pinned_metadata_partitions_enabled,
+            ),
+            1
+        );
+        assert_eq!(fm.trigger_primary_tiering_if_needed(&db_state).unwrap(), 1);
+        assert!(fm.wait_for_offload_idle(Duration::from_secs(5)));
+        assert!(fm.is_data_file_on_primary_volume(data_file.file_id));
+
+        let pin = data_file
+            .pinned_sst_read_metadata()
+            .expect("eligible SST should be pinned after promotion");
+        assert!(pin.index_partition(0).unwrap().is_some());
+        assert!(pin.filter_partition(0).unwrap().is_some());
+
+        let reader = fm.open_data_file_reader(data_file.file_id).unwrap();
+        let reused = PinnedSstReadMetadata::get_or_load(&reader, data_file.as_ref(), false, false)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&pin, &reused));
+        assert_eq!(
+            SSTPointReader::get_exact(
+                Box::new(fm.open_data_file_reader(data_file.file_id).unwrap()),
+                data_file.as_ref(),
+                SSTIteratorOptions {
+                    bloom_filter_enabled: true,
+                    ..SSTIteratorOptions::default()
+                },
+                None,
+                b"key002",
+            )
+            .unwrap()
+            .as_deref(),
+            Some(b"value".as_slice())
+        );
+    }
+
+    #[test]
+    fn readonly_load_keeps_ineligible_and_existing_pins_as_noops() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary_root = dir.path().join("primary");
+        let readonly_root = dir.path().join("readonly");
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    format!("file://{}", primary_root.display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    format!("file://{}", readonly_root.display()),
+                    vec![VolumeUsageKind::Readonly],
+                ),
+            ],
+            ..Config::default()
+        };
+        let fm = Arc::new(
+            FileManager::from_config(
+                &config,
+                "readonly-load-noop",
+                Arc::new(MetricsManager::new("readonly-load-noop")),
+            )
+            .unwrap(),
+        );
+        let data_file = register_readonly_sst(&fm, &readonly_root, 302, false);
+        let db_state = Arc::new(DbStateHandle::new());
+        store_readonly_sst_state(&db_state, 1, Arc::clone(&data_file));
+
+        assert_eq!(
+            fm.mark_readonly_files_for_primary_load(&db_state, Some(0), true),
+            1
+        );
+        assert_eq!(fm.trigger_primary_tiering_if_needed(&db_state).unwrap(), 1);
+        assert!(fm.wait_for_offload_idle(Duration::from_secs(5)));
+        assert!(fm.is_data_file_on_primary_volume(data_file.file_id));
+        assert!(
+            data_file.pinned_sst_read_metadata().is_none(),
+            "an ineligible level must not be pinned by promotion"
+        );
+
+        let reader = fm.open_data_file_reader(data_file.file_id).unwrap();
+        let pin = PinnedSstReadMetadata::get_or_load(&reader, data_file.as_ref(), true, false)
+            .unwrap()
+            .unwrap();
+        fm.pin_promoted_readonly_sst_metadata(data_file.file_id, &db_state, true);
+        let reused = data_file.pinned_sst_read_metadata().unwrap();
+        assert!(Arc::ptr_eq(&pin, &reused));
+
+        let ineligible = referenced_readonly_load_requests(&db_state, Some(0), true);
+        assert!(!ineligible.get(&data_file.file_id).unwrap().pin_metadata);
+        assert!(!ineligible.get(&data_file.file_id).unwrap().pin_partitions);
+
+        let disabled = referenced_readonly_load_requests(&db_state, None, true);
+        assert!(!disabled.get(&data_file.file_id).unwrap().pin_metadata);
+        assert!(!disabled.get(&data_file.file_id).unwrap().pin_partitions);
+    }
+
+    #[test]
+    fn readonly_load_request_uses_lsm_level_and_sst_type_for_pinning() {
+        let sst = Arc::new(DataFile::new_detached(
+            DataFileType::SSTable,
+            vec![0],
+            vec![1],
+            304,
+            0,
+            1,
+            0u16..=0u16,
+            0u16..=0u16,
+        ));
+        let parquet = Arc::new(DataFile::new_detached(
+            DataFileType::Parquet,
+            vec![1],
+            vec![2],
+            305,
+            0,
+            1,
+            0u16..=0u16,
+            0u16..=0u16,
+        ));
+        let db_state = Arc::new(DbStateHandle::new());
+        let current = db_state.load();
+        db_state.store(crate::db_state::DbState {
+            seq_id: current.seq_id,
+            bucket_ranges: vec![0u16..=0u16],
+            multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
+                crate::lsm::LSMTreeVersion {
+                    levels: vec![
+                        crate::lsm::Level {
+                            ordinal: 0,
+                            tiered: true,
+                            files: vec![Arc::clone(&sst), parquet],
+                        },
+                        crate::lsm::Level {
+                            ordinal: 3,
+                            tiered: false,
+                            files: vec![sst],
+                        },
+                    ],
+                },
+            ),
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: current.active.clone(),
+            immutables: current.immutables.clone(),
+            truncation_cursors: current.truncation_cursors.clone(),
+            suggested_base_snapshot_id: None,
+        });
+
+        let requests = referenced_readonly_load_requests(&db_state, Some(0), true);
+        assert!(requests.get(&304).unwrap().pin_metadata);
+        assert!(requests.get(&304).unwrap().pin_partitions);
+        assert!(!requests.get(&305).unwrap().pin_metadata);
+        assert!(!requests.get(&305).unwrap().pin_partitions);
+
+        let disabled = referenced_readonly_load_requests(&db_state, None, true);
+        assert!(!disabled.get(&304).unwrap().pin_metadata);
+        assert!(!disabled.get(&304).unwrap().pin_partitions);
+        assert!(!disabled.get(&305).unwrap().pin_metadata);
+        assert!(!disabled.get(&305).unwrap().pin_partitions);
+
+        let mut invalid = ReadonlyLoadRequest {
+            priority: 0,
+            pin_metadata: false,
+            pin_partitions: false,
+        };
+        invalid.merge(ReadonlyLoadRequest {
+            priority: 1,
+            pin_metadata: false,
+            pin_partitions: true,
+        });
+        assert!(!invalid.pin_metadata);
+        assert!(!invalid.pin_partitions);
+    }
+
+    #[test]
+    fn readonly_load_pin_failure_keeps_promotion_and_allows_foreground_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary_root = dir.path().join("primary");
+        let readonly_root = dir.path().join("readonly");
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    format!("file://{}", primary_root.display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    format!("file://{}", readonly_root.display()),
+                    vec![VolumeUsageKind::Readonly],
+                ),
+            ],
+            ..Config::default()
+        };
+        let fm = Arc::new(
+            FileManager::from_config(
+                &config,
+                "readonly-load-pin-failure",
+                Arc::new(MetricsManager::new("readonly-load-pin-failure")),
+            )
+            .unwrap(),
+        );
+        let data_file = register_readonly_sst(&fm, &readonly_root, 303, false);
+        let db_state = Arc::new(DbStateHandle::new());
+        store_readonly_sst_state(&db_state, 0, Arc::clone(&data_file));
+
+        let target = fm.primary_volume_by_rank(3).unwrap();
+        let mut progress = |_| {};
+        let mut rollback = || {};
+        assert!(
+            fm.move_file_to_primary_volume_with_progress(
+                data_file.file_id,
+                &target,
+                &mut progress,
+                &mut rollback,
+            )
+            .unwrap()
+        );
+        assert!(fm.is_data_file_on_primary_volume(data_file.file_id));
+
+        fm.reader_cache.lock().unwrap().insert(
+            data_file.file_id,
+            Arc::new(FailingReader {
+                size: data_file.size,
+            }),
+        );
+        fm.pin_promoted_readonly_sst_metadata(data_file.file_id, &db_state, false);
+        assert!(data_file.pinned_sst_read_metadata().is_none());
+        assert!(fm.is_data_file_on_primary_volume(data_file.file_id));
+
+        fm.reader_cache.lock().unwrap().remove(&data_file.file_id);
+        assert_eq!(
+            SSTPointReader::get_exact(
+                Box::new(fm.open_data_file_reader(data_file.file_id).unwrap()),
+                data_file.as_ref(),
+                SSTIteratorOptions {
+                    bloom_filter_enabled: true,
+                    pin_metadata: true,
+                    ..SSTIteratorOptions::default()
+                },
+                None,
+                b"key001",
+            )
+            .unwrap()
+            .as_deref(),
+            Some(b"value".as_slice())
+        );
+        assert!(data_file.pinned_sst_read_metadata().is_some());
+    }
+
+    #[test]
+    fn test_readonly_load_keeps_mark_when_no_primary_volume_can_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary_root = dir.path().join("primary");
+        let readonly_root = dir.path().join("readonly");
+        std::fs::create_dir_all(readonly_root.join("db/data")).unwrap();
+        let source_path = readonly_root.join("db/data/201.sst");
+        std::fs::write(&source_path, vec![b'x'; 128]).unwrap();
+
+        let mut primary = crate::VolumeDescriptor::new(
+            format!("file://{}", primary_root.display()),
+            vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+        );
+        primary.size_limit = Some(Size::from_const(100));
+        let readonly = crate::VolumeDescriptor::new(
+            format!("file://{}", readonly_root.display()),
+            vec![VolumeUsageKind::Readonly],
+        );
+        let config = Config {
+            volumes: vec![primary, readonly],
+            base_file_size: Size::from_const(32),
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("readonly-load-no-space"));
+        let fm = Arc::new(FileManager::from_config(&config, "db", metrics_manager).unwrap());
+        fm.register_data_file_readonly(201, &format!("file://{}", source_path.display()))
+            .unwrap();
+        let data_file = Arc::new(crate::data_file::DataFile::new(
+            crate::data_file::DataFileType::SSTable,
+            vec![0],
+            vec![1],
+            201,
+            crate::file::TrackedFileId::new(&fm, 201),
+            0,
+            128,
+            0u16..=0u16,
+            0u16..=0u16,
+        ));
+        let db_state = Arc::new(crate::db_state::DbStateHandle::new());
+        let current = db_state.load();
+        db_state.store(crate::db_state::DbState {
+            seq_id: current.seq_id,
+            bucket_ranges: vec![0u16..=0u16],
+            multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
+                crate::lsm::LSMTreeVersion {
+                    levels: vec![crate::lsm::Level {
+                        ordinal: 0,
+                        tiered: true,
+                        files: vec![data_file],
+                    }],
+                },
+            ),
+            vlog_version: crate::vlog::VlogVersion::new(),
+            active: current.active.clone(),
+            immutables: current.immutables.clone(),
+            truncation_cursors: current.truncation_cursors.clone(),
+            suggested_base_snapshot_id: None,
+        });
+
+        assert_eq!(
+            fm.mark_readonly_files_for_primary_load(&db_state, None, false),
+            1
+        );
+        assert_eq!(fm.trigger_primary_tiering_if_needed(&db_state).unwrap(), 0);
+        assert!(
+            fm.offload_runtime.pending_readonly_loads.contains_key(&201),
+            "a capacity-blocked load must remain marked for a later retry"
+        );
+        assert!(fm.data_files.get(&201).is_some_and(|tracked| {
+            tracked
+                .volume
+                .as_ref()
+                .is_some_and(|volume| volume.readonly_source)
+        }));
+        assert!(source_path.exists());
+        let worker = fm.start_primary_tiering_worker(&db_state).unwrap();
+        assert!(
+            worker.is_some(),
+            "READONLY loading needs a scanner even with one primary tier"
+        );
+        let worker = worker.unwrap();
+        worker.stop();
+        worker.join();
+    }
+
+    #[test]
+    fn test_move_deletes_uncommitted_target_when_file_is_removed_during_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_root = dir.path().join("source");
+        let target_root = dir.path().join("target");
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    format!("file://{}", source_root.display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    format!("file://{}", target_root.display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityLow],
+                ),
+            ],
+            base_file_size: Size::from_const(64),
+            ..Config::default()
+        };
+        let metrics_manager = Arc::new(MetricsManager::new("move-delete-during-copy"));
+        let fm = Arc::new(FileManager::from_config(&config, "db", metrics_manager).unwrap());
+        let (file_id, mut writer) = fm.create_data_file().unwrap();
+        writer.write(&vec![b'x'; 1024]).unwrap();
+        writer.close().unwrap();
+        drop(writer);
+        let source_path = fm.get_data_file_path(file_id).unwrap();
+        let source_fs = fm.primary_volume_by_rank(3).unwrap().fs().clone();
+        let target_volume = fm.primary_volume_by_rank(1).unwrap();
+        let target_fs = target_volume.fs().clone();
+        let mut copied_target_path = None;
+        let mut removed = false;
+        let moved = {
+            let mut progress = |_: u64| {
+                if removed {
+                    return;
+                }
+                let target_name = target_fs
+                    .list("db/data")
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .expect("copy target should exist before commit");
+                copied_target_path = Some(format!("db/data/{target_name}"));
+                fm.remove_data_file(file_id).unwrap();
+                removed = true;
+            };
+            fm.move_file_to_primary_volume_with_progress(
+                file_id,
+                &target_volume,
+                &mut progress,
+                &mut || {},
+            )
+            .unwrap()
+        };
+
+        assert!(!moved, "a logically removed file must not commit its copy");
+        assert!(!fm.has_data_file(file_id));
+        let copied_target_path = copied_target_path.expect("copy target path");
+        test_utils::wait_for_file_deletion(&target_fs, &copied_target_path);
+        assert!(
+            !target_fs.exists(&copied_target_path).unwrap(),
+            "the uncommitted target copy must be deleted"
+        );
+        test_utils::wait_for_file_deletion(&source_fs, &source_path);
+        assert!(
+            !source_fs.exists(&source_path).unwrap(),
+            "the owned source must also follow normal lifecycle deletion"
+        );
     }
 
     #[test]

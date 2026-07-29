@@ -325,6 +325,32 @@ impl Db {
         &self.id
     }
 
+    /// Marks every currently referenced file on READONLY volumes for asynchronous loading into
+    /// primary storage.
+    ///
+    /// LSM files are loaded from lower levels first and VLog files last. Each file is placed on
+    /// the highest-priority primary volume with enough capacity. Files added after this call are
+    /// not included unless this method is called again.
+    ///
+    /// Returns the number of current READONLY files marked for loading.
+    pub fn load_readonly_files_to_primary(&self) -> Result<usize> {
+        let _access = self.begin_access()?;
+        let marked = self.file_manager.mark_readonly_files_for_primary_load(
+            &self.db_state,
+            self.config.sst_pinned_metadata_max_level,
+            self.config.sst_pinned_metadata_partitions_enabled,
+        );
+        if marked == 0 {
+            return Ok(0);
+        }
+        self.file_manager
+            .trigger_primary_tiering_if_needed(&self.db_state)?;
+        if let Some(worker) = &self.primary_tiering_worker {
+            worker.wake();
+        }
+        Ok(marked)
+    }
+
     pub fn jni_direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
         Ok((
             self.config.jni_direct_buffer_size_bytes()?,
