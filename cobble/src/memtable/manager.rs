@@ -1026,7 +1026,8 @@ impl MemtableManager {
             .name("cobble-flush".to_string())
             .spawn(move || {
                 while let Ok(job) = flush_rx.recv() {
-                    if db_lifecycle.ensure_open().is_err() {
+                    if let Err(err) = db_lifecycle.ensure_open() {
+                        Self::fail_snapshot(&job.snapshot, err);
                         // Remove immutable from state so the memtable can be
                         // fully dropped, triggering the reclaimer → buffer_ready.
                         if let Some(id) = job.memtable_id {
@@ -1099,6 +1100,7 @@ impl MemtableManager {
                                     Ok(snapshot) => snapshot,
                                     Err(err) => {
                                         db_lifecycle.mark_error(err.clone());
+                                        Self::fail_snapshot(&job.snapshot, err.clone());
                                         // Remove immutable from state so the
                                         // memtable drop triggers the reclaimer.
                                         db_state_clone.remove_immutable(memtable_id);
@@ -1125,6 +1127,7 @@ impl MemtableManager {
                             }
                             Err(err) => {
                                 db_lifecycle.mark_error(err.clone());
+                                Self::fail_snapshot(&job.snapshot, err.clone());
                                 // Remove immutable from state so the
                                 // memtable drop triggers the reclaimer.
                                 if let Some(id) = job.memtable_id {
@@ -1156,6 +1159,7 @@ impl MemtableManager {
                             Ok(result) => result,
                             Err(err) => {
                                 db_lifecycle.mark_error(err.clone());
+                                Self::fail_snapshot(&job.snapshot, err.clone());
                                 let mut state = state_clone.lock().unwrap();
                                 state.in_flight = state.in_flight.saturating_sub(1);
                                 flush_done_clone.notify_all();
@@ -1208,10 +1212,26 @@ impl MemtableManager {
                 snapshot_job.truncation_cursors.as_ref(),
             )
         {
-            let _ = snapshot_job
+            if let Err(err) = snapshot_job
                 .manager
-                .schedule_materialize(snapshot_job.snapshot_id);
-            let _ = snapshot_job.manager.process_retention();
+                .schedule_materialize(snapshot_job.snapshot_id)
+            {
+                snapshot_job
+                    .manager
+                    .fail_snapshot(snapshot_job.snapshot_id, err);
+                return;
+            }
+            if let Err(err) = snapshot_job.manager.process_retention() {
+                warn!("failed to process snapshot retention: {}", err);
+            }
+        }
+    }
+
+    fn fail_snapshot(snapshot_completion: &Option<SnapshotCompletion>, error: Error) {
+        if let Some(snapshot_job) = snapshot_completion {
+            snapshot_job
+                .manager
+                .fail_snapshot(snapshot_job.snapshot_id, error);
         }
     }
 
@@ -1846,17 +1866,35 @@ impl MemtableManager {
                 manager: manager.clone(),
                 truncation_cursors: None,
             });
-        self.flush_active_internal(auto_snapshot, cause)
+        let auto_snapshot_id = auto_snapshot
+            .as_ref()
+            .map(|snapshot| (snapshot.snapshot_id, snapshot.manager.clone()));
+        let result = self.flush_active_internal(auto_snapshot, cause);
+        if let Err(err) = &result
+            && let Some((snapshot_id, manager)) = auto_snapshot_id
+        {
+            manager.fail_snapshot(snapshot_id, err.clone());
+        }
+        result
     }
 
+    /// Queues a checkpoint flush and owns failure completion for its snapshot callback.
+    ///
+    /// Callers only propagate the returned error: completing the callback twice would race the
+    /// materializer and obscure the original flush failure.
     pub(crate) fn flush_snapshot(&self, snapshot_id: u64, manager: SnapshotManager) -> Result<()> {
         let snapshot = SnapshotCompletion {
             snapshot_id,
-            manager,
+            manager: manager.clone(),
             truncation_cursors: None,
         };
-        let _ = self.flush_active_internal(Some(snapshot), FlushCause::Snapshot)?;
-        Ok(())
+        match self.flush_active_internal(Some(snapshot), FlushCause::Snapshot) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                manager.fail_snapshot(snapshot_id, err.clone());
+                Err(err)
+            }
+        }
     }
 
     fn flush_active_internal(
@@ -1984,13 +2022,28 @@ impl MemtableManager {
             return Ok(flushed_id);
         };
         drop(state);
-        let sender = self.flush_tx.lock().unwrap();
-        if let Some(sender) = sender.as_ref() {
-            if sender.send(job).is_err() {
-                panic!("failed to spawn flush task: {:?}", sender);
+        let enqueue_result = {
+            let sender = self.flush_tx.lock().unwrap();
+            match sender.as_ref() {
+                Some(sender) => sender.send(job).map_err(|error| {
+                    (
+                        Error::IoError("Flush worker unavailable".to_string()),
+                        error.0,
+                    )
+                }),
+                None => Err((Error::IoError("Flush worker unavailable".to_string()), job)),
             }
-        } else {
-            warn!("failed to spawn flush task, flush channel closed");
+        };
+        if let Err((err, job)) = enqueue_result {
+            self.db_lifecycle.mark_error(err.clone());
+            Self::fail_snapshot(&job.snapshot, err.clone());
+            if let Some(id) = job.memtable_id {
+                self.db_state.remove_immutable(id);
+            }
+            let mut state = self.state.lock().unwrap();
+            state.in_flight = state.in_flight.saturating_sub(1);
+            self.flush_done.notify_all();
+            return Err(err);
         }
         Ok(flushed_id)
     }

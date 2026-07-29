@@ -712,6 +712,11 @@ pub struct FileManager {
 }
 
 impl FileManager {
+    /// Limits all background data transfers, including primary tiering and snapshot copies.
+    pub(crate) fn transfer_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+        self.offload_runtime.transfer_semaphore()
+    }
+
     fn is_volume_write_stopped(&self, volume: &Arc<DataVolume>, expected_write_bytes: u64) -> bool {
         volume.is_write_stopped_with_expected(
             self.options.primary_volume_write_stop_watermark,

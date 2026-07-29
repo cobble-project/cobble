@@ -225,6 +225,11 @@ impl OffloadRuntime {
             .map(Arc::clone)
     }
 
+    /// Shares the database-wide background transfer budget with snapshot uploads.
+    pub(crate) fn transfer_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.semaphore)
+    }
+
     pub(crate) fn select_lower_priority_primary_volume(
         &self,
         source_priority_rank: u8,

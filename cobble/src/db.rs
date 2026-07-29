@@ -1648,7 +1648,7 @@ mod tests {
     use crate::{
         CompactionMode, DbBuilder, DbGovernance, GovernanceMode, ReadOptions, RuntimeManifestMode,
         ScanOptions, U32CounterMergeOperator, U64CounterMergeOperator, VolumeDescriptor,
-        WriteOptions,
+        VolumeUsageKind, WriteOptions,
     };
     use bytes::BytesMut;
     use serial_test::serial;
@@ -1885,6 +1885,132 @@ mod tests {
             SnapshotLifecycleState::CommitStartedExpireRequested
         );
 
+        db.close().unwrap();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_failed_snapshot_completes_callback_and_releases_snapshot() {
+        let root = "/tmp/db_failed_snapshot_callback";
+        cleanup_test_root(root);
+        let db = open_db(config_with_small_memtable(root));
+        let (tx, rx) = mpsc::channel();
+        let snapshot = db
+            .snapshot_manager
+            .create_snapshot(Some(Arc::new(move |result| {
+                tx.send(result).expect("send failed snapshot result");
+            })));
+
+        db.snapshot_manager.fail_snapshot(
+            snapshot.id,
+            Error::IoError("flush worker failed before materialization".to_string()),
+        );
+
+        let callback_result = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive failed snapshot result");
+        assert!(matches!(callback_result, Err(Error::IoError(_))));
+        assert!(!db.expire_snapshot(snapshot.id).unwrap());
+
+        db.close().unwrap();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_snapshot_callback_completes_when_flush_worker_is_unavailable() {
+        let root = "/tmp/db_snapshot_flush_worker_unavailable";
+        cleanup_test_root(root);
+        let db = open_db(config_with_small_memtable(root));
+        db.memtable_manager.force_close();
+
+        let (tx, rx) = mpsc::channel();
+        let err = db
+            .snapshot_with_callback(move |result| {
+                tx.send(result).expect("send failed snapshot result");
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::IoError(_)));
+        let callback_result = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive failed snapshot result");
+        assert!(matches!(callback_result, Err(Error::IoError(_))));
+
+        db.force_close();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_snapshot_completes_while_writer_rotates_multiple_memtables() {
+        let root = "/tmp/db_snapshot_continuous_writes";
+        cleanup_test_root(root);
+        let primary = format!("file://{root}/primary");
+        let snapshot = format!("file://{root}/snapshot");
+        let db = Arc::new(open_db(Config {
+            memtable_capacity: Size::from_kib(8),
+            memtable_buffer_count: 2,
+            l0_file_limit: 64,
+            file_transfer_concurrency: 2,
+            num_columns: 1,
+            volumes: vec![
+                VolumeDescriptor::new(primary, vec![VolumeUsageKind::PrimaryDataPriorityHigh]),
+                VolumeDescriptor::new(
+                    snapshot,
+                    vec![VolumeUsageKind::Snapshot, VolumeUsageKind::Meta],
+                ),
+            ],
+            ..Config::default()
+        }));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_db = Arc::clone(&db);
+        let writer_stop = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            let value = vec![b'v'; 512];
+            let mut index = 0_u64;
+            while !writer_stop.load(AtomicOrdering::Relaxed) {
+                let key = format!("key-{}", index % 256);
+                writer_db.put(0, key.as_bytes(), 0, &value)?;
+                index += 1;
+                if index.is_multiple_of(64) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok::<(), Error>(())
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        let (tx, rx) = mpsc::channel();
+        let mut snapshot_id = None;
+        let snapshot_result =
+            (|| -> Result<(u64, Result<crate::coordinator::ShardSnapshotInput>)> {
+                let id = db.snapshot_with_callback(move |result| {
+                    let _ = tx.send(result);
+                })?;
+                snapshot_id = Some(id);
+                let result = rx.recv_timeout(Duration::from_secs(5)).map_err(|err| {
+                    Error::IoError(format!(
+                        "snapshot did not complete while writes continued: {err}"
+                    ))
+                })?;
+                Ok((id, result))
+            })();
+        stop.store(true, AtomicOrdering::Relaxed);
+        let writer_result = writer.join().expect("continuous writer did not panic");
+
+        if let Err(err) = &snapshot_result {
+            if let Some(snapshot_id) = snapshot_id {
+                let _ = db.cancel_snapshot(snapshot_id);
+            }
+            db.force_close();
+            cleanup_test_root(root);
+            panic!("snapshot result: {err}");
+        }
+        let (snapshot_id, result) = snapshot_result.expect("snapshot result");
+        writer_result.expect("continuous writer result");
+        assert!(result.is_ok(), "snapshot result: {result:?}");
+        assert!(db.expire_snapshot(snapshot_id).unwrap());
         db.close().unwrap();
         cleanup_test_root(root);
     }

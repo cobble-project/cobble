@@ -27,6 +27,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinSet;
 
 const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -171,9 +172,35 @@ impl SnapshotCopyResourceRegistry for MaterializeTempResourceRegistry {
 }
 
 impl SnapshotManager {
-    fn cleanup_cancelled_snapshot(&self, id: u64) {
+    fn cleanup_unpublished_snapshot(&self, id: u64) {
         if let Err(err) = self.expire_snapshot(id) {
-            warn!("failed to cleanup cancelled snapshot {}: {}", id, err);
+            warn!("failed to cleanup unpublished snapshot {}: {}", id, err);
+        }
+    }
+
+    /// Completes a snapshot that failed before materialization was scheduled.
+    ///
+    /// A flush worker can fail after `create_snapshot` but before the materializer owns the
+    /// callback. In that window no other worker will complete the caller's future, so cleanup and
+    /// callback delivery must happen together here.
+    pub(crate) fn fail_snapshot(&self, id: u64, error: Error) {
+        let callback = {
+            let mut state = self.state.lock().unwrap();
+            let Some(current) = state.snapshots.get(&id).cloned() else {
+                return;
+            };
+            if !current.try_cancel() {
+                return;
+            }
+
+            let mut updated = (*current).clone();
+            let callback = updated.callback.take();
+            state.snapshots.insert(id, Arc::new(updated));
+            callback
+        };
+        self.cleanup_unpublished_snapshot(id);
+        if let Some(callback) = callback {
+            callback(Err(error));
         }
     }
 
@@ -419,7 +446,7 @@ impl SnapshotManager {
         state.snapshots.insert(id, Arc::clone(&snapshot));
         if snapshot.is_cancelled() {
             drop(state);
-            self.cleanup_cancelled_snapshot(id);
+            self.cleanup_unpublished_snapshot(id);
             return false;
         }
         increment_schema_ref_counts(
@@ -680,8 +707,8 @@ impl SnapshotManager {
             }
             None => Err(Error::IoError(format!("Snapshot {} not found", id))),
         };
-        if matches!(result, Err(Error::CancelledError(_))) {
-            self.cleanup_cancelled_snapshot(id);
+        if result.is_err() {
+            self.cleanup_unpublished_snapshot(id);
         }
         let manifest_info = if result.is_err() {
             None
@@ -845,15 +872,23 @@ impl SnapshotManager {
                 let file_manager = Arc::clone(&file_manager);
                 let copy_resource_registry = Arc::clone(&copy_resource_registry);
                 let lifecycle_state = Arc::clone(&lifecycle_state);
-                join_set.spawn_blocking(move || {
-                    file_manager
-                        .copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
-                            source_file_id,
-                            &source_tracked,
-                            Some(copy_resource_registry),
-                            Some(lifecycle_state.as_ref()),
-                        )
-                        .map(|(copied_id, _)| (source_file_id, copied_id))
+                join_set.spawn(async move {
+                    let permit = acquire_snapshot_transfer_permit(file_manager.as_ref()).await?;
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        file_manager
+                            .copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
+                                source_file_id,
+                                &source_tracked,
+                                Some(copy_resource_registry),
+                                Some(lifecycle_state.as_ref()),
+                            )
+                            .map(|(copied_id, _)| (source_file_id, copied_id))
+                    })
+                    .await
+                    .map_err(|err| {
+                        Error::IoError(format!("Snapshot upload task failed to join: {}", err))
+                    })?
                 });
             }
             let mut file_id_map = HashMap::new();
@@ -1119,6 +1154,16 @@ impl SnapshotManager {
     }
 }
 
+async fn acquire_snapshot_transfer_permit(
+    file_manager: &FileManager,
+) -> Result<OwnedSemaphorePermit> {
+    file_manager
+        .transfer_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|_| Error::IoError("Snapshot transfer runtime stopped".to_string()))
+}
+
 fn remap_snapshot_tree_file_ids(
     versions: &[LSMTreeVersion],
     file_id_map: &HashMap<u64, u64>,
@@ -1317,6 +1362,9 @@ fn clone_vlog_version_untracked(vlog_version: &VlogVersion) -> VlogVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics_manager::MetricsManager;
+    use crate::{Config, VolumeDescriptor};
+    use tokio::time::{Duration, timeout};
 
     fn snapshot_with_base(id: u64, base_snapshot_id: Option<u64>) -> Arc<DbSnapshot> {
         let mut snapshot = DbSnapshot::new(id, &format!("SNAPSHOT-{id}"), None);
@@ -1349,5 +1397,52 @@ mod tests {
         let snapshots = BTreeMap::from([(2, Arc::clone(&parent)), (3, Arc::clone(&child))]);
 
         assert_eq!(suggested_base_fallback_id(&snapshots, 3), None);
+    }
+
+    #[test]
+    fn snapshot_copy_permits_bound_concurrent_transfers() {
+        let root = "/tmp/snapshot_copy_transfer_budget";
+        let _ = std::fs::remove_dir_all(root);
+        let file_manager = FileManager::from_config(
+            &Config {
+                file_transfer_concurrency: 2,
+                volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+                ..Config::default()
+            },
+            "snapshot-copy-transfer-budget",
+            Arc::new(MetricsManager::new("snapshot-copy-transfer-budget")),
+        )
+        .unwrap();
+        let runtime = Runtime::new().unwrap();
+        runtime.block_on(async {
+            let first = acquire_snapshot_transfer_permit(&file_manager)
+                .await
+                .unwrap();
+            let second = acquire_snapshot_transfer_permit(&file_manager)
+                .await
+                .unwrap();
+
+            assert!(
+                timeout(
+                    Duration::from_millis(20),
+                    acquire_snapshot_transfer_permit(&file_manager)
+                )
+                .await
+                .is_err()
+            );
+
+            drop(first);
+            assert!(
+                timeout(
+                    Duration::from_secs(1),
+                    acquire_snapshot_transfer_permit(&file_manager)
+                )
+                .await
+                .unwrap()
+                .is_ok()
+            );
+            drop(second);
+        });
+        let _ = std::fs::remove_dir_all(root);
     }
 }
