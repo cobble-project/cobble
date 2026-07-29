@@ -20,6 +20,7 @@ Each volume is tagged with one or more usage kinds that control what data lives 
 | **Meta** | Snapshot manifests, schema files, global pointers | Any reliable storage |
 | **Snapshot** | Materialized snapshot copies for sharing or backup | Cloud object store or shared FS |
 | **Cache** | Disk tier for the [hybrid block cache](block-cache) | Fast local SSD |
+| **Readonly** | Existing data files that can be read in place or explicitly loaded into primary storage | Shared or historical storage |
 
 A single volume can serve multiple roles. For example, a local SSD can be both `PrimaryData(High)` and `Meta`.
 
@@ -34,6 +35,26 @@ Writes → High-priority SSD ⇄ Medium-priority SSD ⇄ Low-priority storage
 ```
 
 Backfill considers only files referenced by the current LSM or VLOG state. Lower LSM levels have higher backfill priority, deeper levels have lower priority, and VLOG files are last. Snapshot-only replicas, orphan outputs, and other unreferenced tracked files are not pulled back.
+
+## Loading Files from Readonly Volumes
+
+An application can explicitly ask an open writer DB to load its currently referenced files from
+`Readonly` volumes into primary storage:
+
+```rust
+let marked = db.load_readonly_files_to_primary()?;
+```
+
+The call returns after marking the current file set; copying continues asynchronously through the
+normal file-transfer runtime. Files are processed by LSM priority, with VLOG files last, and are
+placed on the highest-priority primary volume that has space. A file remains on its `Readonly`
+source until the new primary copy is complete, and the source volume is never modified or deleted.
+Files that cannot currently fit remain marked for a later retry. Call the method again to include
+files that became current after the previous call.
+
+The API is also available through `SingleDb`, `StructuredDb`, and `StructuredSingleDb`. Java users
+can call `loadReadonlyFilesToPrimary()` on the corresponding raw or structured `Db` and `SingleDb`
+class.
 
 ## Offload Behavior
 

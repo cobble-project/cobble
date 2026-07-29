@@ -71,6 +71,14 @@ Db restoredFresh = Db.restore("config.yaml", input.snapshotId, db.id(), true);
 Db restoredFromManifest = Db.restoreWithManifest("config.yaml", input.manifestPath);
 ```
 
+Load referenced files from `Readonly` volumes into primary storage with:
+
+```java
+long marked = db.loadReadonlyFilesToPrimary();
+```
+
+See [Loading Files from Readonly Volumes](../architecture/multi-volume#loading-files-from-readonly-volumes).
+
 Java `Config` exposes the same remote compaction failure policy as Rust:
 
 ```java

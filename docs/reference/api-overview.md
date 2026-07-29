@@ -100,6 +100,7 @@ db.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Byte
 db.scan_with_options(bucket, range, &ScanOptions::for_column(0).with_column_family("metrics")) -> Result<DbIterator<'_>>
 db.snapshot() -> Result<u64>
 db.snapshot_with_callback(callback) -> Result<u64>
+db.load_readonly_files_to_primary() -> Result<usize>
 ```
 
 #### Db
@@ -128,6 +129,7 @@ db.cancel_snapshot(snapshot_id) -> Result<bool>
 db.expire_snapshot(snapshot_id) -> Result<bool>
 db.retain_snapshot(snapshot_id) -> bool
 db.shard_snapshot_input(snapshot_id) -> Result<ShardSnapshotInput>
+db.load_readonly_files_to_primary() -> Result<usize>
 ```
 
 `open_from_snapshot` preserves the source db identity and snapshot directory. `open_new_with_snapshot`
@@ -142,6 +144,9 @@ Snapshot lifecycle notes:
 - `db.cancel_snapshot(snapshot_id)` only succeeds before manifest publication completes.
 - `db.expire_snapshot(snapshot_id)` releases snapshot ownership and file references.
 - `db.retain_snapshot(snapshot_id)` keeps a completed snapshot alive across retention passes.
+
+`load_readonly_files_to_primary()` is also available on `StructuredDb` and
+`StructuredSingleDb`. See [Loading Files from Readonly Volumes](../architecture/multi-volume#loading-files-from-readonly-volumes).
 
 #### Reader
 
@@ -206,6 +211,8 @@ exclusive-end semantics as raw `Db`.
 The Java API mirrors the Rust API. See [Java Bindings](../ffi-bindings/java) for usage details.
 On the Java side, restore flows are exposed as `Db.restore(..., boolean newDbId)` and
 `Db.restoreWithManifest(...)`.
+Raw and structured `Db` / `SingleDb` classes also expose `loadReadonlyFilesToPrimary()`. See
+[Loading Files from Readonly Volumes](../architecture/multi-volume#loading-files-from-readonly-volumes).
 
 ### Java Classes
 
