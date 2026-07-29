@@ -605,6 +605,24 @@ pub extern "system" fn Java_io_cobble_SingleDb_retainSnapshot(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_loadReadonlyFilesToPrimary(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jlong {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    match db.load_readonly_files_to_primary() {
+        Ok(marked) => marked as jlong,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_SingleDb_expireSnapshot(
     mut env: JNIEnv,
     _class: JClass,

@@ -1055,6 +1055,15 @@ public final class Db extends NativeObject {
         return retainSnapshot(nativeHandle, snapshotId);
     }
 
+    /**
+     * Mark every currently referenced READONLY file for asynchronous loading into primary storage.
+     *
+     * @return number of READONLY files marked by this call
+     */
+    public long loadReadonlyFilesToPrimary() {
+        return loadReadonlyFilesToPrimary(nativeHandle);
+    }
+
     /** Build a {@link ShardSnapshot} from a DB snapshot id. */
     public ShardSnapshot getShardSnapshot(long snapshotId) {
         return ShardSnapshot.fromJson(getShardSnapshotJson(nativeHandle, snapshotId));
@@ -1258,6 +1267,8 @@ public final class Db extends NativeObject {
     private static native boolean expireSnapshot(long nativeHandle, long snapshotId);
 
     private static native boolean retainSnapshot(long nativeHandle, long snapshotId);
+
+    private static native long loadReadonlyFilesToPrimary(long nativeHandle);
 
     private static native String getShardSnapshotJson(long nativeHandle, long snapshotId);
 

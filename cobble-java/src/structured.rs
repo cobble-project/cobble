@@ -2663,6 +2663,24 @@ pub extern "system" fn Java_io_cobble_structured_Db_cancelSnapshot(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_loadReadonlyFilesToPrimary(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    match db.load_readonly_files_to_primary() {
+        Ok(marked) => marked as jlong,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_structured_Db_expireSnapshot(
     mut env: JNIEnv,
     _class: JClass,

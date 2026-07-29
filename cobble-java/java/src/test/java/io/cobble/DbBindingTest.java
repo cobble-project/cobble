@@ -25,6 +25,15 @@ import static org.junit.jupiter.api.Assertions.*;
 class DbBindingTest {
 
     @Test
+    void readonlyLoadTriggerIsExposedOnDb() throws IOException {
+        Path dbDir = Files.createTempDirectory("cobble-java-readonly-load-db-");
+        Config dbConfig = new Config().addVolume(dbDir.toString()).numColumns(1).totalBuckets(1);
+        try (Db db = Db.open(dbConfig)) {
+            assertEquals(0L, db.loadReadonlyFilesToPrimary());
+        }
+    }
+
+    @Test
     void configSerializesSstReadMetadataCacheMode() {
         Config config = new Config();
         config.sstReadMetadataCacheMode = Config.SstReadMetadataCacheMode.LAZY;

@@ -122,6 +122,12 @@ impl SingleDb {
         })
     }
 
+    /// Mark all currently referenced READONLY files for asynchronous loading into primary
+    /// storage.
+    pub fn load_readonly_files_to_primary(&self) -> Result<usize> {
+        self.db.load_readonly_files_to_primary()
+    }
+
     pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
     where
         F: Fn(Result<GlobalSnapshotManifest>) + Send + Sync + 'static,

@@ -347,6 +347,15 @@ public final class SingleDb extends NativeObject {
         return expireSnapshot(nativeHandle, snapshotId);
     }
 
+    /**
+     * Mark every currently referenced READONLY file for asynchronous loading into primary storage.
+     *
+     * @return number of READONLY files marked by this call
+     */
+    public long loadReadonlyFilesToPrimary() {
+        return loadReadonlyFilesToPrimary(nativeHandle);
+    }
+
     /** List global snapshots materialized by this single-node coordinator. */
     public List<GlobalSnapshot> listSnapshots() {
         return GlobalSnapshot.listFromJson(listSnapshotsJson(nativeHandle));
@@ -446,6 +455,8 @@ public final class SingleDb extends NativeObject {
     private static native boolean retainSnapshot(long nativeHandle, long snapshotId);
 
     private static native boolean expireSnapshot(long nativeHandle, long snapshotId);
+
+    private static native long loadReadonlyFilesToPrimary(long nativeHandle);
 
     private static native String listSnapshotsJson(long nativeHandle);
 }
