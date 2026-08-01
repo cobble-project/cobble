@@ -439,7 +439,7 @@ pub(crate) struct DbState {
     pub(crate) bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) multi_lsm_version: MultiLSMTreeVersion,
     pub(crate) vlog_version: VlogVersion,
-    pub(crate) active: Option<Arc<Mutex<ActiveMemtable>>>,
+    pub(crate) active: Option<Arc<RwLock<ActiveMemtable>>>,
     pub(crate) immutables: VecDeque<ImmutableMemtable>,
     pub(crate) truncation_cursors: TruncationCursorStore,
     // This is used to suggest a base snapshot ID for new snapshots

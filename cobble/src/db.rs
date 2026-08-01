@@ -1646,15 +1646,15 @@ mod tests {
     use crate::snapshot::SnapshotLifecycleState;
     use crate::r#type::encode_merge_separated_array;
     use crate::{
-        CompactionMode, DbBuilder, DbGovernance, GovernanceMode, ReadOptions, RuntimeManifestMode,
-        ScanOptions, U32CounterMergeOperator, U64CounterMergeOperator, VolumeDescriptor,
-        VolumeUsageKind, WriteOptions,
+        CompactionMode, DbBuilder, DbGovernance, GovernanceMode, MemtableType, ReadOptions,
+        RuntimeManifestMode, ScanOptions, U32CounterMergeOperator, U64CounterMergeOperator,
+        VolumeDescriptor, VolumeUsageKind, WriteOptions,
     };
     use bytes::BytesMut;
     use serial_test::serial;
     use size::Size;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::Duration;
 
     fn cleanup_test_root(path: &str) {
@@ -2013,6 +2013,113 @@ mod tests {
         assert!(db.expire_snapshot(snapshot_id).unwrap());
         db.close().unwrap();
         cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_single_writer_with_concurrent_gets_and_scans_across_memtable_rotation() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Db>();
+
+        for memtable_type in [
+            MemtableType::Hash,
+            MemtableType::Skiplist,
+            MemtableType::Vec,
+        ] {
+            let root = format!(
+                "/tmp/db_concurrent_reads_{}",
+                format!("{memtable_type:?}").to_lowercase()
+            );
+            cleanup_test_root(&root);
+            let db = Arc::new(open_db(Config {
+                memtable_capacity: Size::from_kib(16),
+                memtable_buffer_count: 3,
+                memtable_type,
+                l0_file_limit: 64,
+                num_columns: 1,
+                volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+                ..Config::default()
+            }));
+            let published = Arc::new(AtomicUsize::new(0));
+            let done = Arc::new(AtomicBool::new(false));
+            let start = Arc::new(Barrier::new(6));
+
+            let writer_db = Arc::clone(&db);
+            let writer_published = Arc::clone(&published);
+            let writer_done = Arc::clone(&done);
+            let writer_start = Arc::clone(&start);
+            let writer = std::thread::spawn(move || {
+                writer_start.wait();
+                for index in 1..=1_000usize {
+                    let key = format!("key-{index:05}");
+                    let value = format!("value-{index:05}-{}", "x".repeat(128));
+                    writer_db
+                        .put(0, key.as_bytes(), 0, value.as_bytes())
+                        .expect("single writer put");
+                    writer_published.store(index, AtomicOrdering::Release);
+                }
+                writer_done.store(true, AtomicOrdering::Release);
+            });
+
+            let readers = (0..4usize)
+                .map(|reader_id| {
+                    let reader_db = Arc::clone(&db);
+                    let reader_published = Arc::clone(&published);
+                    let reader_done = Arc::clone(&done);
+                    let reader_start = Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        reader_start.wait();
+                        let mut round = 0usize;
+                        while !reader_done.load(AtomicOrdering::Acquire) {
+                            let high = reader_published.load(AtomicOrdering::Acquire);
+                            if high > 0 {
+                                let index =
+                                    1 + (round.wrapping_mul(97).wrapping_add(reader_id)) % high;
+                                let key = format!("key-{index:05}");
+                                let expected_prefix = format!("value-{index:05}-");
+                                let row = reader_db
+                                    .get(0, key.as_bytes())
+                                    .expect("concurrent get")
+                                    .expect("published key is visible");
+                                assert!(
+                                    row[0]
+                                        .as_ref()
+                                        .expect("column exists")
+                                        .starts_with(expected_prefix.as_bytes())
+                                );
+                            }
+                            if round.is_multiple_of(32) {
+                                let mut previous = None;
+                                let iter = reader_db
+                                    .scan(0, b"".as_slice()..b"\xff".as_slice())
+                                    .expect("concurrent scan");
+                                for row in iter {
+                                    let (key, columns) = row.expect("scan row");
+                                    if let Some(previous) = previous.as_ref() {
+                                        assert!(previous < &key);
+                                    }
+                                    assert!(columns[0].is_some());
+                                    previous = Some(key);
+                                }
+                            }
+                            round += 1;
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            start.wait();
+            writer.join().expect("writer did not panic");
+            for reader in readers {
+                reader.join().expect("reader did not panic");
+            }
+            for index in 1..=1_000usize {
+                let key = format!("key-{index:05}");
+                assert!(db.get(0, key.as_bytes()).unwrap().is_some());
+            }
+            db.close().unwrap();
+            cleanup_test_root(&root);
+        }
     }
 
     #[test]

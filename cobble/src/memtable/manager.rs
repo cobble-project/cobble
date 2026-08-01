@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockWriteGuard, mpsc};
 use std::thread::JoinHandle;
 
 use crate::config::MemtableType;
@@ -252,7 +252,7 @@ struct FlushJob {
 }
 
 struct ActiveMemtableSnapshotJob {
-    active: Arc<Mutex<ActiveMemtable>>,
+    active: Arc<RwLock<ActiveMemtable>>,
 }
 
 struct ActiveMemtableSnapshotWriteResult {
@@ -296,12 +296,64 @@ pub(crate) struct SnapshotCompletion {
 pub(crate) struct ActiveMemtable {
     id: Uuid,
     schema: Arc<Schema>,
-    memtable: Option<MemtableImpl>,
+    contents: ActiveMemtableContents,
+}
+
+enum ActiveMemtableContents {
+    Writable(MemtableImpl),
+    Frozen(Arc<MemtableImpl>),
+    Empty,
+}
+
+impl ActiveMemtable {
+    fn readable_memtable(&self) -> Option<&MemtableImpl> {
+        match &self.contents {
+            ActiveMemtableContents::Writable(memtable) => Some(memtable),
+            ActiveMemtableContents::Frozen(memtable) => Some(memtable.as_ref()),
+            ActiveMemtableContents::Empty => None,
+        }
+    }
+
+    fn writable_memtable(&mut self) -> Option<&mut MemtableImpl> {
+        match &mut self.contents {
+            ActiveMemtableContents::Writable(memtable) => Some(memtable),
+            ActiveMemtableContents::Frozen(_) | ActiveMemtableContents::Empty => None,
+        }
+    }
+
+    /// Freezes the writable contents without invalidating readers that retained an older
+    /// `DbState`. Both those readers and the new immutable state share the same table.
+    fn freeze(&mut self) -> Option<Arc<MemtableImpl>> {
+        let contents = std::mem::replace(&mut self.contents, ActiveMemtableContents::Empty);
+        match contents {
+            ActiveMemtableContents::Writable(memtable) => {
+                let memtable = Arc::new(memtable);
+                self.contents = ActiveMemtableContents::Frozen(Arc::clone(&memtable));
+                Some(memtable)
+            }
+            ActiveMemtableContents::Frozen(memtable) => {
+                self.contents = ActiveMemtableContents::Frozen(Arc::clone(&memtable));
+                Some(memtable)
+            }
+            ActiveMemtableContents::Empty => None,
+        }
+    }
+
+    fn take_empty_writable(&mut self) -> Option<MemtableImpl> {
+        let contents = std::mem::replace(&mut self.contents, ActiveMemtableContents::Empty);
+        match contents {
+            ActiveMemtableContents::Writable(memtable) if memtable.is_empty() => Some(memtable),
+            other => {
+                self.contents = other;
+                None
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
 enum MemtableScanSource {
-    Active(Arc<Mutex<ActiveMemtable>>),
+    Active(Arc<RwLock<ActiveMemtable>>),
     Immutable(Arc<MemtableImpl>),
 }
 
@@ -353,8 +405,8 @@ impl SkiplistScanCursor {
         };
         match &self.source {
             MemtableScanSource::Active(active) => {
-                let active = active.lock().unwrap();
-                let Some(memtable) = active.memtable.as_ref() else {
+                let active = active.read().unwrap();
+                let Some(memtable) = active.readable_memtable() else {
                     return Ok(None);
                 };
                 match memtable {
@@ -398,8 +450,8 @@ impl SkiplistScanCursor {
         };
         match &self.source {
             MemtableScanSource::Active(active) => {
-                let active = active.lock().unwrap();
-                let Some(memtable) = active.memtable.as_ref() else {
+                let active = active.read().unwrap();
+                let Some(memtable) = active.readable_memtable() else {
                     return Ok(None);
                 };
                 match memtable {
@@ -533,7 +585,7 @@ fn build_memtable_row_filter(
 
 impl MemtableScanIterator {
     fn for_active(
-        active: Arc<Mutex<ActiveMemtable>>,
+        active: Arc<RwLock<ActiveMemtable>>,
         start_bound_inclusive: Option<Bytes>,
         end_bound_exclusive: Option<Bytes>,
         row_filter: Option<MemtableRowFilter>,
@@ -600,8 +652,8 @@ impl MemtableScanIterator {
         self.skiplist_iter = None;
         self.entries = match &self.source {
             MemtableScanSource::Active(active) => {
-                let active = active.lock().unwrap();
-                let Some(memtable) = active.memtable.as_ref() else {
+                let active = active.read().unwrap();
+                let Some(memtable) = active.readable_memtable() else {
                     self.entries.clear();
                     self.current_key = None;
                     self.current_value = None;
@@ -1238,15 +1290,14 @@ impl MemtableManager {
     fn write_active_memtable_snapshot_data(
         snapshot_id: u64,
         base_snapshot_id: Option<u64>,
-        active: &Arc<Mutex<ActiveMemtable>>,
+        active: &Arc<RwLock<ActiveMemtable>>,
         snapshot_manager: &SnapshotManager,
         file_manager: &Arc<FileManager>,
     ) -> Result<ActiveMemtableSnapshotWriteResult> {
-        let active_guard = active.lock().unwrap();
+        let active_guard = active.read().unwrap();
         let memtable_id = active_guard.id.to_string();
         let memtable = active_guard
-            .memtable
-            .as_ref()
+            .readable_memtable()
             .ok_or_else(|| InvalidState("Active memtable missing".to_string()))?;
         let memtable_type = match memtable {
             MemtableImpl::Hash(_) => MemtableType::Hash,
@@ -1335,10 +1386,10 @@ impl MemtableManager {
                     reclaimer.clone(),
                 )),
             };
-            let active = Arc::new(Mutex::new(ActiveMemtable {
+            let active = Arc::new(RwLock::new(ActiveMemtable {
                 id: memtable_id,
                 schema,
-                memtable: Some(memtable),
+                contents: ActiveMemtableContents::Writable(memtable),
             }));
             db_state.cas_mutate(snapshot.seq_id, |db_state, snapshot| {
                 Some(DbState {
@@ -1432,12 +1483,15 @@ impl MemtableManager {
                 .active
                 .clone()
                 .expect("active memtable exists");
-            let mut active = active.lock().unwrap();
+            let mut active = active.write().unwrap();
+            if active.writable_memtable().is_none() {
+                drop(active);
+                continue;
+            }
             let latest_schema = self.schema_manager.latest_schema();
             if active.schema.version() != latest_schema.version() {
                 let is_empty = active
-                    .memtable
-                    .as_ref()
+                    .readable_memtable()
                     .map(|memtable| memtable.is_empty())
                     .unwrap_or(true);
                 if is_empty {
@@ -1452,10 +1506,6 @@ impl MemtableManager {
                 .schema
                 .num_columns_in_family(key.column_family())
                 .unwrap_or(0);
-            if active.memtable.is_none() {
-                drop(active);
-                continue;
-            }
             // Steps:
             // 1) reject user-supplied separated value tags
             // 2) encode the original value into memtable storage
@@ -1465,7 +1515,9 @@ impl MemtableManager {
                 continue;
             }
             let put_result = {
-                let memtable = active.memtable.as_mut().expect("active memtable exists");
+                let memtable = active
+                    .writable_memtable()
+                    .expect("active memtable is writable");
                 memtable.put_ref(key, value, num_columns)
             };
             match put_result {
@@ -1507,15 +1559,14 @@ impl MemtableManager {
             .active
             .clone()
             .expect("active memtable exists");
-        let mut active = active.lock().unwrap();
-        if active.memtable.is_none() {
+        let mut active = active.write().unwrap();
+        if active.writable_memtable().is_none() {
             return Ok(false);
         }
         let latest_schema = self.schema_manager.latest_schema();
         if active.schema.version() != latest_schema.version() {
             let is_empty = active
-                .memtable
-                .as_ref()
+                .readable_memtable()
                 .map(|memtable| memtable.is_empty())
                 .unwrap_or(true);
             if is_empty {
@@ -1533,9 +1584,8 @@ impl MemtableManager {
                 Some(num_columns)
             );
             let put_result = active
-                .memtable
-                .as_mut()
-                .expect("active memtable exists")
+                .writable_memtable()
+                .expect("active memtable is writable")
                 .put_ref(&key, &value, num_columns);
             if let Err(err) = put_result {
                 self.handle_memtable_put_error(&err, active, &key, &value)?;
@@ -1562,17 +1612,25 @@ impl MemtableManager {
             let mut state = self.state.lock().unwrap();
             state.allow_make_active_buffer_in_reclaimer = false;
         }
-        {
+        let old_memtable = {
             // Release the current active memtable if exists to free up budget.
-            let _guard = self.db_state.lock();
+            let guard = self.db_state.lock();
             let snapshot = self.db_state.load();
             let Some(active) = snapshot.active.as_ref() else {
+                drop(guard);
                 let mut state = self.state.lock().unwrap();
                 state.allow_make_active_buffer_in_reclaimer = true;
                 return Ok(false);
             };
-            let mut active = active.lock().unwrap();
-            let old_memtable = active.memtable.take();
+            let mut active = active.write().unwrap();
+            let old_memtable = active.take_empty_writable();
+            if old_memtable.is_none() {
+                drop(active);
+                drop(guard);
+                let mut state = self.state.lock().unwrap();
+                state.allow_make_active_buffer_in_reclaimer = true;
+                return Ok(false);
+            }
             drop(active);
             self.db_state
                 .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
@@ -1587,8 +1645,10 @@ impl MemtableManager {
                         suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
                     })
                 });
-            drop(old_memtable);
-        }
+            drop(guard);
+            old_memtable
+        };
+        drop(old_memtable);
         // Try to make a new active buffer with just enough capacity for the single key-value pair.
         let mut state = self.state.lock().unwrap();
         loop {
@@ -1623,7 +1683,7 @@ impl MemtableManager {
     fn handle_memtable_put_error(
         &self,
         err: &Error,
-        active: MutexGuard<ActiveMemtable>,
+        active: RwLockWriteGuard<ActiveMemtable>,
         key: &RefKey<'_>,
         value: &RefValue<'_>,
     ) -> Result<()> {
@@ -1633,9 +1693,8 @@ impl MemtableManager {
                 remaining: _remaining,
             } => {
                 if active
-                    .memtable
-                    .as_ref()
-                    .expect("active memtable exists")
+                    .readable_memtable()
+                    .expect("active memtable is readable")
                     .is_empty()
                 {
                     drop(active);
@@ -1696,14 +1755,14 @@ impl MemtableManager {
         F: FnMut(&[u8], &Schema) -> Result<ControlFlow<()>>,
     {
         if let Some(active) = &snapshot.active {
-            let active = active.lock().unwrap();
-            let memtable = active.memtable.as_ref().expect("active memtable exists");
-            for value in memtable.get_all(key) {
-                if f(value, active.schema.as_ref())?.is_break() {
-                    return Ok(());
+            let active = active.read().unwrap();
+            if let Some(memtable) = active.readable_memtable() {
+                for value in memtable.get_all(key) {
+                    if f(value, active.schema.as_ref())?.is_break() {
+                        return Ok(());
+                    }
                 }
             }
-            drop(active);
         }
         for immutable in snapshot.immutables.iter().rev() {
             for value in immutable.memtable.get_all(key) {
@@ -1735,7 +1794,7 @@ impl MemtableManager {
         let mut deeper_collected_limits_allowed = true;
         if let Some(active) = &snapshot.active {
             let source_schema = {
-                let active_guard = active.lock().unwrap();
+                let active_guard = active.read().unwrap();
                 Arc::clone(&active_guard.schema)
             };
             let row_filter = build_memtable_row_filter(
@@ -1920,8 +1979,8 @@ impl MemtableManager {
         if snapshot.is_some()
             && let Some(active) = snapshot_state.active.as_ref()
         {
-            let inner_active = active.lock().unwrap();
-            if let Some(memtable) = inner_active.memtable.as_ref()
+            let inner_active = active.read().unwrap();
+            if let Some(memtable) = inner_active.readable_memtable()
                 && !memtable.is_empty()
                 && self.should_use_active_incremental_snapshot(memtable)
             {
@@ -1934,8 +1993,8 @@ impl MemtableManager {
             self.db_state
                 .cas_mutate(snapshot_state.seq_id, |db_state, snapshot_state| {
                     let active = snapshot_state.active.clone()?;
-                    let mut inner_active = active.lock().unwrap();
-                    let memtable = match inner_active.memtable.as_ref() {
+                    let mut inner_active = active.write().unwrap();
+                    let memtable = match inner_active.readable_memtable() {
                         Some(memtable) => memtable,
                         None => {
                             return None;
@@ -1944,15 +2003,12 @@ impl MemtableManager {
                     if memtable.is_empty() {
                         return None;
                     }
-                    let active_memtable = inner_active
-                        .memtable
-                        .take()
-                        .expect("active memtable exists");
+                    let active_memtable = inner_active.freeze().expect("active memtable exists");
                     let mut immutables = snapshot_state.immutables.clone();
                     let new_immutable = ImmutableMemtable {
                         id: inner_active.id,
                         schema: Arc::clone(&inner_active.schema),
-                        memtable: Arc::new(active_memtable),
+                        memtable: active_memtable,
                     };
                     to_flush = Some(new_immutable.clone());
                     immutables.push_back(new_immutable);
@@ -2630,10 +2686,10 @@ mod tests {
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: Vec::new() }),
             vlog_version: crate::vlog::VlogVersion::new(),
-            active: Some(Arc::new(Mutex::new(ActiveMemtable {
+            active: Some(Arc::new(RwLock::new(ActiveMemtable {
                 id: Uuid::new_v4(),
                 schema: Arc::clone(&schema),
-                memtable: Some(build_test_memtable(
+                contents: ActiveMemtableContents::Writable(build_test_memtable(
                     MemtableType::Skiplist,
                     &[
                         (b"k", ValueType::Put, b"old-active"),
@@ -2766,23 +2822,26 @@ mod tests {
     #[test]
     fn skiplist_scan_cursor_active_releases_lock_and_retains_entry_across_rotation() {
         let schema = Arc::new(Schema::new(1, 1, Vec::new()));
-        let active = Arc::new(Mutex::new(ActiveMemtable {
+        let active = Arc::new(RwLock::new(ActiveMemtable {
             id: Uuid::new_v4(),
             schema,
-            memtable: Some(build_test_memtable(
+            contents: ActiveMemtableContents::Writable(build_test_memtable(
                 MemtableType::Skiplist,
-                &[(b"a", ValueType::Put, b"value")],
+                &[
+                    (b"a", ValueType::Put, b"value-a"),
+                    (b"b", ValueType::Put, b"value-b"),
+                ],
             )),
         }));
         let mut active_cursor =
             SkiplistScanCursor::new(MemtableScanSource::Active(Arc::clone(&active)), None);
 
         active_cursor.seek_to_first().unwrap();
-        assert!(active.try_lock().is_ok());
+        assert!(active.try_write().is_ok());
 
         let rotated = {
-            let mut active_guard = active.lock().unwrap();
-            active_guard.memtable.take().unwrap()
+            let mut active_guard = active.write().unwrap();
+            active_guard.freeze().unwrap()
         };
         let key = active_cursor.take_key().unwrap().unwrap();
         let value = active_cursor
@@ -2799,9 +2858,26 @@ mod tests {
                 .unwrap()
                 .data()
                 .as_ref(),
-            b"value"
+            b"value-a"
         );
-        assert!(!active_cursor.next().unwrap());
+        assert!(active_cursor.next().unwrap());
+        assert_eq!(
+            active_cursor.key().unwrap(),
+            Some(encode_scan_key(0, 0, b"b").as_ref())
+        );
+        let mut value = active_cursor
+            .take_value()
+            .unwrap()
+            .unwrap()
+            .unwrap_encoded();
+        assert_eq!(
+            decode_value(&mut value, 1).unwrap().columns()[0]
+                .as_ref()
+                .unwrap()
+                .data()
+                .as_ref(),
+            b"value-b"
+        );
     }
 
     #[test]
@@ -2971,8 +3047,8 @@ mod tests {
             state.hash_bucket_advisor.bucket_count_for(256)
         };
         let active = manager.db_state.load().active.clone().unwrap();
-        let active = active.lock().unwrap();
-        let MemtableImpl::Hash(memtable) = active.memtable.as_ref().unwrap() else {
+        let active = active.read().unwrap();
+        let MemtableImpl::Hash(memtable) = active.readable_memtable().unwrap() else {
             panic!("expected active HashMemtable");
         };
         assert_eq!(memtable.bucket_count(), expected_bucket_count);
@@ -3017,10 +3093,10 @@ mod tests {
         manager.open().unwrap();
 
         let schema = manager.schema_manager.latest_schema();
-        let active = Arc::new(Mutex::new(ActiveMemtable {
+        let active = Arc::new(RwLock::new(ActiveMemtable {
             id: Uuid::new_v4(),
             schema: Arc::clone(&schema),
-            memtable: Some(build_test_memtable(
+            contents: ActiveMemtableContents::Writable(build_test_memtable(
                 MemtableType::Hash,
                 &[
                     (b"a".as_slice(), ValueType::Delete, b""),
