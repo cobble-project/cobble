@@ -21,6 +21,7 @@ pub struct SingleDb {
     db: Arc<Db>,
     coordinator: Arc<DbCoordinator>,
     total_buckets: u32,
+    snapshot_start: Mutex<()>,
     snapshot_state: Arc<Mutex<SingleNodeSnapshotState>>,
     snapshot_done: Arc<Condvar>,
 }
@@ -44,6 +45,7 @@ impl SingleDb {
             db,
             coordinator,
             total_buckets,
+            snapshot_start: Mutex::new(()),
             snapshot_state: Arc::new(Mutex::new(SingleNodeSnapshotState::default())),
             snapshot_done: Arc::new(Condvar::new()),
         })
@@ -87,6 +89,7 @@ impl SingleDb {
             db,
             coordinator,
             total_buckets,
+            snapshot_start: Mutex::new(()),
             snapshot_state: Arc::new(Mutex::new(SingleNodeSnapshotState::default())),
             snapshot_done: Arc::new(Condvar::new()),
         })
@@ -132,6 +135,9 @@ impl SingleDb {
     where
         F: Fn(Result<GlobalSnapshotManifest>) + Send + Sync + 'static,
     {
+        // Keep global id assignment in the same order as local snapshot enqueueing so concurrent
+        // callbacks cannot publish the global CURRENT pointer backwards.
+        let _snapshot_start = self.snapshot_start.lock().unwrap();
         self.begin_snapshot_in_flight()?;
 
         let global_snapshot_id = self.coordinator.allocate_snapshot_id();
@@ -364,6 +370,8 @@ impl SingleDb {
 mod tests {
     use super::*;
     use crate::VolumeDescriptor;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
     use uuid::Uuid;
 
     #[test]
@@ -393,6 +401,69 @@ mod tests {
         let row3 = resumed.get(0, b"k3").unwrap().unwrap();
         assert_eq!(row3[0].as_deref(), Some(&b"v3"[..]));
         resumed.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_single_db_snapshots_do_not_regress_current_pointer() {
+        const SNAPSHOT_COUNT: usize = 8;
+
+        let root = format!("/tmp/single_db_concurrent_snapshots_{}", Uuid::new_v4());
+        let db = Arc::new(
+            SingleDb::open(Config {
+                volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+                total_buckets: 1,
+                num_columns: 1,
+                snapshot_retention: None,
+                ..Config::default()
+            })
+            .unwrap(),
+        );
+        db.put(0, b"initial", 0, b"value").unwrap();
+        let start = Arc::new(Barrier::new(SNAPSHOT_COUNT + 1));
+        let snapshots = (0..SNAPSHOT_COUNT)
+            .map(|_| {
+                let snapshot_db = Arc::clone(&db);
+                let snapshot_start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    snapshot_start.wait();
+                    let (tx, rx) = mpsc::channel();
+                    let allocated_id = snapshot_db
+                        .snapshot_with_callback(move |result| {
+                            let _ = tx.send(result);
+                        })
+                        .unwrap();
+                    let manifest = rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("global snapshot callback")
+                        .expect("global snapshot materialization");
+                    assert_eq!(manifest.id, allocated_id);
+                    manifest
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        let mut manifests = snapshots
+            .into_iter()
+            .map(|snapshot| snapshot.join().expect("snapshot thread did not panic"))
+            .collect::<Vec<_>>();
+        manifests.sort_by_key(|manifest| manifest.id);
+        assert_eq!(manifests.len(), SNAPSHOT_COUNT);
+        for pair in manifests.windows(2) {
+            assert!(pair[0].id < pair[1].id);
+            assert!(
+                pair[0].shard_snapshots[0].snapshot_id < pair[1].shard_snapshots[0].snapshot_id
+            );
+        }
+        let current = db
+            .coordinator
+            .load_current_global_snapshot()
+            .unwrap()
+            .expect("current global snapshot");
+        assert_eq!(current.id, manifests.last().unwrap().id);
+
+        db.close().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 }

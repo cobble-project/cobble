@@ -20,7 +20,7 @@ Cobble is built around a few core ideas:
 - **Weak coordination among shards.** In a distributed deployment, each `Db` shard operates mostly independently, with the Coordinator only involved in snapshot management. This minimizes cross-shard communication and allows for high write throughput without distributed locking. We leave it to the application to decide how to partition data and handle cross-shard consistency if needed.
 - **Flexible with more options.** Cobble provides multiple implementations for key components (memtable, file formats, compaction strategies) that can be configured based on workload needs. The architecture is designed to accommodate these options without sacrificing core performance.
 - **Snapshots for consistency as well as read serving.** The snapshot system is not just for backup and restore — it's a fundamental part of how Cobble provides consistent read views in a distributed environment. This makes Cobble a good fit for analytical workloads that need to read from a consistent point-in-time view while writes are ongoing.
-- **Single-threaded APIs for simplicity and performance.** Each components' APIs are designed to be called from a single thread, which simplifies the internal design and allows for high performance without locking. For concurrent access, you use multiple instance of `Reader` or `Scanner` against snapshots, which are safe to use concurrently.
+- **Concurrent access within a writer.** A writer `Db` accepts concurrent reads, writes, scans, and snapshots while preserving a single ordered memtable write stream.
 
 ## Module Map
 

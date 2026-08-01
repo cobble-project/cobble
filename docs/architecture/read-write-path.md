@@ -40,9 +40,9 @@ Within each file, [bloom filters](lsm-tree#file-formats) (if enabled) provide a 
 
 If the value is stored in a VLOG file (see [key-value separation](key-value-separation)), the pointer is transparently dereferenced. If multiple [merge operands](merge-operator) are found across levels, they are combined using the registered operator to produce the final value.
 
-### Lock-Free Reads
+### Concurrent Reads
 
-Cobble uses an atomic swap mechanism for its database state, which means readers never block writers. When you call `get`, you acquire an immutable snapshot of the current state — no locks involved. Writers can continue inserting data concurrently. This design is fundamental to achieving high read throughput alongside sustained write loads.
+Cobble uses an atomic swap mechanism to acquire an immutable database-state snapshot. Readers retain that view across memtable rotation and file replacement, while a short shared lock protects access to the current active memtable. Reads, writes, and scans can therefore run concurrently without requiring separate `Db` instances.
 
 ### Scanning
 

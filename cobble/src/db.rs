@@ -858,10 +858,8 @@ impl Db {
     /// The manifest is materialized asynchronously after the flush completes.
     pub fn snapshot(&self) -> Result<u64> {
         let _access = self.begin_access()?;
-        let db_snapshot = self.snapshot_manager.create_snapshot(None);
         self.memtable_manager
-            .flush_snapshot(db_snapshot.id, self.snapshot_manager.clone())?;
-        Ok(db_snapshot.id)
+            .create_snapshot(self.snapshot_manager.clone(), None)
     }
 
     /// Flush the active memtable, schedule manifest materialization, and invoke the callback with
@@ -891,14 +889,13 @@ impl Db {
                 })
             }));
         });
-        let snapshot = self.snapshot_manager.create_snapshot(Some(wrapper));
         self.memtable_manager
-            .flush_snapshot(snapshot.id, self.snapshot_manager.clone())?;
-        Ok(snapshot.id)
+            .create_snapshot(self.snapshot_manager.clone(), Some(wrapper))
     }
 
     /// Cancel an in-flight snapshot before manifest publication completes.
     pub fn cancel_snapshot(&self, snapshot_id: u64) -> Result<bool> {
+        let _access = self.begin_access()?;
         let cancelled = self.snapshot_manager.cancel_snapshot(snapshot_id)?;
         if cancelled {
             let fallback = self.snapshot_manager.suggested_base_fallback(snapshot_id);
@@ -1799,6 +1796,8 @@ mod tests {
         assert!(matches!(get_err, Error::InvalidState(_)));
         let snapshot_err = db.snapshot().unwrap_err();
         assert!(matches!(snapshot_err, Error::InvalidState(_)));
+        let cancel_err = db.cancel_snapshot(0).unwrap_err();
+        assert!(matches!(cancel_err, Error::InvalidState(_)));
         assert!(!db.retain_snapshot(0));
 
         cleanup_test_root(root);
@@ -2017,6 +2016,110 @@ mod tests {
 
     #[test]
     #[serial(file)]
+    fn test_concurrent_snapshots_follow_id_order_during_writes() {
+        const WRITER_COUNT: usize = 3;
+        const SNAPSHOT_COUNT: usize = 8;
+        const WRITES_PER_WRITER: usize = 300;
+
+        let root = "/tmp/db_concurrent_snapshots";
+        cleanup_test_root(root);
+        let db = Arc::new(open_db(Config {
+            memtable_capacity: Size::from_kib(8),
+            memtable_buffer_count: 4,
+            l0_file_limit: 128,
+            write_stall_limit: Some(128),
+            snapshot_retention: None,
+            num_columns: 1,
+            volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+            ..Config::default()
+        }));
+        let start = Arc::new(Barrier::new(WRITER_COUNT + SNAPSHOT_COUNT + 1));
+
+        let writers = (0..WRITER_COUNT)
+            .map(|writer_id| {
+                let writer_db = Arc::clone(&db);
+                let writer_start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    writer_start.wait();
+                    for sequence in 0..WRITES_PER_WRITER {
+                        let key = format!("snapshot-writer-{writer_id}-{sequence:04}");
+                        let value = vec![b'a' + writer_id as u8; 128];
+                        writer_db
+                            .put(0, key.as_bytes(), 0, &value)
+                            .expect("write during concurrent snapshots");
+                        if sequence.is_multiple_of(32) {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let snapshots = (0..SNAPSHOT_COUNT)
+            .map(|snapshot_thread| {
+                let snapshot_db = Arc::clone(&db);
+                let snapshot_start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    snapshot_start.wait();
+                    std::thread::sleep(Duration::from_millis((snapshot_thread % 4) as u64));
+                    let (tx, rx) = mpsc::channel();
+                    let snapshot_id = snapshot_db
+                        .snapshot_with_callback(move |result| {
+                            let _ = tx.send(result);
+                        })
+                        .expect("create concurrent snapshot");
+                    let input = rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("concurrent snapshot callback")
+                        .expect("materialize concurrent snapshot");
+                    assert_eq!(input.snapshot_id, snapshot_id);
+                    assert!(snapshot_db.retain_snapshot(snapshot_id));
+                    snapshot_id
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        for writer in writers {
+            writer.join().expect("snapshot writer did not panic");
+        }
+        let mut snapshot_ids = snapshots
+            .into_iter()
+            .map(|snapshot| snapshot.join().expect("snapshot thread did not panic"))
+            .collect::<Vec<_>>();
+        snapshot_ids.sort_unstable();
+        snapshot_ids.dedup();
+        assert_eq!(snapshot_ids.len(), SNAPSHOT_COUNT);
+
+        let mut previous_seq_id = None;
+        for snapshot_id in &snapshot_ids {
+            let manifest = load_manifest_for_snapshot(&db.file_manager, *snapshot_id)
+                .expect("load concurrent snapshot manifest");
+            if let Some(previous) = previous_seq_id {
+                assert!(
+                    manifest.seq_id >= previous,
+                    "snapshot id order regressed from seq {previous} to {} at id {snapshot_id}",
+                    manifest.seq_id
+                );
+            }
+            previous_seq_id = Some(manifest.seq_id);
+        }
+
+        for snapshot_id in snapshot_ids {
+            assert!(db.expire_snapshot(snapshot_id).unwrap());
+        }
+        for writer_id in 0..WRITER_COUNT {
+            for sequence in 0..WRITES_PER_WRITER {
+                let key = format!("snapshot-writer-{writer_id}-{sequence:04}");
+                assert!(db.get(0, key.as_bytes()).unwrap().is_some());
+            }
+        }
+        db.close().unwrap();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
     fn test_single_writer_with_concurrent_gets_and_scans_across_memtable_rotation() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Db>();
@@ -2120,6 +2223,220 @@ mod tests {
             db.close().unwrap();
             cleanup_test_root(&root);
         }
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_concurrent_writers_and_readers_across_memtable_rotation() {
+        const WRITER_COUNT: usize = 6;
+        const READER_COUNT: usize = 2;
+        const WRITES_PER_WRITER: usize = 200;
+
+        for memtable_type in [
+            MemtableType::Hash,
+            MemtableType::Skiplist,
+            MemtableType::Vec,
+        ] {
+            let root = format!(
+                "/tmp/db_concurrent_writes_{}",
+                format!("{memtable_type:?}").to_lowercase()
+            );
+            cleanup_test_root(&root);
+            let db = Arc::new(open_db(Config {
+                memtable_capacity: Size::from_kib(16),
+                memtable_buffer_count: 4,
+                memtable_type,
+                l0_file_limit: 128,
+                write_stall_limit: Some(128),
+                num_columns: 1,
+                volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+                ..Config::default()
+            }));
+            let done = Arc::new(AtomicBool::new(false));
+            let start = Arc::new(Barrier::new(WRITER_COUNT + READER_COUNT + 1));
+
+            let writers = (0..WRITER_COUNT)
+                .map(|writer_id| {
+                    let writer_db = Arc::clone(&db);
+                    let writer_start = Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        writer_start.wait();
+                        for sequence in 0..WRITES_PER_WRITER {
+                            let key = format!("writer-{writer_id}-key-{sequence:04}");
+                            let value = format!(
+                                "writer-{writer_id}-value-{sequence:04}-{}",
+                                "x".repeat(128)
+                            );
+                            let latest_key = format!("writer-{writer_id}-latest");
+                            let latest = format!("{sequence:04}");
+                            match writer_id % 3 {
+                                0 => {
+                                    writer_db
+                                        .put(0, key.as_bytes(), 0, value.as_bytes())
+                                        .expect("concurrent writer put");
+                                    writer_db
+                                        .put(0, latest_key.as_bytes(), 0, latest.as_bytes())
+                                        .expect("concurrent writer ordered put");
+                                }
+                                1 => {
+                                    let entries = [
+                                        (key.as_bytes(), value.as_bytes()),
+                                        (latest_key.as_bytes(), latest.as_bytes()),
+                                    ];
+                                    writer_db
+                                        .put_column_batch_with_options(
+                                            0,
+                                            0,
+                                            entries,
+                                            &WriteOptions::default(),
+                                        )
+                                        .expect("concurrent column batch");
+                                }
+                                _ => {
+                                    let mut batch = WriteBatch::new();
+                                    batch.put(0, key.as_bytes(), 0, value.as_bytes());
+                                    batch.put(0, latest_key.as_bytes(), 0, latest.as_bytes());
+                                    writer_db
+                                        .write_batch(batch)
+                                        .expect("concurrent write batch");
+                                }
+                            }
+
+                            if sequence.is_multiple_of(50) {
+                                let deleted_key =
+                                    format!("writer-{writer_id}-deleted-{sequence:04}");
+                                writer_db
+                                    .put(0, deleted_key.as_bytes(), 0, b"temporary")
+                                    .expect("put before concurrent delete");
+                                writer_db
+                                    .delete(0, deleted_key.as_bytes(), 0)
+                                    .expect("concurrent delete");
+
+                                let merged_key = format!("writer-{writer_id}-merged-{sequence:04}");
+                                writer_db
+                                    .put(0, merged_key.as_bytes(), 0, b"base")
+                                    .expect("put before concurrent merge");
+                                writer_db
+                                    .merge(0, merged_key.as_bytes(), 0, b"-tail")
+                                    .expect("concurrent merge");
+                            }
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let readers = (0..READER_COUNT)
+                .map(|reader_id| {
+                    let reader_db = Arc::clone(&db);
+                    let reader_done = Arc::clone(&done);
+                    let reader_start = Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        reader_start.wait();
+                        let mut round = 0usize;
+                        while !reader_done.load(AtomicOrdering::Acquire) {
+                            let writer_id = (round + reader_id) % WRITER_COUNT;
+                            let key = format!("writer-{writer_id}-latest");
+                            let _ = reader_db.get(0, key.as_bytes()).expect("concurrent get");
+                            if round.is_multiple_of(64) {
+                                let iter = reader_db
+                                    .scan(0, b"writer-".as_slice()..b"writer.".as_slice())
+                                    .expect("concurrent scan");
+                                for row in iter {
+                                    row.expect("concurrent scan row");
+                                }
+                            }
+                            round += 1;
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            start.wait();
+            for writer in writers {
+                writer.join().expect("writer did not panic");
+            }
+            done.store(true, AtomicOrdering::Release);
+            for reader in readers {
+                reader.join().expect("reader did not panic");
+            }
+
+            for writer_id in 0..WRITER_COUNT {
+                for sequence in 0..WRITES_PER_WRITER {
+                    let key = format!("writer-{writer_id}-key-{sequence:04}");
+                    assert!(
+                        db.get(0, key.as_bytes()).unwrap().is_some(),
+                        "missing {key} for {memtable_type:?}"
+                    );
+                }
+                let key = format!("writer-{writer_id}-latest");
+                let value = db.get(0, key.as_bytes()).unwrap().unwrap();
+                assert_eq!(
+                    value[0].as_deref(),
+                    Some(format!("{:04}", WRITES_PER_WRITER - 1).as_bytes())
+                );
+                for sequence in (0..WRITES_PER_WRITER).step_by(50) {
+                    let deleted_key = format!("writer-{writer_id}-deleted-{sequence:04}");
+                    assert!(db.get(0, deleted_key.as_bytes()).unwrap().is_none());
+                    let merged_key = format!("writer-{writer_id}-merged-{sequence:04}");
+                    let value = db.get(0, merged_key.as_bytes()).unwrap().unwrap();
+                    assert_eq!(value[0].as_deref(), Some(b"base-tail".as_slice()));
+                }
+            }
+            db.close().unwrap();
+            cleanup_test_root(&root);
+        }
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_concurrent_oversized_writes_replace_empty_active_once() {
+        const WRITER_COUNT: usize = 4;
+        const WRITES_PER_WRITER: usize = 12;
+
+        let root = "/tmp/db_concurrent_oversized_writes";
+        cleanup_test_root(root);
+        let db = Arc::new(open_db(Config {
+            memtable_capacity: Size::from_const(128),
+            memtable_buffer_count: 3,
+            memtable_type: MemtableType::Hash,
+            l0_file_limit: 128,
+            write_stall_limit: Some(128),
+            num_columns: 1,
+            volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+            ..Config::default()
+        }));
+        let start = Arc::new(Barrier::new(WRITER_COUNT + 1));
+        let writers = (0..WRITER_COUNT)
+            .map(|writer_id| {
+                let writer_db = Arc::clone(&db);
+                let writer_start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    writer_start.wait();
+                    for sequence in 0..WRITES_PER_WRITER {
+                        let key = format!("oversized-{writer_id}-{sequence:03}");
+                        let value = vec![b'a' + writer_id as u8; 1_024 + sequence];
+                        writer_db
+                            .put(0, key.as_bytes(), 0, &value)
+                            .expect("concurrent oversized put");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        for writer in writers {
+            writer.join().expect("oversized writer did not panic");
+        }
+        for writer_id in 0..WRITER_COUNT {
+            for sequence in 0..WRITES_PER_WRITER {
+                let key = format!("oversized-{writer_id}-{sequence:03}");
+                let expected = vec![b'a' + writer_id as u8; 1_024 + sequence];
+                let value = db.get(0, key.as_bytes()).unwrap().unwrap();
+                assert_eq!(value[0].as_deref(), Some(expected.as_slice()));
+            }
+        }
+        db.close().unwrap();
+        cleanup_test_root(root);
     }
 
     #[test]

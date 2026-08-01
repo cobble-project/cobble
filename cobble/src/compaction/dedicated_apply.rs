@@ -835,9 +835,9 @@ fn commit_and_verify(
     let callback: SnapshotCallback = Arc::new(move |result| {
         let _ = tx.send(result);
     });
-    let snapshot = ctx.snapshot_manager.create_snapshot(Some(callback));
-    ctx.memtable_manager
-        .flush_snapshot(snapshot.id, ctx.snapshot_manager.clone())?;
+    let snapshot_id = ctx
+        .memtable_manager
+        .create_snapshot(ctx.snapshot_manager.clone(), Some(callback))?;
 
     // Wait for the materialization callback. This blocks until the snapshot is materialized
     // (or fails). The background materializer invokes the callback exactly once.
@@ -845,7 +845,7 @@ fn commit_and_verify(
     let manifest_info = rx.recv_timeout(Duration::from_secs(30)).map_err(|_| {
         Error::InvalidState(format!(
             "dedicated compaction snapshot {} materialization timed out after 30s",
-            snapshot.id
+            snapshot_id
         ))
     })??;
 

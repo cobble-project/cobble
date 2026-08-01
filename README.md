@@ -21,7 +21,7 @@ We list some of Cobble's key features below, they are either implemented or are 
 - **Schema Support & Evolution**: User-defined column schemas with incremental evolution.
 - **Multiple File Formats**: SST and Parquet for both point lookup and analytical queries.
 - **Distributed Snapshots**: Global consistent snapshots across multiple shards and machines, with local shard snapshots as building blocks.
-- **One writer, multiple readers for one shard**: A single writer for consistency, with concurrent readers across processes or machines.
+- **One writer process per shard**: One process owns writes for consistency; that writer accepts concurrent read and write calls, while snapshot readers can run in other processes or machines.
 - **Remote Compaction**: Compaction can run on remote object storage to reduce local resource usage.
 - **Multi-version Snapshots**: Read historical data states via versioned snapshots.
 - **Key-value Separation**: Separates keys and values to optimize large-value, low-access patterns.

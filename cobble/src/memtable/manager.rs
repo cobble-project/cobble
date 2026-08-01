@@ -26,7 +26,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::parquet::{ParquetWriter, ParquetWriterOptions};
 use crate::paths::snapshot_active_data_relative_path;
 use crate::schema::{Schema, SchemaManager};
-use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotManager};
+use crate::snapshot::{ActiveMemtableSnapshotData, SnapshotCallback, SnapshotManager};
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use crate::r#type::{
     ENCODED_KEY_PREFIX_BYTES, KvValue, RefKey, RefValue, ValueType, key_bucket, key_column_family,
@@ -105,6 +105,8 @@ impl Default for MemtableManagerOptions {
 
 pub(crate) struct MemtableManager {
     state: Arc<Mutex<MemtableManagerState>>,
+    /// Serializes active-memtable replacement without serializing normal writes.
+    rotation_lock: Mutex<()>,
     buffer_ready: Arc<Condvar>,
     flush_done: Arc<Condvar>,
     file_manager: Arc<FileManager>,
@@ -1004,6 +1006,7 @@ impl MemtableManager {
         db_lifecycle.register_error_notifier(db_state.changed_condvar());
         Ok(Self {
             state,
+            rotation_lock: Mutex::new(()),
             buffer_ready,
             flush_done,
             file_manager,
@@ -1477,12 +1480,9 @@ impl MemtableManager {
                 }
                 drop(state);
             }
-            let active = self
-                .db_state
-                .load()
-                .active
-                .clone()
-                .expect("active memtable exists");
+            let Some(active) = self.db_state.load().active.clone() else {
+                continue;
+            };
             let mut active = active.write().unwrap();
             if active.writable_memtable().is_none() {
                 drop(active);
@@ -1497,8 +1497,9 @@ impl MemtableManager {
                 if is_empty {
                     active.schema = latest_schema;
                 } else {
+                    let active_id = active.id;
                     drop(active);
-                    let _ = self.flush_active()?;
+                    let _ = self.flush_active_if_current(active_id, FlushCause::Manual)?;
                     continue;
                 }
             }
@@ -1553,12 +1554,9 @@ impl MemtableManager {
                 state = self.buffer_ready.wait(state).unwrap();
             }
         }
-        let active = self
-            .db_state
-            .load()
-            .active
-            .clone()
-            .expect("active memtable exists");
+        let Some(active) = self.db_state.load().active.clone() else {
+            return Ok(false);
+        };
         let mut active = active.write().unwrap();
         if active.writable_memtable().is_none() {
             return Ok(false);
@@ -1572,8 +1570,9 @@ impl MemtableManager {
             if is_empty {
                 active.schema = latest_schema;
             } else {
+                let active_id = active.id;
                 drop(active);
-                let _ = self.flush_active()?;
+                let _ = self.flush_active_if_current(active_id, FlushCause::Manual)?;
                 return Ok(false);
             }
         }
@@ -1598,9 +1597,11 @@ impl MemtableManager {
 
     fn allocate_one_key_value_special_vec_memtable_as_active(
         &self,
+        expected_active_id: Uuid,
         key: &RefKey<'_>,
         value: &RefValue<'_>,
     ) -> Result<bool> {
+        let _rotation_guard = self.rotation_lock.lock().unwrap();
         let latest_schema = self.schema_manager.latest_schema();
         let num_columns = latest_schema
             .num_columns_in_family(key.column_family())
@@ -1612,72 +1613,74 @@ impl MemtableManager {
             let mut state = self.state.lock().unwrap();
             state.allow_make_active_buffer_in_reclaimer = false;
         }
-        let old_memtable = {
-            // Release the current active memtable if exists to free up budget.
-            let guard = self.db_state.lock();
-            let snapshot = self.db_state.load();
-            let Some(active) = snapshot.active.as_ref() else {
-                drop(guard);
-                let mut state = self.state.lock().unwrap();
-                state.allow_make_active_buffer_in_reclaimer = true;
-                return Ok(false);
-            };
-            let mut active = active.write().unwrap();
-            let old_memtable = active.take_empty_writable();
-            if old_memtable.is_none() {
+        let result = (|| {
+            let old_memtable = {
+                // Release the current active memtable if it is still the empty table on which
+                // this writer observed MemtableFull. Another writer may already have replaced it.
+                let guard = self.db_state.lock();
+                let snapshot = self.db_state.load();
+                let Some(active) = snapshot.active.as_ref() else {
+                    return Ok(false);
+                };
+                let mut active = active.write().unwrap();
+                if active.id != expected_active_id {
+                    return Ok(false);
+                }
+                let Some(old_memtable) = active.take_empty_writable() else {
+                    return Ok(false);
+                };
                 drop(active);
+                self.db_state
+                    .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
+                        Some(DbState {
+                            seq_id: db_state.allocate_seq_id(),
+                            bucket_ranges: snapshot.bucket_ranges.clone(),
+                            multi_lsm_version: snapshot.multi_lsm_version.clone(),
+                            vlog_version: snapshot.vlog_version.clone(),
+                            active: None,
+                            immutables: snapshot.immutables.clone(),
+                            truncation_cursors: snapshot.truncation_cursors.clone(),
+                            suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+                        })
+                    });
                 drop(guard);
-                let mut state = self.state.lock().unwrap();
-                state.allow_make_active_buffer_in_reclaimer = true;
-                return Ok(false);
+                old_memtable
+            };
+            drop(old_memtable);
+
+            // Try to make a new active buffer with just enough capacity for this key-value pair.
+            let mut state = self.state.lock().unwrap();
+            loop {
+                Self::make_active_buffer(
+                    &mut state,
+                    &self.db_state,
+                    &self.schema_manager,
+                    capacity,
+                    MemtableType::Vec,
+                    &self.reclaimer,
+                    self.total_budget,
+                    true,
+                );
+                if self.db_state.load().active.is_some() {
+                    return Ok(true);
+                }
+                if state.in_flight == 0 {
+                    return Err(InvalidState(
+                        "failed to allocate special active vec memtable".to_string(),
+                    ));
+                }
+                self.db_lifecycle.ensure_open()?;
+                state = self.buffer_ready.wait(state).unwrap();
             }
-            drop(active);
-            self.db_state
-                .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
-                    Some(DbState {
-                        seq_id: db_state.allocate_seq_id(),
-                        bucket_ranges: snapshot.bucket_ranges.clone(),
-                        multi_lsm_version: snapshot.multi_lsm_version.clone(),
-                        vlog_version: snapshot.vlog_version.clone(),
-                        active: None,
-                        immutables: snapshot.immutables.clone(),
-                        truncation_cursors: snapshot.truncation_cursors.clone(),
-                        suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
-                    })
-                });
-            drop(guard);
-            old_memtable
-        };
-        drop(old_memtable);
-        // Try to make a new active buffer with just enough capacity for the single key-value pair.
+        })();
+
+        // A failed or cancelled special allocation must not permanently suppress normal buffer
+        // recreation by the reclaimer.
         let mut state = self.state.lock().unwrap();
-        loop {
-            Self::make_active_buffer(
-                &mut state,
-                &self.db_state,
-                &self.schema_manager,
-                capacity,
-                MemtableType::Vec,
-                &self.reclaimer,
-                self.total_budget,
-                true,
-            );
-            if self.db_state.load().active.is_some() {
-                break;
-            }
-            if state.in_flight == 0 {
-                state.allow_make_active_buffer_in_reclaimer = true;
-                return Err(InvalidState(
-                    "failed to allocate special active vec memtable".to_string(),
-                ));
-            }
-            self.db_lifecycle.ensure_open()?;
-            state = self.buffer_ready.wait(state).unwrap();
-        }
-        // Allow reclaimer to make active buffer again for future flushes.
         state.allow_make_active_buffer_in_reclaimer = true;
+        self.buffer_ready.notify_all();
         drop(state);
-        Ok(true)
+        result
     }
 
     fn handle_memtable_put_error(
@@ -1697,8 +1700,11 @@ impl MemtableManager {
                     .expect("active memtable is readable")
                     .is_empty()
                 {
+                    let active_id = active.id;
                     drop(active);
-                    self.allocate_one_key_value_special_vec_memtable_as_active(key, value)?;
+                    self.allocate_one_key_value_special_vec_memtable_as_active(
+                        active_id, key, value,
+                    )?;
                 } else {
                     // flush active memtable and retry
                     let active_id = active.id;
@@ -1909,11 +1915,24 @@ impl MemtableManager {
     }
 
     pub(crate) fn flush_active(&self) -> Result<Option<Uuid>> {
+        let _rotation_guard = self.rotation_lock.lock().unwrap();
         self.flush_active_with_auto_snapshot(FlushCause::Manual)
     }
 
     fn flush_active_for_capacity_full(&self, active_id: Uuid) -> Result<Option<Uuid>> {
-        self.flush_active_with_auto_snapshot(FlushCause::CapacityFull(active_id))
+        self.flush_active_if_current(active_id, FlushCause::CapacityFull(active_id))
+    }
+
+    fn flush_active_if_current(&self, active_id: Uuid, cause: FlushCause) -> Result<Option<Uuid>> {
+        let _rotation_guard = self.rotation_lock.lock().unwrap();
+        let snapshot = self.db_state.load();
+        let Some(active) = snapshot.active.as_ref() else {
+            return Ok(None);
+        };
+        if active.read().unwrap().id != active_id {
+            return Ok(None);
+        }
+        self.flush_active_with_auto_snapshot(cause)
     }
 
     fn flush_active_with_auto_snapshot(&self, cause: FlushCause) -> Result<Option<Uuid>> {
@@ -1937,11 +1956,24 @@ impl MemtableManager {
         result
     }
 
-    /// Queues a checkpoint flush and owns failure completion for its snapshot callback.
-    ///
-    /// Callers only propagate the returned error: completing the callback twice would race the
-    /// materializer and obscure the original flush failure.
-    pub(crate) fn flush_snapshot(&self, snapshot_id: u64, manager: SnapshotManager) -> Result<()> {
+    /// Allocates and captures a snapshot in one rotation critical section so snapshot ids follow
+    /// capture order even when callers invoke `Db::snapshot` concurrently.
+    pub(crate) fn create_snapshot(
+        &self,
+        manager: SnapshotManager,
+        callback: Option<SnapshotCallback>,
+    ) -> Result<u64> {
+        let _rotation_guard = self.rotation_lock.lock().unwrap();
+        let snapshot_id = manager.create_snapshot(callback).id;
+        self.flush_snapshot_under_rotation(snapshot_id, manager)?;
+        Ok(snapshot_id)
+    }
+
+    fn flush_snapshot_under_rotation(
+        &self,
+        snapshot_id: u64,
+        manager: SnapshotManager,
+    ) -> Result<()> {
         let snapshot = SnapshotCompletion {
             snapshot_id,
             manager: manager.clone(),
@@ -4161,6 +4193,89 @@ mod tests {
         let state = manager.state.lock().unwrap();
         assert_eq!(state.in_flight, 0);
         assert_eq!(state.budget, 0);
+        cleanup_test_root();
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn stale_capacity_full_request_does_not_rotate_the_replacement_memtable() {
+        cleanup_test_root();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register("file:///tmp/memtable_manager_test")
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("memtable-stale-rotation-test"));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let lsm_tree = Arc::new(crate::lsm::LSMTree::with_state(
+            Arc::new(crate::db_state::DbStateHandle::new()),
+            Arc::clone(&metrics_manager),
+        ));
+        let manager = MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 256,
+                buffer_count: 3,
+                memtable_type: MemtableType::Vec,
+                num_columns: 1,
+                write_stall_limit: 8,
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        manager.open().unwrap();
+
+        let key = RefKey::new(0, b"key");
+        let value_bytes = vec![b'v'; 64];
+        let value = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, &value_bytes))]);
+        manager.put(&key, &value).unwrap();
+        let old_active_id = manager
+            .db_state
+            .load()
+            .active
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            manager
+                .flush_active_for_capacity_full(old_active_id)
+                .unwrap(),
+            Some(old_active_id)
+        );
+        let replacement_id = manager
+            .db_state
+            .load()
+            .active
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .id;
+        assert_ne!(replacement_id, old_active_id);
+
+        assert_eq!(
+            manager
+                .flush_active_for_capacity_full(old_active_id)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            manager
+                .db_state
+                .load()
+                .active
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap()
+                .id,
+            replacement_id
+        );
+        assert_eq!(manager.wait_for_flushes().len(), 1);
         cleanup_test_root();
     }
 

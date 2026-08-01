@@ -32,11 +32,11 @@ Limitation: Cobble only support maximum of 230 column families. Do not create mo
 
 ### Db
 
-A `Db` is a **single writer shard** — it owns a set of buckets and handles all writes to them. Internally it manages a [memtable](../architecture/memtable), [LSM tree](../architecture/lsm-tree), [compaction](../architecture/compaction), and optionally [value-separated VLOG files](../architecture/key-value-separation).
+A `Db` is a **writer shard** — it owns a set of buckets and handles all writes to them. Internally it manages a [memtable](../architecture/memtable), [LSM tree](../architecture/lsm-tree), [compaction](../architecture/compaction), and optionally [value-separated VLOG files](../architecture/key-value-separation).
 
 In a distributed deployment you run multiple `Db` instances, each owning a non-overlapping range of buckets.
 
-> IMPORTANT: All the APIs for `Db` is designed to be invoked in serial. No concurrent calls to the same `Db` instance are allowed. This simplifies the internal design and allows for high performance without locking. If you need concurrent access, use a `Reader` or `Scanner` against a snapshot (see below).
+Only one writer process may own a shard, but callers within that process may use the same `Db` concurrently for reads, writes, scans, and snapshots.
 
 ### Coordinator
 
