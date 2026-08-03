@@ -1430,6 +1430,39 @@ impl StructuredDb {
         self.get_with_options(bucket, key, &self.default_read_options)
     }
 
+    pub fn multi_get<K>(
+        &self,
+        keys: &[(u16, K)],
+    ) -> Result<Vec<Option<Vec<Option<StructuredColumnValue>>>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.multi_get_with_options(keys, &self.default_read_options)
+    }
+
+    pub fn multi_get_with_options<K>(
+        &self,
+        keys: &[(u16, K)],
+        options: &StructuredReadOptions,
+    ) -> Result<Vec<Option<Vec<Option<StructuredColumnValue>>>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let raw_keys = keys
+            .iter()
+            .map(|(bucket, key)| (*bucket, key.as_ref()))
+            .collect::<Vec<_>>();
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
+        self.db
+            .multi_get_with_options(&raw_keys, options.as_cobble())?
+            .into_iter()
+            .map(|raw| {
+                raw.map(|columns| decode_row(&projected_schema, 0, columns))
+                    .transpose()
+            })
+            .collect()
+    }
+
     pub fn get_with_options<K>(
         &self,
         bucket: u16,

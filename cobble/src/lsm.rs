@@ -25,6 +25,7 @@ use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaManager};
 use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions, SSTPointReader};
 use crate::r#type::{Value, key_bucket, key_column_family};
+use bytes::Bytes;
 use log::{debug, warn};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::RangeInclusive;
@@ -57,6 +58,21 @@ fn file_intersects_scan(file: &DataFile, encoded_start: &[u8], encoded_end: Opti
 pub(crate) struct LSMTreeVersion {
     pub(crate) levels: Vec<Level>,
 }
+
+/// Per-key mutable state for a batched point lookup. The caller initializes
+/// values/masks from the memtable snapshot; the LSM path appends older values.
+pub(crate) struct BatchGetRequest {
+    pub(crate) bucket: u16,
+    pub(crate) encoded_key: Bytes,
+    pub(crate) values: Vec<Value>,
+    pub(crate) terminal_mask: Option<Vec<u8>>,
+    pub(crate) decode_mask: Vec<u8>,
+    pub(crate) stopped: bool,
+}
+
+/// Small point batches avoid sorting and use per-key binary routing in
+/// non-tiered levels. Larger batches amortize one sort with merge routing.
+const SMALL_BATCH_POINT_ROUTING_REQUEST_LIMIT: usize = 8;
 
 pub(crate) struct LSMTree {
     db_state: Arc<DbStateHandle>,
@@ -1005,6 +1021,145 @@ impl LSMTree {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn get_many_with_snapshot(
+        &self,
+        file_manager: &Arc<FileManager>,
+        snapshot: Arc<DbState>,
+        requests: &mut [BatchGetRequest],
+        target_schema: &Schema,
+        schema_manager: &SchemaManager,
+        selected_columns: Option<&[usize]>,
+        selected_mask: Option<&[u8]>,
+        column_family_id: u8,
+    ) -> Result<()> {
+        let tree_groups = group_request_indices_by_tree(&snapshot, requests, column_family_id);
+        for (tree_idx, mut request_indices) in tree_groups {
+            self.get_many_with_levels(
+                file_manager,
+                snapshot
+                    .multi_lsm_version
+                    .version_of_index(tree_idx)
+                    .levels
+                    .as_slice(),
+                &mut request_indices,
+                requests,
+                target_schema,
+                schema_manager,
+                column_family_id,
+                selected_columns,
+                selected_mask,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn get_many_with_levels(
+        &self,
+        file_manager: &Arc<FileManager>,
+        levels: &[Level],
+        request_indices: &mut Vec<usize>,
+        requests: &mut [BatchGetRequest],
+        target_schema: &Schema,
+        schema_manager: &SchemaManager,
+        column_family_id: u8,
+        selected_columns: Option<&[usize]>,
+        selected_mask: Option<&[u8]>,
+    ) -> Result<()> {
+        let mut requests_are_sorted = false;
+        for level in levels {
+            retain_active_request_indices(request_indices, requests);
+            if request_indices.is_empty() {
+                break;
+            }
+            if level.tiered {
+                let use_partition_routing =
+                    request_indices.len() > SMALL_BATCH_POINT_ROUTING_REQUEST_LIMIT;
+                if use_partition_routing && !requests_are_sorted {
+                    sort_request_indices(request_indices, requests);
+                    requests_are_sorted = true;
+                }
+                for file in level.files.iter().rev() {
+                    let matches = if use_partition_routing {
+                        let first = request_indices.partition_point(|idx| {
+                            requests[*idx].encoded_key.as_ref() < file.start_key.as_slice()
+                        });
+                        let last = request_indices.partition_point(|idx| {
+                            requests[*idx].encoded_key.as_ref() <= file.end_key.as_slice()
+                        });
+                        request_indices[first..last]
+                            .iter()
+                            .copied()
+                            .filter(|idx| !requests[*idx].stopped)
+                            .collect::<Vec<_>>()
+                    } else {
+                        request_indices
+                            .iter()
+                            .copied()
+                            .filter(|idx| {
+                                let request = &requests[*idx];
+                                !request.stopped
+                                    && request.encoded_key.as_ref() >= file.start_key.as_slice()
+                                    && request.encoded_key.as_ref() <= file.end_key.as_slice()
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    if matches.is_empty() {
+                        continue;
+                    }
+                    self.get_values_in_one_file_many(
+                        file,
+                        level.ordinal,
+                        file_manager,
+                        &matches,
+                        requests,
+                        target_schema,
+                        schema_manager,
+                        column_family_id,
+                        selected_columns,
+                        selected_mask,
+                    )?;
+                }
+            } else {
+                let use_binary_routing =
+                    should_use_binary_non_tiered_routing(request_indices.len(), level.files.len());
+                if !use_binary_routing && !requests_are_sorted {
+                    sort_request_indices(request_indices, requests);
+                    requests_are_sorted = true;
+                }
+                let by_file = if use_binary_routing {
+                    route_non_tiered_requests_binary(&level.files, request_indices, requests)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                } else {
+                    route_non_tiered_requests(&level.files, request_indices, requests)
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(file_idx, matches)| {
+                            (!matches.is_empty()).then_some((file_idx, matches))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for (file_idx, matches) in by_file {
+                    self.get_values_in_one_file_many(
+                        &level.files[file_idx],
+                        level.ordinal,
+                        file_manager,
+                        &matches,
+                        requests,
+                        target_schema,
+                        schema_manager,
+                        column_family_id,
+                        selected_columns,
+                        selected_mask,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn get_with_levels(
         &self,
         file_manager: &Arc<FileManager>,
@@ -1260,6 +1415,112 @@ impl LSMTree {
         Ok(iterators)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn get_values_in_one_file_many(
+        &self,
+        file: &Arc<DataFile>,
+        level_ordinal: u8,
+        file_manager: &Arc<FileManager>,
+        request_indices: &[usize],
+        requests: &mut [BatchGetRequest],
+        target_schema: &Schema,
+        schema_manager: &SchemaManager,
+        column_family_id: u8,
+        selected_columns: Option<&[usize]>,
+        selected_mask: Option<&[u8]>,
+    ) -> Result<()> {
+        if request_indices.is_empty() {
+            return Ok(());
+        }
+        let target_num_columns = target_schema
+            .num_columns_in_family(column_family_id)
+            .unwrap_or(0);
+        if file.file_type == DataFileType::Parquet {
+            // Keep Parquet on the established point-read path for now. SSTs are
+            // the format whose block I/O is coalesced by this batch API.
+            for idx in request_indices {
+                let request = &mut requests[*idx];
+                let should_continue = self.get_values_in_one_file(
+                    file,
+                    level_ordinal,
+                    file_manager,
+                    request.encoded_key.as_ref(),
+                    target_schema,
+                    schema_manager,
+                    column_family_id,
+                    selected_columns,
+                    selected_mask,
+                    request.terminal_mask.as_deref_mut(),
+                    &mut request.decode_mask,
+                    &mut request.values,
+                )?;
+                request.stopped = !should_continue
+                    || (target_num_columns == 1
+                        && request.values.last().is_some_and(Value::is_terminal));
+            }
+            return Ok(());
+        }
+
+        let source_schema = schema_manager.schema(file.schema_id)?;
+        let source_num_columns = source_schema
+            .num_columns_in_family(column_family_id)
+            .unwrap_or(0);
+        let indices = request_indices
+            .iter()
+            .copied()
+            .filter(|idx| file.effective_bucket_range.contains(&requests[*idx].bucket))
+            .collect::<Vec<_>>();
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let keys = indices
+            .iter()
+            .map(|idx| requests[*idx].encoded_key.as_ref())
+            .collect::<Vec<_>>();
+        let data_cache_namespaces = indices
+            .iter()
+            .map(|idx| bucket_scoped_cache_namespace(self.cache_namespace, requests[*idx].bucket))
+            .collect::<Vec<_>>();
+        let values = SSTPointReader::get_exact_many(
+            Box::new(file_manager.open_data_file_reader(file.file_id)?),
+            file.as_ref(),
+            SSTIteratorOptions {
+                num_columns: source_num_columns,
+                metrics: Some(Arc::clone(&self.sst_metrics)),
+                bloom_filter_enabled: true,
+                read_metadata_cache_mode: self.sst_read_metadata_cache_mode,
+                pin_metadata: self
+                    .sst_pinned_metadata_max_level
+                    .is_some_and(|max_level| level_ordinal <= max_level),
+                pin_metadata_partitions: self.sst_pinned_metadata_partitions_enabled,
+                cache_namespace: self.cache_namespace,
+                ..SSTIteratorOptions::default()
+            },
+            self.block_cache.clone(),
+            &keys,
+            &data_cache_namespaces,
+        )?;
+        for (idx, value_bytes) in indices.into_iter().zip(values) {
+            let request = &mut requests[idx];
+            let should_continue = self.apply_value_from_file(
+                file,
+                target_schema,
+                schema_manager,
+                column_family_id,
+                source_num_columns,
+                selected_mask,
+                request.terminal_mask.as_deref_mut(),
+                &mut request.decode_mask,
+                &mut request.values,
+                value_bytes,
+            )?;
+            request.stopped = !should_continue
+                || (target_num_columns == 1
+                    && request.values.last().is_some_and(Value::is_terminal));
+        }
+        Ok(())
+    }
+
     /// Get values from one data file for the given encoded key.
     /// Returns Ok(true) if the caller should continue to the next file,
     /// or Ok(false) if the caller should stop.
@@ -1275,19 +1536,15 @@ impl LSMTree {
         column_family_id: u8,
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
-        mut terminal_mask: Option<&mut [u8]>,
+        terminal_mask: Option<&mut [u8]>,
         decode_mask: &mut [u8],
         out_values: &mut Vec<Value>,
     ) -> Result<bool> {
-        let num_columns = target_schema
-            .num_columns_in_family(column_family_id)
-            .unwrap_or(0);
         let target_schema_id = target_schema.version();
         let source_schema = schema_manager.schema(file.schema_id)?;
         let source_num_columns = source_schema
             .num_columns_in_family(column_family_id)
             .unwrap_or(0);
-        let mask_size = decode_mask.len();
         if let Some(bucket) = key_bucket(encoded_key)
             && !file.effective_bucket_range.contains(&bucket)
         {
@@ -1339,6 +1596,51 @@ impl LSMTree {
                 }
             }
         };
+        self.apply_value_from_file(
+            file,
+            target_schema,
+            schema_manager,
+            column_family_id,
+            source_num_columns,
+            selected_mask,
+            terminal_mask,
+            decode_mask,
+            out_values,
+            value_bytes_opt,
+        )
+    }
+
+    /// Applies one file lookup result to a logical point read.
+    ///
+    /// Both the single-key path and the batched SST file-read path call this
+    /// function so schema evolution, TTL, terminal values, and VLOG offsets
+    /// have identical behavior. `value_bytes_opt == None` means this file has
+    /// no value for the key and the caller should continue searching older
+    /// files. When a file uses an older schema, the value is decoded with its
+    /// source column-family width and evolved before it is added to the result.
+    ///
+    /// `terminal_mask` records columns already made terminal by newer files;
+    /// `decode_mask` avoids decoding those older columns; and `out_values`
+    /// accumulates values in newest-to-oldest file order for the final merge.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_value_from_file(
+        &self,
+        file: &DataFile,
+        target_schema: &Schema,
+        schema_manager: &SchemaManager,
+        column_family_id: u8,
+        source_num_columns: usize,
+        selected_mask: Option<&[u8]>,
+        mut terminal_mask: Option<&mut [u8]>,
+        decode_mask: &mut [u8],
+        out_values: &mut Vec<Value>,
+        value_bytes_opt: Option<Bytes>,
+    ) -> Result<bool> {
+        let num_columns = target_schema
+            .num_columns_in_family(column_family_id)
+            .unwrap_or(0);
+        let target_schema_id = target_schema.version();
+        let mask_size = decode_mask.len();
         if let Some(value_bytes) = value_bytes_opt {
             let value = if file.schema_id == target_schema_id {
                 let mut value_bytes = value_bytes;
@@ -1390,6 +1692,93 @@ impl LSMTree {
         }
         Ok(true)
     }
+}
+
+/// Routes active, sorted request indices to non-overlapping, start-key-sorted files.
+/// A request in a gap is intentionally not assigned to either adjacent file.
+fn route_non_tiered_requests(
+    files: &[Arc<DataFile>],
+    request_indices: &[usize],
+    requests: &[BatchGetRequest],
+) -> Vec<Vec<usize>> {
+    let mut by_file = vec![Vec::new(); files.len()];
+    let mut file_idx = 0;
+    for idx in request_indices {
+        let request = &requests[*idx];
+        while file_idx < files.len()
+            && files[file_idx].end_key.as_slice() < request.encoded_key.as_ref()
+        {
+            file_idx += 1;
+        }
+        if file_idx == files.len() {
+            break;
+        }
+        if request.encoded_key.as_ref() >= files[file_idx].start_key.as_slice() {
+            by_file[file_idx].push(*idx);
+        }
+    }
+    by_file
+}
+
+fn sort_request_indices(request_indices: &mut [usize], requests: &[BatchGetRequest]) {
+    request_indices.sort_unstable_by(|left, right| {
+        requests[*left]
+            .encoded_key
+            .cmp(&requests[*right].encoded_key)
+    });
+}
+
+fn retain_active_request_indices(request_indices: &mut Vec<usize>, requests: &[BatchGetRequest]) {
+    request_indices.retain(|idx| !requests[*idx].stopped);
+}
+
+fn should_use_binary_non_tiered_routing(request_count: usize, file_count: usize) -> bool {
+    if request_count <= SMALL_BATCH_POINT_ROUTING_REQUEST_LIMIT || file_count <= 1 {
+        return true;
+    }
+    let binary_steps = (usize::BITS - (file_count - 1).leading_zeros()) as usize;
+    let binary_cost = request_count.saturating_mul(binary_steps);
+    let merge_cost = request_count.saturating_add(file_count);
+    binary_cost <= merge_cost
+}
+
+fn route_non_tiered_requests_binary(
+    files: &[Arc<DataFile>],
+    request_indices: &[usize],
+    requests: &[BatchGetRequest],
+) -> BTreeMap<usize, Vec<usize>> {
+    let mut by_file = BTreeMap::new();
+    for idx in request_indices {
+        let request = &requests[*idx];
+        let file_idx =
+            files.partition_point(|file| file.end_key.as_slice() < request.encoded_key.as_ref());
+        if let Some(file) = files.get(file_idx)
+            && request.encoded_key.as_ref() >= file.start_key.as_slice()
+        {
+            by_file.entry(file_idx).or_insert_with(Vec::new).push(*idx);
+        }
+    }
+    by_file
+}
+
+fn group_request_indices_by_tree(
+    snapshot: &DbState,
+    requests: &[BatchGetRequest],
+    column_family_id: u8,
+) -> BTreeMap<usize, Vec<usize>> {
+    let mut groups = BTreeMap::new();
+    for (idx, request) in requests.iter().enumerate() {
+        if request.stopped {
+            continue;
+        }
+        if let Some(tree_idx) = snapshot
+            .multi_lsm_version
+            .tree_index_for_bucket_and_column_family(request.bucket, column_family_id)
+        {
+            groups.entry(tree_idx).or_insert_with(Vec::new).push(idx);
+        }
+    }
+    groups
 }
 
 #[cfg(test)]
@@ -1543,6 +1932,123 @@ mod tests {
     fn make_value_bytes(data: &[u8], num_columns: usize) -> Vec<u8> {
         let value = Value::new(vec![Some(Column::new(ValueType::Put, data.to_vec()))]);
         encode_value(&value, num_columns).to_vec()
+    }
+
+    fn batch_request_for_key(key: &[u8], stopped: bool) -> BatchGetRequest {
+        BatchGetRequest {
+            bucket: 0,
+            encoded_key: Bytes::copy_from_slice(key),
+            values: Vec::new(),
+            terminal_mask: None,
+            decode_mask: vec![0x01],
+            stopped,
+        }
+    }
+
+    #[test]
+    fn non_tiered_routing_skips_gaps_and_preserves_boundaries() {
+        let files = vec![create_data_file(b"a", b"b"), create_data_file(b"d", b"e")];
+        let mut requests = vec![
+            batch_request_for_key(b"0", false),
+            batch_request_for_key(b"a", false),
+            batch_request_for_key(b"b", false),
+            batch_request_for_key(b"c", false),
+            batch_request_for_key(b"d", false),
+            batch_request_for_key(b"e", false),
+            batch_request_for_key(b"z", false),
+        ];
+        let mut indices = (0..requests.len()).collect::<Vec<_>>();
+        assert_eq!(
+            route_non_tiered_requests(&files, &indices, &requests),
+            vec![vec![1, 2], vec![4, 5]]
+        );
+
+        requests[2].stopped = true;
+        retain_active_request_indices(&mut indices, &requests);
+        assert_eq!(
+            route_non_tiered_requests(&files, &indices, &requests),
+            vec![vec![1], vec![4, 5]]
+        );
+    }
+
+    #[test]
+    fn non_tiered_routing_selects_binary_for_small_or_sparse_batches() {
+        assert!(should_use_binary_non_tiered_routing(8, 1_000_000));
+        assert!(should_use_binary_non_tiered_routing(9, 1_000_000));
+        assert!(!should_use_binary_non_tiered_routing(9, 3));
+    }
+
+    #[test]
+    fn non_tiered_routing_rechecks_after_active_requests_shrink() {
+        let mut requests = (b'a'..=b'i')
+            .map(|key| batch_request_for_key(&[key], false))
+            .collect::<Vec<_>>();
+        let mut request_indices = (0..requests.len()).collect::<Vec<_>>();
+
+        assert!(
+            !should_use_binary_non_tiered_routing(request_indices.len(), 3),
+            "the initial nine-key batch should use merge routing"
+        );
+
+        for request in requests.iter_mut().take(8) {
+            request.stopped = true;
+        }
+        retain_active_request_indices(&mut request_indices, &requests);
+
+        assert_eq!(request_indices, vec![8]);
+        assert!(
+            should_use_binary_non_tiered_routing(request_indices.len(), 3),
+            "the next level must choose from its one active key"
+        );
+        let files = vec![
+            create_data_file(b"a", b"b"),
+            create_data_file(b"d", b"e"),
+            create_data_file(b"h", b"i"),
+        ];
+        assert_eq!(
+            route_non_tiered_requests_binary(&files, &request_indices, &requests),
+            BTreeMap::from([(2, vec![8])])
+        );
+    }
+
+    #[test]
+    fn multi_get_groups_shared_versions_by_tree_index() {
+        let shared = Arc::new(LSMTreeVersion { levels: Vec::new() });
+        let scopes = vec![
+            LSMTreeScope::new(0u16..=0u16, DEFAULT_COLUMN_FAMILY_ID),
+            LSMTreeScope::new(1u16..=1u16, DEFAULT_COLUMN_FAMILY_ID),
+        ];
+        let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
+            2,
+            &scopes,
+            vec![Arc::clone(&shared), Arc::clone(&shared)],
+        )
+        .unwrap();
+        let snapshot = DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version,
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
+            suggested_base_snapshot_id: None,
+        };
+        let requests = vec![
+            BatchGetRequest {
+                bucket: 0,
+                ..batch_request_for_key(b"a", false)
+            },
+            BatchGetRequest {
+                bucket: 1,
+                ..batch_request_for_key(b"b", false)
+            },
+        ];
+
+        assert_eq!(
+            group_request_indices_by_tree(&snapshot, &requests, DEFAULT_COLUMN_FAMILY_ID),
+            BTreeMap::from([(0, vec![0]), (1, vec![1])])
+        );
     }
 
     fn empty_lsm_versions(len: usize) -> Vec<Arc<LSMTreeVersion>> {
@@ -2688,6 +3194,213 @@ mod tests {
         assert_eq!(
             value[1].columns()[0].as_ref().unwrap().data().as_ref(),
             b"old"
+        );
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_lsm_many_tiered_skips_older_file_after_terminal_per_key() {
+        let root = "/tmp/lsm_many_tiered_terminal";
+        cleanup_test_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(format!("file://{root}")).unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-many-tiered"));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let num_columns = 1;
+        let older = create_test_sst(
+            &file_manager,
+            1,
+            vec![
+                (b"k", &make_value_bytes(b"old-k", num_columns)),
+                (b"m", &make_value_bytes(b"old-m", num_columns)),
+            ],
+        )
+        .unwrap();
+        let newer = create_test_sst(
+            &file_manager,
+            2,
+            vec![
+                (b"k", &make_value_bytes(b"new-k", num_columns)),
+                (b"z", &make_value_bytes(b"new-z", num_columns)),
+            ],
+        )
+        .unwrap();
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion {
+                levels: vec![Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: vec![older, newer],
+                }],
+            }),
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
+            suggested_base_snapshot_id: None,
+        });
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+        let schema_manager = SchemaManager::new(num_columns);
+        let schema = schema_manager.latest_schema();
+        let mut requests = vec![
+            BatchGetRequest {
+                bucket: 0,
+                encoded_key: encode_key(&Key::new(0, b"m".to_vec())),
+                values: Vec::new(),
+                terminal_mask: None,
+                decode_mask: vec![0x01],
+                stopped: false,
+            },
+            BatchGetRequest {
+                bucket: 0,
+                encoded_key: encode_key(&Key::new(0, b"k".to_vec())),
+                values: Vec::new(),
+                terminal_mask: None,
+                decode_mask: vec![0x01],
+                stopped: false,
+            },
+        ];
+
+        lsm_tree
+            .get_many_with_snapshot(
+                &file_manager,
+                db_state.load(),
+                &mut requests,
+                schema.as_ref(),
+                &schema_manager,
+                None,
+                None,
+                DEFAULT_COLUMN_FAMILY_ID,
+            )
+            .unwrap();
+
+        assert_eq!(requests[0].values.len(), 1);
+        assert_eq!(
+            requests[0].values[0].columns()[0]
+                .as_ref()
+                .unwrap()
+                .data()
+                .as_ref(),
+            b"old-m"
+        );
+        assert_eq!(requests[1].values.len(), 1, "terminal key skips older file");
+        assert_eq!(
+            requests[1].values[0].columns()[0]
+                .as_ref()
+                .unwrap()
+                .data()
+                .as_ref(),
+            b"new-k"
+        );
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_lsm_many_non_tiered_routes_unsorted_small_batch_across_gaps() {
+        let root = "/tmp/lsm_many_non_tiered_routing";
+        cleanup_test_root(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(format!("file://{root}")).unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("lsm-many-non-tiered"));
+        let file_manager =
+            Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics_manager)).unwrap());
+        let num_columns = 1;
+        let left = create_test_sst(
+            &file_manager,
+            1,
+            vec![
+                (b"a", &make_value_bytes(b"left-a", num_columns)),
+                (b"b", &make_value_bytes(b"left-b", num_columns)),
+            ],
+        )
+        .unwrap();
+        let right = create_test_sst(
+            &file_manager,
+            2,
+            vec![
+                (b"d", &make_value_bytes(b"right-d", num_columns)),
+                (b"e", &make_value_bytes(b"right-e", num_columns)),
+            ],
+        )
+        .unwrap();
+        let db_state = Arc::new(DbStateHandle::new());
+        db_state.store(DbState {
+            seq_id: 0,
+            bucket_ranges: Vec::new(),
+            multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion {
+                levels: vec![Level {
+                    ordinal: 1,
+                    tiered: false,
+                    files: vec![left, right],
+                }],
+            }),
+            vlog_version: VlogVersion::new(),
+            active: None,
+            immutables: VecDeque::new(),
+            truncation_cursors: crate::db_state::new_truncation_cursors(),
+            suggested_base_snapshot_id: None,
+        });
+        let lsm_tree = LSMTree::with_state(Arc::clone(&db_state), metrics_manager);
+        let schema_manager = SchemaManager::new(num_columns);
+        let schema = schema_manager.latest_schema();
+        let mut requests = [b"e", b"c", b"a", b"b"]
+            .into_iter()
+            .map(|key| BatchGetRequest {
+                bucket: 0,
+                encoded_key: encode_key(&Key::new(0, key.to_vec())),
+                values: Vec::new(),
+                terminal_mask: None,
+                decode_mask: vec![0x01],
+                stopped: false,
+            })
+            .collect::<Vec<_>>();
+
+        lsm_tree
+            .get_many_with_snapshot(
+                &file_manager,
+                db_state.load(),
+                &mut requests,
+                schema.as_ref(),
+                &schema_manager,
+                None,
+                None,
+                DEFAULT_COLUMN_FAMILY_ID,
+            )
+            .unwrap();
+
+        assert_eq!(
+            requests[0].values[0].columns()[0]
+                .as_ref()
+                .unwrap()
+                .data()
+                .as_ref(),
+            b"right-e"
+        );
+        assert!(
+            requests[1].values.is_empty(),
+            "key in the file gap is absent"
+        );
+        assert_eq!(
+            requests[2].values[0].columns()[0]
+                .as_ref()
+                .unwrap()
+                .data()
+                .as_ref(),
+            b"left-a"
+        );
+        assert_eq!(
+            requests[3].values[0].columns()[0]
+                .as_ref()
+                .unwrap()
+                .data()
+                .as_ref(),
+            b"left-b"
         );
         cleanup_test_root(root);
     }

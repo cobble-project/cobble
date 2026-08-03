@@ -23,6 +23,7 @@ use bytes::Bytes;
 use log::info;
 use serde_json::Error as SerdeError;
 use size::Size;
+use std::collections::HashMap;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -252,6 +253,44 @@ impl Reader {
 
     pub fn get(&mut self, bucket_id: u16, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
         self.get_with_options(bucket_id, key, &ReadOptions::default())
+    }
+
+    pub fn multi_get<K: AsRef<[u8]>>(
+        &mut self,
+        keys: &[(u16, K)],
+    ) -> Result<Vec<Option<Vec<Option<Bytes>>>>> {
+        self.multi_get_with_options(keys, &ReadOptions::default())
+    }
+
+    pub fn multi_get_with_options<K: AsRef<[u8]>>(
+        &mut self,
+        keys: &[(u16, K)],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Vec<Option<Bytes>>>>> {
+        if self.auto_refresh {
+            self.refresh_if_changed(false)?;
+        }
+        let mut by_snapshot = HashMap::<Arc<BucketSnapshotKey>, Vec<(usize, u16, &[u8])>>::new();
+        for (index, (bucket, key)) in keys.iter().enumerate() {
+            let snapshot_key = self.snapshot_key_for_bucket(*bucket)?;
+            by_snapshot
+                .entry(snapshot_key)
+                .or_default()
+                .push((index, *bucket, key.as_ref()));
+        }
+        let mut results = vec![None; keys.len()];
+        for (snapshot_key, requests) in by_snapshot {
+            let db = self.load_snapshot(&snapshot_key)?;
+            let batch_keys = requests
+                .iter()
+                .map(|(_, bucket, key)| (*bucket, *key))
+                .collect::<Vec<_>>();
+            let batch_results = db.multi_get_with_options(&batch_keys, options)?;
+            for ((index, _, _), result) in requests.into_iter().zip(batch_results) {
+                results[index] = result;
+            }
+        }
+        Ok(results)
     }
 
     pub fn get_with_options(
@@ -695,6 +734,15 @@ mod tests {
             db_id: db_b,
             snapshot_id: snap_b,
         })));
+
+        let values = proxy
+            .multi_get(&[
+                (0, b"key-a".as_slice()),
+                (3, b"key-b".as_slice()),
+                (0, b"key-a".as_slice()),
+            ])
+            .unwrap();
+        assert_eq!(values, vec![None, None, None]);
 
         cleanup_root(root);
     }

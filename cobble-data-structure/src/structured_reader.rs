@@ -58,6 +58,34 @@ impl StructuredReader {
         self.get_with_options(bucket_id, key, &default_options)
     }
 
+    pub fn multi_get<K: AsRef<[u8]>>(
+        &mut self,
+        keys: &[(u16, K)],
+    ) -> Result<Vec<Option<Vec<Option<StructuredColumnValue>>>>> {
+        let default_options = self.default_read_options.clone();
+        self.multi_get_with_options(keys, &default_options)
+    }
+
+    pub fn multi_get_with_options<K: AsRef<[u8]>>(
+        &mut self,
+        keys: &[(u16, K)],
+        options: &StructuredReadOptions,
+    ) -> Result<Vec<Option<Vec<Option<StructuredColumnValue>>>>> {
+        let raw_keys = keys
+            .iter()
+            .map(|(bucket, key)| (*bucket, key.as_ref()))
+            .collect::<Vec<_>>();
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
+        self.reader
+            .multi_get_with_options(&raw_keys, options.as_cobble())?
+            .into_iter()
+            .map(|raw| {
+                raw.map(|columns| decode_row(&projected_schema, 0, columns))
+                    .transpose()
+            })
+            .collect()
+    }
+
     pub fn get_with_options(
         &mut self,
         bucket_id: u16,

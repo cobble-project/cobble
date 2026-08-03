@@ -3,6 +3,7 @@ use crate::data_file::DataFile;
 use crate::error::{Error, Result};
 use crate::file::RandomAccessFile;
 use crate::sst::bloom::BloomFilter;
+use crate::sst::compression::{decode_block_bytes, verify_block_checksum};
 use crate::sst::format::{Block, Footer, SstReadMetadata};
 use crate::sst::iterator::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 use crate::sst::read::{
@@ -10,7 +11,21 @@ use crate::sst::read::{
 };
 use crate::util::unsafe_bytes;
 use bytes::{BufMut, Bytes, BytesMut};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+/// Keep one batch read bounded even when an SST contains a very large run of
+/// physically adjacent data blocks. This bound applies to one FileManager
+/// `read_at` call; it does not change the logical block-cache granularity.
+const MAX_BATCH_DATA_READ_BYTES: usize = 8 * 1024 * 1024;
+
+struct BatchDataBlock {
+    offset: u64,
+    size: usize,
+    block_id: u32,
+    key_slots: Vec<usize>,
+    data_cache_namespaces: Vec<u64>,
+}
 
 /// Immutable SST read metadata held by a `DataFile`, outside the block-cache budget.
 #[derive(Debug)]
@@ -227,6 +242,417 @@ impl SSTPointReader {
             index_top,
             key,
         )
+    }
+
+    /// Looks up multiple keys in one immutable SST using per-key data-cache
+    /// namespaces.
+    ///
+    /// Unlike repeatedly calling [`Self::get_exact`], this prepares the footer
+    /// and top-level metadata once, shares filter/index partitions between
+    /// keys, and reads each required data block at most once. Results retain
+    /// the input order (including duplicate keys).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn get_exact_many(
+        file: Box<dyn RandomAccessFile>,
+        data_file: &DataFile,
+        options: SSTIteratorOptions,
+        block_cache: Option<BlockCache>,
+        keys: &[&[u8]],
+        data_cache_namespaces: &[u64],
+    ) -> Result<Vec<Option<Bytes>>> {
+        if keys.len() != data_cache_namespaces.len() {
+            return Err(Error::InvalidState(format!(
+                "SST batch key/cache namespace length mismatch: {} keys, {} namespaces",
+                keys.len(),
+                data_cache_namespaces.len()
+            )));
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let metrics = SSTIterator::metrics_for(&options);
+        if let Some(pinned) = PinnedSstReadMetadata::get_or_load(
+            file.as_ref(),
+            data_file,
+            options.pin_metadata,
+            options.pin_metadata_partitions,
+        )? {
+            return Self::get_exact_many_with_metadata(
+                file.as_ref(),
+                data_file.file_id,
+                &options,
+                &block_cache,
+                &metrics,
+                pinned.read_metadata(),
+                pinned.index_top(),
+                Some(pinned.as_ref()),
+                keys,
+                data_cache_namespaces,
+            );
+        }
+
+        let cached_metadata = options
+            .read_metadata_cache_mode
+            .caches_reads()
+            .then(|| data_file.sst_read_metadata())
+            .flatten();
+        let (footer, cached_footer) = if let Some(metadata) = &cached_metadata {
+            (metadata.footer().clone(), None)
+        } else {
+            SSTIterator::decode_footer(data_file.meta_bytes(), file.as_ref())?
+        };
+        let index_top = SSTIterator::load_index_block(
+            file.as_ref(),
+            data_file.file_id,
+            &options,
+            &block_cache,
+            &metrics,
+            &footer,
+        )?;
+        let metadata = match cached_metadata {
+            Some(metadata) => metadata,
+            None => {
+                let metadata = Arc::new(SstReadMetadata::from_index_block(footer, &index_top)?);
+                if options.read_metadata_cache_mode.caches_reads() {
+                    data_file.set_sst_read_metadata(Arc::clone(&metadata));
+                }
+                if let Some(bytes) = cached_footer {
+                    data_file.set_meta_bytes(bytes);
+                }
+                metadata
+            }
+        };
+        Self::get_exact_many_with_metadata(
+            file.as_ref(),
+            data_file.file_id,
+            &options,
+            &block_cache,
+            &metrics,
+            metadata.as_ref(),
+            index_top,
+            None,
+            keys,
+            data_cache_namespaces,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn get_exact_many_with_metadata(
+        file: &dyn RandomAccessFile,
+        file_id: u64,
+        options: &SSTIteratorOptions,
+        block_cache: &Option<BlockCache>,
+        metrics: &SSTIteratorMetrics,
+        metadata: &SstReadMetadata,
+        index_top: Arc<Block>,
+        pinned: Option<&PinnedSstReadMetadata>,
+        keys: &[&[u8]],
+        data_cache_namespaces: &[u64],
+    ) -> Result<Vec<Option<Bytes>>> {
+        let footer = metadata.footer();
+        if index_top.is_empty() {
+            return Ok(vec![None; keys.len()]);
+        }
+
+        let mut by_partition: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (slot, key) in keys.iter().enumerate() {
+            by_partition
+                .entry(find_partition(footer, &index_top, key)?)
+                .or_default()
+                .push(slot);
+        }
+
+        let mut requests = Vec::<BatchDataBlock>::new();
+        let mut request_by_location = HashMap::<(u64, usize), usize>::new();
+        for (partition_idx, slots) in by_partition {
+            let slots = if should_check_bloom(options, footer) {
+                let filter = if let Some(metadata) = pinned {
+                    match metadata.filter_partition(partition_idx)? {
+                        Some(filter) => filter,
+                        None => {
+                            let filter_index = metadata.filter_index();
+                            load_cached_filter(
+                                file,
+                                file_id,
+                                options,
+                                block_cache,
+                                metrics,
+                                footer,
+                                partition_idx,
+                                filter_index.as_deref(),
+                            )?
+                        }
+                    }
+                } else {
+                    load_cached_filter(
+                        file,
+                        file_id,
+                        options,
+                        block_cache,
+                        metrics,
+                        footer,
+                        partition_idx,
+                        None,
+                    )?
+                };
+                slots
+                    .into_iter()
+                    .filter(|slot| filter.may_contain(keys[*slot]))
+                    .collect::<Vec<_>>()
+            } else {
+                slots
+            };
+            if slots.is_empty() {
+                continue;
+            }
+            Self::add_partition_requests(
+                file,
+                file_id,
+                options,
+                block_cache,
+                metrics,
+                metadata,
+                &index_top,
+                pinned,
+                partition_idx,
+                slots,
+                keys,
+                data_cache_namespaces,
+                &mut requests,
+                &mut request_by_location,
+            )?;
+        }
+
+        for request in &mut requests {
+            request.data_cache_namespaces.sort_unstable();
+            request.data_cache_namespaces.dedup();
+        }
+
+        let blocks =
+            Self::load_many_data_blocks(file, file_id, block_cache, metrics, footer, &requests)?;
+        let mut out = vec![None; keys.len()];
+        for (request, block) in requests.iter().zip(blocks) {
+            for slot in &request.key_slots {
+                out[*slot] = block
+                    .get_exact(keys[*slot])?
+                    .map(|value| normalize_encoded_value(footer, value));
+            }
+        }
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_partition_requests(
+        file: &dyn RandomAccessFile,
+        file_id: u64,
+        options: &SSTIteratorOptions,
+        block_cache: &Option<BlockCache>,
+        metrics: &SSTIteratorMetrics,
+        metadata: &SstReadMetadata,
+        index_top: &Arc<Block>,
+        pinned: Option<&PinnedSstReadMetadata>,
+        partition_idx: usize,
+        slots: Vec<usize>,
+        keys: &[&[u8]],
+        data_cache_namespaces: &[u64],
+        requests: &mut Vec<BatchDataBlock>,
+        request_by_location: &mut HashMap<(u64, usize), usize>,
+    ) -> Result<()> {
+        let footer = metadata.footer();
+        let partition = if footer.partitioned_index {
+            match pinned
+                .map(|metadata| metadata.index_partition(partition_idx))
+                .transpose()?
+                .flatten()
+            {
+                Some(partition) => partition,
+                None => {
+                    let (offset, size) = metadata.index_partitions()[partition_idx];
+                    load_cached_block(
+                        file,
+                        file_id,
+                        options,
+                        block_cache,
+                        metrics,
+                        offset,
+                        size,
+                        partition_idx as u32,
+                        BlockCacheKind::IndexPartition,
+                    )?
+                }
+            }
+        } else {
+            // The top-level index is the only index partition here and was
+            // already loaded while preparing the shared metadata.
+            Arc::clone(index_top)
+        };
+        for slot in slots {
+            let block_idx = partition.find_lower_or_equal_idx(&unsafe_bytes(keys[slot]))?;
+            let (offset, size) = indexed_block_location(&partition, block_idx, "data")?;
+            let request_slot = match request_by_location.entry((offset, size)) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let request_slot = requests.len();
+                    requests.push(BatchDataBlock {
+                        offset,
+                        size,
+                        block_id: block_idx as u32,
+                        key_slots: Vec::new(),
+                        data_cache_namespaces: Vec::new(),
+                    });
+                    entry.insert(request_slot);
+                    request_slot
+                }
+            };
+            requests[request_slot].key_slots.push(slot);
+            requests[request_slot]
+                .data_cache_namespaces
+                .push(data_cache_namespaces[slot]);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_many_data_blocks(
+        file: &dyn RandomAccessFile,
+        file_id: u64,
+        block_cache: &Option<BlockCache>,
+        metrics: &SSTIteratorMetrics,
+        footer: &Footer,
+        requests: &[BatchDataBlock],
+    ) -> Result<Vec<Arc<Block>>> {
+        let mut blocks = vec![None; requests.len()];
+        let mut misses = Vec::new();
+        for (idx, request) in requests.iter().enumerate() {
+            if let Some(cache) = block_cache {
+                let mut cached_block = None;
+                for namespace in &request.data_cache_namespaces {
+                    let cache_key = BlockCacheKey {
+                        namespace: *namespace,
+                        file_id,
+                        block_id: request.offset,
+                        kind: BlockCacheKind::Data,
+                    };
+                    if let Some(cached) = cache.get(&cache_key) {
+                        let block = match cached {
+                            CachedBlock::Block(block) => block,
+                            _ => {
+                                return Err(Error::IoError(
+                                    "Data block cache entry invalid".to_string(),
+                                ));
+                            }
+                        };
+                        cached_block = Some(block);
+                        break;
+                    }
+                }
+                if let Some(block) = cached_block {
+                    metrics.record_data_hit();
+                    for namespace in &request.data_cache_namespaces {
+                        cache.insert(
+                            BlockCacheKey {
+                                namespace: *namespace,
+                                file_id,
+                                block_id: request.offset,
+                                kind: BlockCacheKind::Data,
+                            },
+                            CachedBlock::Block(Arc::clone(&block)),
+                        );
+                    }
+                    blocks[idx] = Some(block);
+                    continue;
+                }
+                metrics.record_data_miss();
+            }
+            misses.push(idx);
+        }
+        misses.sort_by_key(|idx| requests[*idx].offset);
+        let mut start = 0;
+        while start < misses.len() {
+            let first = misses[start];
+            let range_start = requests[first].offset;
+            let first_size = u64::try_from(requests[first].size).map_err(|_| {
+                Error::IoError("SST batch data block size does not fit u64".to_string())
+            })?;
+            let mut range_end = range_start.checked_add(first_size).ok_or_else(|| {
+                Error::IoError("SST batch data block range overflows u64".to_string())
+            })?;
+            let mut end = start + 1;
+            while end < misses.len() {
+                let next = &requests[misses[end]];
+                let next_size = u64::try_from(next.size).map_err(|_| {
+                    Error::IoError("SST batch data block size does not fit u64".to_string())
+                })?;
+                let next_end = next.offset.checked_add(next_size).ok_or_else(|| {
+                    Error::IoError("SST batch data block range overflows u64".to_string())
+                })?;
+                if next.offset != range_end
+                    || next_end.saturating_sub(range_start) > MAX_BATCH_DATA_READ_BYTES as u64
+                {
+                    break;
+                }
+                range_end = next_end;
+                end += 1;
+            }
+            let range_len = usize::try_from(range_end - range_start).map_err(|_| {
+                Error::IoError("SST batch data range does not fit usize".to_string())
+            })?;
+            let range_offset = usize::try_from(range_start).map_err(|_| {
+                Error::IoError("SST batch data offset does not fit usize".to_string())
+            })?;
+            let bytes = file.read_at(range_offset, range_len)?;
+            if bytes.len() != range_len {
+                return Err(Error::IoError(format!(
+                    "Short SST batch data read at offset {range_start}: expected {range_len} bytes, got {}",
+                    bytes.len()
+                )));
+            }
+            for request_idx in &misses[start..end] {
+                let request = &requests[*request_idx];
+                let begin =
+                    usize::try_from(request.offset.checked_sub(range_start).ok_or_else(|| {
+                        Error::IoError("SST batch data block precedes merged read".to_string())
+                    })?)
+                    .map_err(|_| {
+                        Error::IoError("SST batch data block offset does not fit usize".to_string())
+                    })?;
+                let end = begin.checked_add(request.size).ok_or_else(|| {
+                    Error::IoError("SST batch data block range overflow".to_string())
+                })?;
+                if end > bytes.len() {
+                    return Err(Error::IoError(format!(
+                        "SST batch data block exceeds merged read at offset {}",
+                        request.offset
+                    )));
+                }
+                let encoded = bytes.slice(begin..end);
+                let verified =
+                    verify_block_checksum(encoded, footer.block_checksums, "SST data block")?;
+                let decoded = decode_block_bytes(verified)?;
+                let mut block = Block::decode(decoded)?;
+                block.set_block_id(request.block_id);
+                let block = Arc::new(block);
+                if let Some(cache) = block_cache {
+                    for namespace in &request.data_cache_namespaces {
+                        cache.insert(
+                            BlockCacheKey {
+                                namespace: *namespace,
+                                file_id,
+                                block_id: request.offset,
+                                kind: BlockCacheKind::Data,
+                            },
+                            CachedBlock::Block(Arc::clone(&block)),
+                        );
+                    }
+                }
+                blocks[*request_idx] = Some(block);
+            }
+            start = end;
+        }
+        blocks
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| Error::IoError("Missing batch data block".to_string()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -601,8 +1027,46 @@ mod tests {
         }
     }
 
+    struct RecordingRandomAccessFile {
+        inner: Box<dyn RandomAccessFile>,
+        reads: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+
+    impl File for RecordingRandomAccessFile {
+        fn close(&mut self) -> Result<()> {
+            self.inner.close()
+        }
+
+        fn size(&self) -> usize {
+            self.inner.size()
+        }
+    }
+
+    impl RandomAccessFile for RecordingRandomAccessFile {
+        fn read_at(&self, offset: usize, size: usize) -> Result<Bytes> {
+            self.reads.lock().unwrap().push((offset, size));
+            self.inner.read_at(offset, size)
+        }
+    }
+
     fn write_sst(
         partitioned_index: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<dyn crate::file::FileSystem>,
+        DataFile,
+    ) {
+        write_sst_with_options(
+            partitioned_index,
+            crate::SstCompressionAlgorithm::None,
+            false,
+        )
+    }
+
+    fn write_sst_with_options(
+        partitioned_index: bool,
+        compression: crate::SstCompressionAlgorithm,
+        block_checksum_enabled: bool,
     ) -> (
         tempfile::TempDir,
         Arc<dyn crate::file::FileSystem>,
@@ -620,7 +1084,8 @@ mod tests {
                 bloom_filter_enabled: true,
                 bloom_bits_per_key: 100,
                 partitioned_index,
-                block_checksum_enabled: false,
+                compression,
+                block_checksum_enabled,
                 ..SSTWriterOptions::default()
             },
         );
@@ -659,10 +1124,238 @@ mod tests {
         }
     }
 
+    fn get_exact_many_with_default_namespace(
+        file: Box<dyn RandomAccessFile>,
+        data_file: &DataFile,
+        options: SSTIteratorOptions,
+        block_cache: Option<BlockCache>,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Bytes>>> {
+        let data_cache_namespaces = vec![options.cache_namespace; keys.len()];
+        SSTPointReader::get_exact_many(
+            file,
+            data_file,
+            options,
+            block_cache,
+            keys,
+            &data_cache_namespaces,
+        )
+    }
+
     fn assert_only_data_block_cache_accesses(cache: &RecordingCache) {
         let kinds = cache.requested_kinds();
         assert!(!kinds.is_empty());
         assert!(kinds.iter().all(|kind| *kind == BlockCacheKind::Data));
+    }
+
+    #[test]
+    fn point_reader_many_deduplicates_data_blocks_and_coalesces_adjacent_reads() {
+        let (_directory, fs, data_file) = write_sst(false);
+        let reader = fs.open_read("point-read.sst").unwrap();
+        let pinned = PinnedSstReadMetadata::get_or_load(reader.as_ref(), &data_file, true, true)
+            .unwrap()
+            .unwrap();
+        assert!(
+            pinned.index_top().get(1).is_ok(),
+            "test SST needs multiple data blocks"
+        );
+
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let keys = [
+            b"key000".as_slice(),
+            b"key001".as_slice(),
+            b"key001".as_slice(),
+            b"key002".as_slice(),
+            b"key003".as_slice(),
+        ];
+        let values = get_exact_many_with_default_namespace(
+            Box::new(RecordingRandomAccessFile {
+                inner: fs.open_read("point-read.sst").unwrap(),
+                reads: Arc::clone(&reads),
+            }),
+            &data_file,
+            options(true, true),
+            None,
+            &keys,
+        )
+        .unwrap();
+
+        assert_eq!(
+            values,
+            vec![
+                Some(Bytes::from_static(b"value")),
+                Some(Bytes::from_static(b"value")),
+                Some(Bytes::from_static(b"value")),
+                Some(Bytes::from_static(b"value")),
+                Some(Bytes::from_static(b"value")),
+            ]
+        );
+        let reads = reads.lock().unwrap();
+        assert_eq!(reads.len(), 1, "all uncached adjacent data blocks coalesce");
+        assert_eq!(
+            reads[0].0, 0,
+            "the first requested data block starts the range"
+        );
+        assert!(reads[0].1 > 0);
+    }
+
+    #[test]
+    fn point_reader_many_reuses_cached_data_blocks() {
+        let (_directory, fs, data_file) = write_sst(false);
+        let reader = fs.open_read("point-read.sst").unwrap();
+        PinnedSstReadMetadata::get_or_load(reader.as_ref(), &data_file, true, true)
+            .unwrap()
+            .unwrap();
+        let recording_cache = Arc::new(RecordingCache::default());
+        let block_cache: BlockCache = recording_cache.clone();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let keys = [
+            b"key000".as_slice(),
+            b"key001".as_slice(),
+            b"key001".as_slice(),
+        ];
+
+        get_exact_many_with_default_namespace(
+            Box::new(RecordingRandomAccessFile {
+                inner: fs.open_read("point-read.sst").unwrap(),
+                reads: Arc::clone(&reads),
+            }),
+            &data_file,
+            options(true, true),
+            Some(block_cache.clone()),
+            &keys,
+        )
+        .unwrap();
+        assert_eq!(reads.lock().unwrap().len(), 1);
+        assert_only_data_block_cache_accesses(&recording_cache);
+
+        reads.lock().unwrap().clear();
+        recording_cache.clear_history();
+        get_exact_many_with_default_namespace(
+            Box::new(RecordingRandomAccessFile {
+                inner: fs.open_read("point-read.sst").unwrap(),
+                reads: Arc::clone(&reads),
+            }),
+            &data_file,
+            options(true, true),
+            Some(block_cache),
+            &keys,
+        )
+        .unwrap();
+        assert!(
+            reads.lock().unwrap().is_empty(),
+            "cached data needs no file I/O"
+        );
+        assert_only_data_block_cache_accesses(&recording_cache);
+    }
+
+    #[test]
+    fn point_reader_many_aliases_one_data_block_into_each_cache_namespace() {
+        let (_directory, fs, data_file) = write_sst(false);
+        let reader = fs.open_read("point-read.sst").unwrap();
+        PinnedSstReadMetadata::get_or_load(reader.as_ref(), &data_file, true, true)
+            .unwrap()
+            .unwrap();
+        let recording_cache = Arc::new(RecordingCache::default());
+        let block_cache: BlockCache = recording_cache.clone();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let namespace_a = 101;
+        let namespace_b = 202;
+        let batch_options = SSTIteratorOptions {
+            cache_namespace: 999,
+            ..options(true, true)
+        };
+
+        SSTPointReader::get_exact_many(
+            Box::new(RecordingRandomAccessFile {
+                inner: fs.open_read("point-read.sst").unwrap(),
+                reads: Arc::clone(&reads),
+            }),
+            &data_file,
+            batch_options,
+            Some(block_cache.clone()),
+            &[b"key000".as_slice(), b"key000".as_slice()],
+            &[namespace_a, namespace_b],
+        )
+        .unwrap();
+        assert_eq!(reads.lock().unwrap().len(), 1);
+
+        for namespace in [namespace_a, namespace_b] {
+            reads.lock().unwrap().clear();
+            get_exact_many_with_default_namespace(
+                Box::new(RecordingRandomAccessFile {
+                    inner: fs.open_read("point-read.sst").unwrap(),
+                    reads: Arc::clone(&reads),
+                }),
+                &data_file,
+                SSTIteratorOptions {
+                    cache_namespace: namespace,
+                    ..options(true, true)
+                },
+                Some(block_cache.clone()),
+                &[b"key000".as_slice()],
+            )
+            .unwrap();
+            assert!(
+                reads.lock().unwrap().is_empty(),
+                "namespace {namespace} should reuse the aliased data block"
+            );
+        }
+    }
+
+    #[test]
+    fn point_reader_many_supports_partitioned_index_and_filter() {
+        let (_directory, fs, data_file) = write_partitioned_sst();
+        let keys = [
+            b"key000".as_slice(),
+            b"missing".as_slice(),
+            b"key003".as_slice(),
+            b"key000".as_slice(),
+        ];
+
+        assert_eq!(
+            get_exact_many_with_default_namespace(
+                fs.open_read("point-read.sst").unwrap(),
+                &data_file,
+                options(false, false),
+                None,
+                &keys,
+            )
+            .unwrap(),
+            vec![
+                Some(Bytes::from_static(b"value")),
+                None,
+                Some(Bytes::from_static(b"value")),
+                Some(Bytes::from_static(b"value")),
+            ]
+        );
+    }
+
+    #[test]
+    fn point_reader_many_decodes_lz4_blocks_with_checksums() {
+        let (_directory, fs, data_file) =
+            write_sst_with_options(true, crate::SstCompressionAlgorithm::Lz4, true);
+        let keys = [
+            b"key000".as_slice(),
+            b"key003".as_slice(),
+            b"key001".as_slice(),
+        ];
+
+        assert_eq!(
+            get_exact_many_with_default_namespace(
+                fs.open_read("point-read.sst").unwrap(),
+                &data_file,
+                options(false, false),
+                None,
+                &keys,
+            )
+            .unwrap(),
+            vec![
+                Some(Bytes::from_static(b"value")),
+                Some(Bytes::from_static(b"value")),
+                Some(Bytes::from_static(b"value")),
+            ]
+        );
     }
 
     #[test]

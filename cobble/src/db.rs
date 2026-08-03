@@ -8,7 +8,7 @@ use crate::file::FileManager;
 use crate::key_codec::{
     encode_key, encode_next_column_family_scan_key, encode_scan_key, encode_scan_key_after,
 };
-use crate::lsm::{LSMTree, LSMTreeVersion};
+use crate::lsm::{BatchGetRequest, LSMTree, LSMTreeVersion};
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
 use crate::merge_operator::MergeOperator;
 use crate::metrics_manager::MetricsManager;
@@ -27,6 +27,7 @@ use crate::writer_options::WriterOptions;
 use crate::{Config, ReadOptions, ScanOptions, TimeProvider, WriteOptions};
 use bytes::Bytes;
 use log::{error, info, warn};
+use std::collections::HashMap;
 use std::ops::{ControlFlow, Range, RangeInclusive};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1277,6 +1278,193 @@ impl Db {
     /// and schema evolution when SST schema differs from current.
     pub fn get(&self, bucket: u16, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
         self.get_with_options(bucket, key, &self.default_read_options)
+    }
+
+    /// Read several keys from one consistent database-state snapshot.
+    pub fn multi_get<K: AsRef<[u8]>>(
+        &self,
+        keys: &[(u16, K)],
+    ) -> Result<Vec<Option<Vec<Option<Bytes>>>>> {
+        self.multi_get_with_options(keys, &self.default_read_options)
+    }
+
+    pub fn multi_get_with_options<K: AsRef<[u8]>>(
+        &self,
+        keys: &[(u16, K)],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Vec<Option<Bytes>>>>> {
+        let _access = self.begin_access()?;
+        let schema = self.schema_manager.latest_schema();
+        let column_family_id = options.resolve_column_family_id_cached(schema.as_ref())?;
+        let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
+        if let Some(max_index) = options.max_index()
+            && max_index >= num_columns
+        {
+            return Err(Error::IoError(format!(
+                "max_index {} in ReadOptions exceeds num_columns {}",
+                max_index, num_columns
+            )));
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique = Vec::<(u16, Vec<u8>)>::new();
+        let mut positions = Vec::with_capacity(keys.len());
+        let mut seen = HashMap::<(u16, Vec<u8>), usize>::new();
+        for (bucket, key) in keys {
+            let entry = (*bucket, key.as_ref().to_vec());
+            let next = unique.len();
+            let index = *seen.entry(entry.clone()).or_insert_with(|| {
+                unique.push(entry);
+                next
+            });
+            positions.push(index);
+        }
+
+        let snapshot = self.db_state.load();
+        let selected_columns = options.columns();
+        let masks = options.masks(num_columns);
+        let selected_mask = masks.selected_mask.as_deref();
+        let base_decode_mask = masks.base_mask.as_ref();
+        let mask_size = base_decode_mask.len();
+        let mut requests = Vec::with_capacity(unique.len());
+        for (bucket, key) in unique {
+            let encoded_key = encode_key(bucket, column_family_id, key.as_slice());
+            let mut terminal_mask = (num_columns > 1).then(|| vec![0u8; mask_size]);
+            let mut values = Vec::new();
+            let mut stopped = snapshot.key_is_truncated(bucket, column_family_id, key.as_slice());
+            if !stopped {
+                self.memtable_manager.get_all_with_snapshot_until(
+                    Arc::clone(&snapshot),
+                    encoded_key.as_ref(),
+                    |raw, source_schema| {
+                        let mut raw_value = Bytes::copy_from_slice(raw);
+                        let value = if source_schema.version() == schema.version() {
+                            decode_value_masked(
+                                &mut raw_value,
+                                source_schema
+                                    .num_columns_in_family(column_family_id)
+                                    .unwrap_or(0),
+                                base_decode_mask,
+                                None,
+                            )?
+                        } else {
+                            let decoded = decode_value(
+                                &mut raw_value,
+                                source_schema
+                                    .num_columns_in_family(column_family_id)
+                                    .unwrap_or(0),
+                            )?;
+                            self.schema_manager.evolve_value(
+                                decoded,
+                                source_schema.version(),
+                                schema.version(),
+                            )?
+                        };
+                        if let Some(mask) = terminal_mask.as_mut() {
+                            for (idx, column) in
+                                value.columns().iter().enumerate().take(num_columns)
+                            {
+                                if column
+                                    .as_ref()
+                                    .is_some_and(|column| column.value_type().is_terminal())
+                                {
+                                    mask[idx / 8] |= 1 << (idx % 8);
+                                }
+                            }
+                            if let Some(selected) = selected_mask {
+                                for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size)
+                                {
+                                    *mask_byte &= selected[idx];
+                                }
+                            }
+                        }
+                        let stop = num_columns == 1 && value.is_terminal();
+                        values.push(value);
+                        if stop {
+                            stopped = true;
+                            Ok(ControlFlow::Break(()))
+                        } else {
+                            Ok(ControlFlow::Continue(()))
+                        }
+                    },
+                )?;
+            }
+            let mut decode_mask = base_decode_mask.to_vec();
+            if let Some(mask) = terminal_mask.as_ref() {
+                for (idx, mask_byte) in mask.iter().enumerate().take(mask_size) {
+                    decode_mask[idx] &= !*mask_byte;
+                }
+            }
+            requests.push(BatchGetRequest {
+                bucket,
+                encoded_key,
+                values,
+                terminal_mask,
+                decode_mask,
+                stopped,
+            });
+        }
+        if let Err(err) = self.lsm_tree.get_many_with_snapshot(
+            &self.file_manager,
+            Arc::clone(&snapshot),
+            &mut requests,
+            schema.as_ref(),
+            self.schema_manager.as_ref(),
+            selected_columns,
+            selected_mask,
+            column_family_id,
+        ) {
+            self.maybe_mark_error_on_read(&err);
+            return Err(err);
+        }
+        let unique_results = (|| {
+            let mut unique_results = Vec::with_capacity(requests.len());
+            for request in requests {
+                let values = request
+                    .values
+                    .into_iter()
+                    .filter(|value| !self.ttl_provider.expired(&value.expired_at))
+                    .rev()
+                    .collect::<Vec<_>>();
+                if values.is_empty() {
+                    unique_results.push(None);
+                    continue;
+                }
+                let merged = Value::merge_all_in_column_family(
+                    values,
+                    &schema,
+                    column_family_id,
+                    Some(self.time_provider.as_ref()),
+                )?;
+                let result = value_to_vec_of_columns_with_vlog(
+                    merged,
+                    |pointer| {
+                        self.vlog_store
+                            .read_pointer(&snapshot.vlog_version, pointer)
+                    },
+                    &schema,
+                    column_family_id,
+                    Some(self.time_provider.as_ref()),
+                )?;
+                unique_results.push(result.map(|columns| match selected_columns {
+                    Some(selected) => select_projected_columns(columns, selected),
+                    None => columns,
+                }));
+            }
+            Ok::<_, Error>(unique_results)
+        })();
+        let unique_results = match unique_results {
+            Ok(results) => results,
+            Err(err) => {
+                self.maybe_mark_error_on_read(&err);
+                return Err(err);
+            }
+        };
+        Ok(positions
+            .into_iter()
+            .map(|index| unique_results[index].clone())
+            .collect())
     }
 
     pub fn get_with_options(
@@ -3513,6 +3701,128 @@ mod tests {
         let value = db.get(0, b"k1").unwrap().expect("value present");
         let col = value[0].as_ref().unwrap();
         assert_eq!(col.as_ref(), b"new");
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_multi_get_preserves_order_duplicates_and_memtable_l0_merges() {
+        let root = "/tmp/db_multi_get";
+        cleanup_test_root(root);
+        let db = open_db(config_with_small_memtable(root));
+
+        let mut batch = WriteBatch::new();
+        batch.put(0, b"k1", 0, b"base");
+        batch.put(0, b"k2", 0, b"old");
+        batch.put(0, b"pad", 0, vec![b'x'; 64]);
+        db.write_batch(batch).unwrap();
+        db.memtable_manager.flush_active().unwrap();
+        db.memtable_manager.wait_for_flushes();
+
+        db.merge(0, b"k1", 0, b"-memtable").unwrap();
+        db.put(0, b"k3", 0, b"fresh").unwrap();
+        let values = db
+            .multi_get(&[
+                (0, b"k2".as_slice()),
+                (0, b"k1"),
+                (0, b"k2"),
+                (0, b"missing"),
+                (0, b"k3"),
+            ])
+            .unwrap();
+
+        assert_eq!(values.len(), 5);
+        assert_eq!(
+            values[0].as_ref().unwrap()[0].as_deref(),
+            Some(b"old".as_slice())
+        );
+        assert_eq!(
+            values[1].as_ref().unwrap()[0].as_deref(),
+            Some(b"base-memtable".as_slice())
+        );
+        assert_eq!(values[2], values[0]);
+        assert!(values[3].is_none());
+        assert_eq!(
+            values[4].as_ref().unwrap()[0].as_deref(),
+            Some(b"fresh".as_slice())
+        );
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_db_multi_get_matches_get_for_generic_keys_buckets_and_projection() {
+        let root = "/tmp/db_multi_get_options";
+        cleanup_test_root(root);
+        let db = DbBuilder::new(Config {
+            total_buckets: 2,
+            num_columns: 2,
+            ..config_with_small_memtable(root)
+        })
+        .bucket_ranges(vec![0..=0, 1..=1])
+        .open()
+        .unwrap();
+        db.put(0, b"left", 0, b"left-0").unwrap();
+        db.put(0, b"left", 1, b"left-1").unwrap();
+        db.put(1, b"right", 0, b"right-0").unwrap();
+        db.put(1, b"right", 1, b"right-1").unwrap();
+        let options = ReadOptions::for_columns(vec![1]);
+        let keys = vec![
+            (1, b"right".to_vec()),
+            (0, b"left".to_vec()),
+            (1, b"right".to_vec()),
+            (0, b"missing".to_vec()),
+        ];
+
+        let expected = keys
+            .iter()
+            .map(|(bucket, key)| db.get_with_options(*bucket, key, &options))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            db.multi_get_with_options(&keys, &options).unwrap(),
+            expected
+        );
+        let empty: Vec<(u16, Vec<u8>)> = Vec::new();
+        assert!(db.multi_get(&empty).unwrap().is_empty());
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_read_only_db_multi_get_matches_snapshot_get() {
+        let root = "/tmp/read_only_db_multi_get";
+        cleanup_test_root(root);
+        let config = config_with_small_memtable(root);
+        let db = open_db(config.clone());
+        db.put(0, b"k1", 0, b"snapshot-1").unwrap();
+        db.put(0, b"k2", 0, b"snapshot-2").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let snapshot_id = db
+            .snapshot_with_callback(move |result| {
+                tx.send(result).expect("send snapshot result");
+            })
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("receive snapshot result")
+            .unwrap();
+        let read_only = Db::open_read_only(config, snapshot_id, db.id().to_string()).unwrap();
+        let keys = vec![
+            (0, b"k2".to_vec()),
+            (0, b"k1".to_vec()),
+            (0, b"k2".to_vec()),
+            (0, b"missing".to_vec()),
+        ];
+
+        let expected = keys
+            .iter()
+            .map(|(bucket, key)| read_only.get(*bucket, key))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(read_only.multi_get(&keys).unwrap(), expected);
 
         cleanup_test_root(root);
     }

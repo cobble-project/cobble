@@ -9,7 +9,7 @@ use crate::file::FileManager;
 use crate::key_codec::{
     encode_key, encode_next_column_family_scan_key, encode_scan_key, encode_scan_key_after,
 };
-use crate::lsm::LSMTree;
+use crate::lsm::{BatchGetRequest, LSMTree};
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
 use crate::schema::{Schema, SchemaManager};
@@ -25,7 +25,7 @@ use crate::vlog::VlogStore;
 use crate::{Config, MergeOperatorResolver, ReadOptions, ScanOptions};
 use bytes::Bytes;
 use log::info;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -254,6 +254,109 @@ impl ReadOnlyDb {
     /// Lookup a key in a bucket across the snapshot LSM levels.
     pub fn get(&self, bucket: u16, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
         self.get_with_options(bucket, key, &self.default_read_options)
+    }
+
+    pub fn multi_get<K: AsRef<[u8]>>(
+        &self,
+        keys: &[(u16, K)],
+    ) -> Result<Vec<Option<Vec<Option<Bytes>>>>> {
+        self.multi_get_with_options(keys, &self.default_read_options)
+    }
+
+    pub fn multi_get_with_options<K: AsRef<[u8]>>(
+        &self,
+        keys: &[(u16, K)],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Vec<Option<Bytes>>>>> {
+        let schema = self.schema_manager.latest_schema();
+        let column_family_id = options.resolve_column_family_id_cached(schema.as_ref())?;
+        let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
+        if let Some(max_index) = options.max_index()
+            && max_index >= num_columns
+        {
+            return Err(Error::IoError(format!(
+                "max_index {} in ReadOptions exceeds num_columns {}",
+                max_index, num_columns
+            )));
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique = Vec::<(u16, Vec<u8>)>::new();
+        let mut positions = Vec::with_capacity(keys.len());
+        let mut seen = HashMap::<(u16, Vec<u8>), usize>::new();
+        for (bucket, key) in keys {
+            let entry = (*bucket, key.as_ref().to_vec());
+            let next = unique.len();
+            let index = *seen.entry(entry.clone()).or_insert_with(|| {
+                unique.push(entry);
+                next
+            });
+            positions.push(index);
+        }
+        let snapshot = self.lsm_tree.db_state().load();
+        let masks = options.masks(num_columns);
+        let mut requests = unique
+            .into_iter()
+            .map(|(bucket, key)| BatchGetRequest {
+                bucket,
+                stopped: snapshot.key_is_truncated(bucket, column_family_id, key.as_slice()),
+                encoded_key: encode_key(bucket, column_family_id, key.as_slice()),
+                values: Vec::new(),
+                terminal_mask: (num_columns > 1).then(|| vec![0u8; masks.base_mask.len()]),
+                decode_mask: masks.base_mask.to_vec(),
+            })
+            .collect::<Vec<_>>();
+        self.lsm_tree.get_many_with_snapshot(
+            &self.file_manager,
+            Arc::clone(&snapshot),
+            &mut requests,
+            schema.as_ref(),
+            self.schema_manager.as_ref(),
+            options.columns(),
+            masks.selected_mask.as_deref(),
+            column_family_id,
+        )?;
+        let mut unique_results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let mut values = request
+                .values
+                .into_iter()
+                .filter(|value| !self.ttl_provider.expired(&value.expired_at))
+                .rev()
+                .collect::<Vec<_>>()
+                .into_iter();
+            let Some(mut merged) = values.next() else {
+                unique_results.push(None);
+                continue;
+            };
+            for newer in values {
+                merged = merged.merge_in_column_family(
+                    newer,
+                    &schema,
+                    column_family_id,
+                    Some(self.ttl_provider.time_provider()),
+                )?;
+            }
+            let value = value_to_vec_of_columns_with_vlog(
+                merged,
+                |pointer| {
+                    self.vlog_store
+                        .read_pointer(&snapshot.vlog_version, pointer)
+                },
+                &schema,
+                column_family_id,
+                Some(self.ttl_provider.time_provider()),
+            )?;
+            unique_results.push(value.map(|columns| match options.columns() {
+                Some(selected_columns) => select_projected_columns(columns, selected_columns),
+                None => columns,
+            }));
+        }
+        Ok(positions
+            .into_iter()
+            .map(|index| unique_results[index].clone())
+            .collect())
     }
 
     pub fn get_with_options(

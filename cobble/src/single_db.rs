@@ -205,6 +205,21 @@ impl SingleDb {
         self.get_with_options(bucket, key, &ReadOptions::default())
     }
 
+    pub fn multi_get<K: AsRef<[u8]>>(
+        &self,
+        keys: &[(u16, K)],
+    ) -> Result<Vec<Option<Vec<Option<Bytes>>>>> {
+        self.multi_get_with_options(keys, &ReadOptions::default())
+    }
+
+    pub fn multi_get_with_options<K: AsRef<[u8]>>(
+        &self,
+        keys: &[(u16, K)],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Vec<Option<Bytes>>>>> {
+        self.db.multi_get_with_options(keys, options)
+    }
+
     pub fn get_with_options(
         &self,
         bucket: u16,
