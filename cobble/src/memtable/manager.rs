@@ -697,7 +697,11 @@ impl MemtableScanIterator {
         self.skiplist_iter = None;
         self.entries = match &self.source {
             MemtableScanSource::Active(active) => {
-                let active = active.read().unwrap();
+                let mut active = active.write().unwrap();
+                // Iterator construction and the first seek are separate operations. Seal again
+                // while collecting so entries appended between them cannot be rewritten in place
+                // after their zero-copy `Bytes` views escape this lock.
+                active.seal_read_snapshot_data();
                 let Some(memtable) = active.readable_memtable() else {
                     self.entries.clear();
                     self.current_key = None;
@@ -2878,6 +2882,69 @@ mod tests {
         assert!(is_full_terminal_ref_value(&terminal, 1));
         assert!(!is_full_terminal_ref_value(&merge, 1));
         assert!(!is_full_terminal_ref_value(&partial, 2));
+    }
+
+    #[test]
+    fn active_scan_seals_entries_appended_after_iterator_creation() {
+        for memtable_type in [
+            MemtableType::Hash,
+            MemtableType::Skiplist,
+            MemtableType::Vec,
+        ] {
+            let schema = Arc::new(Schema::new(1, 1, Vec::new()));
+            let active = Arc::new(RwLock::new(ActiveMemtable {
+                id: Uuid::new_v4(),
+                schema,
+                sealed_data_end: 0,
+                contents: ActiveMemtableContents::Writable(build_test_memtable(memtable_type, &[])),
+            }));
+            let mut iter = MemtableScanIterator::for_active(
+                Arc::clone(&active),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            );
+
+            let key = RefKey::new(0, b"key");
+            let old = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"old"))]);
+            let new = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"new"))]);
+            {
+                let mut active = active.write().unwrap();
+                active
+                    .writable_memtable()
+                    .unwrap()
+                    .put_ref(&key, &old, 1)
+                    .unwrap();
+            }
+
+            iter.seek_to_first().unwrap();
+            let captured_end = active
+                .read()
+                .unwrap()
+                .readable_memtable()
+                .unwrap()
+                .data_offset();
+            {
+                let mut active = active.write().unwrap();
+                assert_eq!(active.sealed_data_end, captured_end, "{memtable_type:?}");
+                active.put_ref_or_replace(&key, &new, 1).unwrap();
+                assert!(
+                    active.readable_memtable().unwrap().data_offset() > captured_end,
+                    "{memtable_type:?}"
+                );
+            }
+
+            let mut retained = iter.take_value().unwrap().unwrap().unwrap_encoded();
+            let retained = decode_value(&mut retained, 1).unwrap();
+            assert_eq!(
+                retained.columns()[0].as_ref().unwrap().data().as_ref(),
+                b"old",
+                "{memtable_type:?}"
+            );
+        }
     }
 
     #[test]
