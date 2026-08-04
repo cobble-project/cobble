@@ -1,6 +1,7 @@
 package io.cobble;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
@@ -108,6 +109,23 @@ public final class SingleDb extends NativeObject {
         return get(nativeHandle, bucket, key, readOptionsHandle);
     }
 
+    /**
+     * Read several keys in one batch from a consistent database-state snapshot.
+     *
+     * <p>{@code buckets} and {@code keys} must have the same length. The returned array has the
+     * same length as the input; each element is {@code null} (key not found) or a {@code byte[][]}
+     * of column values (identical to {@link #get(int, byte[])}).
+     */
+    public byte[][][] multiGet(int[] buckets, byte[][] keys) {
+        return multiGet(nativeHandle, buckets, keys, 0L);
+    }
+
+    /** Batch multi-get with explicit native-backed read options. */
+    public byte[][][] multiGetWithOptions(int[] buckets, byte[][] keys, ReadOptions options) {
+        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
+        return multiGet(nativeHandle, buckets, keys, readOptionsHandle);
+    }
+
     /** Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive). */
     public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
         return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
@@ -171,6 +189,26 @@ public final class SingleDb extends NativeObject {
             throw new IllegalArgumentException("nextSeconds must be >= 0");
         }
         setTime(nativeHandle, nextSeconds);
+    }
+
+    /**
+     * Switch the active memtable type used by future active memtables in this process.
+     *
+     * <p>This is a runtime-only setting: it does not modify the persisted {@link Config}. When
+     * {@code flushCurrent} is {@code false}, the active memtable is left untouched and the target
+     * type applies at its next natural rotation. When {@code flushCurrent} is {@code true}, a
+     * non-empty active memtable is rotated through the normal manual-flush and auto-snapshot path
+     * (the call returns once rotation is scheduled, not after the data reaches disk), while an
+     * empty active table is immediately replaced when its implementation differs.
+     *
+     * @param memtableType target memtable type (hash, skiplist, or vec)
+     * @param flushCurrent whether to rotate the current memtable before switching
+     */
+    public void switchMemtableType(Config.MemtableType memtableType, boolean flushCurrent) {
+        if (memtableType == null) {
+            throw new IllegalArgumentException("memtableType must not be null");
+        }
+        switchMemtableType(nativeHandle, memtableType.name().toLowerCase(Locale.ROOT), flushCurrent);
     }
 
     /** Trigger snapshot creation asynchronously and return future of global snapshot payload. */
@@ -255,6 +293,9 @@ public final class SingleDb extends NativeObject {
     private static native byte[][] get(
             long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
 
+    private static native byte[][][] multiGet(
+            long nativeHandle, int[] buckets, byte[][] keys, long readOptionsHandle);
+
     private static native long openScanCursor(
             long nativeHandle,
             int bucket,
@@ -268,6 +309,9 @@ public final class SingleDb extends NativeObject {
             long nativeHandle, int bucket, byte[] key, int column, long writeOptionsHandle);
 
     private static native void setTime(long nativeHandle, int nextSeconds);
+
+    private static native void switchMemtableType(
+            long nativeHandle, String memtableType, boolean flushCurrent);
 
     private static native void asyncSnapshot(
             long nativeHandle, CompletableFuture<String> snapshotJsonFuture);

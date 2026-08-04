@@ -11,6 +11,7 @@ import io.cobble.ShardSnapshot;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -640,6 +641,34 @@ public final class Db extends NativeObject {
     }
 
     /**
+     * Read several keys in one batch from a consistent database-state snapshot.
+     *
+     * <p>{@code buckets} and {@code keys} must have the same length. The returned array has the
+     * same length as the input; each element is {@code null} (key not found) or a {@link Row}.
+     */
+    public Row[] multiGet(int[] buckets, byte[][] keys) {
+        Object[] raw = multiGetTyped(nativeHandle, buckets, keys, 0L);
+        return rawToRows(buckets, keys, raw);
+    }
+
+    /** Batch multi-get with explicit native-backed read options. */
+    public Row[] multiGetWithOptions(int[] buckets, byte[][] keys, ReadOptions options) {
+        long roh = options == null ? 0L : options.getNativeHandle();
+        Object[] raw = multiGetTyped(nativeHandle, buckets, keys, roh);
+        return rawToRows(buckets, keys, raw);
+    }
+
+    private static Row[] rawToRows(int[] buckets, byte[][] keys, Object[] raw) {
+        Row[] rows = new Row[raw.length];
+        for (int i = 0; i < raw.length; i++) {
+            if (raw[i] != null) {
+                rows[i] = Row.fromRawColumns(keys[i], (Object[]) raw[i]);
+            }
+        }
+        return rows;
+    }
+
+    /**
      * Get one encoded structured row through key bytes.
      *
      * <p>The input key and encoded row payload share one IO buffer. The binding keeps a reusable
@@ -984,6 +1013,30 @@ public final class Db extends NativeObject {
         }
     }
 
+    /**
+     * Read several keys in one batch via direct-buffer I/O (structured encoding).
+     *
+     * <p>Keys must be packed into {@code ioBuffer} using
+     * {@link io.cobble.Db#packMultiGetKeys(int[], byte[][])}. The result payload is always
+     * non-empty: even when every key is absent it carries {@code i32 num_keys} followed by a zero
+     * row length per key. Format: {@code i32 num_keys}, then per key:
+     * {@code i32 row_payload_length} (0 = not found) + row payload (same encoding as single
+     * structured get: tag 0=None, 1=Bytes, 2=List).
+     *
+     * @return encoded length (positive = in ioBuffer, negative = in overflow)
+     */
+    public int multiGetEncodedDirectWithOptions(ByteBuffer ioBuffer, ReadOptions options) {
+        if (ioBuffer == null || !ioBuffer.isDirect()) {
+            throw new IllegalArgumentException("ioBuffer must be a direct ByteBuffer");
+        }
+        long roh = options == null ? 0L : options.getNativeHandle();
+        return multiGetEncodedDirectWithOptions(
+                nativeHandle,
+                io.cobble.DirectIoUtils.directAddress(ioBuffer),
+                ioBuffer.capacity(),
+                roh);
+    }
+
     // ── metadata / time ───────────────────────────────────────────────────
 
     /** Return the DB runtime id. */
@@ -1007,6 +1060,26 @@ public final class Db extends NativeObject {
             throw new IllegalArgumentException("nextSeconds must be >= 0");
         }
         setTime(nativeHandle, nextSeconds);
+    }
+
+    /**
+     * Switch the active memtable type used by future active memtables in this process.
+     *
+     * <p>This is a runtime-only setting: it does not modify the persisted {@link Config}. When
+     * {@code flushCurrent} is {@code false}, the active memtable is left untouched and the target
+     * type applies at its next natural rotation. When {@code flushCurrent} is {@code true}, a
+     * non-empty active memtable is rotated through the normal manual-flush and auto-snapshot path
+     * (the call returns once rotation is scheduled, not after the data reaches disk), while an
+     * empty active table is immediately replaced when its implementation differs.
+     *
+     * @param memtableType target memtable type (hash, skiplist, or vec)
+     * @param flushCurrent whether to rotate the current memtable before switching
+     */
+    public void switchMemtableType(Config.MemtableType memtableType, boolean flushCurrent) {
+        if (memtableType == null) {
+            throw new IllegalArgumentException("memtableType must not be null");
+        }
+        switchMemtableType(nativeHandle, memtableType.name().toLowerCase(Locale.ROOT), flushCurrent);
     }
 
     // ── snapshot lifecycle ────────────────────────────────────────────────
@@ -1224,6 +1297,9 @@ public final class Db extends NativeObject {
     private static native Object[] getTypedWithOptions(
             long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
 
+    private static native Object[] multiGetTyped(
+            long nativeHandle, int[] buckets, byte[][] keys, long readOptionsHandle);
+
     private static native int getEncodedDirectWithOptions(
             long nativeHandle,
             int bucket,
@@ -1231,6 +1307,9 @@ public final class Db extends NativeObject {
             int ioCapacity,
             int keyLength,
             long readOptionsHandle);
+
+    private static native int multiGetEncodedDirectWithOptions(
+            long nativeHandle, long ioAddress, int ioCapacity, long readOptionsHandle);
 
     static native ByteBuffer getLastDirectOverflowBuffer();
 
@@ -1258,6 +1337,9 @@ public final class Db extends NativeObject {
     private static native int nowSeconds(long nativeHandle);
 
     private static native void setTime(long nativeHandle, int nextSeconds);
+
+    private static native void switchMemtableType(
+            long nativeHandle, String memtableType, boolean flushCurrent);
 
     private static native long asyncSnapshot(
             long nativeHandle, CompletableFuture<String> snapshotJsonFuture);

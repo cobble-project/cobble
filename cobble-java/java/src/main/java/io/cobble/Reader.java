@@ -110,6 +110,22 @@ public final class Reader extends NativeObject {
         return get(nativeHandle, bucket, key, readOptionsHandle);
     }
 
+    /**
+     * Read several keys in one batch from a consistent snapshot.
+     *
+     * <p>{@code buckets} and {@code keys} must have the same length. Each element of the result is
+     * {@code null} (not found) or a {@code byte[][]} of column values.
+     */
+    public byte[][][] multiGet(int[] buckets, byte[][] keys) {
+        return multiGet(nativeHandle, buckets, keys, 0L);
+    }
+
+    /** Batch multi-get with explicit native-backed read options. */
+    public byte[][][] multiGetWithOptions(int[] buckets, byte[][] keys, ReadOptions options) {
+        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
+        return multiGet(nativeHandle, buckets, keys, readOptionsHandle);
+    }
+
     /** Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive). */
     public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
         return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
@@ -181,6 +197,9 @@ public final class Reader extends NativeObject {
 
     private static native byte[][] get(
             long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
+
+    private static native byte[][][] multiGet(
+            long nativeHandle, int[] buckets, byte[][] keys, long readOptionsHandle);
 
     private static native long openScanCursor(
             long nativeHandle,

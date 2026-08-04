@@ -6,6 +6,7 @@ import io.cobble.NativeLoader;
 import io.cobble.NativeObject;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
@@ -274,6 +275,34 @@ public final class SingleDb extends NativeObject {
         return Row.fromRawColumns(key, raw);
     }
 
+    /**
+     * Read several keys in one batch from a consistent database-state snapshot.
+     *
+     * <p>{@code buckets} and {@code keys} must have the same length. The returned array has the
+     * same length as the input; each element is {@code null} (key not found) or a {@link Row}.
+     */
+    public Row[] multiGet(int[] buckets, byte[][] keys) {
+        Object[] raw = multiGetTyped(nativeHandle, buckets, keys, 0L);
+        return rawToRows(buckets, keys, raw);
+    }
+
+    /** Batch multi-get with explicit native-backed read options. */
+    public Row[] multiGetWithOptions(int[] buckets, byte[][] keys, ReadOptions options) {
+        long roh = options == null ? 0L : options.getNativeHandle();
+        Object[] raw = multiGetTyped(nativeHandle, buckets, keys, roh);
+        return rawToRows(buckets, keys, raw);
+    }
+
+    private static Row[] rawToRows(int[] buckets, byte[][] keys, Object[] raw) {
+        Row[] rows = new Row[raw.length];
+        for (int i = 0; i < raw.length; i++) {
+            if (raw[i] != null) {
+                rows[i] = Row.fromRawColumns(keys[i], (Object[]) raw[i]);
+            }
+        }
+        return rows;
+    }
+
     /** Open a structured scan cursor within [startKeyInclusive, endKeyExclusive). */
     public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
         return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
@@ -313,6 +342,26 @@ public final class SingleDb extends NativeObject {
             throw new IllegalArgumentException("nextSeconds must be >= 0");
         }
         setTime(nativeHandle, nextSeconds);
+    }
+
+    /**
+     * Switch the active memtable type used by future active memtables in this process.
+     *
+     * <p>This is a runtime-only setting: it does not modify the persisted {@link Config}. When
+     * {@code flushCurrent} is {@code false}, the active memtable is left untouched and the target
+     * type applies at its next natural rotation. When {@code flushCurrent} is {@code true}, a
+     * non-empty active memtable is rotated through the normal manual-flush and auto-snapshot path
+     * (the call returns once rotation is scheduled, not after the data reaches disk), while an
+     * empty active table is immediately replaced when its implementation differs.
+     *
+     * @param memtableType target memtable type (hash, skiplist, or vec)
+     * @param flushCurrent whether to rotate the current memtable before switching
+     */
+    public void switchMemtableType(Config.MemtableType memtableType, boolean flushCurrent) {
+        if (memtableType == null) {
+            throw new IllegalArgumentException("memtableType must not be null");
+        }
+        switchMemtableType(nativeHandle, memtableType.name().toLowerCase(Locale.ROOT), flushCurrent);
     }
 
     // ── snapshot lifecycle ────────────────────────────────────────────────────
@@ -437,6 +486,9 @@ public final class SingleDb extends NativeObject {
     private static native Object[] getTypedWithOptions(
             long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
 
+    private static native Object[] multiGetTyped(
+            long nativeHandle, int[] buckets, byte[][] keys, long readOptionsHandle);
+
     // typed scan
     private static native long openStructuredScanCursor(
             long nativeHandle,
@@ -448,6 +500,9 @@ public final class SingleDb extends NativeObject {
     private static native int nowSeconds(long nativeHandle);
 
     private static native void setTime(long nativeHandle, int nextSeconds);
+
+    private static native void switchMemtableType(
+            long nativeHandle, String memtableType, boolean flushCurrent);
 
     private static native void asyncSnapshot(
             long nativeHandle, CompletableFuture<String> snapshotJsonFuture);

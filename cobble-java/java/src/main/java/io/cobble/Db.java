@@ -3,6 +3,7 @@ package io.cobble;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -424,6 +425,27 @@ public final class Db extends NativeObject {
     }
 
     /**
+     * Read several keys in one batch from a consistent database-state snapshot.
+     *
+     * <p>{@code buckets} and {@code keys} must have the same length. The returned array has the
+     * same length as the input; each element is {@code null} (key not found) or a {@code byte[][]}
+     * of column values (identical to {@link #get(int, byte[])}).
+     *
+     * @param buckets bucket id for each key
+     * @param keys logical user key for each entry
+     * @return parallel array of results; {@code null} element means the key was not found
+     */
+    public byte[][][] multiGet(int[] buckets, byte[][] keys) {
+        return multiGet(nativeHandle, buckets, keys, 0L);
+    }
+
+    /** Batch multi-get with explicit native-backed read options. */
+    public byte[][][] multiGetWithOptions(int[] buckets, byte[][] keys, ReadOptions options) {
+        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
+        return multiGet(nativeHandle, buckets, keys, readOptionsHandle);
+    }
+
+    /**
      * Get selected columns for one key as an encoded zero-copy direct row view.
      *
      * <p>The returned payload references either the pooled IO buffer or an overflow direct buffer.
@@ -591,6 +613,74 @@ public final class Db extends NativeObject {
         ((Buffer) view).clear();
         ((Buffer) view).limit(length);
         return view;
+    }
+
+    /**
+     * Read several keys in one batch via direct-buffer I/O.
+     *
+     * <p>Keys must be packed into {@code ioBuffer} in the format:
+     * {@code i32 num_keys}, then per key: {@code i32 bucket}, {@code i32 key_length},
+     * {@code key_bytes}. Use {@link #packMultiGetKeys(int[], byte[][])} to build this layout.
+     *
+     * <p>The result payload (written to {@code ioBuffer} or the cached overflow buffer) has the
+     * same conventions as {@link #getEncodedDirectWithOptions}: positive return = payload in
+     * {@code ioBuffer}, negative = payload in overflow buffer (retrieve via
+     * {@link #getLastDirectOverflowBuffer()}). Unlike single-get, the payload is always non-empty:
+     * even when every key is absent it still carries {@code i32 num_keys} followed by a zero row
+     * length per key, so the return value is never 0.
+     *
+     * <p>Result payload format: {@code i32 num_keys}, then per key:
+     * {@code i32 row_payload_length} (0 = not found) followed by the row payload (same encoding
+     * as single-get: {@code i32 col_count}, per column: {@code u8 present} + [{@code i32 len} +
+     * bytes]).
+     *
+     * @return encoded length (positive = in ioBuffer, negative = in overflow)
+     */
+    public int multiGetEncodedDirectWithOptions(
+            ByteBuffer ioBuffer, ReadOptions options) {
+        if (ioBuffer == null || !ioBuffer.isDirect()) {
+            throw new IllegalArgumentException("ioBuffer must be a direct ByteBuffer");
+        }
+        long readOptionsHandle = options == null ? 0L : options.nativeHandle;
+        return multiGetEncodedDirectWithOptions(
+                nativeHandle,
+                DirectIoUtils.directAddress(ioBuffer),
+                ioBuffer.capacity(),
+                readOptionsHandle);
+    }
+
+    /**
+     * Packs bucket/key pairs into a direct ByteBuffer for {@link #multiGetEncodedDirectWithOptions}.
+     *
+     * <p>Layout: {@code i32 num_keys}, then per key: {@code i32 bucket}, {@code i32 key_length},
+     * {@code key_bytes}.
+     *
+     * @param buckets bucket id for each key
+     * @param keys logical user key for each entry
+     * @return a direct ByteBuffer containing the packed keys
+     */
+    public static ByteBuffer packMultiGetKeys(int[] buckets, byte[][] keys) {
+        if (buckets == null || keys == null) {
+            throw new IllegalArgumentException("buckets and keys must not be null");
+        }
+        if (buckets.length != keys.length) {
+            throw new IllegalArgumentException(
+                    "buckets length " + buckets.length + " != keys length " + keys.length);
+        }
+        int totalSize = 4; // num_keys
+        for (byte[] key : keys) {
+            totalSize += 8; // bucket + key_length
+            totalSize += key.length;
+        }
+        ByteBuffer buf = ByteBuffer.allocateDirect(totalSize);
+        buf.putInt(buckets.length);
+        for (int i = 0; i < buckets.length; i++) {
+            buf.putInt(buckets[i]);
+            buf.putInt(keys[i].length);
+            buf.put(keys[i]);
+        }
+        ((Buffer) buf).clear();
+        return buf;
     }
 
     /**
@@ -862,6 +952,26 @@ public final class Db extends NativeObject {
         setTime(nativeHandle, nextSeconds);
     }
 
+    /**
+     * Switch the active memtable type used by future active memtables in this process.
+     *
+     * <p>This is a runtime-only setting: it does not modify the persisted {@link Config}. When
+     * {@code flushCurrent} is {@code false}, the active memtable is left untouched and the target
+     * type applies at its next natural rotation. When {@code flushCurrent} is {@code true}, a
+     * non-empty active memtable is rotated through the normal manual-flush and auto-snapshot path
+     * (the call returns once rotation is scheduled, not after the data reaches disk), while an
+     * empty active table is immediately replaced when its implementation differs.
+     *
+     * @param memtableType target memtable type (hash, skiplist, or vec)
+     * @param flushCurrent whether to rotate the current memtable before switching
+     */
+    public void switchMemtableType(Config.MemtableType memtableType, boolean flushCurrent) {
+        if (memtableType == null) {
+            throw new IllegalArgumentException("memtableType must not be null");
+        }
+        switchMemtableType(nativeHandle, memtableType.name().toLowerCase(Locale.ROOT), flushCurrent);
+    }
+
     /** Expand bucket ownership by importing data from another shard snapshot. */
     public long expandBucket(
             String sourceDbId,
@@ -1080,6 +1190,9 @@ public final class Db extends NativeObject {
     private static native byte[][] get(
             long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
 
+    private static native byte[][][] multiGet(
+            long nativeHandle, int[] buckets, byte[][] keys, long readOptionsHandle);
+
     private static native int getEncodedDirectWithOptions(
             long nativeHandle,
             int bucket,
@@ -1087,6 +1200,9 @@ public final class Db extends NativeObject {
             int ioCapacity,
             int keyLength,
             long readOptionsHandle);
+
+    private static native int multiGetEncodedDirectWithOptions(
+            long nativeHandle, long ioAddress, int ioCapacity, long readOptionsHandle);
 
     static native ByteBuffer getLastDirectOverflowBuffer();
 
@@ -1123,6 +1239,9 @@ public final class Db extends NativeObject {
             long nativeHandle, int bucket, byte[] key, int column, long writeOptionsHandle);
 
     private static native void setTime(long nativeHandle, int nextSeconds);
+
+    private static native void switchMemtableType(
+            long nativeHandle, String memtableType, boolean flushCurrent);
 
     private static native String id(long nativeHandle);
 
