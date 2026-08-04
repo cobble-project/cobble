@@ -1,13 +1,13 @@
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{ScanCursorHandle, decode_scan_open_args};
 use crate::util::{
-    decode_java_bytes, decode_java_string, decode_u16, decode_u64_from_jlong, parse_config_json,
-    throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
-    to_java_string_or_throw,
+    decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_u16,
+    decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
+    to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
 };
 use cobble::{Config, Reader, ReaderConfig};
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JObject, JString};
+use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{jint, jlong, jobject, jstring};
 
 #[unsafe(no_mangle)]
@@ -220,6 +220,50 @@ pub extern "system" fn Java_io_cobble_Reader_get(
         Ok(array) => array,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_multiGet<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    native_handle: jlong,
+    buckets: JIntArray<'local>,
+    keys: JObjectArray<'local>,
+    read_options_handle: jlong,
+) -> jobject {
+    let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let keys_vec = match decode_multi_get_keys(&mut env, &buckets, &keys) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let results = match if read_options_handle == 0 {
+        reader.multi_get(keys_vec.as_slice())
+    } else {
+        let Some(read_options_handle) =
+            read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        reader.multi_get_with_options(keys_vec.as_slice(), read_options_handle.read_options())
+    } {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match to_java_optional_bytes_3d(&mut env, results.as_slice()) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
             std::ptr::null_mut()
         }
     }

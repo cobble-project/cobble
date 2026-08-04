@@ -3,14 +3,30 @@ use cobble::Config;
 use jni::JNIEnv;
 use jni::descriptors::Desc;
 use jni::objects::{
-    GlobalRef, JByteArray, JByteBuffer, JClass, JIntArray, JMethodID, JObject, JObjectArray,
-    JString, JThrowable, JValue,
+    AutoLocal, GlobalRef, JByteArray, JByteBuffer, JClass, JIntArray, JMethodID, JObject,
+    JObjectArray, JString, JThrowable, JValue,
 };
 use jni::signature::{Primitive, ReturnType};
 use jni::sys::{jint, jlong, jobject, jstring};
 use std::cell::RefCell;
 use std::ops::RangeInclusive;
 use std::sync::OnceLock;
+
+/// Error type that bridges JNI [`Error`]s and plain strings, so local-frame
+/// closures can also surface string diagnostics.
+pub(crate) struct FrameError(pub(crate) String);
+
+impl From<jni::errors::Error> for FrameError {
+    fn from(err: jni::errors::Error) -> Self {
+        FrameError(err.to_string())
+    }
+}
+
+impl From<String> for FrameError {
+    fn from(err: String) -> Self {
+        FrameError(err)
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Utils_versionString(env: JNIEnv, class: JClass) -> jstring {
@@ -204,6 +220,149 @@ pub(crate) fn to_java_optional_bytes_2d(
             .map_err(|err| err.to_string())?;
     }
     Ok(array.into_raw() as jobject)
+}
+
+/// Builds a Java `byte[][][]` from a multi-get result.
+///
+/// Each outer element is `null` (key not found) or a `byte[][]` produced by
+/// [`to_java_optional_bytes_2d`] (the column values for that key).
+///
+/// The outer array lives in the caller's frame; each non-null row is built
+/// inside its own local reference frame so the per-row `byte[]`/`byte[][]`
+/// intermediates are released as soon as the row is stored. Only the promoted
+/// row reference survives, so large batches never accumulate unbounded local
+/// refs.
+pub(crate) fn to_java_optional_bytes_3d(
+    env: &mut JNIEnv,
+    rows: &[Option<Vec<Option<Bytes>>>],
+) -> Result<jobject, String> {
+    let byte_array_2d = byte_array_2d_class(env)?;
+    let array = new_object_array(env, rows.len() as i32, byte_array_2d)?;
+    for (index, row) in rows.iter().enumerate() {
+        let Some(columns) = row.as_ref() else {
+            continue;
+        };
+        // Build and store this row in a temporary frame. The outer array keeps
+        // the row alive after every local ref created for the row is released.
+        env.with_local_frame(16, |env| {
+            let row = to_java_optional_bytes_2d(env, columns.as_slice())?;
+            // SAFETY: `row` is a freshly created `byte[][]` local ref.
+            let row = unsafe { JObject::from_raw(row) };
+            env.set_object_array_element(&array, index as i32, &row)?;
+            Ok(())
+        })
+        .map_err(|err: FrameError| err.0)?;
+    }
+    Ok(array.into_raw() as jobject)
+}
+
+/// Decodes parallel `int[] buckets` + `byte[][] keys` into a `Vec<(u16, Vec<u8>)>`.
+///
+/// The two arrays must have the same length. Each bucket must fit in `u16`.
+pub(crate) fn decode_multi_get_keys<'local>(
+    env: &mut JNIEnv<'local>,
+    buckets: &JIntArray<'local>,
+    keys: &JObjectArray<'local>,
+) -> Result<Vec<(u16, Vec<u8>)>, String> {
+    let bucket_count = env
+        .get_array_length(buckets)
+        .map_err(|err| format!("invalid buckets array: {}", err))?;
+    let key_count = env
+        .get_array_length(keys)
+        .map_err(|err| format!("invalid keys array: {}", err))?;
+    if bucket_count != key_count {
+        return Err(format!(
+            "buckets length {} does not match keys length {}",
+            bucket_count, key_count
+        ));
+    }
+    let mut raw_buckets = vec![0i32; bucket_count as usize];
+    env.get_int_array_region(buckets, 0, &mut raw_buckets)
+        .map_err(|err| format!("invalid buckets array: {}", err))?;
+    let mut result = Vec::with_capacity(raw_buckets.len());
+    for (i, &bucket) in raw_buckets.iter().enumerate() {
+        if bucket < 0 || bucket > u16::MAX as i32 {
+            return Err(format!("bucket out of range at index {}: {}", i, bucket));
+        }
+        // `AutoLocal` releases each key's local ref after we copy the bytes out,
+        // so large batches don't exhaust the JNI local-reference table.
+        let key_obj = env
+            .get_object_array_element(keys, i as i32)
+            .map_err(|err| format!("failed to get key at index {}: {}", i, err))?;
+        let key_obj = AutoLocal::new(key_obj, env);
+        let key: &JByteArray = key_obj.as_ref().into();
+        let key_bytes = env
+            .convert_byte_array(key)
+            .map_err(|err| format!("invalid key byte array at index {}: {}", i, err))?;
+        result.push((bucket as u16, key_bytes));
+    }
+    Ok(result)
+}
+
+/// Decodes packed keys from a direct buffer for multi-get direct I/O.
+///
+/// Format: `i32 num_keys`, then per key: `i32 bucket`, `i32 key_length`, `key_bytes`.
+///
+/// # Safety
+///
+/// The caller must ensure `addr` points to at least `capacity` readable bytes.
+pub(crate) fn decode_packed_multi_get_keys(
+    addr: *const u8,
+    capacity: usize,
+) -> Result<Vec<(u16, Vec<u8>)>, String> {
+    if capacity < 4 {
+        return Err("IO buffer too small for multi-get key header".to_string());
+    }
+    // SAFETY: caller guarantees `addr..addr+capacity` is valid.
+    let buf = unsafe { std::slice::from_raw_parts(addr, capacity) };
+    let num_keys = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // Reject malformed headers before allocating. Each key needs at least 8 bytes
+    // (i32 bucket + i32 key_length) in addition to the 4-byte count prefix.
+    let max_keys = (capacity - 4) / 8;
+    if num_keys > max_keys {
+        return Err(format!(
+            "multi-get num_keys {} exceeds buffer capacity {} (max {} keys)",
+            num_keys, capacity, max_keys
+        ));
+    }
+    let mut offset = 4usize;
+    let mut keys = Vec::with_capacity(num_keys);
+    for i in 0..num_keys {
+        if offset + 8 > capacity {
+            return Err(format!(
+                "IO buffer too small for multi-get key {} header",
+                i
+            ));
+        }
+        let bucket = u32::from_be_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ]);
+        if bucket > u16::MAX as u32 {
+            return Err(format!("bucket out of range at key {}: {}", i, bucket));
+        }
+        offset += 4;
+        let key_len = u32::from_be_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if offset
+            .checked_add(key_len)
+            .map(|end| end > capacity)
+            .unwrap_or(true)
+        {
+            return Err(format!("IO buffer too small for multi-get key {} bytes", i));
+        }
+        let key = buf[offset..offset + key_len].to_vec();
+        offset += key_len;
+        keys.push((bucket as u16, key));
+    }
+    Ok(keys)
 }
 
 pub(crate) fn new_object_array<'local>(

@@ -3,16 +3,17 @@ use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{ScanCursorHandle, decode_scan_open_bounds_args};
 use crate::util::{
     complete_future_exceptionally, complete_future_with_cobble_error, complete_future_with_string,
-    decode_bucket_ranges, decode_java_bytes, decode_java_string, decode_u16, decode_u32,
-    decode_u64_from_jlong, parse_config_json, take_last_overflow_direct_buffer,
-    throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
-    to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
+    decode_bucket_ranges, decode_java_bytes, decode_java_string, decode_multi_get_keys,
+    decode_packed_multi_get_keys, decode_u16, decode_u32, decode_u64_from_jlong, parse_config_json,
+    take_last_overflow_direct_buffer, throw_illegal_argument, throw_illegal_state,
+    to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
+    write_payload_to_io_or_cached_overflow,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use cobble::{Config, Db};
 use jni::JNIEnv;
 use jni::JavaVM;
-use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JString};
+use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jintArray, jlong, jobject, jstring};
 use serde_json::json;
 
@@ -1053,6 +1054,50 @@ pub extern "system" fn Java_io_cobble_Db_getLastDirectOverflowBuffer(
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_multiGet<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    native_handle: jlong,
+    buckets: JIntArray<'local>,
+    keys: JObjectArray<'local>,
+    read_options_handle: jlong,
+) -> jobject {
+    let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let keys_vec = match decode_multi_get_keys(&mut env, &buckets, &keys) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let results = match if read_options_handle == 0 {
+        db.multi_get(keys_vec.as_slice())
+    } else {
+        let Some(read_options_handle) =
+            read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        db.multi_get_with_options(keys_vec.as_slice(), read_options_handle.read_options())
+    } {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match to_java_optional_bytes_3d(&mut env, results.as_slice()) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 fn encode_optional_columns_to_direct_buffer<'local>(
     env: &mut JNIEnv<'local>,
     values: Option<Vec<Option<bytes::Bytes>>>,
@@ -1109,6 +1154,117 @@ fn encode_optional_columns_payload(columns: &[Option<bytes::Bytes>]) -> Result<V
         }
     }
     Ok(encoded)
+}
+
+/// Encodes a multi-get result into a single contiguous payload for direct-buffer transfer.
+///
+/// Format:
+/// ```text
+/// i32 num_keys
+/// for each key:
+///     i32 row_payload_length   // 0 = not found
+///     [row payload bytes]      // same format as encode_optional_columns_payload
+/// ```
+fn encode_multi_get_payload(rows: &[Option<Vec<Option<bytes::Bytes>>>]) -> Result<Vec<u8>, String> {
+    let mut total = 4usize; // num_keys
+    let mut row_payloads = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row {
+            None => {
+                total = total
+                    .checked_add(4)
+                    .ok_or("encoded multi-get size overflow")?;
+                row_payloads.push(Vec::new());
+            }
+            Some(columns) => {
+                let payload = encode_optional_columns_payload(columns.as_slice())?;
+                total = total
+                    .checked_add(4)
+                    .and_then(|v| v.checked_add(payload.len()))
+                    .ok_or("encoded multi-get row size overflow")?;
+                row_payloads.push(payload);
+            }
+        }
+    }
+    let mut encoded = Vec::with_capacity(total);
+    encoded.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+    for payload in &row_payloads {
+        encoded.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(payload);
+    }
+    Ok(encoded)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_multiGetEncodedDirectWithOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    native_handle: jlong,
+    io_address: jlong,
+    io_capacity: jint,
+    read_options_handle: jlong,
+) -> jint {
+    let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    let io_capacity = match usize::try_from(io_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "ioCapacity must be >= 0".to_string());
+            return 0;
+        }
+    };
+    let direct_addr = match usize::try_from(io_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "ioAddress must be > 0".to_string());
+            return 0;
+        }
+    };
+    // Decode packed keys from the IO buffer:
+    // i32 num_keys, then for each: i32 bucket, i32 key_length, key_bytes
+    let keys_vec = match decode_packed_multi_get_keys(direct_addr, io_capacity) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let results = match if read_options_handle == 0 {
+        db.multi_get(keys_vec.as_slice())
+    } else {
+        let Some(read_options_handle) =
+            read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return 0;
+        };
+        db.multi_get_with_options(keys_vec.as_slice(), read_options_handle.read_options())
+    } {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let encoded = match encode_multi_get_payload(results.as_slice()) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            return 0;
+        }
+    };
+    match write_payload_to_io_or_cached_overflow(
+        &mut env,
+        direct_addr,
+        io_capacity,
+        encoded.as_slice(),
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            0
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1377,6 +1533,44 @@ pub extern "system" fn Java_io_cobble_Db_loadReadonlyFilesToPrimary(
             throw_illegal_state(&mut env, err.to_string());
             0
         }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_switchMemtableType(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    memtable_type: JString,
+    flush_current: jboolean,
+) {
+    let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let type_str = match decode_java_string(&mut env, memtable_type) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let memtable_type = match type_str.as_str() {
+        "hash" => cobble::MemtableType::Hash,
+        "skiplist" => cobble::MemtableType::Skiplist,
+        "vec" => cobble::MemtableType::Vec,
+        other => {
+            throw_illegal_argument(
+                &mut env,
+                format!(
+                    "unknown memtable type '{}': expected hash, skiplist, or vec",
+                    other
+                ),
+            );
+            return;
+        }
+    };
+    if let Err(err) = db.switch_memtable_type(memtable_type, flush_current == JNI_TRUE) {
+        throw_illegal_state(&mut env, err.to_string());
     }
 }
 

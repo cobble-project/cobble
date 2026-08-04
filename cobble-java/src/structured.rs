@@ -12,10 +12,11 @@ use crate::structured_scan_options::{
 };
 use crate::structured_write_options::structured_write_options_from_handle_or_throw;
 use crate::util::{
-    byte_array_class, complete_future_exceptionally, complete_future_with_cobble_error,
+    FrameError, byte_array_class, complete_future_exceptionally, complete_future_with_cobble_error,
     complete_future_with_string, decode_bucket_ranges, decode_java_bytes, decode_java_bytes_ref,
-    decode_java_string, decode_optional_java_string, decode_u16, decode_u64_from_jlong,
-    new_object_array, object_class, parse_config_json, take_last_overflow_direct_buffer,
+    decode_java_string, decode_multi_get_keys, decode_optional_java_string,
+    decode_packed_multi_get_keys, decode_u16, decode_u64_from_jlong, new_object_array,
+    object_array_class, object_class, parse_config_json, take_last_overflow_direct_buffer,
     throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
     write_payload_to_io_or_cached_overflow,
 };
@@ -1994,6 +1995,49 @@ pub extern "system" fn Java_io_cobble_structured_Db_getTypedWithOptions<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_multiGetTyped<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    buckets: JIntArray<'local>,
+    keys: JObjectArray<'local>,
+    read_options_handle: jlong,
+) -> jobject {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let keys_vec = match decode_multi_get_keys(&mut env, &buckets, &keys) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let results = match if read_options_handle == 0 {
+        db.multi_get(keys_vec.as_slice())
+    } else {
+        let Some(ro) = structured_read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        db.multi_get_with_options(keys_vec.as_slice(), ro.read_options())
+    } {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match to_java_multi_typed_columns(&mut env, results) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_structured_Db_getEncodedDirectWithOptions<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass,
@@ -2077,6 +2121,113 @@ pub extern "system" fn Java_io_cobble_structured_Db_getLastDirectOverflowBuffer(
             std::ptr::null_mut()
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_multiGetEncodedDirectWithOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    io_address: jlong,
+    io_capacity: jint,
+    read_options_handle: jlong,
+) -> jint {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    let io_capacity = match usize::try_from(io_capacity) {
+        Ok(v) => v,
+        Err(_) => {
+            throw_illegal_argument(&mut env, "ioCapacity must be >= 0".to_string());
+            return 0;
+        }
+    };
+    let direct_addr = match usize::try_from(io_address) {
+        Ok(v) if v != 0 => v as *mut u8,
+        _ => {
+            throw_illegal_argument(&mut env, "ioAddress must be > 0".to_string());
+            return 0;
+        }
+    };
+    let keys_vec = match decode_packed_multi_get_keys(direct_addr, io_capacity) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let results = match if read_options_handle == 0 {
+        db.multi_get(keys_vec.as_slice())
+    } else {
+        let Some(ro) = structured_read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return 0;
+        };
+        db.multi_get_with_options(keys_vec.as_slice(), ro.read_options())
+    } {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let encoded = match encode_multi_get_structured_payload(&results) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            return 0;
+        }
+    };
+    match write_payload_to_io_or_cached_overflow(
+        &mut env,
+        direct_addr,
+        io_capacity,
+        encoded.as_slice(),
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            0
+        }
+    }
+}
+
+/// Encodes a structured multi-get result into a single contiguous payload.
+///
+/// Format: i32 num_keys, then per key: i32 row_payload_length (0 = not found) + [row payload].
+/// Row payload uses the same encoding as `encode_row_payload` (tag 0=None, 1=Bytes, 2=List).
+fn encode_multi_get_structured_payload(
+    rows: &[Option<Vec<Option<StructuredColumnValue>>>],
+) -> std::result::Result<Vec<u8>, String> {
+    let mut total = 4usize; // num_keys
+    let mut row_payloads = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row {
+            None => {
+                total = total
+                    .checked_add(4)
+                    .ok_or("encoded multi-get size overflow")?;
+                row_payloads.push(Vec::new());
+            }
+            Some(columns) => {
+                let row_size = encoded_row_size(columns)?;
+                let mut payload = vec![0u8; row_size];
+                encode_row_payload(columns, &mut payload)?;
+                total = total
+                    .checked_add(4)
+                    .and_then(|v| v.checked_add(payload.len()))
+                    .ok_or("encoded multi-get row size overflow")?;
+                row_payloads.push(payload);
+            }
+        }
+    }
+    let mut encoded = Vec::with_capacity(total);
+    encoded.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+    for payload in &row_payloads {
+        encoded.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(payload);
+    }
+    Ok(encoded)
 }
 
 fn encode_structured_columns_to_direct_buffer<'local>(
@@ -2677,6 +2828,44 @@ pub extern "system" fn Java_io_cobble_structured_Db_loadReadonlyFilesToPrimary(
             throw_illegal_state(&mut env, err.to_string());
             0
         }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_switchMemtableType(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    memtable_type: JString,
+    flush_current: jboolean,
+) {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let type_str = match decode_java_string(&mut env, memtable_type) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let memtable_type = match type_str.as_str() {
+        "hash" => cobble::MemtableType::Hash,
+        "skiplist" => cobble::MemtableType::Skiplist,
+        "vec" => cobble::MemtableType::Vec,
+        other => {
+            throw_illegal_argument(
+                &mut env,
+                format!(
+                    "unknown memtable type '{}': expected hash, skiplist, or vec",
+                    other
+                ),
+            );
+            return;
+        }
+    };
+    if let Err(err) = db.switch_memtable_type(memtable_type, flush_current == JNI_TRUE) {
+        throw_illegal_state(&mut env, err.to_string());
     }
 }
 
@@ -3672,6 +3861,40 @@ pub(crate) fn to_java_typed_columns(
                     .map_err(|err| err.to_string())?;
             }
         }
+    }
+    Ok(array.into_raw() as jobject)
+}
+
+/// Builds a Java `Object[]` from a structured multi-get result.
+///
+/// Each outer element is `null` (key not found) or an `Object[]` produced by
+/// [`to_java_typed_columns`] (the typed column values for that key).
+///
+/// The outer array lives in the caller's frame; each non-null row is built
+/// inside its own local reference frame so the per-row `byte[]`/`byte[][]`/`Object[]`
+/// intermediates are released as soon as the row is stored. Only the promoted
+/// row reference survives, so large batches never accumulate unbounded local
+/// refs.
+pub(crate) fn to_java_multi_typed_columns(
+    env: &mut JNIEnv,
+    rows: Vec<Option<Vec<Option<StructuredColumnValue>>>>,
+) -> std::result::Result<jobject, String> {
+    let object_array_class = object_array_class(env)?;
+    let array = new_object_array(env, rows.len() as i32, object_array_class)?;
+    for (i, row) in rows.into_iter().enumerate() {
+        let Some(columns) = row else {
+            continue;
+        };
+        // Build and store this row in a temporary frame. The outer array keeps
+        // the row alive after every local ref created for the row is released.
+        env.with_local_frame(16, |env| {
+            let row = to_java_typed_columns(env, columns)?;
+            // SAFETY: `row` is a freshly created `Object[]` local ref.
+            let row = unsafe { JObject::from_raw(row) };
+            env.set_object_array_element(&array, i as i32, &row)?;
+            Ok(())
+        })
+        .map_err(|err: FrameError| err.0)?;
     }
     Ok(array.into_raw() as jobject)
 }

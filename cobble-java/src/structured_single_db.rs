@@ -7,22 +7,22 @@
 use crate::structured::{
     StructuredScanCursorHandle, StructuredSchemaBuilderHandle, decode_write_bytes_args,
     decode_write_list_args, direct_buffer_pool_config_array, new_priority_queue_handle,
-    to_java_typed_columns,
+    to_java_multi_typed_columns, to_java_typed_columns,
 };
 use crate::structured_read_options::structured_read_options_from_handle_or_throw;
 use crate::structured_scan_options::decode_structured_scan_open_args;
 use crate::structured_write_options::structured_write_options_from_handle_or_throw;
 use crate::util::{
     complete_future_exceptionally, complete_future_with_string, decode_java_bytes_ref,
-    decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong, parse_config_json,
-    throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
+    decode_java_string, decode_multi_get_keys, decode_u16, decode_u32, decode_u64_from_jlong,
+    parse_config_json, throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
 };
 use bytes::Bytes;
 use cobble::Config;
 use cobble_data_structure::{StructuredColumnValue, StructuredSingleDb};
 use jni::JNIEnv;
 use jni::JavaVM;
-use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JObjectArray, JString};
+use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jintArray, jlong, jobject, jstring};
 
 // ── open ────────────────────────────────────────────────────────────────────
@@ -692,6 +692,49 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_getTypedWithOptions<'l
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_multiGetTyped<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    buckets: JIntArray<'local>,
+    keys: JObjectArray<'local>,
+    read_options_handle: jlong,
+) -> jobject {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let keys_vec = match decode_multi_get_keys(&mut env, &buckets, &keys) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let results = match if read_options_handle == 0 {
+        db.multi_get(keys_vec.as_slice())
+    } else {
+        let Some(ro) = structured_read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        db.multi_get_with_options(keys_vec.as_slice(), ro.read_options())
+    } {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match to_java_multi_typed_columns(&mut env, results) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 // ── typed scan ──────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
@@ -862,6 +905,44 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_loadReadonlyFilesToPri
             throw_illegal_state(&mut env, err.to_string());
             0
         }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_switchMemtableType(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    memtable_type: JString,
+    flush_current: jboolean,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let type_str = match decode_java_string(&mut env, memtable_type) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let memtable_type = match type_str.as_str() {
+        "hash" => cobble::MemtableType::Hash,
+        "skiplist" => cobble::MemtableType::Skiplist,
+        "vec" => cobble::MemtableType::Vec,
+        other => {
+            throw_illegal_argument(
+                &mut env,
+                format!(
+                    "unknown memtable type '{}': expected hash, skiplist, or vec",
+                    other
+                ),
+            );
+            return;
+        }
+    };
+    if let Err(err) = db.switch_memtable_type(memtable_type, flush_current == JNI_TRUE) {
+        throw_illegal_state(&mut env, err.to_string());
     }
 }
 
