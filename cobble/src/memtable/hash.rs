@@ -189,6 +189,35 @@ impl HashMemtable {
         (start, start + 8)
     }
 
+    fn latest_entry_offset(&self, key: &[u8]) -> Option<usize> {
+        let hash = Self::hash_key(key);
+        let bucket = self.bucket_index_from_hash(hash);
+        let mut node_off = self.bucket_head(bucket);
+        while node_off != u32::MAX {
+            let start = node_off as usize;
+            if start + Self::index_entry_size() > self.buffer.len() {
+                return None;
+            }
+            let mut node_slice = &self.buffer[start..start + Self::index_entry_size()];
+            let node_hash = node_slice.get_u64();
+            let entry_offset = node_slice.get_u32() as usize;
+            let next = node_slice.get_u32();
+            if node_hash == hash && entry_offset + 8 <= self.data_end {
+                let mut header = &self.buffer[entry_offset..entry_offset + 8];
+                let key_len = header.get_u32() as usize;
+                let value_len = header.get_u32() as usize;
+                let entry_end = entry_offset.checked_add(Self::entry_size(key_len, value_len))?;
+                if entry_end <= self.data_end
+                    && self.buffer[entry_offset + 8..entry_offset + 8 + key_len] == *key
+                {
+                    return Some(entry_offset);
+                }
+            }
+            node_off = next;
+        }
+        None
+    }
+
     fn bucket_head(&self, bucket: usize) -> u32 {
         let pos = self.bucket_base + bucket * 4;
         let mut slice = &self.buffer[pos..pos + 4];
@@ -338,20 +367,50 @@ impl Memtable for HashMemtable {
         self.data_end
     }
 
-    fn write_data_since(
+    fn write_data_range(
         &self,
-        offset: usize,
+        start_offset: usize,
+        end_offset: usize,
         writer: &mut dyn crate::file::SequentialWriteFile,
     ) -> Result<usize> {
-        if offset > self.data_end {
+        if start_offset > end_offset || end_offset > self.data_end {
             return Err(Error::InvalidState(format!(
-                "invalid memtable data offset {} > {}",
-                offset, self.data_end
+                "invalid hash memtable data range [{}, {}) with end {}",
+                start_offset, end_offset, self.data_end
             )));
         }
-        let bytes = &self.buffer[offset..self.data_end];
+        let bytes = &self.buffer[start_offset..end_offset];
         writer.write(bytes)?;
         Ok(bytes.len())
+    }
+
+    fn try_replace_latest_ref(
+        &mut self,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+        sealed_data_end: usize,
+    ) -> Result<bool> {
+        let key_len = key.encoded_len();
+        let mut encoded_key = vec![0; key_len];
+        encode_key_ref_into(key, &mut encoded_key.as_mut_slice());
+        let Some(entry_offset) = self.latest_entry_offset(&encoded_key) else {
+            return Ok(false);
+        };
+        if entry_offset < sealed_data_end {
+            return Ok(false);
+        }
+        let mut header = &self.buffer[entry_offset..entry_offset + 8];
+        let stored_key_len = header.get_u32() as usize;
+        let stored_value_len = header.get_u32() as usize;
+        let value_len = value.encoded_len(num_columns);
+        if stored_key_len != key_len || stored_value_len != value_len {
+            return Ok(false);
+        }
+        let value_start = entry_offset + 8 + stored_key_len;
+        let mut value_buf = &mut self.buffer[value_start..value_start + stored_value_len];
+        encode_value_ref_into(value, num_columns, &mut value_buf);
+        Ok(true)
     }
 
     /// Returns an iterator over all key-value pairs ordered by key bytes ascending.
@@ -410,6 +469,28 @@ impl Drop for HashMemtable {
 mod tests {
     use super::*;
     use crate::iterator::KvIterator;
+    use crate::r#type::{RefColumn, ValueType};
+
+    #[test]
+    fn inplace_replace_latest_requires_equal_length_and_unsealed_entry() {
+        let mut mem = HashMemtable::with_capacity(1024);
+        let key = RefKey::new(0, b"key");
+        let old = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"old"))]);
+        let new = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"new"))]);
+        let shorter = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"x"))]);
+        mem.put_ref(&key, &old, 1).unwrap();
+        let offset = mem.data_offset();
+        assert!(mem.try_replace_latest_ref(&key, &new, 1, 0).unwrap());
+        assert_eq!(mem.data_offset(), offset);
+        let mut encoded_key = vec![0; key.encoded_len()];
+        encode_key_ref_into(&key, &mut encoded_key.as_mut_slice());
+        let mut expected_value = vec![0; new.encoded_len(1)];
+        encode_value_ref_into(&new, 1, &mut expected_value.as_mut_slice());
+        assert_eq!(mem.get(&encoded_key), Some(expected_value.as_slice()));
+        assert!(!mem.try_replace_latest_ref(&key, &shorter, 1, 0).unwrap());
+        assert_eq!(mem.data_offset(), offset);
+        assert!(!mem.try_replace_latest_ref(&key, &new, 1, offset).unwrap());
+    }
 
     #[test]
     fn put_and_get() {

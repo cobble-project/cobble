@@ -605,20 +605,58 @@ impl Memtable for SkiplistMemtable {
         self.data_end
     }
 
-    fn write_data_since(
+    fn write_data_range(
         &self,
-        offset: usize,
+        start_offset: usize,
+        end_offset: usize,
         writer: &mut dyn crate::file::SequentialWriteFile,
     ) -> Result<usize> {
-        if offset > self.data_end {
+        if start_offset > end_offset || end_offset > self.data_end {
             return Err(Error::InvalidState(format!(
-                "invalid memtable data offset {} > {}",
-                offset, self.data_end
+                "invalid skiplist memtable data range [{}, {}) with end {}",
+                start_offset, end_offset, self.data_end
             )));
         }
-        let bytes = &self.buffer[offset..self.data_end];
+        let bytes = &self.buffer[start_offset..end_offset];
         writer.write(bytes)?;
         Ok(bytes.len())
+    }
+
+    fn try_replace_latest_ref(
+        &mut self,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+        sealed_data_end: usize,
+    ) -> Result<bool> {
+        let key_len = key.encoded_len();
+        let mut encoded_key = vec![0; key_len];
+        encode_key_ref_into(key, &mut encoded_key.as_mut_slice());
+        let node = self.lower_bound_node(&encoded_key);
+        if node == NULL_OFFSET || self.node_key(node) != Some(encoded_key.as_slice()) {
+            return Ok(false);
+        }
+        let Some(entry_offset) = self.node_entry_offset(node) else {
+            return Ok(false);
+        };
+        if entry_offset < sealed_data_end {
+            return Ok(false);
+        }
+        let Some(stored_key_len) = self.node_key_len(node) else {
+            return Ok(false);
+        };
+        let Some(stored_value_len) = self.read_u32_le(entry_offset + 4) else {
+            return Ok(false);
+        };
+        let stored_value_len = stored_value_len as usize;
+        let value_len = value.encoded_len(num_columns);
+        if stored_key_len != key_len || stored_value_len != value_len {
+            return Ok(false);
+        }
+        let value_start = entry_offset + 8 + stored_key_len;
+        let mut value_buf = &mut self.buffer[value_start..value_start + stored_value_len];
+        encode_value_ref_into(value, num_columns, &mut value_buf);
+        Ok(true)
     }
 
     fn iter(&self) -> Self::KvIter<'_> {
@@ -667,6 +705,28 @@ impl Drop for SkiplistMemtable {
 mod tests {
     use super::*;
     use crate::iterator::KvIterator;
+    use crate::r#type::{RefColumn, ValueType};
+
+    #[test]
+    fn inplace_replace_latest_requires_equal_length_and_unsealed_entry() {
+        let mut mem = SkiplistMemtable::with_capacity(1024);
+        let key = RefKey::new(0, b"key");
+        let old = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"old"))]);
+        let new = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"new"))]);
+        let shorter = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"x"))]);
+        mem.put_ref(&key, &old, 1).unwrap();
+        let offset = mem.data_offset();
+        assert!(mem.try_replace_latest_ref(&key, &new, 1, 0).unwrap());
+        assert_eq!(mem.data_offset(), offset);
+        let mut encoded_key = vec![0; key.encoded_len()];
+        encode_key_ref_into(&key, &mut encoded_key.as_mut_slice());
+        let mut expected_value = vec![0; new.encoded_len(1)];
+        encode_value_ref_into(&new, 1, &mut expected_value.as_mut_slice());
+        assert_eq!(mem.get(&encoded_key), Some(expected_value.as_slice()));
+        assert!(!mem.try_replace_latest_ref(&key, &shorter, 1, 0).unwrap());
+        assert_eq!(mem.data_offset(), offset);
+        assert!(!mem.try_replace_latest_ref(&key, &new, 1, offset).unwrap());
+    }
 
     fn assert_compare_matches_full_key_ordering(keys: &[&[u8]]) {
         let mut mem = SkiplistMemtable::with_capacity(8192);

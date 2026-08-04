@@ -133,33 +133,44 @@ impl Memtable for VecMemtable {
         self.data_end
     }
 
-    fn write_data_since(
+    fn write_data_range(
         &self,
-        offset: usize,
+        start_offset: usize,
+        end_offset: usize,
         writer: &mut dyn crate::file::SequentialWriteFile,
     ) -> Result<usize> {
-        if offset > self.data_end {
+        if start_offset > end_offset || end_offset > self.data_end {
             return Err(Error::InvalidState(format!(
-                "invalid memtable data offset {} > {}",
-                offset, self.data_end
+                "invalid vec memtable data range [{}, {}) with end {}",
+                start_offset, end_offset, self.data_end
             )));
         }
-        if offset == self.data_end {
+        if start_offset == end_offset {
             return Ok(0);
         }
         let start_idx = self
             .entry_data_offsets
             .iter()
-            .position(|entry_offset| *entry_offset >= offset)
+            .position(|entry_offset| *entry_offset >= start_offset)
             .ok_or_else(|| Error::InvalidState("missing memtable data offset".to_string()))?;
-        if self.entry_data_offsets[start_idx] != offset {
+        if self.entry_data_offsets[start_idx] != start_offset {
             return Err(Error::InvalidState(format!(
-                "unaligned memtable data offset {}",
-                offset
+                "unaligned vec memtable data start {}",
+                start_offset
             )));
         }
+        let end_idx = if end_offset == self.data_end {
+            self.entries.len()
+        } else {
+            self.entry_data_offsets
+                .iter()
+                .position(|entry_offset| *entry_offset == end_offset)
+                .ok_or_else(|| {
+                    Error::InvalidState(format!("unaligned vec memtable data end {}", end_offset))
+                })?
+        };
         let mut written = 0usize;
-        for (key, value) in self.entries.iter().skip(start_idx) {
+        for (key, value) in self.entries[start_idx..end_idx].iter() {
             let key_len = (key.len() as u32).to_le_bytes();
             let value_len = (value.len() as u32).to_le_bytes();
             writer.write(&key_len)?;
@@ -172,6 +183,46 @@ impl Memtable for VecMemtable {
                 .saturating_add(value.len());
         }
         Ok(written)
+    }
+
+    fn try_replace_latest_ref(
+        &mut self,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+        sealed_data_end: usize,
+    ) -> Result<bool> {
+        let Some((last_key, last_value)) = self.entries.last_mut() else {
+            return Ok(false);
+        };
+        let entry_start = *self
+            .entry_data_offsets
+            .last()
+            .expect("vec memtable entries and offsets must match");
+        if entry_start < sealed_data_end {
+            return Ok(false);
+        }
+        let key_len = key.encoded_len();
+        if last_key.len() != key_len {
+            return Ok(false);
+        }
+        let mut encoded_key = vec![0; key_len];
+        encode_key_ref_into(key, &mut encoded_key.as_mut_slice());
+        if last_key.as_ref() != encoded_key {
+            return Ok(false);
+        }
+        let value_len = value.encoded_len(num_columns);
+        if value_len > last_value.len() {
+            return Ok(false);
+        }
+        let mut encoded_value = vec![0; value_len];
+        encode_value_ref_into(value, num_columns, &mut encoded_value.as_mut_slice());
+        let old_entry_len = Self::entry_size(last_key.len(), last_value.len());
+        let new_entry_len = Self::entry_size(last_key.len(), value_len);
+        *last_value = Bytes::from(encoded_value);
+        self.data_end = self.data_end - old_entry_len + new_entry_len;
+        self.used_bytes = self.used_bytes - old_entry_len + new_entry_len;
+        Ok(true)
     }
 
     fn iter(&self) -> Self::KvIter<'_> {
@@ -221,6 +272,30 @@ impl Drop for VecMemtable {
 mod tests {
     use super::*;
     use crate::iterator::KvIterator;
+    use crate::r#type::{RefColumn, RefKey, RefValue, ValueType};
+
+    #[test]
+    fn inplace_replace_last_entry_can_shrink_but_not_rewrite_an_older_entry() {
+        let mut mem = VecMemtable::with_capacity(1024);
+        let key = RefKey::new(0, b"key");
+        let old = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"long"))]);
+        let short = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"x"))]);
+        mem.put_ref(&key, &old, 1).unwrap();
+        let before = mem.data_offset();
+        assert!(mem.try_replace_latest_ref(&key, &short, 1, 0).unwrap());
+        assert!(mem.data_offset() < before);
+        let mut encoded_key = vec![0; key.encoded_len()];
+        encode_key_ref_into(&key, &mut encoded_key.as_mut_slice());
+        let mut expected_value = vec![0; short.encoded_len(1)];
+        encode_value_ref_into(&short, 1, &mut expected_value.as_mut_slice());
+        assert_eq!(mem.get(&encoded_key), Some(expected_value.as_slice()));
+        let other_key = RefKey::new(0, b"other");
+        let other = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"value"))]);
+        mem.put_ref(&other_key, &other, 1).unwrap();
+        let after_append = mem.data_offset();
+        assert!(!mem.try_replace_latest_ref(&key, &old, 1, 0).unwrap());
+        assert_eq!(mem.data_offset(), after_append);
+    }
 
     #[test]
     fn put_and_get() {

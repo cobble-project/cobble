@@ -35,11 +35,21 @@ pub(crate) trait Memtable {
     fn remaining_capacity(&self) -> usize;
     fn is_empty(&self) -> bool;
     fn data_offset(&self) -> usize;
-    fn write_data_since(
+    /// Writes the complete encoded entries in `[start_offset, end_offset)`.
+    /// Callers must supply entry boundaries in the memtable's append stream.
+    fn write_data_range(
         &self,
-        offset: usize,
+        start_offset: usize,
+        end_offset: usize,
         writer: &mut dyn crate::file::SequentialWriteFile,
     ) -> Result<usize>;
+    fn try_replace_latest_ref(
+        &mut self,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+        sealed_data_end: usize,
+    ) -> Result<bool>;
 
     fn iter(&self) -> Self::KvIter<'_>;
 
@@ -212,15 +222,36 @@ impl Memtable for MemtableImpl {
         }
     }
 
-    fn write_data_since(
+    fn write_data_range(
         &self,
-        offset: usize,
+        start_offset: usize,
+        end_offset: usize,
         writer: &mut dyn crate::file::SequentialWriteFile,
     ) -> Result<usize> {
         match self {
-            Self::Hash(memtable) => memtable.write_data_since(offset, writer),
-            Self::Skiplist(memtable) => memtable.write_data_since(offset, writer),
-            Self::Vec(memtable) => memtable.write_data_since(offset, writer),
+            Self::Hash(memtable) => memtable.write_data_range(start_offset, end_offset, writer),
+            Self::Skiplist(memtable) => memtable.write_data_range(start_offset, end_offset, writer),
+            Self::Vec(memtable) => memtable.write_data_range(start_offset, end_offset, writer),
+        }
+    }
+
+    fn try_replace_latest_ref(
+        &mut self,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+        sealed_data_end: usize,
+    ) -> Result<bool> {
+        match self {
+            Self::Hash(memtable) => {
+                memtable.try_replace_latest_ref(key, value, num_columns, sealed_data_end)
+            }
+            Self::Skiplist(memtable) => {
+                memtable.try_replace_latest_ref(key, value, num_columns, sealed_data_end)
+            }
+            Self::Vec(memtable) => {
+                memtable.try_replace_latest_ref(key, value, num_columns, sealed_data_end)
+            }
         }
     }
 

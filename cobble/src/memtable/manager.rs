@@ -255,6 +255,7 @@ struct FlushJob {
 
 struct ActiveMemtableSnapshotJob {
     active: Arc<RwLock<ActiveMemtable>>,
+    capture_end: usize,
 }
 
 struct ActiveMemtableSnapshotWriteResult {
@@ -281,6 +282,15 @@ fn validate_ref_value_for_memtable(value: &RefValue<'_>, num_columns: usize) -> 
     Ok(())
 }
 
+fn is_full_terminal_ref_value(value: &RefValue<'_>, num_columns: usize) -> bool {
+    num_columns > 0
+        && value.columns().get(..num_columns).is_some_and(|columns| {
+            columns
+                .iter()
+                .all(|column| column.is_some_and(|column| column.value_type.is_terminal()))
+        })
+}
+
 struct FlushTreeBuilder {
     scope: LSMTreeScope,
     file_id: u64,
@@ -298,6 +308,10 @@ pub(crate) struct SnapshotCompletion {
 pub(crate) struct ActiveMemtable {
     id: Uuid,
     schema: Arc<Schema>,
+    /// Monotonic end offset captured by durable snapshots or in-process read snapshots. Entries
+    /// before this offset are immutable because published/in-flight snapshot segments or scan
+    /// iterators can reference their bytes.
+    sealed_data_end: usize,
     contents: ActiveMemtableContents,
 }
 
@@ -320,6 +334,35 @@ impl ActiveMemtable {
         match &mut self.contents {
             ActiveMemtableContents::Writable(memtable) => Some(memtable),
             ActiveMemtableContents::Frozen(_) | ActiveMemtableContents::Empty => None,
+        }
+    }
+
+    fn seal_data_end(&mut self, end: usize) {
+        self.sealed_data_end = self.sealed_data_end.max(end);
+    }
+
+    fn seal_read_snapshot_data(&mut self) {
+        if let Some(memtable) = self.readable_memtable() {
+            self.seal_data_end(memtable.data_offset());
+        }
+    }
+
+    fn put_ref_or_replace(
+        &mut self,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+    ) -> Result<()> {
+        let sealed_data_end = self.sealed_data_end;
+        let memtable = self
+            .writable_memtable()
+            .expect("active memtable is writable");
+        if is_full_terminal_ref_value(value, num_columns)
+            && memtable.try_replace_latest_ref(key, value, num_columns, sealed_data_end)?
+        {
+            Ok(())
+        } else {
+            memtable.put_ref(key, value, num_columns)
         }
     }
 
@@ -1316,6 +1359,7 @@ impl MemtableManager {
                                 snapshot_job.snapshot_id,
                                 snapshot.suggested_base_snapshot_id,
                                 &active_snapshot_job.active,
+                                active_snapshot_job.capture_end,
                                 &snapshot_job.manager,
                                 &file_manager_clone,
                             ),
@@ -1407,6 +1451,7 @@ impl MemtableManager {
         snapshot_id: u64,
         base_snapshot_id: Option<u64>,
         active: &Arc<RwLock<ActiveMemtable>>,
+        capture_end: usize,
         snapshot_manager: &SnapshotManager,
         file_manager: &Arc<FileManager>,
     ) -> Result<ActiveMemtableSnapshotWriteResult> {
@@ -1421,7 +1466,14 @@ impl MemtableManager {
             memtable_type,
             &memtable_id,
         );
-        let data_end_offset = memtable.data_offset();
+        if capture_end > memtable.data_offset() {
+            return Err(InvalidState(format!(
+                "active snapshot capture end {} exceeds memtable end {}",
+                capture_end,
+                memtable.data_offset()
+            )));
+        }
+        let data_end_offset = capture_end;
         let inherited_data_end = segments.last().map_or(0, |segment| segment.end_offset);
         let inherited_data_end = usize::try_from(inherited_data_end).unwrap_or(usize::MAX);
         let data_start_offset = if inherited_data_end <= data_end_offset {
@@ -1433,7 +1485,7 @@ impl MemtableManager {
         if data_start_offset < data_end_offset {
             let path = snapshot_active_data_relative_path(snapshot_id);
             let mut writer = file_manager.create_metadata_file(&path)?;
-            memtable.write_data_since(data_start_offset, &mut writer)?;
+            memtable.write_data_range(data_start_offset, data_end_offset, &mut writer)?;
             writer.close()?;
             segments.push(ActiveMemtableSnapshotData {
                 path,
@@ -1501,6 +1553,7 @@ impl MemtableManager {
             let active = Arc::new(RwLock::new(ActiveMemtable {
                 id: memtable_id,
                 schema,
+                sealed_data_end: 0,
                 contents: ActiveMemtableContents::Writable(memtable),
             }));
             db_state.cas_mutate(snapshot.seq_id, |db_state, snapshot| {
@@ -1623,12 +1676,7 @@ impl MemtableManager {
                 self.handle_memtable_put_error(&err, active, key, value)?;
                 continue;
             }
-            let put_result = {
-                let memtable = active
-                    .writable_memtable()
-                    .expect("active memtable is writable");
-                memtable.put_ref(key, value, num_columns)
-            };
+            let put_result = active.put_ref_or_replace(key, value, num_columns);
             match put_result {
                 Ok(()) => return Ok(()),
                 Err(err) => {
@@ -1690,10 +1738,7 @@ impl MemtableManager {
                 active.schema.num_columns_in_family(key.column_family()),
                 Some(num_columns)
             );
-            let put_result = active
-                .writable_memtable()
-                .expect("active memtable is writable")
-                .put_ref(&key, &value, num_columns);
+            let put_result = active.put_ref_or_replace(&key, &value, num_columns);
             if let Err(err) = put_result {
                 self.handle_memtable_put_error(&err, active, &key, &value)?;
                 self.put(&key, &value)?;
@@ -1908,7 +1953,8 @@ impl MemtableManager {
         let mut deeper_collected_limits_allowed = true;
         if let Some(active) = &snapshot.active {
             let source_schema = {
-                let active_guard = active.read().unwrap();
+                let mut active_guard = active.write().unwrap();
+                active_guard.seal_read_snapshot_data();
                 Arc::clone(&active_guard.schema)
             };
             let row_filter = build_memtable_row_filter(
@@ -2119,13 +2165,16 @@ impl MemtableManager {
         if snapshot.is_some()
             && let Some(active) = snapshot_state.active.as_ref()
         {
-            let inner_active = active.read().unwrap();
+            let mut inner_active = active.write().unwrap();
             if let Some(memtable) = inner_active.readable_memtable()
                 && !memtable.is_empty()
                 && self.should_use_active_incremental_snapshot(memtable)
             {
+                let capture_end = memtable.data_offset();
+                inner_active.seal_data_end(capture_end);
                 active_memtable_snapshot = Some(ActiveMemtableSnapshotJob {
                     active: Arc::clone(active),
+                    capture_end,
                 });
             }
         }
@@ -2807,6 +2856,251 @@ mod tests {
         memtable
     }
 
+    fn active_data_offset(manager: &MemtableManager) -> usize {
+        manager
+            .db_state
+            .load()
+            .active
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .readable_memtable()
+            .unwrap()
+            .data_offset()
+    }
+
+    #[test]
+    fn inplace_update_requires_full_terminal_row() {
+        let terminal = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"value"))]);
+        let merge = RefValue::new(vec![Some(RefColumn::new(ValueType::Merge, b"value"))]);
+        let partial = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"value")), None]);
+        assert!(is_full_terminal_ref_value(&terminal, 1));
+        assert!(!is_full_terminal_ref_value(&merge, 1));
+        assert!(!is_full_terminal_ref_value(&partial, 2));
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn active_snapshot_capture_end_excludes_later_tail_and_restores() {
+        let root = "/tmp/memtable_snapshot_capture_end";
+        let _ = std::fs::remove_dir_all(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let metrics = Arc::new(MetricsManager::new("memtable-capture-end-test"));
+        let file_manager = Arc::new(FileManager::with_defaults(fs, metrics).unwrap());
+        let schema_manager = Arc::new(SchemaManager::new(1));
+        let snapshot_manager = SnapshotManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&schema_manager),
+            Arc::new(DbLifecycle::new_open()),
+            None,
+            false,
+            false,
+            vec![0..=u16::MAX],
+        );
+        let active = Arc::new(RwLock::new(ActiveMemtable {
+            id: Uuid::new_v4(),
+            schema: schema_manager.latest_schema(),
+            sealed_data_end: 0,
+            contents: ActiveMemtableContents::Writable(MemtableImpl::Vec(
+                VecMemtable::with_capacity(1024),
+            )),
+        }));
+        let first_key = RefKey::new(0, b"first");
+        let first_value = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"one"))]);
+        let replacement_value = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"two"))]);
+        let capture_end = {
+            let mut active = active.write().unwrap();
+            active
+                .writable_memtable()
+                .unwrap()
+                .put_ref(&first_key, &first_value, 1)
+                .unwrap();
+            let capture_end = active.readable_memtable().unwrap().data_offset();
+            active.seal_data_end(capture_end);
+            let sealed_data_end = active.sealed_data_end;
+            assert!(
+                !active
+                    .writable_memtable()
+                    .unwrap()
+                    .try_replace_latest_ref(&first_key, &replacement_value, 1, sealed_data_end)
+                    .unwrap()
+            );
+            active
+                .writable_memtable()
+                .unwrap()
+                .put_ref(&first_key, &replacement_value, 1)
+                .unwrap();
+            capture_end
+        };
+        let snapshot_write = MemtableManager::write_active_memtable_snapshot_data(
+            1,
+            None,
+            &active,
+            capture_end,
+            &snapshot_manager,
+            &file_manager,
+        )
+        .unwrap();
+        assert_eq!(snapshot_write.active_data[0].end_offset, capture_end as u64);
+        let restored = decode_active_snapshot_segments_into_memtable(
+            &file_manager,
+            &snapshot_write.active_data,
+        )
+        .unwrap();
+        let mut restored_value = Bytes::copy_from_slice(
+            restored
+                .get(&encode_scan_key(0, 0, b"first"))
+                .expect("captured entry is restored"),
+        );
+        let restored_value = decode_value(&mut restored_value, 1).unwrap();
+        assert_eq!(
+            restored_value.columns()[0]
+                .as_ref()
+                .unwrap()
+                .data()
+                .as_ref(),
+            b"one"
+        );
+        assert_eq!(restored.data_offset(), capture_end);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn incremental_snapshot_scheduling_seals_active_before_later_writes() {
+        let root = "/tmp/memtable_incremental_snapshot_seal";
+        let _ = std::fs::remove_dir_all(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", root))
+            .unwrap();
+        let metrics = Arc::new(MetricsManager::new("memtable-snapshot-seal-test"));
+        let file_manager = Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics)).unwrap());
+        let db_lifecycle = Arc::new(DbLifecycle::new_open());
+        let schema_manager = Arc::new(SchemaManager::new(1));
+        let lsm_tree = Arc::new(LSMTree::with_state(
+            Arc::new(DbStateHandle::new()),
+            Arc::clone(&metrics),
+        ));
+        let snapshot_manager = SnapshotManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&schema_manager),
+            Arc::clone(&db_lifecycle),
+            None,
+            false,
+            false,
+            vec![0..=u16::MAX],
+        );
+        let manager = MemtableManager::new(
+            file_manager,
+            lsm_tree,
+            MemtableManagerOptions {
+                memtable_capacity: 4096,
+                buffer_count: 2,
+                num_columns: 1,
+                write_stall_limit: 8,
+                schema_manager: Some(schema_manager),
+                active_memtable_incremental_snapshot_ratio: 1.0,
+                db_lifecycle: Some(db_lifecycle),
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap();
+        manager.open().unwrap();
+        let key = RefKey::new(0, b"key");
+        let old = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"old"))]);
+        let replacement = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"new"))]);
+        manager.put(&key, &old).unwrap();
+        let capture_end = active_data_offset(&manager);
+
+        manager
+            .create_snapshot(snapshot_manager.clone(), None)
+            .unwrap();
+        let active = manager.db_state.load().active.clone().unwrap();
+        assert_eq!(active.read().unwrap().sealed_data_end, capture_end);
+        manager.put(&key, &replacement).unwrap();
+        assert!(active_data_offset(&manager) > capture_end);
+
+        assert!(manager.wait_for_flushes().iter().all(Result::is_ok));
+        assert!(snapshot_manager.wait_for_materialization(Duration::from_secs(5)));
+        manager.close().unwrap();
+        snapshot_manager.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn manager_inplace_updates_only_full_terminal_rows() {
+        for memtable_type in [
+            MemtableType::Hash,
+            MemtableType::Skiplist,
+            MemtableType::Vec,
+        ] {
+            cleanup_test_root();
+            let registry = FileSystemRegistry::new();
+            let fs = registry
+                .get_or_register("file:///tmp/memtable_manager_test")
+                .unwrap();
+            let metrics = Arc::new(MetricsManager::new("memtable-inplace-update-test"));
+            let file_manager =
+                Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics)).unwrap());
+            let lsm_tree = Arc::new(LSMTree::with_state(
+                Arc::new(DbStateHandle::new()),
+                Arc::clone(&metrics),
+            ));
+            let schema_manager = Arc::new(SchemaManager::new(2));
+            let manager = MemtableManager::new(
+                file_manager,
+                lsm_tree,
+                MemtableManagerOptions {
+                    memtable_capacity: 4096,
+                    buffer_count: 2,
+                    memtable_type,
+                    num_columns: 2,
+                    write_stall_limit: 8,
+                    schema_manager: Some(schema_manager),
+                    ..MemtableManagerOptions::default()
+                },
+            )
+            .unwrap();
+            manager.open().unwrap();
+
+            let key = RefKey::new(0, b"key");
+            let old = RefValue::new(vec![
+                Some(RefColumn::new(ValueType::Put, b"aa")),
+                Some(RefColumn::new(ValueType::Put, b"bb")),
+            ]);
+            let replacement = RefValue::new(vec![
+                Some(RefColumn::new(ValueType::Put, b"cc")),
+                Some(RefColumn::new(ValueType::Put, b"dd")),
+            ]);
+            manager.put(&key, &old).unwrap();
+            let offset = active_data_offset(&manager);
+            manager.put(&key, &replacement).unwrap();
+            let replaced_offset = active_data_offset(&manager);
+            assert_eq!(replaced_offset, offset, "{memtable_type:?}");
+
+            let merge = RefValue::new(vec![
+                Some(RefColumn::new(ValueType::Merge, b"ee")),
+                Some(RefColumn::new(ValueType::Put, b"ff")),
+            ]);
+            manager.put(&key, &merge).unwrap();
+            let merge_offset = active_data_offset(&manager);
+            assert!(merge_offset > replaced_offset, "{memtable_type:?}");
+
+            let partial = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"gg")), None]);
+            manager.put(&key, &partial).unwrap();
+            let partial_offset = active_data_offset(&manager);
+            assert!(partial_offset > merge_offset, "{memtable_type:?}");
+            manager.close().unwrap();
+        }
+        cleanup_test_root();
+    }
+
     #[test]
     fn get_all_until_stops_before_older_active_and_immutable_values() {
         let registry = FileSystemRegistry::new();
@@ -2830,6 +3124,7 @@ mod tests {
             active: Some(Arc::new(RwLock::new(ActiveMemtable {
                 id: Uuid::new_v4(),
                 schema: Arc::clone(&schema),
+                sealed_data_end: 0,
                 contents: ActiveMemtableContents::Writable(build_test_memtable(
                     MemtableType::Skiplist,
                     &[
@@ -2966,6 +3261,7 @@ mod tests {
         let active = Arc::new(RwLock::new(ActiveMemtable {
             id: Uuid::new_v4(),
             schema,
+            sealed_data_end: 0,
             contents: ActiveMemtableContents::Writable(build_test_memtable(
                 MemtableType::Skiplist,
                 &[
@@ -3237,6 +3533,7 @@ mod tests {
         let active = Arc::new(RwLock::new(ActiveMemtable {
             id: Uuid::new_v4(),
             schema: Arc::clone(&schema),
+            sealed_data_end: 0,
             contents: ActiveMemtableContents::Writable(build_test_memtable(
                 MemtableType::Hash,
                 &[
@@ -3279,7 +3576,7 @@ mod tests {
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: Vec::new() }),
             vlog_version: crate::vlog::VlogVersion::new(),
-            active: Some(active),
+            active: Some(Arc::clone(&active)),
             immutables,
             truncation_cursors: crate::db_state::new_truncation_cursors(),
             suggested_base_snapshot_id: None,
@@ -3298,6 +3595,12 @@ mod tests {
                 Some(1),
             )
             .unwrap();
+        let active_guard = active.read().unwrap();
+        assert_eq!(
+            active_guard.sealed_data_end,
+            active_guard.readable_memtable().unwrap().data_offset()
+        );
+        drop(active_guard);
         let mut iter = DbIterator::new(
             memtable_iters,
             Vec::new(),
@@ -3857,6 +4160,12 @@ mod tests {
             1,
             None,
             &active,
+            active
+                .read()
+                .unwrap()
+                .readable_memtable()
+                .unwrap()
+                .data_offset(),
             &snapshot_manager,
             &source_file_manager,
         )
@@ -4008,6 +4317,12 @@ mod tests {
             1,
             None,
             &active,
+            active
+                .read()
+                .unwrap()
+                .readable_memtable()
+                .unwrap()
+                .data_offset(),
             &snapshot_manager,
             &source_file_manager,
         )
