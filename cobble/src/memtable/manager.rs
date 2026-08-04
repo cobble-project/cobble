@@ -118,7 +118,6 @@ pub(crate) struct MemtableManager {
     schema_manager: Arc<SchemaManager>,
     memtable_capacity: usize,
     total_budget: i64,
-    memtable_type: MemtableType,
     reclaimer: MemtableReclaimer,
     write_stall_limit: usize,
     flush_tx: Mutex<Option<mpsc::Sender<FlushJob>>>,
@@ -129,6 +128,7 @@ pub(crate) struct MemtableManager {
 }
 
 struct MemtableManagerState {
+    memtable_type: MemtableType,
     budget: i64,
     allow_make_active_buffer_in_reclaimer: bool,
     in_flight: usize,
@@ -945,6 +945,7 @@ impl MemtableManager {
             (options.buffer_count as u64).saturating_mul(options.memtable_capacity as u64);
         let total_budget = total_budget.min(i64::MAX as u64) as i64;
         let state = MemtableManagerState {
+            memtable_type: options.memtable_type,
             budget: total_budget,
             allow_make_active_buffer_in_reclaimer: true,
             in_flight: 0,
@@ -979,7 +980,6 @@ impl MemtableManager {
             Arc::clone(&db_state),
             Arc::clone(&schema_manager),
             options.memtable_capacity,
-            options.memtable_type,
         );
         let vlog_store = options.vlog_store.unwrap_or_else(|| {
             Arc::new(VlogStore::new(
@@ -1018,7 +1018,6 @@ impl MemtableManager {
             schema_manager,
             memtable_capacity: options.memtable_capacity,
             total_budget,
-            memtable_type: options.memtable_type,
             reclaimer,
             write_stall_limit: options.write_stall_limit,
             flush_tx: Mutex::new(Some(flush_tx)),
@@ -1035,14 +1034,128 @@ impl MemtableManager {
         Arc::clone(&self.db_state)
     }
 
+    /// Changes the type used for subsequently created active memtables.
+    ///
+    /// Rotation remains serialized, but normal writers do not take the rotation lock. Empty
+    /// active replacement therefore removes the old active from `DbState` while holding both the
+    /// state and active write locks; writers that already retained its `Arc` observe `Empty` and
+    /// retry against the replacement. When `flush_current` is false, this only updates the target
+    /// in manager state; the current active table is untouched until a later natural rotation.
+    pub(crate) fn switch_memtable_type(
+        &self,
+        target_type: MemtableType,
+        flush_current: bool,
+    ) -> Result<()> {
+        self.db_lifecycle.ensure_open()?;
+        if !flush_current {
+            let mut state = self.state.lock().unwrap();
+            state.memtable_type = target_type;
+            return Ok(());
+        }
+
+        let _rotation_guard = self.rotation_lock.lock().unwrap();
+
+        let old_empty_memtable = {
+            let mut state = self.state.lock().unwrap();
+            while state.restore_in_progress {
+                state = self.flush_done.wait(state).unwrap();
+            }
+            state.memtable_type = target_type;
+
+            let db_state_guard = self.db_state.lock();
+            let snapshot = self.db_state.load();
+            let Some(active) = snapshot.active.as_ref() else {
+                drop(db_state_guard);
+                let memtable_type = state.memtable_type;
+                Self::make_active_buffer(
+                    &mut state,
+                    &self.db_state,
+                    &self.schema_manager,
+                    self.memtable_capacity,
+                    memtable_type,
+                    &self.reclaimer,
+                    self.total_budget,
+                    false,
+                );
+                return Ok(());
+            };
+            let mut active = active.write().unwrap();
+            let Some(memtable) = active.readable_memtable() else {
+                return Err(InvalidState("active memtable is missing".to_string()));
+            };
+            if !memtable.is_empty() {
+                // `flush_current` rotates every non-empty active, even when a prior oversized
+                // write fallback already made this particular table the target type.
+                drop(active);
+                drop(db_state_guard);
+                drop(state);
+                self.flush_active_with_auto_snapshot(FlushCause::Manual)?;
+                return Ok(());
+            }
+            if memtable.memtable_type() == target_type {
+                return Ok(());
+            }
+
+            let old_memtable = active
+                .take_empty_writable()
+                .ok_or_else(|| InvalidState("active memtable is not writable".to_string()))?;
+            self.db_state
+                .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
+                    Some(DbState {
+                        seq_id: db_state.allocate_seq_id(),
+                        bucket_ranges: snapshot.bucket_ranges.clone(),
+                        multi_lsm_version: snapshot.multi_lsm_version.clone(),
+                        vlog_version: snapshot.vlog_version.clone(),
+                        active: None,
+                        immutables: snapshot.immutables.clone(),
+                        truncation_cursors: snapshot.truncation_cursors.clone(),
+                        suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+                    })
+                });
+            drop(active);
+            drop(db_state_guard);
+            drop(state);
+            old_memtable
+        };
+        // Dropping invokes the reclaimer, which observes the latest type from manager state and
+        // creates the replacement without holding any switch locks.
+        drop(old_empty_memtable);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_memtable_type(&self) -> Option<MemtableType> {
+        let snapshot = self.db_state.load();
+        let active = snapshot.active.as_ref()?.read().unwrap();
+        active.readable_memtable().map(MemtableImpl::memtable_type)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_active_memtable_type(&self) -> Result<MemtableType> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            self.db_lifecycle.ensure_open()?;
+            if let Some(memtable_type) = self.active_memtable_type() {
+                return Ok(memtable_type);
+            }
+            state = self.buffer_ready.wait(state).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_memtable_type(&self) -> MemtableType {
+        self.state.lock().unwrap().memtable_type
+    }
+
     pub(crate) fn open(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
+        let memtable_type = state.memtable_type;
         Self::make_active_buffer(
             &mut state,
             &self.db_state,
             &self.schema_manager,
             self.memtable_capacity,
-            self.memtable_type,
+            memtable_type,
             &self.reclaimer,
             self.total_budget,
             false,
@@ -1302,11 +1415,7 @@ impl MemtableManager {
         let memtable = active_guard
             .readable_memtable()
             .ok_or_else(|| InvalidState("Active memtable missing".to_string()))?;
-        let memtable_type = match memtable {
-            MemtableImpl::Hash(_) => MemtableType::Hash,
-            MemtableImpl::Skiplist(_) => MemtableType::Skiplist,
-            MemtableImpl::Vec(_) => MemtableType::Vec,
-        };
+        let memtable_type = memtable.memtable_type();
         let mut segments = snapshot_manager.active_memtable_snapshot_segments(
             base_snapshot_id,
             memtable_type,
@@ -1418,7 +1527,6 @@ impl MemtableManager {
         db_state: Arc<DbStateHandle>,
         schema_manager: Arc<SchemaManager>,
         memtable_capacity: usize,
-        memtable_type: MemtableType,
     ) -> MemtableReclaimer {
         let state = Arc::downgrade(&state);
         let buffer_ready = Arc::downgrade(&buffer_ready);
@@ -1441,14 +1549,14 @@ impl MemtableManager {
             let mut guard = state.lock().unwrap();
             let returned_budget = returned.min(i64::MAX as u64) as i64;
             guard.budget = guard.budget.saturating_add(returned_budget);
-            // reuse the same reclaimer since it captures nothing by reference
+            let memtable_type = guard.memtable_type;
+            // Reuse the same reclaimer since it captures only shared state.
             let reclaimer = Self::make_reclaimer(
                 Arc::clone(&state),
                 Arc::clone(&buffer_ready),
                 Arc::clone(&db_state),
                 Arc::clone(&schema_manager),
                 memtable_capacity,
-                memtable_type,
             );
             // try to make a new active buffer
             if guard.allow_make_active_buffer_in_reclaimer {
@@ -2065,12 +2173,13 @@ impl MemtableManager {
                 to_flush.memtable.as_ref(),
                 self.memtable_capacity,
             );
+            let memtable_type = state.memtable_type;
             Self::make_active_buffer(
                 &mut state,
                 &self.db_state,
                 &self.schema_manager,
                 self.memtable_capacity,
-                self.memtable_type,
+                memtable_type,
                 &self.reclaimer,
                 self.total_budget,
                 false,

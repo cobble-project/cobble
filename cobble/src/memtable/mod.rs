@@ -7,6 +7,7 @@ mod skiplist;
 mod vec;
 mod vlog;
 
+use crate::config::MemtableType;
 use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::r#type::{KvValue, RefKey, RefValue};
@@ -55,6 +56,16 @@ pub(crate) enum MemtableImpl {
     Hash(HashMemtable),
     Skiplist(SkiplistMemtable),
     Vec(VecMemtable),
+}
+
+impl MemtableImpl {
+    pub(crate) fn memtable_type(&self) -> MemtableType {
+        match self {
+            Self::Hash(_) => MemtableType::Hash,
+            Self::Skiplist(_) => MemtableType::Skiplist,
+            Self::Vec(_) => MemtableType::Vec,
+        }
+    }
 }
 
 pub(crate) enum MemtableValueIter<'a> {

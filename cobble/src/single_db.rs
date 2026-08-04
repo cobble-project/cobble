@@ -1,7 +1,7 @@
 use crate::coordinator::{CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest};
 use crate::db_state::full_bucket_range;
 use crate::error::{Error, Result};
-use crate::{Config, Db, ReadOptions, WriteBatch, WriteOptions};
+use crate::{Config, Db, MemtableType, ReadOptions, WriteBatch, WriteOptions};
 use bytes::Bytes;
 use log::error;
 use std::ops::Deref;
@@ -129,6 +129,18 @@ impl SingleDb {
     /// storage.
     pub fn load_readonly_files_to_primary(&self) -> Result<usize> {
         self.db.load_readonly_files_to_primary()
+    }
+
+    /// Change the memtable implementation for future rotations.
+    ///
+    /// `flush_current = false` leaves the active memtable untouched; `true` rotates a non-empty
+    /// active memtable now through the normal flush path.
+    pub fn switch_memtable_type(
+        &self,
+        memtable_type: MemtableType,
+        flush_current: bool,
+    ) -> Result<()> {
+        self.db.switch_memtable_type(memtable_type, flush_current)
     }
 
     pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>

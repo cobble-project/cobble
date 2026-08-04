@@ -8,7 +8,7 @@ use crate::structured_db::{
     StructuredWriteOptions, decode_row, encode_for_write,
     load_structured_schema_from_cobble_schema, persist_structured_schema_on_db,
 };
-use cobble::{Config, DbIterator, Error, Result, SingleDb};
+use cobble::{Config, DbIterator, Error, MemtableType, Result, SingleDb};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -376,6 +376,18 @@ impl StructuredSingleDb {
 
     pub fn snapshot(&self) -> Result<u64> {
         self.db.snapshot()
+    }
+
+    /// Change the memtable implementation for future rotations.
+    ///
+    /// `flush_current = false` leaves the active memtable untouched; `true` rotates a non-empty
+    /// active memtable now through the normal flush path.
+    pub fn switch_memtable_type(
+        &self,
+        memtable_type: MemtableType,
+        flush_current: bool,
+    ) -> Result<()> {
+        self.db.switch_memtable_type(memtable_type, flush_current)
     }
 
     /// Mark all currently referenced READONLY files for asynchronous loading into primary

@@ -863,6 +863,23 @@ impl Db {
             .create_snapshot(self.snapshot_manager.clone(), None)
     }
 
+    /// Change the memtable implementation used by future active memtables in this process.
+    ///
+    /// This is a runtime-only setting: it does not modify this database's [`Config`] or persisted
+    /// properties. With `flush_current = false`, the active memtable is unchanged and the target
+    /// applies at its next natural rotation. With `flush_current = true`, a non-empty active
+    /// memtable rotates through the normal manual-flush and auto-snapshot path, while an empty
+    /// active table is immediately replaced when its implementation differs.
+    pub fn switch_memtable_type(
+        &self,
+        memtable_type: crate::MemtableType,
+        flush_current: bool,
+    ) -> Result<()> {
+        let _access = self.begin_access()?;
+        self.memtable_manager
+            .switch_memtable_type(memtable_type, flush_current)
+    }
+
     /// Flush the active memtable, schedule manifest materialization, and invoke the callback with
     /// a [`crate::coordinator::ShardSnapshotInput`] once publication completes.
     pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
@@ -2623,6 +2640,141 @@ mod tests {
                 assert_eq!(value[0].as_deref(), Some(expected.as_slice()));
             }
         }
+        db.close().unwrap();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_switch_memtable_type_replaces_empty_and_flushes_nonempty_active() {
+        let root = "/tmp/db_switch_memtable_type";
+        cleanup_test_root(root);
+        let db = open_db(Config {
+            memtable_capacity: Size::from_const(128),
+            memtable_buffer_count: 1,
+            memtable_type: MemtableType::Hash,
+            volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+            ..Config::default()
+        });
+        let active_type = || db.memtable_manager.active_memtable_type();
+
+        assert_eq!(active_type(), Some(MemtableType::Hash));
+        db.switch_memtable_type(MemtableType::Vec, true).unwrap();
+        assert_eq!(active_type(), Some(MemtableType::Vec));
+        assert!(db.db_state.load().immutables.is_empty());
+
+        db.switch_memtable_type(MemtableType::Hash, true).unwrap();
+        assert_eq!(active_type(), Some(MemtableType::Hash));
+
+        let oversized = vec![b'x'; 1_024];
+        db.put(0, b"oversized", 0, &oversized).unwrap();
+        assert_eq!(active_type(), Some(MemtableType::Vec));
+        assert_eq!(
+            db.memtable_manager.target_memtable_type(),
+            MemtableType::Hash
+        );
+        db.switch_memtable_type(MemtableType::Vec, true).unwrap();
+        let flush_results = db.memtable_manager.wait_for_flushes();
+        assert_eq!(flush_results.len(), 1);
+        assert!(flush_results[0].is_ok());
+        assert_eq!(
+            db.memtable_manager.wait_for_active_memtable_type().unwrap(),
+            MemtableType::Vec
+        );
+        assert_eq!(
+            db.get(0, b"oversized").unwrap().unwrap()[0].as_deref(),
+            Some(oversized.as_slice())
+        );
+
+        db.switch_memtable_type(MemtableType::Hash, true).unwrap();
+        assert_eq!(active_type(), Some(MemtableType::Hash));
+        db.put(0, b"flushed", 0, b"value").unwrap();
+        db.switch_memtable_type(MemtableType::Skiplist, true)
+            .unwrap();
+        let flush_results = db.memtable_manager.wait_for_flushes();
+        assert_eq!(flush_results.len(), 1);
+        assert!(flush_results[0].is_ok());
+        assert_eq!(
+            db.memtable_manager.wait_for_active_memtable_type().unwrap(),
+            MemtableType::Skiplist
+        );
+        assert_eq!(
+            db.get(0, b"flushed").unwrap().unwrap()[0].as_deref(),
+            Some(b"value".as_slice())
+        );
+
+        assert!(db.memtable_manager.wait_for_flushes().is_empty());
+        db.put(0, b"same-target", 0, b"value").unwrap();
+        db.switch_memtable_type(MemtableType::Skiplist, true)
+            .unwrap();
+        let flush_results = db.memtable_manager.wait_for_flushes();
+        assert_eq!(flush_results.len(), 1);
+        assert!(flush_results[0].is_ok());
+        assert_eq!(
+            db.memtable_manager.wait_for_active_memtable_type().unwrap(),
+            MemtableType::Skiplist
+        );
+        assert_eq!(
+            db.get(0, b"same-target").unwrap().unwrap()[0].as_deref(),
+            Some(b"value".as_slice())
+        );
+
+        db.switch_memtable_type(MemtableType::Vec, true).unwrap();
+        assert_eq!(active_type(), Some(MemtableType::Vec));
+        db.switch_memtable_type(MemtableType::Hash, true).unwrap();
+        assert_eq!(active_type(), Some(MemtableType::Hash));
+
+        db.close().unwrap();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_switch_memtable_type_without_flush_defers_until_natural_rotation() {
+        let root = "/tmp/db_switch_memtable_type_deferred";
+        cleanup_test_root(root);
+        let db = open_db(Config {
+            memtable_capacity: Size::from_const(128),
+            memtable_buffer_count: 1,
+            memtable_type: MemtableType::Hash,
+            volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+            ..Config::default()
+        });
+
+        db.put(0, b"deferred", 0, b"value").unwrap();
+        assert_eq!(
+            db.memtable_manager.active_memtable_type(),
+            Some(MemtableType::Hash)
+        );
+        db.switch_memtable_type(MemtableType::Vec, false).unwrap();
+        assert_eq!(
+            db.memtable_manager.target_memtable_type(),
+            MemtableType::Vec
+        );
+        assert_eq!(
+            db.memtable_manager.active_memtable_type(),
+            Some(MemtableType::Hash)
+        );
+        assert!(db.db_state.load().immutables.is_empty());
+        assert!(db.memtable_manager.wait_for_flushes().is_empty());
+        assert_eq!(
+            db.get(0, b"deferred").unwrap().unwrap()[0].as_deref(),
+            Some(b"value".as_slice())
+        );
+
+        db.memtable_manager.flush_active().unwrap();
+        let flush_results = db.memtable_manager.wait_for_flushes();
+        assert_eq!(flush_results.len(), 1);
+        assert!(flush_results[0].is_ok());
+        assert_eq!(
+            db.memtable_manager.wait_for_active_memtable_type().unwrap(),
+            MemtableType::Vec
+        );
+        assert_eq!(
+            db.get(0, b"deferred").unwrap().unwrap()[0].as_deref(),
+            Some(b"value".as_slice())
+        );
+
         db.close().unwrap();
         cleanup_test_root(root);
     }

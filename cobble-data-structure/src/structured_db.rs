@@ -9,8 +9,9 @@ use crate::priority_queue::{
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use cobble::{
-    BytesMergeOperator, Config, Db, DbIterator, Error, MergeOperatorResolver, ReadOptions, Result,
-    ScanOptions, Schema, SchemaBuilder, ShardSnapshotInput, WriteBatch, WriteOptions,
+    BytesMergeOperator, Config, Db, DbIterator, Error, MemtableType, MergeOperatorResolver,
+    ReadOptions, Result, ScanOptions, Schema, SchemaBuilder, ShardSnapshotInput, WriteBatch,
+    WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -1534,6 +1535,18 @@ impl StructuredDb {
 
     pub fn snapshot(&self) -> Result<u64> {
         self.db.snapshot()
+    }
+
+    /// Change the memtable implementation for future rotations.
+    ///
+    /// `flush_current = false` leaves the active memtable untouched; `true` rotates a non-empty
+    /// active memtable now through the normal flush path.
+    pub fn switch_memtable_type(
+        &self,
+        memtable_type: MemtableType,
+        flush_current: bool,
+    ) -> Result<()> {
+        self.db.switch_memtable_type(memtable_type, flush_current)
     }
 
     /// Mark all currently referenced READONLY files for asynchronous loading into primary
