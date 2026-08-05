@@ -618,26 +618,24 @@ public final class Db extends NativeObject {
     /**
      * Read several keys in one batch via direct-buffer I/O.
      *
-     * <p>Keys must be packed into {@code ioBuffer} in the format:
-     * {@code i32 num_keys}, then per key: {@code i32 bucket}, {@code i32 key_length},
-     * {@code key_bytes}. Use {@link #packMultiGetKeys(int[], byte[][])} to build this layout.
+     * <p>Keys must be packed into {@code ioBuffer} in the format: {@code i32 num_keys}, then per
+     * key: {@code i32 bucket}, {@code i32 key_length}, {@code key_bytes}. Use {@link
+     * #packMultiGetKeys(int[], byte[][])} to build this layout.
      *
      * <p>The result payload (written to {@code ioBuffer} or the cached overflow buffer) has the
-     * same conventions as {@link #getEncodedDirectWithOptions}: positive return = payload in
-     * {@code ioBuffer}, negative = payload in overflow buffer (retrieve via
-     * {@link #getLastDirectOverflowBuffer()}). Unlike single-get, the payload is always non-empty:
-     * even when every key is absent it still carries {@code i32 num_keys} followed by a zero row
-     * length per key, so the return value is never 0.
+     * same conventions as {@link #getEncodedDirectWithOptions}: positive return = payload in {@code
+     * ioBuffer}, negative = payload in overflow buffer (retrieve via {@link
+     * #getLastDirectOverflowBuffer()}). Unlike single-get, the payload is always non-empty: even
+     * when every key is absent it still carries {@code i32 num_keys} followed by a zero row length
+     * per key, so the return value is never 0.
      *
-     * <p>Result payload format: {@code i32 num_keys}, then per key:
-     * {@code i32 row_payload_length} (0 = not found) followed by the row payload (same encoding
-     * as single-get: {@code i32 col_count}, per column: {@code u8 present} + [{@code i32 len} +
-     * bytes]).
+     * <p>Result payload format: {@code i32 num_keys}, then per key: {@code i32 row_payload_length}
+     * (0 = not found) followed by the row payload (same encoding as single-get: {@code i32
+     * col_count}, per column: {@code u8 present} + [{@code i32 len} + bytes]).
      *
      * @return encoded length (positive = in ioBuffer, negative = in overflow)
      */
-    public int multiGetEncodedDirectWithOptions(
-            ByteBuffer ioBuffer, ReadOptions options) {
+    public int multiGetEncodedDirectWithOptions(ByteBuffer ioBuffer, ReadOptions options) {
         if (ioBuffer == null || !ioBuffer.isDirect()) {
             throw new IllegalArgumentException("ioBuffer must be a direct ByteBuffer");
         }
@@ -650,7 +648,8 @@ public final class Db extends NativeObject {
     }
 
     /**
-     * Packs bucket/key pairs into a direct ByteBuffer for {@link #multiGetEncodedDirectWithOptions}.
+     * Packs bucket/key pairs into a direct ByteBuffer for {@link
+     * #multiGetEncodedDirectWithOptions}.
      *
      * <p>Layout: {@code i32 num_keys}, then per key: {@code i32 bucket}, {@code i32 key_length},
      * {@code key_bytes}.
@@ -969,7 +968,8 @@ public final class Db extends NativeObject {
         if (memtableType == null) {
             throw new IllegalArgumentException("memtableType must not be null");
         }
-        switchMemtableType(nativeHandle, memtableType.name().toLowerCase(Locale.ROOT), flushCurrent);
+        switchMemtableType(
+                nativeHandle, memtableType.name().toLowerCase(Locale.ROOT), flushCurrent);
     }
 
     /** Expand bucket ownership by importing data from another shard snapshot. */

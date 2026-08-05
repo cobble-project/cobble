@@ -1016,12 +1016,11 @@ public final class Db extends NativeObject {
     /**
      * Read several keys in one batch via direct-buffer I/O (structured encoding).
      *
-     * <p>Keys must be packed into {@code ioBuffer} using
-     * {@link io.cobble.Db#packMultiGetKeys(int[], byte[][])}. The result payload is always
-     * non-empty: even when every key is absent it carries {@code i32 num_keys} followed by a zero
-     * row length per key. Format: {@code i32 num_keys}, then per key:
-     * {@code i32 row_payload_length} (0 = not found) + row payload (same encoding as single
-     * structured get: tag 0=None, 1=Bytes, 2=List).
+     * <p>Keys must be packed into {@code ioBuffer} using {@link
+     * io.cobble.Db#packMultiGetKeys(int[], byte[][])}. The result payload is always non-empty: even
+     * when every key is absent it carries {@code i32 num_keys} followed by a zero row length per
+     * key. Format: {@code i32 num_keys}, then per key: {@code i32 row_payload_length} (0 = not
+     * found) + row payload (same encoding as single structured get: tag 0=None, 1=Bytes, 2=List).
      *
      * @return encoded length (positive = in ioBuffer, negative = in overflow)
      */
@@ -1079,7 +1078,8 @@ public final class Db extends NativeObject {
         if (memtableType == null) {
             throw new IllegalArgumentException("memtableType must not be null");
         }
-        switchMemtableType(nativeHandle, memtableType.name().toLowerCase(Locale.ROOT), flushCurrent);
+        switchMemtableType(
+                nativeHandle, memtableType.name().toLowerCase(Locale.ROOT), flushCurrent);
     }
 
     // ── snapshot lifecycle ────────────────────────────────────────────────

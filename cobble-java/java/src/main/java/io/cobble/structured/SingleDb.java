@@ -361,7 +361,8 @@ public final class SingleDb extends NativeObject {
         if (memtableType == null) {
             throw new IllegalArgumentException("memtableType must not be null");
         }
-        switchMemtableType(nativeHandle, memtableType.name().toLowerCase(Locale.ROOT), flushCurrent);
+        switchMemtableType(
+                nativeHandle, memtableType.name().toLowerCase(Locale.ROOT), flushCurrent);
     }
 
     // ── snapshot lifecycle ────────────────────────────────────────────────────
