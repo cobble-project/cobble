@@ -10,19 +10,25 @@ The memtable is Cobble's in-memory write buffer. All incoming writes — `put`, 
 
 ## Choosing a Memtable Type
 
-Cobble provides three memtable implementations, each optimized for different access patterns. You select one via `memtable_type`:
+Cobble provides several memtable implementations, each optimized for different access patterns. You select one via `memtable_type`:
+
+### Adaptive
+
+Automatically chooses among the available memtable implementations as the workload changes. Use it when the workload mixes reads, writes, and scans or may change over time. This is the default for both Rust and Java.
 
 ### Hash
 
 Uses a hash table with chaining. Point lookups are O(1) on average, making it the best choice when you need to read recently written data frequently. At flush time, entries are sorted before writing to disk.
 
-### Skiplist (default)
+### Skiplist
 
 Uses a probabilistic balanced tree. Entries are always maintained in sorted order, so iteration and range queries over the memtable are efficient. Point lookups are O(log n). This is the default and recommended for workloads that frequently scan recently written data before it has been flushed.
 
 ### Vec
 
 Uses an append-only vector with binary search for lookups. Writes are O(1) amortized, and the data structure has minimal memory overhead. Best for sequential, write-only workloads where you rarely read from the memtable.
+
+The memtable type can also be changed at runtime. Selecting a concrete type keeps that choice fixed; selecting `Adaptive` resumes automatic selection. The caller can choose whether to flush the current memtable immediately or apply the change at its next rotation.
 
 ## Capacity and Buffering
 

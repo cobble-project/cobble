@@ -30,8 +30,11 @@ public final class Config {
     /** Number of memtable buffers kept in memory. */
     public Integer memtableBufferCount;
 
-    /** Memtable implementation type. */
-    public MemtableType memtableType;
+    /**
+     * Memtable implementation type. Defaults to {@code ADAPTIVE}, which monitors read/write/scan
+     * patterns and switches between hash, skiplist, and vec automatically.
+     */
+    public MemtableType memtableType = MemtableType.ADAPTIVE;
 
     /** Initial number of columns in the default column family for a brand-new DB. */
     public Integer numColumns;
@@ -258,7 +261,9 @@ public final class Config {
         @SerializedName("skiplist")
         SKIPLIST,
         @SerializedName("vec")
-        VEC
+        VEC,
+        @SerializedName("adaptive")
+        ADAPTIVE
     }
 
     public enum CompactionPolicyKind {

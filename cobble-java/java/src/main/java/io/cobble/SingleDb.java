@@ -201,7 +201,8 @@ public final class SingleDb extends NativeObject {
      * (the call returns once rotation is scheduled, not after the data reaches disk), while an
      * empty active table is immediately replaced when its implementation differs.
      *
-     * @param memtableType target memtable type (hash, skiplist, or vec)
+     * @param memtableType target memtable type (hash, skiplist, vec, or adaptive; a concrete type
+     *     pins the memtable and disables adaptive statistics, adaptive re-enables them)
      * @param flushCurrent whether to rotate the current memtable before switching
      */
     public void switchMemtableType(Config.MemtableType memtableType, boolean flushCurrent) {

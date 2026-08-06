@@ -167,13 +167,40 @@ pub enum PrimaryVolumeOffloadPolicyKind {
 }
 
 /// Memtable implementation selection.
+///
+/// `Adaptive` is a strategy, not a concrete memtable: when selected, the memtable manager starts
+/// with `Skiplist` and an [`crate::memtable::AdaptiveMemtableController`] that monitors read/write/
+/// scan patterns and switches the concrete type at runtime. The controller transitions toward
+/// `Vec` on pure-write windows and toward `Hash` on point-read-heavy windows (with no scans); it
+/// rolls back to `Skiplist` (flushing the current memtable) when a specialized type encounters an
+/// unsupported pattern (`Vec` under any reads, `Hash` under any scan), and otherwise keeps the
+/// current concrete type.
+///
+/// At runtime, [`crate::Db::switch_memtable_type`] accepts both concrete types and `Adaptive`:
+/// switching to a concrete type pins the memtable to that type and **disables** adaptive
+/// statistics; switching to `Adaptive` **re-enables** statistics and resumes from the controller's
+/// last known concrete type.
+///
+/// `Adaptive` is the default for both Rust and Java.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemtableType {
     Hash,
-    #[default]
     Skiplist,
     Vec,
+    #[default]
+    Adaptive,
+}
+
+impl MemtableType {
+    /// Resolves a strategy type to the concrete memtable type used to build the first buffer.
+    /// `Adaptive` resolves to `Skiplist`; all other variants are returned as-is.
+    pub(crate) fn resolve(self) -> Self {
+        match self {
+            Self::Adaptive => Self::Skiplist,
+            other => other,
+        }
+    }
 }
 
 /// Caching policy for decoded SST footer and index-partition metadata.
@@ -880,7 +907,7 @@ impl Default for Config {
             volumes: VolumeDescriptor::single_volume("file:///tmp/cobble"),
             memtable_capacity: Size::from_mib(64),
             memtable_buffer_count: 2,
-            memtable_type: MemtableType::Skiplist,
+            memtable_type: MemtableType::Adaptive,
             num_columns: 1,
             total_buckets: 1,
             l0_file_limit: 4,
@@ -1479,9 +1506,9 @@ mod tests {
     use tempfile::Builder;
 
     #[test]
-    fn test_default_memtable_type_is_skiplist() {
-        assert_eq!(MemtableType::default(), MemtableType::Skiplist);
-        assert_eq!(Config::default().memtable_type, MemtableType::Skiplist);
+    fn test_default_memtable_type_is_adaptive() {
+        assert_eq!(MemtableType::default(), MemtableType::Adaptive);
+        assert_eq!(Config::default().memtable_type, MemtableType::Adaptive);
         assert_eq!(Config::default().sst_pinned_metadata_max_level, Some(2));
     }
 
@@ -1967,7 +1994,7 @@ mod tests {
         }"#;
         let decoded = Config::from_json_str(json).expect("Cannot deserialize partial json");
         assert_eq!(decoded.memtable_capacity, Size::from_kib(2));
-        assert_eq!(decoded.memtable_type, MemtableType::Skiplist);
+        assert_eq!(decoded.memtable_type, MemtableType::Adaptive);
         assert_eq!(decoded.num_columns, Config::default().num_columns);
         assert_eq!(decoded.data_file_type, Config::default().data_file_type);
         assert!(decoded.block_checksum_enabled);

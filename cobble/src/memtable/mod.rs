@@ -1,5 +1,6 @@
 //! Module for memtable implementations and management.
 //! Static dispatch is used for method calls to avoid virtual call overhead.
+mod adaptive;
 mod hash;
 mod iter;
 mod manager;
@@ -15,6 +16,8 @@ pub(crate) use hash::HashMemtable;
 pub(crate) use skiplist::SkiplistMemtable;
 use std::sync::Arc;
 pub(crate) use vec::VecMemtable;
+
+pub(crate) use adaptive::{AdaptiveMemtableController, SwitchDecision};
 
 /// Type alias for memtable reclaimer function.
 pub(crate) type MemtableReclaimer = Arc<dyn Fn(u64) + Send + Sync>;

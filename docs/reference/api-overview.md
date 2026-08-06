@@ -100,6 +100,7 @@ db.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Byte
 db.scan_with_options(bucket, range, &ScanOptions::for_column(0).with_column_family("metrics")) -> Result<DbIterator<'_>>
 db.snapshot() -> Result<u64>
 db.snapshot_with_callback(callback) -> Result<u64>
+db.switch_memtable_type(memtable_type, flush_current) -> Result<()>
 db.load_readonly_files_to_primary() -> Result<usize>
 ```
 
@@ -125,6 +126,7 @@ read_only.scan_with_options(bucket, range, &scan_options) -> Result<DbIterator<'
 read_only.scan_with_options_bounds(bucket, start_key_inclusive, end_key_exclusive, &scan_options) -> Result<DbIterator<'static>>
 db.snapshot() -> Result<u64>
 db.snapshot_with_callback(callback) -> Result<u64>
+db.switch_memtable_type(memtable_type, flush_current) -> Result<()>
 db.cancel_snapshot(snapshot_id) -> Result<bool>
 db.expire_snapshot(snapshot_id) -> Result<bool>
 db.retain_snapshot(snapshot_id) -> bool
@@ -147,6 +149,8 @@ Snapshot lifecycle notes:
 
 `load_readonly_files_to_primary()` is also available on `StructuredDb` and
 `StructuredSingleDb`. See [Loading Files from Readonly Volumes](../architecture/multi-volume#loading-files-from-readonly-volumes).
+
+`switch_memtable_type()` accepts `Adaptive` or a concrete memtable type. See [Memtable](../architecture/memtable#choosing-a-memtable-type).
 
 #### Reader
 

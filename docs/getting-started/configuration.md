@@ -109,7 +109,7 @@ All capacity/size fields in `Config` (such as `memtable_capacity`, `l1_base_byte
 |-----------|---------|-------------|
 | `memtable_capacity` | 64 MB | Maximum bytes before flush to L0 |
 | `memtable_buffer_count` | 2 | Number of memtable buffers (active + immutable) |
-| `memtable_type` | `Skiplist` | Implementation: `Hash`, `Skiplist`, or `Vec` |
+| `memtable_type` | `Adaptive` | `Adaptive`, `Hash`, `Skiplist`, or `Vec` |
 
 ### LSM Tree
 

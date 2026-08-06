@@ -688,11 +688,12 @@ pub extern "system" fn Java_io_cobble_SingleDb_switchMemtableType(
         "hash" => cobble::MemtableType::Hash,
         "skiplist" => cobble::MemtableType::Skiplist,
         "vec" => cobble::MemtableType::Vec,
+        "adaptive" => cobble::MemtableType::Adaptive,
         other => {
             throw_illegal_argument(
                 &mut env,
                 format!(
-                    "unknown memtable type '{}': expected hash, skiplist, or vec",
+                    "unknown memtable type '{}': expected hash, skiplist, vec, or adaptive",
                     other
                 ),
             );

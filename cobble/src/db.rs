@@ -221,6 +221,27 @@ impl Db {
         self.db_lifecycle.begin_access()
     }
 
+    /// Applies an adaptive memtable switch decision if one was returned by the controller.
+    /// Called after the operation completes and any active-memtable locks are released, so the
+    /// switch (which may flush) cannot deadlock with the caller.
+    ///
+    /// The full [`SwitchDecision`] (epoch + generation) is passed to the manager, which validates
+    /// it inside the transition lock **before** any side effect. If the decision is stale (mode
+    /// was toggled, or a newer decision supersedes it), it is silently discarded. If the physical
+    /// switch fails, the controller state is left unchanged so the next window can retry.
+    #[inline]
+    fn apply_adaptive_decision(&self, decision: Option<crate::memtable::SwitchDecision>) {
+        if let Some(decision) = decision
+            && let Err(err) = self.memtable_manager.apply_adaptive_switch(&decision)
+        {
+            log::warn!(
+                "Adaptive memtable switch to {:?} failed: {}",
+                decision.target,
+                err
+            );
+        }
+    }
+
     fn should_mark_error_on_read(err: &Error) -> bool {
         let message = match err {
             Error::IoError(msg) | Error::FileSystemError(msg) => msg,
@@ -561,7 +582,12 @@ impl Db {
         columns[column_idx] = Some(column);
         let record = RefValue::new_with_expired_at(columns, expired_at);
         let key = RefKey::new_with_column_family(bucket, column_family_id, key.as_ref());
-        self.memtable_manager.put(&key, &record)
+        let result = self.memtable_manager.put(&key, &record);
+        // Record after the write completes (active lock released) to avoid re-entering the
+        // manager while holding it.
+        let decision = self.memtable_manager.record_adaptive_write(1);
+        self.apply_adaptive_decision(decision);
+        result
     }
 
     /// Insert a single key/value pair into the given bucket and column.
@@ -620,16 +646,27 @@ impl Db {
             },
         );
 
-        let entries = entries.into_iter().map(|(key, value)| {
-            let mut columns = vec![None; num_columns];
-            columns[column_idx] = Some(RefColumn::new(ValueType::Put, value));
-            (
-                RefKey::new_with_column_family(bucket, column_family_id, key),
-                RefValue::new_with_expired_at(columns, expired_at),
-            )
-        });
-        self.memtable_manager
-            .put_validated_batch(entries, num_columns)
+        // Count consumed entries with a Cell so we can record accurate adaptive stats even if
+        // the batch is only partially consumed before an error. Avoids collecting the whole
+        // batch into a Vec just to measure its length.
+        let count = std::cell::Cell::new(0u64);
+        let entries = entries
+            .into_iter()
+            .inspect(|_| count.set(count.get() + 1))
+            .map(|(key, value)| {
+                let mut columns = vec![None; num_columns];
+                columns[column_idx] = Some(RefColumn::new(ValueType::Put, value));
+                (
+                    RefKey::new_with_column_family(bucket, column_family_id, key),
+                    RefValue::new_with_expired_at(columns, expired_at),
+                )
+            });
+        let result = self
+            .memtable_manager
+            .put_validated_batch(entries, num_columns);
+        let decision = self.memtable_manager.record_adaptive_write(count.get());
+        self.apply_adaptive_decision(decision);
+        result
     }
 
     /// Delete a single column value in the given bucket.
@@ -687,6 +724,7 @@ impl Db {
     /// is full, separated value extraction to VLOG, and schema validation.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         let _access = self.begin_access()?;
+        let batch_len = batch.ops.len() as u64;
         let mut pending: std::collections::BTreeMap<(u16, u8, Bytes), Value> =
             std::collections::BTreeMap::new();
         let schema = self.schema_manager.latest_schema();
@@ -762,6 +800,8 @@ impl Db {
             let value_ref = RefValue::new_with_expired_at(columns, value.expired_at());
             self.memtable_manager.put(&key, &value_ref)?;
         }
+        let decision = self.memtable_manager.record_adaptive_write(batch_len);
+        self.apply_adaptive_decision(decision);
         Ok(())
     }
 
@@ -1325,6 +1365,7 @@ impl Db {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        let key_count = keys.len() as u64;
         let mut unique = Vec::<(u16, Vec<u8>)>::new();
         let mut positions = Vec::with_capacity(keys.len());
         let mut seen = HashMap::<(u16, Vec<u8>), usize>::new();
@@ -1478,10 +1519,13 @@ impl Db {
                 return Err(err);
             }
         };
-        Ok(positions
+        let result: Result<Vec<_>> = Ok(positions
             .into_iter()
             .map(|index| unique_results[index].clone())
-            .collect())
+            .collect());
+        let decision = self.memtable_manager.record_adaptive_point_read(key_count);
+        self.apply_adaptive_decision(decision);
+        result
     }
 
     pub fn get_with_options(
@@ -1491,162 +1535,173 @@ impl Db {
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<Bytes>>>> {
         let _access = self.begin_access()?;
-        let schema = self.schema_manager.latest_schema();
-        let column_family_id = options.resolve_column_family_id_cached(schema.as_ref())?;
-        let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
-        if let Some(max_index) = options.max_index()
-            && max_index >= num_columns
-        {
-            return Err(Error::IoError(format!(
-                "max_index {} in ReadOptions exceeds num_columns {}",
-                max_index, num_columns
-            )));
-        }
-        let snapshot = self.db_state.load();
-        if snapshot.key_is_truncated(bucket, column_family_id, key) {
-            return Ok(None);
-        }
-        let encoded_key = encode_key(bucket, column_family_id, key);
-        let selected_columns = options.columns();
-        let masks = options.masks(num_columns);
-        let selected_mask = masks.selected_mask.as_deref();
-        let decode_mask = masks.base_mask.as_ref();
-        let mask_size = decode_mask.len();
+        // Wrap the lookup in a closure so we can uniformly record one point read on every return
+        // path (including truncated miss and empty values) before applying any adaptive decision.
+        let result = (|| {
+            let schema = self.schema_manager.latest_schema();
+            let column_family_id = options.resolve_column_family_id_cached(schema.as_ref())?;
+            let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
+            if let Some(max_index) = options.max_index()
+                && max_index >= num_columns
+            {
+                return Err(Error::IoError(format!(
+                    "max_index {} in ReadOptions exceeds num_columns {}",
+                    max_index, num_columns
+                )));
+            }
+            let snapshot = self.db_state.load();
+            if snapshot.key_is_truncated(bucket, column_family_id, key) {
+                return Ok(None);
+            }
+            let encoded_key = encode_key(bucket, column_family_id, key);
+            let selected_columns = options.columns();
+            let masks = options.masks(num_columns);
+            let selected_mask = masks.selected_mask.as_deref();
+            let decode_mask = masks.base_mask.as_ref();
+            let mask_size = decode_mask.len();
 
-        let mut terminal_mask = if num_columns == 1 {
-            None
-        } else {
-            Some(vec![0u8; mask_size])
-        };
-        let mut values: Vec<Value> = Vec::new();
-        let mut stopped_by_memtable_terminal = false;
-        self.memtable_manager.get_all_with_snapshot_until(
-            Arc::clone(&snapshot),
-            encoded_key.as_ref(),
-            |raw, source_schema| {
-                let mut raw_value = Bytes::copy_from_slice(raw);
-                let value = if source_schema.version() == schema.version() {
-                    decode_value_masked(
-                        &mut raw_value,
-                        source_schema
-                            .num_columns_in_family(column_family_id)
-                            .unwrap_or(0),
-                        decode_mask,
-                        None,
-                    )?
-                } else {
-                    let decoded = decode_value(
-                        &mut raw_value,
-                        source_schema
-                            .num_columns_in_family(column_family_id)
-                            .unwrap_or(0),
-                    )?;
-                    self.schema_manager.evolve_value(
-                        decoded,
-                        source_schema.version(),
-                        schema.version(),
-                    )?
-                };
-                // Keep the established multi-column terminal-mask behavior unchanged.
-                if let Some(mask) = terminal_mask.as_mut() {
-                    for (idx, column) in value.columns().iter().enumerate().take(num_columns) {
-                        if column
-                            .as_ref()
-                            .is_some_and(|column| column.value_type().is_terminal())
-                        {
-                            mask[idx / 8] |= 1 << (idx % 8);
-                        }
-                    }
-                    if let Some(selected) = selected_mask {
-                        for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {
-                            *mask_byte &= selected[idx];
-                        }
-                    }
-                }
-                // A terminal value in a physical single-column family, regardless of TTL, hides
-                // all older versions. Multi-column reads keep traversing for per-column masking.
-                let stop = num_columns == 1 && value.is_terminal();
-                values.push(value);
-                if stop {
-                    stopped_by_memtable_terminal = true;
-                    Ok(ControlFlow::Break(()))
-                } else {
-                    Ok(ControlFlow::Continue(()))
-                }
-            },
-        )?;
-        // A single-column terminal cuts off the rest of the lookup before older layers are read.
-        // Multi-column reads continue through the LSM mask path.
-        let mut should_stop = stopped_by_memtable_terminal;
-        let lsm_values = if should_stop {
-            Vec::new()
-        } else {
-            match self.lsm_tree.get_with_snapshot(
-                &self.file_manager,
+            let mut terminal_mask = if num_columns == 1 {
+                None
+            } else {
+                Some(vec![0u8; mask_size])
+            };
+            let mut values: Vec<Value> = Vec::new();
+            let mut stopped_by_memtable_terminal = false;
+            self.memtable_manager.get_all_with_snapshot_until(
                 Arc::clone(&snapshot),
-                bucket,
                 encoded_key.as_ref(),
-                schema.as_ref(),
-                self.schema_manager.as_ref(),
-                selected_columns,
-                selected_mask,
-                terminal_mask.as_deref_mut(),
-            ) {
-                Ok(values) => values,
+                |raw, source_schema| {
+                    let mut raw_value = Bytes::copy_from_slice(raw);
+                    let value = if source_schema.version() == schema.version() {
+                        decode_value_masked(
+                            &mut raw_value,
+                            source_schema
+                                .num_columns_in_family(column_family_id)
+                                .unwrap_or(0),
+                            decode_mask,
+                            None,
+                        )?
+                    } else {
+                        let decoded = decode_value(
+                            &mut raw_value,
+                            source_schema
+                                .num_columns_in_family(column_family_id)
+                                .unwrap_or(0),
+                        )?;
+                        self.schema_manager.evolve_value(
+                            decoded,
+                            source_schema.version(),
+                            schema.version(),
+                        )?
+                    };
+                    // Keep the established multi-column terminal-mask behavior unchanged.
+                    if let Some(mask) = terminal_mask.as_mut() {
+                        for (idx, column) in value.columns().iter().enumerate().take(num_columns) {
+                            if column
+                                .as_ref()
+                                .is_some_and(|column| column.value_type().is_terminal())
+                            {
+                                mask[idx / 8] |= 1 << (idx % 8);
+                            }
+                        }
+                        if let Some(selected) = selected_mask {
+                            for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {
+                                *mask_byte &= selected[idx];
+                            }
+                        }
+                    }
+                    // A terminal value in a physical single-column family, regardless of TTL, hides
+                    // all older versions. Multi-column reads keep traversing for per-column masking.
+                    let stop = num_columns == 1 && value.is_terminal();
+                    values.push(value);
+                    if stop {
+                        stopped_by_memtable_terminal = true;
+                        Ok(ControlFlow::Break(()))
+                    } else {
+                        Ok(ControlFlow::Continue(()))
+                    }
+                },
+            )?;
+            // A single-column terminal cuts off the rest of the lookup before older layers are read.
+            // Multi-column reads continue through the LSM mask path.
+            let mut should_stop = stopped_by_memtable_terminal;
+            let lsm_values = if should_stop {
+                Vec::new()
+            } else {
+                match self.lsm_tree.get_with_snapshot(
+                    &self.file_manager,
+                    Arc::clone(&snapshot),
+                    bucket,
+                    encoded_key.as_ref(),
+                    schema.as_ref(),
+                    self.schema_manager.as_ref(),
+                    selected_columns,
+                    selected_mask,
+                    terminal_mask.as_deref_mut(),
+                ) {
+                    Ok(values) => values,
+                    Err(err) => {
+                        self.maybe_mark_error_on_read(&err);
+                        return Err(err);
+                    }
+                }
+            };
+            for value in lsm_values {
+                if should_stop {
+                    break;
+                }
+                if num_columns > 1 {
+                    should_stop = value.is_terminal();
+                }
+                values.push(value);
+            }
+
+            let values: Vec<Value> = values
+                .into_iter()
+                .filter(|v| !self.ttl_provider.expired(&v.expired_at))
+                .rev()
+                .collect();
+
+            if values.is_empty() {
+                return Ok(None);
+            }
+            let merged = Value::merge_all_in_column_family(
+                values,
+                &schema,
+                column_family_id,
+                Some(self.time_provider.as_ref()),
+            )?;
+            let result = value_to_vec_of_columns_with_vlog(
+                merged,
+                |pointer| {
+                    self.vlog_store
+                        .read_pointer(&snapshot.vlog_version, pointer)
+                },
+                &schema,
+                column_family_id,
+                Some(self.time_provider.as_ref()),
+            );
+            match result {
+                Ok(value) => Ok(value.map(|columns| {
+                    if let Some(selected_columns) = selected_columns {
+                        select_projected_columns(columns, selected_columns)
+                    } else {
+                        columns
+                    }
+                })),
                 Err(err) => {
                     self.maybe_mark_error_on_read(&err);
-                    return Err(err);
+                    Err(err)
                 }
             }
-        };
-        for value in lsm_values {
-            if should_stop {
-                break;
-            }
-            if num_columns > 1 {
-                should_stop = value.is_terminal();
-            }
-            values.push(value);
-        }
+        })();
 
-        let values: Vec<Value> = values
-            .into_iter()
-            .filter(|v| !self.ttl_provider.expired(&v.expired_at))
-            .rev()
-            .collect();
-
-        if values.is_empty() {
-            return Ok(None);
-        }
-        let merged = Value::merge_all_in_column_family(
-            values,
-            &schema,
-            column_family_id,
-            Some(self.time_provider.as_ref()),
-        )?;
-        let result = value_to_vec_of_columns_with_vlog(
-            merged,
-            |pointer| {
-                self.vlog_store
-                    .read_pointer(&snapshot.vlog_version, pointer)
-            },
-            &schema,
-            column_family_id,
-            Some(self.time_provider.as_ref()),
-        );
-        match result {
-            Ok(value) => Ok(value.map(|columns| {
-                if let Some(selected_columns) = selected_columns {
-                    select_projected_columns(columns, selected_columns)
-                } else {
-                    columns
-                }
-            })),
-            Err(err) => {
-                self.maybe_mark_error_on_read(&err);
-                Err(err)
-            }
-        }
+        // Record exactly one point read on every return path (truncated miss, empty-values miss,
+        // error, or hit). Misses must count too: a Vec memtable still pays the point-lookup cost,
+        // and uncounted misses would prevent rollback away from Vec.
+        let decision = self.memtable_manager.record_adaptive_point_read(1);
+        self.apply_adaptive_decision(decision);
+        result
     }
 
     pub fn scan<'a>(&'a self, bucket: u16, range: Range<&[u8]>) -> Result<DbIterator<'a>> {
@@ -1684,6 +1739,8 @@ impl Db {
         options: &ScanOptions,
     ) -> Result<DbIterator<'a>> {
         let access_guard = self.begin_access()?;
+        let decision = self.memtable_manager.record_adaptive_range_scan();
+        self.apply_adaptive_decision(decision);
         let snapshot = self.db_state.load();
         let schema = self.schema_manager.latest_schema();
         let resolved_scan_options = options.resolve_cached(&schema)?;
@@ -2723,6 +2780,129 @@ mod tests {
         assert_eq!(active_type(), Some(MemtableType::Vec));
         db.switch_memtable_type(MemtableType::Hash, true).unwrap();
         assert_eq!(active_type(), Some(MemtableType::Hash));
+
+        db.close().unwrap();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_adaptive_memtable_switches_to_vec_on_pure_writes() {
+        let root = "/tmp/db_adaptive_memtable";
+        cleanup_test_root(root);
+        let db = open_db(Config {
+            memtable_capacity: Size::from_kib(64),
+            memtable_buffer_count: 2,
+            memtable_type: MemtableType::Adaptive,
+            l0_file_limit: 64,
+            num_columns: 1,
+            volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+            ..Config::default()
+        });
+
+        // Initial concrete type is Skiplist (Adaptive resolves to Skiplist).
+        assert_eq!(
+            db.memtable_manager.target_memtable_type(),
+            MemtableType::Skiplist
+        );
+
+        // 4096 writes should trigger the adaptive controller to switch to Vec
+        // (pure writes >= 99.9% with zero reads).
+        for i in 0..4097u32 {
+            let key = format!("key{i}");
+            db.put(0, key.as_bytes(), 0, b"value").unwrap();
+        }
+
+        // The controller should have switched the target to Vec (non-disruptive, flush_current=false).
+        assert_eq!(
+            db.memtable_manager.target_memtable_type(),
+            MemtableType::Vec
+        );
+
+        // Switching to a concrete type pins it and disables adaptive statistics.
+        db.switch_memtable_type(MemtableType::Skiplist, false)
+            .unwrap();
+        assert_eq!(
+            db.memtable_manager.target_memtable_type(),
+            MemtableType::Skiplist
+        );
+        assert!(!db.memtable_manager.adaptive_enabled());
+        // Writes no longer trigger adaptive switches (stats disabled).
+        for i in 0..8192u32 {
+            let key = format!("pure{i}");
+            db.put(0, key.as_bytes(), 0, b"value").unwrap();
+        }
+        assert_eq!(
+            db.memtable_manager.target_memtable_type(),
+            MemtableType::Skiplist
+        );
+
+        // Switching back to Adaptive re-enables statistics, resuming from Skiplist.
+        db.switch_memtable_type(MemtableType::Adaptive, false)
+            .unwrap();
+        assert!(db.memtable_manager.adaptive_enabled());
+        assert_eq!(
+            db.memtable_manager.target_memtable_type(),
+            MemtableType::Skiplist
+        );
+        // Now pure writes should trigger a switch to Vec again.
+        for i in 0..4097u32 {
+            let key = format!("resume{i}");
+            db.put(0, key.as_bytes(), 0, b"value").unwrap();
+        }
+        assert_eq!(
+            db.memtable_manager.target_memtable_type(),
+            MemtableType::Vec
+        );
+
+        db.close().unwrap();
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_adaptive_memtable_no_deadlock_on_vec_rollback_during_writes() {
+        // Regression test for P1 deadlock: recording a write while holding the active-memtable
+        // write lock must not re-enter the manager to perform a flush. The adaptive decision is
+        // applied only after the write completes and the lock is released.
+        let root = "/tmp/db_adaptive_no_deadlock";
+        cleanup_test_root(root);
+        let db = open_db(Config {
+            memtable_capacity: Size::from_kib(64),
+            memtable_buffer_count: 2,
+            memtable_type: MemtableType::Adaptive,
+            l0_file_limit: 64,
+            num_columns: 1,
+            volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+            ..Config::default()
+        });
+
+        // Phase 1: enter Vec via pure writes.
+        for i in 0..4097u32 {
+            db.put(0, format!("w{i}").as_bytes(), 0, b"value").unwrap();
+        }
+        assert_eq!(
+            db.memtable_manager.target_memtable_type(),
+            MemtableType::Vec
+        );
+
+        // Phase 2: issue reads to trigger VEC rollback (flush_current=true).
+        // This must not deadlock - the decision is applied after the read returns.
+        for i in 0..20u32 {
+            let _ = db.get(0, format!("w{i}").as_bytes());
+        }
+        // After reads on VEC, the controller should have rolled back to Skiplist.
+        assert_eq!(
+            db.memtable_manager.target_memtable_type(),
+            MemtableType::Skiplist
+        );
+
+        // Phase 3: verify the DB is still usable after the rollback.
+        db.put(0, b"after_rollback", 0, b"value").unwrap();
+        assert_eq!(
+            db.get(0, b"after_rollback").unwrap().unwrap()[0].as_deref(),
+            Some(b"value".as_slice())
+        );
 
         db.close().unwrap();
         cleanup_test_root(root);

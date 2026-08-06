@@ -20,7 +20,9 @@ use crate::iterator::{
 };
 use crate::lsm::LSMTree;
 use crate::memtable::vlog::rewrite_kv_value_for_flush;
-use crate::memtable::{HashMemtable, SkiplistMemtable, VecMemtable};
+use crate::memtable::{
+    AdaptiveMemtableController, HashMemtable, SkiplistMemtable, SwitchDecision, VecMemtable,
+};
 use crate::memtable::{Memtable, MemtableImpl, MemtableReclaimer};
 use crate::metrics_manager::MetricsManager;
 use crate::parquet::{ParquetWriter, ParquetWriterOptions};
@@ -125,6 +127,14 @@ pub(crate) struct MemtableManager {
     auto_snapshot_manager: Option<SnapshotManager>,
     active_memtable_incremental_snapshot_ratio: f64,
     metrics: MemtableManagerMetrics,
+    /// Adaptive memtable controller. Always present; its `enabled` flag reflects whether
+    /// adaptive mode is active (`memtable_type == Adaptive`). Toggled by `switch_memtable_type`.
+    adaptive_controller: Arc<AdaptiveMemtableController>,
+    /// Serializes all memtable type transitions (manual `switch_memtable_type` and adaptive
+    /// `apply_adaptive_switch`) so that a manual pin cannot race with an in-flight adaptive
+    /// decision. The adaptive decision is validated (epoch + generation) inside this lock
+    /// **before** any side effect, so a stale decision never mutates the memtable target.
+    transition_lock: Mutex<()>,
 }
 
 struct MemtableManagerState {
@@ -988,11 +998,19 @@ impl MemtableManager {
                 "buffer_count must be greater than 0".to_string(),
             ));
         }
+        let adaptive_enabled = options.memtable_type == MemtableType::Adaptive;
+        // `Adaptive` is a strategy: the concrete type starts as `Skiplist` and the controller
+        // switches it at runtime via `switch_memtable_type`.
+        let concrete_memtable_type = options.memtable_type.resolve();
+        let adaptive_controller = Arc::new(AdaptiveMemtableController::new(
+            adaptive_enabled,
+            concrete_memtable_type,
+        ));
         let total_budget =
             (options.buffer_count as u64).saturating_mul(options.memtable_capacity as u64);
         let total_budget = total_budget.min(i64::MAX as u64) as i64;
         let state = MemtableManagerState {
-            memtable_type: options.memtable_type,
+            memtable_type: concrete_memtable_type,
             budget: total_budget,
             allow_make_active_buffer_in_reclaimer: true,
             in_flight: 0,
@@ -1074,6 +1092,8 @@ impl MemtableManager {
                 .active_memtable_incremental_snapshot_ratio
                 .clamp(0.0, 1.0),
             metrics,
+            adaptive_controller,
+            transition_lock: Mutex::new(()),
         })
     }
 
@@ -1081,7 +1101,54 @@ impl MemtableManager {
         Arc::clone(&self.db_state)
     }
 
+    /// Records `count` writes for adaptive memtable type evaluation. Returns a
+    /// [`SwitchDecision`] if the controller decided to switch types; the caller must pass it to
+    /// [`apply_adaptive_switch`], which validates and applies it atomically. Returns `None`
+    /// when adaptive mode is not active or no switch is needed.
+    ///
+    /// This method is safe to call while holding an active-memtable write lock: it never calls
+    /// back into the manager. The caller defers the switch until after releasing the lock.
+    ///
+    /// [`apply_adaptive_switch`]: MemtableManager::apply_adaptive_switch
+    #[inline]
+    pub(crate) fn record_adaptive_write(&self, count: u64) -> Option<SwitchDecision> {
+        self.adaptive_controller.record_write(count)
+    }
+
+    /// Records `count` point reads for adaptive evaluation. See [`record_adaptive_write`].
+    ///
+    /// [`record_adaptive_write`]: MemtableManager::record_adaptive_write
+    #[inline]
+    pub(crate) fn record_adaptive_point_read(&self, count: u64) -> Option<SwitchDecision> {
+        self.adaptive_controller.record_point_read(count)
+    }
+
+    /// Records a range scan for adaptive evaluation. See [`record_adaptive_write`].
+    ///
+    /// [`record_adaptive_write`]: MemtableManager::record_adaptive_write
+    #[inline]
+    pub(crate) fn record_adaptive_range_scan(&self) -> Option<SwitchDecision> {
+        self.adaptive_controller.record_range_scan()
+    }
+
+    /// Returns whether adaptive evaluation is currently active.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn adaptive_enabled(&self) -> bool {
+        self.adaptive_controller.is_enabled()
+    }
+
     /// Changes the type used for subsequently created active memtables.
+    ///
+    /// `target_type` may be a concrete type (`Hash`, `Skiplist`, `Vec`) or `Adaptive`:
+    /// - A concrete type pins the memtable to that type and **disables** adaptive statistics.
+    ///   Future operations stop recording until `Adaptive` is switched back on.
+    /// - `Adaptive` **enables** adaptive statistics. The concrete type resumes from the
+    ///   controller's last known type, and the controller resumes switching based on observed
+    ///   workload.
+    ///
+    /// The controller mode is toggled **only after** the physical switch succeeds, so a failed
+    /// rotation/flush leaves the controller state consistent with the memtable state.
     ///
     /// Rotation remains serialized, but normal writers do not take the rotation lock. Empty
     /// active replacement therefore removes the old active from `DbState` while holding both the
@@ -1094,9 +1161,64 @@ impl MemtableManager {
         flush_current: bool,
     ) -> Result<()> {
         self.db_lifecycle.ensure_open()?;
+        // Resolve Adaptive to the concrete type the controller should resume from.
+        let concrete_type = match target_type {
+            MemtableType::Adaptive => self.adaptive_controller.current_type(),
+            concrete => concrete,
+        };
+        // Serialize with any in-flight adaptive decision application.
+        let _transition_guard = self.transition_lock.lock().unwrap();
+        // Perform the physical switch first. If it fails, the controller mode is left unchanged.
+        self.switch_memtable_type_impl(concrete_type, flush_current)?;
+        // Commit the controller mode change only after success.
+        match target_type {
+            MemtableType::Adaptive => self.adaptive_controller.enable(),
+            concrete => self.adaptive_controller.disable(concrete),
+        }
+        Ok(())
+    }
+
+    /// Applies an adaptive controller-driven switch. Validates the decision (epoch + pending
+    /// generation) inside the transition lock **before** any side effect, so a stale or superseded
+    /// decision never mutates the memtable target or triggers a flush. On success, confirms the
+    /// decision so the controller updates its tracked type. On failure, cancels the pending
+    /// decision so the next window can retry without a generation gap.
+    pub(crate) fn apply_adaptive_switch(&self, decision: &SwitchDecision) -> Result<()> {
+        self.db_lifecycle.ensure_open()?;
+        let _transition_guard = self.transition_lock.lock().unwrap();
+        // Validate before any side effect: reject if disabled, stale epoch, or not the current
+        // pending decision. This prevents a stale decision from overriding a manual pin.
+        if !self.adaptive_controller.validate_decision(decision) {
+            return Ok(());
+        }
+        let concrete_type = decision.target.resolve();
+        match self.switch_memtable_type_impl(concrete_type, decision.flush_current) {
+            Ok(()) => {
+                // Confirm only after the physical switch succeeded: updates current_type and
+                // clears the pending slot.
+                self.adaptive_controller.confirm_switch(decision);
+                Ok(())
+            }
+            Err(err) => {
+                // Cancel the pending decision so the next window can generate a fresh one.
+                // Without this, the pending slot would remain occupied and block all future
+                // switching.
+                self.adaptive_controller.cancel_decision(decision);
+                Err(err)
+            }
+        }
+    }
+
+    /// Core switch logic: updates `state.memtable_type` and optionally rotates the active
+    /// memtable. Does not interact with the adaptive controller.
+    fn switch_memtable_type_impl(
+        &self,
+        concrete_type: MemtableType,
+        flush_current: bool,
+    ) -> Result<()> {
         if !flush_current {
             let mut state = self.state.lock().unwrap();
-            state.memtable_type = target_type;
+            state.memtable_type = concrete_type;
             return Ok(());
         }
 
@@ -1107,7 +1229,7 @@ impl MemtableManager {
             while state.restore_in_progress {
                 state = self.flush_done.wait(state).unwrap();
             }
-            state.memtable_type = target_type;
+            state.memtable_type = concrete_type;
 
             let db_state_guard = self.db_state.lock();
             let snapshot = self.db_state.load();
@@ -1139,7 +1261,7 @@ impl MemtableManager {
                 self.flush_active_with_auto_snapshot(FlushCause::Manual)?;
                 return Ok(());
             }
-            if memtable.memtable_type() == target_type {
+            if memtable.memtable_type() == concrete_type {
                 return Ok(());
             }
 
@@ -1542,7 +1664,7 @@ impl MemtableManager {
                         reclaimer.clone(),
                     ))
                 }
-                MemtableType::Skiplist => {
+                MemtableType::Skiplist | MemtableType::Adaptive => {
                     let buffer = vec![0u8; memtable_capacity];
                     MemtableImpl::Skiplist(SkiplistMemtable::with_buffer_and_reclaimer(
                         buffer,
@@ -2680,7 +2802,7 @@ fn decode_active_snapshot_segments_into_memtable(
                 MemtableType::Hash => {
                     u32::from_be_bytes(kv_bytes[kv_pos..kv_pos + 4].try_into().unwrap()) as usize
                 }
-                MemtableType::Skiplist | MemtableType::Vec => {
+                MemtableType::Skiplist | MemtableType::Vec | MemtableType::Adaptive => {
                     u32::from_le_bytes(kv_bytes[kv_pos..kv_pos + 4].try_into().unwrap()) as usize
                 }
             };
@@ -2689,7 +2811,7 @@ fn decode_active_snapshot_segments_into_memtable(
                     u32::from_be_bytes(kv_bytes[kv_pos + 4..kv_pos + 8].try_into().unwrap())
                         as usize
                 }
-                MemtableType::Skiplist | MemtableType::Vec => {
+                MemtableType::Skiplist | MemtableType::Vec | MemtableType::Adaptive => {
                     u32::from_le_bytes(kv_bytes[kv_pos + 4..kv_pos + 8].try_into().unwrap())
                         as usize
                 }
@@ -2849,7 +2971,9 @@ mod tests {
     ) -> MemtableImpl {
         let mut memtable = match memtable_type {
             MemtableType::Hash => MemtableImpl::Hash(HashMemtable::with_capacity(4096)),
-            MemtableType::Skiplist => MemtableImpl::Skiplist(SkiplistMemtable::with_capacity(4096)),
+            MemtableType::Skiplist | MemtableType::Adaptive => {
+                MemtableImpl::Skiplist(SkiplistMemtable::with_capacity(4096))
+            }
             MemtableType::Vec => MemtableImpl::Vec(VecMemtable::with_capacity(4096)),
         };
         for (key_bytes, value_type, value_bytes) in entries {
