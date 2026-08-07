@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Current version of the dedicated compaction result format.
-pub(crate) const DEDICATED_COMPACTION_RESULT_VERSION: u32 = 2;
+pub(crate) const DEDICATED_COMPACTION_RESULT_VERSION: u32 = 3;
 
 /// Directory (relative to the db base dir) where result files live.
 pub(crate) const DEDICATED_COMPACTION_RESULTS_DIR: &str = "compaction/results";
@@ -58,7 +58,7 @@ pub(crate) fn parse_dedicated_compaction_job_id(name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Complete immutable descriptor for a data file, covering the same 13 fields as `ManifestFile`.
+/// Complete immutable descriptor for a data file, covering the same fields as `ManifestFile`.
 ///
 /// For inputs this is the writer's canonical file id and path. For outputs the `file_id` is the
 /// compactor's process-local id; the writer remaps it to a canonical id on apply.
@@ -77,6 +77,8 @@ pub(crate) struct DedicatedDataFile {
     pub effective_bucket_range_start: u16,
     pub effective_bucket_range_end: u16,
     pub vlog_file_seq_offset: u32,
+    #[serde(default)]
+    pub max_expired_at: u32,
 }
 
 impl From<&ManifestFile> for DedicatedDataFile {
@@ -95,6 +97,7 @@ impl From<&ManifestFile> for DedicatedDataFile {
             effective_bucket_range_start: file.effective_bucket_range_start,
             effective_bucket_range_end: file.effective_bucket_range_end,
             vlog_file_seq_offset: file.vlog_file_seq_offset,
+            max_expired_at: file.max_expired_at,
         }
     }
 }
@@ -136,6 +139,7 @@ impl DedicatedDataFile {
             effective_bucket_range_start: *file.effective_bucket_range.start(),
             effective_bucket_range_end: *file.effective_bucket_range.end(),
             vlog_file_seq_offset: file.vlog_file_seq_offset,
+            max_expired_at: file.max_expired_at(),
         }
     }
 
@@ -180,6 +184,7 @@ impl DedicatedDataFile {
             && self.effective_bucket_range_start == file.effective_bucket_range_start
             && self.effective_bucket_range_end == file.effective_bucket_range_end
             && self.vlog_file_seq_offset == file.vlog_file_seq_offset
+            && self.max_expired_at == file.max_expired_at
     }
 
     /// Compares this descriptor against a `ManifestFile` for full fingerprint equality.
@@ -197,6 +202,7 @@ impl DedicatedDataFile {
             && self.effective_bucket_range_start == file.effective_bucket_range_start
             && self.effective_bucket_range_end == file.effective_bucket_range_end
             && self.vlog_file_seq_offset == file.vlog_file_seq_offset
+            && self.max_expired_at == file.max_expired_at
     }
 
     /// Compares this descriptor against a live `DataFile` for full fingerprint equality,
@@ -228,7 +234,8 @@ impl DedicatedDataFile {
             && self.bucket_range_end == *file.bucket_range.end()
             && self.effective_bucket_range_start == *file.effective_bucket_range.start()
             && self.effective_bucket_range_end == *file.effective_bucket_range.end()
-            && self.vlog_file_seq_offset == file.vlog_file_seq_offset)
+            && self.vlog_file_seq_offset == file.vlog_file_seq_offset
+            && self.max_expired_at == file.max_expired_at())
     }
 
     /// Compares this descriptor against a live `DataFile` for full fingerprint equality (all
@@ -260,7 +267,8 @@ impl DedicatedDataFile {
             && self.bucket_range_end == *file.bucket_range.end()
             && self.effective_bucket_range_start == *file.effective_bucket_range.start()
             && self.effective_bucket_range_end == *file.effective_bucket_range.end()
-            && self.vlog_file_seq_offset == file.vlog_file_seq_offset)
+            && self.vlog_file_seq_offset == file.vlog_file_seq_offset
+            && self.max_expired_at == file.max_expired_at())
     }
 }
 
@@ -652,6 +660,7 @@ mod tests {
                         effective_bucket_range_start: 0,
                         effective_bucket_range_end: 0,
                         vlog_file_seq_offset: 0,
+                        max_expired_at: 0,
                     },
                 }],
                 output_level: 1,
@@ -717,6 +726,7 @@ mod tests {
                 effective_bucket_range_start: 0,
                 effective_bucket_range_end: 0,
                 vlog_file_seq_offset: 0,
+                max_expired_at: 0,
             },
         };
         let rewrite = DedicatedCompactionOperation::Rewrite {
@@ -862,5 +872,59 @@ mod tests {
             !fm.data_volume_path_exists(&crashed_dir).unwrap(),
             "crashed job directory should be swept"
         );
+    }
+
+    #[test]
+    fn test_dedicated_data_file_preserves_max_expired_at() {
+        let manifest_file = ManifestFile {
+            file_id: 10,
+            file_type: "sst".to_string(),
+            schema_id: 1,
+            size: 100,
+            start_key: "61".to_string(),
+            end_key: "7a".to_string(),
+            path: "data/10.sst".to_string(),
+            has_separated_values: false,
+            bucket_range_start: 0,
+            bucket_range_end: 0,
+            effective_bucket_range_start: 0,
+            effective_bucket_range_end: 0,
+            vlog_file_seq_offset: 0,
+            max_expired_at: 5000,
+        };
+        let dedicated: DedicatedDataFile = DedicatedDataFile::from(&manifest_file);
+        assert_eq!(dedicated.max_expired_at, 5000);
+        // Round-trip through JSON should preserve the value.
+        let json = serde_json::to_string(&dedicated).unwrap();
+        let decoded: DedicatedDataFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.max_expired_at, 5000);
+        // Fingerprint match should require max_expired_at equality.
+        assert!(dedicated.matches_manifest_file(&manifest_file));
+        let mut mismatched = manifest_file.clone();
+        mismatched.max_expired_at = 0;
+        assert!(!dedicated.matches_manifest_file(&mismatched));
+    }
+
+    #[test]
+    fn test_dedicated_data_file_backward_compatible_without_max_expired_at() {
+        // JSON without max_expired_at (old format) should decode with default 0.
+        let json = r#"{
+            "file_id": 10,
+            "file_type": "sst",
+            "path": "data/10.sst",
+            "schema_id": 1,
+            "size": 100,
+            "start_key": "61",
+            "end_key": "7a",
+            "has_separated_values": false,
+            "bucket_range_start": 0,
+            "bucket_range_end": 0,
+            "effective_bucket_range_start": 0,
+            "effective_bucket_range_end": 0,
+            "vlog_file_seq_offset": 0
+        }"#;
+        let decoded: DedicatedDataFile = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.max_expired_at, 0);
+        assert_eq!(decoded.file_id, 10);
     }
 }

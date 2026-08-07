@@ -14,6 +14,8 @@ pub(crate) struct FileBuildResult {
     pub(crate) file_size: usize,
     pub(crate) meta_bytes: Bytes,
     pub(crate) sst_read_metadata: Option<Arc<SstReadMetadata>>,
+    /// Maximum `expired_at` across all values in this file. 0 = no value has an expiration.
+    pub(crate) max_expired_at: u32,
 }
 
 impl FileBuildResult {
@@ -29,11 +31,17 @@ impl FileBuildResult {
             file_size,
             meta_bytes,
             sst_read_metadata: None,
+            max_expired_at: 0,
         }
     }
 
     pub(crate) fn with_sst_read_metadata(mut self, metadata: SstReadMetadata) -> Self {
         self.sst_read_metadata = Some(Arc::new(metadata));
+        self
+    }
+
+    pub(crate) fn with_max_expired_at(mut self, max_expired_at: u32) -> Self {
+        self.max_expired_at = max_expired_at;
         self
     }
 }

@@ -825,6 +825,16 @@ impl LSMTree {
         Arc::clone(&self.ttl_provider)
     }
 
+    /// Returns the current wall-clock seconds for read-time TTL checks, or 0 when TTL is
+    /// disabled (in which case `is_fully_expired` always returns false).
+    fn read_now_seconds(&self) -> u32 {
+        if self.ttl_provider.is_enabled() {
+            self.ttl_provider.now_seconds()
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn tree_scope_of_tree(&self, tree_idx: usize) -> Option<LSMTreeScope> {
         self.db_state
             .load()
@@ -863,9 +873,16 @@ impl LSMTree {
             .multi_lsm_version
             .tree_scope_of_tree(tree_idx);
         let truncation_cursors = levels_snapshot.truncation_cursors.capture();
+        let ttl_provider = self.ttl_provider();
+        let now_seconds = if ttl_provider.is_enabled() {
+            ttl_provider.now_seconds()
+        } else {
+            0
+        };
         let policy_context = CompactionPolicyContext {
             truncation_cursors: Some(truncation_cursors.as_map()),
             tree_scope: expected_scope.as_ref(),
+            now_seconds,
         };
         let plan = state.compaction_policy.pick_with_context(
             &tree_version.levels,
@@ -875,6 +892,19 @@ impl LSMTree {
         let Some(plan) = plan else {
             return;
         };
+        if plan.drop_expired {
+            if let Some(file) = Self::find_plan_base_file(&tree_version.levels, &plan)
+                && file.is_fully_expired(now_seconds)
+            {
+                let edit = Self::build_truncated_drop_edit(file, &plan);
+                debug!(
+                    "compaction drop expired file tree={} L{} file_id={}",
+                    tree_idx, plan.input_level, plan.base_file_id
+                );
+                self.apply_edit_locked(state, vec![(tree_idx, edit)], |_db_state| {});
+            }
+            return;
+        }
         if plan.drop_truncated {
             if let Some(file) = Self::find_plan_base_file(&tree_version.levels, &plan)
                 && file_fully_covered_by_truncation_cursor(&file, policy_context)
@@ -1067,6 +1097,7 @@ impl LSMTree {
         selected_mask: Option<&[u8]>,
     ) -> Result<()> {
         let mut requests_are_sorted = false;
+        let now_seconds = self.read_now_seconds();
         for level in levels {
             retain_active_request_indices(request_indices, requests);
             if request_indices.is_empty() {
@@ -1080,6 +1111,9 @@ impl LSMTree {
                     requests_are_sorted = true;
                 }
                 for file in level.files.iter().rev() {
+                    if file.is_fully_expired(now_seconds) {
+                        continue;
+                    }
                     let matches = if use_partition_routing {
                         let first = request_indices.partition_point(|idx| {
                             requests[*idx].encoded_key.as_ref() < file.start_key.as_slice()
@@ -1197,9 +1231,13 @@ impl LSMTree {
             terminal_mask = None;
         }
 
+        let now_seconds = self.read_now_seconds();
         for level in levels.iter() {
             if level.tiered {
                 for file in level.files.iter().rev() {
+                    if file.is_fully_expired(now_seconds) {
+                        continue;
+                    }
                     let should_continue = self.get_values_in_one_file(
                         file,
                         level.ordinal,
@@ -1224,6 +1262,9 @@ impl LSMTree {
                         || encoded_key > file.end_key.as_slice()
                     {
                         continue;
+                    }
+                    if file.is_fully_expired(now_seconds) {
+                        break;
                     }
                     let should_continue = self.get_values_in_one_file(
                         file,
@@ -1272,6 +1313,7 @@ impl LSMTree {
         let pin_metadata_partitions = self.sst_pinned_metadata_partitions_enabled;
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let mut runs: Vec<SortedRun> = Vec::new();
+        let now_seconds = self.read_now_seconds();
         let target_num_columns = target_schema
             .num_columns_in_family(column_family_id)
             .unwrap_or(0);
@@ -1285,7 +1327,9 @@ impl LSMTree {
                 }
                 if level.tiered {
                     for file in level.files.iter().rev() {
-                        if file_intersects_scan(file, encoded_start, encoded_end) {
+                        if !file.is_fully_expired(now_seconds)
+                            && file_intersects_scan(file, encoded_start, encoded_end)
+                        {
                             runs.push(SortedRun::new(level.ordinal, vec![Arc::clone(file)]));
                         }
                     }
@@ -1293,7 +1337,10 @@ impl LSMTree {
                     let files: Vec<Arc<DataFile>> = level
                         .files
                         .iter()
-                        .filter(|file| file_intersects_scan(file, encoded_start, encoded_end))
+                        .filter(|file| {
+                            !file.is_fully_expired(now_seconds)
+                                && file_intersects_scan(file, encoded_start, encoded_end)
+                        })
                         .cloned()
                         .collect();
                     if !files.is_empty() {
@@ -1909,6 +1956,7 @@ mod tests {
             file_size,
             meta_bytes,
             sst_read_metadata,
+            max_expired_at,
         } = writer.finish_with_range()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
         let data_file = DataFile::new(
@@ -1923,6 +1971,7 @@ mod tests {
             bucket_range,
         );
         data_file.set_meta_bytes(meta_bytes);
+        data_file.set_max_expired_at(max_expired_at);
         if let Some(metadata) = sst_read_metadata {
             data_file.set_sst_read_metadata(metadata);
         }

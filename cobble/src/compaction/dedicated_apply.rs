@@ -747,6 +747,7 @@ fn prepare_outputs(
         )
         .with_vlog_offset(output.vlog_file_seq_offset)
         .with_separated_values(output.has_separated_values);
+        data_file.set_max_expired_at(output.max_expired_at);
         // Set the priority for the output level.
         let _ = ctx.file_manager.set_data_file_priority(
             local_id,
@@ -1055,6 +1056,7 @@ mod tests {
             effective_bucket_range_start: 0,
             effective_bucket_range_end: 0,
             vlog_file_seq_offset: 0,
+            max_expired_at: 0,
         }
     }
 

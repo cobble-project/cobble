@@ -462,4 +462,69 @@ mod tests {
         );
         cleanup_test_root("/tmp/parquet_row_group_resume_test");
     }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_parquet_writer_mixed_ttl_and_no_ttl_yields_zero() {
+        let root = "file:///tmp/parquet_mixed_ttl_test";
+        cleanup_test_root("/tmp/parquet_mixed_ttl_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(root).unwrap();
+        let writer_file = fs.open_write("test.parquet").unwrap();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            ParquetWriterOptions {
+                num_columns: 1,
+                ..ParquetWriterOptions::default()
+            },
+        )
+        .unwrap();
+        let encode = |expired_at: Option<u32>| {
+            encode_value(
+                &Value::new_with_expired_at(
+                    vec![Some(Column::new(ValueType::Put, b"v".to_vec()))],
+                    expired_at,
+                ),
+                1,
+            )
+        };
+        writer.add(b"key1", &encode(Some(100))).unwrap();
+        writer.add(b"key2", &encode(None)).unwrap();
+        let result = writer.finish().unwrap();
+        assert_eq!(result.max_expired_at, 0);
+        cleanup_test_root("/tmp/parquet_mixed_ttl_test");
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_parquet_writer_all_ttl_yields_max() {
+        let root = "file:///tmp/parquet_all_ttl_test";
+        cleanup_test_root("/tmp/parquet_all_ttl_test");
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(root).unwrap();
+        let writer_file = fs.open_write("test.parquet").unwrap();
+        let mut writer = ParquetWriter::with_options(
+            writer_file,
+            ParquetWriterOptions {
+                num_columns: 1,
+                ..ParquetWriterOptions::default()
+            },
+        )
+        .unwrap();
+        let encode = |expired_at: Option<u32>| {
+            encode_value(
+                &Value::new_with_expired_at(
+                    vec![Some(Column::new(ValueType::Put, b"v".to_vec()))],
+                    expired_at,
+                ),
+                1,
+            )
+        };
+        writer.add(b"key1", &encode(Some(100))).unwrap();
+        writer.add(b"key2", &encode(Some(500))).unwrap();
+        writer.add(b"key3", &encode(Some(300))).unwrap();
+        let result = writer.finish().unwrap();
+        assert_eq!(result.max_expired_at, 500);
+        cleanup_test_root("/tmp/parquet_all_ttl_test");
+    }
 }

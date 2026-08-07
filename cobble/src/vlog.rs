@@ -268,6 +268,7 @@ impl VlogEdit {
 
 pub(crate) type VlogMergeCollectorHandle = Rc<RefCell<VlogMergeCollector>>;
 pub(crate) type VlogMergeCallback = Box<dyn FnMut(Option<&Column>, Option<&Column>)>;
+pub(crate) type ExpiredValueCallback = Box<dyn FnMut(&crate::r#type::Value) -> Result<()>>;
 
 #[derive(Default)]
 pub(crate) struct VlogMergeCollector {
@@ -290,6 +291,14 @@ impl VlogMergeCollector {
         Box::new(move |old_column, new_column| {
             handle.borrow_mut().on_merge(old_column, new_column);
         })
+    }
+
+    /// Creates a callback that collects VLOG removal deltas for expired separated values.
+    pub(crate) fn expired_value_callback(
+        handle: &VlogMergeCollectorHandle,
+    ) -> ExpiredValueCallback {
+        let handle = Rc::clone(handle);
+        Box::new(move |value| handle.borrow_mut().on_expired_value(value))
     }
 
     pub(crate) fn has_separated_values(&self) -> bool {
@@ -388,6 +397,25 @@ impl VlogMergeCollector {
         {
             self.error = Some(err);
         }
+    }
+
+    /// Called when a value is expired and dropped during compaction. Collects VLOG removal
+    /// deltas for any separated-value columns in the expired value.
+    ///
+    /// This only records entry-count deltas - it does *not* set `has_separated_values`, because
+    /// the expired value is not written to the output SST. Marking the output file would prevent
+    /// future whole-file TTL/truncation drops even when every surviving value is inline.
+    fn on_expired_value(&mut self, value: &crate::r#type::Value) -> Result<()> {
+        if self.error.is_some() || !self.track_removed_entries {
+            return Ok(());
+        }
+        for column in value.columns().iter().flatten() {
+            if let Err(err) = self.collect_removed_entries_from_column(column) {
+                self.error = Some(err);
+                break;
+            }
+        }
+        self.check_error()
     }
 }
 

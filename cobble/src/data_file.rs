@@ -72,6 +72,11 @@ pub struct DataFile {
     pub(crate) sst_read_metadata: OnceLock<Arc<SstReadMetadata>>,
     /// Pinned SST metadata shared by point reads, scans, and compactions.
     pub(crate) pinned_sst_read_metadata: OnceLock<Arc<PinnedSstReadMetadata>>,
+    /// Maximum `expired_at` across all values in this file. 0 = no value has an expiration.
+    /// When `now >= max_expired_at`, all values are expired and the file can be dropped by
+    /// compaction without reading or rewriting. Set at write time from `FileBuildResult`,
+    /// or restored from manifest.
+    pub(crate) max_expired_at: OnceLock<u32>,
 }
 
 impl DataFile {
@@ -104,6 +109,7 @@ impl DataFile {
             meta_bytes: Default::default(),
             sst_read_metadata: Default::default(),
             pinned_sst_read_metadata: Default::default(),
+            max_expired_at: Default::default(),
         }
     }
 
@@ -140,6 +146,7 @@ impl DataFile {
             meta_bytes: Default::default(),
             sst_read_metadata: Default::default(),
             pinned_sst_read_metadata: Default::default(),
+            max_expired_at: Default::default(),
         };
         data_file.copy_meta_from(self);
         data_file
@@ -193,6 +200,9 @@ impl DataFile {
         if let Some(metadata) = source.pinned_sst_read_metadata() {
             self.set_pinned_sst_read_metadata(metadata);
         }
+        if let Some(max_expired_at) = source.max_expired_at.get() {
+            self.set_max_expired_at(*max_expired_at);
+        }
     }
 
     pub(crate) fn needs_bucket_filter(&self) -> bool {
@@ -224,6 +234,25 @@ impl DataFile {
         let _ = self.pinned_sst_read_metadata.set(metadata);
     }
 
+    /// Returns the maximum `expired_at` across all values in this file.
+    /// Returns 0 if no value has an expiration (file never expires at the file level).
+    pub(crate) fn max_expired_at(&self) -> u32 {
+        self.max_expired_at.get().copied().unwrap_or(0)
+    }
+
+    /// Sets the file-level `max_expired_at`. Called after the file is built or restored from
+    /// manifest.
+    pub(crate) fn set_max_expired_at(&self, val: u32) {
+        let _ = self.max_expired_at.set(val);
+    }
+
+    /// Returns true if all values in this file are expired at the given time.
+    /// A file with `max_expired_at == 0` (no value has an expiration) never expires.
+    pub(crate) fn is_fully_expired(&self, now_seconds: u32) -> bool {
+        let max = self.max_expired_at();
+        max > 0 && now_seconds >= max
+    }
+
     pub fn has_separated_values(&self) -> bool {
         self.has_separated_values
     }
@@ -252,4 +281,45 @@ pub(crate) fn intersect_bucket_ranges(
     let start = (*left.start()).max(*right.start());
     let end = (*left.end()).min(*right.end());
     (start <= end).then_some(start..=end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_file() -> DataFile {
+        DataFile::new_detached(
+            DataFileType::SSTable,
+            b"a".to_vec(),
+            b"z".to_vec(),
+            1,
+            0,
+            100,
+            0..=u16::MAX,
+            0..=u16::MAX,
+        )
+    }
+
+    #[test]
+    fn test_data_file_max_expired_at_defaults_to_zero() {
+        let file = make_file();
+        assert_eq!(file.max_expired_at(), 0);
+    }
+
+    #[test]
+    fn test_data_file_is_fully_expired() {
+        let file = make_file();
+        file.set_max_expired_at(1000);
+        assert!(!file.is_fully_expired(500));
+        assert!(!file.is_fully_expired(999));
+        assert!(file.is_fully_expired(1000));
+        assert!(file.is_fully_expired(1001));
+    }
+
+    #[test]
+    fn test_data_file_zero_max_expired_at_never_expires() {
+        let file = make_file();
+        assert!(!file.is_fully_expired(0));
+        assert!(!file.is_fully_expired(u32::MAX));
+    }
 }

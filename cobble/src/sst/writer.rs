@@ -98,6 +98,11 @@ pub struct SSTWriter<W: SequentialWriteFile> {
     hot_block_cache: Option<WriterHotBlockCache>,
     hot_block_cache_namespace: Option<u64>,
     hot_block_output_file_id: Option<u64>,
+    /// Maximum `expired_at` across all values added to this file. 0 = none had expiration.
+    max_expired_at: u32,
+    /// True if any value added to this file has no `expired_at` (never expires). When set,
+    /// `max_expired_at` is reported as 0 so the file is never dropped at the file level.
+    has_no_ttl_entry: bool,
 }
 
 impl<W: SequentialWriteFile> SSTWriter<W> {
@@ -142,6 +147,8 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             hot_block_cache,
             hot_block_cache_namespace,
             hot_block_output_file_id,
+            max_expired_at: 0,
+            has_no_ttl_entry: false,
         }
     }
 
@@ -352,10 +359,12 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             self.writer.write(&footer_encoded)?;
 
             let file_size = self.writer.offset();
+            let max_expired_at = self.effective_max_expired_at();
             let mut writer = self.writer;
             writer.close()?;
 
-            let result = FileBuildResult::new(first_key, last_key, file_size, meta_bytes);
+            let result = FileBuildResult::new(first_key, last_key, file_size, meta_bytes)
+                .with_max_expired_at(max_expired_at);
             return Ok(if self.options.read_metadata_cache_mode.embeds_on_write() {
                 result.with_sst_read_metadata(read_metadata)
             } else {
@@ -478,12 +487,14 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
 
         // Get final file size before closing
         let file_size = self.writer.offset();
+        let max_expired_at = self.effective_max_expired_at();
 
         // Flush and close
         let mut writer = self.writer;
         writer.close()?;
 
-        let result = FileBuildResult::new(first_key, last_key, file_size, meta_bytes);
+        let result = FileBuildResult::new(first_key, last_key, file_size, meta_bytes)
+            .with_max_expired_at(max_expired_at);
         Ok(if self.options.read_metadata_cache_mode.embeds_on_write() {
             result.with_sst_read_metadata(read_metadata)
         } else {
@@ -501,6 +512,16 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
     /// Finish writing the SST file and return its immutable build result.
     pub(crate) fn finish_with_range(self) -> Result<FileBuildResult> {
         self.finish_internal()
+    }
+
+    /// Returns `max_expired_at` unless any entry has no expiration, in which case returns 0
+    /// (the file can never be fully expired at the file level).
+    fn effective_max_expired_at(&self) -> u32 {
+        if self.has_no_ttl_entry {
+            0
+        } else {
+            self.max_expired_at
+        }
     }
 
     /// Returns the current offset (bytes written) in the file.
@@ -527,6 +548,15 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
 /// Implement FileBuilder trait for SSTWriter to support compaction.
 impl<W: SequentialWriteFile + 'static> FileBuilder for SSTWriter<W> {
     fn add(&mut self, key: &[u8], value: &KvValue) -> Result<()> {
+        match value.expired_at() {
+            Ok(Some(exp)) => {
+                if exp > self.max_expired_at {
+                    self.max_expired_at = exp;
+                }
+            }
+            // No expiration on this entry: the file can never be fully expired.
+            Ok(None) | Err(_) => self.has_no_ttl_entry = true,
+        }
         match value {
             KvValue::Encoded(bytes) => SSTWriter::add(self, key, bytes),
             KvValue::Decoded(v) => {
@@ -554,7 +584,9 @@ mod tests {
     use super::*;
     use crate::data_file::DataFile;
     use crate::file::FileSystemRegistry;
+    use crate::format::FileBuilder;
     use crate::sst::{SSTIterator, SSTIteratorOptions};
+    use crate::r#type::Column;
 
     #[test]
     fn test_sst_writer_default_buffer_size() {
@@ -732,6 +764,92 @@ mod tests {
             let result = writer.finish_with_range().unwrap();
             assert_eq!(result.sst_read_metadata.is_some(), index == 0);
         }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn make_kv_value(expired_at: Option<u32>) -> KvValue {
+        let column = Column::new(crate::r#type::ValueType::Put, b"v".to_vec());
+        KvValue::Decoded(Value::new_with_expired_at(vec![Some(column)], expired_at))
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_writer_tracks_max_expired_at() {
+        let root = "/tmp/sst_writer_ttl_test";
+        let _ = std::fs::remove_dir_all(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(format!("file://{root}")).unwrap();
+
+        let writer_file = fs.open_write("test.sst").unwrap();
+        let mut writer = Box::new(SSTWriter::new(writer_file, SSTWriterOptions::default()))
+            as Box<dyn FileBuilder>;
+        writer.add(b"key1", &make_kv_value(Some(100))).unwrap();
+        writer.add(b"key2", &make_kv_value(Some(500))).unwrap();
+        writer.add(b"key3", &make_kv_value(Some(300))).unwrap();
+        let result = writer.finish().unwrap();
+        assert_eq!(result.max_expired_at, 500);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_writer_no_ttl_max_expired_at_zero() {
+        let root = "/tmp/sst_writer_no_ttl_test";
+        let _ = std::fs::remove_dir_all(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(format!("file://{root}")).unwrap();
+
+        let writer_file = fs.open_write("test.sst").unwrap();
+        let mut writer = Box::new(SSTWriter::new(writer_file, SSTWriterOptions::default()))
+            as Box<dyn FileBuilder>;
+        writer.add(b"key1", &make_kv_value(None)).unwrap();
+        writer.add(b"key2", &make_kv_value(None)).unwrap();
+        let result = writer.finish().unwrap();
+        assert_eq!(result.max_expired_at, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_writer_mixed_ttl_and_no_ttl_yields_zero() {
+        // A file with both a TTL entry and a no-TTL entry must report max_expired_at=0,
+        // because the no-TTL entry should never be dropped at the file level.
+        let root = "/tmp/sst_writer_mixed_ttl_test";
+        let _ = std::fs::remove_dir_all(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(format!("file://{root}")).unwrap();
+
+        let writer_file = fs.open_write("test.sst").unwrap();
+        let mut writer = Box::new(SSTWriter::new(writer_file, SSTWriterOptions::default()))
+            as Box<dyn FileBuilder>;
+        writer.add(b"key1", &make_kv_value(Some(100))).unwrap();
+        writer.add(b"key2", &make_kv_value(None)).unwrap();
+        let result = writer.finish().unwrap();
+        assert_eq!(result.max_expired_at, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_sst_writer_mixed_ttl_different_order_yields_zero() {
+        // Same as above but with no-TTL entry first, then TTL, then no-TTL again.
+        let root = "/tmp/sst_writer_mixed_ttl_order_test";
+        let _ = std::fs::remove_dir_all(root);
+        let registry = FileSystemRegistry::new();
+        let fs = registry.get_or_register(format!("file://{root}")).unwrap();
+
+        let writer_file = fs.open_write("test.sst").unwrap();
+        let mut writer = Box::new(SSTWriter::new(writer_file, SSTWriterOptions::default()))
+            as Box<dyn FileBuilder>;
+        writer.add(b"key1", &make_kv_value(None)).unwrap();
+        writer.add(b"key2", &make_kv_value(Some(500))).unwrap();
+        writer.add(b"key3", &make_kv_value(None)).unwrap();
+        let result = writer.finish().unwrap();
+        assert_eq!(result.max_expired_at, 0);
 
         let _ = std::fs::remove_dir_all(root);
     }

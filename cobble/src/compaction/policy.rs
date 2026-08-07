@@ -71,18 +71,20 @@ pub(crate) struct CompactionPlan {
     pub(crate) base_file_id: u64,
     pub(crate) trivial_move: bool,
     pub(crate) drop_truncated: bool,
+    pub(crate) drop_expired: bool,
 }
 
 impl fmt::Display for CompactionPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "L{}->L{} base_file_id={} trivial_move={} drop_truncated={}",
+            "L{}->L{} base_file_id={} trivial_move={} drop_truncated={} drop_expired={}",
             self.input_level,
             self.output_level,
             self.base_file_id,
             self.trivial_move,
-            self.drop_truncated
+            self.drop_truncated,
+            self.drop_expired
         )
     }
 }
@@ -91,6 +93,9 @@ impl fmt::Display for CompactionPlan {
 pub(crate) struct CompactionPolicyContext<'a> {
     pub(crate) truncation_cursors: Option<&'a TruncationCursorMap>,
     pub(crate) tree_scope: Option<&'a LSMTreeScope>,
+    /// Current wall-clock seconds from the TTL provider. 0 means TTL is disabled
+    /// and expired-file detection should be skipped.
+    pub(crate) now_seconds: u32,
 }
 
 pub(crate) trait CompactionPolicy: Send {
@@ -113,6 +118,28 @@ fn pick_first_level(
     context: CompactionPolicyContext<'_>,
 ) -> Option<CompactionPlan> {
     let level0 = levels.iter().find(|level| level.ordinal == 0)?;
+    if let Some((level, file_id)) = pick_expired_file(levels, context.now_seconds) {
+        return Some(CompactionPlan {
+            input_level: level,
+            output_level: level.saturating_add(1),
+            base_file_id: file_id,
+            trivial_move: true,
+            drop_truncated: false,
+            drop_expired: true,
+        });
+    }
+    if let Some((level, output_level, file_id)) =
+        pick_expired_separated_file_for_rewrite(levels, context.now_seconds, config.max_level)
+    {
+        return Some(CompactionPlan {
+            input_level: level,
+            output_level,
+            base_file_id: file_id,
+            trivial_move: false,
+            drop_truncated: false,
+            drop_expired: false,
+        });
+    }
     if let Some((level, file_id)) = pick_fully_truncated_file(levels, context) {
         return Some(CompactionPlan {
             input_level: level,
@@ -120,6 +147,7 @@ fn pick_first_level(
             base_file_id: file_id,
             trivial_move: true,
             drop_truncated: true,
+            drop_expired: false,
         });
     }
     if level0.files.len() > config.l0_file_limit {
@@ -135,6 +163,7 @@ fn pick_first_level(
             base_file_id,
             trivial_move: false,
             drop_truncated: false,
+            drop_expired: false,
         });
     }
     None
@@ -152,9 +181,67 @@ fn pick_fully_truncated_file(
                 .iter()
                 .map(move |file| (level.ordinal, file.as_ref()))
         })
-        .filter(|(_, file)| file_fully_covered_by_truncation_cursor(file, context))
+        .filter(|(_, file)| {
+            // Files with separated values cannot be dropped via the removal-only fast path
+            // because VLOG entry-count deltas are only computed during rewrite compaction.
+            !file.has_separated_values() && file_fully_covered_by_truncation_cursor(file, context)
+        })
         .min_by_key(|(level, file)| (*level, file.file_id))
         .map(|(level, file)| (level, file.file_id))
+}
+
+/// Pick the lowest-level file whose every value is expired, so compaction can drop it
+/// without reading or rewriting. Returns None when TTL is disabled (`now_seconds == 0`).
+/// Files with separated values are excluded (they need rewrite to collect VLOG deltas).
+fn pick_expired_file(levels: &[Level], now_seconds: u32) -> Option<(u8, FileId)> {
+    if now_seconds == 0 {
+        return None;
+    }
+    levels
+        .iter()
+        .flat_map(|level| {
+            level
+                .files
+                .iter()
+                .map(move |file| (level.ordinal, file.as_ref()))
+        })
+        .filter(|(_, file)| {
+            // Files with separated values cannot be dropped via the removal-only fast path
+            // because VLOG entry-count deltas are only computed during rewrite compaction.
+            !file.has_separated_values() && file.is_fully_expired(now_seconds)
+        })
+        .min_by_key(|(level, file)| (*level, file.file_id))
+        .map(|(level, file)| (level, file.file_id))
+}
+
+/// Pick the lowest-level separated-value file whose every value is expired, so compaction can
+/// rewrite it (filtering expired entries and collecting VLOG deltas). Returns None when TTL is
+/// disabled or no separated-value file is fully expired.
+///
+/// Files below `max_level` move down one level. Files at or above `max_level` are rewritten in
+/// place, which also handles databases reopened with a lower configured maximum.
+fn pick_expired_separated_file_for_rewrite(
+    levels: &[Level],
+    now_seconds: u32,
+    max_level: u8,
+) -> Option<(u8, u8, FileId)> {
+    if now_seconds == 0 {
+        return None;
+    }
+    levels
+        .iter()
+        .flat_map(|level| {
+            level
+                .files
+                .iter()
+                .map(move |file| (level.ordinal, file.as_ref()))
+        })
+        .filter(|(_, file)| file.has_separated_values() && file.is_fully_expired(now_seconds))
+        .min_by_key(|(level, file)| (*level, file.file_id))
+        .map(|(level, file)| {
+            let output_level = if level >= max_level { level } else { level + 1 };
+            (level, output_level, file.file_id)
+        })
 }
 
 pub(crate) fn file_fully_covered_by_truncation_cursor(
@@ -228,6 +315,28 @@ impl CompactionPolicy for RoundRobinPolicy {
         if levels.is_empty() {
             return None;
         }
+        if let Some((level, file_id)) = pick_expired_file(levels, context.now_seconds) {
+            return Some(CompactionPlan {
+                input_level: level,
+                output_level: level.saturating_add(1),
+                base_file_id: file_id,
+                trivial_move: true,
+                drop_truncated: false,
+                drop_expired: true,
+            });
+        }
+        if let Some((level, output_level, file_id)) =
+            pick_expired_separated_file_for_rewrite(levels, context.now_seconds, config.max_level)
+        {
+            return Some(CompactionPlan {
+                input_level: level,
+                output_level,
+                base_file_id: file_id,
+                trivial_move: false,
+                drop_truncated: false,
+                drop_expired: false,
+            });
+        }
         if let Some((level, file_id)) = pick_fully_truncated_file(levels, context) {
             return Some(CompactionPlan {
                 input_level: level,
@@ -235,6 +344,7 @@ impl CompactionPolicy for RoundRobinPolicy {
                 base_file_id: file_id,
                 trivial_move: true,
                 drop_truncated: true,
+                drop_expired: false,
             });
         }
         let input_level = levels
@@ -297,6 +407,7 @@ impl CompactionPolicy for RoundRobinPolicy {
             base_file_id,
             trivial_move,
             drop_truncated: false,
+            drop_expired: false,
         })
     }
 }
@@ -461,6 +572,7 @@ impl ScorePriorityPolicy {
             base_file_id: file.file_id,
             trivial_move: Self::rocksdb_trivial_move(levels, selected_level, file, config),
             drop_truncated: false,
+            drop_expired: false,
         })
     }
 }
@@ -475,6 +587,28 @@ impl CompactionPolicy for ScorePriorityPolicy {
         if levels.is_empty() {
             return None;
         }
+        if let Some((level, file_id)) = pick_expired_file(levels, context.now_seconds) {
+            return Some(CompactionPlan {
+                input_level: level,
+                output_level: level.saturating_add(1),
+                base_file_id: file_id,
+                trivial_move: true,
+                drop_truncated: false,
+                drop_expired: true,
+            });
+        }
+        if let Some((level, output_level, file_id)) =
+            pick_expired_separated_file_for_rewrite(levels, context.now_seconds, config.max_level)
+        {
+            return Some(CompactionPlan {
+                input_level: level,
+                output_level,
+                base_file_id: file_id,
+                trivial_move: false,
+                drop_truncated: false,
+                drop_expired: false,
+            });
+        }
         if let Some((level, file_id)) = pick_fully_truncated_file(levels, context) {
             return Some(CompactionPlan {
                 input_level: level,
@@ -482,6 +616,7 @@ impl CompactionPolicy for ScorePriorityPolicy {
                 base_file_id: file_id,
                 trivial_move: true,
                 drop_truncated: true,
+                drop_expired: false,
             });
         }
         for (level_ordinal, score) in Self::scored_levels(levels, &config) {
@@ -502,6 +637,7 @@ impl CompactionPolicy for ScorePriorityPolicy {
                     base_file_id,
                     trivial_move: false,
                     drop_truncated: false,
+                    drop_expired: false,
                 });
             }
             if let Some(plan) = self.pick_level_plan(levels, level_ordinal, &config) {
@@ -522,6 +658,28 @@ impl CompactionPolicy for MinOverlapPolicy {
         if levels.is_empty() {
             return None;
         }
+        if let Some((level, file_id)) = pick_expired_file(levels, context.now_seconds) {
+            return Some(CompactionPlan {
+                input_level: level,
+                output_level: level.saturating_add(1),
+                base_file_id: file_id,
+                trivial_move: true,
+                drop_truncated: false,
+                drop_expired: true,
+            });
+        }
+        if let Some((level, output_level, file_id)) =
+            pick_expired_separated_file_for_rewrite(levels, context.now_seconds, config.max_level)
+        {
+            return Some(CompactionPlan {
+                input_level: level,
+                output_level,
+                base_file_id: file_id,
+                trivial_move: false,
+                drop_truncated: false,
+                drop_expired: false,
+            });
+        }
         if let Some((level, file_id)) = pick_fully_truncated_file(levels, context) {
             return Some(CompactionPlan {
                 input_level: level,
@@ -529,6 +687,7 @@ impl CompactionPolicy for MinOverlapPolicy {
                 base_file_id: file_id,
                 trivial_move: true,
                 drop_truncated: true,
+                drop_expired: false,
             });
         }
 
@@ -597,6 +756,7 @@ impl CompactionPolicy for MinOverlapPolicy {
             base_file_id,
             trivial_move,
             drop_truncated: false,
+            drop_expired: false,
         })
     }
 }
@@ -905,6 +1065,23 @@ mod tests {
         ))
     }
 
+    fn make_separated_file(id: FileId, start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
+        let bucket_range = DataFile::bucket_range_from_keys(start, end);
+        Arc::new(
+            DataFile::new_detached(
+                DataFileType::SSTable,
+                start.to_vec(),
+                end.to_vec(),
+                id,
+                0,
+                size,
+                bucket_range.clone(),
+                bucket_range,
+            )
+            .with_separated_values(true),
+        )
+    }
+
     fn make_encoded_file(id: FileId, start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
         let start_key = encode_key(&Key::new(0, start.to_vec()));
         let end_key = encode_key(&Key::new(0, end.to_vec()));
@@ -1027,6 +1204,7 @@ mod tests {
             base_file_id: 1,
             trivial_move: false,
             drop_truncated: false,
+            drop_expired: false,
         };
         let runs = build_runs_for_plan(&[level1, level2], &plan, &config);
         assert_eq!(runs.len(), 1);
@@ -1064,6 +1242,7 @@ mod tests {
             base_file_id: 2,
             trivial_move: false,
             drop_truncated: false,
+            drop_expired: false,
         };
         let runs = build_runs_for_plan(&[level1, level2], &plan, &config);
         assert_eq!(runs.len(), 2);
@@ -1358,6 +1537,7 @@ mod tests {
         let context = CompactionPolicyContext {
             truncation_cursors: Some(&cursors),
             tree_scope: Some(&scope),
+            now_seconds: 0,
         };
         let mut policy = ScorePriorityPolicy::new();
         let plan = policy
@@ -1504,5 +1684,245 @@ mod tests {
             .pick(&[level0, level1, level2, level3], config)
             .expect("plan");
         assert!(!plan.trivial_move);
+    }
+
+    fn make_expired_file(id: FileId, size: usize, max_expired_at: u32) -> Arc<DataFile> {
+        let file = make_file(id, b"a", b"z", size);
+        file.set_max_expired_at(max_expired_at);
+        file
+    }
+
+    #[test]
+    fn test_score_priority_drops_expired_file() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 100,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![make_expired_file(1, 10, 500), make_file(2, b"n", b"z", 10)],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let context = CompactionPolicyContext {
+            truncation_cursors: None,
+            tree_scope: None,
+            now_seconds: 600,
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy
+            .pick_with_context(&[level0, level1, level2], config, context)
+            .expect("plan");
+        assert_eq!(plan.input_level, 1);
+        assert_eq!(plan.base_file_id, 1);
+        assert!(plan.drop_expired);
+        assert!(!plan.drop_truncated);
+    }
+
+    #[test]
+    fn test_score_priority_skips_expired_when_ttl_disabled() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 100,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![make_expired_file(1, 10, 500)],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: Vec::new(),
+        };
+        // now_seconds = 0 means TTL disabled, so no expired drop should be picked.
+        let context = CompactionPolicyContext {
+            truncation_cursors: None,
+            tree_scope: None,
+            now_seconds: 0,
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy.pick_with_context(&[level0, level1, level2], config, context);
+        assert!(
+            plan.is_none(),
+            "no compaction expected when TTL is disabled"
+        );
+    }
+
+    #[test]
+    fn test_expired_file_with_separated_values_picked_for_rewrite() {
+        // Files with separated values must not use the removal-only drop path;
+        // instead they should be picked for rewrite compaction to collect VLOG deltas.
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 100,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let expired_sep_file = make_separated_file(1, b"a", b"z", 10);
+        expired_sep_file.set_max_expired_at(500);
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![expired_sep_file],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let context = CompactionPolicyContext {
+            truncation_cursors: None,
+            tree_scope: None,
+            now_seconds: 600,
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy
+            .pick_with_context(&[level0, level1, level2], config, context)
+            .expect("rewrite plan for expired separated-value file");
+        assert!(!plan.drop_expired, "must not use removal-only drop");
+        assert!(!plan.drop_truncated);
+        assert!(!plan.trivial_move);
+        assert_eq!(plan.base_file_id, 1);
+    }
+
+    #[test]
+    fn test_expired_separated_file_at_max_level_rewrites_in_place() {
+        // An expired separated-value file at the maximum level must not produce
+        // output_level = max_level + 1. It should rewrite in place (output_level == max_level).
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 100,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let expired_sep_file = make_separated_file(1, b"a", b"z", 10);
+        expired_sep_file.set_max_expired_at(500);
+        // Place the file at max_level (4).
+        let level4 = Level {
+            ordinal: 4,
+            tiered: false,
+            files: vec![expired_sep_file],
+        };
+        let context = CompactionPolicyContext {
+            truncation_cursors: None,
+            tree_scope: None,
+            now_seconds: 600,
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy
+            .pick_with_context(&[level0, level4], config, context)
+            .expect("rewrite plan for expired separated-value file at max level");
+        assert_eq!(plan.input_level, 4);
+        assert_eq!(
+            plan.output_level, 4,
+            "output_level must be capped at max_level, not max_level + 1"
+        );
+        assert!(!plan.drop_expired);
+        assert!(!plan.trivial_move);
+    }
+
+    #[test]
+    fn test_expired_separated_file_above_configured_max_level_rewrites_in_place() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 100,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let expired_sep_file = make_separated_file(1, b"a", b"z", 10);
+        expired_sep_file.set_max_expired_at(500);
+        let level5 = Level {
+            ordinal: 5,
+            tiered: false,
+            files: vec![expired_sep_file],
+        };
+        let context = CompactionPolicyContext {
+            truncation_cursors: None,
+            tree_scope: None,
+            now_seconds: 600,
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy
+            .pick_with_context(&[level5], config, context)
+            .expect("rewrite plan for expired separated-value file above configured max level");
+        assert_eq!(plan.input_level, 5);
+        assert_eq!(plan.output_level, 5);
+        assert!(!plan.drop_expired);
+        assert!(!plan.trivial_move);
+    }
+
+    #[test]
+    fn test_truncated_file_with_separated_values_not_dropped() {
+        let config = CompactionConfig {
+            l0_file_limit: 4,
+            l1_base_bytes: 100,
+            level_size_multiplier: 10,
+            max_level: 4,
+            ..CompactionConfig::default()
+        };
+        let level0 = Level {
+            ordinal: 0,
+            tiered: true,
+            files: Vec::new(),
+        };
+        let start_key = encode_key(&Key::new(0, b"a".to_vec()));
+        let end_key = encode_key(&Key::new(0, b"m".to_vec()));
+        let truncated_sep_file = make_separated_file(1, start_key.as_ref(), end_key.as_ref(), 10);
+        let level1 = Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![truncated_sep_file],
+        };
+        let level2 = Level {
+            ordinal: 2,
+            tiered: false,
+            files: Vec::new(),
+        };
+        let (cursors, scope) = cursor_context(b"m");
+        let context = CompactionPolicyContext {
+            truncation_cursors: Some(&cursors),
+            tree_scope: Some(&scope),
+            now_seconds: 0,
+        };
+        let mut policy = ScorePriorityPolicy::new();
+        let plan = policy.pick_with_context(&[level0, level1, level2], config, context);
+        assert!(
+            plan.is_none() || !plan.as_ref().is_some_and(|p| p.drop_truncated),
+            "separated-value file must not be picked for removal-only truncated drop"
+        );
     }
 }

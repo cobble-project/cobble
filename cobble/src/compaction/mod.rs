@@ -373,6 +373,7 @@ mod tests {
             file_size,
             meta_bytes,
             sst_read_metadata,
+            max_expired_at,
         } = writer.finish_with_range()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
         let data_file = DataFile::new(
@@ -387,6 +388,7 @@ mod tests {
             bucket_range,
         );
         data_file.set_meta_bytes(meta_bytes);
+        data_file.set_max_expired_at(max_expired_at);
         if let Some(metadata) = sst_read_metadata {
             data_file.set_sst_read_metadata(metadata);
         }

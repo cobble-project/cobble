@@ -19,7 +19,8 @@ use std::sync::Arc;
 pub(crate) mod publisher;
 
 /// Runtime manifests version 2 describe SSTs with big-endian bucket prefixes.
-pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 2;
+/// Version 3 adds per-file `max_expired_at` (defaults to 0 for older manifests).
+pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 3;
 pub(crate) const MAX_RUNTIME_MANIFEST_CHAIN_DEPTH: usize = 64;
 const RUNTIME_MANIFEST_DIR: &str = "runtime";
 const RUNTIME_CURRENT_NAME: &str = "runtime/CURRENT";
@@ -160,9 +161,9 @@ pub(crate) fn decode_runtime_manifest(bytes: &[u8]) -> Result<RuntimeManifestEnv
 }
 
 fn validate_runtime_manifest_version(version: u32) -> Result<()> {
-    if version != RUNTIME_MANIFEST_VERSION_CURRENT {
+    if !(2..=RUNTIME_MANIFEST_VERSION_CURRENT).contains(&version) {
         return Err(Error::IoError(format!(
-            "Unsupported runtime manifest version: {version} (expected {RUNTIME_MANIFEST_VERSION_CURRENT})"
+            "Unsupported runtime manifest version: {version} (expected 2..={RUNTIME_MANIFEST_VERSION_CURRENT})"
         )));
     }
     Ok(())
@@ -780,6 +781,7 @@ mod tests {
             effective_bucket_range_start: 0,
             effective_bucket_range_end: 0,
             vlog_file_seq_offset: 0,
+            max_expired_at: 0,
         }
     }
 
@@ -874,7 +876,7 @@ mod tests {
         let err = decode_runtime_manifest(&raw).expect_err("version 1 must be rejected");
         assert!(
             err.to_string()
-                .contains("Unsupported runtime manifest version: 1 (expected 2)")
+                .contains("Unsupported runtime manifest version: 1 (expected 2..=3)")
         );
     }
 

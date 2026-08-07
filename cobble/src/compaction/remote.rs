@@ -325,6 +325,8 @@ struct RemoteDataFile {
     effective_bucket_range_end: u16,
     vlog_file_seq_offset: u32,
     meta_bytes: Option<Vec<u8>>,
+    #[serde(default)]
+    max_expired_at: u32,
 }
 
 impl RemoteDataFile {
@@ -344,6 +346,7 @@ impl RemoteDataFile {
             effective_bucket_range_end: *file.effective_bucket_range.end(),
             vlog_file_seq_offset: file.vlog_file_seq_offset,
             meta_bytes: file.meta_bytes().map(|bytes| bytes.to_vec()),
+            max_expired_at: file.max_expired_at(),
         }
     }
 
@@ -385,6 +388,7 @@ impl RemoteDataFile {
         )
         .with_vlog_offset(self.vlog_file_seq_offset)
         .with_separated_values(self.has_separated_values);
+        data_file.set_max_expired_at(self.max_expired_at);
         if let Some(bytes) = self.meta_bytes.map(Bytes::from) {
             data_file.set_meta_bytes(bytes);
         }
@@ -1790,6 +1794,7 @@ mod tests {
             file_size,
             meta_bytes,
             sst_read_metadata,
+            max_expired_at,
         } = writer.finish_with_range()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
         let data_file = DataFile::new(
@@ -1804,6 +1809,7 @@ mod tests {
             bucket_range,
         );
         data_file.set_meta_bytes(meta_bytes);
+        data_file.set_max_expired_at(max_expired_at);
         if let Some(metadata) = sst_read_metadata {
             data_file.set_sst_read_metadata(metadata);
         }
@@ -2835,12 +2841,86 @@ mod tests {
 
     #[test]
     fn test_client_timeout_on_connect() {
-        // Connect to a non-routable address — should timeout
+        // Connect to a non-routable address - should timeout
         let result = send_command_to(
             "192.0.2.1:9999", // RFC 5737 TEST-NET, non-routable
             RemoteCompactionCommand::SupportedMergeOperators,
             Duration::from_millis(200),
         );
         assert!(result.is_err(), "should timeout on non-routable address");
+    }
+
+    #[test]
+    #[serial(file)]
+    fn test_remote_data_file_round_trips_max_expired_at() {
+        let root = "/tmp/remote_data_file_ttl_roundtrip";
+        cleanup_test_root(root);
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            ..Config::default()
+        };
+        let db_id = "remote-data-file-ttl-roundtrip".to_string();
+        let metrics_manager = Arc::new(MetricsManager::new(&db_id));
+        let file_manager = test_file_manager(&config, &db_id, &metrics_manager);
+
+        // Build a DataFile with a non-zero max_expired_at.
+        let (file_id, mut writer) = file_manager.create_data_file().unwrap();
+        writer.write(b"placeholder").unwrap();
+        writer.close().unwrap();
+        let full_path = file_manager.get_data_file_full_path(file_id).unwrap();
+        let start_key = b"a".to_vec();
+        let end_key = b"z".to_vec();
+        let bucket_range = DataFile::bucket_range_from_keys(&start_key, &end_key);
+        let data_file = DataFile::new(
+            DataFileType::SSTable,
+            start_key,
+            end_key,
+            file_id,
+            TrackedFileId::new(&file_manager, file_id),
+            0,
+            42,
+            bucket_range.clone(),
+            bucket_range,
+        );
+        data_file.set_max_expired_at(500);
+
+        // from_data_file must capture max_expired_at.
+        let remote = RemoteDataFile::from_data_file(&data_file, full_path.clone());
+        assert_eq!(remote.max_expired_at, 500);
+
+        // Serialize -> deserialize (simulates crossing the process boundary).
+        let json = serde_json::to_string(&remote).unwrap();
+        let remote: RemoteDataFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(remote.max_expired_at, 500);
+
+        // into_data_file must restore max_expired_at.
+        let restored = remote.into_data_file(&file_manager, file_id, true).unwrap();
+        assert_eq!(restored.max_expired_at(), 500);
+
+        cleanup_test_root(root);
+    }
+
+    #[test]
+    fn test_remote_data_file_backward_compatible_without_max_expired_at() {
+        // A RemoteDataFile serialized without the max_expired_at field (as produced by
+        // older binaries) must decode with the default value of 0.
+        let json = serde_json::json!({
+            "file_id": 1,
+            "file_type": "SSTable",
+            "full_path": "file:///tmp/legacy",
+            "start_key": [],
+            "end_key": [],
+            "schema_id": 0,
+            "size": 0,
+            "has_separated_values": false,
+            "bucket_range_start": 0,
+            "bucket_range_end": 0,
+            "effective_bucket_range_start": 0,
+            "effective_bucket_range_end": 0,
+            "vlog_file_seq_offset": 0,
+            "meta_bytes": null,
+        });
+        let remote: RemoteDataFile = serde_json::from_value(json).unwrap();
+        assert_eq!(remote.max_expired_at, 0);
     }
 }

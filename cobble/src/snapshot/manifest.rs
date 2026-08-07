@@ -24,7 +24,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Snapshot manifests version 2 require SST row keys with big-endian bucket prefixes.
-pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 2;
+/// Version 3 adds per-file `max_expired_at` (defaults to 0 for older manifests).
+pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 3;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
@@ -94,10 +95,9 @@ impl ManifestPayload {
 }
 
 fn validate_manifest_version(version: u32) -> Result<()> {
-    if version != MANIFEST_VERSION_CURRENT {
+    if !(2..=MANIFEST_VERSION_CURRENT).contains(&version) {
         return Err(Error::IoError(format!(
-            "Unsupported snapshot manifest version: {} (expected {})",
-            version, MANIFEST_VERSION_CURRENT
+            "Unsupported snapshot manifest version: {version} (expected 2..={MANIFEST_VERSION_CURRENT})"
         )));
     }
     Ok(())
@@ -864,6 +864,75 @@ mod tests {
     }
 
     #[test]
+    fn decode_manifest_v2_backward_compatible_defaults_max_expired_at() {
+        // A version-2 manifest with a file that has no max_expired_at field.
+        // serde(default) should fill in 0 (no expiration).
+        let v2 = r#"{
+            "version": 2,
+            "id": 1,
+            "seq_id": 2,
+            "latest_schema_id": 3,
+            "data_size_bytes": 0,
+            "incremental_data_size_bytes": 0,
+            "bucket_ranges": [],
+            "lsm_tree_bucket_ranges": [],
+            "tree_scopes": [],
+            "tree_levels": [[{"ordinal": 1, "tiered": false, "files": [
+                {"file_id": 10, "file_type": "sst", "schema_id": 1, "size": 100,
+                 "start_key": "61", "end_key": "7a", "path": "data/10.sst",
+                 "has_separated_values": false,
+                 "bucket_range_start": 0, "bucket_range_end": 0,
+                 "effective_bucket_range_start": 0, "effective_bucket_range_end": 0,
+                 "vlog_file_seq_offset": 0}
+            ]}]],
+            "vlog_files": [],
+            "active_memtable_data": []
+        }"#;
+        let payload = decode_manifest(v2.as_bytes()).expect("v2 manifest should decode");
+        match payload {
+            ManifestPayload::Snapshot(s) => {
+                let file = &s.tree_levels[0][0].files[0];
+                assert_eq!(file.max_expired_at, 0);
+            }
+            _ => panic!("expected snapshot payload"),
+        }
+    }
+
+    #[test]
+    fn decode_manifest_v3_preserves_max_expired_at() {
+        let v3 = r#"{
+            "version": 3,
+            "id": 1,
+            "seq_id": 2,
+            "latest_schema_id": 3,
+            "data_size_bytes": 0,
+            "incremental_data_size_bytes": 0,
+            "bucket_ranges": [],
+            "lsm_tree_bucket_ranges": [],
+            "tree_scopes": [],
+            "tree_levels": [[{"ordinal": 1, "tiered": false, "files": [
+                {"file_id": 10, "file_type": "sst", "schema_id": 1, "size": 100,
+                 "start_key": "61", "end_key": "7a", "path": "data/10.sst",
+                 "has_separated_values": false,
+                 "bucket_range_start": 0, "bucket_range_end": 0,
+                 "effective_bucket_range_start": 0, "effective_bucket_range_end": 0,
+                 "vlog_file_seq_offset": 0,
+                 "max_expired_at": 5000}
+            ]}]],
+            "vlog_files": [],
+            "active_memtable_data": []
+        }"#;
+        let payload = decode_manifest(v3.as_bytes()).expect("v3 manifest should decode");
+        match payload {
+            ManifestPayload::Snapshot(s) => {
+                let file = &s.tree_levels[0][0].files[0];
+                assert_eq!(file.max_expired_at, 5000);
+            }
+            _ => panic!("expected snapshot payload"),
+        }
+    }
+
+    #[test]
     fn decode_manifest_rejects_previous_physical_key_format() {
         let previous = r#"{
             "version": 1,
@@ -885,7 +954,7 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("Unsupported snapshot manifest version: 1 (expected 2)")
+                .contains("Unsupported snapshot manifest version: 1 (expected 2..=3)")
         );
     }
 }

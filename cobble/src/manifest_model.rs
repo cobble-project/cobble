@@ -43,6 +43,10 @@ pub(crate) struct ManifestFile {
     pub(crate) effective_bucket_range_start: u16,
     pub(crate) effective_bucket_range_end: u16,
     pub(crate) vlog_file_seq_offset: u32,
+    /// Maximum `expired_at` across all values in this file. 0 = no value has an expiration.
+    /// Defaults to 0 for manifests written before this field existed.
+    #[serde(default)]
+    pub(crate) max_expired_at: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -68,6 +72,7 @@ pub(crate) fn manifest_file_from_data_file(file: &DataFile, path: String) -> Man
         effective_bucket_range_start: *file.effective_bucket_range.start(),
         effective_bucket_range_end: *file.effective_bucket_range.end(),
         vlog_file_seq_offset: file.vlog_file_seq_offset,
+        max_expired_at: file.max_expired_at(),
     }
 }
 
@@ -246,21 +251,21 @@ fn build_data_file(
         file_manager.set_data_file_priority(file.file_id, lsm_file_priority_for_level(ordinal))?;
         TrackedFileId::new(file_manager, file.file_id)
     };
-    Ok(Arc::new(
-        DataFile::new(
-            file_type,
-            start_key,
-            end_key,
-            file.file_id,
-            tracked_id,
-            file.schema_id,
-            file.size,
-            file.bucket_range_start..=file.bucket_range_end,
-            file.effective_bucket_range_start..=file.effective_bucket_range_end,
-        )
-        .with_vlog_offset(file.vlog_file_seq_offset)
-        .with_separated_values(file.has_separated_values),
-    ))
+    let data_file = DataFile::new(
+        file_type,
+        start_key,
+        end_key,
+        file.file_id,
+        tracked_id,
+        file.schema_id,
+        file.size,
+        file.bucket_range_start..=file.bucket_range_end,
+        file.effective_bucket_range_start..=file.effective_bucket_range_end,
+    )
+    .with_vlog_offset(file.vlog_file_seq_offset)
+    .with_separated_values(file.has_separated_values);
+    data_file.set_max_expired_at(file.max_expired_at);
+    Ok(Arc::new(data_file))
 }
 
 /// Verifies every file referenced by a durable layout is readable before a consumer plans work.

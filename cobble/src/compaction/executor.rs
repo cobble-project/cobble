@@ -649,6 +649,9 @@ impl CompactionExecutor {
             .any(|file| file.has_separated_values());
         let merge_collector = input_has_separated_values.then(|| VlogMergeCollector::shared(true));
         let merge_callback = merge_collector.as_ref().map(VlogMergeCollector::callback);
+        let expired_callback = merge_collector
+            .as_ref()
+            .map(VlogMergeCollector::expired_value_callback);
 
         // Create deduplicating iterator
         let mut dedup_iter = DeduplicatingIterator::new_for_sst_build(
@@ -656,6 +659,7 @@ impl CompactionExecutor {
             Some(num_columns),
             task.ttl_provider(),
             merge_callback,
+            expired_callback,
             Arc::clone(&target_schema),
         );
         dedup_iter.seek_to_first()?;
@@ -770,6 +774,7 @@ impl CompactionExecutor {
                         file_size,
                         meta_bytes,
                         sst_read_metadata,
+                        max_expired_at,
                     } = builder.finish()?;
                     let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
                     trace!(
@@ -794,6 +799,7 @@ impl CompactionExecutor {
                             .is_some_and(|collector| collector.borrow().has_separated_values()),
                     );
                     data_file.set_meta_bytes(meta_bytes);
+                    data_file.set_max_expired_at(max_expired_at);
                     if let Some(metadata) = sst_read_metadata {
                         data_file.set_sst_read_metadata(metadata);
                     }
@@ -822,6 +828,7 @@ impl CompactionExecutor {
                 file_size,
                 meta_bytes,
                 sst_read_metadata,
+                max_expired_at,
             } = builder.finish()?;
             let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
             trace!(
@@ -846,6 +853,7 @@ impl CompactionExecutor {
                     .is_some_and(|collector| collector.borrow().has_separated_values()),
             );
             data_file.set_meta_bytes(meta_bytes);
+            data_file.set_max_expired_at(max_expired_at);
             if let Some(metadata) = sst_read_metadata {
                 data_file.set_sst_read_metadata(metadata);
             }
@@ -1080,6 +1088,19 @@ mod tests {
         encode_value(&value, num_columns).to_vec()
     }
 
+    fn make_typed_value_bytes_with_expired(
+        value_type: ValueType,
+        data: &[u8],
+        num_columns: usize,
+        expired_at: Option<u32>,
+    ) -> Vec<u8> {
+        let value = Value::new_with_expired_at(
+            vec![Some(Column::new(value_type, data.to_vec()))],
+            expired_at,
+        );
+        encode_value(&value, num_columns).to_vec()
+    }
+
     fn schema_manager_for(num_columns: usize) -> Arc<SchemaManager> {
         Arc::new(SchemaManager::from_schemas(
             vec![Schema::new(0, num_columns, Vec::new())],
@@ -1114,6 +1135,7 @@ mod tests {
             file_size,
             meta_bytes,
             sst_read_metadata,
+            max_expired_at,
         } = writer.finish_with_range()?;
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
 
@@ -1130,6 +1152,7 @@ mod tests {
         )
         .with_separated_values(true);
         data_file.set_meta_bytes(meta_bytes);
+        data_file.set_max_expired_at(max_expired_at);
         if let Some(metadata) = sst_read_metadata {
             data_file.set_sst_read_metadata(metadata);
         }
@@ -1988,6 +2011,7 @@ mod tests {
             file_size,
             meta_bytes,
             sst_read_metadata,
+            max_expired_at,
         } = writer.finish_with_range().unwrap();
         let bucket_range = DataFile::bucket_range_from_keys(&first_key, &last_key);
 
@@ -2003,6 +2027,7 @@ mod tests {
             bucket_range,
         );
         file.set_meta_bytes(meta_bytes);
+        file.set_max_expired_at(max_expired_at);
         if let Some(metadata) = sst_read_metadata {
             file.set_sst_read_metadata(metadata);
         }
@@ -2194,6 +2219,250 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(deltas.get(&9).copied(), Some(-1));
+        cleanup_test_dir(test_dir);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_compaction_expired_separated_values_emit_vlog_deltas() {
+        // End-to-end: a file with separated values whose entries are expired should
+        // produce VLOG entry-delta = -1 per separated pointer when rewritten.
+        let test_dir = "/tmp/compaction_expired_vlog_delta_test";
+        cleanup_test_dir(test_dir);
+
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", test_dir))
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
+        let num_columns = 1;
+        let pointer = crate::vlog::VlogPointer::new(9, 0);
+        // Create an SST with a PutSeparated value that has expired_at = 100.
+        let expired_sep = create_test_sst(
+            &file_manager,
+            vec![(
+                b"k",
+                &make_typed_value_bytes_with_expired(
+                    ValueType::PutSeparated,
+                    &pointer.to_bytes(),
+                    num_columns,
+                    Some(100),
+                ),
+            )],
+        )
+        .unwrap();
+
+        // Use a manual time provider set past the expiration (now = 200 > 100).
+        let time_provider = Arc::new(crate::time::ManualTimeProvider::new(200));
+        let ttl_provider = Arc::new(crate::ttl::TTLProvider::new(
+            &crate::ttl::TtlConfig {
+                enabled: true,
+                default_ttl_seconds: None,
+            },
+            time_provider,
+        ));
+
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions::default());
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
+        let task = CompactionTask::new(
+            compaction_metrics,
+            sst_metrics,
+            0,
+            vec![SortedRun::new(1, vec![expired_sep])],
+            1,
+            Arc::clone(&file_manager),
+            factory,
+            DataFileType::SSTable,
+            ttl_provider,
+            schema_manager_for(num_columns),
+        );
+        let executor =
+            CompactionExecutor::with_defaults(Arc::new(DbLifecycle::new_open())).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+        // The expired separated value should produce a -1 delta for VLOG file seq 9.
+        let deltas: std::collections::HashMap<u32, i64> = result
+            .vlog_edit()
+            .expect("VLOG edit should be present for expired separated values")
+            .entry_deltas()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            deltas.get(&9).copied(),
+            Some(-1),
+            "expired separated value should produce VLOG removal delta"
+        );
+        cleanup_test_dir(test_dir);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_compaction_corrupt_expired_separated_value_returns_error() {
+        // A corrupt expired separated value must abort compaction with an error, not be
+        // silently dropped (which would leak the VLOG entry-count reference).
+        let test_dir = "/tmp/compaction_corrupt_expired_sep_test";
+        cleanup_test_dir(test_dir);
+
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", test_dir))
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
+        let num_columns = 1;
+
+        // Build a corrupt value: 4-byte expired_at = 100 (little-endian), then a truncated
+        // column body with no value_type byte. `value_expired_at` reads only the first 4 bytes
+        // and succeeds, but `decode_value` (called via `into_decoded` in the expired callback)
+        // fails because there is no value_type byte.
+        let corrupt_expired_value: Vec<u8> = 100u32.to_le_bytes().to_vec();
+
+        let corrupt_file = create_test_sst(
+            &file_manager,
+            vec![(b"k", corrupt_expired_value.as_slice())],
+        )
+        .unwrap();
+
+        let time_provider = Arc::new(crate::time::ManualTimeProvider::new(200));
+        let ttl_provider = Arc::new(crate::ttl::TTLProvider::new(
+            &crate::ttl::TtlConfig {
+                enabled: true,
+                default_ttl_seconds: None,
+            },
+            time_provider,
+        ));
+
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions::default());
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
+        let task = CompactionTask::new(
+            compaction_metrics,
+            sst_metrics,
+            0,
+            vec![SortedRun::new(1, vec![corrupt_file])],
+            1,
+            Arc::clone(&file_manager),
+            factory,
+            DataFileType::SSTable,
+            ttl_provider,
+            schema_manager_for(num_columns),
+        );
+        let executor =
+            CompactionExecutor::with_defaults(Arc::new(DbLifecycle::new_open())).unwrap();
+        let result = executor.execute_blocking(task, None);
+        assert!(
+            result.is_err(),
+            "compaction must return an error for a corrupt expired separated value, not silently drop it"
+        );
+        cleanup_test_dir(test_dir);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_compaction_expired_sep_plus_live_inline_output_not_separated() {
+        // An expired separated value plus a surviving inline value in the same compaction
+        // must: (1) emit a VLOG removal delta for the expired separated pointer, and
+        // (2) produce an output file whose has_separated_values is false (since the only
+        // surviving value is inline). This verifies that on_expired_value does not pollute
+        // the output file's separated-values flag.
+        let test_dir = "/tmp/compaction_expired_sep_live_inline_test";
+        cleanup_test_dir(test_dir);
+
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(format!("file://{}", test_dir))
+            .unwrap();
+        let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
+        let file_manager = Arc::new(
+            FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+        );
+        let num_columns = 1;
+        let pointer = crate::vlog::VlogPointer::new(7, 0);
+
+        // File A: an expired PutSeparated value at key "a".
+        let expired_sep = create_test_sst(
+            &file_manager,
+            vec![(
+                b"a",
+                &make_typed_value_bytes_with_expired(
+                    ValueType::PutSeparated,
+                    &pointer.to_bytes(),
+                    num_columns,
+                    Some(100),
+                ),
+            )],
+        )
+        .unwrap();
+
+        // File B: a live (non-expired) inline Put value at key "b".
+        let live_inline = create_test_sst(
+            &file_manager,
+            vec![(
+                b"b",
+                &make_typed_value_bytes_with_expired(
+                    ValueType::Put,
+                    b"alive",
+                    num_columns,
+                    Some(500),
+                ),
+            )],
+        )
+        .unwrap();
+
+        let time_provider = Arc::new(crate::time::ManualTimeProvider::new(200));
+        let ttl_provider = Arc::new(crate::ttl::TTLProvider::new(
+            &crate::ttl::TtlConfig {
+                enabled: true,
+                default_ttl_seconds: None,
+            },
+            time_provider,
+        ));
+
+        let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions::default());
+        let compaction_metrics = Arc::new(CompactionTaskMetrics::new("test"));
+        let sst_metrics = Arc::new(crate::sst::SSTIteratorMetrics::new("test"));
+        let task = CompactionTask::new(
+            compaction_metrics,
+            sst_metrics,
+            0,
+            vec![SortedRun::new(1, vec![expired_sep, live_inline])],
+            1,
+            Arc::clone(&file_manager),
+            factory,
+            DataFileType::SSTable,
+            ttl_provider,
+            schema_manager_for(num_columns),
+        );
+        let executor =
+            CompactionExecutor::with_defaults(Arc::new(DbLifecycle::new_open())).unwrap();
+        let result = executor.execute_blocking(task, None).unwrap();
+
+        // (1) VLOG removal delta for the expired separated pointer (file seq 7).
+        let deltas: std::collections::HashMap<u32, i64> = result
+            .vlog_edit()
+            .expect("VLOG edit should be present for expired separated values")
+            .entry_deltas()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            deltas.get(&7).copied(),
+            Some(-1),
+            "expired separated value should produce VLOG removal delta"
+        );
+
+        // (2) The output file must NOT be marked as having separated values, because the
+        // only surviving value is inline.
+        let output_files = result.new_files();
+        assert_eq!(output_files.len(), 1);
+        assert!(
+            !output_files[0].has_separated_values(),
+            "output file must not be marked as separated when all surviving values are inline"
+        );
         cleanup_test_dir(test_dir);
     }
 

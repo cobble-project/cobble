@@ -844,6 +844,11 @@ pub struct Config {
     /// Compression algorithm per level (index by level number).
     pub sst_compression_by_level: Vec<SstCompressionAlgorithm>,
     /// Whether TTL is enabled. If false, TTL metadata is ignored.
+    ///
+    /// **Known limitation:** TTL is not supported with `CompactionMode::Dedicated`. The config
+    /// validator rejects `ttl_enabled = true` combined with `compaction_mode = dedicated` because
+    /// the dedicated compactor process has no shared clock for expiration decisions. File-level TTL
+    /// cleanup is fully supported in `Embedded` and `Remote` compaction modes.
     pub ttl_enabled: bool,
     /// Default TTL duration (in seconds). None means no expiration by default.
     pub default_ttl_seconds: Option<u32>,

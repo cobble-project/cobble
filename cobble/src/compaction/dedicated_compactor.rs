@@ -339,9 +339,14 @@ impl DedicatedCompactor {
                 continue;
             };
             let mut policy = Self::make_policy(self.config.compaction_policy);
+            // Dedicated compaction runs in a separate process without a shared clock, so TTL is
+            // disabled here (now_seconds = 0). The config validator rejects `ttl_enabled + dedicated`
+            // (see `Config::validate`); the `drop_expired` validation in `publish_drop_result` is
+            // correct but unreachable until cross-process TTL clock sync is implemented.
             let policy_context = CompactionPolicyContext {
                 truncation_cursors: Some(&truncation_cursors),
                 tree_scope: Some(tree_scope),
+                now_seconds: 0,
             };
             let plan =
                 policy.pick_with_context(&tree_version.levels, compaction_config, policy_context);
@@ -366,6 +371,7 @@ impl DedicatedCompactor {
                 &schema_manager,
                 &observation.source,
                 &job_id,
+                policy_context.now_seconds,
             ) {
                 Ok(()) => {
                     return Ok(DedicatedCompactionStep::ResultPublished { job_id });
@@ -463,6 +469,7 @@ impl DedicatedCompactor {
         schema_manager: &Arc<SchemaManager>,
         source: &DedicatedCompactionSource,
         job_id: &str,
+        now_seconds: u32,
     ) -> Result<()> {
         // Write a lease file so the writer's orphan sweep doesn't delete our outputs
         // while we're still working. We also start a heartbeat thread to refresh the lease
@@ -471,7 +478,7 @@ impl DedicatedCompactor {
         let heartbeat_handle = self.start_lease_heartbeat(job_id);
 
         // Handle trivial move and drop without executing a full compaction task.
-        let result = if plan.drop_truncated {
+        let result = if plan.drop_truncated || plan.drop_expired {
             self.publish_drop_result(
                 tree_idx,
                 tree_scope,
@@ -480,6 +487,7 @@ impl DedicatedCompactor {
                 truncation_cursors,
                 source,
                 job_id,
+                now_seconds,
             )
         } else if plan.trivial_move {
             self.publish_trivial_move_result(tree_idx, tree_scope, levels, plan, source, job_id)
@@ -683,17 +691,31 @@ impl DedicatedCompactor {
         truncation_cursors: &crate::db_state::TruncationCursorMap,
         source: &DedicatedCompactionSource,
         job_id: &str,
+        now_seconds: u32,
     ) -> Result<()> {
         let input_file = Self::find_plan_file(levels, plan)?;
-        // Verify the file is fully covered by a truncation cursor.
+        // Validate the drop according to its kind:
+        // - drop_expired: the file must be fully expired at the current time.
+        // - drop_truncated: the file must be fully covered by a truncation cursor.
         let policy_context = CompactionPolicyContext {
             truncation_cursors: Some(truncation_cursors),
             tree_scope: Some(tree_scope),
+            now_seconds,
         };
-        if !file_fully_covered_by_truncation_cursor(&input_file, policy_context) {
+        let valid = if plan.drop_expired {
+            input_file.is_fully_expired(now_seconds)
+        } else {
+            file_fully_covered_by_truncation_cursor(&input_file, policy_context)
+        };
+        if !valid {
             return Err(Error::InvalidState(format!(
-                "drop plan file {} is not fully covered by truncation cursor",
-                input_file.file_id
+                "drop plan file {} is not fully {}",
+                input_file.file_id,
+                if plan.drop_expired {
+                    "expired"
+                } else {
+                    "covered by truncation cursor"
+                }
             )));
         }
         let input = DedicatedCompactionInput {

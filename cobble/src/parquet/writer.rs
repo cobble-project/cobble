@@ -63,6 +63,11 @@ pub(crate) struct ParquetWriter<W: SequentialWriteFile> {
     /// Output-cache addressing shared with scan iterators and async preload.
     hot_block_cache_namespace: Option<u64>,
     hot_block_output_file_id: Option<u64>,
+    /// Maximum `expired_at` across all values added to this file. 0 = none had expiration.
+    max_expired_at: u32,
+    /// True if any value added to this file has no `expired_at` (never expires). When set,
+    /// `max_expired_at` is reported as 0 so the file is never dropped at the file level.
+    has_no_ttl_entry: bool,
 }
 
 impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
@@ -116,6 +121,8 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
             hot_block_cache,
             hot_block_cache_namespace,
             hot_block_output_file_id,
+            max_expired_at: 0,
+            has_no_ttl_entry: false,
         })
     }
 
@@ -250,8 +257,16 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
         self.last_key = key.to_vec();
         self.total_rows += 1;
         self.keys.push(ByteArray::from(Bytes::copy_from_slice(key)));
-        self.expired_ats
-            .push(decoded.expired_at().unwrap_or(0) as i64);
+        let exp = decoded.expired_at().unwrap_or(0);
+        self.expired_ats.push(exp as i64);
+        match decoded.expired_at() {
+            Some(e) => {
+                if e > self.max_expired_at {
+                    self.max_expired_at = e;
+                }
+            }
+            None => self.has_no_ttl_entry = true,
+        }
         for idx in 0..num_columns {
             if let Some(column) = decoded.columns().get(idx).and_then(|col| col.as_ref()) {
                 let mut payload = Vec::with_capacity(1 + column.data().len());
@@ -309,6 +324,7 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
     pub(crate) fn finish(mut self) -> Result<FileBuildResult> {
         let first_key = self.first_key.clone().unwrap_or_default();
         self.flush_current_group()?;
+        let max_expired_at = self.effective_max_expired_at();
         let last_key = self.last_key;
         let mut adapter = self
             .writer
@@ -321,7 +337,18 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
             last_key,
             file_size,
             ParquetMeta::new(self.total_rows, self.row_group_ranges).encode(),
-        ))
+        )
+        .with_max_expired_at(max_expired_at))
+    }
+
+    /// Returns `max_expired_at` unless any entry has no expiration, in which case returns 0
+    /// (the file can never be fully expired at the file level).
+    fn effective_max_expired_at(&self) -> u32 {
+        if self.has_no_ttl_entry {
+            0
+        } else {
+            self.max_expired_at
+        }
     }
 
     pub(crate) fn offset(&self) -> usize {

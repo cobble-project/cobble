@@ -2611,6 +2611,7 @@ fn flush_memtable(
         None,
         ttl_provider,
         None,
+        None,
         Arc::clone(&schema),
     );
     dedup_iter.seek_to_first()?;
@@ -2704,6 +2705,7 @@ fn flush_memtable(
             file_size,
             meta_bytes,
             sst_read_metadata,
+            max_expired_at,
         } = builder.finish()?;
         let bucket_range = min_bucket..=max_bucket;
         let data_file = DataFile::new(
@@ -2719,6 +2721,7 @@ fn flush_memtable(
         )
         .with_separated_values(has_separated_values);
         data_file.set_meta_bytes(meta_bytes);
+        data_file.set_max_expired_at(max_expired_at);
         if let Some(metadata) = sst_read_metadata {
             data_file.set_sst_read_metadata(metadata);
         }

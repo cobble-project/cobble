@@ -17,6 +17,11 @@ use std::sync::Arc;
 /// is guaranteed to be called first as well, as callback(None, oldest_column) before any
 /// newer column is merged.
 type MergeCallback = Box<dyn FnMut(Option<&Column>, Option<&Column>)>;
+/// Callback invoked when a value is expired and dropped during compaction, so the caller can
+/// collect VLOG removal deltas for separated-value columns. Returning an error aborts the
+/// compaction - a corrupt expired value must not be silently dropped without updating VLOG
+/// reference counts.
+type ExpiredCallback = Box<dyn FnMut(&Value) -> Result<()>>;
 
 /// Boundary handling for the deduplicating wrapper.
 ///
@@ -80,6 +85,8 @@ pub struct DeduplicatingIterator<I> {
     ttl_provider: Arc<TTLProvider>,
     /// Callback invoked for every merged column pair (older, newer).
     on_merge: Option<MergeCallback>,
+    /// Callback invoked when a value is expired and dropped, for VLOG delta collection.
+    on_expired: Option<ExpiredCallback>,
     /// Whether to allow terminal fast-path that skips collecting older versions.
     allow_terminal_shortcut: bool,
     /// Representation contract for a lone non-terminal value after deduplication.
@@ -91,6 +98,7 @@ pub struct DeduplicatingIterator<I> {
 /// Collects a value into the values vector or selects it as the final value.
 /// This function checks for expiration and terminal status.
 /// Takes ownership of the KvValue to avoid unnecessary copies.
+#[allow(clippy::too_many_arguments)]
 fn collect_value(
     value: KvValue,
     num_columns: usize,
@@ -99,9 +107,18 @@ fn collect_value(
     values: &mut Vec<KvValue>,
     selected_value: &mut Option<KvValue>,
     stop_collecting: &mut bool,
+    on_expired: &mut Option<ExpiredCallback>,
 ) -> Result<()> {
     let expired_at = value.expired_at()?;
     if ttl_provider.expired(&expired_at) {
+        // The value is expired and will be dropped. If a VLOG collection callback is
+        // present, decode the value and forward it so removal deltas can be collected.
+        // A decode failure is an error: the value would be deleted without updating VLOG
+        // reference counts, leaking separated-value entries.
+        if let Some(callback) = on_expired.as_deref_mut() {
+            let decoded = value.into_decoded(num_columns)?;
+            callback(&decoded)?;
+        }
         return Ok(());
     }
     let is_terminal = value.is_terminal(num_columns)?;
@@ -135,6 +152,7 @@ impl<I> DeduplicatingIterator<I> {
             num_columns,
             ttl_provider,
             on_merge,
+            None,
             schema,
             OutputMode::Materialize,
         )
@@ -149,6 +167,7 @@ impl<I> DeduplicatingIterator<I> {
         num_columns: Option<usize>,
         ttl_provider: Arc<TTLProvider>,
         on_merge: Option<MergeCallback>,
+        on_expired: Option<ExpiredCallback>,
         schema: Arc<Schema>,
     ) -> Self {
         Self::new_with_output_mode(
@@ -156,6 +175,7 @@ impl<I> DeduplicatingIterator<I> {
             num_columns,
             ttl_provider,
             on_merge,
+            on_expired,
             schema,
             OutputMode::PreserveSingleValueForSst,
         )
@@ -166,6 +186,7 @@ impl<I> DeduplicatingIterator<I> {
         num_columns: Option<usize>,
         ttl_provider: Arc<TTLProvider>,
         on_merge: Option<MergeCallback>,
+        on_expired: Option<ExpiredCallback>,
         schema: Arc<Schema>,
         output_mode: OutputMode,
     ) -> Self {
@@ -178,6 +199,7 @@ impl<I> DeduplicatingIterator<I> {
             boundary_state: BoundaryState::None,
             ttl_provider,
             on_merge,
+            on_expired,
             allow_terminal_shortcut,
             output_mode,
             schema,
@@ -241,6 +263,7 @@ impl<I> DeduplicatingIterator<I> {
                 &mut values,
                 &mut selected_value,
                 &mut stop_collecting,
+                &mut self.on_expired,
             )?;
 
             // Advance to next entry and check for same key
@@ -272,6 +295,7 @@ impl<I> DeduplicatingIterator<I> {
                         &mut values,
                         &mut selected_value,
                         &mut stop_collecting,
+                        &mut self.on_expired,
                     )?;
                 }
             }
@@ -587,6 +611,7 @@ mod tests {
             Some(1),
             Arc::new(TTLProvider::disabled()),
             None,
+            None,
             Schema::empty(),
         );
 
@@ -617,6 +642,7 @@ mod tests {
                 assert!(new_column.is_some());
                 observed_for_callback.fetch_add(1, Ordering::Relaxed);
             })),
+            None,
             Schema::empty(),
         );
 

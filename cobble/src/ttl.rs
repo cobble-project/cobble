@@ -63,6 +63,11 @@ impl TTLProvider {
         self.time_provider.now_seconds()
     }
 
+    /// Returns whether TTL expiration is enabled.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub(crate) fn time_provider(&self) -> &dyn crate::time::TimeProvider {
         self.time_provider.as_ref()
     }
