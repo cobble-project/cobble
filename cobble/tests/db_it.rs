@@ -2796,9 +2796,10 @@ fn test_db_snapshot_auto_expire() {
         root,
         bucket_snapshot_manifest_path(db.id(), second_id)
     );
-    wait_for_missing(&first_path);
+    let _ = wait_for_manifest_in_db(root, db.id(), first_id);
     assert!(!db.expire_snapshot(first_id).unwrap());
     assert!(db.expire_snapshot(second_id).unwrap());
+    wait_for_missing(&first_path);
     wait_for_missing(&second_path);
 
     cleanup_test_root(root);
