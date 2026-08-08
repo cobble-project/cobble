@@ -81,7 +81,7 @@ mod tests {
             start_key,
             end_key,
             file_id,
-            TrackedFileId::detached(file_id),
+            TrackedFileId::untracked(file_id),
             0,
             file_size,
             0..=0,

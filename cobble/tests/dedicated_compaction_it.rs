@@ -194,9 +194,7 @@ fn current_runtime_manifest_references_path(root: &str, path: &str) -> bool {
         generation: u64,
     ) -> Option<std::collections::BTreeMap<u64, String>> {
         let manifest_path = runtime_dir.join(format!("MANIFEST-{generation}"));
-        let Some(payload) = metadata_payload(&manifest_path) else {
-            return None;
-        };
+        let payload = metadata_payload(&manifest_path)?;
         let envelope = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
         let manifest = envelope.get("manifest")?;
         let payload = manifest.get("payload")?;

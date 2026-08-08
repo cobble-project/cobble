@@ -202,7 +202,7 @@ pub(crate) fn build_vlog_version_from_files(
                 file.origin.clone(),
             )?;
             file_manager.set_data_file_priority(file.file_id, VLOG_FILE_PRIORITY)?;
-            TrackedFileId::detached(file.file_id)
+            TrackedFileId::untracked(file.file_id)
         } else {
             if !file_manager.has_data_file(file.file_id) {
                 match &file.origin {
@@ -269,7 +269,7 @@ fn build_data_file(
             file.origin.clone(),
         )?;
         file_manager.set_data_file_priority(file.file_id, lsm_file_priority_for_level(ordinal))?;
-        TrackedFileId::detached(file.file_id)
+        TrackedFileId::untracked(file.file_id)
     } else {
         if !file_manager.has_data_file(file.file_id) {
             match &file.origin {

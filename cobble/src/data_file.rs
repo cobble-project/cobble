@@ -153,9 +153,9 @@ impl DataFile {
         data_file
     }
 
-    /// Create a detached DataFile (for snapshots / read-only use).
+    /// Create a DataFile without a FileManager callback (for snapshots / read-only use).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_detached(
+    pub(crate) fn new_untracked(
         file_type: DataFileType,
         start_key: Vec<u8>,
         end_key: Vec<u8>,
@@ -170,7 +170,7 @@ impl DataFile {
             start_key,
             end_key,
             file_id,
-            TrackedFileId::detached(file_id),
+            TrackedFileId::untracked(file_id),
             schema_id,
             size,
             bucket_range,
@@ -259,12 +259,12 @@ impl DataFile {
     }
 
     /// Returns the logical file backing this data file, if one has been attached by the
-    /// FileManager. Returns `None` for detached/test data files that were never registered.
+    /// FileManager. Returns `None` for untracked/test data files that were never registered.
     pub(crate) fn logical_file(&self) -> Option<Arc<LogicalFile>> {
         self.logical_file.get().cloned()
     }
 
-    /// Attaches a logical file to a detached data file.
+    /// Attaches a logical file to an untracked data file.
     pub(crate) fn attach_logical_file(&self, logical: Arc<LogicalFile>) {
         let _ = self.logical_file.set(logical);
     }
@@ -299,7 +299,7 @@ mod tests {
     use super::*;
 
     fn make_file() -> DataFile {
-        DataFile::new_detached(
+        DataFile::new_untracked(
             DataFileType::SSTable,
             b"a".to_vec(),
             b"z".to_vec(),

@@ -762,7 +762,7 @@ pub(crate) fn build_tree_versions_from_manifest_untracked(
         let start_key = from_hex(&file.start_key)?;
         let end_key = from_hex(&file.end_key)?;
         Ok(Arc::new(
-            DataFile::new_detached(
+            DataFile::new_untracked(
                 file_type,
                 start_key,
                 end_key,
@@ -787,7 +787,7 @@ pub(crate) fn build_vlog_version_from_manifest_untracked(
         .map(|file| {
             (
                 file.file_seq,
-                TrackedFileId::detached(file.file_id),
+                TrackedFileId::untracked(file.file_id),
                 file.valid_entries,
             )
         })
@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn topology_epoch_change_forces_full_snapshot_manifest() {
-        let file = Arc::new(DataFile::new_detached(
+        let file = Arc::new(DataFile::new_untracked(
             DataFileType::SSTable,
             b"a".to_vec(),
             b"b".to_vec(),

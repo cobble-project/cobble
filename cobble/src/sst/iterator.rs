@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     fn test_data_file(file_id: u64, size: usize) -> DataFile {
-        DataFile::new_detached(
+        DataFile::new_untracked(
             DataFileType::SSTable,
             b"a".to_vec(),
             b"z".to_vec(),

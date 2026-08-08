@@ -1,4 +1,4 @@
-use super::file_manager::FileId;
+use super::file_manager::{FileId, PhysicalDeletePolicy};
 use crate::Error;
 use crate::config::PrimaryVolumeOffloadPolicyKind;
 use crate::data_file::{DataFile, DataFileType};
@@ -27,7 +27,9 @@ fn effective_backfill_trigger_watermark(requested: f64, offload_trigger: f64) ->
 }
 
 fn projected_source_release_bytes(source: &TrackedFile) -> u64 {
-    if source.is_marked_for_deletion() && source.explicit_refs.load(AtomicOrdering::SeqCst) == 0 {
+    if source.physical_delete_policy() == PhysicalDeletePolicy::ManagedDelete
+        && source.explicit_refs.load(AtomicOrdering::SeqCst) == 0
+    {
         source.size_bytes()
     } else {
         0
@@ -593,7 +595,7 @@ impl FileManager {
         &self,
         volume: &Arc<DataVolume>,
     ) -> crate::Result<(TrackedWriter, Arc<TrackedFile>)> {
-        let tracked = Arc::new(TrackedFile::new(
+        let tracked = Arc::new(TrackedFile::managed(
             self.data_file_path(0),
             Arc::clone(volume.fs()),
             Some(Arc::clone(volume)),
@@ -1307,7 +1309,9 @@ impl FileManager {
                 let explicit_refs = tracked
                     .explicit_refs
                     .load(std::sync::atomic::Ordering::SeqCst);
-                if explicit_refs != 0 && !tracked.is_marked_for_deletion() {
+                if explicit_refs != 0
+                    && tracked.physical_delete_policy() != PhysicalDeletePolicy::ManagedDelete
+                {
                     return None;
                 }
                 if self.offload_runtime.is_queued_or_running(*entry.key()) {
@@ -2530,11 +2534,11 @@ mod tests {
         let candidates = vec![
             (
                 7,
-                Arc::new(TrackedFile::new("a".to_string(), Arc::clone(&fs), None)),
+                Arc::new(TrackedFile::managed("a".to_string(), Arc::clone(&fs), None)),
             ),
             (
                 3,
-                Arc::new(TrackedFile::new("b".to_string(), Arc::clone(&fs), None)),
+                Arc::new(TrackedFile::managed("b".to_string(), Arc::clone(&fs), None)),
             ),
         ];
         candidates[0].1.update_size_bytes(128);
@@ -2565,11 +2569,11 @@ mod tests {
         let candidates = vec![
             (
                 12,
-                Arc::new(TrackedFile::new("b".to_string(), Arc::clone(&fs), None)),
+                Arc::new(TrackedFile::managed("b".to_string(), Arc::clone(&fs), None)),
             ),
             (
                 6,
-                Arc::new(TrackedFile::new("a".to_string(), Arc::clone(&fs), None)),
+                Arc::new(TrackedFile::managed("a".to_string(), Arc::clone(&fs), None)),
             ),
         ];
         candidates[0].1.update_size_bytes(64);
@@ -2590,11 +2594,11 @@ mod tests {
         let candidates = vec![
             (
                 11,
-                Arc::new(TrackedFile::new("a".to_string(), Arc::clone(&fs), None)),
+                Arc::new(TrackedFile::managed("a".to_string(), Arc::clone(&fs), None)),
             ),
             (
                 22,
-                Arc::new(TrackedFile::new("b".to_string(), Arc::clone(&fs), None)),
+                Arc::new(TrackedFile::managed("b".to_string(), Arc::clone(&fs), None)),
             ),
         ];
         candidates[0].1.update_size_bytes(1024);
@@ -2873,7 +2877,7 @@ mod tests {
                 .unwrap()
         );
         high_volume.add_usage(400);
-        let data_file = Arc::new(DataFile::new_detached(
+        let data_file = Arc::new(DataFile::new_untracked(
             DataFileType::SSTable,
             vec![0],
             vec![1],
@@ -2883,7 +2887,7 @@ mod tests {
             0u16..=0u16,
             0u16..=0u16,
         ));
-        let second_data_file = Arc::new(DataFile::new_detached(
+        let second_data_file = Arc::new(DataFile::new_untracked(
             DataFileType::SSTable,
             vec![1],
             vec![2],
@@ -3482,7 +3486,7 @@ mod tests {
 
     #[test]
     fn readonly_load_request_uses_lsm_level_and_sst_type_for_pinning() {
-        let sst = Arc::new(DataFile::new_detached(
+        let sst = Arc::new(DataFile::new_untracked(
             DataFileType::SSTable,
             vec![0],
             vec![1],
@@ -3492,7 +3496,7 @@ mod tests {
             0u16..=0u16,
             0u16..=0u16,
         ));
-        let parquet = Arc::new(DataFile::new_detached(
+        let parquet = Arc::new(DataFile::new_untracked(
             DataFileType::Parquet,
             vec![1],
             vec![2],

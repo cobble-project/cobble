@@ -1837,7 +1837,7 @@ mod tests {
             let id = FILE_ID_COUNTER;
             FILE_ID_COUNTER += 1;
             let bucket_range = DataFile::bucket_range_from_keys(start, end);
-            Arc::new(DataFile::new_detached(
+            Arc::new(DataFile::new_untracked(
                 DataFileType::SSTable,
                 start.to_vec(),
                 end.to_vec(),
@@ -1866,7 +1866,7 @@ mod tests {
             let id = FILE_ID_COUNTER;
             FILE_ID_COUNTER += 1;
             let bucket_range = DataFile::bucket_range_from_keys(start, end);
-            Arc::new(DataFile::new_detached(
+            Arc::new(DataFile::new_untracked(
                 DataFileType::SSTable,
                 start.to_vec(),
                 end.to_vec(),
@@ -3516,7 +3516,7 @@ mod tests {
             empty_lsm_versions(scopes.len()),
         )
         .unwrap();
-        let tracked_vlog = TrackedFileId::detached(700);
+        let tracked_vlog = TrackedFileId::untracked(700);
         db_state.store(DbState {
             seq_id: 0,
             topology_epoch: 0,

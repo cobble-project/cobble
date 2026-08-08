@@ -1094,7 +1094,7 @@ mod tests {
         }
         writer.finish().unwrap();
         let size = fs.open_read("point-read.sst").unwrap().size();
-        let data_file = DataFile::new_detached(
+        let data_file = DataFile::new_untracked(
             DataFileType::SSTable,
             b"key000".to_vec(),
             b"key003".to_vec(),

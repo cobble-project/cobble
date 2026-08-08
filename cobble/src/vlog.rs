@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn test_vlog_version_removes_zero_valid_entry_file() {
         let version =
-            VlogVersion::from_files_with_entries(vec![(7, TrackedFileId::detached(42), 1)]);
+            VlogVersion::from_files_with_entries(vec![(7, TrackedFileId::untracked(42), 1)]);
         let mut edit = VlogEdit::default();
         edit.add_entry_delta(7, -1);
         let next = version.apply_edit(edit);

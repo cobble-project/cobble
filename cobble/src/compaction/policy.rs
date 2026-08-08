@@ -1053,7 +1053,7 @@ mod tests {
 
     fn make_file(id: FileId, start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
         let bucket_range = DataFile::bucket_range_from_keys(start, end);
-        Arc::new(DataFile::new_detached(
+        Arc::new(DataFile::new_untracked(
             DataFileType::SSTable,
             start.to_vec(),
             end.to_vec(),
@@ -1068,7 +1068,7 @@ mod tests {
     fn make_separated_file(id: FileId, start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
         let bucket_range = DataFile::bucket_range_from_keys(start, end);
         Arc::new(
-            DataFile::new_detached(
+            DataFile::new_untracked(
                 DataFileType::SSTable,
                 start.to_vec(),
                 end.to_vec(),

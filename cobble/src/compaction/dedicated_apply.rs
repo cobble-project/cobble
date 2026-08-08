@@ -158,7 +158,7 @@ pub(crate) fn apply_external_compaction_result(
             // Only commit_and_verify (which reads the manifest from disk) can prove durability.
             commit_and_verify(ctx, result, freshly_applied)?;
             // A runtime manifest may only describe an edit after the snapshot barrier made the
-            // edit durable. If this publication fails, preserve the result and readonly outputs
+            // edit durable. If this publication fails, preserve the result and pending outputs
             // so a retry can prove the snapshot again and advance runtime CURRENT later.
             if let Some(publisher) = &ctx.runtime_manifest_publisher {
                 publisher.publish_at_least_and_resume(&publication_owner, applied_seq_id)?;
@@ -260,7 +260,7 @@ fn validate_result(ctx: &PollerContext, result: &DedicatedCompactionResult) -> R
             )));
         }
         // Note: output file existence is verified later in `prepare_outputs` when we
-        // register the file as readonly. We don't check here because the path is
+        // register the file for pending adoption. We don't check here because the path is
         // volume-absolute (e.g. `file://...`) and the FileManager's metadata APIs
         // expect relative paths.
     }
@@ -466,7 +466,7 @@ fn apply_rewrite(
     );
     match status {
         OperationStatus::Pending => {
-            // Allocate canonical file ids for outputs and register them readonly.
+            // Allocate canonical file ids for outputs and register them for pending adoption.
             // prepare_outputs returns the path->id mapping so we have it before apply_edit.
             let (prepared_outputs, path_to_id) =
                 prepare_outputs(ctx, outputs, output_level).map_err(classify_apply_error)?;
@@ -718,9 +718,10 @@ fn resolve_input_arcs(
     Ok(arcs)
 }
 
-/// Allocates canonical file ids for outputs, registers them readonly, and builds DataFile Arcs.
+/// Allocates canonical file ids for outputs, registers them for pending adoption, and builds
+/// DataFile Arcs.
 ///
-/// Each output is registered with a **real** `TrackedFileId::new` (not detached) so that when
+/// Each output is registered with a **real** `TrackedFileId::new` (not untracked) so that when
 /// the file is eventually removed from the LSM, the FileManager's tracking is cleaned up and
 /// the physical file is deleted once its replica has been adopted.
 ///
@@ -750,10 +751,10 @@ fn prepare_outputs(
             ))
         })?;
         let (start_key, end_key) = output.decode_keys()?;
-        // Use a real TrackedFileId (not detached) so the FileManager tracks the file's
+        // Use a real TrackedFileId (not untracked) so the FileManager tracks the file's
         // lifecycle. When the DataFile is dropped from the LSM, the TrackedFileId's Drop
         // impl calls remove_data_file, which removes the TrackedFile from the FileManager.
-        // Once the replica is adopted (delete_on_drop=true), the TrackedFile's Drop
+        // Once the replica is adopted (managed deletion), the TrackedFile's Drop
         // then deletes the physical file.
         let data_file = DataFile::new(
             file_type,

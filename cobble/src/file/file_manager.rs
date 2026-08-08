@@ -30,7 +30,9 @@ use dashmap::DashMap;
 use metrics::{Counter, Gauge, counter, gauge};
 use rand::random;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use uuid::Uuid;
 
@@ -84,9 +86,10 @@ enum ReplicaCatalogLoadMode {
     ReadonlyConsumer,
 }
 
-#[derive(Clone, Copy)]
-enum TrackedFileOwnership {
-    Owned,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum PhysicalDeletePolicy {
+    ManagedDelete,
     Retained,
 }
 
@@ -382,8 +385,8 @@ pub struct TrackedFile {
     accounted_on_volume: bool,
     /// Bytes tracked for this file.
     pub(crate) size_bytes: AtomicU64,
-    /// Whether to delete the file when this TrackedFile is dropped.
-    pub(crate) delete_on_drop: AtomicBool,
+    /// Which process is responsible for physically deleting the file.
+    physical_delete_policy: AtomicU8,
     /// Count of explicit references to this file (e.g., from snapshots).
     pub(crate) explicit_refs: AtomicU32,
     /// File priority used by primary-volume offload policy.
@@ -394,8 +397,8 @@ impl TrackedFile {
     pub(crate) fn fs(&self) -> &Arc<dyn FileSystem> {
         &self.fs
     }
-    /// Creates a new TrackedFile.
-    pub(crate) fn new(
+    /// Creates a tracked file whose final drop deletes the physical file.
+    pub(crate) fn managed(
         path: String,
         fs: Arc<dyn FileSystem>,
         volume: Option<Arc<DataVolume>>,
@@ -406,14 +409,14 @@ impl TrackedFile {
             volume,
             accounted_on_volume: true,
             size_bytes: AtomicU64::new(0),
-            delete_on_drop: AtomicBool::new(true),
+            physical_delete_policy: AtomicU8::new(PhysicalDeletePolicy::ManagedDelete as u8),
             explicit_refs: AtomicU32::new(0),
             priority: AtomicU8::new(DEFAULT_TRACKED_FILE_PRIORITY),
         }
     }
 
-    /// Creates a locally owned TrackedFile that never deletes on drop.
-    pub(crate) fn readonly(
+    /// Creates a tracked file retained by another lifecycle owner.
+    pub(crate) fn retained(
         path: String,
         fs: Arc<dyn FileSystem>,
         volume: Option<Arc<DataVolume>>,
@@ -424,7 +427,7 @@ impl TrackedFile {
             volume,
             accounted_on_volume: true,
             size_bytes: AtomicU64::new(0),
-            delete_on_drop: AtomicBool::new(false),
+            physical_delete_policy: AtomicU8::new(PhysicalDeletePolicy::Retained as u8),
             explicit_refs: AtomicU32::new(0),
             priority: AtomicU8::new(DEFAULT_TRACKED_FILE_PRIORITY),
         }
@@ -443,24 +446,24 @@ impl TrackedFile {
             volume,
             accounted_on_volume: false,
             size_bytes: AtomicU64::new(0),
-            delete_on_drop: AtomicBool::new(false),
+            physical_delete_policy: AtomicU8::new(PhysicalDeletePolicy::Retained as u8),
             explicit_refs: AtomicU32::new(0),
             priority: AtomicU8::new(DEFAULT_TRACKED_FILE_PRIORITY),
         }
     }
 
-    /// Marks the file for deletion when this TrackedFile is dropped.
-    pub(crate) fn mark_for_deletion(&self) {
-        self.delete_on_drop.store(true, Ordering::SeqCst);
+    pub(crate) fn set_physical_delete_policy(&self, policy: PhysicalDeletePolicy) {
+        self.physical_delete_policy
+            .store(policy as u8, Ordering::SeqCst);
     }
 
-    pub(crate) fn mark_for_retention(&self) {
-        self.delete_on_drop.store(false, Ordering::SeqCst);
-    }
-
-    /// Returns true if the file is marked for deletion on drop.
-    pub(crate) fn is_marked_for_deletion(&self) -> bool {
-        self.delete_on_drop.load(Ordering::SeqCst)
+    pub(crate) fn physical_delete_policy(&self) -> PhysicalDeletePolicy {
+        match self.physical_delete_policy.load(Ordering::SeqCst) {
+            value if value == PhysicalDeletePolicy::ManagedDelete as u8 => {
+                PhysicalDeletePolicy::ManagedDelete
+            }
+            _ => PhysicalDeletePolicy::Retained,
+        }
     }
 
     /// Returns the path to the file.
@@ -537,7 +540,7 @@ impl TrackedFileId {
         self.file_id
     }
 
-    pub fn detached(file_id: FileId) -> Arc<Self> {
+    pub fn untracked(file_id: FileId) -> Arc<Self> {
         Arc::new(Self {
             file_id,
             file_manager: Weak::new(),
@@ -567,7 +570,7 @@ impl Drop for TrackedFileId {
 
 impl Drop for TrackedFile {
     fn drop(&mut self) {
-        if self.delete_on_drop.load(Ordering::SeqCst)
+        if self.physical_delete_policy() == PhysicalDeletePolicy::ManagedDelete
             && self.explicit_refs.load(Ordering::SeqCst) == 0
         {
             // Attempt to delete the file, ignore errors
@@ -726,7 +729,7 @@ impl AtomicMetadataWriter {
         writer.close()?;
         let size = self.fs.open_read(&self.temp_path)?.size() as u64;
         self.fs.rename(&self.temp_path, &self.final_path)?;
-        let tracked = Arc::new(TrackedFile::readonly(
+        let tracked = Arc::new(TrackedFile::retained(
             self.final_path.clone(),
             Arc::clone(&self.fs),
             self.volume.clone(),
@@ -1242,7 +1245,7 @@ impl FileManager {
             Uuid::new_v4(),
             self.options.data_file_extension
         );
-        let tracked = Arc::new(TrackedFile::new(
+        let tracked = Arc::new(TrackedFile::managed(
             path,
             Arc::clone(volume.fs()),
             Some(Arc::clone(volume)),
@@ -1304,7 +1307,7 @@ impl FileManager {
         file_id: FileId,
         volume: &Arc<DataVolume>,
     ) -> Result<TrackedWriter> {
-        let tracked = Arc::new(TrackedFile::new(
+        let tracked = Arc::new(TrackedFile::managed(
             self.data_file_path(file_id),
             Arc::clone(volume.fs()),
             Some(Arc::clone(volume)),
@@ -1337,7 +1340,7 @@ impl FileManager {
             )));
         }
         let fs = Arc::clone(volume.fs());
-        let tracked = Arc::new(TrackedFile::new(
+        let tracked = Arc::new(TrackedFile::managed(
             relative_path,
             Arc::clone(&fs),
             Some(Arc::clone(&volume)),
@@ -1385,7 +1388,7 @@ impl FileManager {
             path,
             ReplicaLifecycle::OwnedReady,
             FileCommitState::Uncommitted,
-            TrackedFileOwnership::Owned,
+            PhysicalDeletePolicy::ManagedDelete,
             ReplicaOrigin::Owned,
         )
     }
@@ -1576,9 +1579,13 @@ impl FileManager {
                     if matches!(mode, ReplicaCatalogLoadMode::WriterOwner)
                         && lifecycle == ReplicaLifecycle::OwnedReady
                     {
-                        existing.tracked.mark_for_deletion();
+                        existing
+                            .tracked
+                            .set_physical_delete_policy(PhysicalDeletePolicy::ManagedDelete);
                     } else {
-                        existing.tracked.mark_for_retention();
+                        existing
+                            .tracked
+                            .set_physical_delete_policy(PhysicalDeletePolicy::Retained);
                     }
                     existing.tracked.set_priority(replica.priority);
                     restored.push((
@@ -1599,7 +1606,7 @@ impl FileManager {
                     if matches!(mode, ReplicaCatalogLoadMode::WriterOwner)
                         && matches!(origin, ReplicaOrigin::Owned)
                     {
-                        TrackedFile::new(
+                        TrackedFile::managed(
                             relative_path,
                             Arc::clone(volume.fs()),
                             Some(Arc::clone(&volume)),
@@ -1824,7 +1831,7 @@ impl FileManager {
             .preferred_replica_any()
             .ok_or_else(|| Error::InvalidState(format!("Logical file {} has no replica", file_id)))?
             .tracked
-            .mark_for_retention();
+            .set_physical_delete_policy(PhysicalDeletePolicy::Retained);
         logical.set_preferred_lifecycle(ReplicaLifecycle::PublishedTransfer);
         Ok(())
     }
@@ -1841,7 +1848,7 @@ impl FileManager {
             .preferred_replica_any()
             .ok_or_else(|| Error::InvalidState(format!("Logical file {} has no replica", file_id)))?
             .tracked
-            .mark_for_deletion();
+            .set_physical_delete_policy(PhysicalDeletePolicy::ManagedDelete);
         logical.set_preferred_lifecycle(ReplicaLifecycle::OwnedReady);
         Ok(())
     }
@@ -1933,7 +1940,9 @@ impl FileManager {
             }
             replica.tracked.reference();
             if lifecycle == ReplicaLifecycle::OwnedReady && matches!(origin, ReplicaOrigin::Owned) {
-                replica.tracked.mark_for_deletion();
+                replica
+                    .tracked
+                    .set_physical_delete_policy(PhysicalDeletePolicy::ManagedDelete);
                 logical.set_replica_lifecycle(replica.replica_id, lifecycle);
             }
             return Ok(Arc::clone(&replica.tracked));
@@ -1947,13 +1956,13 @@ impl FileManager {
         }
         let tracked = Arc::new(
             if lifecycle == ReplicaLifecycle::OwnedReady && matches!(origin, ReplicaOrigin::Owned) {
-                TrackedFile::new(
+                TrackedFile::managed(
                     relative_path,
                     Arc::clone(volume.fs()),
                     Some(Arc::clone(&volume)),
                 )
             } else if matches!(origin, ReplicaOrigin::Owned) {
-                TrackedFile::readonly(
+                TrackedFile::retained(
                     relative_path,
                     Arc::clone(volume.fs()),
                     Some(Arc::clone(&volume)),
@@ -2006,7 +2015,7 @@ impl FileManager {
                 path,
                 ReplicaLifecycle::ExternalReference,
                 FileCommitState::Committed,
-                TrackedFileOwnership::Retained,
+                PhysicalDeletePolicy::Retained,
                 origin,
             )?;
             return self
@@ -2442,7 +2451,7 @@ impl FileManager {
         let temp_path = format!("{}.tmp-{}", final_path, Uuid::new_v4());
         let writer = self.meta_volume.fs().open_write(&temp_path)?;
 
-        let tracked = Arc::new(TrackedFile::new(
+        let tracked = Arc::new(TrackedFile::managed(
             temp_path.clone(),
             Arc::clone(self.meta_volume.fs()),
             Some(Arc::clone(&self.meta_volume)),
@@ -2503,7 +2512,7 @@ impl FileManager {
 
         // Track the file if not already tracked
         if !self.metadata_files.contains_key(name) {
-            let tracked = Arc::new(TrackedFile::readonly(
+            let tracked = Arc::new(TrackedFile::retained(
                 path.to_string(),
                 Arc::clone(self.meta_volume.fs()),
                 Some(Arc::clone(&self.meta_volume)),
@@ -2570,7 +2579,7 @@ impl FileManager {
             path,
             ReplicaLifecycle::ReadonlyView,
             FileCommitState::Committed,
-            TrackedFileOwnership::Retained,
+            PhysicalDeletePolicy::Retained,
             origin,
         )
     }
@@ -2587,7 +2596,7 @@ impl FileManager {
             path,
             ReplicaLifecycle::PendingAdoption,
             FileCommitState::Uncommitted,
-            TrackedFileOwnership::Retained,
+            PhysicalDeletePolicy::Retained,
             ReplicaOrigin::Owned,
         )
     }
@@ -2598,7 +2607,7 @@ impl FileManager {
         path: &str,
         lifecycle: ReplicaLifecycle,
         commit_state: FileCommitState,
-        ownership: TrackedFileOwnership,
+        physical_delete_policy: PhysicalDeletePolicy,
         origin: ReplicaOrigin,
     ) -> Result<()> {
         if self.logical_files.contains_key(&file_id) {
@@ -2606,7 +2615,7 @@ impl FileManager {
         }
         let (volume, relative_path) = self.resolve_volume_path(path)?;
         let fs = Arc::clone(volume.fs());
-        let tracked = Arc::new(match (ownership, &origin) {
+        let tracked = Arc::new(match (physical_delete_policy, &origin) {
             (
                 _,
                 ReplicaOrigin::ExternalLeased { .. } | ReplicaOrigin::ExternalPersistent { .. },
@@ -2615,11 +2624,11 @@ impl FileManager {
                 Arc::clone(&fs),
                 Some(Arc::clone(&volume)),
             ),
-            (TrackedFileOwnership::Owned, _) => {
-                TrackedFile::new(relative_path, Arc::clone(&fs), Some(Arc::clone(&volume)))
+            (PhysicalDeletePolicy::ManagedDelete, _) => {
+                TrackedFile::managed(relative_path, Arc::clone(&fs), Some(Arc::clone(&volume)))
             }
-            (TrackedFileOwnership::Retained, _) => {
-                TrackedFile::readonly(relative_path, Arc::clone(&fs), Some(Arc::clone(&volume)))
+            (PhysicalDeletePolicy::Retained, _) => {
+                TrackedFile::retained(relative_path, Arc::clone(&fs), Some(Arc::clone(&volume)))
             }
         });
         let size = fs
@@ -2641,7 +2650,7 @@ impl FileManager {
     /// references to it (readers/writers) are dropped.
     pub fn mark_metadata_file_for_deletion(&self, name: &str, remove_from_tracking: bool) {
         if let Some(tracked) = self.metadata_files.get(name) {
-            tracked.mark_for_deletion();
+            tracked.set_physical_delete_policy(PhysicalDeletePolicy::ManagedDelete);
         }
         if remove_from_tracking {
             self.metadata_files.remove(name);
@@ -2653,7 +2662,7 @@ impl FileManager {
     pub fn remove_metadata_file(&self, name: &str) -> Result<()> {
         if let Some((_, tracked)) = self.metadata_files.remove(name) {
             if Arc::strong_count(&tracked) > 1 {
-                tracked.mark_for_deletion();
+                tracked.set_physical_delete_policy(PhysicalDeletePolicy::ManagedDelete);
             } else {
                 self.meta_volume.fs().delete(tracked.path())?;
             }
@@ -3049,7 +3058,7 @@ pub(crate) mod tests {
         let mut replacement_writer = fs.open_write("replacement.sst").unwrap();
         replacement_writer.write(b"next").unwrap();
         replacement_writer.close().unwrap();
-        let replacement = Arc::new(TrackedFile::new(
+        let replacement = Arc::new(TrackedFile::managed(
             "replacement.sst".to_string(),
             Arc::clone(&fs),
             None,
@@ -3122,7 +3131,10 @@ pub(crate) mod tests {
                 consumer_replica.tracked.absolute_path(),
                 replacement.absolute_path()
             );
-            assert!(!consumer_replica.tracked.is_marked_for_deletion());
+            assert_eq!(
+                consumer_replica.tracked.physical_delete_policy(),
+                PhysicalDeletePolicy::Retained
+            );
         }
         assert!(fs.exists("replacement.sst").unwrap());
 
@@ -3197,7 +3209,10 @@ pub(crate) mod tests {
             .preferred_replica_any()
             .unwrap();
         assert_eq!(fallback_replica.tracked.absolute_path(), path);
-        assert!(fallback_replica.tracked.is_marked_for_deletion());
+        assert_eq!(
+            fallback_replica.tracked.physical_delete_policy(),
+            PhysicalDeletePolicy::ManagedDelete
+        );
 
         {
             let consumer = FileManager::with_defaults(
@@ -3241,10 +3256,11 @@ pub(crate) mod tests {
                 .preferred_replica_lifecycle(),
             Some(ReplicaLifecycle::ReadonlyView)
         );
-        assert!(
-            !fm.data_file_ref(file_id + 1)
+        assert_eq!(
+            fm.data_file_ref(file_id + 1)
                 .unwrap()
-                .is_marked_for_deletion()
+                .physical_delete_policy(),
+            PhysicalDeletePolicy::Retained
         );
         fm.register_data_file_pending_adoption(file_id + 2, &path)
             .unwrap();
@@ -3255,17 +3271,19 @@ pub(crate) mod tests {
             Some(ReplicaLifecycle::PendingAdoption)
         );
         assert!(pending.preferred_replica().is_some());
-        assert!(
-            !fm.data_file_ref(file_id + 2)
+        assert_eq!(
+            fm.data_file_ref(file_id + 2)
                 .unwrap()
-                .is_marked_for_deletion()
+                .physical_delete_policy(),
+            PhysicalDeletePolicy::Retained
         );
         fm.register_uncommitted_data_file(file_id + 3, &path)
             .unwrap();
-        assert!(
+        assert_eq!(
             fm.data_file_ref(file_id + 3)
                 .unwrap()
-                .is_marked_for_deletion()
+                .physical_delete_policy(),
+            PhysicalDeletePolicy::ManagedDelete
         );
 
         cleanup_test_root();
@@ -3333,7 +3351,7 @@ pub(crate) mod tests {
             close_called: Arc::clone(&close_called),
             cancel_after_write,
         };
-        let tracked = Arc::new(TrackedFile::new(
+        let tracked = Arc::new(TrackedFile::managed(
             "test-copy".to_string(),
             Arc::clone(fs),
             None,
@@ -3379,7 +3397,7 @@ pub(crate) mod tests {
             Arc::new(CachedRandomAccessFile::new(Arc::clone(&inner)));
         assert!(cached.prefers_read_ahead());
 
-        let tracked = Arc::new(TrackedFile::new("test-reader".to_string(), fs, None));
+        let tracked = Arc::new(TrackedFile::managed("test-reader".to_string(), fs, None));
         let tracked_reader = TrackedReader::new(cached, tracked);
         assert!(tracked_reader.prefers_read_ahead());
         cleanup_test_root();
@@ -4270,7 +4288,10 @@ pub(crate) mod tests {
         fm.register_data_file_for_restore(120, &source_full_path, ReplicaOrigin::Owned, None, None)
             .unwrap();
         let tracked = fm.preferred_tracked_file(120).unwrap();
-        assert!(tracked.is_marked_for_deletion());
+        assert_eq!(
+            tracked.physical_delete_policy(),
+            PhysicalDeletePolicy::ManagedDelete
+        );
         let tracked_fs = Arc::clone(tracked.fs());
         let tracked_path = tracked.path().to_string();
         drop(tracked);

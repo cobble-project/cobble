@@ -1313,7 +1313,7 @@ fn clone_lsm_tree_version_untracked(version: &LSMTreeVersion) -> LSMTreeVersion 
                     .files
                     .iter()
                     .map(|file| {
-                        let detached = DataFile::new_detached(
+                        let untracked = DataFile::new_untracked(
                             file.file_type,
                             file.start_key.clone(),
                             file.end_key.clone(),
@@ -1325,8 +1325,8 @@ fn clone_lsm_tree_version_untracked(version: &LSMTreeVersion) -> LSMTreeVersion 
                         )
                         .with_vlog_offset(file.vlog_file_seq_offset)
                         .with_separated_values(file.has_separated_values);
-                        detached.copy_meta_from(file);
-                        Arc::new(detached)
+                        untracked.copy_meta_from(file);
+                        Arc::new(untracked)
                     })
                     .collect(),
             })
@@ -1343,7 +1343,7 @@ fn clone_vlog_version_untracked(vlog_version: &VlogVersion) -> VlogVersion {
             .map(|(file_seq, tracked_id, valid_entries)| {
                 (
                     file_seq,
-                    TrackedFileId::detached(tracked_id.file_id()),
+                    TrackedFileId::untracked(tracked_id.file_id()),
                     valid_entries,
                 )
             })
