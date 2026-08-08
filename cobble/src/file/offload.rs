@@ -1397,8 +1397,33 @@ impl FileManager {
             target_replica
                 .tracked
                 .set_priority(source_tracked.priority());
-            if !self.promote_replica_if(file_id, &source_tracked, target_replica.replica_id) {
+            let rollback_state = logical.replica_state_snapshot();
+            let rollback_replicas = rollback_state
+                .replicas
+                .iter()
+                .map(|replica| {
+                    (
+                        replica.replica_id,
+                        Arc::clone(&replica.tracked),
+                        replica.lifecycle(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let Some(source_replica_id) = self.select_existing_replica_retaining_source_if(
+                file_id,
+                &source_tracked,
+                target_replica.replica_id,
+            ) else {
                 return Ok(false);
+            };
+            if let Err(err) = self.persist_replica_catalog() {
+                logical.restore_replica_state(rollback_replicas.clone(), Some(source_replica_id));
+                return Err(err);
+            }
+            self.retire_replica(file_id, source_replica_id);
+            if let Err(err) = self.persist_replica_catalog() {
+                logical.restore_replica_state(rollback_replicas, Some(source_replica_id));
+                return Err(err);
             }
             self.record_offload_completed_promotion();
             return Ok(true);
@@ -1418,9 +1443,38 @@ impl FileManager {
             return Err(err);
         }
         new_tracked.set_priority(source_tracked.priority());
-        if !self.publish_and_promote_replica_if(file_id, &source_tracked, new_tracked) {
+        let Some(logical) = self.get_logical_file(file_id) else {
             rollback();
             return Ok(false);
+        };
+        let rollback_state = logical.replica_state_snapshot();
+        let rollback_replicas = rollback_state
+            .replicas
+            .iter()
+            .map(|replica| {
+                (
+                    replica.replica_id,
+                    Arc::clone(&replica.tracked),
+                    replica.lifecycle(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let Some(source_replica_id) = self.select_new_replica_retaining_source_if(
+            file_id,
+            &source_tracked,
+            Arc::clone(&new_tracked),
+        ) else {
+            rollback();
+            return Ok(false);
+        };
+        if let Err(err) = self.persist_replica_catalog() {
+            logical.restore_replica_state(rollback_replicas.clone(), Some(source_replica_id));
+            return Err(err);
+        }
+        self.retire_replica(file_id, source_replica_id);
+        if let Err(err) = self.persist_replica_catalog() {
+            logical.restore_replica_state(rollback_replicas, Some(source_replica_id));
+            return Err(err);
         }
         self.record_offload_completed_copy(copied_bytes);
         Ok(true)

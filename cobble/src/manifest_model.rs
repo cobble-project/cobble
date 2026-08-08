@@ -269,26 +269,24 @@ fn build_data_file(
     Ok(Arc::new(data_file))
 }
 
-/// Verifies every file referenced by a durable layout is readable before a consumer plans work.
-/// Snapshot restore keeps its established lazy opening behavior; dedicated compaction calls this
-/// explicitly so a dangling runtime reference is a clear observation error rather than a later,
-/// ambiguous task failure.
-pub(crate) fn ensure_persisted_files_readable(
+/// Verifies every logical file in a durable layout is readable through its selected physical
+/// replica. Consumers must register all manifest descriptors and apply their replica catalog
+/// before calling this; the manifest path is only the logical-layout fallback.
+pub(crate) fn ensure_preferred_replicas_readable(
     file_manager: &Arc<FileManager>,
     tree_levels: &[Vec<ManifestLevel>],
     vlog_files: &[ManifestVlogFile],
 ) -> Result<()> {
-    let mut file_paths = HashSet::new();
+    let mut file_ids = HashSet::new();
     for level in tree_levels.iter().flatten() {
         for file in &level.files {
-            file_paths.insert((file.file_id, file.path.as_str()));
+            file_ids.insert(file.file_id);
         }
     }
     for file in vlog_files {
-        file_paths.insert((file.file_id, file.path.as_str()));
+        file_ids.insert(file.file_id);
     }
-    for (file_id, path) in file_paths {
-        file_manager.register_data_file_readonly(file_id, path)?;
+    for file_id in file_ids {
         file_manager.open_data_file_reader(file_id)?;
     }
     Ok(())

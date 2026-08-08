@@ -542,9 +542,12 @@ impl SnapshotManager {
                 if !self.file_manager.has_data_file(file_id) {
                     self.file_manager.register_data_file(file_id, &path)?;
                 }
-                self.file_manager.make_data_file_owned(file_id)?;
                 self.file_manager
-                    .data_file_ref(file_id)
+                    .data_file_ref_at_path(
+                        file_id,
+                        &path,
+                        crate::file::logical_file::ReplicaLifecycle::OwnedReady,
+                    )
                     .map(|tracked| (file_id, tracked))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
@@ -931,6 +934,8 @@ impl SnapshotManager {
                 crate::file::logical_file::ReplicaLifecycle::OwnedReady,
             );
         }
+        self.file_manager
+            .commit_logical_files(prepared.snapshot.tracked_data_files.keys().copied());
         let mut state = self.state.lock().unwrap();
         if let Some(snapshot) = state.snapshots.get(&id).cloned() {
             snapshot

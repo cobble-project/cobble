@@ -15,7 +15,7 @@
 //! - Restart after compaction preserves all data.
 use cobble::{
     CompactionMode, CompactionPolicyKind, Config, Db, DbBuilder, DedicatedCompactionService,
-    DedicatedCompactor, RuntimeManifestMode,
+    DedicatedCompactor, RuntimeManifestMode, VolumeDescriptor, VolumeUsageKind,
 };
 use serial_test::serial;
 use size::Size;
@@ -183,6 +183,105 @@ fn runtime_current_exists(root: &str) -> bool {
     walk(std::path::Path::new(root))
 }
 
+fn current_runtime_manifest_references_path(root: &str, path: &str) -> bool {
+    fn metadata_payload(path: &std::path::Path) -> Option<Vec<u8>> {
+        let bytes = std::fs::read(path).ok()?;
+        (bytes.len() >= 8).then(|| bytes[..bytes.len() - 8].to_vec())
+    }
+
+    fn resolve_tree_paths(
+        runtime_dir: &std::path::Path,
+        generation: u64,
+    ) -> Option<std::collections::BTreeMap<u64, String>> {
+        let manifest_path = runtime_dir.join(format!("MANIFEST-{generation}"));
+        let Some(payload) = metadata_payload(&manifest_path) else {
+            return None;
+        };
+        let envelope = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
+        let manifest = envelope.get("manifest")?;
+        let payload = manifest.get("payload")?;
+        let kind = manifest.get("kind")?.as_str()?;
+        let mut paths = if kind == "full" {
+            std::collections::BTreeMap::new()
+        } else {
+            resolve_tree_paths(runtime_dir, payload.get("base_generation")?.as_u64()?)?
+        };
+        if kind == "full" {
+            for levels in payload.get("tree_levels")?.as_array()? {
+                for level in levels.as_array()? {
+                    for file in level.get("files")?.as_array()? {
+                        paths.insert(
+                            file.get("file_id")?.as_u64()?,
+                            file.get("path")?.as_str()?.into(),
+                        );
+                    }
+                }
+            }
+        } else {
+            for tree_edit in payload.get("tree_level_edits")?.as_array()? {
+                for level_edit in tree_edit.get("level_edits")?.as_array()? {
+                    for file_id in level_edit.get("removed_file_ids")?.as_array()? {
+                        paths.remove(&file_id.as_u64()?);
+                    }
+                    for file in level_edit.get("added_files")?.as_array()? {
+                        paths.insert(
+                            file.get("file_id")?.as_u64()?,
+                            file.get("path")?.as_str()?.into(),
+                        );
+                    }
+                }
+            }
+        }
+        Some(paths)
+    }
+
+    let current = find_file(root, |candidate| {
+        candidate.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
+            && candidate
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                == Some("runtime")
+    });
+    let Some(payload) = metadata_payload(&current) else {
+        return false;
+    };
+    let Some(generation) = std::str::from_utf8(&payload)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+    else {
+        return false;
+    };
+    resolve_tree_paths(current.parent().unwrap(), generation)
+        .is_some_and(|paths| paths.values().any(|candidate| candidate == path))
+}
+
+fn current_runtime_manifest_referenced_data_file(
+    root: &str,
+    data_root: &str,
+) -> Option<std::path::PathBuf> {
+    fn walk(root: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(file) = walk(root, &path) {
+                    return Some(file);
+                }
+                continue;
+            }
+            if path.extension().and_then(|extension| extension.to_str()) == Some("sst") {
+                let url = format!("file://{}", path.display());
+                if current_runtime_manifest_references_path(root, &url) {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+    walk(root, std::path::Path::new(data_root))
+}
+
 fn find_file(root: &str, predicate: impl Fn(&std::path::Path) -> bool) -> std::path::PathBuf {
     fn walk(
         dir: &std::path::Path,
@@ -324,6 +423,80 @@ fn test_dedicated_compaction_basic() {
     }
 
     db.close().expect("close");
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn dedicated_compactor_reads_tiered_catalog_replica() {
+    let root = "/tmp/dedicated_compaction_tiered_catalog";
+    let high_root = format!("{root}/high");
+    let low_root = format!("{root}/low");
+    cleanup_test_root(root);
+    let db_id = "dedicated-compaction-tiered-catalog".to_string();
+    let mut config = dedicated_config(root);
+    let mut high = VolumeDescriptor::new(
+        format!("file://{high_root}"),
+        vec![
+            VolumeUsageKind::PrimaryDataPriorityHigh,
+            VolumeUsageKind::Meta,
+        ],
+    );
+    high.size_limit = Some(Size::from_kib(16));
+    config.volumes = vec![
+        high,
+        VolumeDescriptor::new(
+            format!("file://{low_root}"),
+            vec![VolumeUsageKind::PrimaryDataPriorityLow],
+        ),
+    ];
+    config.primary_volume_offload_trigger_watermark = 0.4;
+
+    let db = open_db_with_id(config.clone(), &db_id);
+    let value = vec![b'v'; 1024];
+    for i in 0..10u32 {
+        db.put(0, format!("tiered-source-{i:08}").as_bytes(), 0, &value)
+            .unwrap();
+    }
+    assert!(wait_for(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || runtime_current_exists(root)
+            && current_runtime_manifest_referenced_data_file(root, &high_root).is_some()
+    ));
+    let source = current_runtime_manifest_referenced_data_file(root, &high_root).unwrap();
+    let source_url = format!("file://{}", source.display());
+    assert!(current_runtime_manifest_references_path(root, &source_url));
+
+    for i in 10..28u32 {
+        db.put(0, format!("tiered-target-{i:08}").as_bytes(), 0, &value)
+            .unwrap();
+    }
+    assert!(wait_for(
+        Duration::from_secs(20),
+        Duration::from_millis(50),
+        || !source.exists() && count_data_files(&low_root) > 0
+    ));
+    assert!(current_runtime_manifest_references_path(root, &source_url));
+
+    // `run_once` performs the same observation rebuild as `probe`: it must load the catalog
+    // route to the surviving low-priority replica before validating or selecting a plan.
+    let compactor = Arc::new(DedicatedCompactor::open(config, db_id).unwrap());
+    let worker = Arc::clone(&compactor);
+    let handle = std::thread::spawn(move || worker.run_once());
+    let completed = wait_for(Duration::from_secs(2), Duration::from_millis(50), || {
+        handle.is_finished()
+    });
+    if !completed {
+        compactor.stop();
+    }
+    handle.join().unwrap().unwrap();
+    assert!(
+        completed,
+        "compactor unexpectedly published a result while probing the route"
+    );
+
+    db.close().unwrap();
     cleanup_test_root(root);
 }
 

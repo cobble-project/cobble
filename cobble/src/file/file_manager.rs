@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::file::file_system::{FileSystem, FileSystemRegistry};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
 use crate::file::logical_file::{FileCommitState, LogicalFile, ReplicaId, ReplicaLifecycle};
+use crate::file::metadata_io::MetadataReader;
 use crate::file::metadata_io::MetadataWriter;
 use crate::file::offload::OffloadRuntime;
 use crate::lru::LruCache;
@@ -26,6 +27,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use metrics::{Counter, Gauge, counter, gauge};
 use rand::random;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use uuid::Uuid;
@@ -38,6 +40,41 @@ const DEFAULT_READER_CACHE_CAPACITY: usize = 512;
 const SNAPSHOT_COPY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const VLOG_FILE_PRIORITY: u8 = 10;
 const DEFAULT_TRACKED_FILE_PRIORITY: u8 = u8::MAX;
+const REPLICA_CATALOG_NAME: &str = "files/REPLICA-CATALOG";
+
+#[derive(Deserialize, Serialize)]
+struct ReplicaCatalog {
+    version: u32,
+    files: Vec<ReplicaCatalogFile>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReplicaCatalogFile {
+    file_id: FileId,
+    preferred_replica_id: ReplicaId,
+    replicas: Vec<ReplicaCatalogReplica>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReplicaCatalogReplica {
+    replica_id: ReplicaId,
+    path: String,
+    priority: u8,
+    kind: ReplicaCatalogKind,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ReplicaCatalogKind {
+    Owned,
+    Readonly,
+}
+
+#[derive(Clone, Copy)]
+enum ReplicaCatalogLoadMode {
+    WriterOwner,
+    ReadonlyConsumer,
+}
 
 #[derive(Clone, Copy)]
 enum TrackedFileOwnership {
@@ -745,6 +782,7 @@ pub struct FileManager {
     /// LRU cache for open random access readers, keyed by physical replica.
     pub(crate) reader_cache: Mutex<LruCache<ReplicaKey, Arc<dyn RandomAccessFile>>>,
     pub(crate) offload_runtime: Arc<OffloadRuntime>,
+    replica_catalog_mutex: Mutex<()>,
 }
 
 impl FileManager {
@@ -946,6 +984,7 @@ impl FileManager {
             metadata_files: Arc::new(DashMap::new()),
             reader_cache: Mutex::new(LruCache::new(DEFAULT_READER_CACHE_CAPACITY)),
             offload_runtime,
+            replica_catalog_mutex: Mutex::new(()),
         })
     }
 
@@ -1342,6 +1381,197 @@ impl FileManager {
             .map(|e| Arc::clone(e.value()))
     }
 
+    pub(crate) fn commit_logical_files<I>(&self, file_ids: I)
+    where
+        I: IntoIterator<Item = FileId>,
+    {
+        for file_id in file_ids {
+            if let Some(logical) = self.get_logical_file(file_id) {
+                logical.set_commit_state(FileCommitState::Committed);
+            }
+        }
+        if let Err(err) = self.persist_replica_catalog() {
+            log::warn!("failed to persist replica catalog: {}", err);
+        }
+    }
+
+    pub(crate) fn persist_replica_catalog(&self) -> Result<()> {
+        let _guard = self.replica_catalog_mutex.lock().unwrap();
+        self.ensure_metadata_dir("files")?;
+        let mut files = Vec::new();
+        for entry in &self.logical_files {
+            let logical = entry.value();
+            if logical.commit_state() != FileCommitState::Committed {
+                continue;
+            }
+            let state = logical.replica_state_snapshot();
+            let Some(preferred_replica_id) = state.preferred_replica_id else {
+                continue;
+            };
+            let mut replicas = state
+                .replicas
+                .into_iter()
+                .filter_map(|replica| {
+                    let kind = match replica.lifecycle() {
+                        ReplicaLifecycle::OwnedReady => ReplicaCatalogKind::Owned,
+                        ReplicaLifecycle::ReadonlySource => ReplicaCatalogKind::Readonly,
+                        _ => return None,
+                    };
+                    Some(ReplicaCatalogReplica {
+                        replica_id: replica.replica_id,
+                        path: replica.tracked.absolute_path(),
+                        priority: replica.tracked.priority(),
+                        kind,
+                    })
+                })
+                .collect::<Vec<_>>();
+            replicas.sort_by_key(|replica| replica.replica_id);
+            if replicas
+                .iter()
+                .any(|replica| replica.replica_id == preferred_replica_id)
+            {
+                files.push(ReplicaCatalogFile {
+                    file_id: *entry.key(),
+                    preferred_replica_id,
+                    replicas,
+                });
+            }
+        }
+        files.sort_by_key(|file| file.file_id);
+        let bytes = serde_json::to_vec(&ReplicaCatalog { version: 1, files })
+            .map_err(|err| Error::IoError(format!("encode replica catalog: {err}")))?;
+        let mut writer = self.create_metadata_file(REPLICA_CATALOG_NAME)?;
+        writer.write(&bytes)?;
+        writer.close()
+    }
+
+    pub(crate) fn load_replica_catalog_as_writer_owner(&self) -> Result<()> {
+        self.load_replica_catalog(ReplicaCatalogLoadMode::WriterOwner)
+    }
+
+    pub(crate) fn load_replica_catalog_as_readonly_consumer(&self) -> Result<()> {
+        self.load_replica_catalog(ReplicaCatalogLoadMode::ReadonlyConsumer)
+    }
+
+    fn load_replica_catalog(&self, mode: ReplicaCatalogLoadMode) -> Result<()> {
+        let path = self.metadata_path(REPLICA_CATALOG_NAME);
+        if !self.meta_volume.fs().exists(&path)? {
+            return Ok(());
+        }
+        let reader = MetadataReader::new(self.meta_volume.fs().open_read(&path)?);
+        let catalog: ReplicaCatalog = serde_json::from_slice(reader.read_all()?.as_ref())
+            .map_err(|err| Error::InvalidState(format!("decode replica catalog: {err}")))?;
+        if catalog.version != 1 {
+            return Err(Error::InvalidState(format!(
+                "unsupported replica catalog version {}",
+                catalog.version
+            )));
+        }
+        for file in catalog.files {
+            let Some(logical) = self.get_logical_file(file.file_id) else {
+                continue;
+            };
+            let current = logical.replica_state_snapshot();
+            let manifest_preferred_path = current
+                .preferred_replica_id
+                .and_then(|id| {
+                    current
+                        .replicas
+                        .iter()
+                        .find(|replica| replica.replica_id == id)
+                })
+                .map(|replica| replica.tracked.absolute_path());
+            let mut restored = Vec::new();
+            for replica in file.replicas {
+                let lifecycle = match (mode, replica.kind) {
+                    (ReplicaCatalogLoadMode::WriterOwner, ReplicaCatalogKind::Owned) => {
+                        ReplicaLifecycle::OwnedReady
+                    }
+                    (ReplicaCatalogLoadMode::WriterOwner, ReplicaCatalogKind::Readonly) => {
+                        ReplicaLifecycle::ReadonlySource
+                    }
+                    (ReplicaCatalogLoadMode::ReadonlyConsumer, ReplicaCatalogKind::Owned) => {
+                        ReplicaLifecycle::ReadonlyView
+                    }
+                    (ReplicaCatalogLoadMode::ReadonlyConsumer, ReplicaCatalogKind::Readonly) => {
+                        ReplicaLifecycle::ReadonlySource
+                    }
+                };
+                if let Some(existing) = current
+                    .replicas
+                    .iter()
+                    .find(|current| current.tracked.absolute_path() == replica.path)
+                {
+                    if matches!(mode, ReplicaCatalogLoadMode::WriterOwner)
+                        && lifecycle == ReplicaLifecycle::OwnedReady
+                    {
+                        existing.tracked.mark_for_deletion();
+                    } else {
+                        existing.tracked.mark_for_retention();
+                    }
+                    existing.tracked.set_priority(replica.priority);
+                    restored.push((replica.replica_id, Arc::clone(&existing.tracked), lifecycle));
+                    continue;
+                }
+                let Ok((volume, relative_path)) = self.resolve_volume_path(&replica.path) else {
+                    continue;
+                };
+                if !volume.fs().exists(&relative_path)? {
+                    continue;
+                }
+                let tracked = Arc::new(
+                    if matches!(mode, ReplicaCatalogLoadMode::WriterOwner)
+                        && matches!(replica.kind, ReplicaCatalogKind::Owned)
+                    {
+                        TrackedFile::new(
+                            relative_path,
+                            Arc::clone(volume.fs()),
+                            Some(Arc::clone(&volume)),
+                        )
+                    } else {
+                        TrackedFile::readonly(
+                            relative_path,
+                            Arc::clone(volume.fs()),
+                            Some(Arc::clone(&volume)),
+                        )
+                    },
+                );
+                tracked.update_size_bytes(volume.fs().open_read(tracked.path())?.size() as u64);
+                tracked.set_priority(replica.priority);
+                restored.push((replica.replica_id, tracked, lifecycle));
+            }
+            let mut next_id = restored.iter().map(|(id, _, _)| *id).max().unwrap_or(0) + 1;
+            for replica in current.replicas {
+                if restored.iter().any(|(_, tracked, _)| {
+                    tracked.absolute_path() == replica.tracked.absolute_path()
+                }) {
+                    continue;
+                }
+                while restored.iter().any(|(id, _, _)| *id == next_id) {
+                    next_id += 1;
+                }
+                restored.push((next_id, Arc::clone(&replica.tracked), replica.lifecycle()));
+                next_id += 1;
+            }
+            let preferred = restored
+                .iter()
+                .any(|(id, _, lifecycle)| {
+                    *id == file.preferred_replica_id && lifecycle.is_readable()
+                })
+                .then_some(file.preferred_replica_id)
+                .or_else(|| {
+                    manifest_preferred_path.as_ref().and_then(|path| {
+                        restored
+                            .iter()
+                            .find(|(_, tracked, _)| tracked.absolute_path() == *path)
+                            .map(|(id, _, _)| *id)
+                    })
+                });
+            logical.restore_replica_state(restored, preferred);
+        }
+        Ok(())
+    }
+
     pub(crate) fn copy_reader_to_tracked_writer(
         &self,
         source: &dyn RandomAccessFile,
@@ -1560,6 +1790,48 @@ impl FileManager {
         Ok(Arc::clone(&replica.tracked))
     }
 
+    pub(crate) fn data_file_ref_at_path(
+        &self,
+        file_id: FileId,
+        absolute_path: &str,
+        lifecycle: ReplicaLifecycle,
+    ) -> Result<Arc<TrackedFile>> {
+        let logical = self
+            .get_logical_file(file_id)
+            .ok_or_else(|| Error::IoError(format!("Logical file {} is not tracked", file_id)))?;
+        if let Some(replica) = logical.replica_at_absolute_path(absolute_path) {
+            replica.tracked.reference();
+            if lifecycle == ReplicaLifecycle::OwnedReady {
+                replica.tracked.mark_for_deletion();
+                logical.set_replica_lifecycle(replica.replica_id, lifecycle);
+            }
+            return Ok(Arc::clone(&replica.tracked));
+        }
+        let (volume, relative_path) = self.resolve_volume_path(absolute_path)?;
+        if !volume.fs().exists(&relative_path)? {
+            return Err(Error::IoError(format!(
+                "Manifest file is missing: {}",
+                absolute_path
+            )));
+        }
+        let tracked = Arc::new(match lifecycle {
+            ReplicaLifecycle::OwnedReady => TrackedFile::new(
+                relative_path,
+                Arc::clone(volume.fs()),
+                Some(Arc::clone(&volume)),
+            ),
+            _ => TrackedFile::readonly(
+                relative_path,
+                Arc::clone(volume.fs()),
+                Some(Arc::clone(&volume)),
+            ),
+        });
+        tracked.update_size_bytes(volume.fs().open_read(tracked.path())?.size() as u64);
+        logical.add_replica(Arc::clone(&tracked), lifecycle);
+        tracked.reference();
+        Ok(tracked)
+    }
+
     fn preferred_readable_replica(
         &self,
         file_id: FileId,
@@ -1750,52 +2022,34 @@ impl FileManager {
         self.logical_files.contains_key(&file_id)
     }
 
-    /// Publishes a copied physical replica and retires the source if it is still preferred.
-    pub(crate) fn publish_and_promote_replica_if(
+    pub(crate) fn select_new_replica_retaining_source_if(
         &self,
         file_id: FileId,
         expected: &Arc<TrackedFile>,
         replacement: Arc<TrackedFile>,
-    ) -> bool {
-        let Some(logical) = self.get_logical_file(file_id) else {
-            return false;
-        };
-        let Some(previous_replica_id) =
-            logical.publish_and_promote_replica_if(expected, replacement)
-        else {
-            return false;
-        };
-        if let Ok(mut cache) = self.reader_cache.lock() {
-            cache.remove(&ReplicaKey {
-                file_id,
-                replica_id: previous_replica_id,
-            });
-        }
-        true
+    ) -> Option<ReplicaId> {
+        self.get_logical_file(file_id)?.add_and_select_replica_if(
+            expected,
+            replacement,
+            ReplicaLifecycle::OwnedReady,
+        )
     }
 
-    pub(crate) fn promote_replica_if(
+    pub(crate) fn retire_replica(&self, file_id: FileId, replica_id: ReplicaId) {
+        self.remove_replica(file_id, replica_id);
+    }
+
+    pub(crate) fn select_existing_replica_retaining_source_if(
         &self,
         file_id: FileId,
         expected: &Arc<TrackedFile>,
-        replica_id: crate::file::logical_file::ReplicaId,
-    ) -> bool {
-        let Some(logical) = self.get_logical_file(file_id) else {
-            return false;
-        };
-        let old_key = logical.preferred_replica_any().map(|replica| ReplicaKey {
-            file_id,
-            replica_id: replica.replica_id,
-        });
-        if !logical.promote_replica_if(expected, replica_id) {
-            return false;
-        }
-        if let Some(key) = old_key
-            && let Ok(mut cache) = self.reader_cache.lock()
-        {
-            cache.remove(&key);
-        }
-        true
+        replica_id: ReplicaId,
+    ) -> Option<ReplicaId> {
+        let logical = self.get_logical_file(file_id)?;
+        let source_id = logical.preferred_replica_any()?.replica_id;
+        logical
+            .retain_and_select_replica_if(expected, replica_id)
+            .then_some(source_id)
     }
 
     pub(crate) fn remove_replica(&self, file_id: FileId, replica_id: ReplicaId) {
@@ -2432,8 +2686,14 @@ pub(crate) mod tests {
             None,
         ));
         let source = fm.data_file_ref(file_id).unwrap();
-        assert!(fm.publish_and_promote_replica_if(file_id, &source, Arc::clone(&replacement)));
-        assert!(!fm.publish_and_promote_replica_if(file_id, &source, Arc::clone(&source)));
+        let source_replica_id = fm
+            .select_new_replica_retaining_source_if(file_id, &source, Arc::clone(&replacement))
+            .unwrap();
+        fm.retire_replica(file_id, source_replica_id);
+        assert!(
+            fm.select_new_replica_retaining_source_if(file_id, &source, Arc::clone(&source))
+                .is_none()
+        );
         assert!(Arc::ptr_eq(
             &logical.preferred_replica().unwrap().tracked,
             &replacement
@@ -2445,6 +2705,86 @@ pub(crate) mod tests {
         let new_cache_key = fm.preferred_replica_key(file_id).unwrap();
         assert_ne!(new_cache_key, old_cache_key);
         assert!(fm.reader_cache.lock().unwrap().contains_key(&new_cache_key));
+
+        logical.add_replica(Arc::clone(&source), ReplicaLifecycle::OwnedReady);
+        logical.set_commit_state(FileCommitState::Committed);
+        fm.persist_replica_catalog().unwrap();
+        let reopened = FileManager::with_defaults(
+            Arc::clone(&fs),
+            Arc::new(MetricsManager::new("file-manager-catalog-reopen")),
+        )
+        .unwrap();
+        reopened.register_data_file(file_id, &path).unwrap();
+        reopened.load_replica_catalog_as_writer_owner().unwrap();
+        let reopened_logical = reopened.get_logical_file(file_id).unwrap();
+        assert_eq!(reopened_logical.replica_ids().len(), 2);
+        assert_eq!(
+            reopened_logical
+                .preferred_replica_any()
+                .unwrap()
+                .tracked
+                .absolute_path(),
+            replacement.absolute_path()
+        );
+
+        {
+            let consumer = FileManager::with_defaults(
+                Arc::clone(&fs),
+                Arc::new(MetricsManager::new("file-manager-catalog-consumer")),
+            )
+            .unwrap();
+            consumer
+                .register_data_file_readonly(file_id, &path)
+                .unwrap();
+            consumer
+                .load_replica_catalog_as_readonly_consumer()
+                .unwrap();
+            let consumer_replica = consumer
+                .get_logical_file(file_id)
+                .unwrap()
+                .preferred_replica_any()
+                .unwrap();
+            assert_eq!(
+                consumer_replica.tracked.absolute_path(),
+                replacement.absolute_path()
+            );
+            assert!(!consumer_replica.tracked.is_marked_for_deletion());
+        }
+        assert!(fs.exists("replacement.sst").unwrap());
+
+        let source_replica_id = logical.replica_at_absolute_path(&path).unwrap().replica_id;
+        fm.retire_replica(file_id, source_replica_id);
+        fm.persist_replica_catalog().unwrap();
+        let reader = MetadataReader::new(fs.open_read(REPLICA_CATALOG_NAME).unwrap());
+        let catalog: ReplicaCatalog =
+            serde_json::from_slice(reader.read_all().unwrap().as_ref()).unwrap();
+        let catalog_file = catalog
+            .files
+            .iter()
+            .find(|catalog_file| catalog_file.file_id == file_id)
+            .unwrap();
+        assert_eq!(catalog_file.replicas.len(), 1);
+        assert_eq!(
+            catalog_file.preferred_replica_id,
+            catalog_file.replicas[0].replica_id
+        );
+        assert_eq!(catalog_file.replicas[0].path, replacement.absolute_path());
+
+        fs.delete("replacement.sst").unwrap();
+        let fallback = FileManager::with_defaults(
+            Arc::clone(&fs),
+            Arc::new(MetricsManager::new("file-manager-catalog-fallback")),
+        )
+        .unwrap();
+        fallback.register_data_file(file_id, &path).unwrap();
+        fallback.load_replica_catalog_as_writer_owner().unwrap();
+        let fallback_replica = fallback
+            .get_logical_file(file_id)
+            .unwrap()
+            .preferred_replica_any()
+            .unwrap();
+        assert_eq!(fallback_replica.tracked.absolute_path(), path);
+        assert!(fallback_replica.tracked.is_marked_for_deletion());
 
         fm.register_data_file_readonly(file_id + 1, &path).unwrap();
         assert_eq!(

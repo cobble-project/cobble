@@ -109,6 +109,11 @@ struct ReplicaState {
     preferred_read_replica: Option<ReplicaId>,
 }
 
+pub(crate) struct ReplicaStateSnapshot {
+    pub(crate) preferred_replica_id: Option<ReplicaId>,
+    pub(crate) replicas: Vec<Arc<PhysicalReplica>>,
+}
+
 impl LogicalFile {
     pub(crate) fn new(
         file_id: FileId,
@@ -175,33 +180,6 @@ impl LogicalFile {
             .map(|replica| replica.lifecycle())
     }
 
-    pub(crate) fn publish_and_promote_replica_if(
-        &self,
-        expected: &Arc<TrackedFile>,
-        tracked: Arc<TrackedFile>,
-    ) -> Option<ReplicaId> {
-        let mut state = self.replica_state.write().unwrap();
-        let current = state
-            .preferred_read_replica
-            .and_then(|id| state.replicas.get(&id))?;
-        if !Arc::ptr_eq(&current.tracked, expected) {
-            return None;
-        }
-        let previous_id = state.preferred_read_replica.unwrap();
-        let replica_id = self.next_replica_id.fetch_add(1, Ordering::Relaxed);
-        let replica = Arc::new(PhysicalReplica::new(
-            replica_id,
-            tracked,
-            ReplicaLifecycle::OwnedReady,
-        ));
-        state.replicas.insert(replica_id, replica);
-        state.preferred_read_replica = Some(replica_id);
-        if let Some(previous) = state.replicas.remove(&previous_id) {
-            previous.set_lifecycle(ReplicaLifecycle::Retiring);
-        }
-        Some(previous_id)
-    }
-
     pub(crate) fn add_replica(
         &self,
         tracked: Arc<TrackedFile>,
@@ -259,32 +237,6 @@ impl LogicalFile {
             .min_by_key(|replica| replica.replica_id)
     }
 
-    pub(crate) fn promote_replica_if(
-        &self,
-        expected: &Arc<TrackedFile>,
-        replica_id: ReplicaId,
-    ) -> bool {
-        let mut state = self.replica_state.write().unwrap();
-        let Some(current) = state
-            .preferred_read_replica
-            .and_then(|id| state.replicas.get(&id))
-        else {
-            return false;
-        };
-        if !Arc::ptr_eq(&current.tracked, expected)
-            || current.replica_id == replica_id
-            || !state.replicas.contains_key(&replica_id)
-        {
-            return false;
-        }
-        let previous_id = state.preferred_read_replica.unwrap();
-        state.preferred_read_replica = Some(replica_id);
-        if let Some(previous) = state.replicas.remove(&previous_id) {
-            previous.set_lifecycle(ReplicaLifecycle::Retiring);
-        }
-        true
-    }
-
     pub(crate) fn retain_and_select_replica_if(
         &self,
         expected: &Arc<TrackedFile>,
@@ -309,6 +261,27 @@ impl LogicalFile {
         true
     }
 
+    pub(crate) fn add_and_select_replica_if(
+        &self,
+        expected: &Arc<TrackedFile>,
+        tracked: Arc<TrackedFile>,
+        lifecycle: ReplicaLifecycle,
+    ) -> Option<ReplicaId> {
+        let mut state = self.replica_state.write().unwrap();
+        let current_id = state.preferred_read_replica?;
+        let current = state.replicas.get(&current_id)?;
+        if !Arc::ptr_eq(&current.tracked, expected) {
+            return None;
+        }
+        let replica_id = self.next_replica_id.fetch_add(1, Ordering::Relaxed);
+        state.replicas.insert(
+            replica_id,
+            Arc::new(PhysicalReplica::new(replica_id, tracked, lifecycle)),
+        );
+        state.preferred_read_replica = Some(replica_id);
+        Some(current_id)
+    }
+
     pub(crate) fn set_preferred_lifecycle(&self, lifecycle: ReplicaLifecycle) {
         if let Some(replica) = self.preferred_replica_any() {
             replica.set_lifecycle(lifecycle);
@@ -323,6 +296,43 @@ impl LogicalFile {
             .keys()
             .copied()
             .collect()
+    }
+
+    pub(crate) fn replica_state_snapshot(&self) -> ReplicaStateSnapshot {
+        let state = self.replica_state.read().unwrap();
+        ReplicaStateSnapshot {
+            preferred_replica_id: state.preferred_read_replica,
+            replicas: state.replicas.values().cloned().collect(),
+        }
+    }
+
+    pub(crate) fn replica_at_absolute_path(&self, path: &str) -> Option<Arc<PhysicalReplica>> {
+        self.replica_state
+            .read()
+            .unwrap()
+            .replicas
+            .values()
+            .find(|replica| replica.tracked.absolute_path() == path)
+            .cloned()
+    }
+
+    pub(crate) fn restore_replica_state(
+        &self,
+        replicas: Vec<(ReplicaId, Arc<TrackedFile>, ReplicaLifecycle)>,
+        preferred_replica_id: Option<ReplicaId>,
+    ) {
+        let mut state = self.replica_state.write().unwrap();
+        let next_id = replicas.iter().map(|(id, _, _)| *id).max().unwrap_or(0);
+        state.replicas = replicas
+            .into_iter()
+            .map(|(id, tracked, lifecycle)| {
+                (id, Arc::new(PhysicalReplica::new(id, tracked, lifecycle)))
+            })
+            .collect();
+        state.preferred_read_replica =
+            preferred_replica_id.filter(|id| state.replicas.contains_key(id));
+        self.next_replica_id
+            .fetch_max(next_id.saturating_add(1), Ordering::Relaxed);
     }
 
     pub(crate) fn finish_staging_replica(&self) {

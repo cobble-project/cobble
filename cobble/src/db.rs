@@ -1208,6 +1208,9 @@ impl Db {
             },
         )?);
 
+        if let Err(err) = file_manager.load_replica_catalog_as_writer_owner() {
+            log::warn!("failed to load replica catalog: {}", err);
+        }
         let runtime_manifest_publisher = if config.runtime_manifests_enabled() {
             Some(Arc::new(
                 crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle::open(

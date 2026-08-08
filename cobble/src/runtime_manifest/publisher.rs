@@ -8,9 +8,10 @@ use crate::error::{Error, Result};
 use crate::file::FileManager;
 use crate::lsm::LSMTreeVersion;
 use crate::manifest_model::{
-    ManifestLevel, manifest_file_from_data_file, manifest_truncation_cursors, manifest_vlog_files,
+    ManifestLevel, manifest_file_from_data_file, manifest_truncation_cursors,
 };
 use crate::schema::SchemaManager;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -294,6 +295,10 @@ impl RuntimeManifestPublisher {
             self.file_manager.as_ref(),
             generation,
             latest_schema_id,
+            publication
+                .current
+                .as_ref()
+                .map(|current| &current.manifest),
         )?;
 
         if !force
@@ -311,6 +316,21 @@ impl RuntimeManifestPublisher {
                 Error::InvalidState("Runtime manifest generation space is exhausted".to_string())
             })?;
         self.store.publish(&envelope)?;
+        let tree_versions = state.multi_lsm_version.tree_versions_cloned();
+        let mut file_ids = tree_versions
+            .into_iter()
+            .flat_map(|version| version.levels.clone().into_iter())
+            .flat_map(|level| level.files.into_iter())
+            .map(|file| file.file_id)
+            .collect::<Vec<_>>();
+        file_ids.extend(
+            state
+                .vlog_version
+                .tracked_files()
+                .into_iter()
+                .map(|tracked| tracked.file_id()),
+        );
+        self.file_manager.commit_logical_files(file_ids);
         publication.current = Some(published_manifest_state(
             manifest,
             &envelope,
@@ -373,7 +393,19 @@ fn runtime_manifest_from_state(
     file_manager: &FileManager,
     generation: u64,
     latest_schema_id: u64,
+    previous: Option<&RuntimeManifest>,
 ) -> Result<RuntimeManifest> {
+    let previous_data_paths = previous
+        .into_iter()
+        .flat_map(|manifest| manifest.tree_levels.iter().flatten())
+        .flat_map(|level| level.files.iter())
+        .map(|file| (file.file_id, file.path.as_str()))
+        .collect::<HashMap<_, _>>();
+    let previous_vlog_paths = previous
+        .into_iter()
+        .flat_map(|manifest| manifest.vlog_files.iter())
+        .map(|file| (file.file_id, file.path.as_str()))
+        .collect::<HashMap<_, _>>();
     let tree_versions = state.multi_lsm_version.tree_versions_cloned();
     Ok(RuntimeManifest {
         generation,
@@ -384,9 +416,9 @@ fn runtime_manifest_from_state(
         tree_scopes: state.multi_lsm_version.tree_scopes(),
         tree_levels: tree_versions
             .iter()
-            .map(|tree| manifest_levels(tree, file_manager))
+            .map(|tree| manifest_levels(tree, file_manager, &previous_data_paths))
             .collect::<Result<Vec<_>>>()?,
-        vlog_files: manifest_vlog_files(&state.vlog_version, file_manager)?,
+        vlog_files: manifest_vlog_files(&state.vlog_version, file_manager, &previous_vlog_paths)?,
         truncation_cursors: manifest_truncation_cursors(&state.truncation_cursors_snapshot()),
     })
 }
@@ -394,6 +426,7 @@ fn runtime_manifest_from_state(
 fn manifest_levels(
     tree: &LSMTreeVersion,
     file_manager: &FileManager,
+    previous_data_paths: &HashMap<u64, &str>,
 ) -> Result<Vec<ManifestLevel>> {
     tree.levels
         .iter()
@@ -402,8 +435,11 @@ fn manifest_levels(
                 .files
                 .iter()
                 .map(|file| {
-                    let path = file_manager
-                        .get_data_file_full_path(file.file_id)
+                    let path = previous_data_paths
+                        .get(&file.file_id)
+                        .copied()
+                        .map(str::to_owned)
+                        .or_else(|| file_manager.get_data_file_full_path(file.file_id))
                         .ok_or_else(|| {
                             Error::InvalidState(format!(
                                 "Runtime manifest references unknown data file ID {}",
@@ -417,6 +453,34 @@ fn manifest_levels(
                 ordinal: level.ordinal,
                 tiered: level.tiered,
                 files,
+            })
+        })
+        .collect()
+}
+
+fn manifest_vlog_files(
+    version: &crate::vlog::VlogVersion,
+    file_manager: &FileManager,
+    previous_vlog_paths: &HashMap<u64, &str>,
+) -> Result<Vec<crate::manifest_model::ManifestVlogFile>> {
+    version
+        .files_with_entries()
+        .into_iter()
+        .map(|(file_seq, tracked_id, valid_entries)| {
+            let file_id = tracked_id.file_id();
+            let path = previous_vlog_paths
+                .get(&file_id)
+                .copied()
+                .map(str::to_owned)
+                .or_else(|| file_manager.get_data_file_full_path(file_id))
+                .ok_or_else(|| {
+                    Error::InvalidState(format!("Unknown value-log file ID {file_id}"))
+                })?;
+            Ok(crate::manifest_model::ManifestVlogFile {
+                file_seq,
+                file_id,
+                path,
+                valid_entries,
             })
         })
         .collect()

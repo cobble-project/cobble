@@ -31,7 +31,7 @@ use crate::file::FileManager;
 use crate::lsm::Level;
 use crate::manifest_model::{
     build_tree_versions_from_levels, build_truncation_cursors, build_vlog_version_from_files,
-    ensure_persisted_files_readable, manifest_schema_ids,
+    ensure_preferred_replicas_readable, manifest_schema_ids,
 };
 use crate::metrics_manager::MetricsManager;
 use crate::runtime_manifest::{LoadedRuntimeManifest, RuntimeManifestStore};
@@ -100,6 +100,12 @@ struct DedicatedObservation {
     tree_levels: Vec<Vec<crate::manifest_model::ManifestLevel>>,
     vlog_files: Vec<crate::manifest_model::ManifestVlogFile>,
     truncation_cursors: Vec<crate::manifest_model::ManifestTruncationCursor>,
+}
+
+struct RebuiltObservation {
+    schema_manager: Arc<SchemaManager>,
+    tree_versions: Vec<crate::lsm::LSMTreeVersion>,
+    truncation_cursors: crate::db_state::TruncationCursorMap,
 }
 
 impl DedicatedObservation {
@@ -259,7 +265,7 @@ impl DedicatedCompactor {
         let Some(observation) = self.load_observation()? else {
             return Ok(DedicatedCompactorProbe::WaitingForObservation);
         };
-        self.validate_observation(&observation)?;
+        let _rebuilt = self.rebuild_observation(&observation)?;
         Ok(DedicatedCompactorProbe::Ready)
     }
 
@@ -284,32 +290,8 @@ impl DedicatedCompactor {
             debug!("no dedicated compaction observation is available; waiting for writer");
             return Ok(DedicatedCompactionStep::WaitingForObservation);
         };
-        self.validate_observation_topology(&observation)?;
-
-        // Step 3: Rebuild read-only LSM state, schema, truncation cursors.
-        // Reload schemas in case the writer evolved the schema. Pass the saved resolver so
-        // custom merge operators remain functional.
-        ensure_persisted_files_readable(
-            &self.file_manager,
-            &observation.tree_levels,
-            &observation.vlog_files,
-        )?;
-        let schema_manager = Arc::new(SchemaManager::from_persisted_schema_ids(
-            &self.file_manager,
-            manifest_schema_ids(observation.latest_schema_id, &observation.tree_levels),
-            self.resolver.clone(),
-        )?);
-        let tree_versions = build_tree_versions_from_levels(
-            &self.file_manager,
-            &observation.tree_levels,
-            true, // read_only
-        )?;
-        // Rebuild the VLOG too, even though plan selection currently only needs LSM levels.
-        // This validates the complete persisted layout and keeps the observation boundary shared.
-        let _vlog_version =
-            build_vlog_version_from_files(&self.file_manager, &observation.vlog_files, true)?;
-        let truncation_cursors = build_truncation_cursors(&observation.truncation_cursors)?;
-        let tree_scopes = observation.tree_scopes;
+        let rebuilt = self.rebuild_observation(&observation)?;
+        let tree_scopes = &observation.tree_scopes;
 
         // Advance the compactor's file-id allocator past all file ids in the manifest.
         // The compactor's FileManager is a separate instance from the writer's, so its
@@ -334,7 +316,7 @@ impl DedicatedCompactor {
 
         // Step 4: For each tree, try to select a compaction plan.
         let compaction_config = build_compaction_config(&self.config, self.config.num_columns)?;
-        for (tree_idx, tree_version) in tree_versions.iter().enumerate() {
+        for (tree_idx, tree_version) in rebuilt.tree_versions.iter().enumerate() {
             let Some(tree_scope) = tree_scopes.get(tree_idx) else {
                 continue;
             };
@@ -344,7 +326,7 @@ impl DedicatedCompactor {
             // (see `Config::validate`); the `drop_expired` validation in `publish_drop_result` is
             // correct but unreachable until cross-process TTL clock sync is implemented.
             let policy_context = CompactionPolicyContext {
-                truncation_cursors: Some(&truncation_cursors),
+                truncation_cursors: Some(&rebuilt.truncation_cursors),
                 tree_scope: Some(tree_scope),
                 now_seconds: 0,
             };
@@ -367,8 +349,8 @@ impl DedicatedCompactor {
                 &tree_version.levels,
                 &plan,
                 &compaction_config,
-                &truncation_cursors,
-                &schema_manager,
+                &rebuilt.truncation_cursors,
+                &rebuilt.schema_manager,
                 &observation.source,
                 &job_id,
                 policy_context.now_seconds,
@@ -389,26 +371,32 @@ impl DedicatedCompactor {
         Ok(DedicatedCompactionStep::NoPlan)
     }
 
-    fn validate_observation(&self, observation: &DedicatedObservation) -> Result<()> {
+    fn rebuild_observation(
+        &self,
+        observation: &DedicatedObservation,
+    ) -> Result<RebuiltObservation> {
         self.validate_observation_topology(observation)?;
-        ensure_persisted_files_readable(
-            &self.file_manager,
-            &observation.tree_levels,
-            &observation.vlog_files,
-        )?;
         let schema_manager = Arc::new(SchemaManager::from_persisted_schema_ids(
             &self.file_manager,
             manifest_schema_ids(observation.latest_schema_id, &observation.tree_levels),
             self.resolver.clone(),
         )?);
-        let _tree_versions =
+        let tree_versions =
             build_tree_versions_from_levels(&self.file_manager, &observation.tree_levels, true)?;
         let _vlog_version =
             build_vlog_version_from_files(&self.file_manager, &observation.vlog_files, true)?;
-        let _truncation_cursors = build_truncation_cursors(&observation.truncation_cursors)?;
-        // Keep the schema manager alive through all descriptor reconstruction above.
-        drop(schema_manager);
-        Ok(())
+        self.file_manager
+            .load_replica_catalog_as_readonly_consumer()?;
+        ensure_preferred_replicas_readable(
+            &self.file_manager,
+            &observation.tree_levels,
+            &observation.vlog_files,
+        )?;
+        Ok(RebuiltObservation {
+            schema_manager,
+            tree_versions,
+            truncation_cursors: build_truncation_cursors(&observation.truncation_cursors)?,
+        })
     }
 
     fn validate_observation_topology(&self, observation: &DedicatedObservation) -> Result<()> {
