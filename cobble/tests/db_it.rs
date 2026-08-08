@@ -2766,7 +2766,7 @@ fn test_db_snapshot_auto_expire() {
         num_columns: 1,
         block_cache_size: Size::from_const(0),
         snapshot_retention: Some(1),
-        snapshot_on_flush: true,
+        snapshot_on_flush: false,
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
@@ -2786,11 +2786,20 @@ fn test_db_snapshot_auto_expire() {
     let second_id = db.snapshot().unwrap();
     let _ = wait_for_manifest_in_db(root, db.id(), second_id);
 
-    let _ = wait_for_manifest_in_db(root, db.id(), first_id);
-    let _ = wait_for_manifest_in_db(root, db.id(), second_id);
-    assert!(db.expire_snapshot(first_id).unwrap());
+    let first_path = format!(
+        "{}/{}",
+        root,
+        bucket_snapshot_manifest_path(db.id(), first_id)
+    );
+    let second_path = format!(
+        "{}/{}",
+        root,
+        bucket_snapshot_manifest_path(db.id(), second_id)
+    );
+    wait_for_missing(&first_path);
+    assert!(!db.expire_snapshot(first_id).unwrap());
     assert!(db.expire_snapshot(second_id).unwrap());
-    let _ = db.expire_snapshot(first_id).unwrap();
+    wait_for_missing(&second_path);
 
     cleanup_test_root(root);
 }
