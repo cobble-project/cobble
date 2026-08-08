@@ -7,6 +7,7 @@ use crate::db_state::LSMTreeScope;
 use crate::db_state::TruncationCursorMap;
 use crate::error::Result;
 use crate::file::TrackedFile;
+use crate::file::logical_file::LogicalFile;
 use crate::lsm::LSMTreeVersion;
 use crate::vlog::VlogVersion;
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,6 +61,8 @@ pub(crate) struct DbSnapshot {
     pub lsm_versions: Vec<LSMTreeVersion>,
     // Source data file id -> tracked snapshot file.
     pub tracked_data_files: BTreeMap<u64, Arc<TrackedFile>>,
+    // Source data file id -> logical identity retained while asynchronous materialization runs.
+    pub logical_data_files: BTreeMap<u64, Arc<LogicalFile>>,
     // Vlog version at the time of snapshot creation, without tracked references.
     pub vlog_version: VlogVersion,
     pub seq_id: u64,
@@ -99,6 +102,7 @@ impl DbSnapshot {
             base_snapshot_id: None,
             lsm_versions: vec![],
             tracked_data_files: BTreeMap::new(),
+            logical_data_files: BTreeMap::new(),
             vlog_version: VlogVersion::new(),
             seq_id: 0,
             latest_schema_id: 0,

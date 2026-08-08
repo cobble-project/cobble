@@ -103,27 +103,31 @@ fn suggested_base_fallback_id(
 
 struct PreparedSnapshotMaterialization {
     snapshot: DbSnapshot,
-    source_snapshot_links: Vec<(Arc<DataFile>, Arc<TrackedFileId>)>,
+    staged_replicas: Vec<(
+        Arc<crate::file::logical_file::LogicalFile>,
+        crate::file::logical_file::ReplicaId,
+    )>,
 }
 
 struct MaterializeTempResourceRegistry {
-    file_manager: Arc<FileManager>,
     state: Mutex<MaterializeTempResourceState>,
 }
 
 struct MaterializeTempResourceState {
     referenced_files: Vec<Arc<TrackedFile>>,
-    temp_copied_file_ids: Vec<u64>,
+    temp_copied_replicas: Vec<(
+        Arc<crate::file::logical_file::LogicalFile>,
+        crate::file::logical_file::ReplicaId,
+    )>,
     finalized: bool,
 }
 
 impl MaterializeTempResourceRegistry {
-    fn new(file_manager: Arc<FileManager>) -> Self {
+    fn new() -> Self {
         Self {
-            file_manager,
             state: Mutex::new(MaterializeTempResourceState {
                 referenced_files: Vec::new(),
-                temp_copied_file_ids: Vec::new(),
+                temp_copied_replicas: Vec::new(),
                 finalized: false,
             }),
         }
@@ -138,36 +142,55 @@ impl MaterializeTempResourceRegistry {
         let mut state = self.state.lock().unwrap();
         state.finalized = true;
     }
+
+    fn staged_replicas(
+        &self,
+    ) -> Vec<(
+        Arc<crate::file::logical_file::LogicalFile>,
+        crate::file::logical_file::ReplicaId,
+    )> {
+        self.state
+            .lock()
+            .unwrap()
+            .temp_copied_replicas
+            .iter()
+            .map(|(logical, replica_id)| (Arc::clone(logical), *replica_id))
+            .collect()
+    }
 }
 
 impl Drop for MaterializeTempResourceRegistry {
     fn drop(&mut self) {
-        let (references_to_release, copied_file_ids) = {
+        let (references_to_release, copied_replicas) = {
             let mut state = self.state.lock().unwrap();
             if state.finalized {
                 return;
             }
             (
                 std::mem::take(&mut state.referenced_files),
-                std::mem::take(&mut state.temp_copied_file_ids),
+                std::mem::take(&mut state.temp_copied_replicas),
             )
         };
         for tracked in &references_to_release {
             tracked.dereference();
         }
-        for file_id in &copied_file_ids {
-            let _ = self.file_manager.remove_data_file(*file_id);
+        for (logical, replica_id) in &copied_replicas {
+            logical.remove_replica(*replica_id);
         }
     }
 }
 
 impl SnapshotCopyResourceRegistry for MaterializeTempResourceRegistry {
-    fn register_temp_copied_file(&self, file_id: u64) {
+    fn register_temp_copied_replica(
+        &self,
+        logical: Arc<crate::file::logical_file::LogicalFile>,
+        replica_id: crate::file::logical_file::ReplicaId,
+    ) {
         let mut state = self.state.lock().unwrap();
         if state.finalized {
             return;
         }
-        state.temp_copied_file_ids.push(file_id);
+        state.temp_copied_replicas.push((logical, replica_id));
     }
 }
 
@@ -400,7 +423,7 @@ impl SnapshotManager {
         let tree_versions = db_state.multi_lsm_version.tree_versions_cloned();
         snapshot.lsm_versions = tree_versions
             .iter()
-            .map(|version| clone_lsm_tree_version_untracked(version.as_ref(), &self.file_manager))
+            .map(|version| clone_lsm_tree_version_untracked(version.as_ref()))
             .collect();
         let mut tracked_file_ids: BTreeSet<u64> = tree_versions
             .iter()
@@ -434,6 +457,23 @@ impl SnapshotManager {
                     .ok()
                     .map(|tracked| (file_id, tracked))
             })
+            .collect();
+        snapshot.logical_data_files = tree_versions
+            .iter()
+            .flat_map(|version| version.levels.iter())
+            .flat_map(|level| level.files.iter())
+            .filter_map(|file| file.logical_file().map(|logical| (file.file_id, logical)))
+            .chain(
+                db_state
+                    .vlog_version
+                    .tracked_files()
+                    .into_iter()
+                    .filter_map(|tracked| {
+                        tracked
+                            .logical_file()
+                            .map(|logical| (tracked.file_id(), logical))
+                    }),
+            )
             .collect();
         snapshot.vlog_version = clone_vlog_version_untracked(&db_state.vlog_version);
         snapshot.base_snapshot_id = if self.snapshot_disable_incremental_base_link {
@@ -517,6 +557,7 @@ impl SnapshotManager {
             base_snapshot_id,
             lsm_versions,
             tracked_data_files,
+            logical_data_files: BTreeMap::new(),
             vlog_version: build_vlog_version_from_manifest_untracked(manifest),
             seq_id: manifest.seq_id,
             latest_schema_id: manifest.latest_schema_id,
@@ -624,9 +665,7 @@ impl SnapshotManager {
                         id
                     )))
                 } else {
-                    let resources = Arc::new(MaterializeTempResourceRegistry::new(Arc::clone(
-                        &self.file_manager,
-                    )));
+                    let resources = Arc::new(MaterializeTempResourceRegistry::new());
                     let prepared_result =
                         self.prepare_snapshot_for_materialization(snapshot.as_ref(), &resources);
                     match prepared_result {
@@ -745,25 +784,21 @@ impl SnapshotManager {
         result
     }
 
-    /// Prepare the snapshot for materialization by ensuring all referenced data files are available
-    /// in the snapshot volume, and remapping the snapshot's tracked file references to point to the
-    /// snapshot volume. Returns a remapped snapshot ready for manifest encoding, along with links
-    /// from source data files to their corresponding snapshot data files for later reference management.
+    /// Prepare the snapshot for materialization by selecting one snapshot-persistable physical
+    /// replica for each logical file. Logical ids in the LSM and VLOG versions never change.
     fn prepare_snapshot_for_materialization(
         &self,
         snapshot: &DbSnapshot,
         resources: &Arc<MaterializeTempResourceRegistry>,
     ) -> Result<PreparedSnapshotMaterialization> {
-        let mut file_id_map: HashMap<u64, u64> = HashMap::new();
         let mut copy_candidates = Vec::new();
-        let mut source_data_files: HashMap<u64, Arc<DataFile>> = snapshot
+        let mut source_file_ids: BTreeSet<u64> = snapshot
             .lsm_versions
             .iter()
             .flat_map(|version| version.levels.iter())
             .flat_map(|level| level.files.iter())
-            .map(|file| (file.file_id, Arc::clone(file)))
+            .map(|file| file.file_id)
             .collect();
-        let mut source_file_ids: BTreeSet<u64> = source_data_files.keys().copied().collect();
         source_file_ids.extend(
             snapshot
                 .vlog_version
@@ -771,11 +806,34 @@ impl SnapshotManager {
                 .iter()
                 .map(|(_, tracked_id, _)| tracked_id.file_id()),
         );
-        for source_file_id in source_file_ids {
+        for source_file_id in &source_file_ids {
             // Capture retains the physical file even if compaction removes its id from the active
             // FileManager index before this asynchronous materialization step runs.
             let source_tracked = snapshot
                 .tracked_data_files
+                .get(source_file_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidState(format!(
+                        "Snapshot {} did not retain data file {}",
+                        snapshot.id, source_file_id
+                    ))
+                })?;
+            copy_candidates.push((
+                *source_file_id,
+                source_tracked,
+                snapshot.logical_data_files.get(source_file_id).cloned(),
+            ));
+        }
+        let snapshot_replicas = self.copy_data_files_to_snapshot_volume_parallel(
+            copy_candidates,
+            Arc::clone(resources),
+            Arc::clone(&snapshot.lifecycle_state),
+        )?;
+
+        let mut tracked_data_files = BTreeMap::new();
+        for source_file_id in source_file_ids {
+            let tracked = snapshot_replicas
                 .get(&source_file_id)
                 .cloned()
                 .ok_or_else(|| {
@@ -784,83 +842,30 @@ impl SnapshotManager {
                         snapshot.id, source_file_id
                     ))
                 })?;
-            if source_tracked.is_snapshot_persistable() {
-                file_id_map.insert(source_file_id, source_file_id);
-                continue;
-            }
-            if let Some(mapped_file_id) = source_data_files
-                .get(&source_file_id)
-                .and_then(|data_file| data_file.snapshot_data_file_id())
-                .filter(|mapped_file_id| {
-                    self.file_manager
-                        .is_data_file_on_snapshot_volume(*mapped_file_id)
-                })
-            {
-                file_id_map.insert(source_file_id, mapped_file_id);
-                continue;
-            }
-            copy_candidates.push((source_file_id, source_tracked));
-        }
-        let copied_file_id_map = self.copy_data_files_to_snapshot_volume_parallel(
-            copy_candidates,
-            Arc::clone(resources),
-            Arc::clone(&snapshot.lifecycle_state),
-        )?;
-        file_id_map.extend(copied_file_id_map);
-        let mut source_snapshot_links = Vec::new();
-        for (source_file_id, source_data_file) in source_data_files.drain() {
-            if let Some(mapped_file_id) = file_id_map.get(&source_file_id).copied()
-                && mapped_file_id != source_file_id
-            {
-                source_snapshot_links.push((
-                    source_data_file,
-                    TrackedFileId::new(&self.file_manager, mapped_file_id),
-                ));
-            }
-        }
-
-        let mut tracked_data_files = BTreeMap::new();
-        for (source_file_id, mapped_file_id) in &file_id_map {
-            let tracked = if source_file_id == mapped_file_id {
-                let tracked = snapshot
-                    .tracked_data_files
-                    .get(source_file_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::InvalidState(format!(
-                            "Snapshot {} did not retain data file {}",
-                            snapshot.id, source_file_id
-                        ))
-                    })?;
-                tracked.reference();
-                tracked
-            } else {
-                self.file_manager.data_file_ref(*mapped_file_id)?
-            };
+            tracked.reference();
             resources.register_reference(Arc::clone(&tracked));
-            tracked_data_files.insert(*source_file_id, tracked);
+            tracked_data_files.insert(source_file_id, tracked);
         }
 
-        let mut remapped_snapshot = snapshot.clone();
-        remapped_snapshot.lsm_versions =
-            remap_snapshot_tree_file_ids(&snapshot.lsm_versions, &file_id_map, &self.file_manager);
-        remapped_snapshot.vlog_version =
-            remap_snapshot_vlog_file_ids(&snapshot.vlog_version, &file_id_map);
-        remapped_snapshot.tracked_data_files = tracked_data_files;
+        let mut prepared_snapshot = snapshot.clone();
+        prepared_snapshot.tracked_data_files = tracked_data_files;
         Ok(PreparedSnapshotMaterialization {
-            snapshot: remapped_snapshot,
-            source_snapshot_links,
+            snapshot: prepared_snapshot,
+            staged_replicas: resources.staged_replicas(),
         })
     }
 
-    /// Copy the given data files to the snapshot volume in parallel, and return a map from source file
-    /// ids to copied file ids. Only files that are not already present in the snapshot volume will be copied.
+    /// Select or copy snapshot-persistable replicas in parallel, keyed by logical file id.
     fn copy_data_files_to_snapshot_volume_parallel(
         &self,
-        source_files: Vec<(u64, Arc<TrackedFile>)>,
+        source_files: Vec<(
+            u64,
+            Arc<TrackedFile>,
+            Option<Arc<crate::file::logical_file::LogicalFile>>,
+        )>,
         resources: Arc<MaterializeTempResourceRegistry>,
         lifecycle_state: Arc<AtomicU8>,
-    ) -> Result<HashMap<u64, u64>> {
+    ) -> Result<HashMap<u64, Arc<TrackedFile>>> {
         if source_files.is_empty() {
             return Ok(HashMap::new());
         }
@@ -868,7 +873,7 @@ impl SnapshotManager {
         let copy_resource_registry: Arc<dyn SnapshotCopyResourceRegistry + Send + Sync> = resources;
         self.upload_runtime.block_on(async {
             let mut join_set = JoinSet::new();
-            for (source_file_id, source_tracked) in source_files {
+            for (source_file_id, source_tracked, logical) in source_files {
                 let file_manager = Arc::clone(&file_manager);
                 let copy_resource_registry = Arc::clone(&copy_resource_registry);
                 let lifecycle_state = Arc::clone(&lifecycle_state);
@@ -877,13 +882,14 @@ impl SnapshotManager {
                     tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         file_manager
-                            .copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
+                            .snapshot_replica_for_tracked_file(
                                 source_file_id,
                                 &source_tracked,
+                                logical.as_ref(),
                                 Some(copy_resource_registry),
                                 Some(lifecycle_state.as_ref()),
                             )
-                            .map(|(copied_id, _)| (source_file_id, copied_id))
+                            .map(|tracked| (source_file_id, tracked))
                     })
                     .await
                     .map_err(|err| {
@@ -891,12 +897,12 @@ impl SnapshotManager {
                     })?
                 });
             }
-            let mut file_id_map = HashMap::new();
+            let mut replicas = HashMap::new();
             while let Some(result) = join_set.join_next().await {
                 if SnapshotLifecycleState::is_cancelled_raw(lifecycle_state.as_ref()) {
                     join_set.abort_all();
                 }
-                let (source_file_id, copied_id) = result.map_err(|err| {
+                let (source_file_id, tracked) = result.map_err(|err| {
                     if SnapshotLifecycleState::is_cancelled_raw(lifecycle_state.as_ref())
                         && err.is_cancelled()
                     {
@@ -907,9 +913,9 @@ impl SnapshotManager {
                         Error::IoError(format!("Snapshot upload task failed to join: {}", err))
                     }
                 })??;
-                file_id_map.insert(source_file_id, copied_id);
+                replicas.insert(source_file_id, tracked);
             }
-            Ok(file_id_map)
+            Ok(replicas)
         })
     }
 
@@ -919,11 +925,10 @@ impl SnapshotManager {
         incremental_base_id: Option<u64>,
         mut prepared: PreparedSnapshotMaterialization,
     ) -> bool {
-        for (source_data_file, snapshot_data_file) in &prepared.source_snapshot_links {
-            source_data_file.set_snapshot_data_file(Arc::clone(snapshot_data_file));
-            self.file_manager.register_snapshot_replica_hint(
-                source_data_file.file_id,
-                snapshot_data_file.file_id(),
+        for (logical, replica_id) in &prepared.staged_replicas {
+            logical.set_replica_lifecycle(
+                *replica_id,
+                crate::file::logical_file::ReplicaLifecycle::OwnedReady,
             );
         }
         let mut state = self.state.lock().unwrap();
@@ -934,6 +939,7 @@ impl SnapshotManager {
                 .for_each(|tracked| tracked.dereference());
         }
         prepared.snapshot.base_snapshot_id = incremental_base_id;
+        prepared.snapshot.logical_data_files.clear();
         let expire_requested = prepared.snapshot.mark_published();
         state.snapshots.insert(id, Arc::new(prepared.snapshot));
         // if there is an incremental base, add reference from the new snapshot to the base;
@@ -1164,91 +1170,6 @@ async fn acquire_snapshot_transfer_permit(
         .map_err(|_| Error::IoError("Snapshot transfer runtime stopped".to_string()))
 }
 
-fn remap_snapshot_tree_file_ids(
-    versions: &[LSMTreeVersion],
-    file_id_map: &HashMap<u64, u64>,
-    file_manager: &Arc<FileManager>,
-) -> Vec<LSMTreeVersion> {
-    versions
-        .iter()
-        .map(|version| LSMTreeVersion {
-            levels: version
-                .levels
-                .iter()
-                .map(|level| Level {
-                    ordinal: level.ordinal,
-                    tiered: level.tiered,
-                    files: level
-                        .files
-                        .iter()
-                        .map(|file| {
-                            let mapped_file_id = file_id_map
-                                .get(&file.file_id)
-                                .copied()
-                                .unwrap_or(file.file_id);
-                            let detached = DataFile::new_detached(
-                                file.file_type,
-                                file.start_key.clone(),
-                                file.end_key.clone(),
-                                file.file_id,
-                                file.schema_id,
-                                file.size,
-                                file.bucket_range.clone(),
-                                file.effective_bucket_range.clone(),
-                            )
-                            .with_vlog_offset(file.vlog_file_seq_offset)
-                            .with_separated_values(file.has_separated_values);
-                            if let Some(logical) = file.logical_file() {
-                                detached.attach_logical_file(logical);
-                            }
-                            if mapped_file_id != file.file_id {
-                                if file_manager.is_data_file_on_snapshot_volume(mapped_file_id) {
-                                    detached.set_snapshot_data_file(TrackedFileId::new(
-                                        file_manager,
-                                        mapped_file_id,
-                                    ));
-                                }
-                            } else if let Some(snapshot_file_id) = file.snapshot_data_file_id()
-                                && file_manager.is_data_file_on_snapshot_volume(snapshot_file_id)
-                            {
-                                detached.set_snapshot_data_file(TrackedFileId::new(
-                                    file_manager,
-                                    snapshot_file_id,
-                                ));
-                            }
-                            detached.copy_meta_from(file);
-                            Arc::new(detached)
-                        })
-                        .collect(),
-                })
-                .collect(),
-        })
-        .collect()
-}
-
-fn remap_snapshot_vlog_file_ids(
-    vlog_version: &VlogVersion,
-    file_id_map: &HashMap<u64, u64>,
-) -> VlogVersion {
-    let files = vlog_version
-        .files_with_entries()
-        .into_iter()
-        .map(|(file_seq, tracked_id, valid_entries)| {
-            let source_file_id = tracked_id.file_id();
-            let remapped_file_id = file_id_map
-                .get(&source_file_id)
-                .copied()
-                .unwrap_or(source_file_id);
-            (
-                file_seq,
-                TrackedFileId::detached(remapped_file_id),
-                valid_entries,
-            )
-        })
-        .collect();
-    VlogVersion::from_files_with_entries(files)
-}
-
 /// Collect all schema IDs referenced by the levels.
 fn collect_schema_ids_from_lsm_versions(
     lsm_versions: &[LSMTreeVersion],
@@ -1301,10 +1222,7 @@ fn decrement_schema_ref_counts(
 }
 
 /// Clone an LSM tree version without tracking.
-fn clone_lsm_tree_version_untracked(
-    version: &LSMTreeVersion,
-    file_manager: &Arc<FileManager>,
-) -> LSMTreeVersion {
+fn clone_lsm_tree_version_untracked(version: &LSMTreeVersion) -> LSMTreeVersion {
     LSMTreeVersion {
         levels: version
             .levels
@@ -1328,17 +1246,6 @@ fn clone_lsm_tree_version_untracked(
                         )
                         .with_vlog_offset(file.vlog_file_seq_offset)
                         .with_separated_values(file.has_separated_values);
-                        if let Some(logical) = file.logical_file() {
-                            detached.attach_logical_file(logical);
-                        }
-                        if let Some(snapshot_file_id) = file.snapshot_data_file_id()
-                            && file_manager.is_data_file_on_snapshot_volume(snapshot_file_id)
-                        {
-                            detached.set_snapshot_data_file(TrackedFileId::new(
-                                file_manager,
-                                snapshot_file_id,
-                            ));
-                        }
                         detached.copy_meta_from(file);
                         Arc::new(detached)
                     })

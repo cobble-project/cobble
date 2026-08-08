@@ -12,7 +12,7 @@ pub(crate) use crate::manifest_model::{
 use crate::manifest_model::{
     build_tree_versions_from_levels, build_truncation_cursors, build_vlog_version_from_files,
     manifest_file_from_data_file as manifest_file_from_data_file_at_path,
-    manifest_truncation_cursors, manifest_vlog_files,
+    manifest_truncation_cursors,
 };
 pub(crate) use crate::manifest_model::{from_hex, to_hex};
 use crate::paths::sibling_snapshot_manifest_path;
@@ -440,7 +440,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
     writer: &mut BufferedWriter<W>,
     snapshot: &DbSnapshot,
     base_snapshot: Option<&DbSnapshot>,
-    file_manager: &FileManager,
+    _file_manager: &FileManager,
 ) -> Result<ManifestEncodeResult> {
     let base_file_paths = base_snapshot.map(snapshot_file_sizes).unwrap_or_default();
     let current_files = snapshot_file_sizes(snapshot);
@@ -462,9 +462,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
     };
 
     let manifest = if let Some(base) = base_snapshot {
-        if let Some(tree_level_edits) =
-            build_incremental_tree_level_edits(base, snapshot, file_manager)
-        {
+        if let Some(tree_level_edits) = build_incremental_tree_level_edits(base, snapshot) {
             let active_memtable_total_size_bytes =
                 base.active_memtable_total_size_bytes + current_active_memtable_bytes;
             let data_size_bytes = file_data_size_bytes + active_memtable_total_size_bytes;
@@ -480,7 +478,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
                 tree_scopes: snapshot.tree_scopes.clone(),
                 tree_level_edits,
-                vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
+                vlog_files: manifest_vlog_files_from_snapshot(snapshot),
                 active_memtable_data: snapshot.active_memtable_data.clone(),
                 truncation_cursors: manifest_truncation_cursors_from_snapshot(snapshot),
             })
@@ -495,8 +493,8 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 bucket_ranges: snapshot.bucket_ranges.clone(),
                 lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
                 tree_scopes: snapshot.tree_scopes.clone(),
-                tree_levels: manifest_tree_levels_from_snapshot(snapshot, file_manager),
-                vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
+                tree_levels: manifest_tree_levels_from_snapshot(snapshot),
+                vlog_files: manifest_vlog_files_from_snapshot(snapshot),
                 active_memtable_data: snapshot.active_memtable_data.clone(),
                 truncation_cursors: manifest_truncation_cursors_from_snapshot(snapshot),
             })
@@ -512,8 +510,8 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             bucket_ranges: snapshot.bucket_ranges.clone(),
             lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
             tree_scopes: snapshot.tree_scopes.clone(),
-            tree_levels: manifest_tree_levels_from_snapshot(snapshot, file_manager),
-            vlog_files: manifest_vlog_files_from_snapshot(snapshot, file_manager),
+            tree_levels: manifest_tree_levels_from_snapshot(snapshot),
+            vlog_files: manifest_vlog_files_from_snapshot(snapshot),
             active_memtable_data: snapshot.active_memtable_data.clone(),
             truncation_cursors: manifest_truncation_cursors_from_snapshot(snapshot),
         })
@@ -554,10 +552,7 @@ fn snapshot_file_sizes(snapshot: &DbSnapshot) -> BTreeMap<String, u64> {
     sizes
 }
 
-fn manifest_tree_levels_from_snapshot(
-    snapshot: &DbSnapshot,
-    file_manager: &FileManager,
-) -> Vec<Vec<ManifestLevel>> {
+fn manifest_tree_levels_from_snapshot(snapshot: &DbSnapshot) -> Vec<Vec<ManifestLevel>> {
     snapshot
         .lsm_versions
         .iter()
@@ -572,11 +567,7 @@ fn manifest_tree_levels_from_snapshot(
                         .files
                         .iter()
                         .map(|file| {
-                            manifest_file_from_data_file(
-                                file,
-                                &snapshot.tracked_data_files,
-                                file_manager,
-                            )
+                            manifest_file_from_data_file(file, &snapshot.tracked_data_files)
                         })
                         .collect(),
                 })
@@ -588,23 +579,33 @@ fn manifest_tree_levels_from_snapshot(
 fn manifest_file_from_data_file(
     file: &DataFile,
     tracked_data_files: &BTreeMap<u64, Arc<TrackedFile>>,
-    file_manager: &FileManager,
 ) -> ManifestFile {
-    let path_file_id = file.snapshot_data_file_id().unwrap_or(file.file_id);
     let path = tracked_data_files
         .get(&file.file_id)
         .map(|tracked| tracked.absolute_path())
-        .or_else(|| file_manager.get_data_file_full_path(path_file_id))
         .expect("Unknown file ID");
     manifest_file_from_data_file_at_path(file, path)
 }
 
-fn manifest_vlog_files_from_snapshot(
-    snapshot: &DbSnapshot,
-    file_manager: &FileManager,
-) -> Vec<ManifestVlogFile> {
-    manifest_vlog_files(&snapshot.vlog_version, file_manager)
-        .expect("Snapshot references an unknown value-log file")
+fn manifest_vlog_files_from_snapshot(snapshot: &DbSnapshot) -> Vec<ManifestVlogFile> {
+    snapshot
+        .vlog_version
+        .files_with_entries()
+        .into_iter()
+        .map(|(file_seq, tracked_id, valid_entries)| {
+            let file_id = tracked_id.file_id();
+            let tracked = snapshot
+                .tracked_data_files
+                .get(&file_id)
+                .expect("Snapshot references an unknown value-log file");
+            ManifestVlogFile {
+                file_seq,
+                file_id,
+                path: tracked.absolute_path(),
+                valid_entries,
+            }
+        })
+        .collect()
 }
 
 fn manifest_truncation_cursors_from_snapshot(
@@ -620,7 +621,6 @@ fn build_incremental_level_edits(
     base_levels: &[Level],
     snapshot_levels: &[Level],
     tracked_data_files: &BTreeMap<u64, Arc<TrackedFile>>,
-    file_manager: &FileManager,
 ) -> Option<Vec<ManifestLevelEdit>> {
     let mut edits = Vec::new();
     for level in snapshot_levels {
@@ -647,7 +647,7 @@ fn build_incremental_level_edits(
             .files
             .iter()
             .filter(|file| !base_file_ids.contains(&file.file_id))
-            .map(|file| manifest_file_from_data_file(file, tracked_data_files, file_manager))
+            .map(|file| manifest_file_from_data_file(file, tracked_data_files))
             .collect();
         if !new_files.is_empty() {
             if !level.tiered || level.ordinal != 0 || new_files.len() != 1 || !edits.is_empty() {
@@ -676,7 +676,6 @@ fn build_incremental_level_edits(
 fn build_incremental_tree_level_edits(
     base: &DbSnapshot,
     snapshot: &DbSnapshot,
-    file_manager: &FileManager,
 ) -> Option<Vec<ManifestTreeLevelEdit>> {
     if base.lsm_versions.len() != snapshot.lsm_versions.len() {
         return None;
@@ -688,7 +687,6 @@ fn build_incremental_tree_level_edits(
             &base_tree.levels,
             &tree_version.levels,
             &snapshot.tracked_data_files,
-            file_manager,
         )?;
         if !level_edits.is_empty() {
             tree_edits.push(ManifestTreeLevelEdit {

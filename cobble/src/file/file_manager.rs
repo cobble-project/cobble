@@ -15,7 +15,7 @@ use crate::config::{PrimaryVolumeOffloadPolicyKind, VolumeUsageKind};
 use crate::error::{Error, Result};
 use crate::file::file_system::{FileSystem, FileSystemRegistry};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
-use crate::file::logical_file::{FileCommitState, LogicalFile, ReplicaLifecycle};
+use crate::file::logical_file::{FileCommitState, LogicalFile, ReplicaId, ReplicaLifecycle};
 use crate::file::metadata_io::MetadataWriter;
 use crate::file::offload::OffloadRuntime;
 use crate::lru::LruCache;
@@ -283,15 +283,11 @@ impl DataVolume {
 pub type FileId = u64;
 
 pub(crate) trait SnapshotCopyResourceRegistry: Send + Sync {
-    fn register_temp_copied_file(&self, file_id: FileId);
+    fn register_temp_copied_replica(&self, logical: Arc<LogicalFile>, replica_id: ReplicaId);
 }
 
 pub(crate) trait RestoreCopyResourceRegistry: Send + Sync {
     fn register_temp_restored_copy(&self, file_id: FileId);
-}
-
-pub(crate) struct RestoredDataFileRegistration {
-    pub(crate) snapshot_link_file_id: Option<FileId>,
 }
 
 /// Configuration options for the FileManager.
@@ -744,8 +740,6 @@ pub struct FileManager {
     pub(crate) next_file_id: AtomicU64,
     /// Map of logical IDs to their physical replicas and lifecycle.
     pub(crate) logical_files: DashMap<FileId, Arc<LogicalFile>>,
-    /// Lazy hint mapping from primary data file id to equivalent snapshot replica file id.
-    snapshot_replica_hints: DashMap<FileId, FileId>,
     /// Map of filename to tracked file information for metadata files.
     pub(crate) metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
     /// LRU cache for open random access readers, keyed by physical replica.
@@ -949,7 +943,6 @@ impl FileManager {
             options,
             next_file_id: AtomicU64::new(1), // Start from 1, 0 is reserved
             logical_files: DashMap::new(),
-            snapshot_replica_hints: DashMap::new(),
             metadata_files: Arc::new(DashMap::new()),
             reader_cache: Mutex::new(LruCache::new(DEFAULT_READER_CACHE_CAPACITY)),
             offload_runtime,
@@ -1423,49 +1416,59 @@ impl FileManager {
         path: &str,
         estimated_size_bytes: Option<u64>,
         resource_registry: Option<Arc<dyn RestoreCopyResourceRegistry + Send + Sync>>,
-    ) -> Result<RestoredDataFileRegistration> {
+    ) -> Result<()> {
         let (source_volume, source_relative_path) = self.resolve_volume_path(path)?;
         if source_volume.snapshot_persistable && source_volume.supports_primary_data {
             self.register_data_file_readonly(file_id, path)?;
-            return Ok(RestoredDataFileRegistration {
-                snapshot_link_file_id: Some(file_id),
-            });
+            return Ok(());
         }
 
         if source_volume.supports_primary_data {
             self.register_data_file_readonly(file_id, path)?;
-            return Ok(RestoredDataFileRegistration {
-                snapshot_link_file_id: None,
-            });
+            return Ok(());
         }
-
-        let snapshot_link_file_id = if source_volume.snapshot_persistable {
-            let snapshot_file_id = self.allocate_file_id();
-            self.register_data_file_readonly(snapshot_file_id, path)?;
-            Some(snapshot_file_id)
-        } else {
-            None
-        };
 
         let source_reader = source_volume.fs().open_read(&source_relative_path)?;
         let expected_write_bytes =
             estimated_size_bytes.or_else(|| Some(source_reader.size() as u64));
-        let mut writer = self.create_data_file_with_id(file_id, expected_write_bytes)?;
+        if source_volume.snapshot_persistable {
+            self.register_data_file_readonly(file_id, path)?;
+        }
+        let target_volume = self.select_data_volume(expected_write_bytes)?;
+        let (mut writer, target_tracked) =
+            self.create_untracked_data_file_writer_on_volume(target_volume)?;
         if let Err(err) = self.copy_reader_to_tracked_writer(source_reader.as_ref(), &mut writer) {
-            let _ = self.remove_data_file(file_id);
-            if let Some(snapshot_file_id) = snapshot_link_file_id {
-                let _ = self.remove_data_file(snapshot_file_id);
+            if source_volume.snapshot_persistable {
+                let _ = self.remove_data_file(file_id);
             }
             return Err(err);
+        }
+        if let Some(logical) = self.get_logical_file(file_id) {
+            let source = logical.preferred_replica_any().ok_or_else(|| {
+                Error::InvalidState(format!("Logical file {} has no replica", file_id))
+            })?;
+            if !logical.retain_and_select_replica_if(
+                &source.tracked,
+                logical.add_replica(Arc::clone(&target_tracked), ReplicaLifecycle::OwnedReady),
+            ) {
+                return Err(Error::InvalidState(format!(
+                    "Logical file {} changed while restoring",
+                    file_id
+                )));
+            }
+        } else {
+            self.register_logical_file(
+                file_id,
+                Arc::clone(&target_tracked),
+                ReplicaLifecycle::OwnedReady,
+                FileCommitState::Committed,
+            );
         }
 
         if let Some(registry) = resource_registry {
             registry.register_temp_restored_copy(file_id);
         }
-
-        Ok(RestoredDataFileRegistration {
-            snapshot_link_file_id,
-        })
+        Ok(())
     }
 
     /// Marks a data file as read-only, preventing it from being deleted on drop.
@@ -1515,24 +1518,6 @@ impl FileManager {
             .tracked
             .set_priority(priority);
         Ok(())
-    }
-
-    pub(crate) fn register_snapshot_replica_hint(
-        &self,
-        source_file_id: FileId,
-        replica_file_id: FileId,
-    ) {
-        if source_file_id == replica_file_id {
-            return;
-        }
-        self.snapshot_replica_hints
-            .insert(source_file_id, replica_file_id);
-    }
-
-    pub(crate) fn snapshot_replica_hint_file_id(&self, source_file_id: FileId) -> Option<FileId> {
-        self.snapshot_replica_hints
-            .get(&source_file_id)
-            .map(|entry| *entry.value())
     }
 
     /// Opens a data file for reading.
@@ -1614,11 +1599,6 @@ impl FileManager {
             .any(|volume| volume.snapshot_persistable)
     }
 
-    pub(crate) fn is_data_file_persistable_for_snapshot(&self, file_id: FileId) -> bool {
-        self.preferred_readable_replica(file_id)
-            .is_ok_and(|replica| replica.tracked.is_snapshot_persistable())
-    }
-
     pub(crate) fn is_data_file_on_primary_volume(&self, file_id: FileId) -> bool {
         let Ok(replica) = self.preferred_readable_replica(file_id) else {
             return false;
@@ -1630,13 +1610,13 @@ impl FileManager {
     }
 
     pub(crate) fn is_data_file_on_snapshot_volume(&self, file_id: FileId) -> bool {
-        let Ok(replica) = self.preferred_readable_replica(file_id) else {
+        let Some(logical) = self.get_logical_file(file_id) else {
             return false;
         };
-        let Some(volume) = &replica.tracked.volume else {
-            return false;
-        };
-        volume.snapshot_persistable
+        self.data_volumes
+            .iter()
+            .filter(|volume| volume.snapshot_persistable)
+            .any(|volume| logical.replica_on_volume(volume).is_some())
     }
 
     fn select_snapshot_persistable_volume(&self) -> Result<&Arc<DataVolume>> {
@@ -1672,68 +1652,38 @@ impl FileManager {
             })
     }
 
-    #[cfg(test)]
-    pub(crate) fn copy_data_file_to_snapshot_volume(
-        &self,
-        source_file_id: FileId,
-    ) -> Result<FileId> {
-        self.copy_data_file_to_snapshot_volume_with_result(source_file_id, None)
-            .map(|(file_id, _)| file_id)
-    }
-
-    /// Copies a data file to a snapshot-persistable volume if it's not already on one.
-    ///
-    /// Returns the file ID of the snapshot-persistable copy (which may be the same as the source)
-    /// and a boolean indicating whether a copy was actually made.
-    pub(crate) fn copy_data_file_to_snapshot_volume_with_result(
-        &self,
-        source_file_id: FileId,
-        resource_registry: Option<Arc<dyn SnapshotCopyResourceRegistry + Send + Sync>>,
-    ) -> Result<(FileId, bool)> {
-        self.copy_data_file_to_snapshot_volume_with_result_and_cancel(
-            source_file_id,
-            resource_registry,
-            None,
-        )
-    }
-
-    pub(crate) fn copy_data_file_to_snapshot_volume_with_result_and_cancel(
-        &self,
-        source_file_id: FileId,
-        resource_registry: Option<Arc<dyn SnapshotCopyResourceRegistry + Send + Sync>>,
-        lifecycle_state: Option<&AtomicU8>,
-    ) -> Result<(FileId, bool)> {
-        let source_tracked = self
-            .preferred_readable_replica(source_file_id)?
-            .tracked
-            .clone();
-        self.copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
-            source_file_id,
-            &source_tracked,
-            resource_registry,
-            lifecycle_state,
-        )
-    }
-
-    /// Copies a retained data file reference to snapshot storage.
-    ///
-    /// Snapshot capture keeps this reference alive so asynchronous materialization can continue
-    /// after compaction removes the file id from the active FileManager index.
-    pub(crate) fn copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
+    /// Returns an existing snapshot-persistable replica or adds a copied physical replica under
+    /// the same logical file id. The returned tracked file is the exact replica a snapshot pins.
+    pub(crate) fn snapshot_replica_for_tracked_file(
         &self,
         source_file_id: FileId,
         source_tracked: &Arc<TrackedFile>,
+        logical: Option<&Arc<LogicalFile>>,
         resource_registry: Option<Arc<dyn SnapshotCopyResourceRegistry + Send + Sync>>,
         lifecycle_state: Option<&AtomicU8>,
-    ) -> Result<(FileId, bool)> {
+    ) -> Result<Arc<TrackedFile>> {
         if source_tracked.is_snapshot_persistable() {
-            return Ok((source_file_id, false));
+            return Ok(Arc::clone(source_tracked));
+        }
+        let logical = logical.ok_or_else(|| {
+            Error::InvalidState(format!(
+                "Snapshot did not retain logical file {}",
+                source_file_id
+            ))
+        })?;
+        if let Some(replica) = self
+            .data_volumes
+            .iter()
+            .filter(|volume| volume.snapshot_persistable)
+            .find_map(|volume| logical.replica_on_volume(volume))
+        {
+            return Ok(Arc::clone(&replica.tracked));
         }
         let snapshot_volume = self.select_snapshot_persistable_volume()?;
         let source_reader = source_tracked.fs().open_read(source_tracked.path())?;
         let source_priority = source_tracked.priority();
-        let target_file_id = self.allocate_file_id();
-        let mut writer = self.create_data_file_writer_on_volume(target_file_id, snapshot_volume)?;
+        let (mut writer, target) =
+            self.create_untracked_data_file_writer_on_volume(snapshot_volume)?;
 
         let copy_result = self.copy_reader_to_tracked_writer_with_cancel(
             source_reader.as_ref(),
@@ -1741,28 +1691,26 @@ impl FileManager {
             lifecycle_state,
         );
 
-        if let Err(err) = copy_result {
-            let _ = self.remove_data_file(target_file_id);
-            return Err(err);
-        }
-        writer.tracked.set_priority(source_priority);
+        copy_result?;
+        target.set_priority(source_priority);
+        let replica_id = logical.add_replica(Arc::clone(&target), ReplicaLifecycle::Staging);
         if let Some(registry) = resource_registry {
-            registry.register_temp_copied_file(target_file_id);
+            registry.register_temp_copied_replica(Arc::clone(logical), replica_id);
         }
-        Ok((target_file_id, true))
+        Ok(target)
     }
 
     /// Returns the path for a data file.
     pub fn get_data_file_path(&self, file_id: FileId) -> Option<String> {
-        self.preferred_readable_replica(file_id)
-            .ok()
+        self.get_logical_file(file_id)
+            .and_then(|logical| logical.preferred_replica_any())
             .map(|replica| replica.tracked.path().to_string())
     }
 
     /// Returns the full path for a data file, including the volume base directory if known.
     pub fn get_data_file_full_path(&self, file_id: FileId) -> Option<String> {
-        self.preferred_readable_replica(file_id)
-            .ok()
+        self.get_logical_file(file_id)
+            .and_then(|logical| logical.preferred_replica_any())
             .map(|replica| replica.tracked.absolute_path())
     }
 
@@ -1776,7 +1724,7 @@ impl FileManager {
             .iter()
             .find(|entry| {
                 entry
-                    .preferred_replica()
+                    .preferred_replica_any()
                     .is_some_and(|replica| replica.tracked.absolute_path() == absolute_path)
             })
             .map(|entry| *entry.key())
@@ -1833,9 +1781,46 @@ impl FileManager {
         true
     }
 
+    pub(crate) fn promote_replica_if(
+        &self,
+        file_id: FileId,
+        expected: &Arc<TrackedFile>,
+        replica_id: crate::file::logical_file::ReplicaId,
+    ) -> bool {
+        let Some(logical) = self.get_logical_file(file_id) else {
+            return false;
+        };
+        let old_key = logical.preferred_replica_any().map(|replica| ReplicaKey {
+            file_id,
+            replica_id: replica.replica_id,
+        });
+        if !logical.promote_replica_if(expected, replica_id) {
+            return false;
+        }
+        if let Some(key) = old_key
+            && let Ok(mut cache) = self.reader_cache.lock()
+        {
+            cache.remove(&key);
+        }
+        true
+    }
+
+    pub(crate) fn remove_replica(&self, file_id: FileId, replica_id: ReplicaId) {
+        let Some(logical) = self.get_logical_file(file_id) else {
+            return;
+        };
+        if logical.remove_replica(replica_id).is_some()
+            && let Ok(mut cache) = self.reader_cache.lock()
+        {
+            cache.remove(&ReplicaKey {
+                file_id,
+                replica_id,
+            });
+        }
+    }
+
     /// Removes a data file from tracking.
     pub(crate) fn remove_data_file(&self, file_id: FileId) -> Result<()> {
-        self.snapshot_replica_hints.remove(&file_id);
         let Some((_, logical)) = self.logical_files.remove(&file_id) else {
             return Ok(());
         };
@@ -2998,7 +2983,6 @@ pub(crate) mod tests {
         drop(source_writer);
         let source_path = fm.get_data_file_path(source_file_id).unwrap();
         assert!(primary_fs.exists(&source_path).unwrap());
-        assert!(!fm.is_data_file_persistable_for_snapshot(source_file_id));
 
         let mut metadata_writer = fm.create_metadata_file("snapshot/MANIFEST").unwrap();
         metadata_writer.write(b"manifest").unwrap();
@@ -3011,25 +2995,46 @@ pub(crate) mod tests {
         assert_storage_file_bytes(db_id, "0", 12.0);
         assert_storage_file_bytes(db_id, "1", 16.0);
 
-        let copied_file_id = fm
-            .copy_data_file_to_snapshot_volume(source_file_id)
+        let source = fm.data_file_ref(source_file_id).unwrap();
+        let logical = fm.get_logical_file(source_file_id).unwrap();
+        fm.remove_data_file(source_file_id).unwrap();
+        assert!(!fm.has_data_file(source_file_id));
+        let copied = fm
+            .snapshot_replica_for_tracked_file(source_file_id, &source, Some(&logical), None, None)
             .unwrap();
-        assert_ne!(copied_file_id, source_file_id);
-        assert!(fm.is_data_file_persistable_for_snapshot(copied_file_id));
-        let copied_path = fm.get_data_file_path(copied_file_id).unwrap();
+        let copied_path = copied.path().to_string();
+        let pinned_path = copied.absolute_path();
         assert!(snapshot_fs.exists(&copied_path).unwrap());
-        let copied_reader = fm.open_data_file_reader(copied_file_id).unwrap();
+        let copied_reader = copied.fs().open_read(&copied_path).unwrap();
         assert_eq!(&copied_reader.read_at(0, 12).unwrap()[..], b"source-bytes");
         drop(copied_reader);
         assert_storage_file_bytes(db_id, "0", 12.0);
         assert_storage_file_bytes(db_id, "1", 28.0);
 
-        fm.remove_data_file(source_file_id).unwrap();
+        let replica_id = logical
+            .replica_ids()
+            .into_iter()
+            .find(|replica_id| *replica_id != 0)
+            .unwrap();
+        logical.set_replica_lifecycle(replica_id, ReplicaLifecycle::OwnedReady);
+        let copied_again = fm
+            .snapshot_replica_for_tracked_file(source_file_id, &source, Some(&logical), None, None)
+            .unwrap();
+        assert_eq!(copied.absolute_path(), copied_again.absolute_path());
+        assert!(logical.retain_and_select_replica_if(&source, replica_id));
+        assert_eq!(copied.absolute_path(), pinned_path);
+        assert!(logical.remove_replica(0).is_some());
+        source.dereference();
+        drop(source);
         fm.remove_metadata_file("snapshot/MANIFEST").unwrap();
+        test_utils::wait_for_file_deletion(&primary_fs, &source_path);
         assert_storage_file_bytes(db_id, "0", 0.0);
         assert_storage_file_bytes(db_id, "1", 12.0);
 
-        fm.remove_data_file(copied_file_id).unwrap();
+        drop(copied_again);
+        drop(copied);
+        drop(logical);
+        test_utils::wait_for_file_deletion(&snapshot_fs, &copied_path);
         assert_storage_file_bytes(db_id, "1", 0.0);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3046,108 +3051,6 @@ pub(crate) mod tests {
             })
             .expect("configured volume must expose a storage-byte gauge");
         assert!(matches!(sample.value, crate::MetricValue::Gauge(value) if value == expected));
-    }
-
-    #[test]
-    #[serial_test::serial(file)]
-    fn test_snapshot_copy_uses_retained_file_after_active_tracking_is_removed() {
-        let root = "/tmp/file_manager_retained_snapshot_copy";
-        let _ = std::fs::remove_dir_all(root);
-        let primary_url = format!("file://{}/primary", root);
-        let snapshot_url = format!("file://{}/snapshot", root);
-        let registry = FileSystemRegistry::new();
-        let snapshot_fs = registry.get_or_register(snapshot_url.clone()).unwrap();
-        let config = Config {
-            volumes: vec![
-                crate::VolumeDescriptor::new(
-                    primary_url,
-                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
-                ),
-                crate::VolumeDescriptor::new(
-                    snapshot_url,
-                    vec![VolumeUsageKind::Snapshot, VolumeUsageKind::Meta],
-                ),
-            ],
-            ..Config::default()
-        };
-        let metrics_manager = Arc::new(MetricsManager::new("file-manager-retained-snapshot-copy"));
-        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
-
-        let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
-        source_writer.write(b"retained-source").unwrap();
-        source_writer.close().unwrap();
-        drop(source_writer);
-
-        let retained = fm.data_file_ref(source_file_id).unwrap();
-        fm.remove_data_file(source_file_id).unwrap();
-        assert!(!fm.has_data_file(source_file_id));
-
-        let (copied_file_id, copied) = fm
-            .copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
-                source_file_id,
-                &retained,
-                None,
-                None,
-            )
-            .unwrap();
-        assert!(copied);
-        assert_ne!(copied_file_id, source_file_id);
-        let copied_path = fm.get_data_file_path(copied_file_id).unwrap();
-        assert!(snapshot_fs.exists(&copied_path).unwrap());
-        let copied_reader = fm.open_data_file_reader(copied_file_id).unwrap();
-        assert_eq!(
-            &copied_reader.read_at(0, 15).unwrap()[..],
-            b"retained-source"
-        );
-
-        retained.dereference();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial_test::serial(file)]
-    fn test_snapshot_copy_reuses_retained_persistable_file_after_active_tracking_is_removed() {
-        let root = "/tmp/file_manager_retained_persistable_snapshot";
-        let _ = std::fs::remove_dir_all(root);
-        let shared_url = format!("file://{}/shared", root);
-        let config = Config {
-            volumes: vec![crate::VolumeDescriptor::new(
-                shared_url,
-                vec![
-                    VolumeUsageKind::PrimaryDataPriorityHigh,
-                    VolumeUsageKind::Snapshot,
-                    VolumeUsageKind::Meta,
-                ],
-            )],
-            ..Config::default()
-        };
-        let metrics_manager = Arc::new(MetricsManager::new(
-            "file-manager-retained-persistable-snapshot",
-        ));
-        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
-
-        let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
-        source_writer.write(b"retained-source").unwrap();
-        source_writer.close().unwrap();
-        drop(source_writer);
-
-        let retained = fm.data_file_ref(source_file_id).unwrap();
-        fm.remove_data_file(source_file_id).unwrap();
-        assert!(!fm.has_data_file(source_file_id));
-
-        let (copied_file_id, copied) = fm
-            .copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
-                source_file_id,
-                &retained,
-                None,
-                None,
-            )
-            .unwrap();
-        assert!(!copied);
-        assert_eq!(copied_file_id, source_file_id);
-
-        retained.dereference();
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3218,10 +3121,13 @@ pub(crate) mod tests {
         let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
         source_writer.write(b"source-bytes").unwrap();
         source_writer.close().unwrap();
-        let copied_file_id = fm
-            .copy_data_file_to_snapshot_volume(source_file_id)
+        let source = fm.data_file_ref(source_file_id).unwrap();
+        let logical = fm.get_logical_file(source_file_id).unwrap();
+        let copied = fm
+            .snapshot_replica_for_tracked_file(source_file_id, &source, Some(&logical), None, None)
             .unwrap();
-        let copied_path = fm.get_data_file_path(copied_file_id).unwrap();
+        source.dereference();
+        let copied_path = copied.path().to_string();
         assert!(snapshot_fs.exists(&copied_path).unwrap());
         assert!(!meta_fs.exists(&copied_path).unwrap());
         let _ = std::fs::remove_dir_all(root);
@@ -3258,40 +3164,6 @@ pub(crate) mod tests {
         let metadata_path = fm.get_metadata_file_path("snapshot/MANIFEST").unwrap();
         assert!(meta_a_fs.exists(&metadata_path).unwrap());
         assert!(!meta_b_fs.exists(&metadata_path).unwrap());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial_test::serial(file)]
-    fn test_file_manager_snapshot_copy_creates_snapshot_file() {
-        let root = "/tmp/file_manager_snapshot_copy_reuse";
-        let _ = std::fs::remove_dir_all(root);
-        let primary_url = format!("file://{}/primary", root);
-        let snapshot_url = format!("file://{}/snapshot", root);
-        let config = Config {
-            volumes: vec![
-                crate::VolumeDescriptor::new(
-                    primary_url,
-                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
-                ),
-                crate::VolumeDescriptor::new(snapshot_url, vec![VolumeUsageKind::Snapshot]),
-            ],
-            ..Config::default()
-        };
-        let metrics_manager = Arc::new(MetricsManager::new("file-manager-snapshot-copy-reuse"));
-        let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
-
-        let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
-        source_writer.write(b"source-bytes").unwrap();
-        source_writer.close().unwrap();
-
-        let copied_file_id = fm
-            .copy_data_file_to_snapshot_volume(source_file_id)
-            .unwrap();
-        let copied_file_id_again = fm
-            .copy_data_file_to_snapshot_volume(source_file_id)
-            .unwrap();
-        assert_ne!(copied_file_id_again, copied_file_id);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3371,7 +3243,7 @@ pub(crate) mod tests {
 
     #[test]
     #[serial_test::serial(file)]
-    fn test_register_data_file_for_restore_from_readonly_snapshot_dir_does_not_set_snapshot_link() {
+    fn test_register_data_file_for_restore_copies_from_readonly_source() {
         let root = "/tmp/file_manager_restore_readonly_snapshot_dir";
         let primary_root = format!("{}/primary", root);
         let snapshot_root = format!("{}/snapshot", root);
@@ -3408,8 +3280,7 @@ pub(crate) mod tests {
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-restore-readonly"));
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let source_full_path = format!("file://{}/{}", readonly_root, source_path);
-        let restored = fm
-            .register_data_file_for_restore(42, &source_full_path, None, None)
+        fm.register_data_file_for_restore(42, &source_full_path, None, None)
             .unwrap();
         assert!(fm.is_data_file_on_primary_volume(42));
         let restored_reader = fm.open_data_file_reader(42).unwrap();
@@ -3417,13 +3288,12 @@ pub(crate) mod tests {
             &restored_reader.read_at(0, "restore-source".len()).unwrap()[..],
             b"restore-source"
         );
-        assert_eq!(restored.snapshot_link_file_id, None);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     #[serial_test::serial(file)]
-    fn test_register_data_file_for_restore_sets_snapshot_link_on_snapshot_volume_any_path() {
+    fn test_register_data_file_for_restore_keeps_snapshot_source_replica() {
         let root = "/tmp/file_manager_restore_snapshot_volume_any_path";
         let primary_root = format!("{}/primary", root);
         let snapshot_root = format!("{}/snapshot", root);
@@ -3455,14 +3325,11 @@ pub(crate) mod tests {
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-restore-snapshot-any"));
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let source_full_path = format!("file://{}/{}", snapshot_root, source_path);
-        let restored = fm
-            .register_data_file_for_restore(66, &source_full_path, None, None)
+        fm.register_data_file_for_restore(66, &source_full_path, None, None)
             .unwrap();
         assert!(fm.is_data_file_on_primary_volume(66));
-        let snapshot_link_file_id = restored
-            .snapshot_link_file_id
-            .expect("snapshot link should be set");
-        assert!(fm.is_data_file_on_snapshot_volume(snapshot_link_file_id));
+        assert!(fm.is_data_file_on_snapshot_volume(66));
+        assert_eq!(fm.get_logical_file(66).unwrap().replica_ids().len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3490,10 +3357,9 @@ pub(crate) mod tests {
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-restore-shared-snapshot"));
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let source_full_path = format!("file://{}/db/data/source.sst", shared_root);
-        let restored = fm
-            .register_data_file_for_restore(88, &source_full_path, None, None)
+        fm.register_data_file_for_restore(88, &source_full_path, None, None)
             .unwrap();
-        assert_eq!(restored.snapshot_link_file_id, Some(88));
+        assert!(fm.is_data_file_on_snapshot_volume(88));
         fm.remove_data_file(88).unwrap();
         assert!(std::path::Path::new(&source_local_path).exists());
         let _ = std::fs::remove_dir_all(root);
@@ -3501,7 +3367,7 @@ pub(crate) mod tests {
 
     #[test]
     #[serial_test::serial(file)]
-    fn test_register_data_file_for_restore_clears_snapshot_link_for_non_snapshot_dir() {
+    fn test_register_data_file_for_restore_copies_from_readonly_data_dir() {
         let root = "/tmp/file_manager_restore_readonly_data_dir";
         let primary_root = format!("{}/primary", root);
         let snapshot_root = format!("{}/snapshot", root);
@@ -3538,11 +3404,9 @@ pub(crate) mod tests {
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-restore-readonly-data"));
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let source_full_path = format!("file://{}/{}", readonly_root, source_path);
-        let restored = fm
-            .register_data_file_for_restore(77, &source_full_path, None, None)
+        fm.register_data_file_for_restore(77, &source_full_path, None, None)
             .unwrap();
         assert!(fm.is_data_file_on_primary_volume(77));
-        assert_eq!(restored.snapshot_link_file_id, None);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3573,10 +3437,8 @@ pub(crate) mod tests {
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-restore-primary-unowned"));
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let source_full_path = format!("file://{}/db/data/source.sst", primary_root);
-        let restored = fm
-            .register_data_file_for_restore(120, &source_full_path, None, None)
+        fm.register_data_file_for_restore(120, &source_full_path, None, None)
             .unwrap();
-        assert_eq!(restored.snapshot_link_file_id, None);
         fm.remove_data_file(120).unwrap();
         assert!(std::path::Path::new(&source_local_path).exists());
         let _ = std::fs::remove_dir_all(root);

@@ -48,7 +48,7 @@ pub(crate) enum ExternalDurability {
 }
 
 impl ReplicaLifecycle {
-    fn is_readable(&self) -> bool {
+    pub(crate) fn is_readable(&self) -> bool {
         matches!(
             self,
             Self::OwnedReady
@@ -90,7 +90,7 @@ impl PhysicalReplica {
         *self.lifecycle.lock().unwrap() = lifecycle;
     }
 
-    fn is_readable(&self) -> bool {
+    pub(crate) fn is_readable(&self) -> bool {
         self.lifecycle().is_readable()
     }
 }
@@ -191,10 +191,120 @@ impl LogicalFile {
         if !Arc::ptr_eq(&current.tracked, expected) {
             return false;
         }
+        let previous_id = state.preferred_read_replica.unwrap();
         let replica_id = self.next_replica_id.fetch_add(1, Ordering::Relaxed);
         let replica = Arc::new(PhysicalReplica::new(replica_id, tracked, lifecycle));
-        state.replicas.clear();
         state.replicas.insert(replica_id, replica);
+        state.preferred_read_replica = Some(replica_id);
+        if let Some(previous) = state.replicas.remove(&previous_id) {
+            previous.set_lifecycle(ReplicaLifecycle::Retiring);
+        }
+        true
+    }
+
+    pub(crate) fn add_replica(
+        &self,
+        tracked: Arc<TrackedFile>,
+        lifecycle: ReplicaLifecycle,
+    ) -> ReplicaId {
+        let replica_id = self.next_replica_id.fetch_add(1, Ordering::Relaxed);
+        self.replica_state.write().unwrap().replicas.insert(
+            replica_id,
+            Arc::new(PhysicalReplica::new(replica_id, tracked, lifecycle)),
+        );
+        replica_id
+    }
+
+    pub(crate) fn remove_replica(&self, replica_id: ReplicaId) -> Option<Arc<PhysicalReplica>> {
+        let mut state = self.replica_state.write().unwrap();
+        if state.preferred_read_replica == Some(replica_id) {
+            return None;
+        }
+        let replica = state.replicas.remove(&replica_id)?;
+        replica.set_lifecycle(ReplicaLifecycle::Retiring);
+        Some(replica)
+    }
+
+    pub(crate) fn set_replica_lifecycle(
+        &self,
+        replica_id: ReplicaId,
+        lifecycle: ReplicaLifecycle,
+    ) -> bool {
+        let state = self.replica_state.read().unwrap();
+        let Some(replica) = state.replicas.get(&replica_id) else {
+            return false;
+        };
+        replica.set_lifecycle(lifecycle);
+        true
+    }
+
+    pub(crate) fn replica_on_volume(
+        &self,
+        volume: &Arc<crate::file::DataVolume>,
+    ) -> Option<Arc<PhysicalReplica>> {
+        self.replica_state
+            .read()
+            .unwrap()
+            .replicas
+            .values()
+            .filter_map(|replica| {
+                (replica.is_readable()
+                    && replica
+                        .tracked
+                        .volume
+                        .as_ref()
+                        .is_some_and(|replica_volume| Arc::ptr_eq(replica_volume, volume)))
+                .then_some(Arc::clone(replica))
+            })
+            .min_by_key(|replica| replica.replica_id)
+    }
+
+    pub(crate) fn promote_replica_if(
+        &self,
+        expected: &Arc<TrackedFile>,
+        replica_id: ReplicaId,
+    ) -> bool {
+        let mut state = self.replica_state.write().unwrap();
+        let Some(current) = state
+            .preferred_read_replica
+            .and_then(|id| state.replicas.get(&id))
+        else {
+            return false;
+        };
+        if !Arc::ptr_eq(&current.tracked, expected)
+            || current.replica_id == replica_id
+            || !state.replicas.contains_key(&replica_id)
+        {
+            return false;
+        }
+        let previous_id = state.preferred_read_replica.unwrap();
+        state.preferred_read_replica = Some(replica_id);
+        if let Some(previous) = state.replicas.remove(&previous_id) {
+            previous.set_lifecycle(ReplicaLifecycle::Retiring);
+        }
+        true
+    }
+
+    pub(crate) fn retain_and_select_replica_if(
+        &self,
+        expected: &Arc<TrackedFile>,
+        replica_id: ReplicaId,
+    ) -> bool {
+        let mut state = self.replica_state.write().unwrap();
+        let Some(current) = state
+            .preferred_read_replica
+            .and_then(|id| state.replicas.get(&id))
+        else {
+            return false;
+        };
+        if !Arc::ptr_eq(&current.tracked, expected)
+            || !state
+                .replicas
+                .get(&replica_id)
+                .is_some_and(|replica| replica.is_readable())
+        {
+            return false;
+        }
         state.preferred_read_replica = Some(replica_id);
         true
     }

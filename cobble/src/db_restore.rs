@@ -5,8 +5,8 @@ use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, new_truncation_cursors
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::{
-    FileManager, PrimaryOffloadFileRef, RestoreCopyResourceRegistry, TrackedFileId,
-    VLOG_FILE_PRIORITY, compare_primary_offload_file_refs, lsm_file_priority_for_level,
+    FileManager, PrimaryOffloadFileRef, RestoreCopyResourceRegistry, VLOG_FILE_PRIORITY,
+    compare_primary_offload_file_refs, lsm_file_priority_for_level,
 };
 use crate::lsm::LSMTreeVersion;
 use crate::merge_operator::MergeOperatorResolver;
@@ -77,13 +77,13 @@ impl Drop for RestoreTempResourceRegistry {
 fn prepare_manifest_data_files_for_restore(
     file_manager: &Arc<FileManager>,
     manifest: &ManifestSnapshot,
-) -> Result<HashMap<u64, Option<u64>>> {
+) -> Result<()> {
     let refs = ordered_manifest_data_file_refs_for_restore(
         manifest,
         file_manager.options.primary_volume_offload_policy,
     );
     if refs.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(());
     }
     if let Some(max_file_id) = refs.iter().map(|item| item.file_id).max() {
         let min_next_file_id = max_file_id.saturating_add(1);
@@ -95,7 +95,7 @@ fn prepare_manifest_data_files_for_restore(
     let registry: Arc<dyn RestoreCopyResourceRegistry + Send + Sync> = resources.clone();
     let file_manager = Arc::clone(file_manager);
     let registry = Arc::clone(&registry);
-    let prepared = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let worker_threads = std::thread::available_parallelism()
             .map(|parallelism| parallelism.get())
             .unwrap_or(1)
@@ -115,7 +115,7 @@ fn prepare_manifest_data_files_for_restore(
     .join()
     .map_err(|_| Error::IoError("Restore worker thread panicked".to_string()))??;
     resources.finalize();
-    Ok(prepared)
+    Ok(())
 }
 
 async fn run_restore_prepare_jobs(
@@ -123,7 +123,7 @@ async fn run_restore_prepare_jobs(
     refs: Vec<RestoreFileRef>,
     registry: Arc<dyn RestoreCopyResourceRegistry + Send + Sync>,
     worker_count: usize,
-) -> Result<HashMap<u64, Option<u64>>> {
+) -> Result<()> {
     let worker_count = worker_count.max(1);
     let queue = Arc::new(Mutex::new(VecDeque::from(refs)));
     let mut join_set = JoinSet::new();
@@ -131,8 +131,7 @@ async fn run_restore_prepare_jobs(
         let file_manager = Arc::clone(&file_manager);
         let queue = Arc::clone(&queue);
         let registry = Arc::clone(&registry);
-        join_set.spawn_blocking(move || -> Result<Vec<(u64, Option<u64>)>> {
-            let mut completed = Vec::new();
+        join_set.spawn_blocking(move || -> Result<()> {
             loop {
                 let next = {
                     let mut guard = queue.lock().unwrap();
@@ -141,26 +140,20 @@ async fn run_restore_prepare_jobs(
                 let Some(file) = next else {
                     break;
                 };
-                let restored = file_manager.register_data_file_for_restore(
+                file_manager.register_data_file_for_restore(
                     file.file_id,
                     &file.path,
                     Some(file.size_bytes),
                     Some(Arc::clone(&registry)),
                 )?;
-                completed.push((file.file_id, restored.snapshot_link_file_id));
             }
-            Ok(completed)
+            Ok(())
         });
     }
-    let mut links = HashMap::new();
     while let Some(joined) = join_set.join_next().await {
-        let completed = joined
-            .map_err(|err| Error::IoError(format!("Restore worker join failed: {}", err)))??;
-        for (file_id, snapshot_link_file_id) in completed {
-            links.insert(file_id, snapshot_link_file_id);
-        }
+        joined.map_err(|err| Error::IoError(format!("Restore worker join failed: {}", err)))??;
     }
-    Ok(links)
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -221,28 +214,6 @@ fn ordered_manifest_data_file_refs_for_restore(
     ordered
 }
 
-fn apply_restore_snapshot_links(
-    tree_versions: &[LSMTreeVersion],
-    file_manager: &Arc<FileManager>,
-    restored_snapshot_links: &HashMap<u64, Option<u64>>,
-) {
-    for file in tree_versions
-        .iter()
-        .flat_map(|version| version.levels.iter())
-        .flat_map(|level| level.files.iter())
-    {
-        if let Some(snapshot_data_file_id) = restored_snapshot_links
-            .get(&file.file_id)
-            .copied()
-            .flatten()
-            && snapshot_data_file_id != file.file_id
-        {
-            file.set_snapshot_data_file(TrackedFileId::new(file_manager, snapshot_data_file_id));
-            file_manager.register_snapshot_replica_hint(file.file_id, snapshot_data_file_id);
-        }
-    }
-}
-
 fn can_incremental_snapshot_from_tree_versions(
     tree_versions: &[LSMTreeVersion],
     file_manager: &Arc<FileManager>,
@@ -251,10 +222,7 @@ fn can_incremental_snapshot_from_tree_versions(
         .iter()
         .flat_map(|version| version.levels.iter())
         .flat_map(|level| level.files.iter())
-        .all(|file| {
-            file.snapshot_data_file_id().is_some()
-                || file_manager.is_data_file_on_snapshot_volume(file.file_id)
-        })
+        .all(|file| file_manager.is_data_file_on_snapshot_volume(file.file_id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -269,8 +237,7 @@ fn open_restored_db_from_manifest(
     suggested_base_snapshot_id: Option<u64>,
     advance_next_id_from_existing_manifests: bool,
 ) -> Result<Db> {
-    let restored_snapshot_links =
-        prepare_manifest_data_files_for_restore(&file_manager, &manifest)?;
+    prepare_manifest_data_files_for_restore(&file_manager, &manifest)?;
     let max_vlog_file_seq = manifest
         .vlog_files
         .iter()
@@ -287,7 +254,6 @@ fn open_restored_db_from_manifest(
     let active_memtable_data = manifest.active_memtable_data.clone();
     let truncation_cursors = build_truncation_cursors_from_manifest(&manifest)?;
     let tree_versions = build_tree_versions_from_manifest(&file_manager, &manifest, false)?;
-    apply_restore_snapshot_links(&tree_versions, &file_manager, &restored_snapshot_links);
     let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
     let tree_scopes = build_tree_scopes_from_manifest(&manifest);
     let can_incremental_base =
@@ -521,8 +487,7 @@ impl Db {
                 latest.snapshot_id
             )));
         }
-        let restored_snapshot_links =
-            prepare_manifest_data_files_for_restore(&file_manager, &manifest)?;
+        prepare_manifest_data_files_for_restore(&file_manager, &manifest)?;
         let bucket_ranges = manifest.bucket_ranges.clone();
         let _lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
             manifest.bucket_ranges.clone()
@@ -544,7 +509,6 @@ impl Db {
             .unwrap_or(0);
         let restored_seq_id = latest.manifest.seq_id;
         let tree_versions = build_tree_versions_from_manifest(&file_manager, &manifest, false)?;
-        apply_restore_snapshot_links(&tree_versions, &file_manager, &restored_snapshot_links);
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
         let can_incremental_base =
             can_incremental_snapshot_from_tree_versions(&tree_versions, &file_manager);
