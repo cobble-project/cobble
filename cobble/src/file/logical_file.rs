@@ -3,6 +3,7 @@
 use crate::data_file::DataFileType;
 use crate::file::{FileId, TrackedFile};
 use crate::{Error, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -29,6 +30,19 @@ pub(crate) enum FileCommitState {
     Retired,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ReplicaOrigin {
+    #[default]
+    Owned,
+    ExternalPersistent {
+        source_id: String,
+    },
+    ExternalLeased {
+        export_id: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReplicaLifecycle {
     Staging,
@@ -37,14 +51,8 @@ pub(crate) enum ReplicaLifecycle {
     PendingAdoption,
     ReadonlySource,
     ReadonlyView,
-    ExternalReference { durability: ExternalDurability },
+    ExternalReference,
     Retiring,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ExternalDurability {
-    Leased,
-    Persistent,
 }
 
 impl ReplicaLifecycle {
@@ -56,7 +64,7 @@ impl ReplicaLifecycle {
                 | Self::PendingAdoption
                 | Self::ReadonlySource
                 | Self::ReadonlyView
-                | Self::ExternalReference { .. }
+                | Self::ExternalReference
         )
     }
 }
@@ -67,23 +75,38 @@ pub(crate) struct PhysicalReplica {
     pub(crate) replica_id: ReplicaId,
     pub(crate) tracked: Arc<TrackedFile>,
     lifecycle: Mutex<ReplicaLifecycle>,
+    origin: ReplicaOrigin,
 }
 
 impl PhysicalReplica {
+    pub(crate) fn owned(
+        replica_id: ReplicaId,
+        tracked: Arc<TrackedFile>,
+        lifecycle: ReplicaLifecycle,
+    ) -> Self {
+        Self::new(replica_id, tracked, lifecycle, ReplicaOrigin::Owned)
+    }
+
     pub(crate) fn new(
         replica_id: ReplicaId,
         tracked: Arc<TrackedFile>,
         lifecycle: ReplicaLifecycle,
+        origin: ReplicaOrigin,
     ) -> Self {
         Self {
             replica_id,
             tracked,
             lifecycle: Mutex::new(lifecycle),
+            origin,
         }
     }
 
     pub(crate) fn lifecycle(&self) -> ReplicaLifecycle {
         self.lifecycle.lock().unwrap().clone()
+    }
+
+    pub(crate) fn origin(&self) -> ReplicaOrigin {
+        self.origin.clone()
     }
 
     fn set_lifecycle(&self, lifecycle: ReplicaLifecycle) {
@@ -120,8 +143,9 @@ impl LogicalFile {
         tracked: Arc<TrackedFile>,
         lifecycle: ReplicaLifecycle,
         commit_state: FileCommitState,
+        origin: ReplicaOrigin,
     ) -> Self {
-        let replica = Arc::new(PhysicalReplica::new(0, tracked, lifecycle));
+        let replica = Arc::new(PhysicalReplica::new(0, tracked, lifecycle, origin));
         let mut replicas = HashMap::new();
         replicas.insert(0, replica);
         Self {
@@ -185,10 +209,19 @@ impl LogicalFile {
         tracked: Arc<TrackedFile>,
         lifecycle: ReplicaLifecycle,
     ) -> ReplicaId {
+        self.add_replica_with_origin(tracked, lifecycle, ReplicaOrigin::Owned)
+    }
+
+    pub(crate) fn add_replica_with_origin(
+        &self,
+        tracked: Arc<TrackedFile>,
+        lifecycle: ReplicaLifecycle,
+        origin: ReplicaOrigin,
+    ) -> ReplicaId {
         let replica_id = self.next_replica_id.fetch_add(1, Ordering::Relaxed);
         self.replica_state.write().unwrap().replicas.insert(
             replica_id,
-            Arc::new(PhysicalReplica::new(replica_id, tracked, lifecycle)),
+            Arc::new(PhysicalReplica::new(replica_id, tracked, lifecycle, origin)),
         );
         replica_id
     }
@@ -276,7 +309,7 @@ impl LogicalFile {
         let replica_id = self.next_replica_id.fetch_add(1, Ordering::Relaxed);
         state.replicas.insert(
             replica_id,
-            Arc::new(PhysicalReplica::new(replica_id, tracked, lifecycle)),
+            Arc::new(PhysicalReplica::owned(replica_id, tracked, lifecycle)),
         );
         state.preferred_read_replica = Some(replica_id);
         Some(current_id)
@@ -321,12 +354,29 @@ impl LogicalFile {
         replicas: Vec<(ReplicaId, Arc<TrackedFile>, ReplicaLifecycle)>,
         preferred_replica_id: Option<ReplicaId>,
     ) {
+        self.restore_replica_state_with_origins(
+            replicas
+                .into_iter()
+                .map(|(id, tracked, lifecycle)| (id, tracked, lifecycle, ReplicaOrigin::Owned))
+                .collect(),
+            preferred_replica_id,
+        );
+    }
+
+    pub(crate) fn restore_replica_state_with_origins(
+        &self,
+        replicas: Vec<(ReplicaId, Arc<TrackedFile>, ReplicaLifecycle, ReplicaOrigin)>,
+        preferred_replica_id: Option<ReplicaId>,
+    ) {
         let mut state = self.replica_state.write().unwrap();
-        let next_id = replicas.iter().map(|(id, _, _)| *id).max().unwrap_or(0);
+        let next_id = replicas.iter().map(|(id, _, _, _)| *id).max().unwrap_or(0);
         state.replicas = replicas
             .into_iter()
-            .map(|(id, tracked, lifecycle)| {
-                (id, Arc::new(PhysicalReplica::new(id, tracked, lifecycle)))
+            .map(|(id, tracked, lifecycle, origin)| {
+                (
+                    id,
+                    Arc::new(PhysicalReplica::new(id, tracked, lifecycle, origin)),
+                )
             })
             .collect();
         state.preferred_read_replica =

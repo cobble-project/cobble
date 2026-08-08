@@ -6,6 +6,7 @@
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::{TruncationCursorId, TruncationCursorMap};
 use crate::error::{Error, Result};
+use crate::file::logical_file::ReplicaOrigin;
 use crate::file::{FileManager, TrackedFileId, VLOG_FILE_PRIORITY, lsm_file_priority_for_level};
 use crate::lsm::{LSMTreeVersion, Level};
 use crate::vlog::VlogVersion;
@@ -47,6 +48,8 @@ pub(crate) struct ManifestFile {
     /// Defaults to 0 for manifests written before this field existed.
     #[serde(default)]
     pub(crate) max_expired_at: u32,
+    #[serde(default)]
+    pub(crate) origin: ReplicaOrigin,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -55,9 +58,19 @@ pub(crate) struct ManifestVlogFile {
     pub(crate) file_id: u64,
     pub(crate) path: String,
     pub(crate) valid_entries: u64,
+    #[serde(default)]
+    pub(crate) origin: ReplicaOrigin,
 }
 
 pub(crate) fn manifest_file_from_data_file(file: &DataFile, path: String) -> ManifestFile {
+    manifest_file_from_data_file_with_origin(file, path, ReplicaOrigin::Owned)
+}
+
+pub(crate) fn manifest_file_from_data_file_with_origin(
+    file: &DataFile,
+    path: String,
+    origin: ReplicaOrigin,
+) -> ManifestFile {
     ManifestFile {
         file_id: file.file_id,
         file_type: file.file_type.as_str().to_string(),
@@ -73,6 +86,7 @@ pub(crate) fn manifest_file_from_data_file(file: &DataFile, path: String) -> Man
         effective_bucket_range_end: *file.effective_bucket_range.end(),
         vlog_file_seq_offset: file.vlog_file_seq_offset,
         max_expired_at: file.max_expired_at(),
+        origin,
     }
 }
 
@@ -95,6 +109,7 @@ pub(crate) fn manifest_vlog_files(
                 file_id,
                 path,
                 valid_entries,
+                origin: ReplicaOrigin::Owned,
             })
         })
         .collect()
@@ -181,15 +196,25 @@ pub(crate) fn build_vlog_version_from_files(
     let mut files = Vec::with_capacity(vlog_files.len());
     for file in vlog_files {
         let tracked_id = if read_only {
-            file_manager.register_data_file_readonly(file.file_id, &file.path)?;
+            file_manager.register_data_file_readonly_with_origin(
+                file.file_id,
+                &file.path,
+                file.origin.clone(),
+            )?;
             file_manager.set_data_file_priority(file.file_id, VLOG_FILE_PRIORITY)?;
             TrackedFileId::detached(file.file_id)
         } else {
             if !file_manager.has_data_file(file.file_id) {
-                return Err(Error::IoError(format!(
-                    "Restored VLOG file {} is not tracked by FileManager",
-                    file.file_id
-                )));
+                match &file.origin {
+                    ReplicaOrigin::Owned => {
+                        file_manager.register_data_file(file.file_id, &file.path)?
+                    }
+                    _ => file_manager.register_data_file_readonly_with_origin(
+                        file.file_id,
+                        &file.path,
+                        file.origin.clone(),
+                    )?,
+                }
             }
             file_manager.set_data_file_priority(file.file_id, VLOG_FILE_PRIORITY)?;
             TrackedFileId::new(file_manager, file.file_id)
@@ -238,15 +263,25 @@ fn build_data_file(
     let start_key = from_hex(&file.start_key)?;
     let end_key = from_hex(&file.end_key)?;
     let tracked_id = if read_only {
-        file_manager.register_data_file_readonly(file.file_id, &file.path)?;
+        file_manager.register_data_file_readonly_with_origin(
+            file.file_id,
+            &file.path,
+            file.origin.clone(),
+        )?;
         file_manager.set_data_file_priority(file.file_id, lsm_file_priority_for_level(ordinal))?;
         TrackedFileId::detached(file.file_id)
     } else {
         if !file_manager.has_data_file(file.file_id) {
-            return Err(Error::IoError(format!(
-                "Restored file {} is not tracked by FileManager",
-                file.file_id
-            )));
+            match &file.origin {
+                ReplicaOrigin::Owned => {
+                    file_manager.register_data_file(file.file_id, &file.path)?
+                }
+                _ => file_manager.register_data_file_readonly_with_origin(
+                    file.file_id,
+                    &file.path,
+                    file.origin.clone(),
+                )?,
+            }
         }
         file_manager.set_data_file_priority(file.file_id, lsm_file_priority_for_level(ordinal))?;
         TrackedFileId::new(file_manager, file.file_id)

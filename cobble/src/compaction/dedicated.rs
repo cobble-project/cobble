@@ -891,6 +891,7 @@ mod tests {
             effective_bucket_range_end: 0,
             vlog_file_seq_offset: 0,
             max_expired_at: 5000,
+            origin: crate::file::logical_file::ReplicaOrigin::Owned,
         };
         let dedicated: DedicatedDataFile = DedicatedDataFile::from(&manifest_file);
         assert_eq!(dedicated.max_expired_at, 5000);

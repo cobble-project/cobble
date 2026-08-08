@@ -12,6 +12,7 @@ use crate::data_file::DataFile;
 use crate::db_state::{DbState, DbStateHandle, TruncationCursorSnapshot};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
+use crate::file::logical_file::{LogicalFile, ReplicaOrigin};
 use crate::file::{
     BufferedWriter, File, FileManager, SnapshotCopyResourceRegistry, TrackedFile, TrackedFileId,
 };
@@ -31,6 +32,14 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinSet;
 
 const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+type SnapshotSourceFile = (
+    u64,
+    Arc<TrackedFile>,
+    ReplicaOrigin,
+    Option<Arc<LogicalFile>>,
+);
+type SnapshotReplica = (Arc<TrackedFile>, ReplicaOrigin);
 
 pub(crate) struct SnapshotManager {
     file_manager: Arc<FileManager>,
@@ -449,14 +458,22 @@ impl SnapshotManager {
             .unwrap_or(0);
         snapshot.referenced_schema_ids =
             collect_schema_ids_from_lsm_versions(&snapshot.lsm_versions, snapshot.latest_schema_id);
-        snapshot.tracked_data_files = tracked_file_ids
+        let retained_files = tracked_file_ids
             .into_iter()
             .filter_map(|file_id| {
                 self.file_manager
-                    .data_file_ref(file_id)
+                    .data_file_ref_with_origin(file_id)
                     .ok()
-                    .map(|tracked| (file_id, tracked))
+                    .map(|(tracked, origin)| (file_id, tracked, origin))
             })
+            .collect::<Vec<_>>();
+        snapshot.tracked_data_files = retained_files
+            .iter()
+            .map(|(file_id, tracked, _)| (*file_id, Arc::clone(tracked)))
+            .collect();
+        snapshot.replica_origins = retained_files
+            .into_iter()
+            .map(|(file_id, _, origin)| (file_id, origin))
             .collect();
         snapshot.logical_data_files = tree_versions
             .iter()
@@ -538,19 +555,52 @@ impl SnapshotManager {
             .register_metadata_file(&manifest_name, &manifest_path)?;
 
         let tracked_data_files = manifest_data_file_refs(manifest)
-            .map(|(file_id, path)| {
+            .map(|(file_id, path, origin)| {
                 if !self.file_manager.has_data_file(file_id) {
-                    self.file_manager.register_data_file(file_id, &path)?;
+                    match &origin {
+                        crate::file::logical_file::ReplicaOrigin::Owned => {
+                            self.file_manager.register_data_file(file_id, &path)?;
+                        }
+                        crate::file::logical_file::ReplicaOrigin::ExternalPersistent {
+                            source_id,
+                        } => {
+                            self.file_manager.register_external_persistent_replica(
+                                file_id,
+                                &path,
+                                source_id.clone(),
+                            )?;
+                        }
+                        crate::file::logical_file::ReplicaOrigin::ExternalLeased { export_id } => {
+                            self.file_manager.register_external_leased_replica(
+                                file_id,
+                                &path,
+                                export_id.clone(),
+                            )?;
+                        }
+                    }
                 }
                 self.file_manager
-                    .data_file_ref_at_path(
+                    .data_file_ref_at_path_with_origin(
                         file_id,
                         &path,
-                        crate::file::logical_file::ReplicaLifecycle::OwnedReady,
+                        if matches!(origin, crate::file::logical_file::ReplicaOrigin::Owned) {
+                            crate::file::logical_file::ReplicaLifecycle::OwnedReady
+                        } else {
+                            crate::file::logical_file::ReplicaLifecycle::ReadonlyView
+                        },
+                        origin.clone(),
                     )
-                    .map(|tracked| (file_id, tracked))
+                    .map(|tracked| (file_id, tracked, origin))
             })
-            .collect::<Result<BTreeMap<_, _>>>()?;
+            .collect::<Result<Vec<_>>>()?;
+        let replica_origins = tracked_data_files
+            .iter()
+            .map(|(file_id, _, origin)| (*file_id, origin.clone()))
+            .collect();
+        let tracked_data_files = tracked_data_files
+            .into_iter()
+            .map(|(file_id, tracked, _)| (file_id, tracked))
+            .collect();
         let lsm_versions = build_tree_versions_from_manifest_untracked(manifest)?;
         let referenced_schema_ids =
             collect_schema_ids_from_lsm_versions(&lsm_versions, manifest.latest_schema_id);
@@ -561,6 +611,7 @@ impl SnapshotManager {
             lsm_versions,
             tracked_data_files,
             logical_data_files: BTreeMap::new(),
+            replica_origins,
             vlog_version: build_vlog_version_from_manifest_untracked(manifest),
             seq_id: manifest.seq_id,
             latest_schema_id: manifest.latest_schema_id,
@@ -825,6 +876,11 @@ impl SnapshotManager {
             copy_candidates.push((
                 *source_file_id,
                 source_tracked,
+                snapshot
+                    .replica_origins
+                    .get(source_file_id)
+                    .cloned()
+                    .unwrap_or_default(),
                 snapshot.logical_data_files.get(source_file_id).cloned(),
             ));
         }
@@ -835,23 +891,27 @@ impl SnapshotManager {
         )?;
 
         let mut tracked_data_files = BTreeMap::new();
+        let mut replica_origins = BTreeMap::new();
         for source_file_id in source_file_ids {
-            let tracked = snapshot_replicas
-                .get(&source_file_id)
-                .cloned()
-                .ok_or_else(|| {
-                    Error::InvalidState(format!(
-                        "Snapshot {} did not retain data file {}",
-                        snapshot.id, source_file_id
-                    ))
-                })?;
+            let (tracked, origin) =
+                snapshot_replicas
+                    .get(&source_file_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::InvalidState(format!(
+                            "Snapshot {} did not retain data file {}",
+                            snapshot.id, source_file_id
+                        ))
+                    })?;
             tracked.reference();
             resources.register_reference(Arc::clone(&tracked));
             tracked_data_files.insert(source_file_id, tracked);
+            replica_origins.insert(source_file_id, origin);
         }
 
         let mut prepared_snapshot = snapshot.clone();
         prepared_snapshot.tracked_data_files = tracked_data_files;
+        prepared_snapshot.replica_origins = replica_origins;
         Ok(PreparedSnapshotMaterialization {
             snapshot: prepared_snapshot,
             staged_replicas: resources.staged_replicas(),
@@ -861,14 +921,10 @@ impl SnapshotManager {
     /// Select or copy snapshot-persistable replicas in parallel, keyed by logical file id.
     fn copy_data_files_to_snapshot_volume_parallel(
         &self,
-        source_files: Vec<(
-            u64,
-            Arc<TrackedFile>,
-            Option<Arc<crate::file::logical_file::LogicalFile>>,
-        )>,
+        source_files: Vec<SnapshotSourceFile>,
         resources: Arc<MaterializeTempResourceRegistry>,
         lifecycle_state: Arc<AtomicU8>,
-    ) -> Result<HashMap<u64, Arc<TrackedFile>>> {
+    ) -> Result<HashMap<u64, SnapshotReplica>> {
         if source_files.is_empty() {
             return Ok(HashMap::new());
         }
@@ -876,7 +932,7 @@ impl SnapshotManager {
         let copy_resource_registry: Arc<dyn SnapshotCopyResourceRegistry + Send + Sync> = resources;
         self.upload_runtime.block_on(async {
             let mut join_set = JoinSet::new();
-            for (source_file_id, source_tracked, logical) in source_files {
+            for (source_file_id, source_tracked, source_origin, logical) in source_files {
                 let file_manager = Arc::clone(&file_manager);
                 let copy_resource_registry = Arc::clone(&copy_resource_registry);
                 let lifecycle_state = Arc::clone(&lifecycle_state);
@@ -885,14 +941,15 @@ impl SnapshotManager {
                     tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         file_manager
-                            .snapshot_replica_for_tracked_file(
+                            .snapshot_replica_with_origin(
                                 source_file_id,
                                 &source_tracked,
+                                source_origin,
                                 logical.as_ref(),
                                 Some(copy_resource_registry),
                                 Some(lifecycle_state.as_ref()),
                             )
-                            .map(|tracked| (source_file_id, tracked))
+                            .map(|replica| (source_file_id, replica))
                     })
                     .await
                     .map_err(|err| {
@@ -905,7 +962,7 @@ impl SnapshotManager {
                 if SnapshotLifecycleState::is_cancelled_raw(lifecycle_state.as_ref()) {
                     join_set.abort_all();
                 }
-                let (source_file_id, tracked) = result.map_err(|err| {
+                let (source_file_id, replica) = result.map_err(|err| {
                     if SnapshotLifecycleState::is_cancelled_raw(lifecycle_state.as_ref())
                         && err.is_cancelled()
                     {
@@ -916,7 +973,7 @@ impl SnapshotManager {
                         Error::IoError(format!("Snapshot upload task failed to join: {}", err))
                     }
                 })??;
-                replicas.insert(source_file_id, tracked);
+                replicas.insert(source_file_id, replica);
             }
             Ok(replicas)
         })

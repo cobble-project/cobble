@@ -19,8 +19,8 @@ use std::sync::Arc;
 pub(crate) mod publisher;
 
 /// Runtime manifests version 2 describe SSTs with big-endian bucket prefixes.
-/// Version 3 adds per-file `max_expired_at` (defaults to 0 for older manifests).
-pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 3;
+/// Version 3 adds per-file `max_expired_at`; version 4 adds replica origins.
+pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 4;
 pub(crate) const MAX_RUNTIME_MANIFEST_CHAIN_DEPTH: usize = 64;
 const RUNTIME_MANIFEST_DIR: &str = "runtime";
 const RUNTIME_CURRENT_NAME: &str = "runtime/CURRENT";
@@ -782,6 +782,7 @@ mod tests {
             effective_bucket_range_end: 0,
             vlog_file_seq_offset: 0,
             max_expired_at: 0,
+            origin: crate::file::logical_file::ReplicaOrigin::Owned,
         }
     }
 
@@ -876,7 +877,7 @@ mod tests {
         let err = decode_runtime_manifest(&raw).expect_err("version 1 must be rejected");
         assert!(
             err.to_string()
-                .contains("Unsupported runtime manifest version: 1 (expected 2..=3)")
+                .contains("Unsupported runtime manifest version: 1 (expected 2..=4)")
         );
     }
 

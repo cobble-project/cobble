@@ -6,9 +6,11 @@ use crate::db_state::{DbState, DbStateHandle};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::FileManager;
+use crate::file::logical_file::ReplicaOrigin;
 use crate::lsm::LSMTreeVersion;
 use crate::manifest_model::{
-    ManifestLevel, manifest_file_from_data_file, manifest_truncation_cursors,
+    ManifestLevel, ManifestVlogFile, manifest_file_from_data_file_with_origin,
+    manifest_truncation_cursors,
 };
 use crate::schema::SchemaManager;
 use std::collections::HashMap;
@@ -395,16 +397,16 @@ fn runtime_manifest_from_state(
     latest_schema_id: u64,
     previous: Option<&RuntimeManifest>,
 ) -> Result<RuntimeManifest> {
-    let previous_data_paths = previous
+    let previous_data_replicas = previous
         .into_iter()
         .flat_map(|manifest| manifest.tree_levels.iter().flatten())
         .flat_map(|level| level.files.iter())
-        .map(|file| (file.file_id, file.path.as_str()))
+        .map(|file| (file.file_id, (file.path.as_str(), &file.origin)))
         .collect::<HashMap<_, _>>();
-    let previous_vlog_paths = previous
+    let previous_vlog_replicas = previous
         .into_iter()
         .flat_map(|manifest| manifest.vlog_files.iter())
-        .map(|file| (file.file_id, file.path.as_str()))
+        .map(|file| (file.file_id, (file.path.as_str(), &file.origin)))
         .collect::<HashMap<_, _>>();
     let tree_versions = state.multi_lsm_version.tree_versions_cloned();
     Ok(RuntimeManifest {
@@ -416,9 +418,13 @@ fn runtime_manifest_from_state(
         tree_scopes: state.multi_lsm_version.tree_scopes(),
         tree_levels: tree_versions
             .iter()
-            .map(|tree| manifest_levels(tree, file_manager, &previous_data_paths))
+            .map(|tree| manifest_levels(tree, file_manager, &previous_data_replicas))
             .collect::<Result<Vec<_>>>()?,
-        vlog_files: manifest_vlog_files(&state.vlog_version, file_manager, &previous_vlog_paths)?,
+        vlog_files: manifest_vlog_files(
+            &state.vlog_version,
+            file_manager,
+            &previous_vlog_replicas,
+        )?,
         truncation_cursors: manifest_truncation_cursors(&state.truncation_cursors_snapshot()),
     })
 }
@@ -426,7 +432,7 @@ fn runtime_manifest_from_state(
 fn manifest_levels(
     tree: &LSMTreeVersion,
     file_manager: &FileManager,
-    previous_data_paths: &HashMap<u64, &str>,
+    previous_data_replicas: &HashMap<u64, (&str, &ReplicaOrigin)>,
 ) -> Result<Vec<ManifestLevel>> {
     tree.levels
         .iter()
@@ -435,18 +441,30 @@ fn manifest_levels(
                 .files
                 .iter()
                 .map(|file| {
-                    let path = previous_data_paths
+                    let replica = previous_data_replicas
                         .get(&file.file_id)
-                        .copied()
-                        .map(str::to_owned)
-                        .or_else(|| file_manager.get_data_file_full_path(file.file_id))
+                        .map(|(path, origin)| ((*path).to_owned(), (*origin).clone()))
+                        .or_else(|| {
+                            file_manager
+                                .get_data_file_full_path(file.file_id)
+                                .map(|path| {
+                                    (
+                                        path,
+                                        file_manager
+                                            .preferred_replica_origin(file.file_id)
+                                            .unwrap_or_default(),
+                                    )
+                                })
+                        })
                         .ok_or_else(|| {
                             Error::InvalidState(format!(
                                 "Runtime manifest references unknown data file ID {}",
                                 file.file_id
                             ))
                         })?;
-                    Ok(manifest_file_from_data_file(file, path))
+                    Ok(manifest_file_from_data_file_with_origin(
+                        file, replica.0, replica.1,
+                    ))
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(ManifestLevel {
@@ -461,26 +479,35 @@ fn manifest_levels(
 fn manifest_vlog_files(
     version: &crate::vlog::VlogVersion,
     file_manager: &FileManager,
-    previous_vlog_paths: &HashMap<u64, &str>,
-) -> Result<Vec<crate::manifest_model::ManifestVlogFile>> {
+    previous_vlog_replicas: &HashMap<u64, (&str, &ReplicaOrigin)>,
+) -> Result<Vec<ManifestVlogFile>> {
     version
         .files_with_entries()
         .into_iter()
         .map(|(file_seq, tracked_id, valid_entries)| {
             let file_id = tracked_id.file_id();
-            let path = previous_vlog_paths
+            let replica = previous_vlog_replicas
                 .get(&file_id)
-                .copied()
-                .map(str::to_owned)
-                .or_else(|| file_manager.get_data_file_full_path(file_id))
+                .map(|(path, origin)| ((*path).to_owned(), (*origin).clone()))
+                .or_else(|| {
+                    file_manager.get_data_file_full_path(file_id).map(|path| {
+                        (
+                            path,
+                            file_manager
+                                .preferred_replica_origin(file_id)
+                                .unwrap_or_default(),
+                        )
+                    })
+                })
                 .ok_or_else(|| {
                     Error::InvalidState(format!("Unknown value-log file ID {file_id}"))
                 })?;
-            Ok(crate::manifest_model::ManifestVlogFile {
+            Ok(ManifestVlogFile {
                 file_seq,
                 file_id,
-                path,
+                path: replica.0,
                 valid_entries,
+                origin: replica.1,
             })
         })
         .collect()

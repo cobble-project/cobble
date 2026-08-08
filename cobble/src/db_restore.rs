@@ -4,6 +4,7 @@ use crate::config::PrimaryVolumeOffloadPolicyKind;
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, new_truncation_cursors_with};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
+use crate::file::logical_file::ReplicaOrigin;
 use crate::file::{
     FileManager, PrimaryOffloadFileRef, RestoreCopyResourceRegistry, VLOG_FILE_PRIORITY,
     compare_primary_offload_file_refs, lsm_file_priority_for_level,
@@ -77,10 +78,12 @@ impl Drop for RestoreTempResourceRegistry {
 fn prepare_manifest_data_files_for_restore(
     file_manager: &Arc<FileManager>,
     manifest: &ManifestSnapshot,
+    retained_owned_source_id: Option<&str>,
 ) -> Result<()> {
     let refs = ordered_manifest_data_file_refs_for_restore(
         manifest,
         file_manager.options.primary_volume_offload_policy,
+        retained_owned_source_id,
     );
     if refs.is_empty() {
         return Ok(());
@@ -143,6 +146,7 @@ async fn run_restore_prepare_jobs(
                 file_manager.register_data_file_for_restore(
                     file.file_id,
                     &file.path,
+                    file.origin,
                     Some(file.size_bytes),
                     Some(Arc::clone(&registry)),
                 )?;
@@ -160,6 +164,7 @@ async fn run_restore_prepare_jobs(
 struct RestoreFileRef {
     file_id: u64,
     path: String,
+    origin: ReplicaOrigin,
     size_bytes: u64,
     priority: u8,
 }
@@ -167,6 +172,7 @@ struct RestoreFileRef {
 fn ordered_manifest_data_file_refs_for_restore(
     manifest: &ManifestSnapshot,
     policy: PrimaryVolumeOffloadPolicyKind,
+    retained_owned_source_id: Option<&str>,
 ) -> Vec<RestoreFileRef> {
     let mut refs: HashMap<u64, RestoreFileRef> = HashMap::new();
     for tree_levels in &manifest.tree_levels {
@@ -176,6 +182,7 @@ fn ordered_manifest_data_file_refs_for_restore(
                 let entry = refs.entry(file.file_id).or_insert_with(|| RestoreFileRef {
                     file_id: file.file_id,
                     path: file.path.clone(),
+                    origin: restore_source_origin(&file.origin, retained_owned_source_id),
                     size_bytes: file.size as u64,
                     priority: level_priority,
                 });
@@ -192,6 +199,7 @@ fn ordered_manifest_data_file_refs_for_restore(
         let entry = refs.entry(file.file_id).or_insert_with(|| RestoreFileRef {
             file_id: file.file_id,
             path: file.path.clone(),
+            origin: restore_source_origin(&file.origin, retained_owned_source_id),
             size_bytes: 0,
             priority: VLOG_FILE_PRIORITY,
         });
@@ -212,6 +220,18 @@ fn ordered_manifest_data_file_refs_for_restore(
         compare_primary_offload_file_refs(policy, &left_ref, &right_ref)
     });
     ordered
+}
+
+fn restore_source_origin(
+    origin: &ReplicaOrigin,
+    retained_owned_source_id: Option<&str>,
+) -> ReplicaOrigin {
+    match (origin, retained_owned_source_id) {
+        (ReplicaOrigin::Owned, Some(source_id)) => ReplicaOrigin::ExternalPersistent {
+            source_id: source_id.to_string(),
+        },
+        _ => origin.clone(),
+    }
 }
 
 fn can_incremental_snapshot_from_tree_versions(
@@ -236,8 +256,13 @@ fn open_restored_db_from_manifest(
     manifest: ManifestSnapshot,
     suggested_base_snapshot_id: Option<u64>,
     advance_next_id_from_existing_manifests: bool,
+    retained_owned_source_id: Option<String>,
 ) -> Result<Db> {
-    prepare_manifest_data_files_for_restore(&file_manager, &manifest)?;
+    prepare_manifest_data_files_for_restore(
+        &file_manager,
+        &manifest,
+        retained_owned_source_id.as_deref(),
+    )?;
     let max_vlog_file_seq = manifest
         .vlog_files
         .iter()
@@ -350,6 +375,7 @@ impl Db {
             manifest,
             Some(snapshot_id),
             true,
+            None,
         )
     }
 
@@ -372,8 +398,14 @@ impl Db {
         source_db_id: impl AsRef<str>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
-        let manifest_path = bucket_snapshot_manifest_path(source_db_id.as_ref(), snapshot_id);
-        Self::open_new_with_manifest_path_with_resolver(config, manifest_path, resolver)
+        let source_db_id = source_db_id.as_ref();
+        let manifest_path = bucket_snapshot_manifest_path(source_db_id, snapshot_id);
+        Self::open_new_with_manifest_path_and_source_id_with_resolver(
+            config,
+            manifest_path,
+            format!("snapshot:{source_db_id}:{snapshot_id}"),
+            resolver,
+        )
     }
 
     pub fn open_new_with_manifest_path(
@@ -389,6 +421,20 @@ impl Db {
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
         let manifest_path = manifest_path.into();
+        Self::open_new_with_manifest_path_and_source_id_with_resolver(
+            config,
+            manifest_path.clone(),
+            format!("manifest:{manifest_path}"),
+            resolver,
+        )
+    }
+
+    fn open_new_with_manifest_path_and_source_id_with_resolver(
+        config: Config,
+        manifest_path: String,
+        retained_owned_source_id: String,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
         let config = config.normalize_volume_paths()?;
         init_logging(&config);
         log::info!(
@@ -432,6 +478,7 @@ impl Db {
             manifest,
             None,
             false,
+            Some(retained_owned_source_id),
         )
     }
 
@@ -487,7 +534,7 @@ impl Db {
                 latest.snapshot_id
             )));
         }
-        prepare_manifest_data_files_for_restore(&file_manager, &manifest)?;
+        prepare_manifest_data_files_for_restore(&file_manager, &manifest, None)?;
         let bucket_ranges = manifest.bucket_ranges.clone();
         let _lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
             manifest.bucket_ranges.clone()
@@ -565,18 +612,21 @@ mod tests {
             RestoreFileRef {
                 file_id: 3,
                 path: "a".to_string(),
+                origin: ReplicaOrigin::Owned,
                 size_bytes: 100,
                 priority: 10,
             },
             RestoreFileRef {
                 file_id: 1,
                 path: "b".to_string(),
+                origin: ReplicaOrigin::Owned,
                 size_bytes: 200,
                 priority: 2,
             },
             RestoreFileRef {
                 file_id: 2,
                 path: "c".to_string(),
+                origin: ReplicaOrigin::Owned,
                 size_bytes: 50,
                 priority: 2,
             },
@@ -597,6 +647,12 @@ mod tests {
             )
         });
         assert_eq!(ids(refs), vec![1, 2, 3]);
+        assert_eq!(
+            restore_source_origin(&ReplicaOrigin::Owned, Some("snapshot:source:7")),
+            ReplicaOrigin::ExternalPersistent {
+                source_id: "snapshot:source:7".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -605,18 +661,21 @@ mod tests {
             RestoreFileRef {
                 file_id: 3,
                 path: "a".to_string(),
+                origin: ReplicaOrigin::Owned,
                 size_bytes: 100,
                 priority: 10,
             },
             RestoreFileRef {
                 file_id: 1,
                 path: "b".to_string(),
+                origin: ReplicaOrigin::Owned,
                 size_bytes: 200,
                 priority: 2,
             },
             RestoreFileRef {
                 file_id: 2,
                 path: "c".to_string(),
+                origin: ReplicaOrigin::Owned,
                 size_bytes: 200,
                 priority: 8,
             },

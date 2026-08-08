@@ -11,8 +11,7 @@ pub(crate) use crate::manifest_model::{
 };
 use crate::manifest_model::{
     build_tree_versions_from_levels, build_truncation_cursors, build_vlog_version_from_files,
-    manifest_file_from_data_file as manifest_file_from_data_file_at_path,
-    manifest_truncation_cursors,
+    manifest_file_from_data_file_with_origin, manifest_truncation_cursors,
 };
 pub(crate) use crate::manifest_model::{from_hex, to_hex};
 use crate::paths::sibling_snapshot_manifest_path;
@@ -24,8 +23,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Snapshot manifests version 2 require SST row keys with big-endian bucket prefixes.
-/// Version 3 adds per-file `max_expired_at` (defaults to 0 for older manifests).
-pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 3;
+/// Version 3 adds per-file `max_expired_at`; version 4 adds replica origins.
+pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 4;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
@@ -567,7 +566,11 @@ fn manifest_tree_levels_from_snapshot(snapshot: &DbSnapshot) -> Vec<Vec<Manifest
                         .files
                         .iter()
                         .map(|file| {
-                            manifest_file_from_data_file(file, &snapshot.tracked_data_files)
+                            manifest_file_from_data_file(
+                                file,
+                                &snapshot.tracked_data_files,
+                                &snapshot.replica_origins,
+                            )
                         })
                         .collect(),
                 })
@@ -579,12 +582,20 @@ fn manifest_tree_levels_from_snapshot(snapshot: &DbSnapshot) -> Vec<Vec<Manifest
 fn manifest_file_from_data_file(
     file: &DataFile,
     tracked_data_files: &BTreeMap<u64, Arc<TrackedFile>>,
+    replica_origins: &BTreeMap<u64, crate::file::logical_file::ReplicaOrigin>,
 ) -> ManifestFile {
     let path = tracked_data_files
         .get(&file.file_id)
         .map(|tracked| tracked.absolute_path())
         .expect("Unknown file ID");
-    manifest_file_from_data_file_at_path(file, path)
+    manifest_file_from_data_file_with_origin(
+        file,
+        path,
+        replica_origins
+            .get(&file.file_id)
+            .cloned()
+            .unwrap_or_default(),
+    )
 }
 
 fn manifest_vlog_files_from_snapshot(snapshot: &DbSnapshot) -> Vec<ManifestVlogFile> {
@@ -603,6 +614,11 @@ fn manifest_vlog_files_from_snapshot(snapshot: &DbSnapshot) -> Vec<ManifestVlogF
                 file_id,
                 path: tracked.absolute_path(),
                 valid_entries,
+                origin: snapshot
+                    .replica_origins
+                    .get(&file_id)
+                    .cloned()
+                    .unwrap_or_default(),
             }
         })
         .collect()
@@ -621,6 +637,7 @@ fn build_incremental_level_edits(
     base_levels: &[Level],
     snapshot_levels: &[Level],
     tracked_data_files: &BTreeMap<u64, Arc<TrackedFile>>,
+    replica_origins: &BTreeMap<u64, crate::file::logical_file::ReplicaOrigin>,
 ) -> Option<Vec<ManifestLevelEdit>> {
     let mut edits = Vec::new();
     for level in snapshot_levels {
@@ -647,7 +664,7 @@ fn build_incremental_level_edits(
             .files
             .iter()
             .filter(|file| !base_file_ids.contains(&file.file_id))
-            .map(|file| manifest_file_from_data_file(file, tracked_data_files))
+            .map(|file| manifest_file_from_data_file(file, tracked_data_files, replica_origins))
             .collect();
         if !new_files.is_empty() {
             if !level.tiered || level.ordinal != 0 || new_files.len() != 1 || !edits.is_empty() {
@@ -687,6 +704,7 @@ fn build_incremental_tree_level_edits(
             &base_tree.levels,
             &tree_version.levels,
             &snapshot.tracked_data_files,
+            &snapshot.replica_origins,
         )?;
         if !level_edits.is_empty() {
             tree_edits.push(ManifestTreeLevelEdit {
@@ -705,21 +723,23 @@ fn build_incremental_tree_level_edits(
 /// Extract the file ID and path references for all data files in the manifest, deduplicating by file ID.
 pub(crate) fn manifest_data_file_refs(
     manifest: &ManifestSnapshot,
-) -> impl Iterator<Item = (u64, String)> {
-    let mut refs: BTreeMap<u64, String> = BTreeMap::new();
+) -> impl Iterator<Item = (u64, String, crate::file::logical_file::ReplicaOrigin)> {
+    let mut refs: BTreeMap<u64, (String, crate::file::logical_file::ReplicaOrigin)> =
+        BTreeMap::new();
     for tree_levels in &manifest.tree_levels {
         for level in tree_levels {
             for file in &level.files {
                 refs.entry(file.file_id)
-                    .or_insert_with(|| file.path.clone());
+                    .or_insert_with(|| (file.path.clone(), file.origin.clone()));
             }
         }
     }
     for file in &manifest.vlog_files {
         refs.entry(file.file_id)
-            .or_insert_with(|| file.path.clone());
+            .or_insert_with(|| (file.path.clone(), file.origin.clone()));
     }
     refs.into_iter()
+        .map(|(file_id, (path, origin))| (file_id, path, origin))
 }
 
 pub(crate) fn build_tree_versions_from_manifest_untracked(
@@ -897,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_manifest_v3_preserves_max_expired_at() {
+    fn decode_manifest_v3_and_v4_preserve_file_extensions() {
         let v3 = r#"{
             "version": 3,
             "id": 1,
@@ -925,7 +945,25 @@ mod tests {
             ManifestPayload::Snapshot(s) => {
                 let file = &s.tree_levels[0][0].files[0];
                 assert_eq!(file.max_expired_at, 5000);
+                assert_eq!(file.origin, crate::file::logical_file::ReplicaOrigin::Owned);
             }
+            _ => panic!("expected snapshot payload"),
+        }
+
+        let v4 = v3.replace(
+            "\"version\": 3",
+            "\"version\": 4",
+        ).replace(
+            "\"max_expired_at\": 5000}",
+            "\"max_expired_at\": 5000, \"origin\": {\"kind\": \"external_leased\", \"export_id\": \"runtime-export\"}}",
+        );
+        let payload = decode_manifest(v4.as_bytes()).expect("v4 manifest should decode");
+        match payload {
+            ManifestPayload::Snapshot(s) => assert!(matches!(
+                s.tree_levels[0][0].files[0].origin,
+                crate::file::logical_file::ReplicaOrigin::ExternalLeased { ref export_id }
+                    if export_id == "runtime-export"
+            )),
             _ => panic!("expected snapshot payload"),
         }
     }
@@ -952,7 +990,7 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("Unsupported snapshot manifest version: 1 (expected 2..=3)")
+                .contains("Unsupported snapshot manifest version: 1 (expected 2..=4)")
         );
     }
 }
