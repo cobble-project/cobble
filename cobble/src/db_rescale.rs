@@ -5,6 +5,7 @@ use crate::db_state::{
     DbState, LSMTreeScope, MultiLSMTreeVersion, TruncationCursorMap, bucket_range_fits_total,
 };
 use crate::error::{Error, Result};
+use crate::file::logical_file::ReplicaOrigin;
 use crate::file::{File, FileManager, MetadataReader, SequentialWriteFile};
 use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
@@ -234,12 +235,16 @@ impl Db {
                 .reserve_data_file_ids(source_file_ids.len());
             let file_id_map: HashMap<u64, u64> =
                 source_file_ids.iter().copied().zip(remapped_ids).collect();
+            let source_origin = ReplicaOrigin::ExternalPersistent {
+                source_id: format!("snapshot:{source_db_id}:{source_snapshot_id}"),
+            };
             for levels in &mut source_manifest.tree_levels {
                 for level in levels {
                     for file in &mut level.files {
                         if let Some(mapped) = file_id_map.get(&file.file_id) {
                             file.file_id = *mapped;
                         }
+                        file.origin = source_origin.clone();
                     }
                 }
             }
@@ -247,6 +252,7 @@ impl Db {
                 if let Some(mapped) = file_id_map.get(&file.file_id) {
                     file.file_id = *mapped;
                 }
+                file.origin = source_origin.clone();
             }
 
             // Step 3: Ensure target has all schema files required by source snapshot.
@@ -703,13 +709,45 @@ mod tests {
             crate::snapshot::load_manifest_for_snapshot(&target_file_manager, target_snapshot)
                 .unwrap();
         assert_eq!(target_manifest.bucket_ranges, vec![0u16..=3u16]);
+        let source_identity = format!("snapshot:{}:{source_snapshot}", source.id());
+        let imported_origins = target_manifest
+            .tree_levels
+            .iter()
+            .flatten()
+            .flat_map(|level| level.files.iter())
+            .map(|file| &file.origin)
+            .chain(target_manifest.vlog_files.iter().map(|file| &file.origin))
+            .collect::<Vec<_>>();
+        assert!(!imported_origins.is_empty());
+        assert!(imported_origins.iter().all(|origin| {
+            matches!(
+                origin,
+                ReplicaOrigin::ExternalPersistent { source_id } if source_id == &source_identity
+            )
+        }));
         drop(target);
         let reopened = Db::open_from_snapshot(config.clone(), target_snapshot, target_id).unwrap();
         assert_eq!(
             reopened.get(2, b"k1").unwrap().unwrap()[0].as_deref(),
             Some(&b"v1"[..])
         );
+        let (tx, rx) = mpsc::channel();
+        let reopened_snapshot = reopened
+            .snapshot_with_callback(move |result| {
+                let _ = tx.send(result);
+            })
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
+            reopened_snapshot
+        );
+        assert!(reopened.expire_snapshot(reopened_snapshot).unwrap());
         drop(reopened);
+        let source_value = source.get(2, b"k1").unwrap().unwrap();
+        assert_eq!(source_value[0].as_deref(), Some(&b"v1"[..]));
         drop(source);
         cleanup_test_root(root);
     }
