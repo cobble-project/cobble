@@ -23,7 +23,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::snapshot::SnapshotLifecycleState;
 use crate::util::normalize_storage_path_to_url;
 use bytes::Bytes;
-use dashmap::{DashMap, Entry};
+use dashmap::DashMap;
 use metrics::{Counter, Gauge, counter, gauge};
 use rand::random;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -43,6 +43,13 @@ const DEFAULT_TRACKED_FILE_PRIORITY: u8 = u8::MAX;
 enum TrackedFileOwnership {
     Owned,
     Retained,
+}
+
+/// Reader-cache identity for one concrete replica of a logical file.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ReplicaKey {
+    file_id: FileId,
+    replica_id: crate::file::logical_file::ReplicaId,
 }
 
 #[inline(always)]
@@ -560,18 +567,39 @@ impl RandomAccessFile for TrackedReader {
 pub struct TrackedWriter {
     inner: Box<dyn SequentialWriteFile>,
     tracked: Arc<TrackedFile>,
+    logical_file: Option<Arc<LogicalFile>>,
 }
 
 impl TrackedWriter {
     /// Creates a new TrackedWriter.
     pub fn new(inner: Box<dyn SequentialWriteFile>, tracked: Arc<TrackedFile>) -> Self {
-        Self { inner, tracked }
+        Self {
+            inner,
+            tracked,
+            logical_file: None,
+        }
+    }
+
+    fn new_for_logical(
+        inner: Box<dyn SequentialWriteFile>,
+        tracked: Arc<TrackedFile>,
+        logical_file: Arc<LogicalFile>,
+    ) -> Self {
+        Self {
+            inner,
+            tracked,
+            logical_file: Some(logical_file),
+        }
     }
 }
 
 impl File for TrackedWriter {
     fn close(&mut self) -> Result<(), Error> {
-        self.inner.close()
+        self.inner.close()?;
+        if let Some(logical) = &self.logical_file {
+            logical.finish_staging_replica();
+        }
+        Ok(())
     }
 
     fn size(&self) -> usize {
@@ -714,19 +742,14 @@ pub struct FileManager {
     pub(crate) options: FileManagerOptions,
     /// Counter for generating unique file IDs.
     pub(crate) next_file_id: AtomicU64,
-    /// Map of file ID to tracked file information for data files.
-    pub(crate) data_files: DashMap<FileId, Arc<TrackedFile>>,
-    /// Map of file ID to logical file, providing multi-replica lifecycle management.
-    /// Populated alongside `data_files` during file registration. A logical file may have
-    /// multiple physical replicas (e.g. primary + snapshot), whereas `data_files` only tracks
-    /// the single preferred read replica. In phase 1, every entry here has exactly one replica.
+    /// Map of logical IDs to their physical replicas and lifecycle.
     pub(crate) logical_files: DashMap<FileId, Arc<LogicalFile>>,
     /// Lazy hint mapping from primary data file id to equivalent snapshot replica file id.
     snapshot_replica_hints: DashMap<FileId, FileId>,
     /// Map of filename to tracked file information for metadata files.
     pub(crate) metadata_files: Arc<DashMap<String, Arc<TrackedFile>>>,
-    /// LRU cache for open random access readers.
-    pub(crate) reader_cache: Mutex<LruCache<FileId, Arc<dyn RandomAccessFile>>>,
+    /// LRU cache for open random access readers, keyed by physical replica.
+    pub(crate) reader_cache: Mutex<LruCache<ReplicaKey, Arc<dyn RandomAccessFile>>>,
     pub(crate) offload_runtime: Arc<OffloadRuntime>,
 }
 
@@ -925,7 +948,6 @@ impl FileManager {
             data_volumes,
             options,
             next_file_id: AtomicU64::new(1), // Start from 1, 0 is reserved
-            data_files: DashMap::new(),
             logical_files: DashMap::new(),
             snapshot_replica_hints: DashMap::new(),
             metadata_files: Arc::new(DashMap::new()),
@@ -1158,16 +1180,19 @@ impl FileManager {
             Arc::clone(volume.fs()),
             Some(Arc::clone(volume)),
         ));
-        self.data_files.insert(file_id, Arc::clone(&tracked));
-        self.report_data_files_gauge();
         self.register_logical_file(
             file_id,
             Arc::clone(&tracked),
             ReplicaLifecycle::Staging,
             FileCommitState::Uncommitted,
         );
+        self.report_data_files_gauge();
         let writer = volume.fs().open_write(tracked.path())?;
-        Ok((file_id, TrackedWriter::new(writer, tracked)))
+        let logical = self.get_logical_file(file_id).unwrap();
+        Ok((
+            file_id,
+            TrackedWriter::new_for_logical(writer, tracked, logical),
+        ))
     }
 
     /// Creates a new data file with a specific file ID.
@@ -1179,7 +1204,7 @@ impl FileManager {
         file_id: FileId,
         expected_write_bytes: Option<u64>,
     ) -> Result<TrackedWriter> {
-        if self.data_files.contains_key(&file_id) {
+        if self.logical_files.contains_key(&file_id) {
             return Err(Error::IoError(format!(
                 "File ID {} is already in use",
                 file_id
@@ -1216,16 +1241,16 @@ impl FileManager {
             Arc::clone(volume.fs()),
             Some(Arc::clone(volume)),
         ));
-        self.data_files.insert(file_id, Arc::clone(&tracked));
-        self.report_data_files_gauge();
         self.register_logical_file(
             file_id,
             Arc::clone(&tracked),
             ReplicaLifecycle::Staging,
             FileCommitState::Uncommitted,
         );
+        self.report_data_files_gauge();
         let writer = volume.fs().open_write(tracked.path())?;
-        Ok(TrackedWriter::new(writer, tracked))
+        let logical = self.get_logical_file(file_id).unwrap();
+        Ok(TrackedWriter::new_for_logical(writer, tracked, logical))
     }
 
     /// Registers an existing data file with the FileManager.
@@ -1233,33 +1258,21 @@ impl FileManager {
     /// This is useful when recovering files from disk or when files were
     /// created externally. The file is tracked but no reader is opened.
     pub fn register_data_file(&self, file_id: FileId, path: &str) -> Result<()> {
+        if self.logical_files.contains_key(&file_id) {
+            return Ok(());
+        }
         let (volume, relative_path) = self.resolve_volume_path(path)?;
         let fs = Arc::clone(volume.fs());
-
-        // Track the file if not already tracked
-        {
-            let tracked = self.data_files.entry(file_id).or_insert_with(|| {
-                if volume.readonly_source {
-                    Arc::new(TrackedFile::readonly(
-                        relative_path.clone(),
-                        Arc::clone(&fs),
-                        Some(Arc::clone(&volume)),
-                    ))
-                } else {
-                    Arc::new(TrackedFile::new(
-                        relative_path.clone(),
-                        Arc::clone(&fs),
-                        Some(Arc::clone(&volume)),
-                    ))
-                }
-            });
-            let size = fs
-                .open_read(tracked.path())
-                .map(|reader| reader.size())
-                .unwrap_or(0);
-            tracked.update_size_bytes(size as u64);
-        }
-        self.report_data_files_gauge();
+        let tracked = Arc::new(if volume.readonly_source {
+            TrackedFile::readonly(relative_path, Arc::clone(&fs), Some(Arc::clone(&volume)))
+        } else {
+            TrackedFile::new(relative_path, Arc::clone(&fs), Some(Arc::clone(&volume)))
+        });
+        let size = fs
+            .open_read(tracked.path())
+            .map(|reader| reader.size())
+            .unwrap_or(0);
+        tracked.update_size_bytes(size as u64);
 
         // Ensure a logical file entry mirrors this tracked file for multi-replica APIs.
         let lifecycle = if volume.readonly_source {
@@ -1267,7 +1280,8 @@ impl FileManager {
         } else {
             ReplicaLifecycle::OwnedReady
         };
-        self.ensure_logical_file(file_id, lifecycle, FileCommitState::Committed);
+        self.register_logical_file(file_id, tracked, lifecycle, FileCommitState::Committed);
+        self.report_data_files_gauge();
 
         // Update next_file_id if necessary
         let mut current = self.next_file_id.load(Ordering::SeqCst);
@@ -1310,24 +1324,6 @@ impl FileManager {
         });
     }
 
-    fn ensure_logical_file(
-        &self,
-        file_id: FileId,
-        lifecycle: ReplicaLifecycle,
-        commit_state: FileCommitState,
-    ) {
-        if self.logical_files.contains_key(&file_id) {
-            return;
-        }
-        if let Some(tracked) = self
-            .data_files
-            .get(&file_id)
-            .map(|entry| Arc::clone(entry.value()))
-        {
-            self.register_logical_file(file_id, tracked, lifecycle, commit_state);
-        }
-    }
-
     /// Attaches the logical file for `file_id` (if any) to the given [`DataFile`], so that
     /// multi-replica APIs can be reached from the data file and initializes immutable metadata.
     /// Call this only after all `DataFile` builder fields, including `max_expired_at`, are set.
@@ -1335,20 +1331,14 @@ impl FileManager {
     /// durable; existing manifest/snapshot barriers continue to decide that transition.
     pub(crate) fn finalize_data_file(&self, data_file: &crate::data_file::DataFile) -> Result<()> {
         let file_id = data_file.file_id;
-        self.ensure_logical_file(
-            file_id,
-            ReplicaLifecycle::OwnedReady,
-            FileCommitState::Committed,
-        );
-        if let Some(logical) = self
+        let logical = self
             .logical_files
             .get(&file_id)
             .map(|e| Arc::clone(e.value()))
-        {
-            logical.initialize_metadata(data_file.build_immutable_metadata())?;
-            logical.finish_staging_replica();
-            data_file.attach_logical_file(logical);
-        }
+            .ok_or_else(|| Error::IoError(format!("Logical file {} is not tracked", file_id)))?;
+        logical.initialize_metadata(data_file.build_immutable_metadata())?;
+        logical.finish_staging_replica();
+        data_file.attach_logical_file(logical);
         Ok(())
     }
 
@@ -1480,36 +1470,50 @@ impl FileManager {
 
     /// Marks a data file as read-only, preventing it from being deleted on drop.
     pub(crate) fn make_data_file_readonly(&self, file_id: FileId) -> Result<()> {
-        let tracked = self
-            .data_files
-            .get(&file_id)
-            .ok_or_else(|| Error::IoError(format!("Data file {} is not tracked", file_id)))?;
-        tracked.mark_for_retention();
-        if let Some(logical) = self.get_logical_file(file_id) {
-            logical.set_preferred_lifecycle(ReplicaLifecycle::PublishedTransfer);
-        }
+        let logical = self.get_logical_file(file_id).ok_or_else(|| {
+            Error::IoError(format!(
+                "Logical file {} is not tracked by FileManager",
+                file_id
+            ))
+        })?;
+        logical
+            .preferred_replica_any()
+            .ok_or_else(|| Error::InvalidState(format!("Logical file {} has no replica", file_id)))?
+            .tracked
+            .mark_for_retention();
+        logical.set_preferred_lifecycle(ReplicaLifecycle::PublishedTransfer);
         Ok(())
     }
 
     pub(crate) fn make_data_file_owned(&self, file_id: FileId) -> Result<()> {
-        let tracked = self
-            .data_files
-            .get(&file_id)
-            .ok_or_else(|| Error::IoError(format!("Data file {} is not tracked", file_id)))?;
-        tracked.mark_for_deletion();
-        if let Some(logical) = self.get_logical_file(file_id) {
-            logical.set_preferred_lifecycle(ReplicaLifecycle::OwnedReady);
-            logical.set_commit_state(FileCommitState::Committed);
-        }
+        let logical = self.get_logical_file(file_id).ok_or_else(|| {
+            Error::IoError(format!(
+                "Logical file {} is not tracked by FileManager",
+                file_id
+            ))
+        })?;
+        logical
+            .preferred_replica_any()
+            .ok_or_else(|| Error::InvalidState(format!("Logical file {} has no replica", file_id)))?
+            .tracked
+            .mark_for_deletion();
+        logical.set_preferred_lifecycle(ReplicaLifecycle::OwnedReady);
+        logical.set_commit_state(FileCommitState::Committed);
         Ok(())
     }
 
     pub(crate) fn set_data_file_priority(&self, file_id: FileId, priority: u8) -> Result<()> {
-        let tracked = self
-            .data_files
-            .get(&file_id)
-            .ok_or_else(|| Error::IoError(format!("Data file {} is not tracked", file_id)))?;
-        tracked.set_priority(priority);
+        let logical = self.get_logical_file(file_id).ok_or_else(|| {
+            Error::IoError(format!(
+                "Logical file {} is not tracked by FileManager",
+                file_id
+            ))
+        })?;
+        logical
+            .preferred_replica_any()
+            .ok_or_else(|| Error::InvalidState(format!("Logical file {} has no replica", file_id)))?
+            .tracked
+            .set_priority(priority);
         Ok(())
     }
 
@@ -1536,46 +1540,72 @@ impl FileManager {
     /// Returns a TrackedReader that holds a reference to the TrackedFile.
     /// The file will not be deleted while the reader is in use.
     pub fn open_data_file_reader(&self, file_id: FileId) -> Result<TrackedReader> {
-        // Get the tracked file
-        let tracked = self.data_files.get(&file_id).ok_or_else(|| {
-            Error::IoError(format!(
-                "Data file {} is not tracked by FileManager",
-                file_id
-            ))
-        })?;
+        let replica = self.preferred_readable_replica(file_id)?;
+        let key = ReplicaKey {
+            file_id,
+            replica_id: replica.replica_id,
+        };
         let cached = {
             let mut cache = self
                 .reader_cache
                 .lock()
                 .map_err(|_| Error::IoError("Reader cache lock poisoned".to_string()))?;
-            cache.get(&file_id).map(Arc::clone)
+            cache.get(&key).map(Arc::clone)
         };
         let reader = if let Some(reader) = cached {
             reader
         } else {
-            let reader = tracked.fs().open_read(tracked.path())?;
+            let reader = replica.tracked.fs().open_read(replica.tracked.path())?;
             let reader: Arc<dyn RandomAccessFile> = Arc::from(reader);
             let mut cache = self
                 .reader_cache
                 .lock()
                 .map_err(|_| Error::IoError("Reader cache lock poisoned".to_string()))?;
-            cache.insert(file_id, Arc::clone(&reader));
+            cache.insert(key, Arc::clone(&reader));
             reader
         };
         let reader: Arc<dyn RandomAccessFile> = Arc::new(CachedRandomAccessFile::new(reader));
-        Ok(TrackedReader::new(reader, Arc::clone(&tracked)))
+        Ok(TrackedReader::new(reader, Arc::clone(&replica.tracked)))
     }
 
     /// Returns the tracked data file reference.
     pub(crate) fn data_file_ref(&self, file_id: FileId) -> Result<Arc<TrackedFile>> {
-        let tracked = self.data_files.get(&file_id).ok_or_else(|| {
+        let replica = self.preferred_readable_replica(file_id)?;
+        replica.tracked.reference();
+        Ok(Arc::clone(&replica.tracked))
+    }
+
+    fn preferred_readable_replica(
+        &self,
+        file_id: FileId,
+    ) -> Result<Arc<crate::file::logical_file::PhysicalReplica>> {
+        let logical = self.get_logical_file(file_id).ok_or_else(|| {
             Error::IoError(format!(
-                "Data file {} is not tracked by FileManager",
+                "Logical file {} is not tracked by FileManager",
                 file_id
             ))
         })?;
-        tracked.reference();
-        Ok(Arc::clone(&tracked))
+        logical.preferred_replica().ok_or_else(|| {
+            Error::InvalidState(format!(
+                "Logical file {} has no readable preferred replica",
+                file_id
+            ))
+        })
+    }
+
+    pub(crate) fn preferred_tracked_file(&self, file_id: FileId) -> Option<Arc<TrackedFile>> {
+        self.get_logical_file(file_id)
+            .and_then(|logical| logical.preferred_replica_any())
+            .map(|replica| Arc::clone(&replica.tracked))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preferred_replica_key(&self, file_id: FileId) -> Result<ReplicaKey> {
+        let replica = self.preferred_readable_replica(file_id)?;
+        Ok(ReplicaKey {
+            file_id,
+            replica_id: replica.replica_id,
+        })
     }
 
     pub(crate) fn has_snapshot_volume(&self) -> bool {
@@ -1585,27 +1615,25 @@ impl FileManager {
     }
 
     pub(crate) fn is_data_file_persistable_for_snapshot(&self, file_id: FileId) -> bool {
-        let Some(tracked) = self.data_files.get(&file_id) else {
-            return false;
-        };
-        tracked.is_snapshot_persistable()
+        self.preferred_readable_replica(file_id)
+            .is_ok_and(|replica| replica.tracked.is_snapshot_persistable())
     }
 
     pub(crate) fn is_data_file_on_primary_volume(&self, file_id: FileId) -> bool {
-        let Some(tracked) = self.data_files.get(&file_id) else {
+        let Ok(replica) = self.preferred_readable_replica(file_id) else {
             return false;
         };
-        let Some(volume) = &tracked.volume else {
+        let Some(volume) = &replica.tracked.volume else {
             return false;
         };
         volume.supports_primary_data
     }
 
     pub(crate) fn is_data_file_on_snapshot_volume(&self, file_id: FileId) -> bool {
-        let Some(tracked) = self.data_files.get(&file_id) else {
+        let Ok(replica) = self.preferred_readable_replica(file_id) else {
             return false;
         };
-        let Some(volume) = &tracked.volume else {
+        let Some(volume) = &replica.tracked.volume else {
             return false;
         };
         volume.snapshot_persistable
@@ -1675,17 +1703,10 @@ impl FileManager {
         resource_registry: Option<Arc<dyn SnapshotCopyResourceRegistry + Send + Sync>>,
         lifecycle_state: Option<&AtomicU8>,
     ) -> Result<(FileId, bool)> {
-        // Extract needed data from DashMap Ref and drop it before insert to
-        // avoid self-deadlock when source and target IDs hash to the same shard.
-        let source_tracked = {
-            let tracked = self.data_files.get(&source_file_id).ok_or_else(|| {
-                Error::IoError(format!(
-                    "Data file {} is not tracked by FileManager",
-                    source_file_id
-                ))
-            })?;
-            Arc::clone(&tracked)
-        };
+        let source_tracked = self
+            .preferred_readable_replica(source_file_id)?
+            .tracked
+            .clone();
         self.copy_tracked_data_file_to_snapshot_volume_with_result_and_cancel(
             source_file_id,
             &source_tracked,
@@ -1733,12 +1754,16 @@ impl FileManager {
 
     /// Returns the path for a data file.
     pub fn get_data_file_path(&self, file_id: FileId) -> Option<String> {
-        self.data_files.get(&file_id).map(|f| f.path().to_string())
+        self.preferred_readable_replica(file_id)
+            .ok()
+            .map(|replica| replica.tracked.path().to_string())
     }
 
     /// Returns the full path for a data file, including the volume base directory if known.
     pub fn get_data_file_full_path(&self, file_id: FileId) -> Option<String> {
-        self.data_files.get(&file_id).map(|f| f.absolute_path())
+        self.preferred_readable_replica(file_id)
+            .ok()
+            .map(|replica| replica.tracked.absolute_path())
     }
 
     /// Finds a tracked data file by its absolute (volume-prefixed) path.
@@ -1747,9 +1772,13 @@ impl FileManager {
     /// (e.g. `file://.../compaction/jobs/<id>/data/<uuid>.sst`) back to the canonical file id
     /// the writer assigned when registering the output.
     pub(crate) fn find_data_file_by_absolute_path(&self, absolute_path: &str) -> Option<FileId> {
-        self.data_files
+        self.logical_files
             .iter()
-            .find(|entry| entry.absolute_path() == absolute_path)
+            .find(|entry| {
+                entry
+                    .preferred_replica()
+                    .is_some_and(|replica| replica.tracked.absolute_path() == absolute_path)
+            })
             .map(|entry| *entry.key())
     }
 
@@ -1770,31 +1799,36 @@ impl FileManager {
 
     /// Checks if a data file is tracked by the FileManager.
     pub fn has_data_file(&self, file_id: FileId) -> bool {
-        self.data_files.contains_key(&file_id)
+        self.logical_files.contains_key(&file_id)
     }
 
-    /// Replaces the physical file used by the legacy `data_files` path and mirrors that change
-    /// in its phase-1 LogicalFile. The caller supplies the source it copied so a stale migration
-    /// cannot replace a newer location.
+    /// Replaces the preferred physical replica when the copied source is still current.
     pub(crate) fn replace_data_file_replica(
         &self,
         file_id: FileId,
         expected: &Arc<TrackedFile>,
         replacement: Arc<TrackedFile>,
     ) -> bool {
-        match self.data_files.entry(file_id) {
-            Entry::Occupied(mut occupied) if Arc::ptr_eq(occupied.get(), expected) => {
-                occupied.insert(Arc::clone(&replacement));
-            }
-            _ => return false,
-        }
-        self.ensure_logical_file(
-            file_id,
+        let old_cache_key = self.get_logical_file(file_id).and_then(|logical| {
+            logical.preferred_replica().map(|replica| ReplicaKey {
+                file_id,
+                replica_id: replica.replica_id,
+            })
+        });
+        let Some(logical) = self.get_logical_file(file_id) else {
+            return false;
+        };
+        if !logical.replace_preferred_replica_if(
+            expected,
+            replacement,
             ReplicaLifecycle::OwnedReady,
-            FileCommitState::Committed,
-        );
-        if let Some(logical) = self.get_logical_file(file_id) {
-            logical.replace_preferred_replica(replacement, ReplicaLifecycle::OwnedReady);
+        ) {
+            return false;
+        }
+        if let Some(key) = old_cache_key
+            && let Ok(mut cache) = self.reader_cache.lock()
+        {
+            cache.remove(&key);
         }
         true
     }
@@ -1802,12 +1836,16 @@ impl FileManager {
     /// Removes a data file from tracking.
     pub(crate) fn remove_data_file(&self, file_id: FileId) -> Result<()> {
         self.snapshot_replica_hints.remove(&file_id);
-        self.logical_files.remove(&file_id);
-        let Some(_) = self.data_files.remove(&file_id) else {
+        let Some((_, logical)) = self.logical_files.remove(&file_id) else {
             return Ok(());
         };
         if let Ok(mut cache) = self.reader_cache.lock() {
-            cache.remove(&file_id);
+            for replica_id in logical.replica_ids() {
+                cache.remove(&ReplicaKey {
+                    file_id,
+                    replica_id,
+                });
+            }
         }
         self.report_data_files_gauge();
         Ok(())
@@ -1815,12 +1853,15 @@ impl FileManager {
 
     /// Returns the number of tracked data files.
     pub fn data_file_count(&self) -> usize {
-        self.data_files.len()
+        self.logical_files.len()
     }
 
     /// Returns all tracked data file IDs.
     pub fn data_file_ids(&self) -> Vec<FileId> {
-        self.data_files.iter().map(|entry| *entry.key()).collect()
+        self.logical_files
+            .iter()
+            .map(|entry| *entry.key())
+            .collect()
     }
 
     // =========================================================================
@@ -1976,6 +2017,9 @@ impl FileManager {
         commit_state: FileCommitState,
         ownership: TrackedFileOwnership,
     ) -> Result<()> {
+        if self.logical_files.contains_key(&file_id) {
+            return Ok(());
+        }
         let (volume, relative_path) = self.resolve_volume_path(path)?;
         let fs = Arc::clone(volume.fs());
         let tracked = Arc::new(match ownership {
@@ -1991,11 +2035,8 @@ impl FileManager {
             .map(|reader| reader.size())
             .unwrap_or(0);
         tracked.update_size_bytes(size as u64);
-        {
-            self.data_files.entry(file_id).or_insert_with(|| tracked);
-        }
+        self.register_logical_file(file_id, tracked, lifecycle, commit_state);
         self.report_data_files_gauge();
-        self.ensure_logical_file(file_id, lifecycle, commit_state);
         Ok(())
     }
 
@@ -2037,7 +2078,7 @@ impl FileManager {
     fn report_data_files_gauge(&self) {
         self.metrics
             .data_files_tracked
-            .set(self.data_files.len() as f64);
+            .set(self.logical_files.len() as f64);
     }
 
     fn report_metadata_files_gauge(&self) {
@@ -2375,10 +2416,6 @@ pub(crate) mod tests {
         file.set_max_expired_at(42);
         let logical = file.logical_file().unwrap();
         assert_eq!(logical.metadata(), None);
-        assert_eq!(
-            logical.preferred_replica_lifecycle(),
-            Some(ReplicaLifecycle::Staging)
-        );
         fm.finalize_data_file(&file).unwrap();
 
         assert_eq!(logical.commit_state(), FileCommitState::Uncommitted);
@@ -2388,6 +2425,10 @@ pub(crate) mod tests {
             Some(ReplicaLifecycle::OwnedReady)
         ));
         assert!(logical.preferred_replica().is_some());
+        let old_reader = fm.open_data_file_reader(file_id).unwrap();
+        assert_eq!(old_reader.read_at(0, 4).unwrap().as_ref(), b"data");
+        let old_cache_key = fm.preferred_replica_key(file_id).unwrap();
+        assert!(fm.reader_cache.lock().unwrap().contains_key(&old_cache_key));
 
         let conflicting = DataFile::new(
             DataFileType::SSTable,
@@ -2404,6 +2445,9 @@ pub(crate) mod tests {
         assert!(fm.finalize_data_file(&conflicting).is_err());
 
         let path = fm.get_data_file_full_path(file_id).unwrap();
+        let mut replacement_writer = fs.open_write("replacement.sst").unwrap();
+        replacement_writer.write(b"next").unwrap();
+        replacement_writer.close().unwrap();
         let replacement = Arc::new(TrackedFile::new(
             "replacement.sst".to_string(),
             Arc::clone(&fs),
@@ -2411,10 +2455,18 @@ pub(crate) mod tests {
         ));
         let source = fm.data_file_ref(file_id).unwrap();
         assert!(fm.replace_data_file_replica(file_id, &source, Arc::clone(&replacement)));
+        assert!(!fm.replace_data_file_replica(file_id, &source, Arc::clone(&source)));
         assert!(Arc::ptr_eq(
             &logical.preferred_replica().unwrap().tracked,
             &replacement
         ));
+        let new_reader = fm.open_data_file_reader(file_id).unwrap();
+        assert_eq!(new_reader.read_at(0, 4).unwrap().as_ref(), b"next");
+        assert_eq!(old_reader.read_at(0, 4).unwrap().as_ref(), b"data");
+        assert!(!fm.reader_cache.lock().unwrap().contains_key(&old_cache_key));
+        let new_cache_key = fm.preferred_replica_key(file_id).unwrap();
+        assert_ne!(new_cache_key, old_cache_key);
+        assert!(fm.reader_cache.lock().unwrap().contains_key(&new_cache_key));
 
         fm.register_data_file_readonly(file_id + 1, &path).unwrap();
         assert_eq!(

@@ -672,14 +672,8 @@ impl FileManager {
                 };
                 attempted.insert(file_id);
                 let estimated_bytes = self
-                    .data_files
-                    .get(&file_id)
-                    .map(|entry| {
-                        entry
-                            .value()
-                            .size_bytes
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                    })
+                    .preferred_tracked_file(file_id)
+                    .map(|tracked| tracked.size_bytes())
                     .unwrap_or(0);
                 if estimated_bytes == 0 {
                     break;
@@ -733,7 +727,7 @@ impl FileManager {
         );
         let mut marked = 0usize;
         for (file_id, request) in referenced_files {
-            let is_readonly = self.data_files.get(&file_id).is_some_and(|tracked| {
+            let is_readonly = self.preferred_tracked_file(file_id).is_some_and(|tracked| {
                 tracked
                     .volume
                     .as_ref()
@@ -767,12 +761,14 @@ impl FileManager {
             if self.offload_runtime.is_queued_or_running(file_id) {
                 continue;
             }
-            let Some((size_bytes, true)) = self.data_files.get(&file_id).and_then(|tracked| {
-                tracked
-                    .volume
-                    .as_ref()
-                    .map(|volume| (tracked.size_bytes(), volume.readonly_source))
-            }) else {
+            let Some((size_bytes, true)) =
+                self.preferred_tracked_file(file_id).and_then(|tracked| {
+                    tracked
+                        .volume
+                        .as_ref()
+                        .map(|volume| (tracked.size_bytes(), volume.readonly_source))
+                })
+            else {
                 stale.push(file_id);
                 continue;
             };
@@ -922,9 +918,8 @@ impl FileManager {
                 };
                 attempted.insert(file_id);
                 let estimated_bytes = self
-                    .data_files
-                    .get(&file_id)
-                    .map(|entry| entry.value().size_bytes())
+                    .preferred_tracked_file(file_id)
+                    .map(|tracked| tracked.size_bytes())
                     .unwrap_or(0);
                 if estimated_bytes == 0 {
                     continue;
@@ -1006,9 +1001,7 @@ impl FileManager {
         let target_volume = Arc::clone(target_volume);
         let target_volume_for_job = Arc::clone(&target_volume);
         let source_tracked = self
-            .data_files
-            .get(&file_id)
-            .map(|entry| Arc::clone(entry.value()))
+            .preferred_tracked_file(file_id)
             .ok_or_else(|| Error::IoError(format!("Data file {} is not tracked", file_id)))?;
         let source_volume = source_tracked
             .volume
@@ -1189,7 +1182,7 @@ impl FileManager {
                     return PrimaryMoveGuardStatus::Stale;
                 };
                 if !referenced_primary_file_priorities(&db_state).contains_key(&file_id)
-                    || !self.data_files.get(&file_id).is_some_and(|tracked| {
+                    || !self.preferred_tracked_file(file_id).is_some_and(|tracked| {
                         tracked
                             .volume
                             .as_ref()
@@ -1256,13 +1249,14 @@ impl FileManager {
             return None;
         }
         let candidates: Vec<(FileId, Arc<TrackedFile>)> = self
-            .data_files
+            .logical_files
             .iter()
             .filter_map(|entry| {
                 if excluded_file_ids.contains(entry.key()) {
                     return None;
                 }
-                let tracked = entry.value();
+                let tracked = entry.value().preferred_replica_any()?;
+                let tracked = &tracked.tracked;
                 let volume = tracked.volume.as_ref()?;
                 if !volume.supports_primary_data || !Arc::ptr_eq(volume, source_volume) {
                     return None;
@@ -1314,7 +1308,7 @@ impl FileManager {
         if max_size_bytes == 0 || target_volume.readonly_source {
             return None;
         }
-        self.data_files
+        self.logical_files
             .iter()
             .filter_map(|entry| {
                 let file_id = *entry.key();
@@ -1324,7 +1318,8 @@ impl FileManager {
                     return None;
                 }
                 let priority = *referenced_priorities.get(&file_id)?;
-                let tracked = entry.value();
+                let tracked = entry.value().preferred_replica_any()?;
+                let tracked = &tracked.tracked;
                 let source_volume = tracked.volume.as_ref()?;
                 if !source_volume.supports_primary_data
                     || source_volume.priority.rank() >= target_volume.priority.rank()
@@ -1360,8 +1355,7 @@ impl FileManager {
         let Some(snapshot_replica_file_id) = self.snapshot_replica_hint_file_id(file_id) else {
             return false;
         };
-        self.data_files
-            .get(&snapshot_replica_file_id)
+        self.preferred_tracked_file(snapshot_replica_file_id)
             .is_some_and(|snapshot_tracked| {
                 snapshot_tracked.volume.as_ref().is_some_and(|volume| {
                     volume.supports_primary_data && Arc::ptr_eq(volume, target_volume)
@@ -1390,9 +1384,7 @@ impl FileManager {
         rollback: &mut dyn FnMut(),
     ) -> crate::Result<bool> {
         let source_tracked = self
-            .data_files
-            .get(&file_id)
-            .map(|entry| Arc::clone(entry.value()))
+            .preferred_tracked_file(file_id)
             .ok_or_else(|| Error::IoError(format!("Data file {} is not tracked", file_id)))?;
         let Some(source_volume) = &source_tracked.volume else {
             return Ok(false);
@@ -1406,10 +1398,7 @@ impl FileManager {
             return Ok(false);
         }
         if let Some(snapshot_replica_file_id) = self.snapshot_replica_hint_file_id(file_id)
-            && let Some(snapshot_tracked) = self
-                .data_files
-                .get(&snapshot_replica_file_id)
-                .map(|entry| Arc::clone(entry.value()))
+            && let Some(snapshot_tracked) = self.preferred_tracked_file(snapshot_replica_file_id)
             && let Some(snapshot_volume) = &snapshot_tracked.volume
             && snapshot_volume.supports_primary_data
             && Arc::ptr_eq(snapshot_volume, target_volume)
@@ -1417,9 +1406,6 @@ impl FileManager {
             snapshot_tracked.set_priority(source_tracked.priority());
             if !self.replace_data_file_replica(file_id, &source_tracked, snapshot_tracked) {
                 return Ok(false);
-            }
-            if let Ok(mut cache) = self.reader_cache.lock() {
-                cache.remove(&file_id);
             }
             self.record_offload_completed_promotion();
             return Ok(true);
@@ -1442,9 +1428,6 @@ impl FileManager {
         if !self.replace_data_file_replica(file_id, &source_tracked, new_tracked) {
             rollback();
             return Ok(false);
-        }
-        if let Ok(mut cache) = self.reader_cache.lock() {
-            cache.remove(&file_id);
         }
         self.record_offload_completed_copy(copied_bytes);
         Ok(true)
@@ -1792,9 +1775,8 @@ mod tests {
         writer.write(&[b'x'; 128]).unwrap();
         writer.close().unwrap();
 
-        let tracked = fm.data_files.get(&file_id).unwrap();
-        assert_eq!(projected_source_release_bytes(tracked.value()), 128);
-        drop(tracked);
+        let tracked = fm.preferred_tracked_file(file_id).unwrap();
+        assert_eq!(projected_source_release_bytes(&tracked), 128);
 
         let snapshot_ref = fm.data_file_ref(file_id).unwrap();
         assert_eq!(
@@ -2351,11 +2333,7 @@ mod tests {
         let l3_file = register_readonly(102, 64);
         let added_after_mark = register_readonly(103, 32);
         let vlog_file = register_readonly(104, 32);
-        let old_l0_readonly_tracking = fm
-            .data_files
-            .get(&101)
-            .map(|tracked| Arc::clone(tracked.value()))
-            .unwrap();
+        let old_l0_readonly_tracking = fm.preferred_tracked_file(101).unwrap();
         let source_paths = [101, 102, 103, 104].map(|file_id| {
             (
                 file_id,
@@ -2429,23 +2407,24 @@ mod tests {
         assert_eq!(fm.trigger_primary_tiering_if_needed(&db_state).unwrap(), 1);
         assert!(fm.wait_for_offload_idle(Duration::from_secs(5)));
         assert_eq!(
-            fm.data_files.get(&101).and_then(|tracked| {
+            fm.preferred_tracked_file(101).and_then(|tracked| {
                 tracked.volume.as_ref().map(|volume| volume.priority.rank())
             }),
             Some(1),
             "the highest-priority L0 file should fall back to low when high cannot fit it"
         );
         assert!(
-            fm.data_files
-                .iter()
-                .all(|tracked| !Arc::ptr_eq(tracked.value(), &old_l0_readonly_tracking)),
-            "the old READONLY TrackedFile must no longer be present in canonical tracking"
+            !Arc::ptr_eq(
+                &fm.preferred_tracked_file(101).unwrap(),
+                &old_l0_readonly_tracking
+            ),
+            "the old READONLY TrackedFile must no longer be preferred"
         );
 
         assert_eq!(fm.trigger_primary_tiering_if_needed(&db_state).unwrap(), 1);
         assert!(fm.wait_for_offload_idle(Duration::from_secs(5)));
         assert_eq!(
-            fm.data_files.get(&102).and_then(|tracked| {
+            fm.preferred_tracked_file(102).and_then(|tracked| {
                 tracked.volume.as_ref().map(|volume| volume.priority.rank())
             }),
             Some(3),
@@ -2454,14 +2433,14 @@ mod tests {
         assert_eq!(fm.trigger_primary_tiering_if_needed(&db_state).unwrap(), 1);
         assert!(fm.wait_for_offload_idle(Duration::from_secs(5)));
         assert_eq!(
-            fm.data_files.get(&104).and_then(|tracked| {
+            fm.preferred_tracked_file(104).and_then(|tracked| {
                 tracked.volume.as_ref().map(|volume| volume.priority.rank())
             }),
             Some(3),
             "the VLog file should load only after all marked LSM files"
         );
         assert!(
-            fm.data_files.get(&103).is_some_and(|tracked| {
+            fm.preferred_tracked_file(103).is_some_and(|tracked| {
                 tracked
                     .volume
                     .as_ref()
@@ -2728,8 +2707,9 @@ mod tests {
         );
         assert!(fm.is_data_file_on_primary_volume(data_file.file_id));
 
+        let cache_key = fm.preferred_replica_key(data_file.file_id).unwrap();
         fm.reader_cache.lock().unwrap().insert(
-            data_file.file_id,
+            cache_key.clone(),
             Arc::new(FailingReader {
                 size: data_file.size,
             }),
@@ -2738,7 +2718,7 @@ mod tests {
         assert!(data_file.pinned_sst_read_metadata().is_none());
         assert!(fm.is_data_file_on_primary_volume(data_file.file_id));
 
-        fm.reader_cache.lock().unwrap().remove(&data_file.file_id);
+        fm.reader_cache.lock().unwrap().remove(&cache_key);
         assert_eq!(
             SSTPointReader::get_exact(
                 Box::new(fm.open_data_file_reader(data_file.file_id).unwrap()),
@@ -2826,7 +2806,7 @@ mod tests {
             fm.offload_runtime.pending_readonly_loads.contains_key(&201),
             "a capacity-blocked load must remain marked for a later retry"
         );
-        assert!(fm.data_files.get(&201).is_some_and(|tracked| {
+        assert!(fm.preferred_tracked_file(201).is_some_and(|tracked| {
             tracked
                 .volume
                 .as_ref()
@@ -2998,8 +2978,7 @@ mod tests {
         let worker = fm.start_primary_tiering_worker(&db_state).unwrap().unwrap();
         let moved = (0..100).any(|_| {
             let on_high = fm
-                .data_files
-                .get(&l0_file_id)
+                .preferred_tracked_file(l0_file_id)
                 .and_then(|tracked| {
                     tracked
                         .volume
@@ -3018,15 +2997,14 @@ mod tests {
 
         assert!(moved, "the current L0 file should be backfilled");
         assert_eq!(
-            fm.data_files.get(&vlog_file_id).and_then(|tracked| {
+            fm.preferred_tracked_file(vlog_file_id).and_then(|tracked| {
                 tracked.volume.as_ref().map(|volume| volume.priority.rank())
             }),
             Some(3),
             "a referenced VLOG file should be eligible after LSM files"
         );
         assert_eq!(
-            fm.data_files
-                .get(&unreferenced_file_id)
+            fm.preferred_tracked_file(unreferenced_file_id)
                 .and_then(|tracked| {
                     tracked.volume.as_ref().map(|volume| volume.priority.rank())
                 }),

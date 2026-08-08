@@ -1,7 +1,4 @@
-//! Logical file and physical replica compatibility model.
-//!
-//! The existing `TrackedFile` remains responsible for physical lifetime in this phase. This
-//! module records the logical identity and the replica currently used by the legacy read path.
+//! Logical file and physical replica model.
 
 use crate::data_file::DataFileType;
 use crate::file::{FileId, TrackedFile};
@@ -64,8 +61,8 @@ impl ReplicaLifecycle {
     }
 }
 
-/// One concrete byte copy. Priority and explicit references intentionally remain on
-/// `TrackedFile` until the legacy read and ownership paths move to replicas.
+/// One concrete byte copy. `TrackedFile` carries this replica's priority, references, and
+/// physical deletion behavior.
 pub(crate) struct PhysicalReplica {
     pub(crate) replica_id: ReplicaId,
     pub(crate) tracked: Arc<TrackedFile>,
@@ -98,14 +95,18 @@ impl PhysicalReplica {
     }
 }
 
-/// Immutable LSM identity with the physical replica selected by the current legacy path.
+/// Immutable LSM identity with its selected physical replica.
 pub(crate) struct LogicalFile {
     pub(crate) file_id: FileId,
     metadata: OnceLock<ImmutableFileMetadata>,
     commit_state: Mutex<FileCommitState>,
-    replicas: RwLock<HashMap<ReplicaId, Arc<PhysicalReplica>>>,
-    preferred_read_replica: RwLock<Option<ReplicaId>>,
+    replica_state: RwLock<ReplicaState>,
     next_replica_id: AtomicU64,
+}
+
+struct ReplicaState {
+    replicas: HashMap<ReplicaId, Arc<PhysicalReplica>>,
+    preferred_read_replica: Option<ReplicaId>,
 }
 
 impl LogicalFile {
@@ -122,8 +123,10 @@ impl LogicalFile {
             file_id,
             metadata: OnceLock::new(),
             commit_state: Mutex::new(commit_state),
-            replicas: RwLock::new(replicas),
-            preferred_read_replica: RwLock::new(Some(0)),
+            replica_state: RwLock::new(ReplicaState {
+                replicas,
+                preferred_read_replica: Some(0),
+            }),
             next_replica_id: AtomicU64::new(1),
         }
     }
@@ -156,44 +159,60 @@ impl LogicalFile {
     }
 
     pub(crate) fn preferred_replica(&self) -> Option<Arc<PhysicalReplica>> {
-        let preferred = *self.preferred_read_replica.read().unwrap();
-        let replicas = self.replicas.read().unwrap();
-        preferred
-            .and_then(|id| replicas.get(&id).cloned())
+        self.preferred_replica_any()
             .filter(|replica| replica.is_readable())
     }
 
-    pub(crate) fn preferred_replica_lifecycle(&self) -> Option<ReplicaLifecycle> {
-        let preferred = *self.preferred_read_replica.read().unwrap();
-        preferred.and_then(|id| {
-            self.replicas
-                .read()
-                .unwrap()
-                .get(&id)
-                .map(|replica| replica.lifecycle())
-        })
+    pub(crate) fn preferred_replica_any(&self) -> Option<Arc<PhysicalReplica>> {
+        let state = self.replica_state.read().unwrap();
+        state
+            .preferred_read_replica
+            .and_then(|id| state.replicas.get(&id).cloned())
     }
 
-    pub(crate) fn replace_preferred_replica(
+    pub(crate) fn preferred_replica_lifecycle(&self) -> Option<ReplicaLifecycle> {
+        self.preferred_replica_any()
+            .map(|replica| replica.lifecycle())
+    }
+
+    pub(crate) fn replace_preferred_replica_if(
         &self,
+        expected: &Arc<TrackedFile>,
         tracked: Arc<TrackedFile>,
         lifecycle: ReplicaLifecycle,
-    ) {
+    ) -> bool {
+        let mut state = self.replica_state.write().unwrap();
+        let Some(current) = state
+            .preferred_read_replica
+            .and_then(|id| state.replicas.get(&id))
+        else {
+            return false;
+        };
+        if !Arc::ptr_eq(&current.tracked, expected) {
+            return false;
+        }
         let replica_id = self.next_replica_id.fetch_add(1, Ordering::Relaxed);
         let replica = Arc::new(PhysicalReplica::new(replica_id, tracked, lifecycle));
-        let mut replicas = self.replicas.write().unwrap();
-        replicas.clear();
-        replicas.insert(replica_id, replica);
-        *self.preferred_read_replica.write().unwrap() = Some(replica_id);
+        state.replicas.clear();
+        state.replicas.insert(replica_id, replica);
+        state.preferred_read_replica = Some(replica_id);
+        true
     }
 
     pub(crate) fn set_preferred_lifecycle(&self, lifecycle: ReplicaLifecycle) {
-        let preferred = *self.preferred_read_replica.read().unwrap();
-        if let Some(replica) =
-            preferred.and_then(|id| self.replicas.read().unwrap().get(&id).cloned())
-        {
+        if let Some(replica) = self.preferred_replica_any() {
             replica.set_lifecycle(lifecycle);
         }
+    }
+
+    pub(crate) fn replica_ids(&self) -> Vec<ReplicaId> {
+        self.replica_state
+            .read()
+            .unwrap()
+            .replicas
+            .keys()
+            .copied()
+            .collect()
     }
 
     pub(crate) fn finish_staging_replica(&self) {
