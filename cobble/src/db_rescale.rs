@@ -99,6 +99,7 @@ pub(crate) struct AdoptionCoordinator {
     db_id: String,
     config: crate::Config,
     file_manager: Arc<FileManager>,
+    lsm_tree: Arc<crate::lsm::LSMTree>,
     db_state: Arc<crate::db_state::DbStateHandle>,
     db_lifecycle: Arc<crate::db_status::DbLifecycle>,
     memtable_manager: Arc<crate::memtable::MemtableManager>,
@@ -111,7 +112,7 @@ pub(crate) struct AdoptionCoordinator {
 impl AdoptionCoordinator {
     pub(crate) fn new(
         target: (String, crate::Config),
-        file_manager: Arc<FileManager>,
+        storage: (Arc<FileManager>, Arc<crate::lsm::LSMTree>),
         db_state: Arc<crate::db_state::DbStateHandle>,
         db_lifecycle: Arc<crate::db_status::DbLifecycle>,
         memtable_manager: Arc<crate::memtable::MemtableManager>,
@@ -121,10 +122,12 @@ impl AdoptionCoordinator {
         >,
     ) -> Self {
         let (db_id, config) = target;
+        let (file_manager, lsm_tree) = storage;
         Self {
             db_id,
             config,
             file_manager,
+            lsm_tree,
             db_state,
             db_lifecycle,
             memtable_manager,
@@ -250,6 +253,11 @@ impl AdoptionCoordinator {
         if let Some(publisher) = &self.runtime_manifest_publisher {
             publisher.publish_at_least(self.db_state.load().seq_id)?;
         }
+        if self.lsm_tree.has_pending_compactions()
+            || crate::compaction::dedicated::has_active_dedicated_compaction(&self.file_manager)?
+        {
+            return Ok(());
+        }
         for record in load_import_records(&self.file_manager)? {
             if record.adoption_barrier_snapshot_id != Some(barrier_id) {
                 continue;
@@ -327,14 +335,10 @@ impl Db {
                 "cannot change LSM topology while runtime publication is suspended for {job_id}"
             )));
         }
-        let pending = crate::compaction::dedicated::list_dedicated_compaction_result_job_ids(
-            &self.file_manager,
-        )?;
-        if !pending.is_empty() {
-            return Err(Error::InvalidState(format!(
-                "cannot change LSM topology while dedicated compaction result {} is pending; retry after the writer consumes it",
-                pending[0]
-            )));
+        if crate::compaction::dedicated::has_active_dedicated_compaction(&self.file_manager)? {
+            return Err(Error::InvalidState(
+                "cannot change LSM topology while dedicated compaction is active".to_string(),
+            ));
         }
         Ok(())
     }
@@ -1365,6 +1369,7 @@ mod tests {
                 generation: 1,
                 seq_id: db.db_state.load().seq_id,
             },
+            topology_epoch: db.db_state.load().topology_epoch,
             lsm_tree_idx: 0,
             tree_scope: LSMTreeScope::new(0u16..=3u16, 0),
             operation: crate::compaction::dedicated::DedicatedCompactionOperation::Drop {
@@ -1380,10 +1385,7 @@ mod tests {
         .unwrap();
 
         let err = db.shrink_bucket(vec![0u16..=0u16]).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("result pending-rescale is pending")
-        );
+        assert!(err.to_string().contains("dedicated compaction is active"));
 
         crate::compaction::dedicated::delete_dedicated_compaction_result(
             &db.file_manager,

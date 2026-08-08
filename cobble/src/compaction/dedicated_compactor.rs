@@ -12,7 +12,7 @@
 //! - The result file's disappearance signals the compactor to proceed to the next plan.
 use crate::compaction::dedicated::{
     DEDICATED_COMPACTION_RESULT_VERSION, DedicatedCompactionInput, DedicatedCompactionOperation,
-    DedicatedCompactionResult, DedicatedCompactionSource, DedicatedDataFile,
+    DedicatedCompactionResult, DedicatedCompactionSource, DedicatedDataFile, cleanup_job_dir,
     dedicated_compaction_job_output_prefix, publish_dedicated_compaction_result, write_job_lease,
 };
 use crate::compaction::policy::{
@@ -95,6 +95,7 @@ pub(crate) enum DedicatedCompactionStep {
 
 struct DedicatedObservation {
     source: DedicatedCompactionSource,
+    topology_epoch: u64,
     latest_schema_id: u64,
     tree_scopes: Vec<LSMTreeScope>,
     tree_levels: Vec<Vec<crate::manifest_model::ManifestLevel>>,
@@ -116,6 +117,7 @@ impl DedicatedObservation {
                 generation: loaded.generation,
                 seq_id: manifest.seq_id,
             },
+            topology_epoch: manifest.topology_epoch,
             latest_schema_id: manifest.latest_schema_id,
             tree_scopes: manifest.tree_scopes,
             tree_levels: manifest.tree_levels,
@@ -133,6 +135,7 @@ impl DedicatedObservation {
                 snapshot_id,
                 seq_id: manifest.seq_id,
             },
+            topology_epoch: manifest.topology_epoch,
             latest_schema_id: manifest.latest_schema_id,
             tree_scopes: manifest.tree_scopes,
             tree_levels: manifest.tree_levels,
@@ -352,12 +355,14 @@ impl DedicatedCompactor {
                 &rebuilt.truncation_cursors,
                 &rebuilt.schema_manager,
                 &observation.source,
+                observation.topology_epoch,
                 &job_id,
                 policy_context.now_seconds,
             ) {
-                Ok(()) => {
+                Ok(true) => {
                     return Ok(DedicatedCompactionStep::ResultPublished { job_id });
                 }
+                Ok(false) => return Ok(DedicatedCompactionStep::NoPlan),
                 Err(err) => {
                     warn!(
                         "compaction job {} failed: {}; will retry on next iteration",
@@ -456,13 +461,21 @@ impl DedicatedCompactor {
         truncation_cursors: &crate::db_state::TruncationCursorMap,
         schema_manager: &Arc<SchemaManager>,
         source: &DedicatedCompactionSource,
+        topology_epoch: u64,
         job_id: &str,
         now_seconds: u32,
-    ) -> Result<()> {
-        // Write a lease file so the writer's orphan sweep doesn't delete our outputs
-        // while we're still working. We also start a heartbeat thread to refresh the lease
-        // periodically, in case the compaction takes longer than min_age_ms.
+    ) -> Result<bool> {
+        // Persist the lease before re-reading the selected observation. This closes the gap in
+        // which the writer may replace the layout and collect inputs before this process opens
+        // them.
         write_job_lease(&self.file_manager, job_id)?;
+        let still_current = self.load_observation()?.is_some_and(|current| {
+            current.source == *source && current.topology_epoch == topology_epoch
+        });
+        if !still_current {
+            cleanup_job_dir(&self.file_manager, job_id)?;
+            return Ok(false);
+        }
         let heartbeat_handle = self.start_lease_heartbeat(job_id);
 
         // Handle trivial move and drop without executing a full compaction task.
@@ -474,11 +487,20 @@ impl DedicatedCompactor {
                 plan,
                 truncation_cursors,
                 source,
+                topology_epoch,
                 job_id,
                 now_seconds,
             )
         } else if plan.trivial_move {
-            self.publish_trivial_move_result(tree_idx, tree_scope, levels, plan, source, job_id)
+            self.publish_trivial_move_result(
+                tree_idx,
+                tree_scope,
+                levels,
+                plan,
+                source,
+                topology_epoch,
+                job_id,
+            )
         } else {
             self.execute_rewrite_and_publish(
                 tree_idx,
@@ -489,6 +511,7 @@ impl DedicatedCompactor {
                 truncation_cursors,
                 schema_manager,
                 source,
+                topology_epoch,
                 job_id,
             )
         };
@@ -497,7 +520,7 @@ impl DedicatedCompactor {
         heartbeat_handle.stop();
         heartbeat_handle.join();
 
-        result
+        result.map(|()| true)
     }
 
     /// Starts a background thread that periodically refreshes the lease file for a job.
@@ -540,6 +563,7 @@ impl DedicatedCompactor {
         truncation_cursors: &crate::db_state::TruncationCursorMap,
         schema_manager: &Arc<SchemaManager>,
         source: &DedicatedCompactionSource,
+        topology_epoch: u64,
         job_id: &str,
     ) -> Result<()> {
         let runs = build_runs_for_plan(levels, plan, compaction_config);
@@ -610,6 +634,7 @@ impl DedicatedCompactor {
             version: DEDICATED_COMPACTION_RESULT_VERSION,
             job_id: job_id.to_string(),
             source: source.clone(),
+            topology_epoch,
             lsm_tree_idx: tree_idx,
             tree_scope: tree_scope.clone(),
             operation,
@@ -629,6 +654,7 @@ impl DedicatedCompactor {
     }
 
     /// Publishes a trivial move result (no new physical files).
+    #[allow(clippy::too_many_arguments)]
     fn publish_trivial_move_result(
         &self,
         tree_idx: usize,
@@ -636,6 +662,7 @@ impl DedicatedCompactor {
         levels: &[Level],
         plan: &crate::compaction::policy::CompactionPlan,
         source: &DedicatedCompactionSource,
+        topology_epoch: u64,
         job_id: &str,
     ) -> Result<()> {
         let input_file = Self::find_plan_file(levels, plan)?;
@@ -651,6 +678,7 @@ impl DedicatedCompactor {
             version: DEDICATED_COMPACTION_RESULT_VERSION,
             job_id: job_id.to_string(),
             source: source.clone(),
+            topology_epoch,
             lsm_tree_idx: tree_idx,
             tree_scope: tree_scope.clone(),
             operation,
@@ -678,6 +706,7 @@ impl DedicatedCompactor {
         plan: &crate::compaction::policy::CompactionPlan,
         truncation_cursors: &crate::db_state::TruncationCursorMap,
         source: &DedicatedCompactionSource,
+        topology_epoch: u64,
         job_id: &str,
         now_seconds: u32,
     ) -> Result<()> {
@@ -717,6 +746,7 @@ impl DedicatedCompactor {
             version: DEDICATED_COMPACTION_RESULT_VERSION,
             job_id: job_id.to_string(),
             source: source.clone(),
+            topology_epoch,
             lsm_tree_idx: tree_idx,
             tree_scope: tree_scope.clone(),
             operation,

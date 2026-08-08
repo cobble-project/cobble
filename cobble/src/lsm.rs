@@ -730,6 +730,12 @@ impl LSMTree {
         self.resolve_completed_compaction_locked(&mut state, tree_idx)
     }
 
+    /// Returns whether any compaction still owns a pending-slot fence. Callers that release
+    /// external file leases use this as a lightweight read-only drain check.
+    pub(crate) fn has_pending_compactions(&self) -> bool {
+        !self.state.lock().unwrap().pending_compaction.is_empty()
+    }
+
     /// Applies a successful compaction while holding the pending-compaction lock.
     ///
     /// Removing the pending marker and installing the edit must be atomic. Otherwise a flush can

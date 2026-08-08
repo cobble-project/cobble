@@ -44,16 +44,10 @@ use uuid::Uuid;
 const REMOTE_FILE_ID_START: u64 = u64::MAX / 2;
 /// Remote-compaction protocol version.
 ///
-/// Bumped to 3 when the request started carrying schema definitions (`schemas`). Because a
-/// compactor that predates this field silently ignores it (serde `default`) and then fails at
-/// runtime with "Missing schema version N", the minimum compatible version is also raised to 3.
-/// With both current and min-compatible at 3, v2 and v3 are mutually incompatible in both
-/// directions: a v3 writer is rejected by a v2 compactor (`peer_min(3) > local(2)`), and a v2
-/// writer is rejected by a v3 compactor (`peer(2) < local_min(3)`). There is therefore no safe
-/// rolling order — v2 and v3 cannot run mixed. The compactor and the writer (TaskManagers) must
-/// be upgraded together in the same maintenance window.
-const REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT: u32 = 3;
-const REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION: u32 = 3;
+/// Version 4 adds a topology token echoed by the server, so stale responses can be discarded
+/// before they alter the writer LSM. Version 4 endpoints must be upgraded together.
+const REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT: u32 = 4;
+const REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION: u32 = 4;
 type RemoteCompactionOutput = (Vec<RemoteDataFile>, Vec<(u32, i64)>, Vec<BlockCachePreload>);
 
 /// Checks whether a peer speaking `(peer_version, peer_min_compatible_version)` is compatible
@@ -329,6 +323,12 @@ struct RemoteDataFile {
     max_expired_at: u32,
 }
 
+#[derive(Clone, Copy)]
+enum RemoteReplicaUse {
+    ReadonlyView,
+    PendingAdoption,
+}
+
 impl RemoteDataFile {
     fn from_data_file(file: &DataFile, full_path: String) -> Self {
         Self {
@@ -366,14 +366,17 @@ impl RemoteDataFile {
         self,
         file_manager: &Arc<FileManager>,
         file_id: FileId,
-        readonly: bool,
+        replica_use: RemoteReplicaUse,
     ) -> Result<Arc<DataFile>> {
         let file_type = DataFileType::from_str(&self.file_type).map_err(Error::IoError)?;
         let path = self.full_path;
-        if readonly {
-            file_manager.register_data_file_readonly(file_id, &path)?;
-        } else {
-            file_manager.register_uncommitted_data_file(file_id, &path)?;
+        match replica_use {
+            RemoteReplicaUse::ReadonlyView => {
+                file_manager.register_data_file_readonly(file_id, &path)?;
+            }
+            RemoteReplicaUse::PendingAdoption => {
+                file_manager.register_data_file_pending_adoption(file_id, &path)?;
+            }
         }
         let data_file = DataFile::new(
             file_type,
@@ -427,6 +430,8 @@ pub(crate) struct RemoteCompactionRequest {
     request_id: Option<u64>,
     db_id: String,
     lsm_tree_idx: usize,
+    topology_epoch: u64,
+    tree_scope: crate::db_state::LSMTreeScope,
     column_family_id: u8,
     output_level: u8,
     writer_options: RemoteWriterOptions,
@@ -563,6 +568,8 @@ fn classify_server_error(err: &Error) -> RemoteCompactionErrorKind {
 struct RemoteCompactionResponse {
     version: u32,
     compatible_version: u32,
+    topology_epoch: u64,
+    tree_scope: crate::db_state::LSMTreeScope,
     output_files: Vec<RemoteDataFile>,
     vlog_entry_deltas: Vec<(u32, i64)>,
     /// Output block preload requests produced by the server-side compaction writer.
@@ -595,6 +602,8 @@ enum RemoteCompactionReply {
 
 impl RemoteCompactionResponse {
     fn ok(
+        topology_epoch: u64,
+        tree_scope: crate::db_state::LSMTreeScope,
         output_files: Vec<RemoteDataFile>,
         vlog_entry_deltas: Vec<(u32, i64)>,
         preload_block_keys: Vec<BlockCachePreload>,
@@ -602,6 +611,8 @@ impl RemoteCompactionResponse {
         Self {
             version: REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT,
             compatible_version: REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
+            topology_epoch,
+            tree_scope,
             output_files,
             vlog_entry_deltas,
             preload_block_keys,
@@ -616,6 +627,8 @@ impl RemoteCompactionResponse {
         Self {
             version: REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT,
             compatible_version: REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
+            topology_epoch: 0,
+            tree_scope: crate::db_state::LSMTreeScope::new(0..=0, 0),
             output_files: Vec::new(),
             vlog_entry_deltas: Vec::new(),
             preload_block_keys: Vec::new(),
@@ -835,13 +848,17 @@ impl RemoteCompactionWorker {
         let lsm_tree = self.lsm_tree.upgrade().ok_or_else(|| {
             Error::IoError("lsm tree dropped during remote compaction".to_string())
         })?;
-        let truncation_cursors = lsm_tree.db_state().load().truncation_cursors_snapshot();
-        let tree_scope = lsm_tree.tree_scope_of_tree(lsm_tree_idx).ok_or_else(|| {
-            Error::InvalidState(format!(
-                "missing tree scope for remote compaction tree {}",
-                lsm_tree_idx
-            ))
-        })?;
+        let state = lsm_tree.db_state().load();
+        let truncation_cursors = state.truncation_cursors_snapshot();
+        let tree_scope = state
+            .multi_lsm_version
+            .tree_scope_of_tree(lsm_tree_idx)
+            .ok_or_else(|| {
+                Error::InvalidState(format!(
+                    "missing tree scope for remote compaction tree {}",
+                    lsm_tree_idx
+                ))
+            })?;
         let runs = sorted_runs
             .iter()
             .map(|run| RemoteSortedRun::from_sorted_run(run, &self.file_manager))
@@ -903,6 +920,8 @@ impl RemoteCompactionWorker {
             request_id: None,
             db_id: self.metrics_manager.db_id().to_string(),
             lsm_tree_idx,
+            topology_epoch: state.topology_epoch,
+            tree_scope: tree_scope.clone(),
             column_family_id: tree_scope.column_family_id,
             output_level,
             writer_options: RemoteWriterOptions::from_writer_options(&writer_options, num_columns),
@@ -1179,6 +1198,8 @@ impl RemoteCompactionServer {
                     }
                     let request_id = request_id_counter.fetch_add(1, Ordering::SeqCst);
                     request.request_id = Some(request_id);
+                    let topology_epoch = request.topology_epoch;
+                    let tree_scope = request.tree_scope.clone();
                     info!("Received request: {}", request);
                     let response = match Self::handle_request_with(
                         &config,
@@ -1190,6 +1211,8 @@ impl RemoteCompactionServer {
                     ) {
                         Ok((files, vlog_entry_deltas, preload_block_keys)) => {
                             RemoteCompactionResponse::ok(
+                                topology_epoch,
+                                tree_scope,
                                 files,
                                 vlog_entry_deltas,
                                 preload_block_keys,
@@ -1246,7 +1269,7 @@ impl RemoteCompactionServer {
                     .into_iter()
                     .map(|file| {
                         let file_id = file.file_id;
-                        file.into_data_file(&file_manager, file_id, true)
+                        file.into_data_file(&file_manager, file_id, RemoteReplicaUse::ReadonlyView)
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(SortedRun::new(run.level, files))
@@ -1580,6 +1603,8 @@ pub(crate) fn execute_compaction_request(
     compaction_metrics: &super::CompactionTaskMetrics,
 ) -> RemoteCompactionOutcome {
     let output_level = request.output_level;
+    let topology_epoch = request.topology_epoch;
+    let tree_scope = request.tree_scope.clone();
     let response = match send_compaction_request_to(address, request, remote_timeout) {
         Ok(response) => response,
         Err(Error::IoError(msg)) if msg.contains("protocol incompatible") => {
@@ -1603,12 +1628,41 @@ pub(crate) fn execute_compaction_request(
             _ => RemoteCompactionOutcome::failed_transient(Error::IoError(error)),
         };
     }
+    if response.topology_epoch != topology_epoch || response.tree_scope != tree_scope {
+        cleanup_unregistered_remote_outputs(file_manager, &response.output_files);
+        return RemoteCompactionOutcome::failed_permanent(Error::InvalidState(
+            "remote compaction response topology token does not match request".to_string(),
+        ));
+    }
+    let current = lsm_tree.db_state().load();
+    if current.topology_epoch != topology_epoch
+        || current
+            .multi_lsm_version
+            .tree_scope_of_tree(lsm_tree_idx)
+            .as_ref()
+            != Some(&tree_scope)
+    {
+        cleanup_unregistered_remote_outputs(file_manager, &response.output_files);
+        return RemoteCompactionOutcome::failed_transient(Error::CancelledError(
+            "remote compaction response became stale before apply".to_string(),
+        ));
+    }
     let result = (|| -> Result<CompactionResult> {
         let input_bytes = sorted_runs
             .iter()
             .flat_map(|run| run.files().iter())
             .fold(0u64, |total, file| total.saturating_add(file.size as u64));
+        let remote_output_paths = response
+            .output_files
+            .iter()
+            .map(|file| file.full_path.clone())
+            .collect::<Vec<_>>();
         let output_ids = file_manager.reserve_data_file_ids(response.output_files.len());
+        let mut pending_outputs = PendingRemoteOutputCleanup::new(
+            Arc::clone(file_manager),
+            remote_output_paths,
+            output_ids.clone(),
+        );
         let remote_to_local_file_ids = response
             .output_files
             .iter()
@@ -1621,7 +1675,9 @@ pub(crate) fn execute_compaction_request(
             .output_files
             .into_iter()
             .zip(output_ids)
-            .map(|(file, file_id)| file.into_data_file(file_manager, file_id, false))
+            .map(|(file, file_id)| {
+                file.into_data_file(file_manager, file_id, RemoteReplicaUse::PendingAdoption)
+            })
             .collect::<Result<Vec<_>>>()?;
         let output_bytes = output_files
             .iter()
@@ -1634,16 +1690,25 @@ pub(crate) fn execute_compaction_request(
             let edit = VlogEdit::from_entry_deltas(response.vlog_entry_deltas);
             (!edit.is_empty()).then_some(edit)
         };
+        // Ownership promotion may fail, so complete it before the LSM can reference these files.
+        for file in &output_files {
+            file_manager.adopt_data_file(file.file_id)?;
+        }
         // Success path: release the pending slot and apply the edit exactly once.
         if lsm_tree
             .apply_compaction_result(lsm_tree_idx, edit.clone(), vlog_edit.clone())
             .is_some()
         {
+            pending_outputs.disarm();
             lsm_tree
                 .submit_block_cache_preload(Arc::clone(file_manager), preload_block_keys.clone());
             compaction_metrics.record_read_bytes(input_bytes);
             compaction_metrics.record_write_bytes(output_bytes);
             compaction_metrics.record_completed();
+        } else {
+            return Err(Error::CancelledError(
+                "remote compaction response became stale during apply".to_string(),
+            ));
         }
         Ok(CompactionResult::new(
             lsm_tree_idx,
@@ -1658,6 +1723,51 @@ pub(crate) fn execute_compaction_request(
         // Failures while remapping/applying the (already-validated) response are transient I/O
         // issues. The pending slot has not been released on this path, so the caller still owns it.
         Err(err) => RemoteCompactionOutcome::failed_transient(err),
+    }
+}
+
+fn cleanup_unregistered_remote_outputs(
+    file_manager: &Arc<FileManager>,
+    outputs: &[RemoteDataFile],
+) {
+    for output in outputs {
+        let _ = file_manager.remove_data_file_at_path(&output.full_path);
+    }
+}
+
+struct PendingRemoteOutputCleanup {
+    file_manager: Arc<FileManager>,
+    paths: Vec<String>,
+    file_ids: Vec<FileId>,
+    armed: bool,
+}
+
+impl PendingRemoteOutputCleanup {
+    fn new(file_manager: Arc<FileManager>, paths: Vec<String>, file_ids: Vec<FileId>) -> Self {
+        Self {
+            file_manager,
+            paths,
+            file_ids,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingRemoteOutputCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for file_id in &self.file_ids {
+            let _ = self.file_manager.remove_data_file(*file_id);
+        }
+        for path in &self.paths {
+            let _ = self.file_manager.remove_data_file_at_path(path);
+        }
     }
 }
 
@@ -2902,7 +3012,9 @@ mod tests {
         assert_eq!(remote.max_expired_at, 500);
 
         // into_data_file must restore max_expired_at.
-        let restored = remote.into_data_file(&file_manager, file_id, true).unwrap();
+        let restored = remote
+            .into_data_file(&file_manager, file_id, RemoteReplicaUse::ReadonlyView)
+            .unwrap();
         assert_eq!(restored.max_expired_at(), 500);
 
         cleanup_test_root(root);

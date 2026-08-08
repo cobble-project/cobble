@@ -1790,8 +1790,8 @@ impl FileManager {
         }
     }
 
-    /// Marks a data file as read-only, preventing it from being deleted on drop.
-    pub(crate) fn make_data_file_readonly(&self, file_id: FileId) -> Result<()> {
+    /// Publishes a compactor-produced replica for transfer without making it locally owned.
+    pub(crate) fn publish_data_file_transfer(&self, file_id: FileId) -> Result<()> {
         let logical = self.get_logical_file(file_id).ok_or_else(|| {
             Error::IoError(format!(
                 "Logical file {} is not tracked by FileManager",
@@ -1807,7 +1807,8 @@ impl FileManager {
         Ok(())
     }
 
-    pub(crate) fn make_data_file_owned(&self, file_id: FileId) -> Result<()> {
+    /// Adopts a previously published replica into the local owned lifecycle.
+    pub(crate) fn adopt_data_file(&self, file_id: FileId) -> Result<()> {
         let logical = self.get_logical_file(file_id).ok_or_else(|| {
             Error::IoError(format!(
                 "Logical file {} is not tracked by FileManager",
@@ -1820,7 +1821,6 @@ impl FileManager {
             .tracked
             .mark_for_deletion();
         logical.set_preferred_lifecycle(ReplicaLifecycle::OwnedReady);
-        logical.set_commit_state(FileCommitState::Committed);
         Ok(())
     }
 
@@ -2693,6 +2693,15 @@ impl FileManager {
             if volume.fs().exists(&path)? {
                 volume.fs().delete(&path)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Removes one data file addressed by a volume-qualified path.
+    pub(crate) fn remove_data_file_at_path(&self, path: &str) -> Result<()> {
+        let (volume, relative_path) = self.resolve_volume_path(path)?;
+        if volume.fs().exists(&relative_path)? {
+            volume.fs().delete(&relative_path)?;
         }
         Ok(())
     }

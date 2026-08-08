@@ -9,17 +9,17 @@
 //!    output paths in job namespace, no duplicate file ids, key ranges in tree scope, vlog
 //!    deltas valid).
 //! 2. Operation-specific status judgment: Pending / AppliedInMemory / Conflict.
-//! 3. If Pending: allocate canonical file ids for Rewrite outputs, register them readonly,
+//! 3. If Pending: allocate writer file ids for Rewrite outputs, register them for adoption,
 //!    resolve real input Arcs from the current LSM, apply VersionEdit + VlogEdit.
 //! 4. If freshly applied, run a snapshot barrier (flush + materialize with callback). On retry,
 //!    reuse an existing manifest only when it contains positive evidence for the operation;
 //!    otherwise create a new snapshot. Verify the resulting manifest in either case.
 //! 5. When runtime manifests are enabled, publish the applied DbState after the snapshot proof.
-//! 6. Once durability is proven: make outputs owned, delete the result.
+//! 6. Once durability is proven: adopt outputs, remove the job lease and result.
 //! 7. If Conflict: clean up uncommitted outputs, delete the result.
 use crate::compaction::dedicated::{
     DedicatedCompactionOperation, DedicatedCompactionResult, DedicatedDataFile, cleanup_job_dir,
-    dedicated_compaction_job_output_prefix, delete_dedicated_compaction_result,
+    dedicated_compaction_job_output_prefix, delete_dedicated_compaction_result, remove_job_lease,
 };
 use crate::compaction::dedicated_poller::PollerContext;
 use crate::data_file::{DataFile, DataFileType};
@@ -165,6 +165,7 @@ pub(crate) fn apply_external_compaction_result(
             }
             // Make outputs owned now that the manifest is committed, then delete the result.
             finalize_outputs(ctx, &output_path_to_id)?;
+            remove_job_lease(&ctx.file_manager, &result.job_id)?;
             delete_dedicated_compaction_result(&ctx.file_manager, &result.job_id)?;
             Ok(ExternalCompactionApplyResult::Applied)
         }
@@ -212,9 +213,21 @@ enum ApplyOutcome {
 // ---------------------------------------------------------------------------
 
 fn validate_result(ctx: &PollerContext, result: &DedicatedCompactionResult) -> Result<()> {
-    // Validate that the tree scope still exists.
-    let tree_idx = find_tree_by_scope(ctx, &result.tree_scope)?;
-    let _ = tree_idx; // used in apply
+    // A topology change invalidates every planned tree index and scope. Check this before
+    // registering outputs, suspending runtime publication, or touching canonical state.
+    let state = ctx.db_state.load();
+    if state.topology_epoch != result.topology_epoch
+        || state
+            .multi_lsm_version
+            .tree_scope_of_tree(result.lsm_tree_idx)
+            .as_ref()
+            != Some(&result.tree_scope)
+    {
+        return Err(Error::InvalidState(format!(
+            "dedicated compaction result {} was planned for stale topology epoch {}",
+            result.job_id, result.topology_epoch
+        )));
+    }
 
     // Validate input/output file id uniqueness within their sets.
     let mut seen_input_ids = std::collections::HashSet::new();
@@ -709,7 +722,7 @@ fn resolve_input_arcs(
 ///
 /// Each output is registered with a **real** `TrackedFileId::new` (not detached) so that when
 /// the file is eventually removed from the LSM, the FileManager's tracking is cleaned up and
-/// the physical file is deleted (once `make_data_file_owned` has been called).
+/// the physical file is deleted once its replica has been adopted.
 ///
 /// Returns the prepared `DataFile` Arcs **and** a mapping from each output's compactor path to
 /// the writer's canonical file id. Building the mapping here (before `apply_edit`) ensures that
@@ -740,7 +753,7 @@ fn prepare_outputs(
         // Use a real TrackedFileId (not detached) so the FileManager tracks the file's
         // lifecycle. When the DataFile is dropped from the LSM, the TrackedFileId's Drop
         // impl calls remove_data_file, which removes the TrackedFile from the FileManager.
-        // If make_data_file_owned was called (delete_on_drop=true), the TrackedFile's Drop
+        // Once the replica is adopted (delete_on_drop=true), the TrackedFile's Drop
         // then deletes the physical file.
         let data_file = DataFile::new(
             file_type,
@@ -1003,15 +1016,15 @@ fn finalize_outputs(ctx: &PollerContext, output_path_to_id: &HashMap<String, u64
     // Every output must be mapped to a canonical file id. If any is missing, the path
     // mapping failed, which is a programming error (not transient).
     for (path, file_id) in output_path_to_id {
-        ctx.file_manager
-            .make_data_file_owned(*file_id)
-            .map_err(|e| {
-                Error::InvalidState(format!(
-                    "failed to make output owned (path={}, file_id={}): {}",
-                    path, file_id, e
-                ))
-            })?;
+        ctx.file_manager.adopt_data_file(*file_id).map_err(|e| {
+            Error::InvalidState(format!(
+                "failed to adopt output (path={}, file_id={}): {}",
+                path, file_id, e
+            ))
+        })?;
     }
+    ctx.file_manager
+        .commit_logical_files(output_path_to_id.values().copied());
     if !output_path_to_id.is_empty() {
         ctx.file_manager.persist_replica_catalog()?;
     }
@@ -1173,6 +1186,17 @@ mod tests {
         let tree_version = make_tree_version(0, vec![live_input]);
         let status = classify_rewrite(&tree_version, &inputs, &outputs, 1, &fm);
         assert_eq!(status, OperationStatus::Pending);
+
+        let rerouted_input = DedicatedCompactionInput {
+            level: 0,
+            file: make_dedicated_file(input_id, "file:///alternate-volume/input.sst", "00", "ff"),
+        };
+        let status = classify_rewrite(&tree_version, &[rerouted_input], &outputs, 1, &fm);
+        assert_eq!(
+            status,
+            OperationStatus::Pending,
+            "input replica routing must not change logical compaction identity"
+        );
     }
 
     /// classify_apply_error must map storage errors to PreserveAndRetry (not Terminal),

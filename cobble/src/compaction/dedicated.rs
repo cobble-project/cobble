@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Current version of the dedicated compaction result format.
-pub(crate) const DEDICATED_COMPACTION_RESULT_VERSION: u32 = 3;
+pub(crate) const DEDICATED_COMPACTION_RESULT_VERSION: u32 = 4;
 
 /// Directory (relative to the db base dir) where result files live.
 pub(crate) const DEDICATED_COMPACTION_RESULTS_DIR: &str = "compaction/results";
@@ -187,11 +187,13 @@ impl DedicatedDataFile {
             && self.max_expired_at == file.max_expired_at
     }
 
-    /// Compares this descriptor against a `ManifestFile` for full fingerprint equality.
+    /// Compares this descriptor against a `ManifestFile` for logical input identity.
+    ///
+    /// The physical path deliberately does not participate: a replica route change does not
+    /// change the logical contents selected by a compaction plan.
     pub(crate) fn matches_manifest_file(&self, file: &ManifestFile) -> bool {
         self.file_id == file.file_id
             && self.file_type == file.file_type
-            && self.path == file.path
             && self.schema_id == file.schema_id
             && self.size == file.size
             && self.start_key == file.start_key
@@ -238,8 +240,7 @@ impl DedicatedDataFile {
             && self.max_expired_at == file.max_expired_at())
     }
 
-    /// Compares this descriptor against a live `DataFile` for full fingerprint equality (all
-    /// 13 fields, including `file_id` and `path`).
+    /// Compares this descriptor against a live `DataFile` for logical input identity.
     ///
     /// Keys are hex-encoded in the descriptor but raw bytes on the `DataFile`, so this method
     /// decodes the hex before comparing. The `FileManager` is needed to resolve the `DataFile`'s
@@ -250,13 +251,8 @@ impl DedicatedDataFile {
         file_manager: &Arc<FileManager>,
     ) -> Result<bool> {
         let (start_key, end_key) = self.decode_keys()?;
-        let file_path = file_manager.get_data_file_full_path(file.file_id);
-        let path_matches = match &file_path {
-            Some(p) => *p == self.path,
-            None => false,
-        };
-        Ok(path_matches
-            && self.file_id == file.file_id
+        let _ = file_manager;
+        Ok(self.file_id == file.file_id
             && self.file_type == file.file_type.to_string()
             && self.schema_id == file.schema_id
             && self.size == file.size
@@ -347,10 +343,9 @@ pub(crate) struct DedicatedCompactionResult {
     pub version: u32,
     pub job_id: String,
     /// The durable layout the compactor used to plan this operation. This is diagnostic only:
-    /// the writer applies against its current LSM fingerprints, not a requirement that this
-    /// source is still the latest when the result arrives.
+    /// the writer applies only when the planned topology still matches.
     pub source: DedicatedCompactionSource,
-    /// Hint only; the writer uses `tree_scope` to locate the current tree.
+    pub topology_epoch: u64,
     pub lsm_tree_idx: usize,
     pub tree_scope: LSMTreeScope,
     pub operation: DedicatedCompactionOperation,
@@ -487,6 +482,24 @@ pub(crate) fn dedicated_compaction_result_exists(
     file_manager.metadata_file_exists_untracked(&name)
 }
 
+/// Whether a dedicated compactor still has a published result or a live job lease.
+pub(crate) fn has_active_dedicated_compaction(file_manager: &Arc<FileManager>) -> Result<bool> {
+    if !list_dedicated_compaction_result_job_ids(file_manager)?.is_empty() {
+        return Ok(true);
+    }
+    for job_name in file_manager.list_metadata_names(DEDICATED_COMPACTION_JOBS_DIR)? {
+        let job_id = job_name.rsplit('/').next().unwrap_or(&job_name);
+        let lease_path = format!(
+            "{}/{}/{}",
+            DEDICATED_COMPACTION_JOBS_DIR, job_id, DEDICATED_COMPACTION_LEASE_FILE
+        );
+        if file_manager.metadata_file_exists_untracked(&lease_path)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 // ---------------------------------------------------------------------------
 // Orphan sweep: clean up stale job directories
 // ---------------------------------------------------------------------------
@@ -515,6 +528,15 @@ pub(crate) fn write_job_lease(file_manager: &Arc<FileManager>, job_id: &str) -> 
     Ok(())
 }
 
+/// Removes a completed job's lease while retaining its output directory for manifest-based GC.
+pub(crate) fn remove_job_lease(file_manager: &Arc<FileManager>, job_id: &str) -> Result<()> {
+    let lease_path = format!(
+        "{}/{}/{}",
+        DEDICATED_COMPACTION_JOBS_DIR, job_id, DEDICATED_COMPACTION_LEASE_FILE
+    );
+    file_manager.remove_metadata_volume_path(&lease_path)
+}
+
 /// Sweeps `compaction/jobs/` for orphaned job directories and removes them.
 ///
 /// A job directory is an orphan if:
@@ -532,7 +554,11 @@ pub(crate) fn sweep_orphan_job_dirs(
     min_age_ms: u64,
 ) -> Result<usize> {
     // Job directories live on data volumes (same volume as the output files).
-    let job_dir_names = file_manager.list_data_volume_names(DEDICATED_COMPACTION_JOBS_DIR)?;
+    let job_dir_names = file_manager
+        .list_data_volume_names(DEDICATED_COMPACTION_JOBS_DIR)?
+        .into_iter()
+        .chain(file_manager.list_metadata_names(DEDICATED_COMPACTION_JOBS_DIR)?)
+        .collect::<std::collections::BTreeSet<_>>();
     let active_result_job_ids = list_dedicated_compaction_result_job_ids(file_manager)?;
     // The filesystem's `last_modified` returns unix timestamps in **seconds** (see
     // `posix_fs.rs` / `opendal_fs.rs`), so we compute `now` in seconds for the age comparison.
@@ -641,6 +667,7 @@ mod tests {
                 generation: 42,
                 seq_id: 99,
             },
+            topology_epoch: 0,
             lsm_tree_idx: 0,
             tree_scope: LSMTreeScope::new(0u16..=0u16, 0),
             operation: DedicatedCompactionOperation::Rewrite {
@@ -802,12 +829,21 @@ mod tests {
         // --- Active job: fresh lease, no result, not referenced. Should survive. ---
         let active_job = "job-active";
         write_job_lease(&fm, active_job).unwrap();
+        assert!(
+            has_active_dedicated_compaction(&fm).unwrap(),
+            "a lease alone must fence topology changes before the first output exists"
+        );
         // Create a dummy output file under the job's data dir on the data volume.
         fm.create_data_file_with_prefix(&format!(
             "{}/{}/data",
             DEDICATED_COMPACTION_JOBS_DIR, active_job
         ))
         .unwrap();
+
+        // This job crashes before creating an output directory. Its metadata-only lease must
+        // still be swept once stale, otherwise it would permanently fence topology changes.
+        let lease_only_job = "job-lease-only";
+        write_job_lease(&fm, lease_only_job).unwrap();
 
         // --- Crashed job: stale lease (written then we sleep past min_age), no result,
         //     not referenced. Should be deleted. ---
@@ -845,12 +881,11 @@ mod tests {
 
         // Sweep with a 100ms min age (rounds up to 1s). The active job's lease is fresh,
         // so it survives. The crashed and committed jobs have stale leases. The committed
-        // job survives because its output is referenced by the manifest. Only the crashed
-        // job is swept.
+        // job survives because its output is referenced by the manifest. The crashed data job
+        // and the metadata-only lease are swept.
         let swept = sweep_orphan_job_dirs(&fm, &manifest_paths, 100).unwrap();
 
-        // Only the crashed job should have been swept.
-        assert_eq!(swept, 1, "exactly the crashed job should be swept");
+        assert_eq!(swept, 2, "both crashed job forms should be swept");
 
         // Active job dir should still exist (lease is fresh).
         let active_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, active_job);
@@ -859,8 +894,21 @@ mod tests {
             "active job directory should survive (fresh lease)"
         );
 
-        // Committed job dir should still exist (output referenced by manifest).
+        remove_job_lease(&fm, committed_job).unwrap();
+        assert!(
+            !fm.metadata_file_exists_untracked(&format!(
+                "{}/{}/{}",
+                DEDICATED_COMPACTION_JOBS_DIR, committed_job, DEDICATED_COMPACTION_LEASE_FILE
+            ))
+            .unwrap()
+        );
         let committed_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, committed_job);
+        assert!(
+            fm.data_volume_path_exists(&committed_dir).unwrap(),
+            "removing a completed lease must retain manifest-referenced output"
+        );
+
+        // Committed job dir should still exist (output referenced by manifest).
         assert!(
             fm.data_volume_path_exists(&committed_dir).unwrap(),
             "committed job directory should survive (referenced by manifest)"
@@ -871,6 +919,14 @@ mod tests {
         assert!(
             !fm.data_volume_path_exists(&crashed_dir).unwrap(),
             "crashed job directory should be swept"
+        );
+        assert!(
+            !fm.metadata_file_exists_untracked(&format!(
+                "{}/{}/{}",
+                DEDICATED_COMPACTION_JOBS_DIR, lease_only_job, DEDICATED_COMPACTION_LEASE_FILE
+            ))
+            .unwrap(),
+            "metadata-only crashed lease should be swept"
         );
     }
 

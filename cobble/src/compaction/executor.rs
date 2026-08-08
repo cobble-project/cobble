@@ -916,7 +916,7 @@ impl CompactionExecutor {
             // If files were created in read-only mode, we need to mark them as read-only
             // after writing is complete so they can be opened by other processes.
             for file in &output_files {
-                task.file_manager.make_data_file_readonly(file.file_id)?;
+                task.file_manager.publish_data_file_transfer(file.file_id)?;
             }
         }
         task.metrics.record_completed();

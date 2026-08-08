@@ -1288,7 +1288,7 @@ impl Db {
         };
         let adoption_coordinator = Arc::new(rescale::AdoptionCoordinator::new(
             (id.clone(), config.clone()),
-            Arc::clone(&file_manager),
+            (Arc::clone(&file_manager), Arc::clone(&lsm_tree)),
             Arc::clone(&db_state),
             Arc::clone(&db_lifecycle),
             Arc::clone(&memtable_manager),
