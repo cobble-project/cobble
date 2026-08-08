@@ -929,6 +929,17 @@ impl Db {
         F: Fn(Result<crate::coordinator::ShardSnapshotInput>) + Send + Sync + 'static,
     {
         let _access = self.begin_access()?;
+        self.create_snapshot_with_callback(callback)
+    }
+
+    /// Creates a snapshot while the caller already owns database access.
+    ///
+    /// Topology cutover uses this under exclusive access, where taking another
+    /// ordinary access guard would be rejected by design.
+    fn create_snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
+    where
+        F: Fn(Result<crate::coordinator::ShardSnapshotInput>) + Send + Sync + 'static,
+    {
         let db_id = self.id.clone();
         let timestamp_seconds = self.now_seconds();
         let schema_manager = Arc::clone(&self.schema_manager);
@@ -951,6 +962,19 @@ impl Db {
         });
         self.memtable_manager
             .create_snapshot(self.snapshot_manager.clone(), Some(wrapper))
+    }
+
+    fn create_snapshot_and_wait(&self, operation: &str) -> Result<u64> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let snapshot_id = self.create_snapshot_with_callback(move |result| {
+            let _ = tx.send(result);
+        })?;
+        rx.recv().map_err(|_| {
+            Error::IoError(format!(
+                "Snapshot {snapshot_id} callback was dropped during {operation}"
+            ))
+        })??;
+        Ok(snapshot_id)
     }
 
     /// Cancel an in-flight snapshot before manifest publication completes.
@@ -3202,13 +3226,13 @@ mod tests {
             .as_ref()
             .expect("enabled runtime manifest publisher");
 
-        assert!(publisher.suspend_for_dedicated_apply("test-job").unwrap());
+        assert!(publisher.suspend_for_owner("test-job").unwrap());
         assert!(
-            !publisher.suspend_for_dedicated_apply("test-job").unwrap(),
+            !publisher.suspend_for_owner("test-job").unwrap(),
             "same-job retry must reuse the existing suspension"
         );
         assert!(
-            publisher.suspend_for_dedicated_apply("other-job").is_err(),
+            publisher.suspend_for_owner("other-job").is_err(),
             "another job cannot take over an unproven edit"
         );
         db.put(0, b"suspended-key", 0, vec![b'x'; 96]).unwrap();
@@ -3263,14 +3287,11 @@ mod tests {
         db.runtime_manifest_publisher
             .as_ref()
             .unwrap()
-            .suspend_for_dedicated_apply("close-test-job")
+            .suspend_for_owner("close-test-job")
             .unwrap();
 
         let err = db.close().expect_err("close must reject suspended publish");
-        assert!(
-            err.to_string()
-                .contains("suspended for unproven dedicated compaction job close-test-job")
-        );
+        assert!(err.to_string().contains("suspended for close-test-job"));
         cleanup_test_root(root);
     }
 

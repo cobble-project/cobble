@@ -52,6 +52,10 @@ pub(crate) enum ExternalCompactionApplyResult {
     TerminalInvalid,
 }
 
+pub(crate) fn dedicated_publication_owner(job_id: &str) -> String {
+    format!("dedicated:{job_id}")
+}
+
 /// Entry point called by the poller. Applies (or re-confirms) a dedicated compaction result.
 ///
 /// Returns:
@@ -71,10 +75,11 @@ pub(crate) fn apply_external_compaction_result(
     result: &DedicatedCompactionResult,
     expected_job_id: &str,
 ) -> Result<ExternalCompactionApplyResult> {
+    let publication_owner = dedicated_publication_owner(expected_job_id);
     let owns_existing_suspension = ctx
         .runtime_manifest_publisher
         .as_ref()
-        .is_some_and(|publisher| publisher.owns_dedicated_apply_suspension(expected_job_id));
+        .is_some_and(|publisher| publisher.owns_suspension(&publication_owner));
 
     // Validate that the result's job_id matches the file name's job_id.
     if result.job_id != expected_job_id {
@@ -111,7 +116,7 @@ pub(crate) fn apply_external_compaction_result(
     // LSM. The suspension is persistent so a failed attempt cannot expose an unproven edit when
     // its stack unwinds; the next retry resumes from the same state.
     if let Some(publisher) = &ctx.runtime_manifest_publisher {
-        publisher.suspend_for_dedicated_apply(expected_job_id)?;
+        publisher.suspend_for_owner(&publication_owner)?;
     }
 
     // Step 2: operation-specific status judgment + apply.
@@ -124,7 +129,7 @@ pub(crate) fn apply_external_compaction_result(
                 return Err(err);
             }
             if let Some(publisher) = &ctx.runtime_manifest_publisher {
-                publisher.resume_without_publish(expected_job_id)?;
+                publisher.resume_without_publish(&publication_owner)?;
             }
             debug!(
                 "dedicated compaction result {} apply error (terminal): {}",
@@ -156,7 +161,7 @@ pub(crate) fn apply_external_compaction_result(
             // edit durable. If this publication fails, preserve the result and readonly outputs
             // so a retry can prove the snapshot again and advance runtime CURRENT later.
             if let Some(publisher) = &ctx.runtime_manifest_publisher {
-                publisher.publish_at_least_and_resume(expected_job_id, applied_seq_id)?;
+                publisher.publish_at_least_and_resume(&publication_owner, applied_seq_id)?;
             }
             // Make outputs owned now that the manifest is committed, then delete the result.
             finalize_outputs(ctx, &output_path_to_id)?;
@@ -170,7 +175,7 @@ pub(crate) fn apply_external_compaction_result(
                 )));
             }
             if let Some(publisher) = &ctx.runtime_manifest_publisher {
-                publisher.resume_without_publish(expected_job_id)?;
+                publisher.resume_without_publish(&publication_owner)?;
             }
             // Clean up uncommitted outputs and delete result.
             cleanup_uncommitted_outputs(ctx, result)?;

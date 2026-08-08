@@ -15,7 +15,8 @@ use crate::compaction::dedicated::{
     read_dedicated_compaction_result, sweep_orphan_job_dirs,
 };
 use crate::compaction::dedicated_apply::{
-    ExternalCompactionApplyResult, apply_external_compaction_result, is_transient_error,
+    ExternalCompactionApplyResult, apply_external_compaction_result, dedicated_publication_owner,
+    is_transient_error,
 };
 use crate::config::Config;
 use crate::db_state::DbStateHandle;
@@ -215,15 +216,21 @@ fn poll_once(
     // A suspended job owns an unproven in-memory edit and must remain the only result processed
     // until its durability barrier completes. If its file is temporarily absent, preserve the
     // suspension instead of moving on to unrelated work.
-    let suspended_job_id = ctx
+    let suspended_owner = ctx
         .runtime_manifest_publisher
         .as_ref()
-        .and_then(|publisher| publisher.dedicated_apply_suspension_owner());
-    let job_id = if let Some(owner) = suspended_job_id.as_deref() {
-        let Some(job_id) = job_ids.iter().find(|job_id| job_id.as_str() == owner) else {
+        .and_then(|publisher| publisher.suspension_owner());
+    let job_id = if let Some(owner) = suspended_owner.as_deref() {
+        let Some(dedicated_job_id) = owner.strip_prefix("dedicated:") else {
+            return Ok(PollOutcome::RetryDeferred);
+        };
+        let Some(job_id) = job_ids
+            .iter()
+            .find(|job_id| job_id.as_str() == dedicated_job_id)
+        else {
             warn!(
                 "suspended dedicated compaction result {} is absent; waiting for its retry record",
-                owner
+                dedicated_job_id
             );
             return Ok(PollOutcome::RetryDeferred);
         };
@@ -331,7 +338,7 @@ fn poll_once(
 fn result_job_owns_suspension(ctx: &PollerContext, job_id: &str) -> bool {
     ctx.runtime_manifest_publisher
         .as_ref()
-        .is_some_and(|publisher| publisher.owns_dedicated_apply_suspension(job_id))
+        .is_some_and(|publisher| publisher.owns_suspension(&dedicated_publication_owner(job_id)))
 }
 
 enum ReadResultError {

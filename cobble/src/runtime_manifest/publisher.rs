@@ -44,7 +44,7 @@ struct RuntimeManifestPublisher {
 struct PublicationState {
     current: Option<LoadedRuntimeManifest>,
     next_generation: u64,
-    suspended_job_id: Option<String>,
+    suspended_owner: Option<String>,
 }
 
 impl RuntimeManifestPublisherHandle {
@@ -69,7 +69,7 @@ impl RuntimeManifestPublisherHandle {
             publication: Mutex::new(PublicationState {
                 current,
                 next_generation,
-                suspended_job_id: None,
+                suspended_owner: None,
             }),
             stop: AtomicBool::new(false),
         });
@@ -105,34 +105,34 @@ impl RuntimeManifestPublisherHandle {
         self.publisher.publish_at_least(seq_id)
     }
 
-    /// Suspends background publication before a dedicated compaction may edit the LSM.
+    /// Suspends background publication for one exclusive topology owner.
     ///
     /// Locking `publication` waits for any publication already in progress. The flag persists
     /// across failed result attempts and repeated calls are intentionally idempotent.
-    pub(crate) fn suspend_for_dedicated_apply(&self, job_id: &str) -> Result<bool> {
-        self.publisher.suspend_for_dedicated_apply(job_id)
+    pub(crate) fn suspend_for_owner(&self, owner: &str) -> Result<bool> {
+        self.publisher.suspend_for_owner(owner)
     }
 
     /// Clears a suspension after an attempt proved that no edit was applied.
-    pub(crate) fn resume_without_publish(&self, job_id: &str) -> Result<()> {
-        self.publisher.resume_without_publish(job_id)
+    pub(crate) fn resume_without_publish(&self, owner: &str) -> Result<()> {
+        self.publisher.resume_without_publish(owner)
     }
 
     /// Publishes a snapshot-proven state and clears suspension only after publication succeeds.
-    pub(crate) fn publish_at_least_and_resume(&self, job_id: &str, seq_id: u64) -> Result<()> {
-        self.publisher.publish_at_least_and_resume(job_id, seq_id)
+    pub(crate) fn publish_at_least_and_resume(&self, owner: &str, seq_id: u64) -> Result<()> {
+        self.publisher.publish_at_least_and_resume(owner, seq_id)
     }
 
-    pub(crate) fn owns_dedicated_apply_suspension(&self, job_id: &str) -> bool {
-        self.dedicated_apply_suspension_owner().as_deref() == Some(job_id)
+    pub(crate) fn owns_suspension(&self, owner: &str) -> bool {
+        self.suspension_owner().as_deref() == Some(owner)
     }
 
-    pub(crate) fn dedicated_apply_suspension_owner(&self) -> Option<String> {
+    pub(crate) fn suspension_owner(&self) -> Option<String> {
         self.publisher
             .publication
             .lock()
             .unwrap()
-            .suspended_job_id
+            .suspended_owner
             .clone()
     }
 
@@ -187,8 +187,8 @@ impl RuntimeManifestPublisher {
 
     fn publish_at_least(&self, seq_id: u64) -> Result<()> {
         let mut publication = self.publication.lock().unwrap();
-        if let Some(job_id) = &publication.suspended_job_id {
-            return Err(suspended_publication_error(job_id));
+        if let Some(owner) = &publication.suspended_owner {
+            return Err(suspended_publication_error(owner));
         }
         let state = self.db_state.load();
         if state.seq_id < seq_id {
@@ -202,8 +202,8 @@ impl RuntimeManifestPublisher {
 
     fn publish_current(&self) -> Result<()> {
         let mut publication = self.publication.lock().unwrap();
-        if let Some(job_id) = &publication.suspended_job_id {
-            return Err(suspended_publication_error(job_id));
+        if let Some(owner) = &publication.suspended_owner {
+            return Err(suspended_publication_error(owner));
         }
         let state = self.db_state.load();
         self.publish_state_locked(&mut publication, state, false)
@@ -217,53 +217,51 @@ impl RuntimeManifestPublisher {
 
     fn publish_background_current(&self) -> Result<()> {
         let mut publication = self.publication.lock().unwrap();
-        if publication.suspended_job_id.is_some() {
+        if publication.suspended_owner.is_some() {
             return Ok(());
         }
         let state = self.db_state.load();
         self.publish_state_locked(&mut publication, state, false)
     }
 
-    fn suspend_for_dedicated_apply(&self, job_id: &str) -> Result<bool> {
+    fn suspend_for_owner(&self, owner: &str) -> Result<bool> {
         let mut publication = self.publication.lock().unwrap();
-        match publication.suspended_job_id.as_deref() {
+        match publication.suspended_owner.as_deref() {
             None => {
-                publication.suspended_job_id = Some(job_id.to_string());
+                publication.suspended_owner = Some(owner.to_string());
                 Ok(true)
             }
-            Some(owner) if owner == job_id => Ok(false),
-            Some(owner) => Err(Error::InvalidState(format!(
-                "Runtime manifest publication is suspended for dedicated compaction job {owner}, not {job_id}"
+            Some(current_owner) if current_owner == owner => Ok(false),
+            Some(current_owner) => Err(Error::InvalidState(format!(
+                "Runtime manifest publication is suspended for {current_owner}, not {owner}"
             ))),
         }
     }
 
-    fn resume_without_publish(&self, job_id: &str) -> Result<()> {
+    fn resume_without_publish(&self, owner: &str) -> Result<()> {
         let mut publication = self.publication.lock().unwrap();
-        match publication.suspended_job_id.as_deref() {
-            Some(owner) if owner == job_id => {
-                publication.suspended_job_id = None;
+        match publication.suspended_owner.as_deref() {
+            Some(current_owner) if current_owner == owner => {
+                publication.suspended_owner = None;
                 drop(publication);
                 self.db_state.notify_changed();
                 Ok(())
             }
             None => Ok(()),
-            Some(owner) => Err(Error::InvalidState(format!(
-                "Dedicated compaction job {job_id} cannot resume runtime publication owned by {owner}"
+            Some(current_owner) => Err(Error::InvalidState(format!(
+                "Runtime publication owner {owner} cannot resume publication owned by {current_owner}"
             ))),
         }
     }
 
-    fn publish_at_least_and_resume(&self, job_id: &str, seq_id: u64) -> Result<()> {
+    fn publish_at_least_and_resume(&self, owner: &str, seq_id: u64) -> Result<()> {
         let mut publication = self.publication.lock().unwrap();
-        if publication.suspended_job_id.as_deref() != Some(job_id) {
-            return Err(Error::InvalidState(match &publication.suspended_job_id {
-                Some(owner) => format!(
-                    "Dedicated compaction job {job_id} cannot publish runtime state owned by {owner}"
+        if publication.suspended_owner.as_deref() != Some(owner) {
+            return Err(Error::InvalidState(match &publication.suspended_owner {
+                Some(current_owner) => format!(
+                    "Runtime publication owner {owner} cannot publish state owned by {current_owner}"
                 ),
-                None => {
-                    "Runtime manifest publisher is not suspended for dedicated apply".to_string()
-                }
+                None => "Runtime manifest publisher is not suspended".to_string(),
             }));
         }
         let state = self.db_state.load();
@@ -274,7 +272,7 @@ impl RuntimeManifestPublisher {
             )));
         }
         self.publish_state_locked(&mut publication, state, true)?;
-        publication.suspended_job_id = None;
+        publication.suspended_owner = None;
         drop(publication);
         self.db_state.notify_changed();
         Ok(())
@@ -342,9 +340,9 @@ impl RuntimeManifestPublisher {
     }
 }
 
-fn suspended_publication_error(job_id: &str) -> Error {
+fn suspended_publication_error(owner: &str) -> Error {
     Error::InvalidState(format!(
-        "Runtime manifest publication is suspended for unproven dedicated compaction job {job_id}"
+        "Runtime manifest publication is suspended for {owner}"
     ))
 }
 
