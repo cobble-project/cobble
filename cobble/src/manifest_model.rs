@@ -304,9 +304,8 @@ fn build_data_file(
     Ok(Arc::new(data_file))
 }
 
-/// Verifies every logical file in a durable layout is readable through its selected physical
-/// replica. Consumers must register all manifest descriptors and apply their replica catalog
-/// before calling this; the manifest path is only the logical-layout fallback.
+/// Verifies every logical file in a durable layout is readable through the path registered in
+/// its runtime manifest descriptor.
 pub(crate) fn ensure_preferred_replicas_readable(
     file_manager: &Arc<FileManager>,
     tree_levels: &[Vec<ManifestLevel>],

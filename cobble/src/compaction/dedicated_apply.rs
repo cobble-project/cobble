@@ -1026,9 +1026,6 @@ fn finalize_outputs(ctx: &PollerContext, output_path_to_id: &HashMap<String, u64
     }
     ctx.file_manager
         .commit_logical_files(output_path_to_id.values().copied());
-    if !output_path_to_id.is_empty() {
-        ctx.file_manager.persist_replica_catalog()?;
-    }
     Ok(())
 }
 

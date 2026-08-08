@@ -390,8 +390,6 @@ impl DedicatedCompactor {
             build_tree_versions_from_levels(&self.file_manager, &observation.tree_levels, true)?;
         let _vlog_version =
             build_vlog_version_from_files(&self.file_manager, &observation.vlog_files, true)?;
-        self.file_manager
-            .load_replica_catalog_as_readonly_consumer()?;
         ensure_preferred_replicas_readable(
             &self.file_manager,
             &observation.tree_levels,

@@ -397,6 +397,25 @@ impl LogicalFile {
         }
     }
 
+    pub(crate) fn restore_replica_state_snapshot(&self, snapshot: ReplicaStateSnapshot) {
+        self.restore_replica_state_with_origins(
+            snapshot
+                .replicas
+                .into_iter()
+                .map(|replica| {
+                    (
+                        replica.replica_id,
+                        Arc::clone(&replica.tracked),
+                        replica.lifecycle(),
+                        replica.origin(),
+                    )
+                })
+                .collect(),
+            snapshot.preferred_replica_id,
+            snapshot.durable_replica_id,
+        );
+    }
+
     pub(crate) fn replica_at_absolute_path(&self, path: &str) -> Option<Arc<PhysicalReplica>> {
         self.replica_state
             .read()

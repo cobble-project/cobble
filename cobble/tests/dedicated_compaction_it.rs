@@ -426,12 +426,12 @@ fn test_dedicated_compaction_basic() {
 
 #[test]
 #[serial(file)]
-fn dedicated_compactor_reads_tiered_catalog_replica() {
-    let root = "/tmp/dedicated_compaction_tiered_catalog";
+fn dedicated_compactor_reads_tiered_runtime_manifest_replica() {
+    let root = "/tmp/dedicated_compaction_tiered_runtime_manifest";
     let high_root = format!("{root}/high");
     let low_root = format!("{root}/low");
     cleanup_test_root(root);
-    let db_id = "dedicated-compaction-tiered-catalog".to_string();
+    let db_id = "dedicated-compaction-tiered-runtime-manifest".to_string();
     let mut config = dedicated_config(root);
     let mut high = VolumeDescriptor::new(
         format!("file://{high_root}"),
@@ -473,12 +473,16 @@ fn dedicated_compactor_reads_tiered_catalog_replica() {
     assert!(wait_for(
         Duration::from_secs(20),
         Duration::from_millis(50),
-        || !source.exists() && count_data_files(&low_root) > 0
+        || {
+            !source.exists()
+                && count_data_files(&low_root) > 0
+                && !current_runtime_manifest_references_path(root, &source_url)
+                && current_runtime_manifest_referenced_data_file(root, &low_root).is_some()
+        }
     ));
-    assert!(current_runtime_manifest_references_path(root, &source_url));
 
-    // `run_once` performs the same observation rebuild as `probe`: it must load the catalog
-    // route to the surviving low-priority replica before validating or selecting a plan.
+    // `run_once` performs the same observation rebuild as `probe`: it must use the surviving
+    // low-priority route registered in the runtime manifest before planning.
     let compactor = Arc::new(DedicatedCompactor::open(config, db_id).unwrap());
     let worker = Arc::clone(&compactor);
     let handle = std::thread::spawn(move || worker.run_once());

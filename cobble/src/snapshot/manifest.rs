@@ -23,8 +23,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Snapshot manifests version 2 require SST row keys with big-endian bucket prefixes.
-/// Version 3 adds per-file `max_expired_at`; version 4 adds replica origins; version 5 adds topology epoch.
-pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 5;
+/// Version 3 adds per-file `max_expired_at`; version 4 adds replica origins and topology epochs.
+pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 4;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
@@ -934,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_manifest_v3_to_v5_preserve_file_extensions() {
+    fn decode_manifest_v3_and_v4_preserve_file_extensions() {
         let v3 = r#"{
             "version": 3,
             "id": 1,
@@ -967,29 +967,23 @@ mod tests {
             _ => panic!("expected snapshot payload"),
         }
 
-        let v4 = v3.replace(
-            "\"version\": 3",
-            "\"version\": 4",
-        ).replace(
-            "\"max_expired_at\": 5000}",
-            "\"max_expired_at\": 5000, \"origin\": {\"kind\": \"external_leased\", \"export_id\": \"runtime-export\"}}",
-        );
+        let v4 = v3
+            .replace("\"version\": 3", "\"version\": 4")
+            .replace("\"seq_id\": 2,", "\"seq_id\": 2, \"topology_epoch\": 7,")
+            .replace(
+                "\"max_expired_at\": 5000}",
+                "\"max_expired_at\": 5000, \"origin\": {\"kind\": \"external_leased\", \"export_id\": \"runtime-export\"}}",
+            );
         let payload = decode_manifest(v4.as_bytes()).expect("v4 manifest should decode");
         match payload {
-            ManifestPayload::Snapshot(s) => assert!(matches!(
-                s.tree_levels[0][0].files[0].origin,
-                crate::file::logical_file::ReplicaOrigin::ExternalLeased { ref export_id }
-                    if export_id == "runtime-export"
-            )),
-            _ => panic!("expected snapshot payload"),
-        }
-
-        let v5 = v4
-            .replace("\"version\": 4", "\"version\": 5")
-            .replace("\"seq_id\": 2,", "\"seq_id\": 2, \"topology_epoch\": 7,");
-        let payload = decode_manifest(v5.as_bytes()).expect("v5 manifest should decode");
-        match payload {
-            ManifestPayload::Snapshot(s) => assert_eq!(s.topology_epoch, 7),
+            ManifestPayload::Snapshot(s) => {
+                assert_eq!(s.topology_epoch, 7);
+                assert!(matches!(
+                    s.tree_levels[0][0].files[0].origin,
+                    crate::file::logical_file::ReplicaOrigin::ExternalLeased { ref export_id }
+                        if export_id == "runtime-export"
+                ));
+            }
             _ => panic!("expected snapshot payload"),
         }
     }
@@ -1044,7 +1038,7 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("Unsupported snapshot manifest version: 1 (expected 2..=5)")
+                .contains("Unsupported snapshot manifest version: 1 (expected 2..=4)")
         );
     }
 }

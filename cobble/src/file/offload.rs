@@ -1447,40 +1447,16 @@ impl FileManager {
         )?;
         owned.set_priority(source.priority());
         let rollback_state = logical.replica_state_snapshot();
-        let rollback_replicas = rollback_state
-            .replicas
-            .iter()
-            .map(|replica| {
-                (
-                    replica.replica_id,
-                    Arc::clone(&replica.tracked),
-                    replica.lifecycle(),
-                    replica.origin(),
-                )
-            })
-            .collect::<Vec<_>>();
         let Some(source_replica_id) =
             self.select_new_replica_retaining_source_if(file_id, &source, Arc::clone(&owned))
         else {
             return Ok(false);
         };
-        if let Err(err) = self.persist_replica_catalog() {
-            logical.restore_replica_state_with_origins(
-                rollback_replicas.clone(),
-                Some(source_replica_id),
-                Some(source_replica_id),
-            );
+        if let Err(err) = self.publish_durable_replica_route() {
+            logical.restore_replica_state_snapshot(rollback_state);
             return Err(err);
         }
         self.retire_replica(file_id, source_replica_id);
-        if let Err(err) = self.persist_replica_catalog() {
-            logical.restore_replica_state_with_origins(
-                rollback_replicas,
-                Some(source_replica_id),
-                Some(source_replica_id),
-            );
-            return Err(err);
-        }
         Ok(true)
     }
 
@@ -1603,32 +1579,11 @@ impl FileManager {
             self.create_untracked_data_file_writer_on_volume(target_volume)?;
         self.copy_reader_to_tracked_writer_with_progress(reader.as_ref(), &mut writer, progress)?;
         owned.set_priority(source.priority());
-        let rollback_state = logical.replica_state_snapshot();
-        let rollback_replicas = rollback_state
-            .replicas
-            .iter()
-            .map(|replica| {
-                (
-                    replica.replica_id,
-                    Arc::clone(&replica.tracked),
-                    replica.lifecycle(),
-                    replica.origin(),
-                )
-            })
-            .collect::<Vec<_>>();
         if logical
             .add_and_select_replica_if(&source, Arc::clone(&owned), ReplicaLifecycle::OwnedReady)
             .is_none()
         {
             return Ok(false);
-        }
-        if let Err(err) = self.persist_replica_catalog() {
-            logical.restore_replica_state_with_origins(
-                rollback_replicas,
-                rollback_state.preferred_replica_id,
-                rollback_state.durable_replica_id,
-            );
-            return Err(err);
         }
         Ok(true)
     }
@@ -1660,19 +1615,6 @@ impl FileManager {
         {
             return Ok(false);
         }
-        let rollback_state = logical.replica_state_snapshot();
-        let rollback_replicas = rollback_state
-            .replicas
-            .iter()
-            .map(|replica| {
-                (
-                    replica.replica_id,
-                    Arc::clone(&replica.tracked),
-                    replica.lifecycle(),
-                    replica.origin(),
-                )
-            })
-            .collect::<Vec<_>>();
         let source_replica_id = logical
             .preferred_replica_any()
             .expect("preferred replica")
@@ -1709,25 +1651,7 @@ impl FileManager {
                 .expect("new preferred replica")
                 .replica_id
         };
-        if let Err(err) = self.persist_replica_catalog() {
-            logical.restore_replica_state_with_origins(
-                rollback_replicas.clone(),
-                rollback_state.preferred_replica_id,
-                rollback_state.durable_replica_id,
-            );
-            rollback();
-            return Err(err);
-        }
         self.retire_replica(file_id, source_replica_id);
-        if let Err(err) = self.persist_replica_catalog() {
-            logical.restore_replica_state_with_origins(
-                rollback_replicas,
-                rollback_state.preferred_replica_id,
-                rollback_state.durable_replica_id,
-            );
-            rollback();
-            return Err(err);
-        }
         debug_assert_eq!(
             logical
                 .preferred_replica_any()
@@ -2068,18 +1992,6 @@ impl FileManager {
                 .tracked
                 .set_priority(source_tracked.priority());
             let rollback_state = logical.replica_state_snapshot();
-            let rollback_replicas = rollback_state
-                .replicas
-                .iter()
-                .map(|replica| {
-                    (
-                        replica.replica_id,
-                        Arc::clone(&replica.tracked),
-                        replica.lifecycle(),
-                        replica.origin(),
-                    )
-                })
-                .collect::<Vec<_>>();
             let Some(source_replica_id) = self.select_existing_replica_retaining_source_if(
                 file_id,
                 &source_tracked,
@@ -2087,23 +1999,11 @@ impl FileManager {
             ) else {
                 return Ok(false);
             };
-            if let Err(err) = self.persist_replica_catalog() {
-                logical.restore_replica_state_with_origins(
-                    rollback_replicas.clone(),
-                    Some(source_replica_id),
-                    Some(source_replica_id),
-                );
+            if let Err(err) = self.publish_durable_replica_route() {
+                logical.restore_replica_state_snapshot(rollback_state);
                 return Err(err);
             }
             self.retire_replica(file_id, source_replica_id);
-            if let Err(err) = self.persist_replica_catalog() {
-                logical.restore_replica_state_with_origins(
-                    rollback_replicas,
-                    Some(source_replica_id),
-                    Some(source_replica_id),
-                );
-                return Err(err);
-            }
             self.record_offload_completed_promotion();
             return Ok(true);
         }
@@ -2127,18 +2027,6 @@ impl FileManager {
             return Ok(false);
         };
         let rollback_state = logical.replica_state_snapshot();
-        let rollback_replicas = rollback_state
-            .replicas
-            .iter()
-            .map(|replica| {
-                (
-                    replica.replica_id,
-                    Arc::clone(&replica.tracked),
-                    replica.lifecycle(),
-                    replica.origin(),
-                )
-            })
-            .collect::<Vec<_>>();
         let Some(source_replica_id) = self.select_new_replica_retaining_source_if(
             file_id,
             &source_tracked,
@@ -2147,23 +2035,12 @@ impl FileManager {
             rollback();
             return Ok(false);
         };
-        if let Err(err) = self.persist_replica_catalog() {
-            logical.restore_replica_state_with_origins(
-                rollback_replicas.clone(),
-                Some(source_replica_id),
-                Some(source_replica_id),
-            );
+        if let Err(err) = self.publish_durable_replica_route() {
+            logical.restore_replica_state_snapshot(rollback_state);
+            rollback();
             return Err(err);
         }
         self.retire_replica(file_id, source_replica_id);
-        if let Err(err) = self.persist_replica_catalog() {
-            logical.restore_replica_state_with_origins(
-                rollback_replicas,
-                Some(source_replica_id),
-                Some(source_replica_id),
-            );
-            return Err(err);
-        }
         self.record_offload_completed_copy(copied_bytes);
         Ok(true)
     }

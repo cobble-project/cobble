@@ -1292,24 +1292,14 @@ mod tests {
         drop(cached);
         let reopened_cached =
             Db::open_from_snapshot(config.clone(), cached_snapshot, cached_id).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while cached_file_ids.iter().any(|file_id| {
-            !matches!(
-                reopened_cached
-                    .file_manager
-                    .preferred_replica_origin(*file_id),
-                Some(ReplicaOrigin::Owned)
-            )
-        }) && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        // Cache requests are runtime policy. Reopening restores the durable external route;
+        // the embedding runtime may request local loading again after startup.
         assert!(cached_file_ids.iter().all(|file_id| {
             matches!(
                 reopened_cached
                     .file_manager
                     .preferred_replica_origin(*file_id),
-                Some(ReplicaOrigin::Owned)
+                Some(ReplicaOrigin::ExternalPersistent { .. })
             )
         }));
         assert_eq!(

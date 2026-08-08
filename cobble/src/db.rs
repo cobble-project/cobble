@@ -1273,9 +1273,6 @@ impl Db {
             },
         )?);
 
-        if let Err(err) = file_manager.load_replica_catalog_as_writer_owner() {
-            log::warn!("failed to load replica catalog: {}", err);
-        }
         let runtime_manifest_publisher = if config.runtime_manifests_enabled() {
             Some(Arc::new(
                 crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle::open(
@@ -1288,6 +1285,20 @@ impl Db {
         } else {
             None
         };
+        if let Some(publisher) = &runtime_manifest_publisher {
+            let publisher = Arc::downgrade(publisher);
+            file_manager.install_durable_replica_route_publisher(Arc::new(move || {
+                publisher
+                    .upgrade()
+                    .ok_or_else(|| {
+                        Error::InvalidState(
+                            "runtime manifest publisher stopped during replica transfer"
+                                .to_string(),
+                        )
+                    })?
+                    .publish_current()
+            }));
+        }
         let adoption_coordinator = Arc::new(rescale::AdoptionCoordinator::new(
             (id.clone(), config.clone()),
             (Arc::clone(&file_manager), Arc::clone(&lsm_tree)),
