@@ -293,6 +293,7 @@ fn open_restored_db_from_manifest(
     let db_lifecycle = Arc::new(DbLifecycle::new_initializing());
     db_state.store(crate::db_state::DbState {
         seq_id: restored_seq_id,
+        topology_epoch: manifest.topology_epoch,
         bucket_ranges: bucket_ranges.clone(),
         multi_lsm_version,
         vlog_version,
@@ -569,6 +570,7 @@ impl Db {
         let db_lifecycle = Arc::new(DbLifecycle::new_initializing());
         db_state.store(crate::db_state::DbState {
             seq_id: restored_seq_id,
+            topology_epoch: manifest.topology_epoch,
             bucket_ranges: bucket_ranges.clone(),
             multi_lsm_version,
             vlog_version,

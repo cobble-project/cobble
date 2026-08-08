@@ -93,8 +93,13 @@ struct LSMTreeState {
     level_options: Vec<LevelOptions>,
     compaction_config: CompactionConfig,
     compaction_policy: Box<dyn CompactionPolicy>,
-    pending_compaction: HashMap<usize, Option<LSMTreeScope>>,
+    pending_compaction: HashMap<usize, PendingCompaction>,
     compaction_worker: Option<Arc<dyn CompactionWorker>>,
+}
+
+struct PendingCompaction {
+    scope: Option<LSMTreeScope>,
+    topology_epoch: u64,
 }
 
 #[derive(Clone)]
@@ -314,6 +319,7 @@ impl LSMTree {
                 }
                 let mut new_db_state = DbState {
                     seq_id: db_state.allocate_seq_id(),
+                    topology_epoch: snapshot.topology_epoch,
                     bucket_ranges: snapshot.bucket_ranges.clone(),
                     multi_lsm_version,
                     vlog_version: snapshot.vlog_version.clone(),
@@ -605,34 +611,6 @@ impl LSMTree {
         Some(by_size.min(bucket_count))
     }
 
-    fn remap_pending_compactions(
-        pending: &HashMap<usize, Option<LSMTreeScope>>,
-        new_multi: &crate::db_state::MultiLSMTreeVersion,
-        split_tree_idx: usize,
-        added_tree_count: usize,
-    ) -> HashMap<usize, Option<LSMTreeScope>> {
-        let mut remapped = HashMap::with_capacity(pending.len());
-        for (idx, expected_scope) in pending {
-            let new_idx = if let Some(expected_scope) = expected_scope.as_ref() {
-                new_multi
-                    .tree_index_for_exact_scope(expected_scope)
-                    .or_else(|| {
-                        new_multi.tree_index_for_bucket_and_column_family(
-                            *expected_scope.bucket_range.start(),
-                            expected_scope.column_family_id,
-                        )
-                    })
-                    .unwrap_or(*idx)
-            } else if *idx > split_tree_idx {
-                idx.saturating_add(added_tree_count)
-            } else {
-                *idx
-            };
-            remapped.insert(new_idx, expected_scope.clone());
-        }
-        remapped
-    }
-
     fn maybe_split_tree_locked(
         &self,
         state: &mut LSMTreeState,
@@ -716,6 +694,7 @@ impl LSMTree {
             .cas_mutate(snapshot.seq_id, |db_state, current| {
                 Some(DbState {
                     seq_id: db_state.allocate_seq_id(),
+                    topology_epoch: current.topology_epoch.saturating_add(1),
                     bucket_ranges: current.bucket_ranges.clone(),
                     multi_lsm_version: new_multi.clone(),
                     vlog_version: current.vlog_version.clone(),
@@ -729,13 +708,9 @@ impl LSMTree {
             return None;
         }
         let split_tree_count = split_ranges.len();
-        let added_tree_count = split_ranges.len().saturating_sub(1);
-        state.pending_compaction = Self::remap_pending_compactions(
-            &state.pending_compaction,
-            &new_multi,
-            tree_idx,
-            added_tree_count,
-        );
+        // Results planned against the old scope layout cannot be remapped safely. Their outputs
+        // remain uncommitted and drop once their workers observe the missing pending slot.
+        state.pending_compaction.clear();
         debug!(
             "auto split tree={} level={} size={} threshold={} old_range={}..{} parts={}",
             tree_idx,
@@ -766,7 +741,12 @@ impl LSMTree {
         edit: VersionEdit,
         vlog_edit: Option<VlogEdit>,
     ) -> Option<usize> {
+        let access = self.db_lifecycle.begin_owned_access().ok();
         let mut state = self.state.lock().unwrap();
+        if access.is_none() {
+            state.pending_compaction.remove(&tree_idx);
+            return None;
+        }
         let apply_tree_idx = self.resolve_completed_compaction_locked(&mut state, tree_idx)?;
         self.apply_edit_locked(&mut state, vec![(apply_tree_idx, edit)], move |db_state| {
             if let Some(vlog_edit) = vlog_edit {
@@ -781,12 +761,15 @@ impl LSMTree {
         state: &mut LSMTreeState,
         tree_idx: usize,
     ) -> Option<usize> {
-        let expected_scope = state.pending_compaction.remove(&tree_idx)?;
+        let expected = state.pending_compaction.remove(&tree_idx)?;
         if self.db_lifecycle.ensure_open().is_err() {
             return None;
         }
         let snapshot = self.db_state.load();
-        let Some(expected_scope) = expected_scope else {
+        if snapshot.topology_epoch != expected.topology_epoch {
+            return None;
+        }
+        let Some(expected_scope) = expected.scope else {
             return Some(tree_idx);
         };
         if snapshot
@@ -797,28 +780,21 @@ impl LSMTree {
         {
             return Some(tree_idx);
         }
-        snapshot
-            .multi_lsm_version
-            .tree_index_for_exact_scope(&expected_scope)
-            .or_else(|| {
-                snapshot
-                    .multi_lsm_version
-                    .tree_index_for_bucket_and_column_family(
-                        *expected_scope.bucket_range.start(),
-                        expected_scope.column_family_id,
-                    )
-            })
+        None
     }
 
     #[cfg(test)]
     pub(crate) fn on_compaction_started(&self, tree_idx: usize) {
         let mut state = self.state.lock().unwrap();
-        let expected_scope = self
-            .db_state
-            .load()
-            .multi_lsm_version
-            .tree_scope_of_tree(tree_idx);
-        state.pending_compaction.insert(tree_idx, expected_scope);
+        let snapshot = self.db_state.load();
+        let expected_scope = snapshot.multi_lsm_version.tree_scope_of_tree(tree_idx);
+        state.pending_compaction.insert(
+            tree_idx,
+            PendingCompaction {
+                scope: expected_scope,
+                topology_epoch: snapshot.topology_epoch,
+            },
+        );
     }
 
     pub(crate) fn ttl_provider(&self) -> Arc<crate::ttl::TTLProvider> {
@@ -946,7 +922,13 @@ impl LSMTree {
             // `submit_runs` would deadlock on this mutex; all real workers defer completion to a
             // spawned task.) If submit_runs returns None (worker declined), no pending entry is
             // inserted, leaving the slot free for the next trigger.
-            state.pending_compaction.insert(tree_idx, expected_scope);
+            state.pending_compaction.insert(
+                tree_idx,
+                PendingCompaction {
+                    scope: expected_scope,
+                    topology_epoch: levels_snapshot.topology_epoch,
+                },
+            );
             std::mem::drop(handle);
         }
     }
@@ -2075,6 +2057,7 @@ mod tests {
         .unwrap();
         let snapshot = DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
@@ -2159,6 +2142,7 @@ mod tests {
         };
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
@@ -2244,6 +2228,7 @@ mod tests {
         };
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
@@ -2325,6 +2310,7 @@ mod tests {
         };
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
@@ -2407,6 +2393,7 @@ mod tests {
         };
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
@@ -2489,6 +2476,7 @@ mod tests {
         );
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
@@ -2592,6 +2580,7 @@ mod tests {
         );
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
@@ -2644,6 +2633,7 @@ mod tests {
         );
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
@@ -2696,6 +2686,7 @@ mod tests {
         );
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
@@ -2760,6 +2751,7 @@ mod tests {
         );
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
@@ -2809,6 +2801,7 @@ mod tests {
         let replacement = create_data_file_with_size(b"a", b"z", 1);
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion {
                 levels: vec![
@@ -2876,6 +2869,7 @@ mod tests {
         let after = create_data_file_with_size(b"t", b"z", 1);
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion {
                 levels: vec![
@@ -2969,6 +2963,7 @@ mod tests {
                 .unwrap();
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
@@ -3052,6 +3047,7 @@ mod tests {
                 .unwrap();
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
@@ -3080,7 +3076,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lsm_compaction_completion_remaps_tree_index_by_range() {
+    fn test_lsm_compaction_completion_rejects_stale_topology_epoch() {
         let db_state = Arc::new(DbStateHandle::new());
         let base_version = Arc::new(LSMTreeVersion {
             levels: vec![Level {
@@ -3099,6 +3095,7 @@ mod tests {
         .unwrap();
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: initial_multi,
             vlog_version: VlogVersion::new(),
@@ -3125,6 +3122,7 @@ mod tests {
         .unwrap();
         db_state.store(DbState {
             seq_id: 1,
+            topology_epoch: 1,
             bucket_ranges: Vec::new(),
             multi_lsm_version: shifted_multi,
             vlog_version: VlogVersion::new(),
@@ -3134,8 +3132,8 @@ mod tests {
             suggested_base_snapshot_id: None,
         });
 
-        let remapped_idx = lsm_tree.on_compaction_complete(1);
-        assert_eq!(remapped_idx, Some(2));
+        assert_eq!(lsm_tree.on_compaction_complete(1), None);
+        assert_eq!(lsm_tree.on_compaction_complete(1), None);
     }
 
     #[test]
@@ -3157,6 +3155,7 @@ mod tests {
         .unwrap();
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: initial_multi,
             vlog_version: VlogVersion::new(),
@@ -3211,6 +3210,7 @@ mod tests {
         };
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
             vlog_version: VlogVersion::new(),
@@ -3279,6 +3279,7 @@ mod tests {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion {
                 levels: vec![Level {
@@ -3381,6 +3382,7 @@ mod tests {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion {
                 levels: vec![Level {
@@ -3469,6 +3471,7 @@ mod tests {
         .unwrap();
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::new(),
@@ -3510,6 +3513,7 @@ mod tests {
         let tracked_vlog = TrackedFileId::detached(700);
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: VlogVersion::from_files_with_entries(vec![(7, tracked_vlog, 0)]),

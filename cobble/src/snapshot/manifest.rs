@@ -23,14 +23,16 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Snapshot manifests version 2 require SST row keys with big-endian bucket prefixes.
-/// Version 3 adds per-file `max_expired_at`; version 4 adds replica origins.
-pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 4;
+/// Version 3 adds per-file `max_expired_at`; version 4 adds replica origins; version 5 adds topology epoch.
+pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 5;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
     pub(crate) version: u32,
     pub(crate) id: u64,
     pub(crate) seq_id: u64,
+    #[serde(default)]
+    pub(crate) topology_epoch: u64,
     pub(crate) latest_schema_id: u64,
     pub(crate) data_size_bytes: u64,
     pub(crate) incremental_data_size_bytes: u64,
@@ -49,6 +51,8 @@ pub(crate) struct ManifestIncrementalSnapshot {
     pub(crate) version: u32,
     pub(crate) id: u64,
     pub(crate) seq_id: u64,
+    #[serde(default)]
+    pub(crate) topology_epoch: u64,
     pub(crate) base_snapshot_id: u64,
     pub(crate) latest_schema_id: u64,
     pub(crate) data_size_bytes: u64,
@@ -159,6 +163,7 @@ pub(crate) fn load_manifest_entry(
                     &incremental.tree_level_edits,
                 )?;
                 resolved.version = incremental.version;
+                resolved.topology_epoch = incremental.topology_epoch;
                 resolved.vlog_files = incremental.vlog_files;
                 resolved.id = incremental.id;
                 resolved.seq_id = incremental.seq_id;
@@ -230,6 +235,7 @@ pub(crate) fn load_manifest_chain(
                     &manifest.tree_level_edits,
                 )?;
                 resolved_base.version = manifest.version;
+                resolved_base.topology_epoch = manifest.topology_epoch;
                 resolved_base.vlog_files = manifest.vlog_files;
                 resolved_base.id = manifest.id;
                 resolved_base.seq_id = manifest.seq_id;
@@ -306,6 +312,7 @@ pub(crate) fn load_manifest_chain_from_path(
                     &manifest.tree_level_edits,
                 )?;
                 resolved_base.version = manifest.version;
+                resolved_base.topology_epoch = manifest.topology_epoch;
                 resolved_base.vlog_files = manifest.vlog_files;
                 resolved_base.id = manifest.id;
                 resolved_base.seq_id = manifest.seq_id;
@@ -469,6 +476,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 version: MANIFEST_VERSION_CURRENT,
                 id: snapshot.id,
                 seq_id: snapshot.seq_id,
+                topology_epoch: snapshot.topology_epoch,
                 base_snapshot_id: base.id,
                 latest_schema_id: snapshot.latest_schema_id,
                 data_size_bytes,
@@ -486,6 +494,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 version: MANIFEST_VERSION_CURRENT,
                 id: snapshot.id,
                 seq_id: snapshot.seq_id,
+                topology_epoch: snapshot.topology_epoch,
                 latest_schema_id: snapshot.latest_schema_id,
                 data_size_bytes: file_data_size_bytes + current_active_memtable_bytes,
                 incremental_data_size_bytes,
@@ -503,6 +512,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             version: MANIFEST_VERSION_CURRENT,
             id: snapshot.id,
             seq_id: snapshot.seq_id,
+            topology_epoch: snapshot.topology_epoch,
             latest_schema_id: snapshot.latest_schema_id,
             data_size_bytes: file_data_size_bytes + current_active_memtable_bytes,
             incremental_data_size_bytes,
@@ -694,7 +704,9 @@ fn build_incremental_tree_level_edits(
     base: &DbSnapshot,
     snapshot: &DbSnapshot,
 ) -> Option<Vec<ManifestTreeLevelEdit>> {
-    if base.lsm_versions.len() != snapshot.lsm_versions.len() {
+    if base.topology_epoch != snapshot.topology_epoch
+        || base.lsm_versions.len() != snapshot.lsm_versions.len()
+    {
         return None;
     }
     let mut tree_edits = Vec::new();
@@ -832,6 +844,7 @@ pub(crate) fn build_vlog_version_from_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_file::{DataFile, DataFileType};
 
     #[test]
     fn decode_manifest_requires_version() {
@@ -917,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_manifest_v3_and_v4_preserve_file_extensions() {
+    fn decode_manifest_v3_to_v5_preserve_file_extensions() {
         let v3 = r#"{
             "version": 3,
             "id": 1,
@@ -966,6 +979,43 @@ mod tests {
             )),
             _ => panic!("expected snapshot payload"),
         }
+
+        let v5 = v4
+            .replace("\"version\": 4", "\"version\": 5")
+            .replace("\"seq_id\": 2,", "\"seq_id\": 2, \"topology_epoch\": 7,");
+        let payload = decode_manifest(v5.as_bytes()).expect("v5 manifest should decode");
+        match payload {
+            ManifestPayload::Snapshot(s) => assert_eq!(s.topology_epoch, 7),
+            _ => panic!("expected snapshot payload"),
+        }
+    }
+
+    #[test]
+    fn topology_epoch_change_forces_full_snapshot_manifest() {
+        let file = Arc::new(DataFile::new_detached(
+            DataFileType::SSTable,
+            b"a".to_vec(),
+            b"b".to_vec(),
+            1,
+            0,
+            1,
+            0..=0,
+            0..=0,
+        ));
+        let mut base = DbSnapshot::new(1, "snapshot/1", None);
+        base.lsm_versions = vec![LSMTreeVersion {
+            levels: vec![Level {
+                ordinal: 0,
+                tiered: true,
+                files: Vec::new(),
+            }],
+        }];
+        let mut next = base.clone();
+        next.id = 2;
+        next.topology_epoch = 1;
+        next.lsm_versions[0].levels[0].files.push(file);
+
+        assert!(build_incremental_tree_level_edits(&base, &next).is_none());
     }
 
     #[test]
@@ -990,7 +1040,7 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("Unsupported snapshot manifest version: 1 (expected 2..=4)")
+                .contains("Unsupported snapshot manifest version: 1 (expected 2..=5)")
         );
     }
 }

@@ -68,6 +68,7 @@ pub(crate) struct DbSnapshot {
     // Vlog version at the time of snapshot creation, without tracked references.
     pub vlog_version: VlogVersion,
     pub seq_id: u64,
+    pub topology_epoch: u64,
     pub latest_schema_id: u64,
     pub referenced_schema_ids: BTreeSet<u64>,
     pub active_memtable_data: Vec<ActiveMemtableSnapshotData>,
@@ -108,6 +109,7 @@ impl DbSnapshot {
             replica_origins: BTreeMap::new(),
             vlog_version: VlogVersion::new(),
             seq_id: 0,
+            topology_epoch: 0,
             latest_schema_id: 0,
             referenced_schema_ids: BTreeSet::new(),
             active_memtable_data: Vec::new(),

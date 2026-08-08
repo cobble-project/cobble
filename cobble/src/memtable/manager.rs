@@ -1272,6 +1272,7 @@ impl MemtableManager {
                 .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
                     Some(DbState {
                         seq_id: db_state.allocate_seq_id(),
+                        topology_epoch: snapshot.topology_epoch,
                         bucket_ranges: snapshot.bucket_ranges.clone(),
                         multi_lsm_version: snapshot.multi_lsm_version.clone(),
                         vlog_version: snapshot.vlog_version.clone(),
@@ -1685,6 +1686,7 @@ impl MemtableManager {
             db_state.cas_mutate(snapshot.seq_id, |db_state, snapshot| {
                 Some(DbState {
                     seq_id: db_state.allocate_seq_id(),
+                    topology_epoch: snapshot.topology_epoch,
                     bucket_ranges: snapshot.bucket_ranges.clone(),
                     multi_lsm_version: snapshot.multi_lsm_version.clone(),
                     vlog_version: snapshot.vlog_version.clone(),
@@ -1913,6 +1915,7 @@ impl MemtableManager {
                     .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
                         Some(DbState {
                             seq_id: db_state.allocate_seq_id(),
+                            topology_epoch: snapshot.topology_epoch,
                             bucket_ranges: snapshot.bucket_ranges.clone(),
                             multi_lsm_version: snapshot.multi_lsm_version.clone(),
                             vlog_version: snapshot.vlog_version.clone(),
@@ -2330,6 +2333,7 @@ impl MemtableManager {
 
                     Some(DbState {
                         seq_id: db_state.allocate_seq_id(),
+                        topology_epoch: snapshot_state.topology_epoch,
                         bucket_ranges: snapshot_state.bucket_ranges.clone(),
                         multi_lsm_version: snapshot_state.multi_lsm_version.clone(),
                         vlog_version: snapshot_state.vlog_version.clone(),
@@ -3313,6 +3317,7 @@ mod tests {
         let schema = manager.schema_manager.latest_schema();
         let snapshot = Arc::new(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: Vec::new() }),
             vlog_version: crate::vlog::VlogVersion::new(),
@@ -3768,6 +3773,7 @@ mod tests {
         ]);
         let snapshot = Arc::new(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: Vec::new() }),
             vlog_version: crate::vlog::VlogVersion::new(),
@@ -4197,6 +4203,7 @@ mod tests {
         .unwrap();
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: crate::vlog::VlogVersion::new(),
@@ -4303,6 +4310,7 @@ mod tests {
         let source_db_state = Arc::new(DbStateHandle::new());
         source_db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: multi_lsm_version.clone(),
             vlog_version: crate::vlog::VlogVersion::new(),
@@ -4369,6 +4377,7 @@ mod tests {
         let target_db_state = Arc::new(DbStateHandle::new());
         target_db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: crate::vlog::VlogVersion::new(),
@@ -4455,6 +4464,7 @@ mod tests {
         let source_db_state = Arc::new(DbStateHandle::new());
         source_db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: multi_lsm_version.clone(),
             vlog_version: crate::vlog::VlogVersion::new(),
@@ -4526,6 +4536,7 @@ mod tests {
         let target_db_state = Arc::new(DbStateHandle::new());
         target_db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version,
             vlog_version: crate::vlog::VlogVersion::new(),

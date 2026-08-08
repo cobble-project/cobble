@@ -455,6 +455,7 @@ mod tests {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::from_scopes_with_tree_versions(
                 1,

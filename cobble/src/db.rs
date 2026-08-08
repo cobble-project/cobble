@@ -470,13 +470,14 @@ impl Db {
                 )?;
             db_state.store(crate::db_state::DbState {
                 seq_id: snapshot.seq_id,
+                topology_epoch: snapshot.topology_epoch.saturating_add(1),
                 bucket_ranges: snapshot.bucket_ranges.clone(),
                 multi_lsm_version,
                 vlog_version: snapshot.vlog_version.clone(),
                 active: snapshot.active.clone(),
                 immutables: snapshot.immutables.clone(),
                 truncation_cursors: snapshot.truncation_cursors.clone(),
-                suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+                suggested_base_snapshot_id: None,
             });
             return Ok(());
         }
@@ -509,13 +510,14 @@ impl Db {
             )?;
         db_state.store(crate::db_state::DbState {
             seq_id: snapshot.seq_id,
+            topology_epoch: snapshot.topology_epoch.saturating_add(1),
             bucket_ranges: snapshot.bucket_ranges.clone(),
             multi_lsm_version,
             vlog_version: snapshot.vlog_version.clone(),
             active: snapshot.active.clone(),
             immutables: snapshot.immutables.clone(),
             truncation_cursors: snapshot.truncation_cursors.clone(),
-            suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+            suggested_base_snapshot_id: None,
         });
         Ok(())
     }

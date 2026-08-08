@@ -1637,6 +1637,7 @@ mod tests {
         let current = db_state.load();
         db_state.store(crate::db_state::DbState {
             seq_id: current.seq_id,
+            topology_epoch: current.topology_epoch,
             bucket_ranges: vec![0u16..=0u16],
             multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
                 crate::lsm::LSMTreeVersion {
@@ -2371,6 +2372,7 @@ mod tests {
         let initial = db_state.load();
         db_state.store(crate::db_state::DbState {
             seq_id: initial.seq_id,
+            topology_epoch: initial.topology_epoch,
             bucket_ranges: vec![0u16..=0u16],
             multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
                 crate::lsm::LSMTreeVersion {
@@ -2406,6 +2408,7 @@ mod tests {
         let marked = db_state.load();
         db_state.store(crate::db_state::DbState {
             seq_id: marked.seq_id,
+            topology_epoch: marked.topology_epoch,
             bucket_ranges: marked.bucket_ranges.clone(),
             multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
                 crate::lsm::LSMTreeVersion {
@@ -2644,6 +2647,7 @@ mod tests {
         let current = db_state.load();
         db_state.store(crate::db_state::DbState {
             seq_id: current.seq_id,
+            topology_epoch: current.topology_epoch,
             bucket_ranges: vec![0u16..=0u16],
             multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
                 crate::lsm::LSMTreeVersion {
@@ -2811,6 +2815,7 @@ mod tests {
         let current = db_state.load();
         db_state.store(crate::db_state::DbState {
             seq_id: current.seq_id,
+            topology_epoch: current.topology_epoch,
             bucket_ranges: vec![0u16..=0u16],
             multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
                 crate::lsm::LSMTreeVersion {
@@ -2975,6 +2980,7 @@ mod tests {
         let current = db_state.load();
         db_state.store(crate::db_state::DbState {
             seq_id: current.seq_id,
+            topology_epoch: current.topology_epoch,
             bucket_ranges: vec![0u16..=0u16],
             multi_lsm_version: crate::db_state::MultiLSMTreeVersion::new(
                 crate::lsm::LSMTreeVersion {

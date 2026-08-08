@@ -436,6 +436,7 @@ impl MultiLSMTreeVersion {
 /// split) produces a new DbState and publishes it via CAS.
 pub(crate) struct DbState {
     pub(crate) seq_id: u64,
+    pub(crate) topology_epoch: u64,
     pub(crate) bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) multi_lsm_version: MultiLSMTreeVersion,
     pub(crate) vlog_version: VlogVersion,
@@ -476,6 +477,7 @@ impl DbStateHandle {
         Self {
             current: ArcSwap::from_pointee(DbState {
                 seq_id: 0,
+                topology_epoch: 0,
                 bucket_ranges: Vec::new(),
                 multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: vec![] }),
                 vlog_version: VlogVersion::new(),
@@ -543,6 +545,7 @@ impl DbStateHandle {
             }
             Some(DbState {
                 seq_id,
+                topology_epoch: snapshot.topology_epoch,
                 bucket_ranges: snapshot.bucket_ranges.clone(),
                 multi_lsm_version: snapshot.multi_lsm_version.clone(),
                 vlog_version: snapshot.vlog_version.clone(),
@@ -566,6 +569,7 @@ impl DbStateHandle {
         }
         self.store(DbState {
             seq_id: current.seq_id,
+            topology_epoch: current.topology_epoch,
             bucket_ranges: current.bucket_ranges.clone(),
             multi_lsm_version: current.multi_lsm_version.clone(),
             vlog_version: current.vlog_version.clone(),
@@ -607,13 +611,14 @@ impl DbStateHandle {
         )?;
         self.store(DbState {
             seq_id: snapshot.seq_id,
+            topology_epoch: snapshot.topology_epoch.saturating_add(1),
             bucket_ranges: bucket_ranges.to_vec(),
             multi_lsm_version,
             vlog_version: snapshot.vlog_version.clone(),
             active: snapshot.active.clone(),
             immutables: snapshot.immutables.clone(),
             truncation_cursors: snapshot.truncation_cursors.clone(),
-            suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+            suggested_base_snapshot_id: None,
         });
         Ok(())
     }
@@ -637,6 +642,7 @@ impl DbStateHandle {
         cursors.insert(id, key.to_vec());
         self.store(DbState {
             seq_id: self.allocate_seq_id(),
+            topology_epoch: snapshot.topology_epoch,
             bucket_ranges: snapshot.bucket_ranges.clone(),
             multi_lsm_version: snapshot.multi_lsm_version.clone(),
             vlog_version: snapshot.vlog_version.clone(),
@@ -667,6 +673,7 @@ impl DbStateHandle {
         }
         self.store(DbState {
             seq_id: self.allocate_seq_id(),
+            topology_epoch: snapshot.topology_epoch,
             bucket_ranges: snapshot.bucket_ranges.clone(),
             multi_lsm_version: snapshot.multi_lsm_version.clone(),
             vlog_version: snapshot.vlog_version.clone(),

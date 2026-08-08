@@ -412,6 +412,7 @@ fn runtime_manifest_from_state(
     Ok(RuntimeManifest {
         generation,
         seq_id: state.seq_id,
+        topology_epoch: state.topology_epoch,
         latest_schema_id,
         bucket_ranges: state.bucket_ranges.clone(),
         lsm_tree_bucket_ranges: state.multi_lsm_version.bucket_ranges(),
@@ -514,7 +515,8 @@ fn manifest_vlog_files(
 }
 
 fn same_persisted_state(current: &RuntimeManifest, next: &RuntimeManifest) -> bool {
-    current.latest_schema_id == next.latest_schema_id
+    current.topology_epoch == next.topology_epoch
+        && current.latest_schema_id == next.latest_schema_id
         && current.bucket_ranges == next.bucket_ranges
         && current.lsm_tree_bucket_ranges == next.lsm_tree_bucket_ranges
         && current.tree_scopes == next.tree_scopes
@@ -532,6 +534,7 @@ mod tests {
         RuntimeManifest {
             generation,
             seq_id: generation,
+            topology_epoch: 0,
             latest_schema_id: 0,
             bucket_ranges: Vec::new(),
             lsm_tree_bucket_ranges: Vec::new(),
@@ -549,6 +552,7 @@ mod tests {
                 generation,
                 base_generation,
                 seq_id: generation,
+                topology_epoch: 0,
                 latest_schema_id: 0,
                 tree_level_edits: Vec::new(),
                 vlog_files: Vec::new(),

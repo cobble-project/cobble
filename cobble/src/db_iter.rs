@@ -267,6 +267,7 @@ mod tests {
 
         let snapshot = Arc::new(DbState {
             seq_id: 0,
+            topology_epoch: 0,
             bucket_ranges: Vec::new(),
             multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: Vec::new() }),
             vlog_version: crate::vlog::VlogVersion::new(),

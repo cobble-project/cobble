@@ -356,6 +356,7 @@ impl Db {
         ));
         self.db_state.store(DbState {
             seq_id: current.seq_id,
+            topology_epoch: current.topology_epoch.saturating_add(1),
             bucket_ranges: updated_ranges.clone(),
             multi_lsm_version: merged_multi_lsm,
             vlog_version: merged_vlog,
@@ -489,6 +490,7 @@ impl Db {
             filter_truncation_cursors(&current.truncation_cursors_snapshot(), &updated_ranges);
         self.db_state.store(DbState {
             seq_id: current.seq_id,
+            topology_epoch: current.topology_epoch.saturating_add(1),
             bucket_ranges: updated_ranges.clone(),
             multi_lsm_version: updated_multi_lsm,
             vlog_version: current.vlog_version.clone(),

@@ -19,8 +19,8 @@ use std::sync::Arc;
 pub(crate) mod publisher;
 
 /// Runtime manifests version 2 describe SSTs with big-endian bucket prefixes.
-/// Version 3 adds per-file `max_expired_at`; version 4 adds replica origins.
-pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 4;
+/// Version 3 adds per-file `max_expired_at`; version 4 adds replica origins; version 5 adds topology epoch.
+pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 5;
 pub(crate) const MAX_RUNTIME_MANIFEST_CHAIN_DEPTH: usize = 64;
 const RUNTIME_MANIFEST_DIR: &str = "runtime";
 const RUNTIME_CURRENT_NAME: &str = "runtime/CURRENT";
@@ -30,6 +30,8 @@ const RUNTIME_MANIFEST_PREFIX: &str = "MANIFEST-";
 pub(crate) struct RuntimeManifest {
     pub(crate) generation: u64,
     pub(crate) seq_id: u64,
+    #[serde(default)]
+    pub(crate) topology_epoch: u64,
     pub(crate) latest_schema_id: u64,
     pub(crate) bucket_ranges: Vec<RangeInclusive<u16>>,
     pub(crate) lsm_tree_bucket_ranges: Vec<RangeInclusive<u16>>,
@@ -44,6 +46,8 @@ pub(crate) struct RuntimeIncrementalManifest {
     pub(crate) generation: u64,
     pub(crate) base_generation: u64,
     pub(crate) seq_id: u64,
+    #[serde(default)]
+    pub(crate) topology_epoch: u64,
     pub(crate) latest_schema_id: u64,
     pub(crate) tree_level_edits: Vec<RuntimeTreeLevelEdit>,
     pub(crate) vlog_files: Vec<ManifestVlogFile>,
@@ -130,6 +134,7 @@ pub(crate) fn build_runtime_manifest(
         generation: current.generation,
         base_generation: base.generation,
         seq_id: current.seq_id,
+        topology_epoch: current.topology_epoch,
         latest_schema_id: current.latest_schema_id,
         tree_level_edits: build_runtime_tree_level_edits(&base.manifest, &current)?,
         vlog_files: current.vlog_files.clone(),
@@ -390,7 +395,8 @@ fn read_metadata_file(file_manager: &FileManager, name: &str) -> Result<Vec<u8>>
 }
 
 fn has_same_runtime_topology(base: &RuntimeManifest, current: &RuntimeManifest) -> bool {
-    base.bucket_ranges == current.bucket_ranges
+    base.topology_epoch == current.topology_epoch
+        && base.bucket_ranges == current.bucket_ranges
         && base.lsm_tree_bucket_ranges == current.lsm_tree_bucket_ranges
         && base.tree_scopes == current.tree_scopes
         && base.tree_levels.len() == current.tree_levels.len()
@@ -513,6 +519,7 @@ fn apply_runtime_incremental(
     let manifest = RuntimeManifest {
         generation: incremental.generation,
         seq_id: incremental.seq_id,
+        topology_epoch: incremental.topology_epoch,
         latest_schema_id: incremental.latest_schema_id,
         bucket_ranges: base.bucket_ranges.clone(),
         lsm_tree_bucket_ranges: base.lsm_tree_bucket_ranges.clone(),
@@ -545,6 +552,12 @@ fn validate_runtime_incremental(
         return Err(Error::InvalidState(format!(
             "Runtime incremental manifest sequence {} cannot precede base sequence {}",
             incremental.seq_id, base.seq_id
+        )));
+    }
+    if incremental.topology_epoch != base.topology_epoch {
+        return Err(Error::InvalidState(format!(
+            "Runtime incremental manifest topology epoch {} does not match base {}",
+            incremental.topology_epoch, base.topology_epoch
         )));
     }
     let base_files = manifest_file_descriptors(base)?;
@@ -791,6 +804,7 @@ mod tests {
         RuntimeManifest {
             generation,
             seq_id: generation,
+            topology_epoch: 0,
             latest_schema_id: 1,
             bucket_ranges: vec![0..=0],
             lsm_tree_bucket_ranges: vec![0..=0; tree_count],
@@ -877,7 +891,7 @@ mod tests {
         let err = decode_runtime_manifest(&raw).expect_err("version 1 must be rejected");
         assert!(
             err.to_string()
-                .contains("Unsupported runtime manifest version: 1 (expected 2..=4)")
+                .contains("Unsupported runtime manifest version: 1 (expected 2..=5)")
         );
     }
 
@@ -999,6 +1013,7 @@ mod tests {
             generation: 2,
             base_generation: 99,
             seq_id: 2,
+            topology_epoch: 0,
             latest_schema_id: 1,
             tree_level_edits: Vec::new(),
             vlog_files: Vec::new(),
@@ -1015,6 +1030,7 @@ mod tests {
             generation: 2,
             base_generation: 1,
             seq_id: 0,
+            topology_epoch: 0,
             latest_schema_id: 1,
             tree_level_edits: Vec::new(),
             vlog_files: Vec::new(),
@@ -1133,6 +1149,7 @@ mod tests {
                 generation: 2,
                 base_generation: 1,
                 seq_id: 2,
+                topology_epoch: 0,
                 latest_schema_id: 1,
                 tree_level_edits: Vec::new(),
                 vlog_files: Vec::new(),
@@ -1154,6 +1171,7 @@ mod tests {
                 generation: 3,
                 base_generation: 4,
                 seq_id: 3,
+                topology_epoch: 0,
                 latest_schema_id: 1,
                 tree_level_edits: Vec::new(),
                 vlog_files: Vec::new(),
@@ -1166,6 +1184,7 @@ mod tests {
                 generation: 4,
                 base_generation: 3,
                 seq_id: 4,
+                topology_epoch: 0,
                 latest_schema_id: 1,
                 tree_level_edits: Vec::new(),
                 vlog_files: Vec::new(),
@@ -1218,6 +1237,7 @@ mod tests {
                 generation: 2,
                 base_generation: 1,
                 seq_id: 2,
+                topology_epoch: 0,
                 latest_schema_id: 1,
                 tree_level_edits: vec![RuntimeTreeLevelEdit {
                     tree_idx: 0,

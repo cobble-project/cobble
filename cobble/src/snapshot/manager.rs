@@ -444,6 +444,7 @@ impl SnapshotManager {
             tracked_file_ids.insert(tracked.file_id());
         }
         snapshot.seq_id = db_state.seq_id;
+        snapshot.topology_epoch = db_state.topology_epoch;
         snapshot.truncation_cursors = truncation_cursors
             .map(TruncationCursorSnapshot::to_map)
             .unwrap_or_else(|| db_state.truncation_cursors_snapshot());
@@ -614,6 +615,7 @@ impl SnapshotManager {
             replica_origins,
             vlog_version: build_vlog_version_from_manifest_untracked(manifest),
             seq_id: manifest.seq_id,
+            topology_epoch: manifest.topology_epoch,
             latest_schema_id: manifest.latest_schema_id,
             referenced_schema_ids,
             active_memtable_data: manifest.active_memtable_data.clone(),

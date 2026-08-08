@@ -86,6 +86,10 @@ pub(crate) fn apply_external_compaction_result(
         return Ok(ExternalCompactionApplyResult::TerminalInvalid);
     }
 
+    // An exclusive topology operation owns the database access gate. Leave the durable result
+    // untouched so the poller can retry after the operation releases it.
+    let _access = ctx.db_lifecycle.begin_owned_access()?;
+
     // Tree indices are not stable across expand/shrink or column-family topology changes.
     // Hold the writer's topology lock from scope validation through the durable snapshot proof,
     // so the exact scope resolved below remains attached to the same logical tree throughout
@@ -1226,6 +1230,7 @@ mod tests {
             version: crate::snapshot::manifest::MANIFEST_VERSION_CURRENT,
             id: 7,
             seq_id: 11,
+            topology_epoch: 0,
             latest_schema_id: 0,
             data_size_bytes: 0,
             incremental_data_size_bytes: 0,

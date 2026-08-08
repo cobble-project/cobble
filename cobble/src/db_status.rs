@@ -10,6 +10,10 @@ const STATE_CLOSING: u8 = 2;
 const STATE_CLOSED: u8 = 3;
 const STATE_ERROR: u8 = 4;
 
+const ACCESS_OPEN: u8 = 0;
+const ACCESS_EXCLUSIVE_REQUESTED: u8 = 1;
+const ACCESS_EXCLUSIVE: u8 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DbLifecycleState {
     Initializing,
@@ -72,6 +76,20 @@ pub(crate) struct OwnedDbAccessGuard {
     lifecycle: Arc<DbLifecycle>,
 }
 
+pub(crate) struct ExclusiveDbAccessGuard {
+    lifecycle: Arc<DbLifecycle>,
+}
+
+impl Drop for ExclusiveDbAccessGuard {
+    fn drop(&mut self) {
+        self.lifecycle
+            .access_mode
+            .store(ACCESS_OPEN, Ordering::Release);
+        self.lifecycle.release_access();
+        self.lifecycle.exclusive_wait_condvar.notify_all();
+    }
+}
+
 impl Drop for OwnedDbAccessGuard {
     fn drop(&mut self) {
         self.lifecycle.release_access();
@@ -80,34 +98,43 @@ impl Drop for OwnedDbAccessGuard {
 
 pub(crate) struct DbLifecycle {
     state: AtomicU8,
+    access_mode: AtomicU8,
     active_accesses: AtomicUsize,
     error: ArcSwapOption<Error>,
     /// Condvars to notify when the lifecycle enters an error/closing state.
     error_notifiers: Mutex<Vec<Weak<Condvar>>>,
     access_wait_mutex: Mutex<()>,
     access_wait_condvar: Condvar,
+    exclusive_wait_mutex: Mutex<()>,
+    exclusive_wait_condvar: Condvar,
 }
 
 impl DbLifecycle {
     pub(crate) fn new_initializing() -> Self {
         Self {
             state: AtomicU8::new(STATE_INITIALIZING),
+            access_mode: AtomicU8::new(ACCESS_OPEN),
             active_accesses: AtomicUsize::new(0),
             error: ArcSwapOption::empty(),
             error_notifiers: Mutex::new(Vec::new()),
             access_wait_mutex: Mutex::new(()),
             access_wait_condvar: Condvar::new(),
+            exclusive_wait_mutex: Mutex::new(()),
+            exclusive_wait_condvar: Condvar::new(),
         }
     }
 
     pub(crate) fn new_open() -> Self {
         Self {
             state: AtomicU8::new(STATE_OPEN),
+            access_mode: AtomicU8::new(ACCESS_OPEN),
             active_accesses: AtomicUsize::new(0),
             error: ArcSwapOption::empty(),
             error_notifiers: Mutex::new(Vec::new()),
             access_wait_mutex: Mutex::new(()),
             access_wait_condvar: Condvar::new(),
+            exclusive_wait_mutex: Mutex::new(()),
+            exclusive_wait_condvar: Condvar::new(),
         }
     }
 
@@ -227,14 +254,45 @@ impl DbLifecycle {
         })
     }
 
+    pub(crate) fn begin_exclusive_access(self: &Arc<Self>) -> Result<ExclusiveDbAccessGuard> {
+        let mut wait_guard = self.exclusive_wait_mutex.lock().unwrap();
+        while self.access_mode.load(Ordering::Acquire) != ACCESS_OPEN {
+            wait_guard = self.exclusive_wait_condvar.wait(wait_guard).unwrap();
+        }
+        self.ensure_open()?;
+        // Keep one active-access sentinel from the first transition onward so close cannot miss
+        // an exclusive operation between observing Open and entering its body.
+        self.active_accesses.fetch_add(1, Ordering::AcqRel);
+        self.access_mode
+            .store(ACCESS_EXCLUSIVE_REQUESTED, Ordering::Release);
+        drop(wait_guard);
+
+        self.wait_for_other_accesses_to_drain();
+        if !self.is_open_fast() {
+            self.access_mode.store(ACCESS_OPEN, Ordering::Release);
+            self.release_access();
+            self.exclusive_wait_condvar.notify_all();
+            return Err(self.error_or_invalid_state());
+        }
+        self.access_mode.store(ACCESS_EXCLUSIVE, Ordering::Release);
+        Ok(ExclusiveDbAccessGuard {
+            lifecycle: Arc::clone(self),
+        })
+    }
+
     fn try_begin_access(&self) -> Result<()> {
         loop {
             let current = self.state.load(Ordering::Acquire);
             if current != STATE_OPEN {
                 return Err(self.error_or_invalid_state());
             }
+            if self.access_mode.load(Ordering::Acquire) != ACCESS_OPEN {
+                return Err(Error::InvalidState("db has exclusive access".to_string()));
+            }
             self.active_accesses.fetch_add(1, Ordering::AcqRel);
-            if self.state.load(Ordering::Acquire) == STATE_OPEN {
+            if self.state.load(Ordering::Acquire) == STATE_OPEN
+                && self.access_mode.load(Ordering::Acquire) == ACCESS_OPEN
+            {
                 return Ok(());
             }
             self.release_access();
@@ -262,15 +320,23 @@ impl DbLifecycle {
         }
     }
 
+    fn wait_for_other_accesses_to_drain(&self) {
+        if self.active_accesses.load(Ordering::Acquire) == 1 {
+            return;
+        }
+        let mut wait_guard = self.access_wait_mutex.lock().unwrap();
+        while self.active_accesses.load(Ordering::Acquire) != 1 {
+            wait_guard = self.access_wait_condvar.wait(wait_guard).unwrap();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn active_access_count(&self) -> usize {
         self.active_accesses.load(Ordering::Acquire)
     }
 
     fn release_access(&self) {
-        if self.active_accesses.fetch_sub(1, Ordering::AcqRel) == 1
-            && self.state.load(Ordering::Acquire) == STATE_CLOSING
-        {
+        if self.active_accesses.fetch_sub(1, Ordering::AcqRel) <= 2 {
             self.access_wait_condvar.notify_all();
         }
     }
@@ -347,6 +413,49 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(lifecycle.state(), DbLifecycleState::Closed);
         assert_eq!(lifecycle.active_access_count(), 0);
+    }
+
+    #[test]
+    fn test_exclusive_access_drains_rejects_reopens_and_blocks_close() {
+        let lifecycle = Arc::new(DbLifecycle::new_open());
+        let normal = lifecycle.begin_access().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (exclusive_tx, exclusive_rx) = mpsc::channel();
+        let lifecycle_for_exclusive = Arc::clone(&lifecycle);
+        let exclusive_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let guard = lifecycle_for_exclusive.begin_exclusive_access().unwrap();
+            exclusive_tx.send(guard).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..1000 {
+            if lifecycle.access_mode.load(Ordering::Acquire) != ACCESS_OPEN {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(exclusive_rx.try_recv().is_err());
+        drop(normal);
+        let exclusive = exclusive_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(lifecycle.begin_access().is_err());
+        drop(exclusive);
+        exclusive_thread.join().unwrap();
+        assert!(lifecycle.begin_access().is_ok());
+
+        let exclusive = lifecycle.begin_exclusive_access().unwrap();
+        let lifecycle_for_close = Arc::clone(&lifecycle);
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let close_thread = std::thread::spawn(move || {
+            lifecycle_for_close.begin_close().unwrap();
+            lifecycle_for_close.wait_for_accesses_to_drain();
+            lifecycle_for_close.mark_closed();
+            closed_tx.send(()).unwrap();
+        });
+        assert!(closed_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(exclusive);
+        closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        close_thread.join().unwrap();
     }
 
     #[test]

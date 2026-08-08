@@ -195,6 +195,7 @@ impl ReadOnlyDb {
         let db_state = Arc::new(DbStateHandle::new());
         db_state.store(crate::db_state::DbState {
             seq_id: 0,
+            topology_epoch: manifest.topology_epoch,
             bucket_ranges: bucket_ranges.clone(),
             multi_lsm_version,
             vlog_version,
