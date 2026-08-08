@@ -79,4 +79,10 @@ let snap_c = db_c.shrink_bucket(vec![512..=683])?;
 db_b.expand_bucket(db_a.id(), Some(snap_a), Some(vec![342..=511]))?;
 ```
 
+Expansion defaults to asynchronous ownership adoption: the target reads the exported snapshot
+until its local copy is ready, and `wait_for_expand_adoption` is available when cleanup must wait.
+`ExpandStorageMode::ReferencePersistent` keeps the source files as durable references;
+`ReferencePersistentWithCache` additionally maintains local read caches without changing that
+durable reference. Java exposes the same three modes through `ExpandStorageMode`.
+
 After all expands are done, take new shard snapshots and materialize a new global snapshot with `DbCoordinator`.

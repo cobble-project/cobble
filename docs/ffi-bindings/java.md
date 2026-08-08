@@ -79,6 +79,9 @@ long marked = db.loadReadonlyFilesToPrimary();
 
 See [Loading Files from Readonly Volumes](../architecture/multi-volume#loading-files-from-readonly-volumes).
 
+Raw and structured `Db` also expose `ExpandStorageMode` and `waitForExpandAdoption(...)` for
+bucket rescaling. See [Rescale](../architecture/rescale).
+
 Java uses `Config.MemtableType.ADAPTIVE` by default. `Db`, `SingleDb`, and their structured variants also expose `switchMemtableType(...)` for changing this choice at runtime. See [Memtable](../architecture/memtable#choosing-a-memtable-type).
 
 Java `Config` exposes the same remote compaction failure policy as Rust:

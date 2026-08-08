@@ -15,10 +15,10 @@ use crate::util::{
     FrameError, byte_array_class, complete_future_exceptionally, complete_future_with_cobble_error,
     complete_future_with_string, decode_bucket_ranges, decode_java_bytes, decode_java_bytes_ref,
     decode_java_string, decode_multi_get_keys, decode_optional_java_string,
-    decode_packed_multi_get_keys, decode_u16, decode_u64_from_jlong, new_object_array,
-    object_array_class, object_class, parse_config_json, take_last_overflow_direct_buffer,
-    throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
-    write_payload_to_io_or_cached_overflow,
+    decode_packed_multi_get_keys, decode_u16, decode_u64_from_jlong, expand_storage_mode,
+    new_object_array, object_array_class, object_class, parse_config_json,
+    take_last_overflow_direct_buffer, throw_illegal_argument, throw_illegal_state,
+    to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
 };
 use bytes::Bytes;
 use cobble::Config;
@@ -2957,6 +2957,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_expandBucket(
     snapshot_id: jlong,
     range_starts: JIntArray,
     range_ends: JIntArray,
+    storage_mode: jint,
 ) -> jlong {
     let Some(db) = db_from_handle(&mut env, handle) else {
         return 0;
@@ -2991,11 +2992,43 @@ pub extern "system" fn Java_io_cobble_structured_Db_expandBucket(
     } else {
         Some(ranges)
     };
-    match db.expand_bucket(source_db_id, snapshot_id, ranges) {
+    let storage_mode = match expand_storage_mode(storage_mode) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    match db.expand_bucket_with_storage_mode(source_db_id, snapshot_id, ranges, storage_mode) {
         Ok(v) => v as jlong,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
             0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_waitForExpandAdoption(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    timeout_millis: jlong,
+) {
+    let Some(db) = db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let timeout_millis = match decode_u64_from_jlong("timeoutMillis", timeout_millis) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    match db.wait_for_expand_adoption(std::time::Duration::from_millis(timeout_millis)) {
+        Ok(()) => {}
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
         }
     }
 }

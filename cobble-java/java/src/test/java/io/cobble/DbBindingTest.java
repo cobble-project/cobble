@@ -701,8 +701,10 @@ class DbBindingTest {
                                         source.id(),
                                         shardSnapshot.snapshotId,
                                         new int[] {2},
-                                        new int[] {3})
+                                        new int[] {3},
+                                        ExpandStorageMode.ADOPT_ASYNC)
                                 >= 0L);
+                target.waitForExpandAdoption(10_000L);
                 assertArrayEquals(
                         valueBytes("rescale-source-v", 2),
                         target.get(2, keyBytes("rescale-source", 2), 0));

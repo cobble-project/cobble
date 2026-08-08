@@ -781,8 +781,10 @@ class StructuredDbTest {
                                         source.id(),
                                         snapshot.snapshotId,
                                         new int[] {2},
-                                        new int[] {3})
+                                        new int[] {3},
+                                        ExpandStorageMode.ADOPT_ASYNC)
                                 >= 0L);
+                target.waitForExpandAdoption(10_000L);
                 Row expanded =
                         target.get(2, "bucket-2".getBytes(StandardCharsets.UTF_8), "value-state");
                 assertNotNull(expanded);

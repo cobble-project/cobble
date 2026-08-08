@@ -131,6 +131,8 @@ db.cancel_snapshot(snapshot_id) -> Result<bool>
 db.expire_snapshot(snapshot_id) -> Result<bool>
 db.retain_snapshot(snapshot_id) -> bool
 db.shard_snapshot_input(snapshot_id) -> Result<ShardSnapshotInput>
+db.expand_bucket_with_storage_mode(source_db_id, snapshot_id, ranges, storage_mode) -> Result<u64>
+db.wait_for_expand_adoption(timeout) -> Result<()>
 db.load_readonly_files_to_primary() -> Result<usize>
 ```
 
@@ -151,6 +153,9 @@ Snapshot lifecycle notes:
 `StructuredSingleDb`. See [Loading Files from Readonly Volumes](../architecture/multi-volume#loading-files-from-readonly-volumes).
 
 `switch_memtable_type()` accepts `Adaptive` or a concrete memtable type. See [Memtable](../architecture/memtable#choosing-a-memtable-type).
+
+Bucket expansion supports asynchronous adoption, persistent references, and persistent references
+with a local read cache. See [Rescale](../architecture/rescale).
 
 #### Reader
 
@@ -217,6 +222,8 @@ On the Java side, restore flows are exposed as `Db.restore(..., boolean newDbId)
 `Db.restoreWithManifest(...)`.
 Raw and structured `Db` / `SingleDb` classes also expose `loadReadonlyFilesToPrimary()`. See
 [Loading Files from Readonly Volumes](../architecture/multi-volume#loading-files-from-readonly-volumes).
+Raw and structured `Db` expose `ExpandStorageMode` and `waitForExpandAdoption(...)`; see
+[Rescale](../architecture/rescale).
 
 ### Java Classes
 

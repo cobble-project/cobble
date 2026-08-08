@@ -1105,6 +1105,21 @@ impl StructuredDb {
         self.db.expand_bucket(source_db_id, snapshot_id, ranges)
     }
 
+    pub fn expand_bucket_with_storage_mode(
+        &self,
+        source_db_id: impl Into<String>,
+        snapshot_id: Option<u64>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: cobble::ExpandStorageMode,
+    ) -> Result<u64> {
+        self.db
+            .expand_bucket_with_storage_mode(source_db_id, snapshot_id, ranges, storage_mode)
+    }
+
+    pub fn wait_for_expand_adoption(&self, timeout: std::time::Duration) -> Result<()> {
+        self.db.wait_for_expand_adoption(timeout)
+    }
+
     pub fn shrink_bucket(&self, ranges: Vec<RangeInclusive<u16>>) -> Result<u64> {
         self.db.shrink_bucket(ranges)
     }

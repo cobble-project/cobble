@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use cobble::Config;
+use cobble::{Config, ExpandStorageMode};
 use jni::JNIEnv;
 use jni::descriptors::Desc;
 use jni::objects::{
@@ -96,6 +96,15 @@ pub(crate) fn decode_u32(name: &str, value: jint) -> Result<u32, String> {
         return Err(format!("{} out of range: {}", name, value));
     }
     Ok(value as u32)
+}
+
+pub(crate) fn expand_storage_mode(value: jint) -> Result<ExpandStorageMode, String> {
+    match value {
+        0 => Ok(ExpandStorageMode::AdoptAsync),
+        1 => Ok(ExpandStorageMode::ReferencePersistent),
+        2 => Ok(ExpandStorageMode::ReferencePersistentWithCache),
+        _ => Err(format!("unknown expand storage mode {value}")),
+    }
 }
 
 pub(crate) fn decode_u64_from_jlong(name: &str, value: jlong) -> Result<u64, String> {

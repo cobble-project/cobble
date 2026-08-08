@@ -980,14 +980,46 @@ public final class Db extends NativeObject {
             int[] rangeStartsInclusive,
             int[] rangeEndsInclusive) {
         return expandBucket(
-                nativeHandle, sourceDbId, snapshotId, rangeStartsInclusive, rangeEndsInclusive);
+                sourceDbId,
+                snapshotId,
+                rangeStartsInclusive,
+                rangeEndsInclusive,
+                ExpandStorageMode.ADOPT_ASYNC);
+    }
+
+    /** Expand bucket ownership with an explicit imported-file storage policy. */
+    public long expandBucket(
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ExpandStorageMode storageMode) {
+        if (storageMode == null) {
+            throw new IllegalArgumentException("storageMode must not be null");
+        }
+        return expandBucket(
+                nativeHandle,
+                sourceDbId,
+                snapshotId,
+                rangeStartsInclusive,
+                rangeEndsInclusive,
+                storageMode.ordinal());
     }
 
     /** Expand bucket ownership from the latest retained snapshot of the source DB. */
     public long expandBucket(
             String sourceDbId, int[] rangeStartsInclusive, int[] rangeEndsInclusive) {
         return expandBucket(
-                nativeHandle, sourceDbId, -1L, rangeStartsInclusive, rangeEndsInclusive);
+                sourceDbId,
+                -1L,
+                rangeStartsInclusive,
+                rangeEndsInclusive,
+                ExpandStorageMode.ADOPT_ASYNC);
+    }
+
+    /** Wait for asynchronous expansion adoption to finish. */
+    public void waitForExpandAdoption(long timeoutMillis) {
+        waitForExpandAdoption(nativeHandle, timeoutMillis);
     }
 
     /** Shrink bucket ownership by removing the given ranges from the current DB. */
@@ -1268,7 +1300,10 @@ public final class Db extends NativeObject {
             String sourceDbId,
             long snapshotId,
             int[] rangeStartsInclusive,
-            int[] rangeEndsInclusive);
+            int[] rangeEndsInclusive,
+            int storageMode);
+
+    private static native void waitForExpandAdoption(long nativeHandle, long timeoutMillis);
 
     private static native long shrinkBucket(
             long nativeHandle, int[] rangeStartsInclusive, int[] rangeEndsInclusive);
