@@ -1,5 +1,5 @@
 //! Functionality for expanding owned buckets by importing snapshot data from another db.
-use super::Db;
+use super::{Db, ExpandStorageMode};
 use crate::data_file::intersect_bucket_ranges;
 use crate::db_state::{
     DbState, LSMTreeScope, MultiLSMTreeVersion, TruncationCursorMap, bucket_range_fits_total,
@@ -10,6 +10,10 @@ use crate::file::{File, FileManager, MetadataReader, SequentialWriteFile};
 use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::paths::schema_file_relative_path;
+use crate::rescale_protocol::{
+    ExportLease, ImportRecord, export_lease_name, import_record_name, load_import_records,
+    write_export_lease, write_import_record,
+};
 use crate::snapshot::{
     build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
     build_truncation_cursors_from_manifest, build_vlog_version_from_manifest,
@@ -22,6 +26,7 @@ use crate::util::{
 use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 const RESCALE_PUBLICATION_OWNER_PREFIX: &str = "rescale";
@@ -80,6 +85,206 @@ fn copy_db_state(state: &DbState) -> DbState {
     }
 }
 
+fn shared_adoption_barrier_id(records: &[ImportRecord]) -> Option<u64> {
+    let snapshot_id = records
+        .first()
+        .and_then(|record| record.adoption_barrier_snapshot_id)?;
+    records
+        .iter()
+        .all(|record| record.adoption_barrier_snapshot_id == Some(snapshot_id))
+        .then_some(snapshot_id)
+}
+
+pub(crate) struct AdoptionCoordinator {
+    db_id: String,
+    config: crate::Config,
+    file_manager: Arc<FileManager>,
+    db_state: Arc<crate::db_state::DbStateHandle>,
+    db_lifecycle: Arc<crate::db_status::DbLifecycle>,
+    memtable_manager: Arc<crate::memtable::MemtableManager>,
+    snapshot_manager: crate::snapshot::SnapshotManager,
+    runtime_manifest_publisher:
+        Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
+    finalizing: AtomicBool,
+}
+
+impl AdoptionCoordinator {
+    pub(crate) fn new(
+        target: (String, crate::Config),
+        file_manager: Arc<FileManager>,
+        db_state: Arc<crate::db_state::DbStateHandle>,
+        db_lifecycle: Arc<crate::db_status::DbLifecycle>,
+        memtable_manager: Arc<crate::memtable::MemtableManager>,
+        snapshot_manager: crate::snapshot::SnapshotManager,
+        runtime_manifest_publisher: Option<
+            Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>,
+        >,
+    ) -> Self {
+        let (db_id, config) = target;
+        Self {
+            db_id,
+            config,
+            file_manager,
+            db_state,
+            db_lifecycle,
+            memtable_manager,
+            snapshot_manager,
+            runtime_manifest_publisher,
+            finalizing: AtomicBool::new(false),
+        }
+    }
+
+    fn current_leased_file_ids(&self) -> Vec<u64> {
+        let state = self.db_state.load();
+        state
+            .multi_lsm_version
+            .tree_versions_cloned()
+            .iter()
+            .flat_map(|tree| tree.levels.iter())
+            .flat_map(|level| level.files.iter())
+            .map(|file| file.file_id)
+            .chain(
+                state
+                    .vlog_version
+                    .tracked_files()
+                    .into_iter()
+                    .map(|file| file.file_id()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|file_id| {
+                self.file_manager
+                    .preferred_replica_origin(*file_id)
+                    .is_some_and(|origin| matches!(origin, ReplicaOrigin::ExternalLeased { .. }))
+            })
+            .collect()
+    }
+
+    pub(crate) fn tick(self: &Arc<Self>) -> Result<()> {
+        let records = load_import_records(&self.file_manager)?;
+        if records
+            .iter()
+            .any(|record| record.target_db_id != self.db_id)
+        {
+            return Err(Error::InvalidState(
+                "import record target_db_id does not match this database".to_string(),
+            ));
+        }
+        if records.is_empty() {
+            return Ok(());
+        }
+        self.file_manager
+            .schedule_referenced_adoptions(&self.db_state)?;
+        if !self.current_leased_file_ids().is_empty()
+            || self
+                .file_manager
+                .has_referenced_adoption_jobs(&self.db_state)
+            || self.finalizing.swap(true, Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        let committed_barrier = match self.adoption_barrier_is_committed(&records) {
+            Ok(committed) => committed,
+            Err(err) => {
+                self.finalizing.store(false, Ordering::Release);
+                return Err(err);
+            }
+        };
+        if let Some(barrier_id) = committed_barrier {
+            let result = self.finish_adoption(barrier_id);
+            self.finalizing.store(false, Ordering::Release);
+            return result;
+        }
+        let _access = match self.db_lifecycle.begin_owned_access() {
+            Ok(access) => access,
+            Err(err) => {
+                self.finalizing.store(false, Ordering::Release);
+                return Err(err);
+            }
+        };
+        if let Some(base) = self.db_state.load().suggested_base_snapshot_id {
+            self.db_state.rebase_suggested_snapshot(base, None);
+        }
+        let coordinator = Arc::clone(self);
+        let callback = Arc::new(
+            move |result: Result<crate::snapshot::SnapshotManifestInfo>| {
+                if let Ok(info) = result
+                    && let Err(err) = coordinator.finish_adoption(info.id)
+                {
+                    log::warn!("expand adoption finalization failed: {err}");
+                }
+                coordinator.finalizing.store(false, Ordering::Release);
+            },
+        );
+        if let Err(err) = self.memtable_manager.create_snapshot_with_before_flush(
+            self.snapshot_manager.clone(),
+            Some(callback),
+            |snapshot_id| self.write_adoption_barrier(snapshot_id),
+        ) {
+            self.finalizing.store(false, Ordering::Release);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// A barrier is committed exactly when its manifest exists. A missing manifest represents a
+    /// failed or interrupted pre-commit attempt and may be replaced by a new barrier.
+    fn adoption_barrier_is_committed(&self, records: &[ImportRecord]) -> Result<Option<u64>> {
+        let Some(snapshot_id) = shared_adoption_barrier_id(records) else {
+            return Ok(None);
+        };
+        Ok(list_snapshot_manifest_ids(&self.file_manager)?
+            .contains(&snapshot_id)
+            .then_some(snapshot_id))
+    }
+
+    fn write_adoption_barrier(&self, snapshot_id: u64) -> Result<()> {
+        for mut record in load_import_records(&self.file_manager)? {
+            record.adoption_barrier_snapshot_id = Some(snapshot_id);
+            write_import_record(&self.file_manager, &record)?;
+        }
+        Ok(())
+    }
+
+    fn finish_adoption(&self, barrier_id: u64) -> Result<()> {
+        if let Some(publisher) = &self.runtime_manifest_publisher {
+            publisher.publish_at_least(self.db_state.load().seq_id)?;
+        }
+        for record in load_import_records(&self.file_manager)? {
+            if record.adoption_barrier_snapshot_id != Some(barrier_id) {
+                continue;
+            }
+            if let Some(snapshot_id) = record.import_snapshot_id
+                && !self.snapshot_manager.is_retained(snapshot_id)
+            {
+                let _ = self.snapshot_manager.expire_snapshot(snapshot_id)?;
+            }
+            if self
+                .snapshot_manager
+                .has_live_external_lease(&record.export_id)
+            {
+                continue;
+            }
+            let source = FileManager::from_config(
+                &self.config,
+                &record.source_db_id,
+                Arc::new(MetricsManager::new(format!(
+                    "{}-adoption-source",
+                    record.source_db_id
+                ))),
+            )?;
+            source.remove_metadata_file(&export_lease_name(&record.export_id))?;
+            self.file_manager
+                .remove_metadata_file(&import_record_name(&record.export_id))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_complete(&self) -> Result<bool> {
+        Ok(load_import_records(&self.file_manager)?.is_empty())
+    }
+}
+
 fn filter_truncation_cursors(
     cursors: &TruncationCursorMap,
     ranges: &[RangeInclusive<u16>],
@@ -92,6 +297,23 @@ fn filter_truncation_cursors(
 }
 
 impl Db {
+    /// Wait until all current leased expand files are copied into this DB's owned storage.
+    pub fn wait_for_expand_adoption(&self, timeout: std::time::Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.adoption_coordinator.is_complete()? {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::IoError(
+                    "Timed out waiting for expand adoption".to_string(),
+                ));
+            }
+            if let Some(worker) = &self.primary_tiering_worker {
+                worker.wake();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
     fn ensure_dedicated_rescale_can_start(&self) -> Result<()> {
         if self.config.compaction_mode != crate::config::CompactionMode::Dedicated {
             return Ok(());
@@ -130,6 +352,22 @@ impl Db {
         source_db_id: impl Into<String>,
         snapshot_id: Option<u64>,
         ranges: Option<Vec<RangeInclusive<u16>>>,
+    ) -> Result<u64> {
+        self.expand_bucket_with_storage_mode(
+            source_db_id,
+            snapshot_id,
+            ranges,
+            ExpandStorageMode::AdoptAsync,
+        )
+    }
+
+    /// Expands owned buckets using the selected imported-file storage policy.
+    pub fn expand_bucket_with_storage_mode(
+        &self,
+        source_db_id: impl Into<String>,
+        snapshot_id: Option<u64>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ExpandStorageMode,
     ) -> Result<u64> {
         let source_db_id = source_db_id.into();
         if source_db_id == self.id {
@@ -216,6 +454,33 @@ impl Db {
                 Uuid::new_v4()
             ),
         )?;
+        let export_id =
+            (storage_mode == ExpandStorageMode::AdoptAsync).then(|| Uuid::new_v4().to_string());
+        if let Some(export_id) = &export_id {
+            let lease = ExportLease {
+                version: 1,
+                export_id: export_id.clone(),
+                source_db_id: source_db_id.clone(),
+                snapshot_id: source_snapshot_id,
+                target_db_id: self.id.clone(),
+                ranges: expand_ranges.clone(),
+            };
+            write_export_lease(&source_file_manager, &lease)?;
+            let record = ImportRecord {
+                version: 1,
+                export_id: export_id.clone(),
+                source_db_id: source_db_id.clone(),
+                snapshot_id: source_snapshot_id,
+                target_db_id: self.id.clone(),
+                ranges: expand_ranges.clone(),
+                import_snapshot_id: None,
+                adoption_barrier_snapshot_id: None,
+            };
+            if let Err(err) = write_import_record(&self.file_manager, &record) {
+                let _ = source_file_manager.remove_metadata_file(&export_lease_name(export_id));
+                return Err(err);
+            }
+        }
         let mut original_state = None;
         let mut original_ranges = None;
         let mut topology_installed = false;
@@ -235,8 +500,13 @@ impl Db {
                 .reserve_data_file_ids(source_file_ids.len());
             let file_id_map: HashMap<u64, u64> =
                 source_file_ids.iter().copied().zip(remapped_ids).collect();
-            let source_origin = ReplicaOrigin::ExternalPersistent {
-                source_id: format!("snapshot:{source_db_id}:{source_snapshot_id}"),
+            let source_origin = match &export_id {
+                Some(export_id) => ReplicaOrigin::ExternalLeased {
+                    export_id: export_id.clone(),
+                },
+                None => ReplicaOrigin::ExternalPersistent {
+                    source_id: format!("snapshot:{source_db_id}:{source_snapshot_id}"),
+                },
             };
             for levels in &mut source_manifest.tree_levels {
                 for level in levels {
@@ -427,7 +697,7 @@ impl Db {
             let merged_vlog =
                 crate::vlog::VlogVersion::from_files_with_entries(merged_vlog_entries);
             let mut updated_ranges = current.bucket_ranges.clone();
-            updated_ranges.extend(expand_ranges);
+            updated_ranges.extend(expand_ranges.clone());
             let updated_ranges = normalize_bucket_ranges(updated_ranges);
             let mut truncation_cursors = current.truncation_cursors_snapshot();
             truncation_cursors.extend(filter_truncation_cursors(
@@ -456,7 +726,25 @@ impl Db {
                 &source_file_manager,
                 &source_manifest.active_memtable_data,
             )?;
-            self.create_snapshot_and_wait("bucket expand")?;
+            if let Some(export_id) = &export_id {
+                self.create_snapshot_and_wait_with_before_flush("bucket expand", |snapshot_id| {
+                    write_import_record(
+                        &self.file_manager,
+                        &ImportRecord {
+                            version: 1,
+                            export_id: export_id.clone(),
+                            source_db_id: source_db_id.clone(),
+                            snapshot_id: source_snapshot_id,
+                            target_db_id: self.id.clone(),
+                            ranges: expand_ranges.clone(),
+                            import_snapshot_id: Some(snapshot_id),
+                            adoption_barrier_snapshot_id: None,
+                        },
+                    )
+                })?
+            } else {
+                self.create_snapshot_and_wait("bucket expand")?
+            };
             snapshot_committed = true;
             let seq_id = self.db_state.load().seq_id;
             if let Err(err) = publication.publish_at_least_and_resume(seq_id) {
@@ -474,6 +762,12 @@ impl Db {
                 ));
                 self.snapshot_manager
                     .set_bucket_ranges(original_ranges.expect("topology has original ranges"));
+            }
+            if !snapshot_committed && let Some(export_id) = &export_id {
+                let _ = self
+                    .file_manager
+                    .remove_metadata_file(&import_record_name(export_id));
+                let _ = source_file_manager.remove_metadata_file(&export_lease_name(export_id));
             }
             return Err(err);
         }
@@ -655,6 +949,28 @@ mod tests {
     }
 
     #[test]
+    fn adoption_barrier_requires_every_live_import() {
+        let record = |barrier| ImportRecord {
+            version: 1,
+            export_id: "export".to_string(),
+            source_db_id: "source".to_string(),
+            snapshot_id: 1,
+            target_db_id: "target".to_string(),
+            ranges: vec![0..=0],
+            import_snapshot_id: Some(2),
+            adoption_barrier_snapshot_id: barrier,
+        };
+        assert_eq!(
+            shared_adoption_barrier_id(&[record(Some(3)), record(Some(3))]),
+            Some(3)
+        );
+        assert_eq!(
+            shared_adoption_barrier_id(&[record(Some(3)), record(None)]),
+            None
+        );
+    }
+
+    #[test]
     #[serial(file)]
     fn test_expand_bucket_from_latest_snapshot() {
         let root = "/tmp/db_expand_bucket";
@@ -689,6 +1005,10 @@ mod tests {
             .expand_bucket(source.id().to_string(), Some(source_snapshot), None)
             .unwrap();
         assert_eq!(imported_snapshot, source_snapshot);
+        assert!(
+            !source.expire_snapshot(source_snapshot).unwrap(),
+            "the export lease must keep the source snapshot alive until adoption finishes"
+        );
 
         let value = target.get(2, b"k1").unwrap().unwrap();
         assert_eq!(value[0].as_deref(), Some(&b"v1"[..]));
@@ -701,6 +1021,31 @@ mod tests {
         let target_metrics = Arc::new(MetricsManager::new("expand-target-manifest"));
         let target_file_manager =
             Arc::new(FileManager::from_config(&config, &target_id, target_metrics).unwrap());
+        let import_snapshot = *list_snapshot_manifest_ids(&target_file_manager)
+            .unwrap()
+            .last()
+            .unwrap();
+        let import_manifest =
+            crate::snapshot::load_manifest_for_snapshot(&target_file_manager, import_snapshot)
+                .unwrap();
+        assert_eq!(import_manifest.bucket_ranges, vec![0u16..=3u16]);
+        let imported_origins = import_manifest
+            .tree_levels
+            .iter()
+            .flatten()
+            .flat_map(|level| level.files.iter())
+            .map(|file| &file.origin)
+            .chain(import_manifest.vlog_files.iter().map(|file| &file.origin))
+            .collect::<Vec<_>>();
+        assert!(!imported_origins.is_empty());
+        assert!(
+            imported_origins
+                .iter()
+                .all(|origin| { matches!(origin, ReplicaOrigin::ExternalLeased { .. }) })
+        );
+        target
+            .wait_for_expand_adoption(Duration::from_secs(10))
+            .unwrap();
         let target_snapshot = *list_snapshot_manifest_ids(&target_file_manager)
             .unwrap()
             .last()
@@ -708,47 +1053,67 @@ mod tests {
         let target_manifest =
             crate::snapshot::load_manifest_for_snapshot(&target_file_manager, target_snapshot)
                 .unwrap();
-        assert_eq!(target_manifest.bucket_ranges, vec![0u16..=3u16]);
-        let source_identity = format!("snapshot:{}:{source_snapshot}", source.id());
-        let imported_origins = target_manifest
-            .tree_levels
-            .iter()
-            .flatten()
-            .flat_map(|level| level.files.iter())
-            .map(|file| &file.origin)
-            .chain(target_manifest.vlog_files.iter().map(|file| &file.origin))
-            .collect::<Vec<_>>();
-        assert!(!imported_origins.is_empty());
-        assert!(imported_origins.iter().all(|origin| {
-            matches!(
-                origin,
-                ReplicaOrigin::ExternalPersistent { source_id } if source_id == &source_identity
+        assert!(
+            target_manifest
+                .tree_levels
+                .iter()
+                .flatten()
+                .flat_map(|level| level.files.iter())
+                .all(|file| matches!(file.origin, ReplicaOrigin::Owned))
+        );
+        assert!(
+            target_file_manager
+                .list_metadata_names("imports")
+                .unwrap()
+                .is_empty()
+        );
+
+        let persistent = Db::open(config.clone(), vec![4u16..=5u16]).unwrap();
+        persistent
+            .expand_bucket_with_storage_mode(
+                source.id().to_string(),
+                Some(source_snapshot),
+                None,
+                ExpandStorageMode::ReferencePersistent,
             )
-        }));
+            .unwrap();
+        let persistent_file_manager = Arc::new(
+            FileManager::from_config(
+                &config,
+                persistent.id(),
+                Arc::new(MetricsManager::new("expand-persistent-manifest")),
+            )
+            .unwrap(),
+        );
+        let persistent_snapshot = *list_snapshot_manifest_ids(&persistent_file_manager)
+            .unwrap()
+            .last()
+            .unwrap();
+        let persistent_manifest = crate::snapshot::load_manifest_for_snapshot(
+            &persistent_file_manager,
+            persistent_snapshot,
+        )
+        .unwrap();
+        assert!(
+            persistent_manifest
+                .tree_levels
+                .iter()
+                .flatten()
+                .flat_map(|level| level.files.iter())
+                .all(|file| matches!(file.origin, ReplicaOrigin::ExternalPersistent { .. }))
+        );
+        drop(persistent);
+        assert!(source.get(2, b"k1").unwrap().is_some());
+
+        assert!(source.expire_snapshot(source_snapshot).unwrap());
+        drop(source);
         drop(target);
         let reopened = Db::open_from_snapshot(config.clone(), target_snapshot, target_id).unwrap();
         assert_eq!(
             reopened.get(2, b"k1").unwrap().unwrap()[0].as_deref(),
             Some(&b"v1"[..])
         );
-        let (tx, rx) = mpsc::channel();
-        let reopened_snapshot = reopened
-            .snapshot_with_callback(move |result| {
-                let _ = tx.send(result);
-            })
-            .unwrap();
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(10))
-                .unwrap()
-                .unwrap()
-                .snapshot_id,
-            reopened_snapshot
-        );
-        assert!(reopened.expire_snapshot(reopened_snapshot).unwrap());
         drop(reopened);
-        let source_value = source.get(2, b"k1").unwrap().unwrap();
-        assert_eq!(source_value[0].as_deref(), Some(&b"v1"[..]));
-        drop(source);
         cleanup_test_root(root);
     }
 

@@ -374,6 +374,8 @@ pub struct TrackedFile {
     pub(crate) fs: Arc<dyn FileSystem>,
     /// Optional volume usage tracker.
     pub(crate) volume: Option<Arc<DataVolume>>,
+    /// Whether this file's bytes belong to this DB's managed volume usage.
+    accounted_on_volume: bool,
     /// Bytes tracked for this file.
     pub(crate) size_bytes: AtomicU64,
     /// Whether to delete the file when this TrackedFile is dropped.
@@ -398,6 +400,7 @@ impl TrackedFile {
             path,
             fs,
             volume,
+            accounted_on_volume: true,
             size_bytes: AtomicU64::new(0),
             delete_on_drop: AtomicBool::new(true),
             explicit_refs: AtomicU32::new(0),
@@ -405,7 +408,7 @@ impl TrackedFile {
         }
     }
 
-    /// Creates a new TrackedFile that never deletes on drop.
+    /// Creates a locally owned TrackedFile that never deletes on drop.
     pub(crate) fn readonly(
         path: String,
         fs: Arc<dyn FileSystem>,
@@ -415,6 +418,26 @@ impl TrackedFile {
             path,
             fs,
             volume,
+            accounted_on_volume: true,
+            size_bytes: AtomicU64::new(0),
+            delete_on_drop: AtomicBool::new(false),
+            explicit_refs: AtomicU32::new(0),
+            priority: AtomicU8::new(DEFAULT_TRACKED_FILE_PRIORITY),
+        }
+    }
+
+    /// Creates a view of another database's file. The view must neither delete nor consume this
+    /// database's volume quota.
+    pub(crate) fn external_view(
+        path: String,
+        fs: Arc<dyn FileSystem>,
+        volume: Option<Arc<DataVolume>>,
+    ) -> Self {
+        Self {
+            path,
+            fs,
+            volume,
+            accounted_on_volume: false,
             size_bytes: AtomicU64::new(0),
             delete_on_drop: AtomicBool::new(false),
             explicit_refs: AtomicU32::new(0),
@@ -464,7 +487,9 @@ impl TrackedFile {
             return;
         }
         self.size_bytes.fetch_add(delta, Ordering::SeqCst);
-        if let Some(volume) = &self.volume {
+        if self.accounted_on_volume
+            && let Some(volume) = &self.volume
+        {
             volume.add_usage(delta);
         }
     }
@@ -544,7 +569,9 @@ impl Drop for TrackedFile {
             // Attempt to delete the file, ignore errors
             let _ = self.fs.delete_async(&self.path);
         }
-        if let Some(volume) = &self.volume {
+        if self.accounted_on_volume
+            && let Some(volume) = &self.volume
+        {
             let size = self.size_bytes.load(Ordering::SeqCst);
             if size > 0 {
                 volume.subtract_usage(size);
@@ -1567,7 +1594,7 @@ impl FileManager {
                             Some(Arc::clone(&volume)),
                         )
                     } else {
-                        TrackedFile::readonly(
+                        TrackedFile::external_view(
                             relative_path,
                             Arc::clone(volume.fs()),
                             Some(Arc::clone(&volume)),
@@ -1903,8 +1930,14 @@ impl FileManager {
                     Arc::clone(volume.fs()),
                     Some(Arc::clone(&volume)),
                 )
-            } else {
+            } else if matches!(origin, ReplicaOrigin::Owned) {
                 TrackedFile::readonly(
+                    relative_path,
+                    Arc::clone(volume.fs()),
+                    Some(Arc::clone(&volume)),
+                )
+            } else {
+                TrackedFile::external_view(
                     relative_path,
                     Arc::clone(volume.fs()),
                     Some(Arc::clone(&volume)),
@@ -1970,7 +2003,7 @@ impl FileManager {
         if !volume.fs().exists(&relative_path)? {
             return Err(Error::IoError(format!("External file is missing: {path}")));
         }
-        let tracked = Arc::new(TrackedFile::readonly(
+        let tracked = Arc::new(TrackedFile::external_view(
             relative_path,
             Arc::clone(volume.fs()),
             Some(Arc::clone(&volume)),
@@ -2465,11 +2498,19 @@ impl FileManager {
         }
         let (volume, relative_path) = self.resolve_volume_path(path)?;
         let fs = Arc::clone(volume.fs());
-        let tracked = Arc::new(match ownership {
-            TrackedFileOwnership::Owned => {
+        let tracked = Arc::new(match (ownership, &origin) {
+            (
+                _,
+                ReplicaOrigin::ExternalLeased { .. } | ReplicaOrigin::ExternalPersistent { .. },
+            ) => TrackedFile::external_view(
+                relative_path,
+                Arc::clone(&fs),
+                Some(Arc::clone(&volume)),
+            ),
+            (TrackedFileOwnership::Owned, _) => {
                 TrackedFile::new(relative_path, Arc::clone(&fs), Some(Arc::clone(&volume)))
             }
-            TrackedFileOwnership::Retained => {
+            (TrackedFileOwnership::Retained, _) => {
                 TrackedFile::readonly(relative_path, Arc::clone(&fs), Some(Arc::clone(&volume)))
             }
         });
@@ -2950,6 +2991,11 @@ pub(crate) mod tests {
             consumer
                 .load_replica_catalog_as_readonly_consumer()
                 .unwrap();
+            assert_eq!(
+                consumer.data_volumes[0].used_bytes.load(Ordering::SeqCst),
+                0,
+                "external and readonly-consumer replicas must not consume local capacity"
+            );
             let consumer_replica = consumer
                 .get_logical_file(file_id)
                 .unwrap()
@@ -3365,11 +3411,14 @@ pub(crate) mod tests {
     #[serial_test::serial(file)]
     fn test_file_manager_metadata_files() {
         let (_fs, fm) = create_test_file_manager();
+        let initial_usage = fm.meta_volume.used_bytes.load(Ordering::SeqCst);
 
         // Create a metadata file
         let mut writer = fm.create_metadata_file("manifest").unwrap();
         writer.write(b"manifest data").unwrap();
         writer.close().unwrap();
+
+        assert!(fm.meta_volume.used_bytes.load(Ordering::SeqCst) > initial_usage);
 
         assert!(fm.has_metadata_file("manifest"));
         assert_eq!(fm.metadata_file_count(), 1);
@@ -3378,10 +3427,15 @@ pub(crate) mod tests {
         let reader = fm.open_metadata_file_reader("manifest").unwrap();
         let data = reader.read_at(0, 13).unwrap();
         assert_eq!(&data[..], b"manifest data");
+        drop(reader);
 
         // Remove it
         fm.remove_metadata_file("manifest").unwrap();
         assert!(!fm.has_metadata_file("manifest"));
+        assert_eq!(
+            fm.meta_volume.used_bytes.load(Ordering::SeqCst),
+            initial_usage
+        );
 
         cleanup_test_root();
     }

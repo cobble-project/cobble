@@ -121,6 +121,7 @@ pub mod paths;
 mod properties;
 mod read_only_db;
 mod reader;
+mod rescale_protocol;
 mod runtime_manifest;
 mod scan;
 mod schema;
@@ -147,7 +148,7 @@ pub use config::{
 pub use coordinator::{
     CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef,
 };
-pub use db::Db;
+pub use db::{Db, ExpandStorageMode};
 pub use db_builder::DbBuilder;
 pub use db_iter::DbIterator;
 pub use error::{Error, Result};

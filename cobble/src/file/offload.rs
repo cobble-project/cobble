@@ -3,6 +3,7 @@ use crate::Error;
 use crate::config::PrimaryVolumeOffloadPolicyKind;
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::DbStateHandle;
+use crate::file::logical_file::ReplicaOrigin;
 use crate::file::{DataVolume, FileManager, TrackedFile, TrackedWriter};
 use crate::sst::PinnedSstReadMetadata;
 use dashmap::{DashMap, Entry};
@@ -103,6 +104,7 @@ enum PrimaryTieringDirection {
     Offload,
     Backfill,
     ReadonlyLoad,
+    Adoption,
 }
 
 enum PrimaryMoveGuard {
@@ -277,6 +279,12 @@ impl OffloadRuntime {
         self.planned_jobs.contains_key(&file_id)
     }
 
+    fn is_adoption_job(&self, file_id: FileId) -> bool {
+        self.planned_jobs
+            .get(&file_id)
+            .is_some_and(|plan| plan.direction == PrimaryTieringDirection::Adoption)
+    }
+
     fn projected_source_offload_bytes(&self, source_volume: &Arc<DataVolume>) -> u64 {
         source_volume.projected_offload_bytes()
     }
@@ -439,6 +447,7 @@ impl PrimaryTieringWorkerHandle {
     fn start(
         file_manager: &Arc<FileManager>,
         db_state: &Arc<DbStateHandle>,
+        adoption_tick: Option<Arc<dyn Fn() -> crate::Result<()> + Send + Sync>>,
     ) -> crate::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new(Notify::new());
@@ -457,6 +466,11 @@ impl PrimaryTieringWorkerHandle {
                 };
                 if let Err(err) = file_manager.trigger_primary_tiering_if_needed(&db_state) {
                     warn!("primary volume tiering scan failed: {}", err);
+                }
+                if let Some(tick) = &adoption_tick
+                    && let Err(err) = tick()
+                {
+                    warn!("external adoption scan failed: {err}");
                 }
                 drop(db_state);
                 drop(file_manager);
@@ -595,21 +609,9 @@ impl FileManager {
     pub(crate) fn start_primary_tiering_worker(
         self: &Arc<Self>,
         db_state: &Arc<DbStateHandle>,
+        adoption_tick: Option<Arc<dyn Fn() -> crate::Result<()> + Send + Sync>>,
     ) -> crate::Result<Option<PrimaryTieringWorkerHandle>> {
-        let distinct_primary_ranks = self
-            .data_volumes
-            .iter()
-            .filter(|volume| volume.supports_primary_data)
-            .map(|volume| volume.priority.rank())
-            .collect::<HashSet<_>>();
-        let has_readonly_source = self
-            .data_volumes
-            .iter()
-            .any(|volume| volume.readonly_source);
-        if distinct_primary_ranks.len() < 2 && !has_readonly_source {
-            return Ok(None);
-        }
-        PrimaryTieringWorkerHandle::start(self, db_state).map(Some)
+        PrimaryTieringWorkerHandle::start(self, db_state, adoption_tick).map(Some)
     }
 
     #[cfg(test)]
@@ -823,6 +825,20 @@ impl FileManager {
                     .projected_target_physical_bytes(volume)
                     .saturating_add(reserved_incoming_bytes)
                     <= max_target_used_bytes
+            })
+            .max_by_key(|volume| volume.priority.rank())
+            .map(Arc::clone)
+    }
+
+    fn select_adoption_target(&self, size_bytes: u64) -> Option<Arc<DataVolume>> {
+        self.data_volumes
+            .iter()
+            .filter(|volume| volume.supports_primary_data && !volume.readonly_source)
+            .filter(|volume| {
+                self.offload_runtime
+                    .projected_target_physical_bytes(volume)
+                    .saturating_add(size_bytes)
+                    <= self.max_readonly_load_target_used_bytes(volume)
             })
             .max_by_key(|volume| volume.priority.rank())
             .map(Arc::clone)
@@ -1370,6 +1386,168 @@ impl FileManager {
         )
     }
 
+    fn adopt_external_leased_file(
+        &self,
+        file_id: FileId,
+        target_volume: &Arc<DataVolume>,
+        progress: &mut dyn FnMut(u64),
+    ) -> crate::Result<bool> {
+        let source = self
+            .preferred_tracked_file(file_id)
+            .ok_or_else(|| Error::IoError(format!("Data file {file_id} is not tracked")))?;
+        let Some(logical) = self.get_logical_file(file_id) else {
+            return Ok(false);
+        };
+        if !matches!(
+            logical
+                .preferred_replica_any()
+                .map(|replica| replica.origin()),
+            Some(ReplicaOrigin::ExternalLeased { .. })
+        ) {
+            return Ok(false);
+        }
+        let source_reader = source.fs().open_read(source.path())?;
+        let (mut writer, owned) =
+            self.create_untracked_data_file_writer_on_volume(target_volume)?;
+        self.copy_reader_to_tracked_writer_with_progress(
+            source_reader.as_ref(),
+            &mut writer,
+            progress,
+        )?;
+        owned.set_priority(source.priority());
+        let rollback_state = logical.replica_state_snapshot();
+        let rollback_replicas = rollback_state
+            .replicas
+            .iter()
+            .map(|replica| {
+                (
+                    replica.replica_id,
+                    Arc::clone(&replica.tracked),
+                    replica.lifecycle(),
+                    replica.origin(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let Some(source_replica_id) =
+            self.select_new_replica_retaining_source_if(file_id, &source, Arc::clone(&owned))
+        else {
+            return Ok(false);
+        };
+        if let Err(err) = self.persist_replica_catalog() {
+            logical.restore_replica_state_with_origins(
+                rollback_replicas.clone(),
+                Some(source_replica_id),
+            );
+            return Err(err);
+        }
+        self.retire_replica(file_id, source_replica_id);
+        if let Err(err) = self.persist_replica_catalog() {
+            logical.restore_replica_state_with_origins(rollback_replicas, Some(source_replica_id));
+            return Err(err);
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn schedule_adopt_external_leased_file(
+        self: &Arc<Self>,
+        file_id: FileId,
+        target_volume: Arc<DataVolume>,
+    ) -> crate::Result<bool> {
+        let source = self
+            .preferred_tracked_file(file_id)
+            .ok_or_else(|| Error::IoError(format!("Data file {file_id} is not tracked")))?;
+        let Some(source_volume) = source.volume.as_ref().map(Arc::clone) else {
+            return Ok(false);
+        };
+        if self
+            .offload_runtime
+            .projected_target_physical_bytes(&target_volume)
+            .saturating_add(source.size_bytes())
+            > self.max_readonly_load_target_used_bytes(&target_volume)
+        {
+            return Ok(false);
+        }
+        let manager = Arc::downgrade(self);
+        let target_for_job = Arc::clone(&target_volume);
+        let copied_bytes = source.size_bytes();
+        let handler = Arc::new(move |scheduled_file_id| {
+            if let Some(manager) = manager.upgrade() {
+                let runtime = Arc::clone(&manager.offload_runtime);
+                let mut progress = |bytes| runtime.record_copy_progress(scheduled_file_id, bytes);
+                match manager.adopt_external_leased_file(
+                    scheduled_file_id,
+                    &target_for_job,
+                    &mut progress,
+                ) {
+                    Ok(true) => manager.record_offload_completed_copy(copied_bytes),
+                    Ok(false) => manager.record_offload_noop(),
+                    Err(err) => {
+                        manager.record_offload_failed();
+                        warn!("external adoption failed for file_id={scheduled_file_id}: {err}");
+                    }
+                }
+            }
+        });
+        let scheduled = self
+            .offload_runtime
+            .schedule(
+                file_id,
+                OffloadJobPlan {
+                    source_volume,
+                    target_volume,
+                    reserved_incoming_bytes: source.size_bytes(),
+                    projected_source_release_bytes: 0,
+                    copied_bytes: Arc::new(AtomicU64::new(0)),
+                    direction: PrimaryTieringDirection::Adoption,
+                },
+                handler,
+                Some(Arc::clone(self)),
+            )
+            .map_err(Error::IoError)?;
+        if scheduled {
+            self.record_offload_scheduled();
+        }
+        Ok(scheduled)
+    }
+
+    pub(crate) fn schedule_referenced_adoptions(
+        self: &Arc<Self>,
+        db_state: &DbStateHandle,
+    ) -> crate::Result<usize> {
+        let priorities = referenced_primary_file_priorities(db_state);
+        let mut candidates = priorities
+            .into_iter()
+            .filter(|(file_id, _)| {
+                self.preferred_replica_origin(*file_id)
+                    .is_some_and(|origin| matches!(origin, ReplicaOrigin::ExternalLeased { .. }))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        let mut scheduled = 0;
+        for (file_id, _) in candidates {
+            if !self.offload_runtime.has_available_worker_slot() {
+                break;
+            }
+            let size = self
+                .preferred_tracked_file(file_id)
+                .map(|file| file.size_bytes())
+                .unwrap_or(0);
+            let Some(target) = self.select_adoption_target(size) else {
+                continue;
+            };
+            if self.schedule_adopt_external_leased_file(file_id, target)? {
+                scheduled += 1;
+            }
+        }
+        Ok(scheduled)
+    }
+
+    pub(crate) fn has_referenced_adoption_jobs(&self, db_state: &DbStateHandle) -> bool {
+        referenced_primary_file_priorities(db_state)
+            .into_keys()
+            .any(|file_id| self.offload_runtime.is_adoption_job(file_id))
+    }
+
     fn move_file_to_primary_volume_with_progress(
         &self,
         file_id: FileId,
@@ -1406,6 +1584,7 @@ impl FileManager {
                         replica.replica_id,
                         Arc::clone(&replica.tracked),
                         replica.lifecycle(),
+                        replica.origin(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1417,12 +1596,16 @@ impl FileManager {
                 return Ok(false);
             };
             if let Err(err) = self.persist_replica_catalog() {
-                logical.restore_replica_state(rollback_replicas.clone(), Some(source_replica_id));
+                logical.restore_replica_state_with_origins(
+                    rollback_replicas.clone(),
+                    Some(source_replica_id),
+                );
                 return Err(err);
             }
             self.retire_replica(file_id, source_replica_id);
             if let Err(err) = self.persist_replica_catalog() {
-                logical.restore_replica_state(rollback_replicas, Some(source_replica_id));
+                logical
+                    .restore_replica_state_with_origins(rollback_replicas, Some(source_replica_id));
                 return Err(err);
             }
             self.record_offload_completed_promotion();
@@ -1456,6 +1639,7 @@ impl FileManager {
                     replica.replica_id,
                     Arc::clone(&replica.tracked),
                     replica.lifecycle(),
+                    replica.origin(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1468,12 +1652,15 @@ impl FileManager {
             return Ok(false);
         };
         if let Err(err) = self.persist_replica_catalog() {
-            logical.restore_replica_state(rollback_replicas.clone(), Some(source_replica_id));
+            logical.restore_replica_state_with_origins(
+                rollback_replicas.clone(),
+                Some(source_replica_id),
+            );
             return Err(err);
         }
         self.retire_replica(file_id, source_replica_id);
         if let Err(err) = self.persist_replica_catalog() {
-            logical.restore_replica_state(rollback_replicas, Some(source_replica_id));
+            logical.restore_replica_state_with_origins(rollback_replicas, Some(source_replica_id));
             return Err(err);
         }
         self.record_offload_completed_copy(copied_bytes);
@@ -2849,7 +3036,7 @@ mod tests {
                 .is_some_and(|volume| volume.readonly_source)
         }));
         assert!(source_path.exists());
-        let worker = fm.start_primary_tiering_worker(&db_state).unwrap();
+        let worker = fm.start_primary_tiering_worker(&db_state, None).unwrap();
         assert!(
             worker.is_some(),
             "READONLY loading needs a scanner even with one primary tier"
@@ -3012,7 +3199,10 @@ mod tests {
         );
         assert!(!referenced_priorities.contains_key(&unreferenced_file_id));
 
-        let worker = fm.start_primary_tiering_worker(&db_state).unwrap().unwrap();
+        let worker = fm
+            .start_primary_tiering_worker(&db_state, None)
+            .unwrap()
+            .unwrap();
         let moved = (0..100).any(|_| {
             let on_high = fm
                 .preferred_tracked_file(l0_file_id)

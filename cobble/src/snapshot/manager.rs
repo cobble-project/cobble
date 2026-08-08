@@ -526,6 +526,18 @@ impl SnapshotManager {
         true
     }
 
+    pub(crate) fn has_live_external_lease(&self, export_id: &str) -> bool {
+        self.state.lock().unwrap().snapshots.values().any(|snapshot| {
+            snapshot.replica_origins.values().any(|origin| {
+                matches!(origin, ReplicaOrigin::ExternalLeased { export_id: current } if current == export_id)
+            })
+        })
+    }
+
+    pub(crate) fn is_retained(&self, id: u64) -> bool {
+        self.state.lock().unwrap().retained.contains(&id)
+    }
+
     pub(crate) fn active_memtable_snapshot_segments(
         &self,
         base_snapshot_id: Option<u64>,
@@ -683,7 +695,7 @@ impl SnapshotManager {
             });
         }
         for id in to_expire {
-            if !self.retain_snapshot(id) {
+            if !self.state.lock().unwrap().retained.contains(&id) {
                 let _ = self.expire_snapshot(id)?;
             }
         }
@@ -1021,6 +1033,9 @@ impl SnapshotManager {
     }
 
     pub(crate) fn expire_snapshot(&self, id: u64) -> Result<bool> {
+        if crate::rescale_protocol::snapshot_has_export_lease(&self.file_manager, id)? {
+            return Ok(false);
+        }
         let (
             removed_snapshots,
             removed_requested_snapshot,

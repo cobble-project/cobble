@@ -72,9 +72,19 @@ pub struct Db {
     dedicated_poller: Option<crate::compaction::dedicated_poller::DedicatedCompactionPollerHandle>,
     /// Periodically moves files between primary volume tiers in both directions.
     primary_tiering_worker: Option<crate::file::PrimaryTieringWorkerHandle>,
+    adoption_coordinator: Arc<rescale::AdoptionCoordinator>,
     /// Durable runtime-manifest publisher for external observers.
     runtime_manifest_publisher:
         Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
+}
+
+/// Storage ownership policy for files imported by [`Db::expand_bucket_with_storage_mode`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpandStorageMode {
+    /// Reference the source snapshot until its files are copied into this DB's owned storage.
+    AdoptAsync,
+    /// Keep a durable external reference to the source snapshot without copying it.
+    ReferencePersistent,
 }
 
 pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<Bytes>>>> {
@@ -977,6 +987,33 @@ impl Db {
         Ok(snapshot_id)
     }
 
+    fn create_snapshot_and_wait_with_before_flush<F>(
+        &self,
+        operation: &str,
+        before_flush: F,
+    ) -> Result<u64>
+    where
+        F: FnOnce(u64) -> Result<()>,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let snapshot_id = self.memtable_manager.create_snapshot_with_before_flush(
+            self.snapshot_manager.clone(),
+            Some(Arc::new(move |result| {
+                let _ = tx.send(result);
+            })),
+            before_flush,
+        )?;
+        match rx.recv() {
+            Ok(result) => {
+                result?;
+                Ok(snapshot_id)
+            }
+            Err(_) => Err(Error::IoError(format!(
+                "Snapshot callback disconnected during {operation}"
+            ))),
+        }
+    }
+
     /// Cancel an in-flight snapshot before manifest publication completes.
     pub fn cancel_snapshot(&self, snapshot_id: u64) -> Result<bool> {
         let _access = self.begin_access()?;
@@ -1249,7 +1286,21 @@ impl Db {
         } else {
             None
         };
-        let primary_tiering_worker = file_manager.start_primary_tiering_worker(&db_state)?;
+        let adoption_coordinator = Arc::new(rescale::AdoptionCoordinator::new(
+            (id.clone(), config.clone()),
+            Arc::clone(&file_manager),
+            Arc::clone(&db_state),
+            Arc::clone(&db_lifecycle),
+            Arc::clone(&memtable_manager),
+            snapshot_manager.clone(),
+            runtime_manifest_publisher.as_ref().map(Arc::clone),
+        ));
+        let adoption_tick = {
+            let coordinator = Arc::clone(&adoption_coordinator);
+            Arc::new(move || coordinator.tick())
+        };
+        let primary_tiering_worker =
+            file_manager.start_primary_tiering_worker(&db_state, Some(adoption_tick))?;
 
         // Mark the DB as open before starting background observers so their
         // `ensure_open()` checks pass immediately.
@@ -1302,6 +1353,7 @@ impl Db {
             ttl_provider,
             dedicated_poller,
             primary_tiering_worker,
+            adoption_coordinator,
             runtime_manifest_publisher,
         })
     }

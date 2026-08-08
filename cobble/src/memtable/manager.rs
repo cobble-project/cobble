@@ -2252,6 +2252,25 @@ impl MemtableManager {
         Ok(snapshot_id)
     }
 
+    pub(crate) fn create_snapshot_with_before_flush<F>(
+        &self,
+        manager: SnapshotManager,
+        callback: Option<SnapshotCallback>,
+        before_flush: F,
+    ) -> Result<u64>
+    where
+        F: FnOnce(u64) -> Result<()>,
+    {
+        let _rotation_guard = self.rotation_lock.lock().unwrap();
+        let snapshot_id = manager.create_snapshot(callback).id;
+        if let Err(err) = before_flush(snapshot_id) {
+            manager.fail_snapshot(snapshot_id, err.clone());
+            return Err(err);
+        }
+        self.flush_snapshot_under_rotation(snapshot_id, manager)?;
+        Ok(snapshot_id)
+    }
+
     fn flush_snapshot_under_rotation(
         &self,
         snapshot_id: u64,
