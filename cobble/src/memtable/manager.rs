@@ -2722,6 +2722,7 @@ fn flush_memtable(
         .with_separated_values(has_separated_values);
         data_file.set_meta_bytes(meta_bytes);
         data_file.set_max_expired_at(max_expired_at);
+        file_manager.finalize_data_file(&data_file)?;
         if let Some(metadata) = sst_read_metadata {
             data_file.set_sst_read_metadata(metadata);
         }

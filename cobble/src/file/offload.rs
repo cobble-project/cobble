@@ -1415,14 +1415,8 @@ impl FileManager {
             && Arc::ptr_eq(snapshot_volume, target_volume)
         {
             snapshot_tracked.set_priority(source_tracked.priority());
-            match self.data_files.entry(file_id) {
-                Entry::Occupied(mut occupied) => {
-                    if !Arc::ptr_eq(occupied.get(), &source_tracked) {
-                        return Ok(false);
-                    }
-                    occupied.insert(snapshot_tracked);
-                }
-                Entry::Vacant(_) => return Ok(false),
+            if !self.replace_data_file_replica(file_id, &source_tracked, snapshot_tracked) {
+                return Ok(false);
             }
             if let Ok(mut cache) = self.reader_cache.lock() {
                 cache.remove(&file_id);
@@ -1445,18 +1439,9 @@ impl FileManager {
             return Err(err);
         }
         new_tracked.set_priority(source_tracked.priority());
-        match self.data_files.entry(file_id) {
-            Entry::Occupied(mut occupied) => {
-                if !Arc::ptr_eq(occupied.get(), &source_tracked) {
-                    rollback();
-                    return Ok(false);
-                }
-                occupied.insert(new_tracked);
-            }
-            Entry::Vacant(_) => {
-                rollback();
-                return Ok(false);
-            }
+        if !self.replace_data_file_replica(file_id, &source_tracked, new_tracked) {
+            rollback();
+            return Ok(false);
         }
         if let Ok(mut cache) = self.reader_cache.lock() {
             cache.remove(&file_id);

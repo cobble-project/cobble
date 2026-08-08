@@ -716,10 +716,9 @@ fn prepare_outputs(
     let mut path_to_id = HashMap::with_capacity(outputs.len());
     for (output, local_id) in outputs.iter().zip(local_ids.iter()) {
         let local_id = *local_id;
-        // Register the output as readonly (delete_on_drop = false) so it survives until
-        // make_data_file_owned is called after manifest commit.
+        // Keep the output until the writer adopts it after manifest commit.
         ctx.file_manager
-            .register_data_file_readonly(local_id, &output.path)?;
+            .register_data_file_pending_adoption(local_id, &output.path)?;
         // Unknown file type is a protocol-level error (corrupt result), not transient I/O.
         // Map it to InvalidState so the poller treats it as terminal and deletes the result.
         let file_type = DataFileType::from_str(&output.file_type).map_err(|e| {
@@ -748,6 +747,7 @@ fn prepare_outputs(
         .with_vlog_offset(output.vlog_file_seq_offset)
         .with_separated_values(output.has_separated_values);
         data_file.set_max_expired_at(output.max_expired_at);
+        ctx.file_manager.finalize_data_file(&data_file)?;
         // Set the priority for the output level.
         let _ = ctx.file_manager.set_data_file_priority(
             local_id,

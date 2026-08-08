@@ -1198,6 +1198,9 @@ fn remap_snapshot_tree_file_ids(
                             )
                             .with_vlog_offset(file.vlog_file_seq_offset)
                             .with_separated_values(file.has_separated_values);
+                            if let Some(logical) = file.logical_file() {
+                                detached.attach_logical_file(logical);
+                            }
                             if mapped_file_id != file.file_id {
                                 if file_manager.is_data_file_on_snapshot_volume(mapped_file_id) {
                                     detached.set_snapshot_data_file(TrackedFileId::new(
@@ -1325,6 +1328,9 @@ fn clone_lsm_tree_version_untracked(
                         )
                         .with_vlog_offset(file.vlog_file_seq_offset)
                         .with_separated_values(file.has_separated_values);
+                        if let Some(logical) = file.logical_file() {
+                            detached.attach_logical_file(logical);
+                        }
                         if let Some(snapshot_file_id) = file.snapshot_data_file_id()
                             && file_manager.is_data_file_on_snapshot_volume(snapshot_file_id)
                         {

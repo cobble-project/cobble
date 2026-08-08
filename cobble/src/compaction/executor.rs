@@ -800,6 +800,7 @@ impl CompactionExecutor {
                     );
                     data_file.set_meta_bytes(meta_bytes);
                     data_file.set_max_expired_at(max_expired_at);
+                    task.file_manager.finalize_data_file(&data_file)?;
                     if let Some(metadata) = sst_read_metadata {
                         data_file.set_sst_read_metadata(metadata);
                     }
@@ -854,6 +855,7 @@ impl CompactionExecutor {
             );
             data_file.set_meta_bytes(meta_bytes);
             data_file.set_max_expired_at(max_expired_at);
+            task.file_manager.finalize_data_file(&data_file)?;
             if let Some(metadata) = sst_read_metadata {
                 data_file.set_sst_read_metadata(metadata);
             }
@@ -1153,6 +1155,7 @@ mod tests {
         .with_separated_values(true);
         data_file.set_meta_bytes(meta_bytes);
         data_file.set_max_expired_at(max_expired_at);
+        file_manager.finalize_data_file(&data_file)?;
         if let Some(metadata) = sst_read_metadata {
             data_file.set_sst_read_metadata(metadata);
         }
@@ -1194,6 +1197,8 @@ mod tests {
             bucket_range,
         );
         data_file.set_meta_bytes(meta_bytes);
+        data_file.set_max_expired_at(0);
+        file_manager.finalize_data_file(&data_file)?;
         Ok(Arc::new(data_file))
     }
 

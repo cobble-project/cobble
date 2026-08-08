@@ -373,7 +373,7 @@ impl RemoteDataFile {
         if readonly {
             file_manager.register_data_file_readonly(file_id, &path)?;
         } else {
-            file_manager.register_data_file(file_id, &path)?;
+            file_manager.register_uncommitted_data_file(file_id, &path)?;
         }
         let data_file = DataFile::new(
             file_type,
@@ -389,6 +389,7 @@ impl RemoteDataFile {
         .with_vlog_offset(self.vlog_file_seq_offset)
         .with_separated_values(self.has_separated_values);
         data_file.set_max_expired_at(self.max_expired_at);
+        file_manager.finalize_data_file(&data_file)?;
         if let Some(bytes) = self.meta_bytes.map(Bytes::from) {
             data_file.set_meta_bytes(bytes);
         }
@@ -1810,6 +1811,7 @@ mod tests {
         );
         data_file.set_meta_bytes(meta_bytes);
         data_file.set_max_expired_at(max_expired_at);
+        file_manager.finalize_data_file(&data_file)?;
         if let Some(metadata) = sst_read_metadata {
             data_file.set_sst_read_metadata(metadata);
         }
@@ -1851,6 +1853,8 @@ mod tests {
             bucket_range,
         );
         data_file.set_meta_bytes(meta_bytes);
+        data_file.set_max_expired_at(0);
+        file_manager.finalize_data_file(&data_file)?;
         Ok(Arc::new(data_file))
     }
 

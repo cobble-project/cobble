@@ -1,6 +1,7 @@
 mod file_manager;
 mod file_system;
 mod files;
+pub(crate) mod logical_file;
 pub(crate) mod metadata_io;
 mod offload;
 mod opendal_file;

@@ -265,6 +265,7 @@ fn build_data_file(
     .with_vlog_offset(file.vlog_file_seq_offset)
     .with_separated_values(file.has_separated_values);
     data_file.set_max_expired_at(file.max_expired_at);
+    file_manager.finalize_data_file(&data_file)?;
     Ok(Arc::new(data_file))
 }
 

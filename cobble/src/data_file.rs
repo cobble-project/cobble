@@ -1,3 +1,4 @@
+use crate::file::logical_file::{ImmutableFileMetadata, LogicalFile};
 use crate::file::{FileId, TrackedFileId};
 use crate::sst::{PinnedSstReadMetadata, SstReadMetadata};
 use crate::r#type::key_bucket;
@@ -77,6 +78,9 @@ pub struct DataFile {
     /// compaction without reading or rewriting. Set at write time from `FileBuildResult`,
     /// or restored from manifest.
     pub(crate) max_expired_at: OnceLock<u32>,
+    /// The logical file backing this data file. `TrackedFileId::new` captures it from the
+    /// FileManager, so every registered production file is connected at construction time.
+    pub(crate) logical_file: OnceLock<Arc<LogicalFile>>,
 }
 
 impl DataFile {
@@ -93,6 +97,10 @@ impl DataFile {
         bucket_range: RangeInclusive<u16>,
         effective_bucket_range: RangeInclusive<u16>,
     ) -> Self {
+        let logical_file = OnceLock::new();
+        if let Some(logical) = tracked_id.logical_file() {
+            let _ = logical_file.set(logical);
+        }
         Self {
             file_type,
             start_key,
@@ -110,6 +118,7 @@ impl DataFile {
             sst_read_metadata: Default::default(),
             pinned_sst_read_metadata: Default::default(),
             max_expired_at: Default::default(),
+            logical_file,
         }
     }
 
@@ -147,6 +156,7 @@ impl DataFile {
             sst_read_metadata: Default::default(),
             pinned_sst_read_metadata: Default::default(),
             max_expired_at: Default::default(),
+            logical_file: self.logical_file.clone(),
         };
         data_file.copy_meta_from(self);
         data_file
@@ -271,6 +281,32 @@ impl DataFile {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = Some(tracked_id);
+    }
+
+    /// Returns the logical file backing this data file, if one has been attached by the
+    /// FileManager. Returns `None` for detached/test data files that were never registered.
+    pub(crate) fn logical_file(&self) -> Option<Arc<LogicalFile>> {
+        self.logical_file.get().cloned()
+    }
+
+    /// Attaches a logical file to a detached data file.
+    pub(crate) fn attach_logical_file(&self, logical: Arc<LogicalFile>) {
+        let _ = self.logical_file.set(logical);
+    }
+
+    /// Builds an [`ImmutableFileMetadata`] snapshot from this data file's current fields.
+    /// Used to construct a [`LogicalFile`] for files that don't have one yet.
+    pub(crate) fn build_immutable_metadata(&self) -> ImmutableFileMetadata {
+        ImmutableFileMetadata {
+            file_type: self.file_type,
+            start_key: self.start_key.clone(),
+            end_key: self.end_key.clone(),
+            schema_id: self.schema_id,
+            size: self.size,
+            bucket_range: self.bucket_range.clone(),
+            has_separated_values: self.has_separated_values,
+            max_expired_at: self.max_expired_at(),
+        }
     }
 }
 

@@ -15,6 +15,7 @@ use crate::config::{PrimaryVolumeOffloadPolicyKind, VolumeUsageKind};
 use crate::error::{Error, Result};
 use crate::file::file_system::{FileSystem, FileSystemRegistry};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
+use crate::file::logical_file::{FileCommitState, LogicalFile, ReplicaLifecycle};
 use crate::file::metadata_io::MetadataWriter;
 use crate::file::offload::OffloadRuntime;
 use crate::lru::LruCache;
@@ -22,7 +23,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::snapshot::SnapshotLifecycleState;
 use crate::util::normalize_storage_path_to_url;
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, Entry};
 use metrics::{Counter, Gauge, counter, gauge};
 use rand::random;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -37,6 +38,12 @@ const DEFAULT_READER_CACHE_CAPACITY: usize = 512;
 const SNAPSHOT_COPY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const VLOG_FILE_PRIORITY: u8 = 10;
 const DEFAULT_TRACKED_FILE_PRIORITY: u8 = u8::MAX;
+
+#[derive(Clone, Copy)]
+enum TrackedFileOwnership {
+    Owned,
+    Retained,
+}
 
 #[inline(always)]
 pub(crate) fn lsm_file_priority_for_level(level: u8) -> u8 {
@@ -441,6 +448,7 @@ impl TrackedFile {
 pub struct TrackedFileId {
     file_id: FileId,
     file_manager: Weak<FileManager>,
+    logical_file: Option<Arc<crate::file::logical_file::LogicalFile>>,
 }
 
 impl TrackedFileId {
@@ -448,6 +456,7 @@ impl TrackedFileId {
         Arc::new(Self {
             file_id,
             file_manager: Arc::downgrade(file_manager),
+            logical_file: file_manager.get_logical_file(file_id),
         })
     }
 
@@ -459,6 +468,7 @@ impl TrackedFileId {
         Arc::new(Self {
             file_id,
             file_manager: Weak::new(),
+            logical_file: None,
         })
     }
 
@@ -467,6 +477,10 @@ impl TrackedFileId {
             return Ok(());
         };
         file_manager.set_data_file_priority(self.file_id, priority)
+    }
+
+    pub(crate) fn logical_file(&self) -> Option<Arc<crate::file::logical_file::LogicalFile>> {
+        self.logical_file.clone()
     }
 }
 
@@ -702,6 +716,11 @@ pub struct FileManager {
     pub(crate) next_file_id: AtomicU64,
     /// Map of file ID to tracked file information for data files.
     pub(crate) data_files: DashMap<FileId, Arc<TrackedFile>>,
+    /// Map of file ID to logical file, providing multi-replica lifecycle management.
+    /// Populated alongside `data_files` during file registration. A logical file may have
+    /// multiple physical replicas (e.g. primary + snapshot), whereas `data_files` only tracks
+    /// the single preferred read replica. In phase 1, every entry here has exactly one replica.
+    pub(crate) logical_files: DashMap<FileId, Arc<LogicalFile>>,
     /// Lazy hint mapping from primary data file id to equivalent snapshot replica file id.
     snapshot_replica_hints: DashMap<FileId, FileId>,
     /// Map of filename to tracked file information for metadata files.
@@ -907,6 +926,7 @@ impl FileManager {
             options,
             next_file_id: AtomicU64::new(1), // Start from 1, 0 is reserved
             data_files: DashMap::new(),
+            logical_files: DashMap::new(),
             snapshot_replica_hints: DashMap::new(),
             metadata_files: Arc::new(DashMap::new()),
             reader_cache: Mutex::new(LruCache::new(DEFAULT_READER_CACHE_CAPACITY)),
@@ -1140,6 +1160,12 @@ impl FileManager {
         ));
         self.data_files.insert(file_id, Arc::clone(&tracked));
         self.report_data_files_gauge();
+        self.register_logical_file(
+            file_id,
+            Arc::clone(&tracked),
+            ReplicaLifecycle::Staging,
+            FileCommitState::Uncommitted,
+        );
         let writer = volume.fs().open_write(tracked.path())?;
         Ok((file_id, TrackedWriter::new(writer, tracked)))
     }
@@ -1192,6 +1218,12 @@ impl FileManager {
         ));
         self.data_files.insert(file_id, Arc::clone(&tracked));
         self.report_data_files_gauge();
+        self.register_logical_file(
+            file_id,
+            Arc::clone(&tracked),
+            ReplicaLifecycle::Staging,
+            FileCommitState::Uncommitted,
+        );
         let writer = volume.fs().open_write(tracked.path())?;
         Ok(TrackedWriter::new(writer, tracked))
     }
@@ -1229,6 +1261,14 @@ impl FileManager {
         }
         self.report_data_files_gauge();
 
+        // Ensure a logical file entry mirrors this tracked file for multi-replica APIs.
+        let lifecycle = if volume.readonly_source {
+            ReplicaLifecycle::ReadonlySource
+        } else {
+            ReplicaLifecycle::OwnedReady
+        };
+        self.ensure_logical_file(file_id, lifecycle, FileCommitState::Committed);
+
         // Update next_file_id if necessary
         let mut current = self.next_file_id.load(Ordering::SeqCst);
         while file_id >= current {
@@ -1244,6 +1284,79 @@ impl FileManager {
         }
 
         Ok(())
+    }
+
+    /// Registers a verified, locally owned output before the writer publishes it in a durable
+    /// layout. It is readable immediately, but remains uncommitted until that barrier.
+    pub(crate) fn register_uncommitted_data_file(&self, file_id: FileId, path: &str) -> Result<()> {
+        self.register_existing_data_file(
+            file_id,
+            path,
+            ReplicaLifecycle::OwnedReady,
+            FileCommitState::Uncommitted,
+            TrackedFileOwnership::Owned,
+        )
+    }
+
+    fn register_logical_file(
+        &self,
+        file_id: FileId,
+        tracked: Arc<TrackedFile>,
+        lifecycle: ReplicaLifecycle,
+        commit_state: FileCommitState,
+    ) {
+        self.logical_files.entry(file_id).or_insert_with(|| {
+            Arc::new(LogicalFile::new(file_id, tracked, lifecycle, commit_state))
+        });
+    }
+
+    fn ensure_logical_file(
+        &self,
+        file_id: FileId,
+        lifecycle: ReplicaLifecycle,
+        commit_state: FileCommitState,
+    ) {
+        if self.logical_files.contains_key(&file_id) {
+            return;
+        }
+        if let Some(tracked) = self
+            .data_files
+            .get(&file_id)
+            .map(|entry| Arc::clone(entry.value()))
+        {
+            self.register_logical_file(file_id, tracked, lifecycle, commit_state);
+        }
+    }
+
+    /// Attaches the logical file for `file_id` (if any) to the given [`DataFile`], so that
+    /// multi-replica APIs can be reached from the data file and initializes immutable metadata.
+    /// Call this only after all `DataFile` builder fields, including `max_expired_at`, are set.
+    /// This makes a finished local output readable, but does not make an uncommitted output
+    /// durable; existing manifest/snapshot barriers continue to decide that transition.
+    pub(crate) fn finalize_data_file(&self, data_file: &crate::data_file::DataFile) -> Result<()> {
+        let file_id = data_file.file_id;
+        self.ensure_logical_file(
+            file_id,
+            ReplicaLifecycle::OwnedReady,
+            FileCommitState::Committed,
+        );
+        if let Some(logical) = self
+            .logical_files
+            .get(&file_id)
+            .map(|e| Arc::clone(e.value()))
+        {
+            logical.initialize_metadata(data_file.build_immutable_metadata())?;
+            logical.finish_staging_replica();
+            data_file.attach_logical_file(logical);
+        }
+        Ok(())
+    }
+
+    /// Returns the logical file for `file_id`, if registered.
+    pub(crate) fn get_logical_file(&self, file_id: FileId) -> Option<Arc<LogicalFile>> {
+        self.logical_files
+            .get(&file_id)
+            .map(|e| Arc::clone(e.value()))
     }
 
     pub(crate) fn copy_reader_to_tracked_writer(
@@ -1372,6 +1485,9 @@ impl FileManager {
             .get(&file_id)
             .ok_or_else(|| Error::IoError(format!("Data file {} is not tracked", file_id)))?;
         tracked.mark_for_retention();
+        if let Some(logical) = self.get_logical_file(file_id) {
+            logical.set_preferred_lifecycle(ReplicaLifecycle::PublishedTransfer);
+        }
         Ok(())
     }
 
@@ -1381,6 +1497,10 @@ impl FileManager {
             .get(&file_id)
             .ok_or_else(|| Error::IoError(format!("Data file {} is not tracked", file_id)))?;
         tracked.mark_for_deletion();
+        if let Some(logical) = self.get_logical_file(file_id) {
+            logical.set_preferred_lifecycle(ReplicaLifecycle::OwnedReady);
+            logical.set_commit_state(FileCommitState::Committed);
+        }
         Ok(())
     }
 
@@ -1653,9 +1773,36 @@ impl FileManager {
         self.data_files.contains_key(&file_id)
     }
 
+    /// Replaces the physical file used by the legacy `data_files` path and mirrors that change
+    /// in its phase-1 LogicalFile. The caller supplies the source it copied so a stale migration
+    /// cannot replace a newer location.
+    pub(crate) fn replace_data_file_replica(
+        &self,
+        file_id: FileId,
+        expected: &Arc<TrackedFile>,
+        replacement: Arc<TrackedFile>,
+    ) -> bool {
+        match self.data_files.entry(file_id) {
+            Entry::Occupied(mut occupied) if Arc::ptr_eq(occupied.get(), expected) => {
+                occupied.insert(Arc::clone(&replacement));
+            }
+            _ => return false,
+        }
+        self.ensure_logical_file(
+            file_id,
+            ReplicaLifecycle::OwnedReady,
+            FileCommitState::Committed,
+        );
+        if let Some(logical) = self.get_logical_file(file_id) {
+            logical.replace_preferred_replica(replacement, ReplicaLifecycle::OwnedReady);
+        }
+        true
+    }
+
     /// Removes a data file from tracking.
     pub(crate) fn remove_data_file(&self, file_id: FileId) -> Result<()> {
         self.snapshot_replica_hints.remove(&file_id);
+        self.logical_files.remove(&file_id);
         let Some(_) = self.data_files.remove(&file_id) else {
             return Ok(());
         };
@@ -1796,13 +1943,49 @@ impl FileManager {
 
     /// Registers an existing data file without deleting it on drop.
     pub fn register_data_file_readonly(&self, file_id: FileId, path: &str) -> Result<()> {
+        self.register_existing_data_file(
+            file_id,
+            path,
+            ReplicaLifecycle::ReadonlyView,
+            FileCommitState::Committed,
+            TrackedFileOwnership::Retained,
+        )
+    }
+
+    /// Registers a compactor-produced file that is readable but cannot be deleted until the
+    /// writer has committed its manifest entry.
+    pub(crate) fn register_data_file_pending_adoption(
+        &self,
+        file_id: FileId,
+        path: &str,
+    ) -> Result<()> {
+        self.register_existing_data_file(
+            file_id,
+            path,
+            ReplicaLifecycle::PendingAdoption,
+            FileCommitState::Uncommitted,
+            TrackedFileOwnership::Retained,
+        )
+    }
+
+    fn register_existing_data_file(
+        &self,
+        file_id: FileId,
+        path: &str,
+        lifecycle: ReplicaLifecycle,
+        commit_state: FileCommitState,
+        ownership: TrackedFileOwnership,
+    ) -> Result<()> {
         let (volume, relative_path) = self.resolve_volume_path(path)?;
         let fs = Arc::clone(volume.fs());
-        let tracked = Arc::new(TrackedFile::readonly(
-            relative_path,
-            Arc::clone(&fs),
-            Some(Arc::clone(&volume)),
-        ));
+        let tracked = Arc::new(match ownership {
+            TrackedFileOwnership::Owned => {
+                TrackedFile::new(relative_path, Arc::clone(&fs), Some(Arc::clone(&volume)))
+            }
+            TrackedFileOwnership::Retained => {
+                TrackedFile::readonly(relative_path, Arc::clone(&fs), Some(Arc::clone(&volume)))
+            }
+        });
         let size = fs
             .open_read(tracked.path())
             .map(|reader| reader.size())
@@ -1812,6 +1995,7 @@ impl FileManager {
             self.data_files.entry(file_id).or_insert_with(|| tracked);
         }
         self.report_data_files_gauge();
+        self.ensure_logical_file(file_id, lifecycle, commit_state);
         Ok(())
     }
 
@@ -2147,6 +2331,7 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::data_file::{DataFile, DataFileType};
     use crate::file::FileSystemRegistry;
     use crate::file::files::File;
     use crate::metrics_manager::MetricsManager;
@@ -2164,6 +2349,108 @@ pub(crate) mod tests {
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-test"));
         let fm = FileManager::with_defaults(Arc::clone(&fs), metrics_manager).unwrap();
         (fs, fm)
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn test_logical_file_attachment_metadata_and_replica_replacement() {
+        let (fs, fm) = create_test_file_manager();
+        let fm = Arc::new(fm);
+        let (file_id, mut writer) = fm.create_data_file().unwrap();
+        writer.write(b"data").unwrap();
+        writer.close().unwrap();
+
+        let file = DataFile::new(
+            DataFileType::SSTable,
+            b"a".to_vec(),
+            b"z".to_vec(),
+            file_id,
+            TrackedFileId::new(&fm, file_id),
+            7,
+            4,
+            0..=0,
+            0..=0,
+        )
+        .with_separated_values(true);
+        file.set_max_expired_at(42);
+        let logical = file.logical_file().unwrap();
+        assert_eq!(logical.metadata(), None);
+        assert_eq!(
+            logical.preferred_replica_lifecycle(),
+            Some(ReplicaLifecycle::Staging)
+        );
+        fm.finalize_data_file(&file).unwrap();
+
+        assert_eq!(logical.commit_state(), FileCommitState::Uncommitted);
+        assert_eq!(logical.metadata(), Some(file.build_immutable_metadata()));
+        assert!(matches!(
+            logical.preferred_replica_lifecycle(),
+            Some(ReplicaLifecycle::OwnedReady)
+        ));
+        assert!(logical.preferred_replica().is_some());
+
+        let conflicting = DataFile::new(
+            DataFileType::SSTable,
+            b"b".to_vec(),
+            b"z".to_vec(),
+            file_id,
+            TrackedFileId::new(&fm, file_id),
+            7,
+            4,
+            0..=0,
+            0..=0,
+        );
+        conflicting.set_max_expired_at(42);
+        assert!(fm.finalize_data_file(&conflicting).is_err());
+
+        let path = fm.get_data_file_full_path(file_id).unwrap();
+        let replacement = Arc::new(TrackedFile::new(
+            "replacement.sst".to_string(),
+            Arc::clone(&fs),
+            None,
+        ));
+        let source = fm.data_file_ref(file_id).unwrap();
+        assert!(fm.replace_data_file_replica(file_id, &source, Arc::clone(&replacement)));
+        assert!(Arc::ptr_eq(
+            &logical.preferred_replica().unwrap().tracked,
+            &replacement
+        ));
+
+        fm.register_data_file_readonly(file_id + 1, &path).unwrap();
+        assert_eq!(
+            fm.get_logical_file(file_id + 1)
+                .unwrap()
+                .preferred_replica_lifecycle(),
+            Some(ReplicaLifecycle::ReadonlyView)
+        );
+        assert!(
+            !fm.data_file_ref(file_id + 1)
+                .unwrap()
+                .is_marked_for_deletion()
+        );
+        fm.register_data_file_pending_adoption(file_id + 2, &path)
+            .unwrap();
+        let pending = fm.get_logical_file(file_id + 2).unwrap();
+        assert_eq!(pending.commit_state(), FileCommitState::Uncommitted);
+        assert_eq!(
+            pending.preferred_replica_lifecycle(),
+            Some(ReplicaLifecycle::PendingAdoption)
+        );
+        assert!(pending.preferred_replica().is_some());
+        assert!(
+            !fm.data_file_ref(file_id + 2)
+                .unwrap()
+                .is_marked_for_deletion()
+        );
+        fm.register_uncommitted_data_file(file_id + 3, &path)
+            .unwrap();
+        assert!(
+            fm.data_file_ref(file_id + 3)
+                .unwrap()
+                .is_marked_for_deletion()
+        );
+
+        cleanup_test_root();
     }
 
     struct TestCopyReader {
