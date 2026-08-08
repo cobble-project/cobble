@@ -732,6 +732,10 @@ fn build_incremental_tree_level_edits(
     }
 }
 
+pub(crate) fn can_encode_incremental_manifest(base: &DbSnapshot, snapshot: &DbSnapshot) -> bool {
+    build_incremental_tree_level_edits(base, snapshot).is_some()
+}
+
 /// Extract the file ID and path references for all data files in the manifest, deduplicating by file ID.
 pub(crate) fn manifest_data_file_refs(
     manifest: &ManifestSnapshot,

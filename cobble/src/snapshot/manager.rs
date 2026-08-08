@@ -1,7 +1,7 @@
 use super::manifest::{
     ManifestSnapshot, build_tree_versions_from_manifest_untracked,
-    build_vlog_version_from_manifest_untracked, encode_manifest, manifest_data_file_refs,
-    snapshot_manifest_name,
+    build_vlog_version_from_manifest_untracked, can_encode_incremental_manifest, encode_manifest,
+    manifest_data_file_refs, snapshot_manifest_name,
 };
 use super::{
     ActiveMemtableSnapshotData, DbSnapshot, SnapshotCallback, SnapshotLifecycleState,
@@ -721,7 +721,24 @@ impl SnapshotManager {
                 .and_then(|snapshot| snapshot.base_snapshot_id)
                 .and_then(|base_id| state.snapshots.get(&base_id))
                 .filter(|snapshot| snapshot.is_published())
+                .filter(|base| {
+                    snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| can_encode_incremental_manifest(base, snapshot))
+                })
                 .cloned();
+            // Pin the selected base before the child manifest can become visible. On successful
+            // publication this is the child-to-base dependency; failure cleanup expires the child
+            // and releases the same edge recursively.
+            if let Some(base) = &base_snapshot
+                && state
+                    .incremental_references
+                    .entry(id)
+                    .or_default()
+                    .insert(base.id)
+            {
+                *state.incremental_ref_counts.entry(base.id).or_insert(0) += 1;
+            }
             (snapshot, callback, base_snapshot)
         };
         let mut incremental_base_id = None;
@@ -760,6 +777,10 @@ impl SnapshotManager {
                                     &self.file_manager,
                                 )?;
                                 incremental_base_id = encode_result.incremental_base_id;
+                                debug_assert_eq!(
+                                    incremental_base_id,
+                                    base_snapshot.as_ref().map(|base| base.id)
+                                );
                                 buffered.close()?;
                                 prepared.snapshot.data_size_bytes = encode_result.data_size_bytes;
                                 prepared.snapshot.incremental_data_size_bytes =
