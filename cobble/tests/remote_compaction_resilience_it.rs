@@ -452,55 +452,71 @@ impl FakeCompactor {
                             //
                             // The wire format is RemoteCompactionReply::Execute(RemoteCompactionResponse),
                             // tagged as {"kind":"execute","payload":{...response...}}.
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&buf).expect("decode execute request");
+                            let topology_epoch = &request["payload"]["topology_epoch"];
+                            let tree_scope = &request["payload"]["tree_scope"];
                             let payload = match *mode_clone {
                                 FakeCompactorMode::ProtocolIncompatible => {
                                     // compatible_version (999) exceeds the client's current version,
                                     // so the client's validate_protocol_compatibility rejects it as
                                     // permanent.
-                                    "{\
-                                    \"kind\":\"execute\",\
-                                    \"payload\":{\
-                                        \"version\":999,\
-                                        \"compatible_version\":999,\
-                                        \"output_files\":[],\
-                                        \"vlog_entry_deltas\":[],\
-                                        \"preload_block_keys\":[],\
-                                        \"error\":null\
-                                    }}"
+                                    serde_json::json!({
+                                        "kind": "execute",
+                                        "payload": {
+                                            "version": 999,
+                                            "compatible_version": 999,
+                                            "topology_epoch": topology_epoch,
+                                            "tree_scope": tree_scope,
+                                            "output_files": [],
+                                            "vlog_entry_deltas": [],
+                                            "preload_block_keys": [],
+                                            "error": null
+                                        }
+                                    })
                                 }
                                 FakeCompactorMode::PermanentServerError => {
                                     // A typed permanent server-side error (e.g. malformed schema).
                                     // The client must classify it permanent via error_kind and mark
                                     // the DB errored — NOT fall back to local.
-                                    "{\
-                                    \"kind\":\"execute\",\
-                                    \"payload\":{\
-                                        \"version\":3,\
-                                        \"compatible_version\":3,\
-                                        \"output_files\":[],\
-                                        \"vlog_entry_deltas\":[],\
-                                        \"preload_block_keys\":[],\
-                                        \"error\":\"remote compactor failed to register carried schema version 1: invalid schema\",\
-                                        \"error_kind\":\"permanent\"\
-                                    }}"
+                                    serde_json::json!({
+                                        "kind": "execute",
+                                        "payload": {
+                                            "version": 4,
+                                            "compatible_version": 4,
+                                            "topology_epoch": topology_epoch,
+                                            "tree_scope": tree_scope,
+                                            "output_files": [],
+                                            "vlog_entry_deltas": [],
+                                            "preload_block_keys": [],
+                                            "error": "remote compactor failed to register carried schema version 1: invalid schema",
+                                            "error_kind": "permanent"
+                                        }
+                                    })
                                 }
                                 FakeCompactorMode::UnsupportedOperator => {
                                     // UnsupportedOperator never reaches Execute (the capability
                                     // check fails first). Reply with a generic error just in case.
-                                    "{\
-                                    \"kind\":\"execute\",\
-                                    \"payload\":{\
-                                        \"version\":3,\
-                                        \"compatible_version\":3,\
-                                        \"output_files\":[],\
-                                        \"vlog_entry_deltas\":[],\
-                                        \"preload_block_keys\":[],\
-                                        \"error\":\"unsupported operator\",\
-                                        \"error_kind\":\"permanent\"\
-                                    }}"
+                                    serde_json::json!({
+                                        "kind": "execute",
+                                        "payload": {
+                                            "version": 4,
+                                            "compatible_version": 4,
+                                            "topology_epoch": topology_epoch,
+                                            "tree_scope": tree_scope,
+                                            "output_files": [],
+                                            "vlog_entry_deltas": [],
+                                            "preload_block_keys": [],
+                                            "error": "unsupported operator",
+                                            "error_kind": "permanent"
+                                        }
+                                    })
                                 }
                             };
-                            write_message_raw(&mut stream, payload.as_bytes());
+                            write_message_raw(
+                                &mut stream,
+                                &serde_json::to_vec(&payload).expect("encode execute response"),
+                            );
                         } else {
                             // Unknown command; reply with an error.
                             write_message_raw(
