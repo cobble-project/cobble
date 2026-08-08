@@ -85,6 +85,8 @@ pub enum ExpandStorageMode {
     AdoptAsync,
     /// Keep a durable external reference to the source snapshot without copying it.
     ReferencePersistent,
+    /// Keep the external reference durable while asynchronously caching preferred local reads.
+    ReferencePersistentWithCache,
 }
 
 pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<Bytes>>>> {

@@ -98,3 +98,10 @@ pub(crate) fn load_import_records(file_manager: &FileManager) -> Result<Vec<Impo
         })
         .collect()
 }
+
+pub(crate) fn has_import_records(file_manager: &FileManager) -> Result<bool> {
+    Ok(file_manager
+        .list_metadata_names(IMPORT_RECORD_DIR)?
+        .iter()
+        .any(|name| name.starts_with("IMPORT-") && name.ends_with(".json")))
+}

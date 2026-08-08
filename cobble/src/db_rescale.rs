@@ -11,8 +11,8 @@ use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::paths::schema_file_relative_path;
 use crate::rescale_protocol::{
-    ExportLease, ImportRecord, export_lease_name, import_record_name, load_import_records,
-    write_export_lease, write_import_record,
+    ExportLease, ImportRecord, export_lease_name, has_import_records, import_record_name,
+    load_import_records, write_export_lease, write_import_record,
 };
 use crate::snapshot::{
     build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
@@ -289,7 +289,7 @@ impl AdoptionCoordinator {
     }
 
     pub(crate) fn is_complete(&self) -> Result<bool> {
-        Ok(load_import_records(&self.file_manager)?.is_empty())
+        Ok(!has_import_records(&self.file_manager)?)
     }
 }
 
@@ -504,6 +504,7 @@ impl Db {
                 .reserve_data_file_ids(source_file_ids.len());
             let file_id_map: HashMap<u64, u64> =
                 source_file_ids.iter().copied().zip(remapped_ids).collect();
+            let imported_file_ids = file_id_map.values().copied().collect::<Vec<_>>();
             let source_origin = match &export_id {
                 Some(export_id) => ReplicaOrigin::ExternalLeased {
                     export_id: export_id.clone(),
@@ -755,6 +756,12 @@ impl Db {
                 self.db_lifecycle.mark_error(err.clone());
                 return Err(err);
             }
+            if storage_mode == ExpandStorageMode::ReferencePersistentWithCache {
+                self.file_manager
+                    .request_referenced_persistent_caches(imported_file_ids)?;
+                self.file_manager
+                    .schedule_referenced_persistent_caches(&self.db_state)?;
+            }
             Ok(source_snapshot_id)
         })();
         if let Err(err) = result {
@@ -941,12 +948,12 @@ mod tests {
     use crate::db_state::full_bucket_range;
     use crate::file::FileManager;
     use crate::metrics_manager::MetricsManager;
-    use crate::{Config, DbBuilder, VolumeDescriptor};
+    use crate::{Config, DbBuilder, RuntimeManifestMode, VolumeDescriptor};
     use serial_test::serial;
     use size::Size;
     use std::sync::Arc;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn cleanup_test_root(path: &str) {
         let _ = std::fs::remove_dir_all(path);
@@ -988,6 +995,7 @@ mod tests {
             ..Config::default()
         };
         config.total_buckets = 8;
+        config.file_transfer_concurrency = 1;
         let source = Db::open(config.clone(), vec![2u16..=3u16]).unwrap();
         source.put(2, b"k1", 0, b"v1").unwrap();
         let (tx, rx) = mpsc::channel();
@@ -1003,8 +1011,24 @@ mod tests {
                 .snapshot_id,
             source_snapshot
         );
+        source.put(2, b"k1-second", 0, b"v1-second").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let source_snapshot = source
+            .snapshot_with_callback(move |result| {
+                let _ = tx.send(result);
+            })
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
+            source_snapshot
+        );
 
-        let target = Db::open(config.clone(), vec![0u16..=1u16]).unwrap();
+        let mut target_config = config.clone();
+        target_config.runtime_manifest_mode = RuntimeManifestMode::Enabled;
+        let target = Db::open(target_config, vec![0u16..=1u16]).unwrap();
         let imported_snapshot = target
             .expand_bucket(source.id().to_string(), Some(source_snapshot), None)
             .unwrap();
@@ -1071,7 +1095,36 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-
+        let runtime_store =
+            crate::runtime_manifest::RuntimeManifestStore::new(Arc::clone(&target.file_manager));
+        let runtime_manifest = (0..100)
+            .find_map(|_| {
+                let current = runtime_store.load_current().unwrap();
+                if current.as_ref().is_some_and(|manifest| {
+                    manifest
+                        .manifest
+                        .tree_levels
+                        .iter()
+                        .flatten()
+                        .flat_map(|level| level.files.iter())
+                        .all(|file| matches!(file.origin, ReplicaOrigin::Owned))
+                }) {
+                    current
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                }
+            })
+            .expect("runtime manifest must publish adopted owned paths");
+        assert!(
+            runtime_manifest
+                .manifest
+                .tree_levels
+                .iter()
+                .flatten()
+                .flat_map(|level| level.files.iter())
+                .all(|file| matches!(file.origin, ReplicaOrigin::Owned))
+        );
         let persistent = Db::open(config.clone(), vec![4u16..=5u16]).unwrap();
         persistent
             .expand_bucket_with_storage_mode(
@@ -1106,6 +1159,164 @@ mod tests {
                 .flat_map(|level| level.files.iter())
                 .all(|file| matches!(file.origin, ReplicaOrigin::ExternalPersistent { .. }))
         );
+
+        let persistent_file_ids = persistent
+            .db_state
+            .load()
+            .multi_lsm_version
+            .tree_versions_cloned()
+            .into_iter()
+            .flat_map(|tree| tree.levels.clone().into_iter())
+            .flat_map(|level| level.files.into_iter())
+            .map(|file| file.file_id)
+            .collect::<Vec<_>>();
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(persistent_file_ids.iter().all(|file_id| {
+            matches!(
+                persistent.file_manager.preferred_replica_origin(*file_id),
+                Some(ReplicaOrigin::ExternalPersistent { .. })
+            )
+        }));
+
+        let mut cached_config = config.clone();
+        cached_config.runtime_manifest_mode = RuntimeManifestMode::Enabled;
+        let cached = Db::open(cached_config, vec![6u16..=7u16]).unwrap();
+        cached
+            .expand_bucket_with_storage_mode(
+                source.id().to_string(),
+                Some(source_snapshot),
+                None,
+                ExpandStorageMode::ReferencePersistentWithCache,
+            )
+            .unwrap();
+        let cached_file_ids = cached
+            .db_state
+            .load()
+            .multi_lsm_version
+            .tree_versions_cloned()
+            .into_iter()
+            .flat_map(|tree| tree.levels.clone().into_iter())
+            .flat_map(|level| level.files.into_iter())
+            .map(|file| file.file_id)
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cached_file_ids.iter().any(|file_id| {
+            !matches!(
+                cached.file_manager.preferred_replica_origin(*file_id),
+                Some(ReplicaOrigin::Owned)
+            )
+        }) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(cached_file_ids.iter().all(|file_id| {
+            matches!(
+                cached.file_manager.preferred_replica_origin(*file_id),
+                Some(ReplicaOrigin::Owned)
+            )
+        }));
+        assert_eq!(
+            cached.get(2, b"k1").unwrap().unwrap()[0].as_deref(),
+            Some(&b"v1"[..])
+        );
+        assert!(cached_file_ids.iter().all(|file_id| {
+            matches!(
+                cached
+                    .file_manager
+                    .durable_data_file_path_with_origin(*file_id)
+                    .map(|(_, origin)| origin),
+                Some(ReplicaOrigin::ExternalPersistent { .. })
+            )
+        }));
+        let cached_runtime_store =
+            crate::runtime_manifest::RuntimeManifestStore::new(Arc::clone(&cached.file_manager));
+        let cached_runtime_manifest = cached_runtime_store.load_current().unwrap().unwrap();
+        assert!(
+            cached_runtime_manifest
+                .manifest
+                .tree_levels
+                .iter()
+                .flatten()
+                .flat_map(|level| level.files.iter())
+                .all(|file| matches!(file.origin, ReplicaOrigin::ExternalPersistent { .. }))
+        );
+
+        let cached_id = cached.id().to_string();
+        let (cache_tx, cache_rx) = mpsc::channel();
+        let cached_snapshot = cached
+            .snapshot_with_callback(move |result| {
+                let _ = cache_tx.send(result);
+            })
+            .unwrap();
+        assert_eq!(
+            cache_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
+            cached_snapshot
+        );
+        let cached_manifest_manager = Arc::new(
+            FileManager::from_config(
+                &config,
+                &cached_id,
+                Arc::new(MetricsManager::new("expand-persistent-cache-manifest")),
+            )
+            .unwrap(),
+        );
+        let cached_manifest =
+            crate::snapshot::load_manifest_for_snapshot(&cached_manifest_manager, cached_snapshot)
+                .unwrap();
+        assert!(
+            cached_manifest
+                .tree_levels
+                .iter()
+                .flatten()
+                .flat_map(|level| level.files.iter())
+                .all(|file| matches!(file.origin, ReplicaOrigin::ExternalPersistent { .. }))
+        );
+        for file_id in &cached_file_ids {
+            assert!(
+                cached
+                    .file_manager
+                    .evict_preferred_persistent_cache(*file_id)
+                    .unwrap()
+            );
+        }
+        assert!(cached_file_ids.iter().all(|file_id| {
+            matches!(
+                cached.file_manager.preferred_replica_origin(*file_id),
+                Some(ReplicaOrigin::ExternalPersistent { .. })
+            )
+        }));
+        drop(cached);
+        let reopened_cached =
+            Db::open_from_snapshot(config.clone(), cached_snapshot, cached_id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cached_file_ids.iter().any(|file_id| {
+            !matches!(
+                reopened_cached
+                    .file_manager
+                    .preferred_replica_origin(*file_id),
+                Some(ReplicaOrigin::Owned)
+            )
+        }) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(cached_file_ids.iter().all(|file_id| {
+            matches!(
+                reopened_cached
+                    .file_manager
+                    .preferred_replica_origin(*file_id),
+                Some(ReplicaOrigin::Owned)
+            )
+        }));
+        assert_eq!(
+            reopened_cached.get(2, b"k1").unwrap().unwrap()[0].as_deref(),
+            Some(&b"v1"[..])
+        );
+        drop(reopened_cached);
         drop(persistent);
         assert!(source.get(2, b"k1").unwrap().is_some());
 

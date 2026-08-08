@@ -463,7 +463,7 @@ impl SnapshotManager {
             .into_iter()
             .filter_map(|file_id| {
                 self.file_manager
-                    .data_file_ref_with_origin(file_id)
+                    .durable_data_file_ref_with_origin(file_id)
                     .ok()
                     .map(|(tracked, origin)| (file_id, tracked, origin))
             })

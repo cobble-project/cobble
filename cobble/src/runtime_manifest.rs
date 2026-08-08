@@ -126,6 +126,7 @@ pub(crate) fn build_runtime_manifest(
     if current.seq_id < base.manifest.seq_id
         || base.chain_depth >= MAX_RUNTIME_MANIFEST_CHAIN_DEPTH
         || !has_same_runtime_topology(&base.manifest, &current)
+        || retained_file_descriptors_changed(&base.manifest, &current)?
     {
         return Ok(full);
     }
@@ -463,25 +464,22 @@ fn build_runtime_tree_level_edits(
             });
         }
     }
-    ensure_retained_file_descriptors_are_unchanged(base, current)?;
     Ok(tree_edits)
 }
 
-fn ensure_retained_file_descriptors_are_unchanged(
+fn retained_file_descriptors_changed(
     base: &RuntimeManifest,
     current: &RuntimeManifest,
-) -> Result<()> {
+) -> Result<bool> {
     let base_files = manifest_file_descriptors(base)?;
     for (file_id, file) in manifest_file_descriptors(current)? {
         if let Some(base_file) = base_files.get(&file_id)
             && base_file != &file
         {
-            return Err(Error::InvalidState(format!(
-                "Runtime manifest changes descriptor for existing file id {file_id}"
-            )));
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn apply_runtime_incremental(
@@ -998,16 +996,17 @@ mod tests {
     }
 
     #[test]
-    fn incremental_rejects_changed_descriptor_wrong_base_and_rewound_sequence() {
+    fn descriptor_change_falls_back_to_full_and_incremental_rejects_wrong_base_and_rewound_sequence()
+     {
         let base = manifest(1, vec![levels(&[1], &[])]);
         let mut changed = manifest(2, vec![levels(&[1], &[])]);
         changed.tree_levels[0][0].files[0].path = "data/changed-1.sst".to_string();
-        assert!(
+        assert!(matches!(
             build_runtime_manifest(changed, Some(&loaded(base.clone(), 1)))
-                .unwrap_err()
-                .to_string()
-                .contains("changes descriptor for existing file id 1")
-        );
+                .unwrap()
+                .manifest,
+            RuntimeManifestPayload::Full(_)
+        ));
 
         let wrong_base = RuntimeIncrementalManifest {
             generation: 2,

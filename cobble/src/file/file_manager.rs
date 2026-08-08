@@ -54,6 +54,10 @@ struct ReplicaCatalog {
 struct ReplicaCatalogFile {
     file_id: FileId,
     preferred_replica_id: ReplicaId,
+    #[serde(default)]
+    durable_replica_id: Option<ReplicaId>,
+    #[serde(default)]
+    persistent_cache_requested: bool,
     replicas: Vec<ReplicaCatalogReplica>,
 }
 
@@ -1454,7 +1458,9 @@ impl FileManager {
                 continue;
             }
             let state = logical.replica_state_snapshot();
-            let Some(preferred_replica_id) = state.preferred_replica_id else {
+            let (Some(preferred_replica_id), Some(durable_replica_id)) =
+                (state.preferred_replica_id, state.durable_replica_id)
+            else {
                 continue;
             };
             let mut replicas = state
@@ -1482,16 +1488,21 @@ impl FileManager {
             if replicas
                 .iter()
                 .any(|replica| replica.replica_id == preferred_replica_id)
+                && replicas
+                    .iter()
+                    .any(|replica| replica.replica_id == durable_replica_id)
             {
                 files.push(ReplicaCatalogFile {
                     file_id: *entry.key(),
                     preferred_replica_id,
+                    durable_replica_id: Some(durable_replica_id),
+                    persistent_cache_requested: logical.persistent_cache_requested(),
                     replicas,
                 });
             }
         }
         files.sort_by_key(|file| file.file_id);
-        let bytes = serde_json::to_vec(&ReplicaCatalog { version: 2, files })
+        let bytes = serde_json::to_vec(&ReplicaCatalog { version: 3, files })
             .map_err(|err| Error::IoError(format!("encode replica catalog: {err}")))?;
         let mut writer = self.create_metadata_file(REPLICA_CATALOG_NAME)?;
         writer.write(&bytes)?;
@@ -1514,7 +1525,7 @@ impl FileManager {
         let reader = MetadataReader::new(self.meta_volume.fs().open_read(&path)?);
         let catalog: ReplicaCatalog = serde_json::from_slice(reader.read_all()?.as_ref())
             .map_err(|err| Error::InvalidState(format!("decode replica catalog: {err}")))?;
-        if !(1..=2).contains(&catalog.version) {
+        if !(1..=3).contains(&catalog.version) {
             return Err(Error::InvalidState(format!(
                 "unsupported replica catalog version {}",
                 catalog.version
@@ -1637,7 +1648,13 @@ impl FileManager {
                             .map(|(id, _, _, _)| *id)
                     })
                 });
-            logical.restore_replica_state_with_origins(restored, preferred);
+            let durable_replica_id = file.durable_replica_id.unwrap_or(file.preferred_replica_id);
+            let durable = restored
+                .iter()
+                .any(|(id, _, lifecycle, _)| *id == durable_replica_id && lifecycle.is_readable())
+                .then_some(durable_replica_id);
+            logical.restore_replica_state_with_origins(restored, preferred, durable);
+            logical.set_persistent_cache_requested(file.persistent_cache_requested);
         }
         Ok(())
     }
@@ -1761,6 +1778,11 @@ impl FileManager {
                     file_id
                 )));
             }
+            let replacement_id = logical
+                .preferred_replica_any()
+                .expect("newly selected replica is present")
+                .replica_id;
+            logical.select_durable_and_preferred(replacement_id);
         } else {
             self.register_logical_file(
                 file_id,
@@ -2035,6 +2057,29 @@ impl FileManager {
         Ok((Arc::clone(&replica.tracked), replica.origin()))
     }
 
+    pub(crate) fn durable_data_file_ref_with_origin(
+        &self,
+        file_id: FileId,
+    ) -> Result<(Arc<TrackedFile>, ReplicaOrigin)> {
+        let logical = self
+            .get_logical_file(file_id)
+            .ok_or_else(|| Error::IoError(format!("Data file {file_id} is not tracked")))?;
+        let replica = logical.durable_replica().ok_or_else(|| {
+            Error::InvalidState(format!("Logical file {file_id} has no durable replica"))
+        })?;
+        replica.tracked.reference();
+        Ok((Arc::clone(&replica.tracked), replica.origin()))
+    }
+
+    pub(crate) fn durable_data_file_path_with_origin(
+        &self,
+        file_id: FileId,
+    ) -> Option<(String, ReplicaOrigin)> {
+        self.get_logical_file(file_id)
+            .and_then(|logical| logical.durable_replica())
+            .map(|replica| (replica.tracked.absolute_path(), replica.origin()))
+    }
+
     fn preferred_readable_replica(
         &self,
         file_id: FileId,
@@ -2254,11 +2299,16 @@ impl FileManager {
         expected: &Arc<TrackedFile>,
         replacement: Arc<TrackedFile>,
     ) -> Option<ReplicaId> {
-        self.get_logical_file(file_id)?.add_and_select_replica_if(
+        let logical = self.get_logical_file(file_id)?;
+        let source_id = logical.add_and_select_replica_if(
             expected,
             replacement,
             ReplicaLifecycle::OwnedReady,
-        )
+        )?;
+        let replacement_id = logical.preferred_replica_any()?.replica_id;
+        logical
+            .select_durable_and_preferred(replacement_id)
+            .then_some(source_id)
     }
 
     pub(crate) fn retire_replica(&self, file_id: FileId, replica_id: ReplicaId) {
@@ -2273,9 +2323,67 @@ impl FileManager {
     ) -> Option<ReplicaId> {
         let logical = self.get_logical_file(file_id)?;
         let source_id = logical.preferred_replica_any()?.replica_id;
+        if !logical.retain_and_select_replica_if(expected, replica_id) {
+            return None;
+        }
         logical
-            .retain_and_select_replica_if(expected, replica_id)
+            .select_durable_and_preferred(replica_id)
             .then_some(source_id)
+    }
+
+    pub(crate) fn request_referenced_persistent_caches(
+        &self,
+        file_ids: impl IntoIterator<Item = FileId>,
+    ) -> Result<()> {
+        for file_id in file_ids {
+            let Some(logical) = self.get_logical_file(file_id) else {
+                continue;
+            };
+            if matches!(
+                logical.durable_replica().map(|replica| replica.origin()),
+                Some(ReplicaOrigin::ExternalPersistent { .. })
+            ) {
+                logical.set_persistent_cache_requested(true);
+            }
+        }
+        self.persist_replica_catalog()
+    }
+
+    pub(crate) fn evict_preferred_persistent_cache(&self, file_id: FileId) -> Result<bool> {
+        let Some(logical) = self.get_logical_file(file_id) else {
+            return Ok(false);
+        };
+        let state = logical.replica_state_snapshot();
+        let (Some(preferred_id), Some(durable_id)) =
+            (state.preferred_replica_id, state.durable_replica_id)
+        else {
+            return Ok(false);
+        };
+        if preferred_id == durable_id
+            || !logical.persistent_cache_requested()
+            || !matches!(
+                logical
+                    .preferred_replica_any()
+                    .map(|replica| replica.origin()),
+                Some(ReplicaOrigin::Owned)
+            )
+            || !matches!(
+                logical.durable_replica().map(|replica| replica.origin()),
+                Some(ReplicaOrigin::ExternalPersistent { .. })
+            )
+        {
+            return Ok(false);
+        }
+        if !logical.select_preferred_read_replica(durable_id) {
+            return Ok(false);
+        }
+        if let Err(err) = self.persist_replica_catalog() {
+            logical.select_preferred_read_replica(preferred_id);
+            return Err(err);
+        }
+        self.remove_replica(file_id, preferred_id);
+        self.persist_replica_catalog()?;
+        Ok(true)
     }
 
     pub(crate) fn remove_replica(&self, file_id: FileId, replica_id: ReplicaId) {
@@ -3045,7 +3153,7 @@ pub(crate) mod tests {
         .unwrap();
         fm.persist_replica_catalog().unwrap();
         let reader = MetadataReader::new(fs.open_read(REPLICA_CATALOG_NAME).unwrap());
-        let catalog: ReplicaCatalog =
+        let mut catalog: ReplicaCatalog =
             serde_json::from_slice(reader.read_all().unwrap().as_ref()).unwrap();
         let catalog_file = catalog
             .files
@@ -3058,7 +3166,22 @@ pub(crate) mod tests {
             catalog_file.replicas[0].replica_id
         );
         assert_eq!(catalog_file.replicas[0].path, replacement.absolute_path());
-        assert_eq!(catalog.version, 2);
+        assert_eq!(catalog.version, 3);
+        assert_eq!(
+            catalog_file.durable_replica_id,
+            Some(catalog_file.preferred_replica_id)
+        );
+
+        // v2 did not persist a separate durable route, so it falls back to the preferred one.
+        catalog.version = 2;
+        for file in &mut catalog.files {
+            file.durable_replica_id = None;
+        }
+        let mut writer = fm.create_metadata_file(REPLICA_CATALOG_NAME).unwrap();
+        writer
+            .write(&serde_json::to_vec(&catalog).unwrap())
+            .unwrap();
+        writer.close().unwrap();
 
         fs.delete("replacement.sst").unwrap();
         let fallback = FileManager::with_defaults(
@@ -3688,6 +3811,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(copied.absolute_path(), copied_again.absolute_path());
         assert!(logical.retain_and_select_replica_if(&source, replica_id));
+        assert!(logical.select_durable_and_preferred(replica_id));
         assert_eq!(copied.absolute_path(), pinned_path);
         assert!(logical.remove_replica(0).is_some());
         source.dereference();

@@ -130,10 +130,13 @@ pub(crate) struct LogicalFile {
 struct ReplicaState {
     replicas: HashMap<ReplicaId, Arc<PhysicalReplica>>,
     preferred_read_replica: Option<ReplicaId>,
+    durable_replica: Option<ReplicaId>,
+    persistent_cache_requested: bool,
 }
 
 pub(crate) struct ReplicaStateSnapshot {
     pub(crate) preferred_replica_id: Option<ReplicaId>,
+    pub(crate) durable_replica_id: Option<ReplicaId>,
     pub(crate) replicas: Vec<Arc<PhysicalReplica>>,
 }
 
@@ -155,6 +158,8 @@ impl LogicalFile {
             replica_state: RwLock::new(ReplicaState {
                 replicas,
                 preferred_read_replica: Some(0),
+                durable_replica: Some(0),
+                persistent_cache_requested: false,
             }),
             next_replica_id: AtomicU64::new(1),
         }
@@ -199,6 +204,14 @@ impl LogicalFile {
             .and_then(|id| state.replicas.get(&id).cloned())
     }
 
+    pub(crate) fn durable_replica(&self) -> Option<Arc<PhysicalReplica>> {
+        let state = self.replica_state.read().unwrap();
+        state
+            .durable_replica
+            .and_then(|id| state.replicas.get(&id).cloned())
+            .filter(|replica| replica.is_readable())
+    }
+
     pub(crate) fn preferred_replica_lifecycle(&self) -> Option<ReplicaLifecycle> {
         self.preferred_replica_any()
             .map(|replica| replica.lifecycle())
@@ -229,6 +242,9 @@ impl LogicalFile {
     pub(crate) fn remove_replica(&self, replica_id: ReplicaId) -> Option<Arc<PhysicalReplica>> {
         let mut state = self.replica_state.write().unwrap();
         if state.preferred_read_replica == Some(replica_id) {
+            return None;
+        }
+        if state.durable_replica == Some(replica_id) {
             return None;
         }
         let replica = state.replicas.remove(&replica_id)?;
@@ -321,6 +337,47 @@ impl LogicalFile {
         }
     }
 
+    pub(crate) fn select_durable_and_preferred(&self, replica_id: ReplicaId) -> bool {
+        let mut state = self.replica_state.write().unwrap();
+        if !state
+            .replicas
+            .get(&replica_id)
+            .is_some_and(|replica| replica.is_readable())
+        {
+            return false;
+        }
+        state.durable_replica = Some(replica_id);
+        state.preferred_read_replica = Some(replica_id);
+        true
+    }
+
+    pub(crate) fn select_preferred_read_replica(&self, replica_id: ReplicaId) -> bool {
+        let mut state = self.replica_state.write().unwrap();
+        if !state
+            .replicas
+            .get(&replica_id)
+            .is_some_and(|replica| replica.is_readable())
+        {
+            return false;
+        }
+        state.preferred_read_replica = Some(replica_id);
+        true
+    }
+
+    pub(crate) fn persistent_cache_requested(&self) -> bool {
+        self.replica_state
+            .read()
+            .unwrap()
+            .persistent_cache_requested
+    }
+
+    pub(crate) fn set_persistent_cache_requested(&self, requested: bool) {
+        self.replica_state
+            .write()
+            .unwrap()
+            .persistent_cache_requested = requested;
+    }
+
     pub(crate) fn replica_ids(&self) -> Vec<ReplicaId> {
         self.replica_state
             .read()
@@ -335,6 +392,7 @@ impl LogicalFile {
         let state = self.replica_state.read().unwrap();
         ReplicaStateSnapshot {
             preferred_replica_id: state.preferred_read_replica,
+            durable_replica_id: state.durable_replica,
             replicas: state.replicas.values().cloned().collect(),
         }
     }
@@ -360,6 +418,7 @@ impl LogicalFile {
                 .map(|(id, tracked, lifecycle)| (id, tracked, lifecycle, ReplicaOrigin::Owned))
                 .collect(),
             preferred_replica_id,
+            preferred_replica_id,
         );
     }
 
@@ -367,6 +426,7 @@ impl LogicalFile {
         &self,
         replicas: Vec<(ReplicaId, Arc<TrackedFile>, ReplicaLifecycle, ReplicaOrigin)>,
         preferred_replica_id: Option<ReplicaId>,
+        durable_replica_id: Option<ReplicaId>,
     ) {
         let mut state = self.replica_state.write().unwrap();
         let next_id = replicas.iter().map(|(id, _, _, _)| *id).max().unwrap_or(0);
@@ -381,6 +441,7 @@ impl LogicalFile {
             .collect();
         state.preferred_read_replica =
             preferred_replica_id.filter(|id| state.replicas.contains_key(id));
+        state.durable_replica = durable_replica_id.filter(|id| state.replicas.contains_key(id));
         self.next_replica_id
             .fetch_max(next_id.saturating_add(1), Ordering::Relaxed);
     }
