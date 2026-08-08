@@ -1750,33 +1750,26 @@ impl FileManager {
         self.logical_files.contains_key(&file_id)
     }
 
-    /// Replaces the preferred physical replica when the copied source is still current.
-    pub(crate) fn replace_data_file_replica(
+    /// Publishes a copied physical replica and retires the source if it is still preferred.
+    pub(crate) fn publish_and_promote_replica_if(
         &self,
         file_id: FileId,
         expected: &Arc<TrackedFile>,
         replacement: Arc<TrackedFile>,
     ) -> bool {
-        let old_cache_key = self.get_logical_file(file_id).and_then(|logical| {
-            logical.preferred_replica().map(|replica| ReplicaKey {
-                file_id,
-                replica_id: replica.replica_id,
-            })
-        });
         let Some(logical) = self.get_logical_file(file_id) else {
             return false;
         };
-        if !logical.replace_preferred_replica_if(
-            expected,
-            replacement,
-            ReplicaLifecycle::OwnedReady,
-        ) {
+        let Some(previous_replica_id) =
+            logical.publish_and_promote_replica_if(expected, replacement)
+        else {
             return false;
-        }
-        if let Some(key) = old_cache_key
-            && let Ok(mut cache) = self.reader_cache.lock()
-        {
-            cache.remove(&key);
+        };
+        if let Ok(mut cache) = self.reader_cache.lock() {
+            cache.remove(&ReplicaKey {
+                file_id,
+                replica_id: previous_replica_id,
+            });
         }
         true
     }
@@ -2439,8 +2432,8 @@ pub(crate) mod tests {
             None,
         ));
         let source = fm.data_file_ref(file_id).unwrap();
-        assert!(fm.replace_data_file_replica(file_id, &source, Arc::clone(&replacement)));
-        assert!(!fm.replace_data_file_replica(file_id, &source, Arc::clone(&source)));
+        assert!(fm.publish_and_promote_replica_if(file_id, &source, Arc::clone(&replacement)));
+        assert!(!fm.publish_and_promote_replica_if(file_id, &source, Arc::clone(&source)));
         assert!(Arc::ptr_eq(
             &logical.preferred_replica().unwrap().tracked,
             &replacement

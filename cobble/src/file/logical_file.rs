@@ -175,31 +175,31 @@ impl LogicalFile {
             .map(|replica| replica.lifecycle())
     }
 
-    pub(crate) fn replace_preferred_replica_if(
+    pub(crate) fn publish_and_promote_replica_if(
         &self,
         expected: &Arc<TrackedFile>,
         tracked: Arc<TrackedFile>,
-        lifecycle: ReplicaLifecycle,
-    ) -> bool {
+    ) -> Option<ReplicaId> {
         let mut state = self.replica_state.write().unwrap();
-        let Some(current) = state
+        let current = state
             .preferred_read_replica
-            .and_then(|id| state.replicas.get(&id))
-        else {
-            return false;
-        };
+            .and_then(|id| state.replicas.get(&id))?;
         if !Arc::ptr_eq(&current.tracked, expected) {
-            return false;
+            return None;
         }
         let previous_id = state.preferred_read_replica.unwrap();
         let replica_id = self.next_replica_id.fetch_add(1, Ordering::Relaxed);
-        let replica = Arc::new(PhysicalReplica::new(replica_id, tracked, lifecycle));
+        let replica = Arc::new(PhysicalReplica::new(
+            replica_id,
+            tracked,
+            ReplicaLifecycle::OwnedReady,
+        ));
         state.replicas.insert(replica_id, replica);
         state.preferred_read_replica = Some(replica_id);
         if let Some(previous) = state.replicas.remove(&previous_id) {
             previous.set_lifecycle(ReplicaLifecycle::Retiring);
         }
-        true
+        Some(previous_id)
     }
 
     pub(crate) fn add_replica(

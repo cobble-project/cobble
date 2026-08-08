@@ -813,7 +813,7 @@ impl FileManager {
             .filter(|volume| volume.supports_primary_data && !volume.readonly_source)
             .filter(|volume| {
                 let reserved_incoming_bytes =
-                    if self.has_snapshot_replica_on_primary_volume(file_id, volume) {
+                    if self.has_ready_replica_on_primary_volume(file_id, volume) {
                         0
                     } else {
                         size_bytes
@@ -1022,7 +1022,7 @@ impl FileManager {
         let projected_source_release_bytes =
             projected_source_release_bytes(source_tracked.as_ref());
         let reserved_incoming_bytes =
-            if self.has_snapshot_replica_on_primary_volume(file_id, &target_volume) {
+            if self.has_ready_replica_on_primary_volume(file_id, &target_volume) {
                 0
             } else {
                 estimated_bytes
@@ -1347,7 +1347,7 @@ impl FileManager {
         self.offload_runtime.primary_volume_by_rank(rank)
     }
 
-    fn has_snapshot_replica_on_primary_volume(
+    fn has_ready_replica_on_primary_volume(
         &self,
         file_id: FileId,
         target_volume: &Arc<DataVolume>,
@@ -1418,7 +1418,7 @@ impl FileManager {
             return Err(err);
         }
         new_tracked.set_priority(source_tracked.priority());
-        if !self.replace_data_file_replica(file_id, &source_tracked, new_tracked) {
+        if !self.publish_and_promote_replica_if(file_id, &source_tracked, new_tracked) {
             rollback();
             return Ok(false);
         }
@@ -2024,6 +2024,11 @@ mod tests {
             new_reader.read_at(payload.len() - 16, 16).unwrap().as_ref(),
             &payload[payload.len() - 16..]
         );
+        assert_eq!(
+            fm.get_logical_file(file_id).unwrap().replica_ids().len(),
+            1,
+            "the retired high-tier source must not remain in the logical replica set"
+        );
         drop(old_reader);
         test_utils::wait_for_file_deletion(&high_fs, &old_path);
         let _ = std::fs::remove_dir_all(root);
@@ -2084,6 +2089,11 @@ mod tests {
             snapshot_replica_path
         );
         assert_ne!(source_path, snapshot_replica_path);
+        assert_eq!(logical.replica_ids().len(), 1);
+        assert!(
+            !Arc::ptr_eq(&logical.preferred_replica_any().unwrap().tracked, &source),
+            "promotion must remove the old preferred source replica"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2136,6 +2146,11 @@ mod tests {
         assert!(
             low_fs.exists(&low_path).unwrap(),
             "backfill must retain the low-tier source while a snapshot references it"
+        );
+        assert_eq!(
+            fm.get_logical_file(file_id).unwrap().replica_ids().len(),
+            1,
+            "the backfilled source is retained only by the snapshot reference"
         );
 
         snapshot_ref.dereference();
@@ -2376,6 +2391,11 @@ mod tests {
                 &old_l0_readonly_tracking
             ),
             "the old READONLY TrackedFile must no longer be preferred"
+        );
+        assert_eq!(
+            fm.get_logical_file(101).unwrap().replica_ids().len(),
+            1,
+            "readonly promotion must retire its source replica from the logical file"
         );
 
         assert_eq!(fm.trigger_primary_tiering_if_needed(&db_state).unwrap(), 1);
