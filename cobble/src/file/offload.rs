@@ -467,11 +467,13 @@ impl PrimaryTieringWorkerHandle {
                 let Some(db_state) = weak_db_state.upgrade() else {
                     break;
                 };
-                if let Err(err) = file_manager.trigger_primary_tiering_if_needed(&db_state) {
+                if let Err(err) = tokio::task::block_in_place(|| {
+                    file_manager.trigger_primary_tiering_if_needed(&db_state)
+                }) {
                     warn!("primary volume tiering scan failed: {}", err);
                 }
                 if let Some(tick) = &adoption_tick
-                    && let Err(err) = tick()
+                    && let Err(err) = tokio::task::block_in_place(|| tick())
                 {
                     warn!("external adoption scan failed: {err}");
                 }
