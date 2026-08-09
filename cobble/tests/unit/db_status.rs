@@ -9,36 +9,50 @@ impl DbLifecycle {
 }
 
 #[test]
-fn test_lifecycle_basic_transitions() {
-    let lifecycle = DbLifecycle::new_initializing();
-    assert_eq!(lifecycle.state(), DbLifecycleState::Initializing);
-    lifecycle.mark_open().unwrap();
-    assert_eq!(lifecycle.state(), DbLifecycleState::Open);
-    assert_eq!(
-        lifecycle.begin_close().unwrap(),
-        CloseTransition::Transitioned
-    );
-    assert_eq!(lifecycle.state(), DbLifecycleState::Closing);
-    lifecycle.mark_closed();
-    assert_eq!(lifecycle.state(), DbLifecycleState::Closed);
-    assert_eq!(
-        lifecycle.begin_close().unwrap(),
-        CloseTransition::AlreadyClosingOrClosed
-    );
+fn lifecycle_transitions_preserve_errors_and_reject_new_accesses_when_closing() {
+    {
+        let lifecycle = DbLifecycle::new_initializing();
+        assert_eq!(lifecycle.state(), DbLifecycleState::Initializing);
+        lifecycle.mark_open().unwrap();
+        assert_eq!(lifecycle.state(), DbLifecycleState::Open);
+        assert_eq!(
+            lifecycle.begin_close().unwrap(),
+            CloseTransition::Transitioned
+        );
+        assert_eq!(lifecycle.state(), DbLifecycleState::Closing);
+        lifecycle.mark_closed();
+        assert_eq!(lifecycle.state(), DbLifecycleState::Closed);
+        assert_eq!(
+            lifecycle.begin_close().unwrap(),
+            CloseTransition::AlreadyClosingOrClosed
+        );
+    }
+
+    {
+        let lifecycle = DbLifecycle::new_initializing();
+        let original = Error::IoError("boom".to_string());
+        lifecycle.mark_error(original.clone());
+        assert_eq!(lifecycle.state(), DbLifecycleState::Error);
+        let err = lifecycle.ensure_open().unwrap_err();
+        assert_eq!(err.to_string(), original.to_string());
+    }
+
+    {
+        let lifecycle = DbLifecycle::new_open();
+        assert_eq!(
+            lifecycle.begin_close().unwrap(),
+            CloseTransition::Transitioned
+        );
+        let err = lifecycle
+            .begin_access()
+            .err()
+            .expect("begin_access should fail once close starts");
+        assert!(err.to_string().contains("db is closing"));
+    }
 }
 
 #[test]
-fn test_lifecycle_error_holds_original_error() {
-    let lifecycle = DbLifecycle::new_initializing();
-    let original = Error::IoError("boom".to_string());
-    lifecycle.mark_error(original.clone());
-    assert_eq!(lifecycle.state(), DbLifecycleState::Error);
-    let err = lifecycle.ensure_open().unwrap_err();
-    assert_eq!(err.to_string(), original.to_string());
-}
-
-#[test]
-fn test_close_waits_for_inflight_accesses() {
+fn close_waits_for_inflight_accesses() {
     let lifecycle = Arc::new(DbLifecycle::new_open());
     let access = lifecycle.begin_access().unwrap();
     assert_eq!(lifecycle.active_access_count(), 1);
@@ -66,7 +80,7 @@ fn test_close_waits_for_inflight_accesses() {
 }
 
 #[test]
-fn test_exclusive_access_drains_rejects_reopens_and_blocks_close() {
+fn exclusive_access_drains_rejects_reopens_and_blocks_close() {
     let lifecycle = Arc::new(DbLifecycle::new_open());
     let normal = lifecycle.begin_access().unwrap();
     let (started_tx, started_rx) = mpsc::channel();
@@ -106,18 +120,4 @@ fn test_exclusive_access_drains_rejects_reopens_and_blocks_close() {
     drop(exclusive);
     closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     close_thread.join().unwrap();
-}
-
-#[test]
-fn test_begin_access_rejected_after_close_starts() {
-    let lifecycle = DbLifecycle::new_open();
-    assert_eq!(
-        lifecycle.begin_close().unwrap(),
-        CloseTransition::Transitioned
-    );
-    let err = lifecycle
-        .begin_access()
-        .err()
-        .expect("begin_access should fail once close starts");
-    assert!(err.to_string().contains("db is closing"));
 }

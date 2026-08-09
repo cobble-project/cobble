@@ -15,7 +15,8 @@ This repository is a Rust + Cargo project implementing an LSM-style KV storage e
   - `cobble-cli`: Command-line interface for interacting with the database.
 
 ## How to Test
-- Run all workspace tests: `cargo test --workspace`
+- Daily unit-test loop: `cargo test-short` (`cargo test --workspace --lib`)
+- Run all workspace tests before committing: `cargo test --workspace`
 - Run a fast subset on the main crate: `cargo test <pattern>` (e.g., `cargo test row_codec`)
   Notes:
 - Some tests write temporary files under `/tmp` and may use serial execution attributes. Remove stale `/tmp` test artifacts if tests intermittently fail.

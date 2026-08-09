@@ -259,8 +259,9 @@ https://cobble-project.github.io/cobble/latest/getting-started/structured-db/
 
 - Format: `cargo fmt --all`
 - Lint (workspace): `cargo clippy --workspace -- -D warnings`
-- Test (workspace): `cargo test --workspace`
-- Fast inner-loop test on the main crate: `cargo test <pattern>`
+- Daily unit-test suite: `cargo test-short`
+- Complete pre-commit suite: `cargo test --workspace`
+- Focused inner-loop test: `cargo test <pattern>`
 
 ## Contributing
 

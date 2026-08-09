@@ -1,0 +1,2 @@
+[alias]
+test-short = "test --workspace --lib"

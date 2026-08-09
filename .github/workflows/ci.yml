@@ -47,7 +47,7 @@ jobs:
       
       - name: Run tests
         timeout-minutes: 10
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose
 
       - name: Start local S3 service (RustFS)
         id: s3

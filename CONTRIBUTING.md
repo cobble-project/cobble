@@ -40,9 +40,10 @@ Fix lint issues automatically (where possible):
 
 ## 2\. Testing
 
-### 2\.1 Run all tests
+### 2\.1 Test suites
 
-- `cargo test --workspace`
+- During daily development, run the fast unit-test suite: `cargo test-short`.
+- Before committing, run the complete workspace suite: `cargo test --workspace`.
 
 ### 2\.2 Run a subset of tests
 
