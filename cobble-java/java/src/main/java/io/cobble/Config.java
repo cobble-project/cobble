@@ -158,6 +158,12 @@ public final class Config {
     /** Whether to take snapshot automatically on each successful flush. */
     public Boolean snapshotOnFlush;
 
+    /** Whether the write-ahead log is enabled. */
+    public Boolean walEnabled;
+
+    /** Maximum interval in milliseconds before the WAL group-commit buffer is published. */
+    public Long walFlushIntervalMs;
+
     /** Ratio threshold for incremental active-memtable snapshot optimization. */
     public Double activeMemtableIncrementalSnapshotRatio;
 

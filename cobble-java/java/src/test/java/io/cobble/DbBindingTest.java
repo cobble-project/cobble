@@ -64,6 +64,16 @@ class DbBindingTest {
     }
 
     @Test
+    void configSerializesWalOptions() {
+        Config config = new Config();
+        config.walEnabled = false;
+        config.walFlushIntervalMs = 25L;
+
+        assertTrue(config.toJson().contains("\"wal_enabled\":false"));
+        assertTrue(config.toJson().contains("\"wal_flush_interval_ms\":25"));
+    }
+
+    @Test
     void nativeMetricsAreExposedAsTypedImmutableSamples() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-metrics-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
