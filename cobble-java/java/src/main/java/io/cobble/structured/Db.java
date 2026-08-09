@@ -6,6 +6,7 @@ import io.cobble.MetricSample;
 import io.cobble.NativeLoader;
 import io.cobble.NativeObject;
 import io.cobble.PendingSnapshot;
+import io.cobble.RecoveryMode;
 import io.cobble.ShardSnapshot;
 
 import java.nio.Buffer;
@@ -195,6 +196,21 @@ public final class Db extends NativeObject {
         return restore(configPath, snapshotId, dbId, false);
     }
 
+    /** Restore a structured DB from a snapshot with explicit WAL recovery behavior. */
+    public static Db restore(
+            String configPath, long snapshotId, String dbId, RecoveryMode recoveryMode) {
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long h =
+                restoreHandleWithRecoveryMode(configPath, snapshotId, dbId, recoveryMode.ordinal());
+        if (h == 0L) {
+            throw new IllegalStateException("failed to restore structured db with recovery mode");
+        }
+        return wrapOpenedDb(h);
+    }
+
     /**
      * Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot.
      *
@@ -216,6 +232,26 @@ public final class Db extends NativeObject {
     /** Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot. */
     public static Db restore(Config config, long snapshotId, String dbId) {
         return restore(config, snapshotId, dbId, false);
+    }
+
+    /** Restore a structured DB from a snapshot with explicit WAL recovery behavior. */
+    public static Db restore(
+            Config config, long snapshotId, String dbId, RecoveryMode recoveryMode) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long h =
+                restoreHandleFromJsonWithRecoveryMode(
+                        config.toJson(), snapshotId, dbId, recoveryMode.ordinal());
+        if (h == 0L) {
+            throw new IllegalStateException(
+                    "failed to restore structured db from config json with recovery mode");
+        }
+        return wrapOpenedDb(h);
     }
 
     /**
@@ -285,6 +321,19 @@ public final class Db extends NativeObject {
         return wrapOpenedDb(h);
     }
 
+    /** Resume a structured DB with explicit WAL recovery behavior. */
+    public static Db resume(String configPath, String dbId, RecoveryMode recoveryMode) {
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long h = resumeHandleWithRecoveryMode(configPath, dbId, recoveryMode.ordinal());
+        if (h == 0L) {
+            throw new IllegalStateException("failed to resume structured db with recovery mode");
+        }
+        return wrapOpenedDb(h);
+    }
+
     /** Resume a structured DB from existing folder state. Schema is auto-loaded. */
     public static Db resume(Config config, String dbId) {
         if (config == null) {
@@ -295,6 +344,24 @@ public final class Db extends NativeObject {
         long h = resumeHandleFromJson(configJson, dbId);
         if (h == 0L) {
             throw new IllegalStateException("failed to resume structured db from config json");
+        }
+        return wrapOpenedDb(h);
+    }
+
+    /** Resume a structured DB with explicit WAL recovery behavior. */
+    public static Db resume(Config config, String dbId, RecoveryMode recoveryMode) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long h =
+                resumeHandleFromJsonWithRecoveryMode(config.toJson(), dbId, recoveryMode.ordinal());
+        if (h == 0L) {
+            throw new IllegalStateException(
+                    "failed to resume structured db from config json with recovery mode");
         }
         return wrapOpenedDb(h);
     }
@@ -1208,6 +1275,12 @@ public final class Db extends NativeObject {
     private static native long restoreHandleFromJson(
             String configJson, long snapshotId, String dbId, boolean newDbId);
 
+    private static native long restoreHandleWithRecoveryMode(
+            String configPath, long snapshotId, String dbId, int recoveryMode);
+
+    private static native long restoreHandleFromJsonWithRecoveryMode(
+            String configJson, long snapshotId, String dbId, int recoveryMode);
+
     private static native long restoreWithManifestHandle(String configPath, String manifestPath);
 
     private static native long restoreWithManifestHandleFromJson(
@@ -1216,6 +1289,12 @@ public final class Db extends NativeObject {
     private static native long resumeHandle(String configPath, String dbId);
 
     private static native long resumeHandleFromJson(String configJson, String dbId);
+
+    private static native long resumeHandleWithRecoveryMode(
+            String configPath, String dbId, int recoveryMode);
+
+    private static native long resumeHandleFromJsonWithRecoveryMode(
+            String configJson, String dbId, int recoveryMode);
 
     // bytes put/merge
     private static native void putBytes(

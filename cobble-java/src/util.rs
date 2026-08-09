@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use cobble::{Config, ExpandStorageMode};
+use cobble::{Config, ExpandStorageMode, RecoveryMode};
 use jni::JNIEnv;
 use jni::descriptors::Desc;
 use jni::objects::{
@@ -104,6 +104,14 @@ pub(crate) fn expand_storage_mode(value: jint) -> Result<ExpandStorageMode, Stri
         1 => Ok(ExpandStorageMode::ReferencePersistent),
         2 => Ok(ExpandStorageMode::ReferencePersistentWithCache),
         _ => Err(format!("unknown expand storage mode {value}")),
+    }
+}
+
+pub(crate) fn decode_recovery_mode(value: jint) -> Result<RecoveryMode, String> {
+    match value {
+        0 => Ok(RecoveryMode::SnapshotOnly),
+        1 => Ok(RecoveryMode::LatestWithWal),
+        _ => Err(format!("unknown recovery mode {value}")),
     }
 }
 

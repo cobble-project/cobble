@@ -42,6 +42,23 @@ public final class SingleDb extends NativeObject {
         return new SingleDb(nativeHandle);
     }
 
+    /** Resume a single-node DB with explicit WAL recovery behavior. */
+    public static SingleDb resume(
+            String configPath, long globalSnapshotId, RecoveryMode recoveryMode) {
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle =
+                openFromGlobalSnapshotHandleWithRecoveryMode(
+                        configPath, globalSnapshotId, recoveryMode.ordinal());
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException(
+                    "failed to resume single db from global snapshot with recovery mode");
+        }
+        return new SingleDb(nativeHandle);
+    }
+
     /** Resume a single-node DB from an existing global snapshot id. */
     public static SingleDb resume(Config config, long globalSnapshotId) {
         if (config == null) {
@@ -52,6 +69,25 @@ public final class SingleDb extends NativeObject {
         if (nativeHandle == 0L) {
             throw new IllegalStateException(
                     "failed to resume single db from global snapshot config json");
+        }
+        return new SingleDb(nativeHandle);
+    }
+
+    /** Resume a single-node DB with explicit WAL recovery behavior. */
+    public static SingleDb resume(Config config, long globalSnapshotId, RecoveryMode recoveryMode) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle =
+                openFromGlobalSnapshotHandleFromJsonWithRecoveryMode(
+                        config.toJson(), globalSnapshotId, recoveryMode.ordinal());
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException(
+                    "failed to resume single db from global snapshot config json with recovery mode");
         }
         return new SingleDb(nativeHandle);
     }
@@ -269,6 +305,12 @@ public final class SingleDb extends NativeObject {
 
     private static native long openFromGlobalSnapshotHandleFromJson(
             String configJson, long globalSnapshotId);
+
+    private static native long openFromGlobalSnapshotHandleWithRecoveryMode(
+            String configPath, long globalSnapshotId, int recoveryMode);
+
+    private static native long openFromGlobalSnapshotHandleFromJsonWithRecoveryMode(
+            String configJson, long globalSnapshotId, int recoveryMode);
 
     private static native void put(
             long nativeHandle, int bucket, byte[] key, int column, byte[] value);

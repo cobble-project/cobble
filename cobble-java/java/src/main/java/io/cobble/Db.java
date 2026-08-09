@@ -143,6 +143,21 @@ public final class Db extends NativeObject {
         return restore(configPath, snapshotId, dbId, false);
     }
 
+    /** Restore a writable DB from one snapshot with explicit WAL recovery behavior. */
+    public static Db restore(
+            String configPath, long snapshotId, String dbId, RecoveryMode recoveryMode) {
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle =
+                restoreHandleWithRecoveryMode(configPath, snapshotId, dbId, recoveryMode.ordinal());
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("failed to restore db with recovery mode");
+        }
+        return wrapOpenedDb(nativeHandle);
+    }
+
     /**
      * Restore a writable DB from one snapshot.
      *
@@ -177,6 +192,26 @@ public final class Db extends NativeObject {
      */
     public static Db restore(Config config, long snapshotId, String dbId) {
         return restore(config, snapshotId, dbId, false);
+    }
+
+    /** Restore a writable DB from one snapshot with explicit WAL recovery behavior. */
+    public static Db restore(
+            Config config, long snapshotId, String dbId, RecoveryMode recoveryMode) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle =
+                restoreHandleFromJsonWithRecoveryMode(
+                        config.toJson(), snapshotId, dbId, recoveryMode.ordinal());
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException(
+                    "failed to restore db from config json with recovery mode");
+        }
+        return wrapOpenedDb(nativeHandle);
     }
 
     /**
@@ -255,6 +290,19 @@ public final class Db extends NativeObject {
         return wrapOpenedDb(nativeHandle);
     }
 
+    /** Resume a writable DB with explicit WAL recovery behavior. */
+    public static Db resume(String configPath, String dbId, RecoveryMode recoveryMode) {
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle = resumeHandleWithRecoveryMode(configPath, dbId, recoveryMode.ordinal());
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("failed to resume db with recovery mode");
+        }
+        return wrapOpenedDb(nativeHandle);
+    }
+
     /**
      * Resume a writable DB from existing folder state.
      *
@@ -270,6 +318,24 @@ public final class Db extends NativeObject {
         long nativeHandle = resumeHandleFromJson(config.toJson(), dbId);
         if (nativeHandle == 0L) {
             throw new IllegalStateException("failed to resume db from config json");
+        }
+        return wrapOpenedDb(nativeHandle);
+    }
+
+    /** Resume a writable DB with explicit WAL recovery behavior. */
+    public static Db resume(Config config, String dbId, RecoveryMode recoveryMode) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle =
+                resumeHandleFromJsonWithRecoveryMode(config.toJson(), dbId, recoveryMode.ordinal());
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException(
+                    "failed to resume db from config json with recovery mode");
         }
         return wrapOpenedDb(nativeHandle);
     }
@@ -1165,6 +1231,12 @@ public final class Db extends NativeObject {
     private static native long restoreHandleFromJson(
             String configJson, long snapshotId, String dbId, boolean newDbId);
 
+    private static native long restoreHandleWithRecoveryMode(
+            String configPath, long snapshotId, String dbId, int recoveryMode);
+
+    private static native long restoreHandleFromJsonWithRecoveryMode(
+            String configJson, long snapshotId, String dbId, int recoveryMode);
+
     private static native long restoreWithManifestHandle(String configPath, String manifestPath);
 
     private static native long restoreWithManifestHandleFromJson(
@@ -1173,6 +1245,12 @@ public final class Db extends NativeObject {
     private static native long resumeHandle(String configPath, String dbId);
 
     private static native long resumeHandleFromJson(String configJson, String dbId);
+
+    private static native long resumeHandleWithRecoveryMode(
+            String configPath, String dbId, int recoveryMode);
+
+    private static native long resumeHandleFromJsonWithRecoveryMode(
+            String configJson, String dbId, int recoveryMode);
 
     private static native void put(
             long nativeHandle, int bucket, byte[] key, int column, byte[] value);

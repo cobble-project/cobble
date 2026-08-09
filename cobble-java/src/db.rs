@@ -4,13 +4,14 @@ use crate::scan::{ScanCursorHandle, decode_scan_open_bounds_args};
 use crate::util::{
     complete_future_exceptionally, complete_future_with_cobble_error, complete_future_with_string,
     decode_bucket_ranges, decode_java_bytes, decode_java_string, decode_multi_get_keys,
-    decode_packed_multi_get_keys, decode_u16, decode_u32, decode_u64_from_jlong,
-    expand_storage_mode, parse_config_json, take_last_overflow_direct_buffer,
-    throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
-    to_java_optional_bytes_3d, to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
+    decode_packed_multi_get_keys, decode_recovery_mode, decode_u16, decode_u32,
+    decode_u64_from_jlong, expand_storage_mode, parse_config_json,
+    take_last_overflow_direct_buffer, throw_illegal_argument, throw_illegal_state,
+    to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
+    write_payload_to_io_or_cached_overflow,
 };
 use crate::write_options::write_options_from_handle_or_throw;
-use cobble::{Config, Db};
+use cobble::{Config, Db, RecoveryMode};
 use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
@@ -111,6 +112,7 @@ fn restore_db(
     snapshot_id: jlong,
     db_id: JString,
     new_db_id: jboolean,
+    recovery_mode: RecoveryMode,
 ) -> jlong {
     let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
         Ok(v) => v,
@@ -129,7 +131,7 @@ fn restore_db(
     let db = if new_db_id == JNI_TRUE {
         Db::open_new_with_snapshot(config, snapshot_id, db_id)
     } else {
-        Db::open_from_snapshot(config, snapshot_id, db_id)
+        Db::open_from_snapshot_with_recovery_mode(config, snapshot_id, db_id, recovery_mode)
     };
     match db {
         Ok(v) => Box::into_raw(Box::new(v)) as jlong,
@@ -184,7 +186,14 @@ pub extern "system" fn Java_io_cobble_Db_restoreHandle(
             return 0;
         }
     };
-    restore_db(&mut env, config, snapshot_id, db_id, new_db_id)
+    restore_db(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        new_db_id,
+        RecoveryMode::SnapshotOnly,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -206,7 +215,90 @@ pub extern "system" fn Java_io_cobble_Db_restoreHandleFromJson(
     let Some(config) = parse_config_json(&mut env, &json) else {
         return 0;
     };
-    restore_db(&mut env, config, snapshot_id, db_id, new_db_id)
+    restore_db(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        new_db_id,
+        RecoveryMode::SnapshotOnly,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_restoreHandleWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    restore_db(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        JNI_FALSE,
+        recovery_mode,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_restoreHandleFromJsonWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    restore_db(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        JNI_FALSE,
+        recovery_mode,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -267,13 +359,6 @@ pub extern "system" fn Java_io_cobble_Db_resumeHandle(
             return 0;
         }
     };
-    let db_id = match decode_java_string(&mut env, db_id) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_argument(&mut env, err);
-            return 0;
-        }
-    };
     let config = match Config::from_path(path) {
         Ok(config) => config,
         Err(err) => {
@@ -281,10 +366,26 @@ pub extern "system" fn Java_io_cobble_Db_resumeHandle(
             return 0;
         }
     };
-    let db = match Db::resume(config, db_id) {
+    resume_db(&mut env, config, db_id, RecoveryMode::LatestWithWal)
+}
+
+fn resume_db(
+    env: &mut JNIEnv,
+    config: Config,
+    db_id: JString,
+    recovery_mode: RecoveryMode,
+) -> jlong {
+    let db_id = match decode_java_string(env, db_id) {
         Ok(v) => v,
         Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    let db = match Db::resume_with_recovery_mode(config, db_id, recovery_mode) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
             return 0;
         }
     };
@@ -305,8 +406,54 @@ pub extern "system" fn Java_io_cobble_Db_resumeHandleFromJson(
             return 0;
         }
     };
-    let db_id = match decode_java_string(&mut env, db_id) {
-        Ok(v) => v,
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    resume_db(&mut env, config, db_id, RecoveryMode::LatestWithWal)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_resumeHandleWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_db(&mut env, config, db_id, recovery_mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_resumeHandleFromJsonWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return 0;
@@ -315,14 +462,14 @@ pub extern "system" fn Java_io_cobble_Db_resumeHandleFromJson(
     let Some(config) = parse_config_json(&mut env, &json) else {
         return 0;
     };
-    let db = match Db::resume(config, db_id) {
-        Ok(v) => v,
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
         Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
+            throw_illegal_argument(&mut env, err);
             return 0;
         }
     };
-    Box::into_raw(Box::new(db)) as jlong
+    resume_db(&mut env, config, db_id, recovery_mode)
 }
 
 fn open_db(env: &mut JNIEnv, config: Config) -> jlong {

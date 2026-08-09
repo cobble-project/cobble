@@ -429,7 +429,10 @@ class DbBindingTest {
             // restore
             try (io.cobble.structured.Db restored =
                     io.cobble.structured.Db.restore(
-                            configPath.toString(), shardSnapshot.snapshotId, dbId)) {
+                            configPath.toString(),
+                            shardSnapshot.snapshotId,
+                            dbId,
+                            RecoveryMode.SNAPSHOT_ONLY)) {
                 for (int i = 0; i < count; i++) {
                     assertArrayEquals(
                             valueBytes("st-snap-v", i),
@@ -450,7 +453,8 @@ class DbBindingTest {
 
             // resume
             try (io.cobble.structured.Db resumed =
-                    io.cobble.structured.Db.resume(configPath.toString(), dbId)) {
+                    io.cobble.structured.Db.resume(
+                            configPath.toString(), dbId, RecoveryMode.LATEST_WITH_WAL)) {
                 for (int i = 0; i < count; i++) {
                     assertArrayEquals(
                             valueBytes("st-snap-v", i),
@@ -622,7 +626,9 @@ class DbBindingTest {
             assertTrue(db.retainSnapshot(globalSnapshotId));
         }
 
-        try (SingleDb resumed = SingleDb.resume(configPath.toString(), globalSnapshotId)) {
+        try (SingleDb resumed =
+                SingleDb.resume(
+                        configPath.toString(), globalSnapshotId, RecoveryMode.SNAPSHOT_ONLY)) {
             for (int i = 0; i < 120; i++) {
                 assertArrayEquals(
                         valueBytes("single-resume-v", i),
@@ -654,7 +660,12 @@ class DbBindingTest {
             assertFalse(shardSnapshot.manifestPath.isEmpty());
             assertTrue(shardSnapshot.dataSizeBytes > 0L);
             assertTrue(shardSnapshot.incrementalDataSizeBytes > 0L);
-            try (Db restored = Db.restore(configPath.toString(), shardSnapshot.snapshotId, dbId)) {
+            try (Db restored =
+                    Db.restore(
+                            configPath.toString(),
+                            shardSnapshot.snapshotId,
+                            dbId,
+                            RecoveryMode.SNAPSHOT_ONLY)) {
                 for (int i = 0; i < 180; i++) {
                     assertArrayEquals(
                             valueBytes("restore-v", i), restored.get(0, keyBytes("restore", i), 0));
@@ -678,7 +689,8 @@ class DbBindingTest {
                             restoredFromManifest.get(0, keyBytes("restore", i), 0));
                 }
             }
-            try (Db resumed = Db.resume(configPath.toString(), dbId)) {
+            try (Db resumed =
+                    Db.resume(configPath.toString(), dbId, RecoveryMode.LATEST_WITH_WAL)) {
                 for (int i = 0; i < 180; i++) {
                     assertArrayEquals(
                             valueBytes("restore-v", i), resumed.get(0, keyBytes("restore", i), 0));

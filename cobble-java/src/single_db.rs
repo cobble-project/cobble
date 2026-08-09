@@ -2,12 +2,12 @@ use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{ScanCursorHandle, decode_scan_open_args};
 use crate::util::{
     complete_future_exceptionally, complete_future_with_string, decode_java_bytes,
-    decode_java_string, decode_multi_get_keys, decode_u16, decode_u32, decode_u64_from_jlong,
-    parse_config_json, throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
-    to_java_optional_bytes_3d, to_java_string_or_throw,
+    decode_java_string, decode_multi_get_keys, decode_recovery_mode, decode_u16, decode_u32,
+    decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
+    to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
-use cobble::{Config, SingleDb};
+use cobble::{Config, RecoveryMode, SingleDb};
 use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
@@ -97,10 +97,24 @@ pub extern "system" fn Java_io_cobble_SingleDb_openFromGlobalSnapshotHandle(
             return 0;
         }
     };
-    let db = match SingleDb::resume(config, global_snapshot_id) {
+    resume_single_db(
+        &mut env,
+        config,
+        global_snapshot_id,
+        RecoveryMode::SnapshotOnly,
+    )
+}
+
+fn resume_single_db(
+    env: &mut JNIEnv,
+    config: Config,
+    global_snapshot_id: u64,
+    recovery_mode: RecoveryMode,
+) -> jlong {
+    let db = match SingleDb::resume_with_recovery_mode(config, global_snapshot_id, recovery_mode) {
         Ok(db) => db,
         Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
+            throw_illegal_state(env, err.to_string());
             return 0;
         }
     };
@@ -131,14 +145,86 @@ pub extern "system" fn Java_io_cobble_SingleDb_openFromGlobalSnapshotHandleFromJ
             return 0;
         }
     };
-    let db = match SingleDb::resume(config, global_snapshot_id) {
-        Ok(db) => db,
+    resume_single_db(
+        &mut env,
+        config,
+        global_snapshot_id,
+        RecoveryMode::SnapshotOnly,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openFromGlobalSnapshotHandleWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    global_snapshot_id: jlong,
+    recovery_mode_value: jint,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
             return 0;
         }
     };
-    Box::into_raw(Box::new(db)) as jlong
+    let global_snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_single_db(&mut env, config, global_snapshot_id, recovery_mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openFromGlobalSnapshotHandleFromJsonWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    global_snapshot_id: jlong,
+    recovery_mode_value: jint,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    let global_snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_single_db(&mut env, config, global_snapshot_id, recovery_mode)
 }
 
 #[unsafe(no_mangle)]

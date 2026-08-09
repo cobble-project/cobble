@@ -15,13 +15,13 @@ use crate::util::{
     FrameError, byte_array_class, complete_future_exceptionally, complete_future_with_cobble_error,
     complete_future_with_string, decode_bucket_ranges, decode_java_bytes, decode_java_bytes_ref,
     decode_java_string, decode_multi_get_keys, decode_optional_java_string,
-    decode_packed_multi_get_keys, decode_u16, decode_u64_from_jlong, expand_storage_mode,
-    new_object_array, object_array_class, object_class, parse_config_json,
+    decode_packed_multi_get_keys, decode_recovery_mode, decode_u16, decode_u64_from_jlong,
+    expand_storage_mode, new_object_array, object_array_class, object_class, parse_config_json,
     take_last_overflow_direct_buffer, throw_illegal_argument, throw_illegal_state,
     to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
 };
 use bytes::Bytes;
-use cobble::Config;
+use cobble::{Config, RecoveryMode};
 use cobble_data_structure::{
     DataStructureDb, PriorityQueue as CobblePriorityQueue, StructuredColumnValue,
     StructuredDbIterator, StructuredScanSplit, StructuredScanSplitScanner,
@@ -1034,7 +1034,14 @@ pub extern "system" fn Java_io_cobble_structured_Db_restoreHandle(
             return 0;
         }
     };
-    restore_structured_db(&mut env, config, snapshot_id, db_id, new_db_id)
+    restore_structured_db(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        new_db_id,
+        RecoveryMode::SnapshotOnly,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -1056,7 +1063,90 @@ pub extern "system" fn Java_io_cobble_structured_Db_restoreHandleFromJson(
     let Some(config) = parse_config_json(&mut env, &config_json) else {
         return 0;
     };
-    restore_structured_db(&mut env, config, snapshot_id, db_id, new_db_id)
+    restore_structured_db(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        new_db_id,
+        RecoveryMode::SnapshotOnly,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_restoreHandleWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let config_path = match decode_java_string(&mut env, config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(&config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    restore_structured_db(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        JNI_FALSE,
+        recovery_mode,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_restoreHandleFromJsonWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let config_json = match decode_java_string(&mut env, config_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    restore_structured_db(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        JNI_FALSE,
+        recovery_mode,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -1109,6 +1199,7 @@ fn restore_structured_db(
     snapshot_id: jlong,
     db_id: JString,
     new_db_id: jboolean,
+    recovery_mode: RecoveryMode,
 ) -> jlong {
     let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
         Ok(v) => v,
@@ -1133,11 +1224,11 @@ fn restore_structured_db(
             Some(resolver),
         )
     } else {
-        DataStructureDb::open_from_snapshot_with_resolver(
+        DataStructureDb::open_from_snapshot_with_recovery_mode(
             config,
             snapshot_id,
             db_id,
-            Some(resolver),
+            recovery_mode,
         )
     };
     match db {
@@ -1196,7 +1287,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_resumeHandle(
             return 0;
         }
     };
-    resume_structured_db(&mut env, config, db_id)
+    resume_structured_db(&mut env, config, db_id, RecoveryMode::LatestWithWal)
 }
 
 #[unsafe(no_mangle)]
@@ -1216,10 +1307,15 @@ pub extern "system" fn Java_io_cobble_structured_Db_resumeHandleFromJson(
     let Some(config) = parse_config_json(&mut env, &config_json) else {
         return 0;
     };
-    resume_structured_db(&mut env, config, db_id)
+    resume_structured_db(&mut env, config, db_id, RecoveryMode::LatestWithWal)
 }
 
-fn resume_structured_db(env: &mut JNIEnv, config: Config, db_id: JString) -> jlong {
+fn resume_structured_db(
+    env: &mut JNIEnv,
+    config: Config,
+    db_id: JString,
+    recovery_mode: RecoveryMode,
+) -> jlong {
     let db_id = match decode_java_string(env, db_id) {
         Ok(v) => v,
         Err(err) => {
@@ -1227,14 +1323,73 @@ fn resume_structured_db(env: &mut JNIEnv, config: Config, db_id: JString) -> jlo
             return 0;
         }
     };
-    let resolver = cobble_data_structure::structured_merge_operator_resolver();
-    match DataStructureDb::resume_with_resolver(config, db_id, Some(resolver)) {
+    match DataStructureDb::resume_with_recovery_mode(config, db_id, recovery_mode) {
         Ok(db) => Box::into_raw(Box::new(db)) as jlong,
         Err(err) => {
             throw_illegal_state(env, err.to_string());
             0
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_resumeHandleWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let config_path = match decode_java_string(&mut env, config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(&config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_structured_db(&mut env, config, db_id, recovery_mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_resumeHandleFromJsonWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let config_json = match decode_java_string(&mut env, config_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_structured_db(&mut env, config, db_id, recovery_mode)
 }
 
 // ── dispose ─────────────────────────────────────────────────────────────────
