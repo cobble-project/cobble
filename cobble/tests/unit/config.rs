@@ -20,6 +20,31 @@ fn test_default_memtable_type_is_adaptive() {
 }
 
 #[test]
+fn wal_is_opt_in_and_requires_one_explicit_volume() {
+    assert!(!Config::from_json_str("{}").unwrap().wal_enabled);
+
+    let mut missing = Config::default();
+    missing.wal_enabled = true;
+    assert!(missing.normalize_volume_paths().is_err());
+
+    let mut duplicate = Config::default();
+    duplicate.wal_enabled = true;
+    duplicate.volumes = vec![
+        VolumeDescriptor::new("file:///tmp/wal-a", vec![VolumeUsageKind::Wal]),
+        VolumeDescriptor::new("file:///tmp/wal-b", vec![VolumeUsageKind::Wal]),
+    ];
+    assert!(duplicate.normalize_volume_paths().is_err());
+
+    let mut enabled = Config::default();
+    enabled.wal_enabled = true;
+    enabled.volumes = vec![VolumeDescriptor::new(
+        "file:///tmp/wal",
+        vec![VolumeUsageKind::Wal],
+    )];
+    assert!(enabled.normalize_volume_paths().is_ok());
+}
+
+#[test]
 fn test_resolved_write_stall_limit() {
     let mut config = Config::default();
     assert_eq!(config.resolved_write_stall_limit(), 32);
@@ -127,6 +152,8 @@ fn test_config_from_file_round_trip() {
         log_console: true,
         log_level: log::LevelFilter::Debug,
         snapshot_on_flush: true,
+        wal_enabled: false,
+        wal_flush_interval_ms: 5,
         active_memtable_incremental_snapshot_ratio: 0.5,
         lsm_split_trigger_level: Some(2),
         primary_volume_write_stop_watermark: 0.93,

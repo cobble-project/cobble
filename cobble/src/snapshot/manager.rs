@@ -418,6 +418,7 @@ impl SnapshotManager {
         active_memtable_data: Vec<ActiveMemtableSnapshotData>,
         db_state_handle: &DbStateHandle,
         truncation_cursors: Option<&TruncationCursorSnapshot>,
+        wal_checkpoint_id: u64,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
         let Some(snapshot) = state.snapshots.get(&id).cloned() else {
@@ -445,6 +446,7 @@ impl SnapshotManager {
         }
         snapshot.seq_id = db_state.seq_id;
         snapshot.topology_epoch = db_state.topology_epoch;
+        snapshot.wal_checkpoint_id = wal_checkpoint_id;
         snapshot.truncation_cursors = truncation_cursors
             .map(TruncationCursorSnapshot::to_map)
             .unwrap_or_else(|| db_state.truncation_cursors_snapshot());
@@ -643,6 +645,7 @@ impl SnapshotManager {
             vlog_version: build_vlog_version_from_manifest_untracked(manifest),
             seq_id: manifest.seq_id,
             topology_epoch: manifest.topology_epoch,
+            wal_checkpoint_id: manifest.wal_checkpoint_id,
             latest_schema_id: manifest.latest_schema_id,
             referenced_schema_ids,
             active_memtable_data: manifest.active_memtable_data.clone(),

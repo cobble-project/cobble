@@ -134,6 +134,7 @@ mod ttl;
 mod r#type;
 mod util;
 mod vlog;
+mod wal;
 mod write_batch;
 mod writer_options;
 

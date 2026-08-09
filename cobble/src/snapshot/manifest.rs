@@ -23,7 +23,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Snapshot manifests version 2 require SST row keys with big-endian bucket prefixes.
-/// Version 3 adds per-file `max_expired_at`; version 4 adds replica origins and topology epochs.
+/// Version 3 adds per-file `max_expired_at`; version 4 adds replica origins, topology epochs, and
+/// the WAL checkpoint included by the snapshot.
 pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 4;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -33,6 +34,9 @@ pub(crate) struct ManifestSnapshot {
     pub(crate) seq_id: u64,
     #[serde(default)]
     pub(crate) topology_epoch: u64,
+    /// Highest WAL segment whose writes are included in this snapshot.
+    #[serde(default)]
+    pub(crate) wal_checkpoint_id: u64,
     pub(crate) latest_schema_id: u64,
     pub(crate) data_size_bytes: u64,
     pub(crate) incremental_data_size_bytes: u64,
@@ -53,6 +57,9 @@ pub(crate) struct ManifestIncrementalSnapshot {
     pub(crate) seq_id: u64,
     #[serde(default)]
     pub(crate) topology_epoch: u64,
+    /// Highest WAL segment whose writes are included in this snapshot.
+    #[serde(default)]
+    pub(crate) wal_checkpoint_id: u64,
     pub(crate) base_snapshot_id: u64,
     pub(crate) latest_schema_id: u64,
     pub(crate) data_size_bytes: u64,
@@ -164,6 +171,7 @@ pub(crate) fn load_manifest_entry(
                 )?;
                 resolved.version = incremental.version;
                 resolved.topology_epoch = incremental.topology_epoch;
+                resolved.wal_checkpoint_id = incremental.wal_checkpoint_id;
                 resolved.vlog_files = incremental.vlog_files;
                 resolved.id = incremental.id;
                 resolved.seq_id = incremental.seq_id;
@@ -236,6 +244,7 @@ pub(crate) fn load_manifest_chain(
                 )?;
                 resolved_base.version = manifest.version;
                 resolved_base.topology_epoch = manifest.topology_epoch;
+                resolved_base.wal_checkpoint_id = manifest.wal_checkpoint_id;
                 resolved_base.vlog_files = manifest.vlog_files;
                 resolved_base.id = manifest.id;
                 resolved_base.seq_id = manifest.seq_id;
@@ -313,6 +322,7 @@ pub(crate) fn load_manifest_chain_from_path(
                 )?;
                 resolved_base.version = manifest.version;
                 resolved_base.topology_epoch = manifest.topology_epoch;
+                resolved_base.wal_checkpoint_id = manifest.wal_checkpoint_id;
                 resolved_base.vlog_files = manifest.vlog_files;
                 resolved_base.id = manifest.id;
                 resolved_base.seq_id = manifest.seq_id;
@@ -477,6 +487,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 id: snapshot.id,
                 seq_id: snapshot.seq_id,
                 topology_epoch: snapshot.topology_epoch,
+                wal_checkpoint_id: snapshot.wal_checkpoint_id,
                 base_snapshot_id: base.id,
                 latest_schema_id: snapshot.latest_schema_id,
                 data_size_bytes,
@@ -495,6 +506,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 id: snapshot.id,
                 seq_id: snapshot.seq_id,
                 topology_epoch: snapshot.topology_epoch,
+                wal_checkpoint_id: snapshot.wal_checkpoint_id,
                 latest_schema_id: snapshot.latest_schema_id,
                 data_size_bytes: file_data_size_bytes + current_active_memtable_bytes,
                 incremental_data_size_bytes,
@@ -513,6 +525,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             id: snapshot.id,
             seq_id: snapshot.seq_id,
             topology_epoch: snapshot.topology_epoch,
+            wal_checkpoint_id: snapshot.wal_checkpoint_id,
             latest_schema_id: snapshot.latest_schema_id,
             data_size_bytes: file_data_size_bytes + current_active_memtable_bytes,
             incremental_data_size_bytes,

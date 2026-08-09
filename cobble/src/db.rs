@@ -22,6 +22,7 @@ use crate::r#type::{
     Column, RefColumn, RefKey, RefValue, Value, ValueType, decode_merge_separated_array,
 };
 use crate::vlog::{VlogPointer, VlogStore};
+use crate::wal::WalWriter;
 use crate::write_batch::{WriteBatch, WriteOp};
 use crate::writer_options::WriterOptions;
 use crate::{Config, ReadOptions, ScanOptions, TimeProvider, WriteOptions};
@@ -76,6 +77,8 @@ pub struct Db {
     /// Durable runtime-manifest publisher for external observers.
     runtime_manifest_publisher:
         Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
+    /// Present only when durable WAL is explicitly enabled.
+    wal_writer: Option<Arc<WalWriter>>,
 }
 
 /// Storage ownership policy for files imported by [`Db::expand_bucket_with_storage_mode`].
@@ -340,6 +343,7 @@ impl Db {
             Some(Arc::clone(&db_governance)),
             bucket_ranges,
             0,
+            0,
             hybrid_cache_plan,
             metrics_manager,
             schema_manager,
@@ -596,11 +600,36 @@ impl Db {
         columns[column_idx] = Some(column);
         let record = RefValue::new_with_expired_at(columns, expired_at);
         let key = RefKey::new_with_column_family(bucket, column_family_id, key.as_ref());
-        let result = self.memtable_manager.put(&key, &record);
+        let result = if let Some(wal_writer) = &self.wal_writer {
+            self.put_ref_with_wal(wal_writer, schema.version(), num_columns, &key, &record)
+        } else {
+            self.memtable_manager.put(&key, &record)
+        };
         // Record after the write completes (active lock released) to avoid re-entering the
         // manager while holding it.
         let decision = self.memtable_manager.record_adaptive_write(1);
         self.apply_adaptive_decision(decision);
+        result
+    }
+
+    fn put_ref_with_wal(
+        &self,
+        wal_writer: &WalWriter,
+        schema_id: u64,
+        num_columns: usize,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+    ) -> Result<()> {
+        let mut guard = wal_writer.lock_for_schema(schema_id)?;
+        let result = self.memtable_manager.put(key, value);
+        let completion = result
+            .as_ref()
+            .ok()
+            .map(|_| guard.append_ref(schema_id, key, value, num_columns));
+        drop(guard);
+        if let Some(completion) = completion {
+            completion.wait_result()?;
+        }
         result
     }
 
@@ -675,9 +704,26 @@ impl Db {
                     RefValue::new_with_expired_at(columns, expired_at),
                 )
             });
-        let result = self
-            .memtable_manager
-            .put_validated_batch(entries, num_columns);
+        let result = if let Some(wal_writer) = &self.wal_writer {
+            let mut guard = wal_writer.lock_for_schema(schema.version())?;
+            let mut last_completion = None;
+            let result = self.memtable_manager.put_validated_batch_with_callback(
+                entries,
+                num_columns,
+                |key, value| {
+                    let completion = guard.append_ref(schema.version(), key, value, num_columns);
+                    last_completion = Some(completion);
+                },
+            );
+            drop(guard);
+            if let Some(completion) = last_completion {
+                completion.wait_result()?;
+            }
+            result
+        } else {
+            self.memtable_manager
+                .put_validated_batch(entries, num_columns)
+        };
         let decision = self.memtable_manager.record_adaptive_write(count.get());
         self.apply_adaptive_decision(decision);
         result
@@ -800,6 +846,41 @@ impl Db {
                 }
             }
         }
+        if let Some(wal_writer) = &self.wal_writer {
+            let mut guard = wal_writer.lock_for_schema(schema.version())?;
+            let mut last_completion = None;
+            let result = (|| {
+                for ((bucket, column_family_id, raw_key), value) in &pending {
+                    let key = RefKey::new_with_column_family(
+                        *bucket,
+                        *column_family_id,
+                        raw_key.as_ref(),
+                    );
+                    let columns: Vec<Option<RefColumn<'_>>> = value
+                        .columns()
+                        .iter()
+                        .map(|column| {
+                            column
+                                .as_ref()
+                                .map(|column| RefColumn::new(column.value_type, column.data()))
+                        })
+                        .collect();
+                    let value_ref = RefValue::new_with_expired_at(columns, value.expired_at());
+                    self.memtable_manager.put(&key, &value_ref)?;
+                    let completion =
+                        guard.append_ref(schema.version(), &key, &value_ref, value.columns().len());
+                    last_completion = Some(completion);
+                }
+                Ok(())
+            })();
+            drop(guard);
+            if let Some(completion) = last_completion {
+                completion.wait_result()?;
+            }
+            let decision = self.memtable_manager.record_adaptive_write(batch_len);
+            self.apply_adaptive_decision(decision);
+            return result;
+        }
         for ((bucket, column_family_id, raw_key), value) in pending {
             let key = RefKey::new_with_column_family(bucket, column_family_id, raw_key.as_ref());
             let columns: Vec<Option<RefColumn<'_>>> = value
@@ -824,6 +905,9 @@ impl Db {
     }
 
     pub(crate) fn force_close(&self) {
+        if let Some(wal_writer) = &self.wal_writer {
+            wal_writer.force_close();
+        }
         if let Some(worker) = &self.primary_tiering_worker {
             worker.stop();
             worker.join();
@@ -859,6 +943,12 @@ impl Db {
         }
         self.db_lifecycle.wait_for_accesses_to_drain();
         if let Some(err) = self.lifecycle_error() {
+            self.force_close();
+            return Err(err);
+        }
+        if let Some(wal_writer) = &self.wal_writer
+            && let Err(err) = wal_writer.close()
+        {
             self.force_close();
             return Err(err);
         }
@@ -913,8 +1003,7 @@ impl Db {
     /// The manifest is materialized asynchronously after the flush completes.
     pub fn snapshot(&self) -> Result<u64> {
         let _access = self.begin_access()?;
-        self.memtable_manager
-            .create_snapshot(self.snapshot_manager.clone(), None)
+        self.create_snapshot_with_wal_checkpoint(None)
     }
 
     /// Change the memtable implementation used by future active memtables in this process.
@@ -972,8 +1061,40 @@ impl Db {
                 })
             }));
         });
-        self.memtable_manager
-            .create_snapshot(self.snapshot_manager.clone(), Some(wrapper))
+        self.create_snapshot_with_wal_checkpoint(Some(wrapper))
+    }
+
+    fn create_snapshot_with_wal_checkpoint(
+        &self,
+        callback: Option<SnapshotCallback>,
+    ) -> Result<u64> {
+        let Some(wal_writer) = &self.wal_writer else {
+            return self
+                .memtable_manager
+                .create_snapshot(self.snapshot_manager.clone(), callback);
+        };
+        let barrier = wal_writer.begin_snapshot_barrier()?;
+        let checkpoint_id = barrier.checkpoint_id();
+        let wal_writer = Arc::clone(wal_writer);
+        let user_callback = callback;
+        let callback: SnapshotCallback = Arc::new(move |result| {
+            if result.is_ok()
+                && let Err(err) = wal_writer.truncate_through(checkpoint_id)
+            {
+                warn!(
+                    "snapshot WAL checkpoint {} published but WAL truncation failed: {}",
+                    checkpoint_id, err
+                );
+            }
+            if let Some(callback) = &user_callback {
+                callback(result);
+            }
+        });
+        self.memtable_manager.create_snapshot_with_wal_checkpoint(
+            self.snapshot_manager.clone(),
+            Some(callback),
+            checkpoint_id,
+        )
     }
 
     fn create_snapshot_and_wait(&self, operation: &str) -> Result<u64> {
@@ -1105,10 +1226,21 @@ impl Db {
         db_governance: Option<Arc<dyn crate::governance::DbGovernance>>,
         bucket_ranges: Vec<RangeInclusive<u16>>,
         initial_vlog_file_seq: u32,
+        restored_wal_checkpoint_id: u64,
         hybrid_cache_plan: Option<crate::config::HybridCacheVolumePlan>,
         metrics_manager: Arc<MetricsManager>,
         schema_manager: Arc<SchemaManager>,
     ) -> Result<Self> {
+        if config.wal_enabled
+            && (config.snapshot_on_flush
+                || (config.compaction_mode == crate::config::CompactionMode::Dedicated
+                    && !config.runtime_manifests_enabled()))
+        {
+            return Err(Error::ConfigError(
+                "WAL requires manually triggered snapshots; automatic snapshots are not supported"
+                    .to_string(),
+            ));
+        }
         crate::properties::refresh_db_properties(file_manager.as_ref(), &id, &config)?;
         let time_provider = config.time_provider.create();
         let ttl_config = TtlConfig {
@@ -1312,12 +1444,41 @@ impl Db {
             let coordinator = Arc::clone(&adoption_coordinator);
             Arc::new(move || coordinator.tick())
         };
+        let wal_writer = if config.wal_enabled {
+            Some(WalWriter::open(
+                &config,
+                &id,
+                Arc::clone(&file_manager),
+                Arc::clone(&schema_manager),
+                Arc::clone(&db_lifecycle),
+                restored_wal_checkpoint_id,
+            )?)
+        } else {
+            None
+        };
         let primary_tiering_worker =
-            file_manager.start_primary_tiering_worker(&db_state, Some(adoption_tick))?;
+            match file_manager.start_primary_tiering_worker(&db_state, Some(adoption_tick)) {
+                Ok(worker) => worker,
+                Err(err) => {
+                    if let Some(wal_writer) = &wal_writer {
+                        wal_writer.force_close();
+                    }
+                    return Err(err);
+                }
+            };
 
         // Mark the DB as open before starting background observers so their
         // `ensure_open()` checks pass immediately.
-        db_lifecycle.mark_open()?;
+        if let Err(err) = db_lifecycle.mark_open() {
+            if let Some(wal_writer) = &wal_writer {
+                wal_writer.force_close();
+            }
+            if let Some(worker) = &primary_tiering_worker {
+                worker.stop();
+                worker.join();
+            }
+            return Err(err);
+        }
 
         if let Some(publisher) = &runtime_manifest_publisher {
             publisher.start();
@@ -1368,6 +1529,7 @@ impl Db {
             primary_tiering_worker,
             adoption_coordinator,
             runtime_manifest_publisher,
+            wal_writer,
         })
     }
 
@@ -1932,9 +2094,7 @@ impl Db {
             .schema_manager
             .latest_schema()
             .resolve_column_family_id(Some(column_family))?;
-        self.db_state
-            .advance_truncation_cursor(bucket, column_family_id, key);
-        Ok(())
+        self.advance_truncation_cursor_with_id(bucket, column_family_id, key)
     }
 
     pub fn advance_truncation_cursor_by_id(
@@ -1944,6 +2104,23 @@ impl Db {
         key: &[u8],
     ) -> Result<()> {
         let _access = self.begin_access()?;
+        self.advance_truncation_cursor_with_id(bucket, column_family_id, key)
+    }
+
+    fn advance_truncation_cursor_with_id(
+        &self,
+        bucket: u16,
+        column_family_id: u8,
+        key: &[u8],
+    ) -> Result<()> {
+        if let Some(wal_writer) = &self.wal_writer {
+            let mut guard = wal_writer.lock()?;
+            self.db_state
+                .advance_truncation_cursor(bucket, column_family_id, key);
+            let completion = guard.append_truncation(bucket, column_family_id, key);
+            drop(guard);
+            return completion.wait_result();
+        }
         self.db_state
             .advance_truncation_cursor(bucket, column_family_id, key);
         Ok(())

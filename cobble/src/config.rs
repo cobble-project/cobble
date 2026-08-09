@@ -18,6 +18,10 @@ use url::Url;
 
 const DEFAULT_READ_PROXY_RELOAD_TOLERANCE_SECONDS: u64 = 10;
 
+fn default_wal_flush_interval_ms() -> u64 {
+    5
+}
+
 fn deserialize_optional_sst_level<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -65,6 +69,7 @@ where
                 "snapshot" => add_kind(&mut mask, VolumeUsageKind::Snapshot),
                 "cache" => add_kind(&mut mask, VolumeUsageKind::Cache),
                 "readonly" => add_kind(&mut mask, VolumeUsageKind::Readonly),
+                "wal" => add_kind(&mut mask, VolumeUsageKind::Wal),
                 _ => {
                     return Err(serde::de::Error::custom(format!(
                         "Unknown volume usage kind: {}",
@@ -243,11 +248,11 @@ pub enum GovernanceMode {
 pub enum VolumeUsageKind {
     // Metadata storage (manifests, snapshots, etc).
     Meta = 0,
-    // Primary data storage with the highest priority (SST files, write-ahead log).
+    // Primary data storage with the highest priority (SST files).
     PrimaryDataPriorityHigh = 1,
-    // Primary data storage with medium priority (SST files, write-ahead log).
+    // Primary data storage with medium priority (SST files).
     PrimaryDataPriorityMedium = 2,
-    // Primary data storage with low priority (SST files, write-ahead log).
+    // Primary data storage with low priority (SST files).
     PrimaryDataPriorityLow = 3,
     // Snapshot materialization storage (snapshot manifests, schema, and uploaded snapshot data).
     Snapshot = 4,
@@ -255,6 +260,8 @@ pub enum VolumeUsageKind {
     Cache = 5,
     // Read-only source volume used only for loading historical snapshot data.
     Readonly = 6,
+    // Write-ahead log storage.
+    Wal = 7,
 }
 
 impl VolumeUsageKind {
@@ -876,6 +883,12 @@ pub struct Config {
     pub log_level: log::LevelFilter,
     /// Automatically take a snapshot on every successful flush.
     pub snapshot_on_flush: bool,
+    /// Enable durable write-ahead log segments. Disabled by default.
+    #[serde(default)]
+    pub wal_enabled: bool,
+    /// Maximum interval before the WAL group-commit buffer is frozen for publication.
+    #[serde(default = "default_wal_flush_interval_ms")]
+    pub wal_flush_interval_ms: u64,
     /// If active memtable usage ratio is below this value during snapshot, write an
     /// incremental active-memtable snapshot data file instead of flushing to SST.
     pub active_memtable_incremental_snapshot_ratio: f64,
@@ -968,6 +981,8 @@ impl Default for Config {
             log_console: false,
             log_level: log::LevelFilter::Info,
             snapshot_on_flush: false,
+            wal_enabled: false,
+            wal_flush_interval_ms: default_wal_flush_interval_ms(),
             active_memtable_incremental_snapshot_ratio: 0.0,
             lsm_split_trigger_level: None,
             primary_volume_write_stop_watermark: 0.95,
@@ -994,6 +1009,7 @@ pub(crate) struct HybridCacheVolumePlan {
 
 impl Config {
     pub(crate) fn normalize_volume_paths(&self) -> Result<Self> {
+        self.validate_wal()?;
         let mut copied = self.clone();
         for volume in &mut copied.volumes {
             volume.base_dir = normalize_storage_path_to_url(&volume.base_dir)?;
@@ -1401,7 +1417,31 @@ impl Config {
                     .to_string(),
             ));
         }
+        self.validate_wal()?;
         self.validate_dedicated_compaction()?;
+        Ok(())
+    }
+
+    /// Validates the explicit WAL-volume contract.
+    pub(crate) fn validate_wal(&self) -> Result<()> {
+        if !self.wal_enabled {
+            return Ok(());
+        }
+        let count = self
+            .volumes
+            .iter()
+            .filter(|volume| volume.supports(VolumeUsageKind::Wal))
+            .count();
+        if count != 1 {
+            return Err(Error::ConfigError(format!(
+                "wal_enabled requires exactly one volume with wal usage, found {count}"
+            )));
+        }
+        if self.wal_flush_interval_ms == 0 {
+            return Err(Error::ConfigError(
+                "wal_flush_interval_ms must be greater than 0 when WAL is enabled".to_string(),
+            ));
+        }
         Ok(())
     }
 

@@ -23,6 +23,75 @@ pub(crate) struct MemtableValueIter<'a> {
     next_idx: usize,
 }
 
+/// Appends one entry in the canonical Vec memtable stream format.
+///
+/// The WAL uses this same append-only representation so replayed entries follow the identical
+/// key/value encoding as active-memtable snapshot data.
+pub(crate) fn encode_vec_entry_stream_entry(output: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+    output.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    output.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    output.extend_from_slice(key);
+    output.extend_from_slice(value);
+}
+
+/// Appends a reference row without allocating intermediate encoded key/value buffers.
+pub(crate) fn encode_vec_entry_stream_ref(
+    output: &mut Vec<u8>,
+    key: &RefKey<'_>,
+    value: &RefValue<'_>,
+    num_columns: usize,
+) {
+    let key_len = key.encoded_len();
+    let value_len = value.encoded_len(num_columns);
+    let entry_start = output.len();
+    output.resize(entry_start + 8 + key_len + value_len, 0);
+    output[entry_start..entry_start + 4].copy_from_slice(&(key_len as u32).to_le_bytes());
+    output[entry_start + 4..entry_start + 8].copy_from_slice(&(value_len as u32).to_le_bytes());
+    let (_, encoded) = output.split_at_mut(entry_start + 8);
+    let (key_output, value_output) = encoded.split_at_mut(key_len);
+    let mut key_output = key_output;
+    let mut value_output = value_output;
+    encode_key_ref_into(key, &mut key_output);
+    encode_value_ref_into(value, num_columns, &mut value_output);
+}
+
+/// Decodes entries written by [`encode_vec_entry_stream_entry`].
+pub(crate) fn decode_vec_entry_stream(bytes: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let header_end = offset
+            .checked_add(8)
+            .ok_or_else(|| Error::IoError("vec entry header overflow".to_string()))?;
+        if header_end > bytes.len() {
+            return Err(Error::InvalidState(
+                "truncated vec memtable entry header".to_string(),
+            ));
+        }
+        let key_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let value_len =
+            u32::from_le_bytes(bytes[offset + 4..header_end].try_into().unwrap()) as usize;
+        let key_start = header_end;
+        let value_start = key_start
+            .checked_add(key_len)
+            .ok_or_else(|| Error::IoError("vec entry key length overflow".to_string()))?;
+        let entry_end = value_start
+            .checked_add(value_len)
+            .ok_or_else(|| Error::IoError("vec entry value length overflow".to_string()))?;
+        if entry_end > bytes.len() {
+            return Err(Error::InvalidState(
+                "truncated vec memtable entry body".to_string(),
+            ));
+        }
+        entries.push((
+            Bytes::copy_from_slice(&bytes[key_start..value_start]),
+            Bytes::copy_from_slice(&bytes[value_start..entry_end]),
+        ));
+        offset = entry_end;
+    }
+    Ok(entries)
+}
+
 impl VecMemtable {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {

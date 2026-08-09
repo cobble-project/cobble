@@ -1,6 +1,8 @@
 #![cfg(feature = "storage-s3")]
 
 use cobble::{Config, SingleDb, VolumeDescriptor, VolumeUsageKind};
+use opendal::Operator;
+use opendal::services;
 use size::Size;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -54,6 +56,149 @@ fn log_progress(
         (completed as f64 / total as f64) * 100.0,
         stage_start.elapsed().as_secs_f64(),
         total_start.elapsed().as_secs_f64()
+    );
+}
+
+fn list_wal_objects(
+    endpoint: &str,
+    bucket: &str,
+    access_id: &str,
+    secret_key: &str,
+    root_prefix: &str,
+    db_id: &str,
+) -> Vec<String> {
+    let builder = services::S3::default()
+        .bucket(bucket)
+        .root(root_prefix)
+        .endpoint(endpoint)
+        .region("us-east-1")
+        .access_key_id(access_id)
+        .secret_access_key(secret_key);
+    let operator = Operator::new(builder).unwrap().finish();
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(operator.list(&format!("{db_id}/wal/")))
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.name().starts_with("WAL-"))
+        .map(|entry| entry.path().to_string())
+        .collect()
+}
+
+fn wal_id(path: &str) -> u64 {
+    path.rsplit_once("WAL-").unwrap().1.parse().unwrap()
+}
+
+#[test]
+fn s3_wal_snapshot_checkpoint_and_truncate() {
+    if !has_required_env() {
+        eprintln!("skipping S3 WAL test: COBBLE_S3_* env vars are not fully set");
+        return;
+    }
+    let endpoint = must_env("COBBLE_S3_ENDPOINT");
+    let bucket = must_env("COBBLE_S3_BUCKET");
+    let access_id = must_env("COBBLE_S3_ACCESS_ID");
+    let secret_key = must_env("COBBLE_S3_SECRET_KEY");
+    let endpoint_url = Url::parse(&endpoint).unwrap();
+    let endpoint_host = endpoint_url.host_str().unwrap();
+    let endpoint_port = endpoint_url.port_or_known_default().unwrap();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let root_prefix = format!("cobble-s3-wal-{unique}");
+    let base_dir = format!(
+        "s3://{}:{}/{}/{}?endpoint_scheme={}&region=us-east-1&disable_config_load=true&disable_ec2_metadata=true&enable_virtual_host_style=false",
+        endpoint_host,
+        endpoint_port,
+        bucket,
+        root_prefix,
+        endpoint_url.scheme()
+    );
+    let mut data_volume = VolumeDescriptor::new(
+        base_dir.clone(),
+        vec![
+            VolumeUsageKind::Meta,
+            VolumeUsageKind::PrimaryDataPriorityHigh,
+            VolumeUsageKind::Snapshot,
+        ],
+    );
+    data_volume.access_id = Some(access_id.clone());
+    data_volume.secret_key = Some(secret_key.clone());
+    let mut wal_volume = VolumeDescriptor::new(base_dir, vec![VolumeUsageKind::Wal]);
+    wal_volume.access_id = Some(access_id.clone());
+    wal_volume.secret_key = Some(secret_key.clone());
+    let config = Config {
+        volumes: vec![data_volume, wal_volume],
+        wal_enabled: true,
+        wal_flush_interval_ms: 5,
+        num_columns: 1,
+        total_buckets: 1,
+        ..Config::default()
+    };
+    let db_id = format!("wal-shard-{unique}");
+    let db = cobble::DbBuilder::new(config.clone())
+        .bucket_ranges(vec![0..=0])
+        .db_id(&db_id)
+        .open()
+        .unwrap();
+    db.put(0, b"before-snapshot", 0, b"value").unwrap();
+    let before_snapshot = list_wal_objects(
+        &endpoint,
+        &bucket,
+        &access_id,
+        &secret_key,
+        &root_prefix,
+        &db_id,
+    );
+    assert_eq!(before_snapshot.len(), 1);
+    let checkpoint_floor = wal_id(&before_snapshot[0]);
+    let (tx, rx) = mpsc::channel();
+    db.snapshot_with_callback(move |result| tx.send(result).unwrap())
+        .unwrap();
+    rx.recv().unwrap().unwrap();
+    assert!(
+        list_wal_objects(
+            &endpoint,
+            &bucket,
+            &access_id,
+            &secret_key,
+            &root_prefix,
+            &db_id,
+        )
+        .is_empty()
+    );
+
+    db.put(0, b"after-snapshot", 0, b"value").unwrap();
+    db.close().unwrap();
+    let after_snapshot = list_wal_objects(
+        &endpoint,
+        &bucket,
+        &access_id,
+        &secret_key,
+        &root_prefix,
+        &db_id,
+    );
+    assert_eq!(after_snapshot.len(), 1);
+
+    let resumed = cobble::Db::resume(config, &db_id).unwrap();
+    assert!(resumed.get(0, b"before-snapshot").unwrap().is_some());
+    resumed.put(0, b"after-resume", 0, b"value").unwrap();
+    resumed.close().unwrap();
+    let after_resume = list_wal_objects(
+        &endpoint,
+        &bucket,
+        &access_id,
+        &secret_key,
+        &root_prefix,
+        &db_id,
+    );
+    assert_eq!(after_resume.len(), 2);
+    assert!(
+        after_resume
+            .iter()
+            .map(|path| wal_id(path))
+            .all(|id| id > checkpoint_floor)
     );
 }
 

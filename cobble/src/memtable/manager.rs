@@ -313,6 +313,7 @@ pub(crate) struct SnapshotCompletion {
     pub(crate) snapshot_id: u64,
     pub(crate) manager: SnapshotManager,
     pub(crate) truncation_cursors: Option<TruncationCursorSnapshot>,
+    pub(crate) wal_checkpoint_id: u64,
 }
 
 pub(crate) struct ActiveMemtable {
@@ -1518,6 +1519,7 @@ impl MemtableManager {
                 active_data,
                 db_state.as_ref(),
                 snapshot_job.truncation_cursors.as_ref(),
+                snapshot_job.wal_checkpoint_id,
             )
         {
             if let Err(err) = snapshot_job
@@ -1784,21 +1786,44 @@ impl MemtableManager {
     }
 
     /// Puts caller-validated rows while retaining the active lock between successful entries.
+    #[inline]
     pub(crate) fn put_validated_batch<'a, I>(&self, entries: I, num_columns: usize) -> Result<()>
     where
         I: IntoIterator<Item = (RefKey<'a>, RefValue<'a>)>,
     {
+        self.put_validated_batch_with_callback(entries, num_columns, |_, _| {})
+    }
+
+    /// Puts caller-validated rows and invokes `on_applied` only after each row is actually
+    /// installed in an active memtable. This is used by WAL to avoid recording failed rows.
+    pub(crate) fn put_validated_batch_with_callback<'a, I, F>(
+        &self,
+        entries: I,
+        num_columns: usize,
+        mut on_applied: F,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (RefKey<'a>, RefValue<'a>)>,
+        F: FnMut(&RefKey<'_>, &RefValue<'_>),
+    {
         let mut entries = entries.into_iter();
         loop {
-            if self.put_batch_into_active(&mut entries, num_columns)? {
+            if self.put_batch_into_active(&mut entries, num_columns, &mut on_applied)? {
                 return Ok(());
             }
         }
     }
 
-    fn put_batch_into_active<'a, I>(&self, entries: &mut I, num_columns: usize) -> Result<bool>
+    #[inline]
+    fn put_batch_into_active<'a, I, F>(
+        &self,
+        entries: &mut I,
+        num_columns: usize,
+        on_applied: &mut F,
+    ) -> Result<bool>
     where
         I: Iterator<Item = (RefKey<'a>, RefValue<'a>)>,
+        F: FnMut(&RefKey<'_>, &RefValue<'_>),
     {
         if self.db_state.load().active.is_none() {
             let mut state = self.state.lock().unwrap();
@@ -1839,8 +1864,10 @@ impl MemtableManager {
             if let Err(err) = put_result {
                 self.handle_memtable_put_error(&err, active, &key, &value)?;
                 self.put(&key, &value)?;
+                on_applied(&key, &value);
                 return Ok(false);
             }
+            on_applied(&key, &value);
         }
         Ok(true)
     }
@@ -2195,6 +2222,7 @@ impl MemtableManager {
                 snapshot_id: manager.create_snapshot(None).id,
                 manager: manager.clone(),
                 truncation_cursors: None,
+                wal_checkpoint_id: 0,
             });
         let auto_snapshot_id = auto_snapshot
             .as_ref()
@@ -2240,15 +2268,41 @@ impl MemtableManager {
         Ok(snapshot_id)
     }
 
+    pub(crate) fn create_snapshot_with_wal_checkpoint(
+        &self,
+        manager: SnapshotManager,
+        callback: Option<SnapshotCallback>,
+        wal_checkpoint_id: u64,
+    ) -> Result<u64> {
+        let _rotation_guard = self.rotation_lock.lock().unwrap();
+        let snapshot_id = manager.create_snapshot(callback).id;
+        self.flush_snapshot_with_checkpoint_under_rotation(
+            snapshot_id,
+            manager,
+            wal_checkpoint_id,
+        )?;
+        Ok(snapshot_id)
+    }
+
     fn flush_snapshot_under_rotation(
         &self,
         snapshot_id: u64,
         manager: SnapshotManager,
     ) -> Result<()> {
+        self.flush_snapshot_with_checkpoint_under_rotation(snapshot_id, manager, 0)
+    }
+
+    fn flush_snapshot_with_checkpoint_under_rotation(
+        &self,
+        snapshot_id: u64,
+        manager: SnapshotManager,
+        wal_checkpoint_id: u64,
+    ) -> Result<()> {
         let snapshot = SnapshotCompletion {
             snapshot_id,
             manager: manager.clone(),
             truncation_cursors: None,
+            wal_checkpoint_id,
         };
         match self.flush_active_internal(Some(snapshot), FlushCause::Snapshot) {
             Ok(_) => Ok(()),

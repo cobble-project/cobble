@@ -15,7 +15,10 @@ use crate::r#type::{KvValue, RefKey, RefValue};
 pub(crate) use hash::HashMemtable;
 pub(crate) use skiplist::SkiplistMemtable;
 use std::sync::Arc;
-pub(crate) use vec::VecMemtable;
+pub(crate) use vec::{
+    VecMemtable, decode_vec_entry_stream, encode_vec_entry_stream_entry,
+    encode_vec_entry_stream_ref,
+};
 
 pub(crate) use adaptive::{AdaptiveMemtableController, SwitchDecision};
 

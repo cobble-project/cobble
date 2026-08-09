@@ -14,6 +14,7 @@ fn properties_are_plain_toml_without_volume_credentials() {
         vec![
             VolumeUsageKind::Meta,
             VolumeUsageKind::PrimaryDataPriorityMedium,
+            VolumeUsageKind::Wal,
         ],
     );
     volume.access_id = Some("field-ak".to_string());
@@ -26,6 +27,7 @@ fn properties_are_plain_toml_without_volume_credentials() {
     let config = Config {
         volumes: vec![volume],
         l0_file_limit: 17,
+        wal_enabled: true,
         ..Config::default()
     };
     let storage_config = Config {
@@ -48,6 +50,8 @@ fn properties_are_plain_toml_without_volume_credentials() {
         Some(Size::from_mib(16))
     );
     assert!(decoded.config.volumes[0].supports(VolumeUsageKind::PrimaryDataPriorityMedium));
+    assert!(decoded.config.volumes[0].supports(VolumeUsageKind::Wal));
+    assert!(decoded.config.wal_enabled);
     assert_eq!(
         decoded.config.volumes[0]
             .custom_options

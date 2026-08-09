@@ -1150,7 +1150,8 @@ impl FileManager {
                     || volume.supports(VolumeUsageKind::PrimaryDataPriorityMedium)
                     || volume.supports(VolumeUsageKind::PrimaryDataPriorityLow)
                     || volume.supports(VolumeUsageKind::Snapshot)
-                    || volume.supports(VolumeUsageKind::Cache);
+                    || volume.supports(VolumeUsageKind::Cache)
+                    || volume.supports(VolumeUsageKind::Wal);
                 if has_other_kinds {
                     return Err(Error::ConfigError(format!(
                         "Volume {} uses readonly and other kinds; readonly must be exclusive",
