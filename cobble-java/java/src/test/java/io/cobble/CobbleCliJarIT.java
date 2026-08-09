@@ -88,7 +88,7 @@ class CobbleCliJarIT {
         Path pom = moduleDir.resolve("pom.xml");
         assertTrue(Files.isRegularFile(pom), "pom.xml not found at " + pom);
         String content = new String(Files.readAllBytes(pom), StandardCharsets.UTF_8);
-        // The pom sets <version>0.2.0-SNAPSHOT</version> as the second child of <project>.
+        // The project version is the first <version> element in this pom.
         int start = content.indexOf("<version>");
         int end = content.indexOf("</version>");
         if (start < 0 || end < 0 || end <= start) {
