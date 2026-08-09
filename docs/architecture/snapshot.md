@@ -36,6 +36,9 @@ For [single-machine use](../getting-started/single-db) via `SingleDb`, this two-
 
 Restore is the process of opening a database from a previously taken snapshot. The key requirement is that **all files referenced by the snapshot must still be accessible** from the configured [volumes](multi-volume). This includes data files, VLOG files, manifests, and schema files.
 
+When the optional [write-ahead log](wal) is enabled, recovery can either restore the snapshot
+exactly or replay the durable WAL tail after the latest snapshot.
+
 For distributed deployments, the restore order matters: restore the coordinator first to load the global manifest, then restore each shard using its referenced shard snapshot.
 
 ## Snapshot Retention

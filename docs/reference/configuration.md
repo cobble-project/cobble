@@ -172,6 +172,15 @@ point and the durability proof for an applied dedicated-compaction result.
 | `snapshot_disable_incremental_base_link` | `bool` | `false` | Disable incremental manifest base linking |
 | `active_memtable_incremental_snapshot_ratio` | `f64` | 0.0 | Ratio for incremental memtable snapshots (0 = disabled) |
 
+### Write-Ahead Log
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `wal_enabled` | `bool` | `false` | Enable the write-ahead log; requires exactly one volume with the `Wal` usage kind |
+| `wal_flush_interval_ms` | `u64` | `5` | Maximum interval before a WAL group is published |
+
+See [Write-Ahead Log](../architecture/wal) for recovery modes and WAL volume behavior.
+
 ### Governance
 
 | Parameter | Type | Default | Description |

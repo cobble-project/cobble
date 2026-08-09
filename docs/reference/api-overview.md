@@ -92,6 +92,7 @@ fails.
 ```rust
 SingleDb::open(config) -> Result<SingleDb>
 SingleDb::resume(config, global_snapshot_id) -> Result<SingleDb>
+SingleDb::resume_with_recovery_mode(config, global_snapshot_id, recovery_mode) -> Result<SingleDb>
 db.put(bucket, key, column, value) -> Result<()>
 db.put_with_options(bucket, key, column, value, &WriteOptions::with_column_family("metrics")) -> Result<()>
 db.merge(bucket, key, column, value) -> Result<()>
@@ -109,6 +110,8 @@ db.load_readonly_files_to_primary() -> Result<usize>
 ```rust
 Db::open(config, bucket_ranges) -> Result<Db>
 Db::open_from_snapshot(config, snapshot_id, db_id) -> Result<Db>
+Db::open_from_snapshot_with_recovery_mode(config, snapshot_id, db_id, recovery_mode) -> Result<Db>
+Db::resume_with_recovery_mode(config, db_id, recovery_mode) -> Result<Db>
 Db::open_new_with_snapshot(config, snapshot_id, source_db_id) -> Result<Db>
 Db::open_new_with_manifest_path(config, manifest_path) -> Result<Db>
 ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id) -> Result<ReadOnlyDb>
@@ -140,6 +143,9 @@ db.load_readonly_files_to_primary() -> Result<usize>
 restores from the source snapshot but assigns a fresh db id and starts a new snapshot chain.
 `open_new_with_manifest_path` does the same thing when your checkpoint metadata already stores the
 exact source manifest path.
+
+Use `RecoveryMode::SnapshotOnly` for an exact snapshot restore or `RecoveryMode::LatestWithWal` to
+replay the latest snapshot's durable WAL tail. See [Write-Ahead Log](../architecture/wal).
 
 Snapshot lifecycle notes:
 
@@ -218,8 +224,8 @@ exclusive-end semantics as raw `Db`.
 ## cobble-java
 
 The Java API mirrors the Rust API. See [Java Bindings](../ffi-bindings/java) for usage details.
-On the Java side, restore flows are exposed as `Db.restore(..., boolean newDbId)` and
-`Db.restoreWithManifest(...)`.
+On the Java side, raw and structured `Db` plus `SingleDb` accept `RecoveryMode` overloads. Restore
+flows also expose `Db.restore(..., boolean newDbId)` and `Db.restoreWithManifest(...)`.
 Raw and structured `Db` / `SingleDb` classes also expose `loadReadonlyFilesToPrimary()`. See
 [Loading Files from Readonly Volumes](../architecture/multi-volume#loading-files-from-readonly-volumes).
 Raw and structured `Db` expose `ExpandStorageMode` and `waitForExpandAdoption(...)`; see

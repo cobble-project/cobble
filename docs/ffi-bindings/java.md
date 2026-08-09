@@ -53,6 +53,7 @@ For multi-shard deployments. See [Distributed Deployment](../getting-started/dis
 import io.cobble.Db;
 import io.cobble.Config;
 import io.cobble.PendingSnapshot;
+import io.cobble.RecoveryMode;
 import io.cobble.ShardSnapshot;
 
 Db db = Db.open("config.yaml");
@@ -69,7 +70,14 @@ Db restoredFresh = Db.restore("config.yaml", input.snapshotId, db.id(), true);
 
 // Restore from an explicit manifest path (always creates a fresh db identity)
 Db restoredFromManifest = Db.restoreWithManifest("config.yaml", input.manifestPath);
+
+// Restore the latest snapshot and replay its durable WAL tail
+Db recovered = Db.restore(
+        "config.yaml", input.snapshotId, db.id(), RecoveryMode.LATEST_WITH_WAL);
 ```
+
+The same `RecoveryMode` overloads are available on raw and structured `Db` and on `SingleDb`. See
+[Write-Ahead Log](../architecture/wal) for the two recovery modes.
 
 Load referenced files from `Readonly` volumes into primary storage with:
 

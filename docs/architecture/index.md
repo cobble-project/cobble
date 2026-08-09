@@ -32,6 +32,7 @@ Cobble is built around a few core ideas:
 | [Key-Value Separation](key-value-separation) | VLOG — when and why to store values separately |
 | [Read & Write Paths](read-write-path) | How data flows from writes to reads |
 | [Snapshot System](snapshot) | Point-in-time consistency for restore, reads, and scans |
+| [Write-Ahead Log](wal) | Optional recovery of durable writes newer than a snapshot |
 | [File Management](file-management) | File lifecycle, volume selection, and storage backends |
 | [Block Cache](block-cache) | Multi-tier caching for read performance |
 | [Schema Evolution](schema-evolution) | Adding and removing columns without rewriting data |

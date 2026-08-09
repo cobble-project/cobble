@@ -19,6 +19,7 @@ Each volume is tagged with one or more usage kinds that control what data lives 
 | **PrimaryData (Low)** | Cold data files — final offload tier | Network-attached or HDD |
 | **Meta** | Snapshot manifests, schema files, global pointers | Any reliable storage |
 | **Snapshot** | Materialized snapshot copies for sharing or backup | Cloud object store or shared FS |
+| **Wal** | Optional write-ahead log used for crash recovery | Reliable local or shared storage |
 | **Cache** | Disk tier for the [hybrid block cache](block-cache) | Fast local SSD |
 | **Readonly** | Existing data files that can be read in place or explicitly loaded into primary storage | Shared or historical storage |
 
