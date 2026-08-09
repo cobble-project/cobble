@@ -2,7 +2,6 @@ use crate::error::{Error, Result};
 use crate::file::files::{File, ReadAllFile, SequentialWriteFile};
 use bytes::Bytes;
 use crc32fast::Hasher;
-use std::path::Path;
 
 const METADATA_CHECKSUM_MAGIC: &[u8; 4] = b"mcs1";
 const METADATA_CHECKSUM_TRAILER_SIZE: usize = 8;
@@ -51,27 +50,13 @@ fn strip_and_verify(bytes: &[u8]) -> Result<&[u8]> {
     Ok(&bytes[..payload_len])
 }
 
-#[doc(hidden)]
-pub fn encode_metadata_payload_for_test(payload: &[u8]) -> Vec<u8> {
-    let checksum = compute_checksum(payload);
-    let trailer = trailer_for_checksum(checksum);
-    let mut encoded = payload.to_vec();
-    encoded.extend_from_slice(&trailer);
-    encoded
-}
+#[path = "../../tests/support/file/metadata_io.rs"]
+mod test_support;
 
 #[doc(hidden)]
-pub fn read_metadata_payload_from_path_for_test(path: impl AsRef<Path>) -> Result<Vec<u8>> {
-    let path = path.as_ref();
-    let bytes = std::fs::read(path).map_err(|err| {
-        Error::IoError(format!(
-            "Failed to read metadata file '{}': {}",
-            path.display(),
-            err
-        ))
-    })?;
-    Ok(strip_and_verify(&bytes)?.to_vec())
-}
+pub use test_support::{
+    encode_metadata_payload_for_test, read_metadata_payload_from_path_for_test,
+};
 
 pub(crate) struct MetadataReader<R: ReadAllFile> {
     inner: R,
@@ -143,29 +128,5 @@ impl<W: SequentialWriteFile> File for MetadataWriter<W> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_strip_and_verify_round_trip() {
-        let payload = br#"{"hello":"world"}"#;
-        let checksum = compute_checksum(payload);
-        let trailer = trailer_for_checksum(checksum);
-        let mut encoded = payload.to_vec();
-        encoded.extend_from_slice(&trailer);
-        let decoded = strip_and_verify(&encoded).unwrap();
-        assert_eq!(decoded, payload);
-    }
-
-    #[test]
-    fn test_strip_and_verify_rejects_checksum_mismatch() {
-        let payload = br#"{"hello":"world"}"#;
-        let checksum = compute_checksum(payload);
-        let trailer = trailer_for_checksum(checksum);
-        let mut encoded = payload.to_vec();
-        encoded.extend_from_slice(&trailer);
-        encoded[1] ^= 0xff;
-        let err = strip_and_verify(&encoded).unwrap_err();
-        assert!(matches!(err, Error::ChecksumMismatch(_)));
-    }
-}
+#[path = "../../tests/unit/file/metadata_io.rs"]
+mod tests;

@@ -95,21 +95,6 @@ impl ParquetIterator {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_with_columns(
-        file: Box<dyn RandomAccessFile>,
-        column_indices: Option<&[usize]>,
-    ) -> Result<Self> {
-        Self::new_with_ranges(
-            file,
-            None,
-            None,
-            None,
-            ParquetIteratorOptions::default(),
-            column_indices,
-        )
-    }
-
     pub(crate) fn from_data_file(
         file: Box<dyn RandomAccessFile>,
         data_file: &DataFile,
@@ -794,3 +779,7 @@ impl<'a> KvIterator<'a> for ParquetIterator {
         self.boundary_state == BoundaryState::Stopped
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/parquet/iterator.rs"]
+mod tests;

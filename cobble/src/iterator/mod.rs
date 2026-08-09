@@ -8,6 +8,8 @@ mod column_masking;
 mod deduplicating;
 mod factory;
 mod merging;
+#[cfg(test)]
+#[path = "../../tests/unit/iterator/mock_iterator.rs"]
 pub(crate) mod mock_iterator;
 mod schema_evolving;
 mod sorted_run;
