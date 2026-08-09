@@ -126,6 +126,11 @@ public final class Config {
     /** Separation threshold in bytes for value-log offload. */
     public Integer valueSeparationThreshold;
 
+    /**
+     * Whether value-log files newly created or copied into primary use the lowest-priority tier.
+     */
+    public Boolean vlogLowPriorityPrimaryEnabled;
+
     /** Time provider implementation used by TTL. */
     public TimeProviderKind timeProvider;
 

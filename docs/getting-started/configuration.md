@@ -154,6 +154,7 @@ files.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `value_separation_threshold` | `None` | Byte threshold to separate values into VLOG (`None` disables separation) |
+| `vlog_low_priority_primary_enabled` | `false` | Place VLOG files newly created or copied into primary on the lowest-priority tier. Existing primary replicas are not rebalanced or promoted by low-to-high primary backfill. |
 
 ### TTL
 

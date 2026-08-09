@@ -6,8 +6,8 @@ use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
 use crate::file::logical_file::ReplicaOrigin;
 use crate::file::{
-    FileManager, PrimaryOffloadFileRef, RestoreCopyResourceRegistry, VLOG_FILE_PRIORITY,
-    compare_primary_offload_file_refs, lsm_file_priority_for_level,
+    FileManager, PrimaryDataPlacement, PrimaryOffloadFileRef, RestoreCopyResourceRegistry,
+    VLOG_FILE_PRIORITY, compare_primary_offload_file_refs, lsm_file_priority_for_level,
 };
 use crate::lsm::LSMTreeVersion;
 use crate::merge_operator::MergeOperatorResolver;
@@ -147,6 +147,7 @@ async fn run_restore_prepare_jobs(
                     file.file_id,
                     &file.path,
                     file.origin,
+                    file.placement,
                     Some(file.size_bytes),
                     Some(Arc::clone(&registry)),
                 )?;
@@ -167,6 +168,7 @@ struct RestoreFileRef {
     origin: ReplicaOrigin,
     size_bytes: u64,
     priority: u8,
+    placement: PrimaryDataPlacement,
 }
 
 fn ordered_manifest_data_file_refs_for_restore(
@@ -185,6 +187,7 @@ fn ordered_manifest_data_file_refs_for_restore(
                     origin: restore_source_origin(&file.origin, retained_owned_source_id),
                     size_bytes: file.size as u64,
                     priority: level_priority,
+                    placement: PrimaryDataPlacement::Standard,
                 });
                 if file.size as u64 > entry.size_bytes {
                     entry.size_bytes = file.size as u64;
@@ -202,8 +205,10 @@ fn ordered_manifest_data_file_refs_for_restore(
             origin: restore_source_origin(&file.origin, retained_owned_source_id),
             size_bytes: 0,
             priority: VLOG_FILE_PRIORITY,
+            placement: PrimaryDataPlacement::Vlog,
         });
         entry.priority = entry.priority.min(VLOG_FILE_PRIORITY);
+        entry.placement = PrimaryDataPlacement::Vlog;
     }
     let mut ordered: Vec<RestoreFileRef> = refs.into_values().collect();
     ordered.sort_by(|left, right| {
@@ -617,6 +622,7 @@ mod tests {
                 origin: ReplicaOrigin::Owned,
                 size_bytes: 100,
                 priority: 10,
+                placement: PrimaryDataPlacement::Standard,
             },
             RestoreFileRef {
                 file_id: 1,
@@ -624,6 +630,7 @@ mod tests {
                 origin: ReplicaOrigin::Owned,
                 size_bytes: 200,
                 priority: 2,
+                placement: PrimaryDataPlacement::Standard,
             },
             RestoreFileRef {
                 file_id: 2,
@@ -631,6 +638,7 @@ mod tests {
                 origin: ReplicaOrigin::Owned,
                 size_bytes: 50,
                 priority: 2,
+                placement: PrimaryDataPlacement::Standard,
             },
         ];
         refs.sort_by(|left, right| {
@@ -666,6 +674,7 @@ mod tests {
                 origin: ReplicaOrigin::Owned,
                 size_bytes: 100,
                 priority: 10,
+                placement: PrimaryDataPlacement::Standard,
             },
             RestoreFileRef {
                 file_id: 1,
@@ -673,6 +682,7 @@ mod tests {
                 origin: ReplicaOrigin::Owned,
                 size_bytes: 200,
                 priority: 2,
+                placement: PrimaryDataPlacement::Standard,
             },
             RestoreFileRef {
                 file_id: 2,
@@ -680,6 +690,7 @@ mod tests {
                 origin: ReplicaOrigin::Owned,
                 size_bytes: 200,
                 priority: 8,
+                placement: PrimaryDataPlacement::Standard,
             },
         ];
         refs.sort_by(|left, right| {

@@ -4,10 +4,11 @@ use crate::config::PrimaryVolumeOffloadPolicyKind;
 use crate::data_file::{DataFile, DataFileType};
 use crate::db_state::DbStateHandle;
 use crate::file::logical_file::{ReplicaLifecycle, ReplicaOrigin};
-use crate::file::{DataVolume, FileManager, TrackedFile, TrackedWriter};
+use crate::file::{DataVolume, FileManager, PrimaryDataPlacement, TrackedFile, TrackedWriter};
 use crate::sst::PinnedSstReadMetadata;
 use dashmap::{DashMap, Entry};
 use log::warn;
+use rand::random;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -765,6 +766,7 @@ impl FileManager {
             return Ok(0);
         }
         let referenced_priorities = referenced_primary_file_priorities(db_state);
+        let vlog_file_ids = referenced_vlog_file_ids(db_state);
         let mut stale = Vec::new();
         let mut candidates = Vec::new();
         for entry in &self.offload_runtime.pending_readonly_loads {
@@ -791,7 +793,12 @@ impl FileManager {
             if size_bytes == 0 {
                 continue;
             }
-            candidates.push((file_id, request, size_bytes));
+            let placement = if vlog_file_ids.contains(&file_id) {
+                PrimaryDataPlacement::Vlog
+            } else {
+                PrimaryDataPlacement::Standard
+            };
+            candidates.push((file_id, request, size_bytes, placement));
         }
         for file_id in stale {
             self.offload_runtime.complete_readonly_load(file_id);
@@ -805,11 +812,13 @@ impl FileManager {
         });
 
         let mut scheduled = 0usize;
-        for (file_id, request, size_bytes) in candidates {
+        for (file_id, request, size_bytes, placement) in candidates {
             if !self.offload_runtime.has_available_worker_slot() {
                 break;
             }
-            let Some(target_volume) = self.select_readonly_load_target(file_id, size_bytes) else {
+            let Some(target_volume) =
+                self.select_readonly_load_target(file_id, size_bytes, placement)
+            else {
                 continue;
             };
             if self.schedule_readonly_load_move(file_id, &target_volume, db_state, request)? {
@@ -823,37 +832,64 @@ impl FileManager {
         &self,
         file_id: FileId,
         size_bytes: u64,
+        placement: PrimaryDataPlacement,
     ) -> Option<Arc<DataVolume>> {
-        self.data_volumes
-            .iter()
-            .filter(|volume| volume.supports_primary_data && !volume.readonly_source)
-            .filter(|volume| {
-                let reserved_incoming_bytes =
-                    if self.has_ready_replica_on_primary_volume(file_id, volume) {
-                        0
-                    } else {
-                        size_bytes
-                    };
-                let max_target_used_bytes = self.max_readonly_load_target_used_bytes(volume);
-                self.offload_runtime
-                    .projected_target_physical_bytes(volume)
-                    .saturating_add(reserved_incoming_bytes)
-                    <= max_target_used_bytes
-            })
-            .max_by_key(|volume| volume.priority.rank())
-            .map(Arc::clone)
+        self.select_primary_tiering_target(placement, |volume| {
+            let reserved_incoming_bytes =
+                if self.has_ready_replica_on_primary_volume(file_id, volume) {
+                    0
+                } else {
+                    size_bytes
+                };
+            let max_target_used_bytes = self.max_readonly_load_target_used_bytes(volume);
+            self.offload_runtime
+                .projected_target_physical_bytes(volume)
+                .saturating_add(reserved_incoming_bytes)
+                <= max_target_used_bytes
+        })
     }
 
-    fn select_adoption_target(&self, size_bytes: u64) -> Option<Arc<DataVolume>> {
-        self.data_volumes
+    fn select_adoption_target(
+        &self,
+        size_bytes: u64,
+        placement: PrimaryDataPlacement,
+    ) -> Option<Arc<DataVolume>> {
+        self.select_primary_tiering_target(placement, |volume| {
+            self.offload_runtime
+                .projected_target_physical_bytes(volume)
+                .saturating_add(size_bytes)
+                <= self.max_readonly_load_target_used_bytes(volume)
+        })
+    }
+
+    /// Chooses a background copy target under the same policy as synchronous primary placement.
+    ///
+    /// Standard files retain the historical highest-priority eligible target. When direct VLOG
+    /// placement is enabled, VLOG copies are limited to the lowest writable primary tier; no
+    /// higher tier is considered if that tier cannot currently accept the file.
+    fn select_primary_tiering_target(
+        &self,
+        placement: PrimaryDataPlacement,
+        is_eligible: impl Fn(&Arc<DataVolume>) -> bool,
+    ) -> Option<Arc<DataVolume>> {
+        let writable_primary = self
+            .data_volumes
             .iter()
-            .filter(|volume| volume.supports_primary_data && !volume.readonly_source)
-            .filter(|volume| {
-                self.offload_runtime
-                    .projected_target_physical_bytes(volume)
-                    .saturating_add(size_bytes)
-                    <= self.max_readonly_load_target_used_bytes(volume)
-            })
+            .filter(|volume| volume.supports_primary_data && !volume.readonly_source);
+        if self.uses_lowest_primary_tier(placement) {
+            let lowest_rank = self.lowest_writable_primary_rank()?;
+            let candidates = writable_primary
+                .filter(|volume| volume.priority.rank() == lowest_rank && is_eligible(volume))
+                .collect::<Vec<_>>();
+            return match candidates.len() {
+                0 => None,
+                1 => Some(Arc::clone(candidates[0])),
+                _ => Some(Arc::clone(candidates[random::<usize>() % candidates.len()])),
+            };
+        }
+
+        writable_primary
+            .filter(|volume| is_eligible(volume))
             .max_by_key(|volume| volume.priority.rank())
             .map(Arc::clone)
     }
@@ -933,7 +969,15 @@ impl FileManager {
                 // lower tiers, so it does not need a usage-ratio trigger or refill target.
                 (u64::MAX, u64::MAX)
             };
-            let mut attempted = HashSet::new();
+            // Direct-low VLOG placement is durable policy: do not immediately undo it by
+            // promoting the same VLOG files during primary-tier backfill. Derive the protected
+            // ids from the live state rather than from file priority, because priority only
+            // influences ordering and is not a file-type contract.
+            let mut attempted = if self.options.vlog_low_priority_primary_enabled {
+                referenced_vlog_file_ids(db_state)
+            } else {
+                HashSet::new()
+            };
             while projected_used < refill_target_bytes
                 && self.offload_runtime.has_available_worker_slot()
             {
@@ -1527,6 +1571,7 @@ impl FileManager {
         db_state: &DbStateHandle,
     ) -> crate::Result<usize> {
         let priorities = referenced_primary_file_priorities(db_state);
+        let vlog_file_ids = referenced_vlog_file_ids(db_state);
         let mut candidates = priorities
             .into_iter()
             .filter(|(file_id, _)| {
@@ -1544,7 +1589,12 @@ impl FileManager {
                 .preferred_tracked_file(file_id)
                 .map(|file| file.size_bytes())
                 .unwrap_or(0);
-            let Some(target) = self.select_adoption_target(size) else {
+            let placement = if vlog_file_ids.contains(&file_id) {
+                PrimaryDataPlacement::Vlog
+            } else {
+                PrimaryDataPlacement::Standard
+            };
+            let Some(target) = self.select_adoption_target(size, placement) else {
                 continue;
             };
             if self.schedule_adopt_external_leased_file(file_id, target)? {
@@ -1815,6 +1865,7 @@ impl FileManager {
         self: &Arc<Self>,
         db_state: &DbStateHandle,
     ) -> crate::Result<usize> {
+        let vlog_file_ids = referenced_vlog_file_ids(db_state);
         let mut candidates = referenced_primary_file_priorities(db_state)
             .into_iter()
             .filter(|(file_id, _)| {
@@ -1845,7 +1896,13 @@ impl FileManager {
             let Some(source_volume) = source.volume.as_ref().map(Arc::clone) else {
                 continue;
             };
-            let Some(target_volume) = self.select_adoption_target(source.size_bytes()) else {
+            let placement = if vlog_file_ids.contains(&file_id) {
+                PrimaryDataPlacement::Vlog
+            } else {
+                PrimaryDataPlacement::Standard
+            };
+            let Some(target_volume) = self.select_adoption_target(source.size_bytes(), placement)
+            else {
                 continue;
             };
             let manager = Arc::downgrade(self);
@@ -2123,6 +2180,16 @@ fn referenced_primary_file_priorities(db_state: &DbStateHandle) -> HashMap<FileI
     priorities
 }
 
+fn referenced_vlog_file_ids(db_state: &DbStateHandle) -> HashSet<FileId> {
+    db_state
+        .load()
+        .vlog_version
+        .files_with_entries()
+        .into_iter()
+        .map(|(_, tracked_id, _)| tracked_id.file_id())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2248,6 +2315,44 @@ mod tests {
         assert_eq!(effective_backfill_trigger_watermark(0.70, 0.85), 0.70);
         assert_eq!(effective_backfill_trigger_watermark(0.90, 0.95), 0.80);
         assert!((effective_backfill_trigger_watermark(0.70, 0.60) - 0.59).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn background_primary_targets_keep_vlogs_on_lowest_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            volumes: vec![
+                crate::VolumeDescriptor::new(
+                    format!("file://{}/high", dir.path().display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+                ),
+                crate::VolumeDescriptor::new(
+                    format!("file://{}/low", dir.path().display()),
+                    vec![VolumeUsageKind::PrimaryDataPriorityLow],
+                ),
+            ],
+            vlog_low_priority_primary_enabled: true,
+            ..Config::default()
+        };
+        let fm = FileManager::from_config(
+            &config,
+            "db",
+            Arc::new(MetricsManager::new("background-vlog-placement")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fm.select_adoption_target(1, PrimaryDataPlacement::Vlog)
+                .map(|volume| volume.priority.rank()),
+            Some(1),
+            "leased adoption and persistent-cache copies share this target selector"
+        );
+        assert_eq!(
+            fm.select_adoption_target(1, PrimaryDataPlacement::Standard)
+                .map(|volume| volume.priority.rank()),
+            Some(3),
+            "ordinary SST copies retain the highest-priority target"
+        );
     }
 
     #[test]
@@ -3048,7 +3153,7 @@ mod tests {
     }
 
     #[test]
-    fn test_readonly_load_prefers_high_priority_target_when_low_precedes_high() {
+    fn test_readonly_load_keeps_vlog_on_lowest_primary_tier() {
         let dir = tempfile::tempdir().unwrap();
         let high_root = dir.path().join("high");
         let low_root = dir.path().join("low");
@@ -3074,6 +3179,7 @@ mod tests {
             volumes: vec![low, high, readonly],
             file_transfer_concurrency: 1,
             base_file_size: Size::from_const(64),
+            vlog_low_priority_primary_enabled: true,
             ..Config::default()
         };
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-readonly-load"));
@@ -3210,8 +3316,8 @@ mod tests {
             fm.preferred_tracked_file(104).and_then(|tracked| {
                 tracked.volume.as_ref().map(|volume| volume.priority.rank())
             }),
-            Some(3),
-            "the VLog file should load only after all marked LSM files"
+            Some(1),
+            "the VLog file should load to the low tier after all marked LSM files"
         );
         assert!(
             fm.preferred_tracked_file(103).is_some_and(|tracked| {
@@ -3685,6 +3791,7 @@ mod tests {
         let config = Config {
             volumes: vec![high, low],
             base_file_size: Size::from_const(64),
+            vlog_low_priority_primary_enabled: true,
             ..Config::default()
         };
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-backfill-worker"));
@@ -3780,8 +3887,8 @@ mod tests {
             fm.preferred_tracked_file(vlog_file_id).and_then(|tracked| {
                 tracked.volume.as_ref().map(|volume| volume.priority.rank())
             }),
-            Some(3),
-            "a referenced VLOG file should be eligible after LSM files"
+            Some(1),
+            "direct-low VLOG files must not be backfilled to the high-priority tier"
         );
         assert_eq!(
             fm.preferred_tracked_file(unreferenced_file_id)

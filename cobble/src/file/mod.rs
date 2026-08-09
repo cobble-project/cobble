@@ -11,6 +11,7 @@ mod posix_fs;
 
 pub(crate) use self::file_manager::DataVolume;
 pub(crate) use self::file_manager::FileManagerMetrics;
+pub(crate) use self::file_manager::PrimaryDataPlacement;
 pub(crate) use self::file_manager::RestoreCopyResourceRegistry;
 pub(crate) use self::file_manager::SnapshotCopyResourceRegistry;
 pub(crate) use self::file_manager::VLOG_FILE_PRIORITY;

@@ -152,6 +152,7 @@ point and the durability proof for an applied dedicated-compaction result.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `value_separation_threshold` | `Option<Size>` | `None` | Byte threshold for VLOG separation (`None` = disabled) |
+| `vlog_low_priority_primary_enabled` | `bool` | `false` | Place VLOG files newly created or copied into primary on the lowest-priority tier. Existing primary replicas are not rebalanced. These VLOG files are not promoted by low-to-high primary backfill; fail if that tier cannot accept writes. |
 
 ### TTL
 

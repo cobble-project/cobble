@@ -315,6 +315,18 @@ pub struct FileManagerOptions {
     pub file_transfer_concurrency: usize,
     /// Offload policy for selecting candidate files.
     pub primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind,
+    /// Whether VLog files newly created or copied into primary use the lowest-priority tier.
+    pub vlog_low_priority_primary_enabled: bool,
+}
+
+/// Placement policy for a file that is becoming locally primary.
+///
+/// Ordinary SSTs retain the normal highest-priority-first behavior. VLog files newly created or
+/// copied into primary may opt into the lowest primary tier through [`FileManagerOptions`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrimaryDataPlacement {
+    Standard,
+    Vlog,
 }
 
 impl Default for FileManagerOptions {
@@ -328,6 +340,7 @@ impl Default for FileManagerOptions {
             primary_volume_backfill_trigger_watermark: 0.40,
             file_transfer_concurrency: 4,
             primary_volume_offload_policy: PrimaryVolumeOffloadPolicyKind::Priority,
+            vlog_low_priority_primary_enabled: false,
         }
     }
 }
@@ -878,6 +891,74 @@ impl FileManager {
         selected.ok_or_else(|| Error::IoError("All primary data volumes are full".to_string()))
     }
 
+    /// Selects only the configured lowest-priority primary tier for a new value-log file.
+    ///
+    /// The priority tier is determined before capacity filtering. This deliberately does not
+    /// fall back to a higher-priority volume when every volume in the lowest tier is full or
+    /// write-stopped: callers that opt into direct VLOG placement expect the file to stay there.
+    fn select_lowest_priority_data_volume(
+        &self,
+        expected_write_bytes: Option<u64>,
+    ) -> Result<&Arc<DataVolume>> {
+        let base_file_size = self.options.base_file_size as u64;
+        let expected_write_bytes = expected_write_bytes.unwrap_or(base_file_size);
+        let Some(lowest_rank) = self
+            .data_volumes
+            .iter()
+            .filter(|volume| volume.supports_primary_data && !volume.readonly_source)
+            .map(|volume| volume.priority.rank())
+            .min()
+        else {
+            return Err(Error::IoError(
+                "No primary data volume is configured for value-log files".to_string(),
+            ));
+        };
+
+        let candidates: Vec<&Arc<DataVolume>> = self
+            .data_volumes
+            .iter()
+            .filter(|volume| {
+                volume.supports_primary_data
+                    && !volume.readonly_source
+                    && volume.priority.rank() == lowest_rank
+                    && !self.is_volume_write_stopped(volume, expected_write_bytes)
+                    && !volume.is_full(base_file_size.max(expected_write_bytes))
+            })
+            .collect();
+        match candidates.len() {
+            0 => Err(Error::IoError(
+                "All lowest-priority primary data volumes are full or write-stopped for value-log files"
+                    .to_string(),
+            )),
+            1 => Ok(candidates[0]),
+            _ => Ok(candidates[random::<usize>() % candidates.len()]),
+        }
+    }
+
+    pub(crate) fn uses_lowest_primary_tier(&self, placement: PrimaryDataPlacement) -> bool {
+        placement == PrimaryDataPlacement::Vlog && self.options.vlog_low_priority_primary_enabled
+    }
+
+    pub(crate) fn lowest_writable_primary_rank(&self) -> Option<u8> {
+        self.data_volumes
+            .iter()
+            .filter(|volume| volume.supports_primary_data && !volume.readonly_source)
+            .map(|volume| volume.priority.rank())
+            .min()
+    }
+
+    fn select_primary_data_volume_for_placement(
+        &self,
+        placement: PrimaryDataPlacement,
+        expected_write_bytes: Option<u64>,
+    ) -> Result<&Arc<DataVolume>> {
+        if self.uses_lowest_primary_tier(placement) {
+            self.select_lowest_priority_data_volume(expected_write_bytes)
+        } else {
+            self.select_data_volume(expected_write_bytes)
+        }
+    }
+
     fn test_existence_for_path(&self, path: &str) -> Result<&Arc<DataVolume>> {
         for volume in &self.data_volumes {
             if volume.fs().exists(path)? {
@@ -1039,6 +1120,7 @@ impl FileManager {
                 .primary_volume_backfill_trigger_watermark,
             file_transfer_concurrency: config.file_transfer_concurrency,
             primary_volume_offload_policy: config.primary_volume_offload_policy,
+            vlog_low_priority_primary_enabled: config.vlog_low_priority_primary_enabled,
             ..FileManagerOptions::default()
         };
         Self::new(data_volumes, options, metrics_manager)
@@ -1194,6 +1276,22 @@ impl FileManager {
     pub fn create_data_file(&self) -> Result<(FileId, TrackedWriter)> {
         let file_id = self.allocate_file_id();
         let volume = self.select_data_volume(None)?;
+        let writer = self.create_data_file_writer_on_volume(file_id, volume)?;
+        Ok((file_id, writer))
+    }
+
+    /// Creates a value-log data file using its configured placement policy.
+    ///
+    /// Every creation first runs the normal primary-tiering check. With direct low-priority
+    /// placement disabled, this keeps the historical route through the highest-priority tier.
+    pub(crate) fn create_vlog_data_file(self: &Arc<Self>) -> Result<(FileId, TrackedWriter)> {
+        if !self.options.vlog_low_priority_primary_enabled {
+            return self.create_data_file_with_offload();
+        }
+        self.trigger_offload_if_needed()?;
+        let file_id = self.allocate_file_id();
+        let volume =
+            self.select_primary_data_volume_for_placement(PrimaryDataPlacement::Vlog, None)?;
         let writer = self.create_data_file_writer_on_volume(file_id, volume)?;
         Ok((file_id, writer))
     }
@@ -1491,21 +1589,19 @@ impl FileManager {
     }
 
     /// Registers an existing data file for restore operations.
-    /// This will copy the file if it's on a snapshot volume, or link it if possible.
+    ///
+    /// Existing primary replicas are retained. Files copied from a non-primary source use the
+    /// requested primary placement.
     pub(crate) fn register_data_file_for_restore(
         &self,
         file_id: FileId,
         path: &str,
         source_origin: ReplicaOrigin,
+        placement: PrimaryDataPlacement,
         estimated_size_bytes: Option<u64>,
         resource_registry: Option<Arc<dyn RestoreCopyResourceRegistry + Send + Sync>>,
     ) -> Result<()> {
         let (source_volume, source_relative_path) = self.resolve_volume_path(path)?;
-        if source_volume.snapshot_persistable && source_volume.supports_primary_data {
-            self.register_restore_source_replica(file_id, path, source_origin)?;
-            return Ok(());
-        }
-
         if source_volume.supports_primary_data {
             self.register_restore_source_replica(file_id, path, source_origin)?;
             return Ok(());
@@ -1517,7 +1613,8 @@ impl FileManager {
         if source_volume.snapshot_persistable {
             self.register_data_file_readonly_with_origin(file_id, path, source_origin)?;
         }
-        let target_volume = self.select_data_volume(expected_write_bytes)?;
+        let target_volume =
+            self.select_primary_data_volume_for_placement(placement, expected_write_bytes)?;
         let (mut writer, target_tracked) =
             self.create_untracked_data_file_writer_on_volume(target_volume)?;
         if let Err(err) = self.copy_reader_to_tracked_writer(source_reader.as_ref(), &mut writer) {
@@ -3736,6 +3833,7 @@ pub(crate) mod tests {
             ReplicaOrigin::ExternalPersistent {
                 source_id: "readonly-snapshot".to_string(),
             },
+            PrimaryDataPlacement::Standard,
             None,
             None,
         )
@@ -3752,9 +3850,10 @@ pub(crate) mod tests {
 
     #[test]
     #[serial_test::serial(file)]
-    fn test_register_data_file_for_restore_keeps_snapshot_source_replica() {
+    fn test_register_data_file_for_restore_places_snapshot_files_by_type() {
         let root = "/tmp/file_manager_restore_snapshot_volume_any_path";
         let primary_root = format!("{}/primary", root);
+        let low_primary_root = format!("{}/low-primary", root);
         let snapshot_root = format!("{}/snapshot", root);
         let _ = std::fs::remove_dir_all(root);
         let registry = FileSystemRegistry::new();
@@ -3767,6 +3866,10 @@ pub(crate) mod tests {
         let mut source_writer = snapshot_fs.open_write(source_path).unwrap();
         source_writer.write(b"restore-source").unwrap();
         source_writer.close().unwrap();
+        let vlog_source_path = "db/data/vlog.sst";
+        let mut vlog_writer = snapshot_fs.open_write(vlog_source_path).unwrap();
+        vlog_writer.write(b"vlog-restore-source").unwrap();
+        vlog_writer.close().unwrap();
 
         let config = Config {
             volumes: vec![
@@ -3775,10 +3878,15 @@ pub(crate) mod tests {
                     vec![VolumeUsageKind::PrimaryDataPriorityHigh],
                 ),
                 crate::VolumeDescriptor::new(
+                    format!("file://{}", low_primary_root),
+                    vec![VolumeUsageKind::PrimaryDataPriorityLow],
+                ),
+                crate::VolumeDescriptor::new(
                     format!("file://{}", snapshot_root),
                     vec![VolumeUsageKind::Snapshot, VolumeUsageKind::Meta],
                 ),
             ],
+            vlog_low_priority_primary_enabled: true,
             ..Config::default()
         };
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-restore-snapshot-any"));
@@ -3790,11 +3898,18 @@ pub(crate) mod tests {
             ReplicaOrigin::ExternalPersistent {
                 source_id: "snapshot-source".to_string(),
             },
+            PrimaryDataPlacement::Standard,
             None,
             None,
         )
         .unwrap();
         assert!(fm.is_data_file_on_primary_volume(66));
+        assert_eq!(
+            fm.preferred_tracked_file(66)
+                .and_then(|tracked| tracked.volume.as_ref().map(|volume| volume.priority.rank())),
+            Some(3),
+            "SST restore should retain the normal highest-priority placement"
+        );
         assert!(fm.is_data_file_on_snapshot_volume(66));
         let logical = fm.get_logical_file(66).unwrap();
         assert_eq!(logical.replica_ids().len(), 2);
@@ -3804,6 +3919,25 @@ pub(crate) mod tests {
                 .map(|replica| replica.origin()),
             Some(ReplicaOrigin::ExternalPersistent { ref source_id }) if source_id == "snapshot-source"
         ));
+        let vlog_source_full_path = format!("file://{snapshot_root}/{vlog_source_path}");
+        fm.register_data_file_for_restore(
+            67,
+            &vlog_source_full_path,
+            ReplicaOrigin::ExternalPersistent {
+                source_id: "snapshot-source".to_string(),
+            },
+            PrimaryDataPlacement::Vlog,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fm.preferred_tracked_file(67)
+                .and_then(|tracked| tracked.volume.as_ref().map(|volume| volume.priority.rank())),
+            Some(1)
+        );
+        assert!(fm.is_data_file_on_snapshot_volume(67));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3837,6 +3971,7 @@ pub(crate) mod tests {
             ReplicaOrigin::ExternalLeased {
                 export_id: "shared-snapshot".to_string(),
             },
+            PrimaryDataPlacement::Standard,
             None,
             None,
         )
@@ -3892,6 +4027,7 @@ pub(crate) mod tests {
             ReplicaOrigin::ExternalPersistent {
                 source_id: "readonly-data".to_string(),
             },
+            PrimaryDataPlacement::Standard,
             None,
             None,
         )
@@ -3902,10 +4038,10 @@ pub(crate) mod tests {
 
     #[test]
     #[serial_test::serial(file)]
-    fn test_register_data_file_for_restore_primary_volume_keeps_same_db_owned_source() {
+    fn test_register_data_file_for_restore_keeps_existing_primary_vlog() {
         let root = "/tmp/file_manager_restore_primary_source_owned";
         let primary_root = format!("{}/primary", root);
-        let snapshot_root = format!("{}/snapshot", root);
+        let low_primary_root = format!("{}/low-primary", root);
         let _ = std::fs::remove_dir_all(root);
         std::fs::create_dir_all(format!("{}/db/data", primary_root)).unwrap();
         let source_local_path = format!("{}/db/data/source.sst", primary_root);
@@ -3918,18 +4054,31 @@ pub(crate) mod tests {
                     vec![VolumeUsageKind::PrimaryDataPriorityHigh],
                 ),
                 crate::VolumeDescriptor::new(
-                    format!("file://{}", snapshot_root),
-                    vec![VolumeUsageKind::Snapshot, VolumeUsageKind::Meta],
+                    format!("file://{}", low_primary_root),
+                    vec![VolumeUsageKind::PrimaryDataPriorityLow],
                 ),
             ],
+            vlog_low_priority_primary_enabled: true,
             ..Config::default()
         };
         let metrics_manager = Arc::new(MetricsManager::new("file-manager-restore-primary-owned"));
         let fm = FileManager::from_config(&config, "db", metrics_manager).unwrap();
         let source_full_path = format!("file://{}/db/data/source.sst", primary_root);
-        fm.register_data_file_for_restore(120, &source_full_path, ReplicaOrigin::Owned, None, None)
-            .unwrap();
+        fm.register_data_file_for_restore(
+            120,
+            &source_full_path,
+            ReplicaOrigin::Owned,
+            PrimaryDataPlacement::Vlog,
+            None,
+            None,
+        )
+        .unwrap();
         let tracked = fm.preferred_tracked_file(120).unwrap();
+        assert_eq!(
+            tracked.volume.as_ref().map(|volume| volume.priority.rank()),
+            Some(3),
+            "an existing primary VLOG replica is not rebalanced"
+        );
         assert_eq!(
             tracked.physical_delete_policy(),
             PhysicalDeletePolicy::ManagedDelete

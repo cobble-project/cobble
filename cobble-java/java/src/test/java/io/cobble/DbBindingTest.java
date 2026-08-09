@@ -56,6 +56,14 @@ class DbBindingTest {
     }
 
     @Test
+    void configSerializesVlogLowPriorityPrimaryPlacement() {
+        Config config = new Config();
+        config.vlogLowPriorityPrimaryEnabled = true;
+
+        assertTrue(config.toJson().contains("\"vlog_low_priority_primary_enabled\":true"));
+    }
+
+    @Test
     void nativeMetricsAreExposedAsTypedImmutableSamples() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-metrics-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);

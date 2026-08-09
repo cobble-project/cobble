@@ -590,7 +590,7 @@ impl VlogStore {
         &self,
         file_seq: VlogFileSeq,
     ) -> Result<(VlogWriter<Box<dyn SequentialWriteFile>>, VlogEdit)> {
-        let (file_id, writer) = self.file_manager.create_data_file_with_offload()?;
+        let (file_id, writer) = self.file_manager.create_vlog_data_file()?;
         self.file_manager
             .set_data_file_priority(file_id, VLOG_FILE_PRIORITY)?;
         let tracked_id = TrackedFileId::new(&self.file_manager, file_id);
@@ -625,15 +625,160 @@ impl VlogStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::FileManager;
-    use crate::file::{FileSystemRegistry, TrackedFileId};
+    use crate::file::{FileManager, FileSystem, FileSystemRegistry, TrackedFileId};
     use crate::metrics_manager::MetricsManager;
+    use crate::{Config, VolumeDescriptor, VolumeUsageKind};
+    use size::Size;
     use std::sync::Arc;
 
     static TEST_ROOT: &str = "file:///tmp/vlog_test";
 
     fn cleanup_test_root() {
         let _ = std::fs::remove_dir_all("/tmp/vlog_test");
+    }
+
+    fn tiered_file_manager(
+        root: &str,
+        vlog_low_priority_primary_enabled: bool,
+    ) -> (
+        Arc<FileManager>,
+        Arc<dyn FileSystem>,
+        Arc<dyn FileSystem>,
+        Arc<dyn FileSystem>,
+    ) {
+        let registry = FileSystemRegistry::new();
+        let high = registry
+            .get_or_register(format!("file://{root}/high"))
+            .unwrap();
+        let low_a = registry
+            .get_or_register(format!("file://{root}/low-a"))
+            .unwrap();
+        let low_b = registry
+            .get_or_register(format!("file://{root}/low-b"))
+            .unwrap();
+        let config = Config {
+            volumes: vec![
+                VolumeDescriptor::new(
+                    format!("file://{root}/high"),
+                    vec![
+                        VolumeUsageKind::PrimaryDataPriorityHigh,
+                        VolumeUsageKind::Meta,
+                    ],
+                ),
+                VolumeDescriptor::new(
+                    format!("file://{root}/low-a"),
+                    vec![VolumeUsageKind::PrimaryDataPriorityLow],
+                ),
+                VolumeDescriptor::new(
+                    format!("file://{root}/low-b"),
+                    vec![VolumeUsageKind::PrimaryDataPriorityLow],
+                ),
+            ],
+            vlog_low_priority_primary_enabled,
+            ..Config::default()
+        };
+        let file_manager = Arc::new(
+            FileManager::from_config(
+                &config,
+                "db",
+                Arc::new(MetricsManager::new("vlog-tier-test")),
+            )
+            .unwrap(),
+        );
+        (file_manager, high, low_a, low_b)
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn vlog_uses_lowest_primary_tier_when_enabled() {
+        let root = "/tmp/vlog_lowest_primary";
+        let _ = std::fs::remove_dir_all(root);
+        let (file_manager, high, low_a, low_b) = tiered_file_manager(root, true);
+
+        let (data_file_id, mut data_writer) = file_manager.create_data_file().unwrap();
+        data_writer.close().unwrap();
+        let data_path = file_manager.get_data_file_path(data_file_id).unwrap();
+        assert!(high.exists(&data_path).unwrap());
+
+        let store = VlogStore::new(Arc::clone(&file_manager), 64, 1);
+        let (mut vlog, edit) = store.create_writer().unwrap();
+        vlog.close().unwrap();
+        let vlog_file_id = edit.new_files[0].1.file_id();
+        let vlog_path = file_manager.get_data_file_path(vlog_file_id).unwrap();
+        assert!(!high.exists(&vlog_path).unwrap());
+        assert_ne!(
+            low_a.exists(&vlog_path).unwrap(),
+            low_b.exists(&vlog_path).unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn vlog_uses_highest_primary_tier_by_default() {
+        let root = "/tmp/vlog_default_primary";
+        let _ = std::fs::remove_dir_all(root);
+        let (file_manager, high, low_a, low_b) = tiered_file_manager(root, false);
+        let store = VlogStore::new(Arc::clone(&file_manager), 64, 1);
+
+        let (mut vlog, edit) = store.create_writer().unwrap();
+        vlog.close().unwrap();
+        let vlog_file_id = edit.new_files[0].1.file_id();
+        let vlog_path = file_manager.get_data_file_path(vlog_file_id).unwrap();
+        assert!(high.exists(&vlog_path).unwrap());
+        assert!(!low_a.exists(&vlog_path).unwrap());
+        assert!(!low_b.exists(&vlog_path).unwrap());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(file)]
+    fn vlog_lowest_primary_tier_does_not_fallback_when_unavailable() {
+        let root = "/tmp/vlog_lowest_primary_unavailable";
+        let _ = std::fs::remove_dir_all(root);
+        let mut low_volume = VolumeDescriptor::new(
+            format!("file://{root}/low"),
+            vec![VolumeUsageKind::PrimaryDataPriorityLow],
+        );
+        low_volume.size_limit = Some(Size::from_const(64));
+        let config = Config {
+            volumes: vec![
+                VolumeDescriptor::new(
+                    format!("file://{root}/high"),
+                    vec![
+                        VolumeUsageKind::PrimaryDataPriorityHigh,
+                        VolumeUsageKind::Meta,
+                    ],
+                ),
+                low_volume,
+            ],
+            base_file_size: Size::from_const(64),
+            vlog_low_priority_primary_enabled: true,
+            ..Config::default()
+        };
+        let file_manager = Arc::new(
+            FileManager::from_config(
+                &config,
+                "db",
+                Arc::new(MetricsManager::new("vlog-tier-unavailable-test")),
+            )
+            .unwrap(),
+        );
+
+        let error = match file_manager.create_vlog_data_file() {
+            Ok(_) => panic!("VLOG creation should not fall back to the high-priority tier"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("All lowest-priority primary data volumes are full or write-stopped")
+        );
+        assert_eq!(file_manager.peek_next_file_id(), 2);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

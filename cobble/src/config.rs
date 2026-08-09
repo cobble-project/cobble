@@ -855,6 +855,9 @@ pub struct Config {
     /// Values larger than this threshold are marked for value-log separation.
     /// None disables value-log separation.
     pub value_separation_threshold: Option<Size>,
+    /// Whether VLog files newly created or copied into primary use the lowest-priority primary
+    /// tier instead of the normal highest-priority tier.
+    pub vlog_low_priority_primary_enabled: bool,
     /// Time provider to use for TTL.
     pub time_provider: TimeProviderKind,
     /// Optional log file path. If None, logs go to console only. Must be a local path.
@@ -955,6 +958,7 @@ impl Default for Config {
             ttl_enabled: false,
             default_ttl_seconds: None,
             value_separation_threshold: None,
+            vlog_low_priority_primary_enabled: false,
             time_provider: TimeProviderKind::default(),
             log_path: None,
             log_max_file_size: Size::from_mib(10),
@@ -1615,6 +1619,7 @@ mod tests {
             ttl_enabled: true,
             default_ttl_seconds: Some(120),
             value_separation_threshold: Some(Size::from_kib(4)),
+            vlog_low_priority_primary_enabled: true,
             time_provider: crate::time::TimeProviderKind::Manual,
             log_path: Some("/tmp/cobble.log".to_string()),
             log_max_file_size: Size::from_mib(16),
@@ -1702,6 +1707,7 @@ mod tests {
             PrimaryVolumeOffloadPolicyKind::LargestFile
         );
         assert_eq!(decoded.value_separation_threshold, Some(Size::from_kib(4)));
+        assert!(decoded.vlog_low_priority_primary_enabled);
         assert_eq!(decoded.compaction_server_max_concurrent, 8);
         assert_eq!(decoded.compaction_server_max_queued, 32);
         assert_eq!(
