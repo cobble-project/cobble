@@ -2817,15 +2817,32 @@ fn test_db_snapshot_auto_expire() {
     batch.put(0, b"k1", 0, b"v1");
     db.write_batch(batch).unwrap();
 
-    let first_id = db.snapshot().unwrap();
-    let _ = wait_for_manifest_in_db(root, db.id(), first_id);
+    let (first_snapshot_tx, first_snapshot_rx) = std::sync::mpsc::channel();
+    let first_id = db
+        .snapshot_with_callback(move |result| {
+            let _ = first_snapshot_tx.send(result);
+        })
+        .unwrap();
+    let first_snapshot = first_snapshot_rx
+        .recv_timeout(ASYNC_TEST_TIMEOUT)
+        .expect("first snapshot callback timed out")
+        .expect("first snapshot materialization failed");
+    assert_eq!(first_id, first_snapshot.snapshot_id);
 
     let mut batch = WriteBatch::new();
     batch.put(0, b"k2", 0, b"v2");
     db.write_batch(batch).unwrap();
 
     let second_id = db.snapshot().unwrap();
-    let _ = wait_for_manifest_in_db(root, db.id(), second_id);
+    let second_manifest = wait_for_manifest_in_db(root, db.id(), second_id);
+    let second_manifest_json: JsonValue = serde_json::from_str(&second_manifest).unwrap();
+    assert_eq!(
+        second_manifest_json
+            .get("base_snapshot_id")
+            .and_then(|value| value.as_u64()),
+        Some(first_id),
+        "second snapshot must retain its published incremental base"
+    );
 
     let first_path = format!(
         "{}/{}",

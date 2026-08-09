@@ -512,6 +512,21 @@ impl SnapshotManager {
             &snapshot.referenced_schema_ids,
         );
         state.completed.insert(id);
+        // Retention runs immediately after this snapshot is enqueued for materialization. Pin a
+        // published incremental base before releasing the state lock so retention cannot remove
+        // it before the materializer selects and encodes the child manifest.
+        if let Some(base_id) = snapshot.base_snapshot_id
+            && let Some(base) = state.snapshots.get(&base_id)
+            && base.is_published()
+            && can_encode_incremental_manifest(base, snapshot.as_ref())
+            && state
+                .incremental_references
+                .entry(id)
+                .or_default()
+                .insert(base_id)
+        {
+            *state.incremental_ref_counts.entry(base_id).or_insert(0) += 1;
+        }
         drop(state);
         db_state_handle.update_suggested_snapshot(db_state.seq_id, id);
         true
