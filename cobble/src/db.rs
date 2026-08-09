@@ -763,9 +763,7 @@ impl Db {
             replayed_through = Some(wal_id);
             expected = expected.saturating_add(1);
         }
-        if self.wal_writer.is_none()
-            && let Some(checkpoint_id) = replayed_through
-        {
+        if let Some(checkpoint_id) = replayed_through {
             *self.recovered_wal_checkpoint.lock().unwrap() = Some(RecoveredWalCheckpoint {
                 store: Arc::new(store),
                 checkpoint_id,
@@ -1266,15 +1264,37 @@ impl Db {
         let barrier = wal_writer.begin_snapshot_barrier()?;
         let checkpoint_id = barrier.checkpoint_id();
         let wal_writer = Arc::clone(wal_writer);
+        let recovered_checkpoint = self.recovered_wal_checkpoint.lock().unwrap().clone();
+        let recovered_wal_checkpoint = Arc::clone(&self.recovered_wal_checkpoint);
         let user_callback = callback;
         let callback: SnapshotCallback = Arc::new(move |result| {
-            if result.is_ok()
-                && let Err(err) = wal_writer.truncate_through(checkpoint_id)
-            {
-                warn!(
-                    "snapshot WAL checkpoint {} published but WAL truncation failed: {}",
-                    checkpoint_id, err
-                );
+            if result.is_ok() {
+                if let Err(err) = wal_writer.truncate_through(checkpoint_id) {
+                    warn!(
+                        "snapshot WAL checkpoint {} published but WAL truncation failed: {}",
+                        checkpoint_id, err
+                    );
+                }
+                if let Some(recovered_checkpoint) = &recovered_checkpoint {
+                    match recovered_checkpoint
+                        .store
+                        .truncate_through(recovered_checkpoint.checkpoint_id)
+                    {
+                        Ok(()) => {
+                            let mut current = recovered_wal_checkpoint.lock().unwrap();
+                            if current.as_ref().is_some_and(|checkpoint| {
+                                checkpoint.checkpoint_id == recovered_checkpoint.checkpoint_id
+                                    && Arc::ptr_eq(&checkpoint.store, &recovered_checkpoint.store)
+                            }) {
+                                *current = None;
+                            }
+                        }
+                        Err(err) => warn!(
+                            "snapshot recovered WAL checkpoint {} published but truncation failed: {}",
+                            recovered_checkpoint.checkpoint_id, err
+                        ),
+                    }
+                }
             }
             if let Some(callback) = &user_callback {
                 callback(result);

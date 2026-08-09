@@ -1,8 +1,7 @@
 use super::Db;
 use crate::Config;
 use crate::config::{
-    PrimaryVolumeOffloadPolicyKind, VolumeDescriptor, VolumeUsageKind,
-    resolve_volume_descriptor_credentials, volume_descriptor_identity,
+    PrimaryVolumeOffloadPolicyKind, VolumeDescriptor, resolve_volume_descriptor_credentials,
 };
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, new_truncation_cursors_with};
 use crate::db_status::DbLifecycle;
@@ -40,34 +39,6 @@ pub enum RecoveryMode {
     /// Replay durable WAL entries after the selected snapshot only when it is the latest;
     /// otherwise restore the selected snapshot exactly.
     LatestWithWal,
-}
-
-fn validate_active_wal_route(
-    config: &Config,
-    recovery_wal_volume: Option<&VolumeDescriptor>,
-) -> Result<()> {
-    let Some(recovery_wal_volume) = recovery_wal_volume else {
-        return Ok(());
-    };
-    if !config.wal_enabled {
-        return Ok(());
-    }
-    let Some(active_wal_volume) = config
-        .volumes
-        .iter()
-        .find(|volume| volume.supports(VolumeUsageKind::Wal))
-    else {
-        return Ok(());
-    };
-    if volume_descriptor_identity(active_wal_volume)
-        != volume_descriptor_identity(recovery_wal_volume)
-    {
-        return Err(Error::ConfigError(
-            "LatestWithWal recovery requires the active WAL volume to match the snapshot WAL route"
-                .to_string(),
-        ));
-    }
-    Ok(())
 }
 
 struct RestoreTempResourceRegistry {
@@ -469,7 +440,6 @@ impl Db {
                     .map(|route| resolve_volume_descriptor_credentials(route, &config))
             })
             .flatten();
-        validate_active_wal_route(&config, recovery_wal_volume.as_ref())?;
         let schema_manager = Arc::new(crate::schema::SchemaManager::from_manifest(
             &file_manager,
             &manifest,
@@ -674,7 +644,6 @@ impl Db {
                     .map(|route| resolve_volume_descriptor_credentials(route, &config))
             })
             .flatten();
-        validate_active_wal_route(&config, recovery_wal_volume.as_ref())?;
         if manifest.bucket_ranges.is_empty() {
             return Err(Error::InvalidState(format!(
                 "Snapshot {} manifest missing bucket_ranges",

@@ -456,8 +456,6 @@ fn recovery_modes_control_wal_replay_without_creating_snapshots() {
     let store = WalStore::open(&wal_config, db_id, &FileSystemRegistry::new())
         .unwrap()
         .unwrap();
-    let replayed_wal_id = *store.list().unwrap().last().unwrap();
-
     let file_manager = Arc::new(
         FileManager::from_config(
             &wal_config,
@@ -482,8 +480,58 @@ fn recovery_modes_control_wal_replay_without_creating_snapshots() {
     assert!(historical.get(0, b"wal-tail").unwrap().is_none());
     historical.force_close();
 
-    // Current writes can disable WAL and omit its usage tag while recovery follows the route in
-    // the selected manifest.
+    // Recovery follows the absolute route in the selected manifest. A WAL volume selected for
+    // new writes may be different.
+    let new_wal_root = format!("file://{}", temp.path().join("new-wal").display());
+    let route_change_config = Config {
+        wal_enabled: true,
+        volumes: vec![
+            VolumeDescriptor::new(
+                root.clone(),
+                vec![
+                    VolumeUsageKind::Meta,
+                    VolumeUsageKind::PrimaryDataPriorityHigh,
+                ],
+            ),
+            VolumeDescriptor::new(new_wal_root.clone(), vec![VolumeUsageKind::Wal]),
+        ],
+        ..wal_config.clone()
+    };
+    let latest = crate::Db::open_from_snapshot_with_recovery_mode(
+        route_change_config.clone(),
+        latest_snapshot_id,
+        db_id,
+        crate::RecoveryMode::LatestWithWal,
+    )
+    .unwrap();
+    assert!(latest.get(0, b"wal-tail").unwrap().is_some());
+    latest
+        .put(0, b"new-route-snapshot", 0, b"new-route-value")
+        .unwrap();
+    let route_change_snapshot_id = snapshot_and_wait(&latest);
+    let route_change_manifest =
+        crate::snapshot::load_manifest_for_snapshot(&file_manager, route_change_snapshot_id)
+            .unwrap();
+    assert_eq!(
+        route_change_manifest
+            .wal_volume
+            .as_ref()
+            .map(|volume| volume.base_dir.as_str()),
+        Some(new_wal_root.as_str())
+    );
+    assert!(store.list().unwrap().is_empty());
+    latest
+        .put(0, b"new-route-tail", 0, b"new-route-tail-value")
+        .unwrap();
+    latest.force_close();
+
+    let new_store = WalStore::open(&route_change_config, db_id, &FileSystemRegistry::new())
+        .unwrap()
+        .unwrap();
+    let new_route_replayed_wal_id = *new_store.list().unwrap().last().unwrap();
+
+    // Current writes can disable WAL and omit its usage tag; recovery still uses the manifest
+    // route, even though that route is absent from the current volume list.
     let recovery_config = Config {
         wal_enabled: false,
         volumes: vec![VolumeDescriptor::new(
@@ -495,64 +543,31 @@ fn recovery_modes_control_wal_replay_without_creating_snapshots() {
         )],
         ..wal_config.clone()
     };
-    let route_change_config = Config {
-        wal_enabled: true,
-        volumes: vec![
-            VolumeDescriptor::new(
-                root,
-                vec![
-                    VolumeUsageKind::Meta,
-                    VolumeUsageKind::PrimaryDataPriorityHigh,
-                ],
-            ),
-            VolumeDescriptor::new("file:///tmp/wal-recovery-other", vec![VolumeUsageKind::Wal]),
-        ],
-        ..wal_config.clone()
-    };
-    assert!(matches!(
-        crate::Db::open_from_snapshot_with_recovery_mode(
-            route_change_config,
-            latest_snapshot_id,
-            db_id,
-            crate::RecoveryMode::LatestWithWal,
-        ),
-        Err(crate::Error::ConfigError(_))
-    ));
-    let latest = crate::Db::open_from_snapshot_with_recovery_mode(
-        recovery_config.clone(),
-        latest_snapshot_id,
-        db_id,
-        crate::RecoveryMode::LatestWithWal,
-    )
-    .unwrap();
-    assert!(latest.get(0, b"wal-tail").unwrap().is_some());
-    latest.force_close();
-
-    // A second recovery still discovers the WAL route from the selected manifest.
     let latest_again = crate::Db::open_from_snapshot_with_recovery_mode(
         recovery_config.clone(),
-        latest_snapshot_id,
+        route_change_snapshot_id,
         db_id,
         crate::RecoveryMode::LatestWithWal,
     )
     .unwrap();
     assert!(latest_again.get(0, b"wal-tail").unwrap().is_some());
+    assert!(latest_again.get(0, b"new-route-tail").unwrap().is_some());
     let recovery_checkpoint_snapshot_id = snapshot_and_wait(&latest_again);
     let recovery_checkpoint_manifest =
         crate::snapshot::load_manifest_for_snapshot(&file_manager, recovery_checkpoint_snapshot_id)
             .unwrap();
     assert_eq!(
         recovery_checkpoint_manifest.wal_checkpoint_id,
-        replayed_wal_id
+        new_route_replayed_wal_id
     );
     assert!(recovery_checkpoint_manifest.wal_volume.is_none());
-    assert!(store.list().unwrap().is_empty());
+    assert!(new_store.list().unwrap().is_empty());
     latest_again.force_close();
     assert_eq!(
         crate::snapshot::list_snapshot_manifest_ids(&file_manager)
             .unwrap()
             .len(),
-        manifests_before.len() + 1
+        manifests_before.len() + 2
     );
 
     // The checkpoint snapshot contains the recovered tail and leaves no WAL tail to replay.
@@ -586,6 +601,7 @@ fn recovery_modes_control_wal_replay_without_creating_snapshots() {
             manifests_before[0],
             old_snapshot_id,
             latest_snapshot_id,
+            route_change_snapshot_id,
             recovery_checkpoint_snapshot_id,
         ]
     );
