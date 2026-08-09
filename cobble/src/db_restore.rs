@@ -349,6 +349,8 @@ impl Db {
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
         let db_id = db_id.into();
+        // A restore references the source snapshot; only resume takes ownership of its lifecycle.
+        let retained_owned_source_id = format!("snapshot:{db_id}:{snapshot_id}");
         let config = config.normalize_volume_paths()?;
         init_logging(&config);
         log::info!(
@@ -381,7 +383,7 @@ impl Db {
             manifest,
             Some(snapshot_id),
             true,
-            None,
+            Some(retained_owned_source_id),
         )
     }
 

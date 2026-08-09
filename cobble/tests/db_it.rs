@@ -2047,6 +2047,47 @@ fn test_db_open_from_snapshot_allows_writes() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_same_id_snapshot_restore_close_preserves_source_ssts() {
+    let root = "/tmp/db_same_id_snapshot_restore_close";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_const(128),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: Size::from_const(0),
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config.clone());
+    for index in 0..64 {
+        let key = format!("key-{index:03}");
+        let value = format!("value-{index:03}-{}", "x".repeat(64));
+        db.put(0, key.as_bytes(), 0, value.as_bytes()).unwrap();
+    }
+
+    let snapshot_id = db.snapshot().unwrap();
+    let manifest = wait_for_manifest_in_db(root, db.id(), snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&manifest).unwrap();
+    assert!(
+        !snapshot_tree_file_paths(&manifest_json).is_empty(),
+        "test requires a flushed SST in the source snapshot"
+    );
+    let db_id = db.id().to_string();
+    db.close().unwrap();
+
+    let restored = Db::open_from_snapshot(config.clone(), snapshot_id, db_id.clone()).unwrap();
+    assert!(restored.get(0, b"key-000").unwrap().is_some());
+    restored.close().unwrap();
+
+    let resumed = Db::resume(config, db_id).unwrap();
+    assert!(resumed.get(0, b"key-000").unwrap().is_some());
+    resumed.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_open_new_with_snapshot_uses_fresh_db_id_and_starts_new_snapshot_chain() {
     let root = "/tmp/db_open_new_with_snapshot";
     cleanup_test_root(root);

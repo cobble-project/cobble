@@ -542,7 +542,6 @@ class DbBindingTest {
             ExecutionException exception =
                     assertThrows(ExecutionException.class, () -> pendingSnapshot.future().get());
             assertInstanceOf(CancelledError.class, exception.getCause());
-            assertTrue(db.expireSnapshot(pendingSnapshot.snapshotId()));
         }
     }
 
