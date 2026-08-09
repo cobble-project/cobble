@@ -17,12 +17,12 @@ use crate::snapshot::{
     ActiveMemtableSnapshotData, LoadedManifest, SnapshotCallback, SnapshotManager,
     SnapshotManifestInfo, load_manifest_for_snapshot, snapshot_manifest_name,
 };
-use crate::sst::row_codec::{decode_value, decode_value_masked};
+use crate::sst::row_codec::{decode_key, decode_value, decode_value_masked};
 use crate::r#type::{
     Column, RefColumn, RefKey, RefValue, Value, ValueType, decode_merge_separated_array,
 };
 use crate::vlog::{VlogPointer, VlogStore};
-use crate::wal::WalWriter;
+use crate::wal::{WalCompletion, WalId, WalSegment, WalStore, WalWriter};
 use crate::write_batch::{WriteBatch, WriteOp};
 use crate::writer_options::WriterOptions;
 use crate::{Config, ReadOptions, ScanOptions, TimeProvider, WriteOptions};
@@ -44,6 +44,13 @@ use crate::util::{build_commit_short_id, build_version_string, init_logging};
 mod rescale;
 #[path = "db_restore.rs"]
 mod restore;
+pub use restore::RecoveryMode;
+
+#[derive(Clone)]
+struct RecoveredWalCheckpoint {
+    store: Arc<WalStore>,
+    checkpoint_id: WalId,
+}
 
 /// Public database interface.
 pub struct Db {
@@ -79,6 +86,9 @@ pub struct Db {
         Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
     /// Present only when durable WAL is explicitly enabled.
     wal_writer: Option<Arc<WalWriter>>,
+    /// Durable WAL replayed while the current writer has WAL disabled. This is runtime-only: the
+    /// next successfully published snapshot records and truncates this boundary.
+    recovered_wal_checkpoint: Arc<Mutex<Option<RecoveredWalCheckpoint>>>,
 }
 
 /// Storage ownership policy for files imported by [`Db::expand_bucket_with_storage_mode`].
@@ -356,6 +366,12 @@ impl Db {
         };
         db.memtable_manager.open()?;
         db.db_lifecycle.mark_open()?;
+        if db.config.wal_enabled
+            && let Err(err) = db.create_snapshot_and_wait("initial WAL snapshot")
+        {
+            db.force_close();
+            return Err(err);
+        }
         Ok(db)
     }
 
@@ -601,7 +617,14 @@ impl Db {
         let record = RefValue::new_with_expired_at(columns, expired_at);
         let key = RefKey::new_with_column_family(bucket, column_family_id, key.as_ref());
         let result = if let Some(wal_writer) = &self.wal_writer {
-            self.put_ref_with_wal(wal_writer, schema.version(), num_columns, &key, &record)
+            self.put_ref_with_wal(
+                wal_writer,
+                schema.version(),
+                num_columns,
+                &key,
+                &record,
+                options.await_durable,
+            )
         } else {
             self.memtable_manager.put(&key, &record)
         };
@@ -619,18 +642,136 @@ impl Db {
         num_columns: usize,
         key: &RefKey<'_>,
         value: &RefValue<'_>,
+        await_durable: bool,
     ) -> Result<()> {
         let mut guard = wal_writer.lock_for_schema(schema_id)?;
-        let result = self.memtable_manager.put(key, value);
-        let completion = result
-            .as_ref()
-            .ok()
-            .map(|_| guard.append_ref(schema_id, key, value, num_columns));
+        let completion = {
+            let mut batch = guard.begin_batch();
+            batch.append_ref(schema_id, key, value, num_columns);
+            match self.memtable_manager.put(key, value) {
+                Ok(()) => batch.commit().expect("single WAL append has a completion"),
+                Err(err) => return Err(err),
+            }
+        };
         drop(guard);
-        if let Some(completion) = completion {
+        if await_durable {
             completion.wait_result()?;
         }
-        result
+        Ok(())
+    }
+
+    fn finish_partially_applied_wal_batch(
+        &self,
+        completion: Arc<WalCompletion>,
+        await_durable: bool,
+        applied: Result<()>,
+    ) -> Result<()> {
+        if let Err(err) = applied {
+            // A batch may have applied an earlier prefix after its WAL entries joined the ordered
+            // batch. We cannot safely roll it back, so stop serving rather than leave this
+            // process with an ambiguous failed write.
+            self.db_lifecycle.mark_error(err.clone());
+            return Err(err);
+        }
+        if await_durable {
+            completion.wait_result()?;
+        }
+        Ok(())
+    }
+
+    /// Replays the durable WAL tail that is newer than a restored snapshot checkpoint.
+    ///
+    /// This calls the memtable manager directly, so recovery never appends a second WAL record.
+    pub(crate) fn replay_wal_after_checkpoint(
+        &self,
+        checkpoint_id: u64,
+        recovery_volume: &crate::VolumeDescriptor,
+    ) -> Result<()> {
+        let store = WalStore::open_existing(
+            recovery_volume,
+            &self.id,
+            &crate::file::FileSystemRegistry::new(),
+        )?;
+        let ids = store
+            .list()?
+            .into_iter()
+            .filter(|wal_id| *wal_id > checkpoint_id)
+            .collect::<Vec<_>>();
+        let mut expected = checkpoint_id.saturating_add(1);
+        let mut replayed_through = None;
+        for wal_id in ids {
+            if wal_id != expected {
+                return Err(Error::InvalidState(format!(
+                    "WAL replay has a gap after checkpoint {checkpoint_id}: expected {expected}, found {wal_id}"
+                )));
+            }
+            match store.read(wal_id)? {
+                WalSegment::Data {
+                    schema_id,
+                    entry_bytes,
+                    ..
+                } => {
+                    if self.schema_manager.schema(schema_id).is_err() {
+                        self.schema_manager
+                            .register_schema_from_file(&self.file_manager, schema_id)?;
+                    }
+                    let schema = self.schema_manager.schema(schema_id)?;
+                    self.ensure_multi_lsm_scopes_for_schema_if_dirty(schema.as_ref())?;
+                    for (mut encoded_key, mut encoded_value) in
+                        crate::memtable::decode_vec_entry_stream(entry_bytes.as_ref())?
+                    {
+                        let key = decode_key(&mut encoded_key)?;
+                        let num_columns = schema
+                            .num_columns_in_family(key.column_family())
+                            .ok_or_else(|| {
+                                Error::InvalidState(format!(
+                                    "WAL {} references unknown column family {} in schema {}",
+                                    wal_id,
+                                    key.column_family(),
+                                    schema_id
+                                ))
+                            })?;
+                        let value = decode_value(&mut encoded_value, num_columns)?;
+                        let columns = value
+                            .columns()
+                            .iter()
+                            .map(|column| {
+                                column
+                                    .as_ref()
+                                    .map(|column| RefColumn::new(column.value_type, column.data()))
+                            })
+                            .collect();
+                        let key = RefKey::new_with_column_family(
+                            key.bucket(),
+                            key.column_family(),
+                            key.data(),
+                        );
+                        let value = RefValue::new_with_expired_at(columns, value.expired_at());
+                        self.memtable_manager.put(&key, &value)?;
+                    }
+                }
+                WalSegment::TruncationCursor { edits, .. } => {
+                    for edit in edits {
+                        self.db_state.advance_truncation_cursor(
+                            edit.bucket,
+                            edit.column_family_id,
+                            edit.key.as_ref(),
+                        );
+                    }
+                }
+            }
+            replayed_through = Some(wal_id);
+            expected = expected.saturating_add(1);
+        }
+        if self.wal_writer.is_none()
+            && let Some(checkpoint_id) = replayed_through
+        {
+            *self.recovered_wal_checkpoint.lock().unwrap() = Some(RecoveredWalCheckpoint {
+                store: Arc::new(store),
+                checkpoint_id,
+            });
+        }
+        Ok(())
     }
 
     /// Insert a single key/value pair into the given bucket and column.
@@ -706,20 +847,22 @@ impl Db {
             });
         let result = if let Some(wal_writer) = &self.wal_writer {
             let mut guard = wal_writer.lock_for_schema(schema.version())?;
-            let mut last_completion = None;
-            let result = self.memtable_manager.put_validated_batch_with_callback(
-                entries,
-                num_columns,
-                |key, value| {
-                    let completion = guard.append_ref(schema.version(), key, value, num_columns);
-                    last_completion = Some(completion);
-                },
-            );
+            let (result, completion) = {
+                let mut batch = guard.begin_batch();
+                let result = self.memtable_manager.put_validated_batch_with_callback(
+                    entries,
+                    num_columns,
+                    |key, value| batch.append_ref(schema.version(), key, value, num_columns),
+                );
+                let completion = batch.commit();
+                (result, completion)
+            };
             drop(guard);
-            if let Some(completion) = last_completion {
-                completion.wait_result()?;
+            if let Some(completion) = completion {
+                self.finish_partially_applied_wal_batch(completion, options.await_durable, result)
+            } else {
+                result
             }
-            result
         } else {
             self.memtable_manager
                 .put_validated_batch(entries, num_columns)
@@ -783,6 +926,15 @@ impl Db {
     /// put_ref. The memtable manager handles flush-to-L0 when the memtable
     /// is full, separated value extraction to VLOG, and schema validation.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.write_batch_with_options(batch, &self.default_write_options)
+    }
+
+    /// Writes a batch of operations with the requested WAL durability behavior.
+    pub fn write_batch_with_options(
+        &self,
+        batch: WriteBatch,
+        options: &WriteOptions,
+    ) -> Result<()> {
         let _access = self.begin_access()?;
         let batch_len = batch.ops.len() as u64;
         let mut pending: std::collections::BTreeMap<(u16, u8, Bytes), Value> =
@@ -848,35 +1000,39 @@ impl Db {
         }
         if let Some(wal_writer) = &self.wal_writer {
             let mut guard = wal_writer.lock_for_schema(schema.version())?;
-            let mut last_completion = None;
-            let result = (|| {
-                for ((bucket, column_family_id, raw_key), value) in &pending {
-                    let key = RefKey::new_with_column_family(
-                        *bucket,
-                        *column_family_id,
-                        raw_key.as_ref(),
-                    );
-                    let columns: Vec<Option<RefColumn<'_>>> = value
-                        .columns()
-                        .iter()
-                        .map(|column| {
-                            column
-                                .as_ref()
-                                .map(|column| RefColumn::new(column.value_type, column.data()))
-                        })
-                        .collect();
-                    let value_ref = RefValue::new_with_expired_at(columns, value.expired_at());
-                    self.memtable_manager.put(&key, &value_ref)?;
-                    let completion =
-                        guard.append_ref(schema.version(), &key, &value_ref, value.columns().len());
-                    last_completion = Some(completion);
-                }
-                Ok(())
-            })();
+            let (result, completion) = {
+                let mut batch = guard.begin_batch();
+                let result = (|| {
+                    for ((bucket, column_family_id, raw_key), value) in &pending {
+                        let key = RefKey::new_with_column_family(
+                            *bucket,
+                            *column_family_id,
+                            raw_key.as_ref(),
+                        );
+                        let columns: Vec<Option<RefColumn<'_>>> = value
+                            .columns()
+                            .iter()
+                            .map(|column| {
+                                column
+                                    .as_ref()
+                                    .map(|column| RefColumn::new(column.value_type, column.data()))
+                            })
+                            .collect();
+                        let value_ref = RefValue::new_with_expired_at(columns, value.expired_at());
+                        batch.append_ref(schema.version(), &key, &value_ref, value.columns().len());
+                        self.memtable_manager.put(&key, &value_ref)?;
+                    }
+                    Ok(())
+                })();
+                let completion = batch.commit();
+                (result, completion)
+            };
             drop(guard);
-            if let Some(completion) = last_completion {
-                completion.wait_result()?;
-            }
+            let result = if let Some(completion) = completion {
+                self.finish_partially_applied_wal_batch(completion, options.await_durable, result)
+            } else {
+                result
+            };
             let decision = self.memtable_manager.record_adaptive_write(batch_len);
             self.apply_adaptive_decision(decision);
             return result;
@@ -1069,9 +1225,43 @@ impl Db {
         callback: Option<SnapshotCallback>,
     ) -> Result<u64> {
         let Some(wal_writer) = &self.wal_writer else {
-            return self
-                .memtable_manager
-                .create_snapshot(self.snapshot_manager.clone(), callback);
+            let recovered_checkpoint = self.recovered_wal_checkpoint.lock().unwrap().clone();
+            let Some(recovered_checkpoint) = recovered_checkpoint else {
+                return self
+                    .memtable_manager
+                    .create_snapshot(self.snapshot_manager.clone(), callback);
+            };
+            let recovered_wal_checkpoint = Arc::clone(&self.recovered_wal_checkpoint);
+            let checkpoint_id = recovered_checkpoint.checkpoint_id;
+            let user_callback = callback;
+            let callback: SnapshotCallback = Arc::new(move |result| {
+                if result.is_ok() {
+                    match recovered_checkpoint.store.truncate_through(checkpoint_id) {
+                        Ok(()) => {
+                            let mut current = recovered_wal_checkpoint.lock().unwrap();
+                            if current.as_ref().is_some_and(|checkpoint| {
+                                checkpoint.checkpoint_id == checkpoint_id
+                                    && Arc::ptr_eq(&checkpoint.store, &recovered_checkpoint.store)
+                            }) {
+                                *current = None;
+                            }
+                        }
+                        Err(err) => warn!(
+                            "snapshot WAL recovery checkpoint {} published but truncation failed: {}",
+                            checkpoint_id, err
+                        ),
+                    }
+                }
+                if let Some(callback) = &user_callback {
+                    callback(result);
+                }
+            });
+            return self.memtable_manager.create_snapshot_with_wal_checkpoint(
+                self.snapshot_manager.clone(),
+                Some(callback),
+                checkpoint_id,
+                None,
+            );
         };
         let barrier = wal_writer.begin_snapshot_barrier()?;
         let checkpoint_id = barrier.checkpoint_id();
@@ -1094,6 +1284,11 @@ impl Db {
             self.snapshot_manager.clone(),
             Some(callback),
             checkpoint_id,
+            self.config
+                .volumes
+                .iter()
+                .find(|volume| volume.supports(crate::VolumeUsageKind::Wal))
+                .map(crate::config::sanitize_volume_descriptor),
         )
     }
 
@@ -1530,6 +1725,7 @@ impl Db {
             adoption_coordinator,
             runtime_manifest_publisher,
             wal_writer,
+            recovered_wal_checkpoint: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -2115,9 +2311,9 @@ impl Db {
     ) -> Result<()> {
         if let Some(wal_writer) = &self.wal_writer {
             let mut guard = wal_writer.lock()?;
+            let completion = guard.append_truncation(bucket, column_family_id, key);
             self.db_state
                 .advance_truncation_cursor(bucket, column_family_id, key);
-            let completion = guard.append_truncation(bucket, column_family_id, key);
             drop(guard);
             return completion.wait_result();
         }

@@ -277,6 +277,15 @@ impl StructuredSingleDb {
         self.db.write_batch(batch.into_inner())
     }
 
+    pub fn write_batch_with_options(
+        &self,
+        batch: StructuredWriteBatch,
+        options: &StructuredWriteOptions,
+    ) -> Result<()> {
+        self.db
+            .write_batch_with_options(batch.into_inner(), options.as_cobble())
+    }
+
     // ── Read operations ─────────────────────────────────────────────────
 
     pub fn get<K>(&self, bucket: u16, key: K) -> Result<Option<Vec<Option<StructuredColumnValue>>>>

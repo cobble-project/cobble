@@ -85,11 +85,12 @@ fn decode_manifest_v2_backward_compatible_defaults_max_expired_at() {
 }
 
 #[test]
-fn decode_manifest_v3_and_v4_preserve_file_extensions() {
+fn decode_manifest_v3_preserves_file_extensions() {
     let v3 = r#"{
             "version": 3,
             "id": 1,
             "seq_id": 2,
+            "topology_epoch": 7,
             "latest_schema_id": 3,
             "data_size_bytes": 0,
             "incremental_data_size_bytes": 0,
@@ -103,7 +104,8 @@ fn decode_manifest_v3_and_v4_preserve_file_extensions() {
                  "bucket_range_start": 0, "bucket_range_end": 0,
                  "effective_bucket_range_start": 0, "effective_bucket_range_end": 0,
                  "vlog_file_seq_offset": 0,
-                 "max_expired_at": 5000}
+                 "max_expired_at": 5000,
+                 "origin": {"kind": "external_leased", "export_id": "runtime-export"}}
             ]}]],
             "vlog_files": [],
             "active_memtable_data": []
@@ -113,24 +115,9 @@ fn decode_manifest_v3_and_v4_preserve_file_extensions() {
         ManifestPayload::Snapshot(s) => {
             let file = &s.tree_levels[0][0].files[0];
             assert_eq!(file.max_expired_at, 5000);
-            assert_eq!(file.origin, crate::file::logical_file::ReplicaOrigin::Owned);
-        }
-        _ => panic!("expected snapshot payload"),
-    }
-
-    let v4 = v3
-            .replace("\"version\": 3", "\"version\": 4")
-            .replace("\"seq_id\": 2,", "\"seq_id\": 2, \"topology_epoch\": 7,")
-            .replace(
-                "\"max_expired_at\": 5000}",
-                "\"max_expired_at\": 5000, \"origin\": {\"kind\": \"external_leased\", \"export_id\": \"runtime-export\"}}",
-            );
-    let payload = decode_manifest(v4.as_bytes()).expect("v4 manifest should decode");
-    match payload {
-        ManifestPayload::Snapshot(s) => {
             assert_eq!(s.topology_epoch, 7);
             assert!(matches!(
-                s.tree_levels[0][0].files[0].origin,
+                file.origin,
                 crate::file::logical_file::ReplicaOrigin::ExternalLeased { ref export_id }
                     if export_id == "runtime-export"
             ));
@@ -187,8 +174,7 @@ fn decode_manifest_rejects_previous_physical_key_format() {
         Ok(_) => panic!("version 1 must be rejected"),
         Err(err) => err,
     };
-    assert!(
-        err.to_string()
-            .contains("Unsupported snapshot manifest version: 1 (expected 2..=4)")
-    );
+    assert!(err.to_string().contains(&format!(
+        "Unsupported snapshot manifest version: 1 (expected 2..={MANIFEST_VERSION_CURRENT})"
+    )));
 }

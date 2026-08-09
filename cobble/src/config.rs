@@ -331,6 +331,83 @@ impl VolumeDescriptor {
     }
 }
 
+/// Returns a volume descriptor safe to persist in metadata.
+pub(crate) fn sanitize_volume_descriptor(volume: &VolumeDescriptor) -> VolumeDescriptor {
+    let mut sanitized = volume.clone();
+    sanitized.access_id = None;
+    sanitized.secret_key = None;
+    if let Some(options) = &mut sanitized.custom_options {
+        options.retain(|key, _| !is_sensitive_volume_option(key));
+        if options.is_empty() {
+            sanitized.custom_options = None;
+        }
+    }
+    if let Ok(mut url) = Url::parse(&sanitized.base_dir) {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        if url.query().is_some() {
+            let retained: Vec<(String, String)> = url
+                .query_pairs()
+                .filter(|(key, _)| !is_sensitive_volume_option(key))
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            url.set_query(None);
+            if !retained.is_empty() {
+                url.query_pairs_mut().extend_pairs(retained);
+            }
+        }
+        sanitized.base_dir = url.to_string();
+    }
+    sanitized
+}
+
+/// Resolves credentials for a persisted volume descriptor from the current process configuration.
+pub(crate) fn resolve_volume_descriptor_credentials(
+    route: &VolumeDescriptor,
+    current_config: &Config,
+) -> VolumeDescriptor {
+    let mut resolved = route.clone();
+    let route_identity = volume_descriptor_identity(route);
+    if let Some(current) = current_config
+        .volumes
+        .iter()
+        .find(|candidate| volume_descriptor_identity(candidate) == route_identity)
+    {
+        resolved.base_dir = current.base_dir.clone();
+        resolved.access_id = current.access_id.clone();
+        resolved.secret_key = current.secret_key.clone();
+        if let Some(options) = current.custom_options.as_ref() {
+            let target = resolved.custom_options.get_or_insert_with(HashMap::new);
+            for (key, value) in options {
+                if is_sensitive_volume_option(key) {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    resolved
+}
+
+pub(crate) fn volume_descriptor_identity(volume: &VolumeDescriptor) -> String {
+    let sanitized = sanitize_volume_descriptor(volume);
+    normalize_storage_path_to_url(&sanitized.base_dir).unwrap_or(sanitized.base_dir)
+}
+
+fn is_sensitive_volume_option(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().replace('-', "_").as_str(),
+        "access_id"
+            | "access_key"
+            | "access_key_id"
+            | "aws_access_key_id"
+            | "secret_key"
+            | "secret_access_key"
+            | "aws_secret_access_key"
+            | "session_token"
+            | "aws_session_token"
+    )
+}
+
 fn supports_primary_data(volume: &VolumeDescriptor) -> bool {
     volume.supports(VolumeUsageKind::PrimaryDataPriorityHigh)
         || volume.supports(VolumeUsageKind::PrimaryDataPriorityMedium)
@@ -385,6 +462,11 @@ pub struct ScanOptions {
 pub struct WriteOptions {
     pub ttl_seconds: Option<u32>,
     pub column_family: Option<String>,
+    /// When WAL is enabled, wait until this write's WAL segment is durably published.
+    ///
+    /// Disabling this keeps the write immediately visible in the current process, but a crash
+    /// may lose the not-yet-published WAL tail.
+    pub await_durable: bool,
     cached_column_family_id: Arc<ArcSwapOption<ColumnFamilyCacheEntry>>,
 }
 
@@ -411,6 +493,7 @@ impl WriteOptions {
         Self {
             ttl_seconds: Some(ttl_seconds),
             column_family: None,
+            await_durable: true,
             cached_column_family_id: Arc::new(ArcSwapOption::empty()),
         }
     }
@@ -419,8 +502,15 @@ impl WriteOptions {
         Self {
             ttl_seconds: None,
             column_family: Some(column_family.into()),
+            await_durable: true,
             cached_column_family_id: Arc::new(ArcSwapOption::empty()),
         }
+    }
+
+    /// Sets whether a WAL-backed write waits for durable publication before returning.
+    pub fn with_await_durable(mut self, await_durable: bool) -> Self {
+        self.await_durable = await_durable;
+        self
     }
 
     pub(crate) fn column_family(&self) -> Option<&str> {
@@ -500,6 +590,7 @@ impl Default for WriteOptions {
         Self {
             ttl_seconds: None,
             column_family: None,
+            await_durable: true,
             cached_column_family_id: Arc::new(ArcSwapOption::empty()),
         }
     }

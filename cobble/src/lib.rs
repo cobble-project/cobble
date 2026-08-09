@@ -149,7 +149,7 @@ pub use config::{
 pub use coordinator::{
     CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef,
 };
-pub use db::{Db, ExpandStorageMode};
+pub use db::{Db, ExpandStorageMode, RecoveryMode};
 pub use db_builder::DbBuilder;
 pub use db_iter::DbIterator;
 pub use error::{Error, Result};

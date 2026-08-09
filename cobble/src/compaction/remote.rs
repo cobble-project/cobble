@@ -1433,6 +1433,7 @@ impl RemoteCompactionServer {
                 crate::schema::ColumnFamilyOptions::default(),
             )],
             num_columns,
+            None,
         ));
         for schema_file in schemas {
             if schema_file.id == 0 {

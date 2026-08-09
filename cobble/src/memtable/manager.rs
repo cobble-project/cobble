@@ -314,6 +314,7 @@ pub(crate) struct SnapshotCompletion {
     pub(crate) manager: SnapshotManager,
     pub(crate) truncation_cursors: Option<TruncationCursorSnapshot>,
     pub(crate) wal_checkpoint_id: u64,
+    pub(crate) wal_volume: Option<crate::config::VolumeDescriptor>,
 }
 
 pub(crate) struct ActiveMemtable {
@@ -1520,6 +1521,7 @@ impl MemtableManager {
                 db_state.as_ref(),
                 snapshot_job.truncation_cursors.as_ref(),
                 snapshot_job.wal_checkpoint_id,
+                snapshot_job.wal_volume.clone(),
             )
         {
             if let Err(err) = snapshot_job
@@ -1794,13 +1796,13 @@ impl MemtableManager {
         self.put_validated_batch_with_callback(entries, num_columns, |_, _| {})
     }
 
-    /// Puts caller-validated rows and invokes `on_applied` only after each row is actually
-    /// installed in an active memtable. This is used by WAL to avoid recording failed rows.
+    /// Puts caller-validated rows and invokes `on_before_apply` before each row is installed.
+    /// WAL uses this to establish its in-memory ordering before the row becomes visible.
     pub(crate) fn put_validated_batch_with_callback<'a, I, F>(
         &self,
         entries: I,
         num_columns: usize,
-        mut on_applied: F,
+        mut on_before_apply: F,
     ) -> Result<()>
     where
         I: IntoIterator<Item = (RefKey<'a>, RefValue<'a>)>,
@@ -1808,7 +1810,7 @@ impl MemtableManager {
     {
         let mut entries = entries.into_iter();
         loop {
-            if self.put_batch_into_active(&mut entries, num_columns, &mut on_applied)? {
+            if self.put_batch_into_active(&mut entries, num_columns, &mut on_before_apply)? {
                 return Ok(());
             }
         }
@@ -1819,7 +1821,7 @@ impl MemtableManager {
         &self,
         entries: &mut I,
         num_columns: usize,
-        on_applied: &mut F,
+        on_before_apply: &mut F,
     ) -> Result<bool>
     where
         I: Iterator<Item = (RefKey<'a>, RefValue<'a>)>,
@@ -1860,14 +1862,13 @@ impl MemtableManager {
                 active.schema.num_columns_in_family(key.column_family()),
                 Some(num_columns)
             );
+            on_before_apply(&key, &value);
             let put_result = active.put_ref_or_replace(&key, &value, num_columns);
             if let Err(err) = put_result {
                 self.handle_memtable_put_error(&err, active, &key, &value)?;
                 self.put(&key, &value)?;
-                on_applied(&key, &value);
                 return Ok(false);
             }
-            on_applied(&key, &value);
         }
         Ok(true)
     }
@@ -2223,6 +2224,7 @@ impl MemtableManager {
                 manager: manager.clone(),
                 truncation_cursors: None,
                 wal_checkpoint_id: 0,
+                wal_volume: None,
             });
         let auto_snapshot_id = auto_snapshot
             .as_ref()
@@ -2273,6 +2275,7 @@ impl MemtableManager {
         manager: SnapshotManager,
         callback: Option<SnapshotCallback>,
         wal_checkpoint_id: u64,
+        wal_volume: Option<crate::config::VolumeDescriptor>,
     ) -> Result<u64> {
         let _rotation_guard = self.rotation_lock.lock().unwrap();
         let snapshot_id = manager.create_snapshot(callback).id;
@@ -2280,6 +2283,7 @@ impl MemtableManager {
             snapshot_id,
             manager,
             wal_checkpoint_id,
+            wal_volume,
         )?;
         Ok(snapshot_id)
     }
@@ -2289,7 +2293,7 @@ impl MemtableManager {
         snapshot_id: u64,
         manager: SnapshotManager,
     ) -> Result<()> {
-        self.flush_snapshot_with_checkpoint_under_rotation(snapshot_id, manager, 0)
+        self.flush_snapshot_with_checkpoint_under_rotation(snapshot_id, manager, 0, None)
     }
 
     fn flush_snapshot_with_checkpoint_under_rotation(
@@ -2297,12 +2301,14 @@ impl MemtableManager {
         snapshot_id: u64,
         manager: SnapshotManager,
         wal_checkpoint_id: u64,
+        wal_volume: Option<crate::config::VolumeDescriptor>,
     ) -> Result<()> {
         let snapshot = SnapshotCompletion {
             snapshot_id,
             manager: manager.clone(),
             truncation_cursors: None,
             wal_checkpoint_id,
+            wal_volume,
         };
         match self.flush_active_internal(Some(snapshot), FlushCause::Snapshot) {
             Ok(_) => Ok(()),

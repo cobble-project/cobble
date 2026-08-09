@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Current version of the dedicated compaction result format.
-pub(crate) const DEDICATED_COMPACTION_RESULT_VERSION: u32 = 4;
+pub(crate) const DEDICATED_COMPACTION_RESULT_VERSION: u32 = 3;
 
 /// Directory (relative to the db base dir) where result files live.
 pub(crate) const DEDICATED_COMPACTION_RESULTS_DIR: &str = "compaction/results";

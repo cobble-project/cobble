@@ -186,9 +186,9 @@ struct WalWriterState {
 
 /// Append-only WAL buffer with a single short sequencer mutex.
 ///
-/// Callers hold [`WalAppendGuard`] while applying their corresponding mutation to the memtable,
-/// then append the same encoded row before releasing the guard. The publisher only sees frozen
-/// buffers and writes them in FIFO order.
+/// Callers hold [`WalAppendGuard`] while appending a mutation to the in-memory WAL buffer and
+/// then applying it to the memtable. The publisher only sees frozen buffers and writes them in
+/// FIFO order.
 pub(crate) struct WalWriter {
     store: WalStore,
     file_manager: Arc<FileManager>,
@@ -204,6 +204,22 @@ pub(crate) struct WalWriter {
 pub(crate) struct WalAppendGuard<'a> {
     writer: &'a WalWriter,
     state: MutexGuard<'a, WalWriterState>,
+}
+
+enum WalBatchStart {
+    Empty,
+    Existing {
+        entry_bytes_len: usize,
+        entry_count: u32,
+    },
+}
+
+/// Defers segment rotation until a complete logical batch has been appended.
+pub(crate) struct WalBatchAppend<'guard, 'writer> {
+    guard: &'guard mut WalAppendGuard<'writer>,
+    start: WalBatchStart,
+    completion: Option<Arc<WalCompletion>>,
+    committed: bool,
 }
 
 /// Holds the write sequencer across snapshot capture. The publisher remains free to persist the
@@ -224,13 +240,13 @@ impl WalWriter {
     ) -> Result<Arc<Self>> {
         let registry = FileSystemRegistry::new();
         let store = WalStore::open(config, db_id, &registry)?.expect("WAL is enabled");
-        let next_wal_id = store
+        let last_published_wal_id = store
             .list()?
             .into_iter()
             .last()
             .unwrap_or(0)
-            .max(restored_checkpoint_id)
-            .saturating_add(1);
+            .max(restored_checkpoint_id);
+        let next_wal_id = last_published_wal_id.saturating_add(1);
         let writer = Arc::new(Self {
             store,
             file_manager,
@@ -243,7 +259,7 @@ impl WalWriter {
                 pending: VecDeque::new(),
                 inflight: None,
                 snapshot_barrier: false,
-                last_published_wal_id: restored_checkpoint_id,
+                last_published_wal_id,
                 stopping: false,
                 failed: None,
             }),
@@ -278,20 +294,14 @@ impl WalWriter {
     }
 
     /// Acquires the write sequencer with a buffer that matches `schema_id`.
-    /// A schema change cuts and durably publishes the preceding group before accepting rows for
-    /// the new schema.
+    /// A schema change cuts the preceding group before accepting rows for the new schema. FIFO
+    /// publication persists the old schema before either segment reaches storage.
     pub(crate) fn lock_for_schema(&self, schema_id: u64) -> Result<WalAppendGuard<'_>> {
-        loop {
-            let mut guard = self.lock()?;
-            if !guard.needs_schema_flush(schema_id) {
-                return Ok(guard);
-            }
-            let completion = guard.freeze_current();
-            drop(guard);
-            if let Some(completion) = completion {
-                completion.wait()?;
-            }
+        let mut guard = self.lock()?;
+        if guard.needs_schema_flush(schema_id) {
+            guard.freeze_current();
         }
+        Ok(guard)
     }
 
     pub(crate) fn begin_snapshot_barrier(&self) -> Result<WalSnapshotBarrier<'_>> {
@@ -339,7 +349,7 @@ impl WalWriter {
     }
 
     pub(crate) fn truncate_through(&self, checkpoint_id: WalId) -> Result<()> {
-        self.store.delete_through(checkpoint_id)
+        self.store.truncate_through(checkpoint_id)
     }
 
     pub(crate) fn close(&self) -> Result<()> {
@@ -487,7 +497,7 @@ impl Drop for WalSnapshotBarrier<'_> {
     }
 }
 
-impl WalAppendGuard<'_> {
+impl<'writer> WalAppendGuard<'writer> {
     fn needs_schema_flush(&self, schema_id: u64) -> bool {
         self.state
             .current
@@ -515,6 +525,36 @@ impl WalAppendGuard<'_> {
         value: &RefValue<'_>,
         num_columns: usize,
     ) -> Arc<WalCompletion> {
+        let completion = self.append_ref_without_freeze(schema_id, key, value, num_columns);
+        self.freeze_if_full();
+        completion
+    }
+
+    /// Starts a batch that cannot be split across WAL segments.
+    pub(crate) fn begin_batch<'guard>(&'guard mut self) -> WalBatchAppend<'guard, 'writer> {
+        let start = self
+            .state
+            .current
+            .as_ref()
+            .map_or(WalBatchStart::Empty, |current| WalBatchStart::Existing {
+                entry_bytes_len: current.entry_bytes.len(),
+                entry_count: current.entry_count,
+            });
+        WalBatchAppend {
+            guard: self,
+            start,
+            completion: None,
+            committed: false,
+        }
+    }
+
+    fn append_ref_without_freeze(
+        &mut self,
+        schema_id: u64,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+    ) -> Arc<WalCompletion> {
         if self.needs_schema_flush(schema_id) {
             panic!("WAL schema changed without flushing the current buffer");
         }
@@ -528,20 +568,22 @@ impl WalAppendGuard<'_> {
                 completion: WalCompletion::new(),
             });
         }
-        let (completion, should_freeze) = {
-            let current = self.state.current.as_mut().unwrap();
-            encode_vec_entry_stream_ref(&mut current.entry_bytes, key, value, num_columns);
-            current.entry_count += 1;
-            (
-                Arc::clone(&current.completion),
-                current.entry_bytes.len() >= WAL_BUFFER_SIZE_BYTES,
-            )
-        };
-        if should_freeze {
+        let current = self.state.current.as_mut().unwrap();
+        encode_vec_entry_stream_ref(&mut current.entry_bytes, key, value, num_columns);
+        current.entry_count += 1;
+        Arc::clone(&current.completion)
+    }
+
+    fn freeze_if_full(&mut self) {
+        if self
+            .state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.entry_bytes.len() >= WAL_BUFFER_SIZE_BYTES)
+        {
             freeze_current(&mut self.state);
             self.writer.work_ready.notify_all();
         }
-        completion
     }
 
     pub(crate) fn append_truncation(
@@ -564,6 +606,52 @@ impl WalAppendGuard<'_> {
         });
         self.writer.work_ready.notify_all();
         completion
+    }
+}
+
+impl WalBatchAppend<'_, '_> {
+    /// Appends one entry while deferring rotation until [`Self::commit`].
+    pub(crate) fn append_ref(
+        &mut self,
+        schema_id: u64,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        num_columns: usize,
+    ) {
+        self.completion =
+            Some(
+                self.guard
+                    .append_ref_without_freeze(schema_id, key, value, num_columns),
+            );
+    }
+
+    /// Makes the accumulated entries eligible for publication as one WAL batch.
+    pub(crate) fn commit(mut self) -> Option<Arc<WalCompletion>> {
+        self.guard.freeze_if_full();
+        self.committed = true;
+        self.completion.take()
+    }
+}
+
+impl Drop for WalBatchAppend<'_, '_> {
+    fn drop(&mut self) {
+        if self.committed || self.completion.is_none() {
+            return;
+        }
+        match self.start {
+            WalBatchStart::Existing {
+                entry_bytes_len,
+                entry_count,
+            } => {
+                let current = self.guard.state.current.as_mut().unwrap();
+                current.entry_bytes.truncate(entry_bytes_len);
+                current.entry_count = entry_count;
+            }
+            WalBatchStart::Empty => {
+                self.guard.state.current.take();
+                self.guard.state.next_wal_id -= 1;
+            }
+        }
     }
 }
 
@@ -606,6 +694,17 @@ impl WalStore {
         Ok(Some(Self { fs, dir }))
     }
 
+    /// Opens the WAL route recorded by a snapshot manifest without creating a directory.
+    pub(crate) fn open_existing(
+        volume: &crate::VolumeDescriptor,
+        db_id: &str,
+        registry: &FileSystemRegistry,
+    ) -> Result<Self> {
+        let fs = registry.get_or_register_volume(volume)?;
+        let dir = format!("{db_id}/{WAL_DIR}");
+        Ok(Self { fs, dir })
+    }
+
     pub(crate) fn publish(&self, segment: &WalSegment) -> Result<()> {
         let final_path = self.path_for(segment.wal_id());
         let temp_path = format!("{}/.tmp-{}", self.dir, Uuid::new_v4());
@@ -646,7 +745,7 @@ impl WalStore {
         Ok(segment)
     }
 
-    fn delete_through(&self, checkpoint_id: WalId) -> Result<()> {
+    pub(crate) fn truncate_through(&self, checkpoint_id: WalId) -> Result<()> {
         for wal_id in self.list()? {
             if wal_id <= checkpoint_id {
                 self.fs.delete(&self.path_for(wal_id))?;

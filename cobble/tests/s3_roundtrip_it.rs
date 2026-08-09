@@ -85,10 +85,6 @@ fn list_wal_objects(
         .collect()
 }
 
-fn wal_id(path: &str) -> u64 {
-    path.rsplit_once("WAL-").unwrap().1.parse().unwrap()
-}
-
 #[test]
 fn s3_wal_snapshot_checkpoint_and_truncate() {
     if !has_required_env() {
@@ -152,7 +148,6 @@ fn s3_wal_snapshot_checkpoint_and_truncate() {
         &db_id,
     );
     assert_eq!(before_snapshot.len(), 1);
-    let checkpoint_floor = wal_id(&before_snapshot[0]);
     let (tx, rx) = mpsc::channel();
     db.snapshot_with_callback(move |result| tx.send(result).unwrap())
         .unwrap();
@@ -181,9 +176,25 @@ fn s3_wal_snapshot_checkpoint_and_truncate() {
     );
     assert_eq!(after_snapshot.len(), 1);
 
-    let resumed = cobble::Db::resume(config, &db_id).unwrap();
+    let mut recovery_config = config;
+    recovery_config.wal_enabled = false;
+    recovery_config
+        .volumes
+        .retain(|volume| !volume.supports(VolumeUsageKind::Wal));
+    let resumed = cobble::Db::resume_with_recovery_mode(
+        recovery_config,
+        &db_id,
+        cobble::RecoveryMode::LatestWithWal,
+    )
+    .unwrap();
     assert!(resumed.get(0, b"before-snapshot").unwrap().is_some());
+    assert!(resumed.get(0, b"after-snapshot").unwrap().is_some());
     resumed.put(0, b"after-resume", 0, b"value").unwrap();
+    let (tx, rx) = mpsc::channel();
+    resumed
+        .snapshot_with_callback(move |result| tx.send(result).unwrap())
+        .unwrap();
+    rx.recv().unwrap().unwrap();
     resumed.close().unwrap();
     let after_resume = list_wal_objects(
         &endpoint,
@@ -193,13 +204,7 @@ fn s3_wal_snapshot_checkpoint_and_truncate() {
         &root_prefix,
         &db_id,
     );
-    assert_eq!(after_resume.len(), 2);
-    assert!(
-        after_resume
-            .iter()
-            .map(|path| wal_id(path))
-            .all(|id| id > checkpoint_floor)
-    );
+    assert!(after_resume.is_empty());
 }
 
 #[test]

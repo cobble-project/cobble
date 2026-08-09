@@ -111,7 +111,7 @@ fn decode_rejects_previous_physical_key_format() {
     let err = decode_runtime_manifest(&raw).expect_err("version 1 must be rejected");
     assert!(
         err.to_string()
-            .contains("Unsupported runtime manifest version: 1 (expected 2..=4)")
+            .contains("Unsupported runtime manifest version: 1 (expected 2..=3)")
     );
 }
 

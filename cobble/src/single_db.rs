@@ -1,7 +1,7 @@
 use crate::coordinator::{CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest};
 use crate::db_state::full_bucket_range;
 use crate::error::{Error, Result};
-use crate::{Config, Db, MemtableType, ReadOptions, WriteBatch, WriteOptions};
+use crate::{Config, Db, MemtableType, ReadOptions, RecoveryMode, WriteBatch, WriteOptions};
 use bytes::Bytes;
 use log::error;
 use std::ops::Deref;
@@ -56,6 +56,15 @@ impl SingleDb {
     /// This restores the local writer state from the shard snapshot referenced by
     /// `global_snapshot_id`, while keeping single-node snapshot APIs available.
     pub fn resume(config: Config, global_snapshot_id: u64) -> Result<Self> {
+        Self::resume_with_recovery_mode(config, global_snapshot_id, RecoveryMode::SnapshotOnly)
+    }
+
+    /// Resume a single-node DB using the requested shard WAL recovery behavior.
+    pub fn resume_with_recovery_mode(
+        config: Config,
+        global_snapshot_id: u64,
+        recovery_mode: RecoveryMode,
+    ) -> Result<Self> {
         let total_buckets = config.total_buckets;
         if total_buckets == 0 || total_buckets > (u16::MAX as u32) + 1 {
             return Err(Error::ConfigError(
@@ -80,10 +89,11 @@ impl SingleDb {
             )));
         }
         let shard = &global.shard_snapshots[0];
-        let db = Arc::new(Db::open_from_snapshot(
+        let db = Arc::new(Db::open_from_snapshot_with_recovery_mode(
             config,
             shard.snapshot_id,
             shard.db_id.clone(),
+            recovery_mode,
         )?);
         Ok(Self {
             db,
@@ -315,6 +325,14 @@ impl SingleDb {
 
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.db.write_batch(batch)
+    }
+
+    pub fn write_batch_with_options(
+        &self,
+        batch: WriteBatch,
+        options: &WriteOptions,
+    ) -> Result<()> {
+        self.db.write_batch_with_options(batch, options)
     }
 
     pub fn set_time(&self, next: u32) {

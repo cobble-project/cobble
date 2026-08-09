@@ -3,6 +3,7 @@ mod manager;
 pub(crate) mod manifest;
 mod memtable;
 
+use crate::config::VolumeDescriptor;
 use crate::db_state::LSMTreeScope;
 use crate::db_state::TruncationCursorMap;
 use crate::error::Result;
@@ -69,8 +70,10 @@ pub(crate) struct DbSnapshot {
     pub vlog_version: VlogVersion,
     pub seq_id: u64,
     pub topology_epoch: u64,
-    /// Highest WAL segment whose writes are included in this snapshot.
+    /// Highest WAL segment that must not be replayed when recovering from this snapshot.
     pub wal_checkpoint_id: u64,
+    /// Sanitized WAL storage route used to recover entries after this snapshot.
+    pub wal_volume: Option<VolumeDescriptor>,
     pub latest_schema_id: u64,
     pub referenced_schema_ids: BTreeSet<u64>,
     pub active_memtable_data: Vec<ActiveMemtableSnapshotData>,
@@ -113,6 +116,7 @@ impl DbSnapshot {
             seq_id: 0,
             topology_epoch: 0,
             wal_checkpoint_id: 0,
+            wal_volume: None,
             latest_schema_id: 0,
             referenced_schema_ids: BTreeSet::new(),
             active_memtable_data: Vec::new(),

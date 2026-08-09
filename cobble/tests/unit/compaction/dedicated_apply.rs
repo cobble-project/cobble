@@ -200,6 +200,7 @@ fn snapshot_tree_lookup_uses_scope_instead_of_current_index() {
         seq_id: 11,
         topology_epoch: 0,
         wal_checkpoint_id: 0,
+        wal_volume: None,
         latest_schema_id: 0,
         data_size_bytes: 0,
         incremental_data_size_bytes: 0,

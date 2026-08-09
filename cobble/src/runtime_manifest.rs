@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 pub(crate) mod publisher;
 
-/// Runtime manifests version 2 describe SSTs with big-endian bucket prefixes.
-/// Version 3 adds per-file `max_expired_at`; version 4 adds replica origins and topology epochs.
-pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 4;
+/// Runtime manifests version 2 are the Cobble 0.3 format. Version 3 adds the 0.4 file metadata,
+/// replica origins, and topology epochs.
+pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 3;
 pub(crate) const MAX_RUNTIME_MANIFEST_CHAIN_DEPTH: usize = 64;
 const RUNTIME_MANIFEST_DIR: &str = "runtime";
 const RUNTIME_CURRENT_NAME: &str = "runtime/CURRENT";

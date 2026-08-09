@@ -1,6 +1,9 @@
 use super::Db;
 use crate::Config;
-use crate::config::PrimaryVolumeOffloadPolicyKind;
+use crate::config::{
+    PrimaryVolumeOffloadPolicyKind, VolumeDescriptor, VolumeUsageKind,
+    resolve_volume_descriptor_credentials, volume_descriptor_identity,
+};
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, new_truncation_cursors_with};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
@@ -27,6 +30,45 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Builder;
 use tokio::task::JoinSet;
 use uuid::Uuid;
+
+/// Selects how a writable database is recovered from a snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecoveryMode {
+    /// Restore exactly the selected snapshot state.
+    #[default]
+    SnapshotOnly,
+    /// Replay durable WAL entries after the selected snapshot only when it is the latest;
+    /// otherwise restore the selected snapshot exactly.
+    LatestWithWal,
+}
+
+fn validate_active_wal_route(
+    config: &Config,
+    recovery_wal_volume: Option<&VolumeDescriptor>,
+) -> Result<()> {
+    let Some(recovery_wal_volume) = recovery_wal_volume else {
+        return Ok(());
+    };
+    if !config.wal_enabled {
+        return Ok(());
+    }
+    let Some(active_wal_volume) = config
+        .volumes
+        .iter()
+        .find(|volume| volume.supports(VolumeUsageKind::Wal))
+    else {
+        return Ok(());
+    };
+    if volume_descriptor_identity(active_wal_volume)
+        != volume_descriptor_identity(recovery_wal_volume)
+    {
+        return Err(Error::ConfigError(
+            "LatestWithWal recovery requires the active WAL volume to match the snapshot WAL route"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
 
 struct RestoreTempResourceRegistry {
     file_manager: Arc<FileManager>,
@@ -262,6 +304,7 @@ fn open_restored_db_from_manifest(
     suggested_base_snapshot_id: Option<u64>,
     advance_next_id_from_existing_manifests: bool,
     retained_owned_source_id: Option<String>,
+    recovery_wal_volume: Option<VolumeDescriptor>,
 ) -> Result<Db> {
     prepare_manifest_data_files_for_restore(
         &file_manager,
@@ -329,18 +372,47 @@ fn open_restored_db_from_manifest(
     }
     db.restore_active_memtable_snapshot_to_l0(&active_memtable_data)?;
     db.memtable_manager.open()?;
+    if let Some(recovery_wal_volume) = recovery_wal_volume.as_ref() {
+        db.replay_wal_after_checkpoint(manifest.wal_checkpoint_id, recovery_wal_volume)?;
+    }
     db.db_lifecycle.mark_open()?;
     Ok(db)
 }
 
 impl Db {
-    /// Open a writable database initialized from a snapshot manifest.
+    /// Open a writable database at the exact state of a snapshot manifest.
+    ///
+    /// Unlike [`Db::resume`], this does not replay WAL entries newer than the snapshot.
     pub fn open_from_snapshot(
         config: Config,
         snapshot_id: u64,
         db_id: impl Into<String>,
     ) -> Result<Self> {
-        Self::open_from_snapshot_with_resolver(config, snapshot_id, db_id, None)
+        Self::open_from_snapshot_with_recovery_mode(
+            config,
+            snapshot_id,
+            db_id,
+            RecoveryMode::SnapshotOnly,
+        )
+    }
+
+    /// Open a writable database from a selected snapshot using the requested recovery mode.
+    ///
+    /// [`RecoveryMode::LatestWithWal`] replays a durable WAL tail only when `snapshot_id` is the
+    /// latest snapshot; for historical snapshots it behaves as [`RecoveryMode::SnapshotOnly`].
+    pub fn open_from_snapshot_with_recovery_mode(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+        recovery_mode: RecoveryMode,
+    ) -> Result<Self> {
+        Self::open_from_snapshot_with_recovery_mode_and_resolver(
+            config,
+            snapshot_id,
+            db_id,
+            recovery_mode,
+            None,
+        )
     }
 
     pub fn open_from_snapshot_with_resolver(
@@ -349,10 +421,26 @@ impl Db {
         db_id: impl Into<String>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
+        Self::open_from_snapshot_with_recovery_mode_and_resolver(
+            config,
+            snapshot_id,
+            db_id,
+            RecoveryMode::SnapshotOnly,
+            resolver,
+        )
+    }
+
+    /// Like [`Db::open_from_snapshot_with_recovery_mode`], with custom merge operators.
+    pub fn open_from_snapshot_with_recovery_mode_and_resolver(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+        recovery_mode: RecoveryMode,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
         let db_id = db_id.into();
-        // A restore references the source snapshot; only resume takes ownership of its lifecycle.
-        let retained_owned_source_id = format!("snapshot:{db_id}:{snapshot_id}");
         let config = config.normalize_volume_paths()?;
+        let retained_owned_source_id = Some(format!("snapshot:{db_id}:{snapshot_id}"));
         init_logging(&config);
         log::info!(
             "cobble=db runtime start version={} build_commit={}",
@@ -368,7 +456,20 @@ impl Db {
         let file_manager =
             FileManager::from_config(&file_manager_config, &db_id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
+        let is_latest_snapshot = list_snapshot_manifest_ids(&file_manager)?
+            .last()
+            .is_some_and(|latest_id| *latest_id == snapshot_id);
         let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
+        let recovery_wal_volume = (recovery_mode == RecoveryMode::LatestWithWal
+            && is_latest_snapshot)
+            .then(|| {
+                manifest
+                    .wal_volume
+                    .as_ref()
+                    .map(|route| resolve_volume_descriptor_credentials(route, &config))
+            })
+            .flatten();
+        validate_active_wal_route(&config, recovery_wal_volume.as_ref())?;
         let schema_manager = Arc::new(crate::schema::SchemaManager::from_manifest(
             &file_manager,
             &manifest,
@@ -384,11 +485,14 @@ impl Db {
             manifest,
             Some(snapshot_id),
             true,
-            Some(retained_owned_source_id),
+            retained_owned_source_id,
+            recovery_wal_volume,
         )
     }
 
-    /// Open a fresh writable database from an existing source snapshot.
+    /// Open a fresh writable database from the exact state of an existing source snapshot.
+    ///
+    /// WAL entries from the source database are never replayed.
     ///
     /// Unlike [`Db::open_from_snapshot`], this creates a new runtime db id and starts a new
     /// snapshot chain in the target db directory. The source manifest is used only as restore
@@ -488,17 +592,42 @@ impl Db {
             None,
             false,
             Some(retained_owned_source_id),
+            None,
         )
     }
 
-    /// Resume a writable database from an existing folder by loading all snapshot manifests.
+    /// Resume a writable database from its latest snapshot and replay newer durable WAL entries.
     pub fn resume(config: Config, db_id: impl Into<String>) -> Result<Self> {
-        Self::resume_with_resolver(config, db_id, None)
+        Self::resume_with_recovery_mode(config, db_id, RecoveryMode::LatestWithWal)
+    }
+
+    /// Resume from the latest snapshot using the requested recovery mode.
+    pub fn resume_with_recovery_mode(
+        config: Config,
+        db_id: impl Into<String>,
+        recovery_mode: RecoveryMode,
+    ) -> Result<Self> {
+        Self::resume_with_recovery_mode_and_resolver(config, db_id, recovery_mode, None)
     }
 
     pub fn resume_with_resolver(
         config: Config,
         db_id: impl Into<String>,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        Self::resume_with_recovery_mode_and_resolver(
+            config,
+            db_id,
+            RecoveryMode::LatestWithWal,
+            resolver,
+        )
+    }
+
+    /// Like [`Db::resume_with_recovery_mode`], with custom merge operators.
+    pub fn resume_with_recovery_mode_and_resolver(
+        config: Config,
+        db_id: impl Into<String>,
+        recovery_mode: RecoveryMode,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
         let db_id = db_id.into();
@@ -537,6 +666,15 @@ impl Db {
             Error::IoError(format!("No snapshot manifests found for db {}", db_id))
         })?;
         let manifest = latest.manifest.clone();
+        let recovery_wal_volume = (recovery_mode == RecoveryMode::LatestWithWal)
+            .then(|| {
+                manifest
+                    .wal_volume
+                    .as_ref()
+                    .map(|route| resolve_volume_descriptor_credentials(route, &config))
+            })
+            .flatten();
+        validate_active_wal_route(&config, recovery_wal_volume.as_ref())?;
         if manifest.bucket_ranges.is_empty() {
             return Err(Error::InvalidState(format!(
                 "Snapshot {} manifest missing bucket_ranges",
@@ -604,6 +742,9 @@ impl Db {
         db.take_over_snapshot_chain(&loaded)?;
         db.restore_active_memtable_snapshot_to_l0(&active_memtable_data)?;
         db.memtable_manager.open()?;
+        if let Some(recovery_wal_volume) = recovery_wal_volume.as_ref() {
+            db.replay_wal_after_checkpoint(manifest.wal_checkpoint_id, recovery_wal_volume)?;
+        }
         db.db_lifecycle.mark_open()?;
         Ok(db)
     }

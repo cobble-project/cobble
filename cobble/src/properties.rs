@@ -1,12 +1,14 @@
 //! Per-DB writer properties shared with external compaction processes.
 
-use crate::Config;
 use crate::error::{Error, Result};
 use crate::file::{FileManager, ReadAllFile};
-use crate::util::normalize_storage_path_to_url;
+use crate::{
+    Config,
+    config::{resolve_volume_descriptor_credentials, sanitize_volume_descriptor},
+};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::collections::HashMap;
-use url::Url;
 
 pub(crate) const DB_PROPERTIES_NAME: &str = "PROPERTIES";
 const DB_PROPERTIES_VERSION_CURRENT: u32 = 1;
@@ -23,7 +25,7 @@ impl DbProperties {
     fn from_writer(db_id: &str, config: &Config) -> Self {
         let mut sanitized = config.clone();
         for volume in &mut sanitized.volumes {
-            sanitize_volume(volume);
+            *volume = sanitize_volume_descriptor(volume);
         }
         Self {
             version: DB_PROPERTIES_VERSION_CURRENT,
@@ -143,22 +145,7 @@ pub(crate) fn load_compactor_config(
 ) -> Result<Config> {
     let mut resolved = load_db_properties(file_manager, db_id)?.config;
     for persisted in &mut resolved.volumes {
-        let Some(process_volume) = process_config
-            .volumes
-            .iter()
-            .find(|candidate| volume_identity(candidate) == volume_identity(persisted))
-        else {
-            continue;
-        };
-        // Use the in-process URL so credentials embedded in URL userinfo/query remain available
-        // to the filesystem implementation without ever appearing in PROPERTIES.
-        persisted.base_dir = process_volume.base_dir.clone();
-        persisted.access_id = process_volume.access_id.clone();
-        persisted.secret_key = process_volume.secret_key.clone();
-        restore_sensitive_options(
-            &mut persisted.custom_options,
-            process_volume.custom_options.as_ref(),
-        );
+        *persisted = resolve_volume_descriptor_credentials(persisted, process_config);
     }
     // These settings control the compactor process itself rather than the DB's persisted layout.
     // Keep CLI/service overrides effective while the writer remains authoritative for storage
@@ -171,71 +158,6 @@ pub(crate) fn load_compactor_config(
     resolved.log_console = process_config.log_console;
     resolved.log_level = process_config.log_level;
     Ok(resolved)
-}
-
-fn volume_identity(volume: &crate::VolumeDescriptor) -> String {
-    let mut sanitized = volume.clone();
-    sanitize_volume(&mut sanitized);
-    normalize_storage_path_to_url(&sanitized.base_dir)
-        .unwrap_or_else(|_| sanitized.base_dir.clone())
-}
-
-fn sanitize_volume(volume: &mut crate::VolumeDescriptor) {
-    volume.access_id = None;
-    volume.secret_key = None;
-    if let Some(options) = &mut volume.custom_options {
-        options.retain(|key, _| !is_sensitive_volume_option(key));
-        if options.is_empty() {
-            volume.custom_options = None;
-        }
-    }
-    let Ok(mut url) = Url::parse(&volume.base_dir) else {
-        return;
-    };
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    if url.query().is_some() {
-        let retained: Vec<(String, String)> = url
-            .query_pairs()
-            .filter(|(key, _)| !is_sensitive_volume_option(key))
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect();
-        url.set_query(None);
-        if !retained.is_empty() {
-            url.query_pairs_mut().extend_pairs(retained);
-        }
-    }
-    volume.base_dir = url.to_string();
-}
-
-fn restore_sensitive_options(
-    persisted: &mut Option<HashMap<String, String>>,
-    process: Option<&HashMap<String, String>>,
-) {
-    let Some(process) = process else {
-        return;
-    };
-    let target = persisted.get_or_insert_with(HashMap::new);
-    for (key, value) in process {
-        if is_sensitive_volume_option(key) {
-            target.insert(key.clone(), value.clone());
-        }
-    }
-}
-
-fn is_sensitive_volume_option(key: &str) -> bool {
-    matches!(
-        key.trim().to_ascii_lowercase().replace('-', "_").as_str(),
-        "access_id"
-            | "access_key"
-            | "access_key_id"
-            | "aws_access_key_id"
-            | "secret_key"
-            | "secret_access_key"
-            | "aws_secret_access_key"
-            | "session_token"
-            | "aws_session_token"
-    )
 }
 
 #[cfg(test)]

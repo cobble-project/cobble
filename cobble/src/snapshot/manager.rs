@@ -8,6 +8,7 @@ use super::{
     SnapshotManifestInfo, memtable,
 };
 use crate::config::MemtableType;
+use crate::config::VolumeDescriptor;
 use crate::data_file::DataFile;
 use crate::db_state::{DbState, DbStateHandle, TruncationCursorSnapshot};
 use crate::db_status::DbLifecycle;
@@ -411,6 +412,7 @@ impl SnapshotManager {
     /// schema files up to the latest referenced schema id, (5) register
     /// the snapshot in the manager's state with ref-counted dependency
     /// tracking, (6) auto-expire old snapshots if retention is configured.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish_snapshot(
         &self,
         id: u64,
@@ -419,6 +421,7 @@ impl SnapshotManager {
         db_state_handle: &DbStateHandle,
         truncation_cursors: Option<&TruncationCursorSnapshot>,
         wal_checkpoint_id: u64,
+        wal_volume: Option<VolumeDescriptor>,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
         let Some(snapshot) = state.snapshots.get(&id).cloned() else {
@@ -447,6 +450,7 @@ impl SnapshotManager {
         snapshot.seq_id = db_state.seq_id;
         snapshot.topology_epoch = db_state.topology_epoch;
         snapshot.wal_checkpoint_id = wal_checkpoint_id;
+        snapshot.wal_volume = wal_volume;
         snapshot.truncation_cursors = truncation_cursors
             .map(TruncationCursorSnapshot::to_map)
             .unwrap_or_else(|| db_state.truncation_cursors_snapshot());
@@ -646,6 +650,7 @@ impl SnapshotManager {
             seq_id: manifest.seq_id,
             topology_epoch: manifest.topology_epoch,
             wal_checkpoint_id: manifest.wal_checkpoint_id,
+            wal_volume: manifest.wal_volume.clone(),
             latest_schema_id: manifest.latest_schema_id,
             referenced_schema_ids,
             active_memtable_data: manifest.active_memtable_data.clone(),

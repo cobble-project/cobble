@@ -631,6 +631,7 @@ pub(crate) struct SchemaManager {
     evolutions: Arc<RwLock<BTreeMap<u64, BuiltinSchemaEvolution>>>,
     max_persisted_schema_id: Arc<RwLock<Option<u64>>>,
     next_version: Arc<AtomicU64>,
+    resolver: Option<Arc<dyn MergeOperatorResolver>>,
 }
 
 impl SchemaManager {
@@ -642,7 +643,11 @@ impl SchemaManager {
         )))
     }
 
-    pub(crate) fn from_schemas(schemas: Vec<Schema>, default_num_columns: usize) -> Self {
+    pub(crate) fn from_schemas(
+        schemas: Vec<Schema>,
+        default_num_columns: usize,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Self {
         let mut versions: BTreeMap<u64, Arc<Schema>> = BTreeMap::new();
         for schema in schemas {
             let version = schema.version();
@@ -661,6 +666,7 @@ impl SchemaManager {
                 evolutions: Arc::new(RwLock::new(BTreeMap::new())),
                 max_persisted_schema_id: Arc::new(RwLock::new(None)),
                 next_version: Arc::new(AtomicU64::new(1)),
+                resolver,
             };
         }
         let mut evolutions = BTreeMap::new();
@@ -678,6 +684,7 @@ impl SchemaManager {
             evolutions: Arc::new(RwLock::new(evolutions)),
             max_persisted_schema_id: Arc::new(RwLock::new(Some(max_version))),
             next_version: Arc::new(AtomicU64::new(max_version.saturating_add(1))),
+            resolver,
         }
     }
 
@@ -719,7 +726,7 @@ impl SchemaManager {
             .into_iter()
             .map(|schema_id| load_schema(file_manager, schema_id, resolver.as_ref()))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self::from_schemas(schemas, 1))
+        Ok(Self::from_schemas(schemas, 1, resolver))
     }
 
     pub(crate) fn from_snapshot_source_manifests<'a, I>(
@@ -743,7 +750,7 @@ impl SchemaManager {
                 load_schema_from_path(file_manager, schema_id, &schema_path, resolver.as_ref())
             })
             .collect::<Result<Vec<_>>>()?;
-        let manager = Self::from_schemas(schemas, 1);
+        let manager = Self::from_schemas(schemas, 1, resolver);
         manager.set_max_persisted_schema_id(None);
         Ok(manager)
     }
@@ -758,6 +765,7 @@ impl SchemaManager {
             evolutions: Arc::new(RwLock::new(BTreeMap::new())),
             max_persisted_schema_id: Arc::new(RwLock::new(None)),
             next_version: Arc::new(AtomicU64::new(next_version)),
+            resolver: None,
         }
     }
 
@@ -921,7 +929,11 @@ impl SchemaManager {
         file_manager: &Arc<FileManager>,
         schema_id: u64,
     ) -> Result<()> {
-        self.register_schema_from_file_with_resolver(file_manager, schema_id, None)
+        self.register_schema_from_file_with_resolver(
+            file_manager,
+            schema_id,
+            self.resolver.as_ref(),
+        )
     }
 
     /// Loads a persisted schema file from the shared metadata volume and registers it, preserving

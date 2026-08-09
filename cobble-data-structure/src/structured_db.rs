@@ -10,8 +10,8 @@ use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use cobble::{
     BytesMergeOperator, Config, Db, DbIterator, Error, MemtableType, MergeOperatorResolver,
-    ReadOptions, Result, ScanOptions, Schema, SchemaBuilder, ShardSnapshotInput, WriteBatch,
-    WriteOptions,
+    ReadOptions, RecoveryMode, Result, ScanOptions, Schema, SchemaBuilder, ShardSnapshotInput,
+    WriteBatch, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -548,6 +548,11 @@ impl StructuredWriteOptions {
         }
     }
 
+    pub fn with_await_durable(mut self, await_durable: bool) -> Self {
+        self.inner = self.inner.with_await_durable(await_durable);
+        self
+    }
+
     pub fn as_cobble(&self) -> &WriteOptions {
         &self.inner
     }
@@ -562,6 +567,10 @@ impl StructuredWriteOptions {
 
     pub fn column_family(&self) -> Option<&str> {
         self.inner.column_family.as_deref()
+    }
+
+    pub fn await_durable(&self) -> bool {
+        self.inner.await_durable
     }
 }
 
@@ -1038,6 +1047,22 @@ impl StructuredDb {
         )?)
     }
 
+    /// Open a selected snapshot using the requested WAL recovery behavior.
+    pub fn open_from_snapshot_with_recovery_mode(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+        recovery_mode: RecoveryMode,
+    ) -> Result<Self> {
+        Self::from_db(Db::open_from_snapshot_with_recovery_mode_and_resolver(
+            config,
+            snapshot_id,
+            db_id,
+            recovery_mode,
+            Some(combined_resolver(None)),
+        )?)
+    }
+
     pub fn open_new_with_snapshot(
         config: Config,
         snapshot_id: u64,
@@ -1093,6 +1118,20 @@ impl StructuredDb {
             config,
             db_id,
             Some(combined_resolver(resolver)),
+        )?)
+    }
+
+    /// Resume the latest snapshot using the requested WAL recovery behavior.
+    pub fn resume_with_recovery_mode(
+        config: Config,
+        db_id: impl Into<String>,
+        recovery_mode: RecoveryMode,
+    ) -> Result<Self> {
+        Self::from_db(Db::resume_with_recovery_mode_and_resolver(
+            config,
+            db_id,
+            recovery_mode,
+            Some(combined_resolver(None)),
         )?)
     }
 
@@ -1437,6 +1476,15 @@ impl StructuredDb {
 
     pub fn write_batch(&self, batch: StructuredWriteBatch) -> Result<()> {
         self.db.write_batch(batch.into_inner())
+    }
+
+    pub fn write_batch_with_options(
+        &self,
+        batch: StructuredWriteBatch,
+        options: &StructuredWriteOptions,
+    ) -> Result<()> {
+        self.db
+            .write_batch_with_options(batch.into_inner(), options.as_cobble())
     }
 
     pub fn get<K>(&self, bucket: u16, key: K) -> Result<Option<Vec<Option<StructuredColumnValue>>>>

@@ -156,6 +156,7 @@ fn schema_manager_for(num_columns: usize) -> Arc<SchemaManager> {
     Arc::new(SchemaManager::from_schemas(
         vec![Schema::new(0, num_columns, Vec::new())],
         num_columns,
+        None,
     ))
 }
 
