@@ -27,17 +27,36 @@ public final class DirectWriteBatch {
     public void put(ByteBuffer key, int keyLength, ByteBuffer value, int valueLength) {
         validateDirectSlice("key", key, keyLength);
         validateDirectSlice("value", value, valueLength);
-        int entryLength;
-        try {
-            entryLength = Math.addExact(ENTRY_HEADER_BYTES, Math.addExact(keyLength, valueLength));
-        } catch (ArithmeticException overflow) {
-            throw new IllegalArgumentException("direct write batch entry is too large", overflow);
-        }
-        ensureCapacity(entryLength);
-        encoded.putInt(keyLength);
-        encoded.putInt(valueLength);
+        prepareEntry(keyLength, valueLength);
         putPrefix(encoded, key, keyLength);
         putPrefix(encoded, value, valueLength);
+        size++;
+    }
+
+    /** Appends one key/value pair by copying the supplied byte arrays. */
+    public void put(byte[] key, byte[] value) {
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
+        if (value == null) {
+            throw new IllegalArgumentException("value must not be null");
+        }
+        put(key, 0, key.length, value, 0, value.length);
+    }
+
+    /** Appends one key/value pair by copying slices of the supplied byte arrays. */
+    public void put(
+            byte[] key,
+            int keyOffset,
+            int keyLength,
+            byte[] value,
+            int valueOffset,
+            int valueLength) {
+        validateArraySlice("key", key, keyOffset, keyLength);
+        validateArraySlice("value", value, valueOffset, valueLength);
+        prepareEntry(keyLength, valueLength);
+        encoded.put(key, keyOffset, keyLength);
+        encoded.put(value, valueOffset, valueLength);
         size++;
     }
 
@@ -57,6 +76,18 @@ public final class DirectWriteBatch {
 
     int encodedLength() {
         return encoded.position();
+    }
+
+    private void prepareEntry(int keyLength, int valueLength) {
+        int entryLength;
+        try {
+            entryLength = Math.addExact(ENTRY_HEADER_BYTES, Math.addExact(keyLength, valueLength));
+        } catch (ArithmeticException overflow) {
+            throw new IllegalArgumentException("direct write batch entry is too large", overflow);
+        }
+        ensureCapacity(entryLength);
+        encoded.putInt(keyLength);
+        encoded.putInt(valueLength);
     }
 
     private void ensureCapacity(int additionalBytes) {
@@ -88,6 +119,16 @@ public final class DirectWriteBatch {
         }
         if (length < 0 || length > buffer.capacity()) {
             throw new IllegalArgumentException(name + "Length out of range: " + length);
+        }
+    }
+
+    private static void validateArraySlice(String name, byte[] bytes, int offset, int length) {
+        if (bytes == null) {
+            throw new IllegalArgumentException(name + " must not be null");
+        }
+        if (offset < 0 || length < 0 || offset > bytes.length - length) {
+            throw new IllegalArgumentException(
+                    name + " slice out of range: offset=" + offset + ", length=" + length);
         }
     }
 
