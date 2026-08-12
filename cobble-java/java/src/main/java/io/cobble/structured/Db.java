@@ -528,6 +528,37 @@ public final class Db extends NativeObject {
     }
 
     /**
+     * Opens a streaming byte-column put batch that submits completed entries after approximately
+     * {@code bufferSizeBytes} have accumulated.
+     */
+    public StreamingWriteBatch streamingWriteBatch(
+            int bucket, int column, WriteOptions options, int bufferSizeBytes) {
+        return new StreamingWriteBatch(this, bucket, column, options, bufferSizeBytes);
+    }
+
+    void putStreamingBatchWithOptions(
+            int bucket,
+            int column,
+            long[] chunkAddresses,
+            int[] chunkLengths,
+            int[] keyLengths,
+            int[] valueLengths,
+            int entryCount,
+            WriteOptions options) {
+        long woh = options == null ? 0L : options.getNativeHandle();
+        putBytesDirectChunksWithOptions(
+                nativeHandle,
+                bucket,
+                column,
+                chunkAddresses,
+                chunkLengths,
+                keyLengths,
+                valueLengths,
+                entryCount,
+                woh);
+    }
+
+    /**
      * Merge one bytes column value with direct ByteBuffer input.
      *
      * <p>The key/value buffers are caller-owned and can be reused by the caller across invocations.
@@ -1135,6 +1166,32 @@ public final class Db extends NativeObject {
                 roh);
     }
 
+    /** Opens a streaming multi-get builder with the given initial result-buffer size. */
+    public StreamingMultiGet streamingMultiGet(ReadOptions options, int bufferSizeBytes) {
+        return new StreamingMultiGet(this, options, bufferSizeBytes);
+    }
+
+    int executeStreamingMultiGet(
+            long[] chunkAddresses,
+            int[] chunkLengths,
+            int[] buckets,
+            int[] keyLengths,
+            int keyCount,
+            ByteBuffer resultBuffer,
+            ReadOptions options) {
+        long roh = options == null ? 0L : options.getNativeHandle();
+        return multiGetBytesDirectChunksWithOptions(
+                nativeHandle,
+                chunkAddresses,
+                chunkLengths,
+                buckets,
+                keyLengths,
+                keyCount,
+                DirectIoUtils.directAddress(resultBuffer),
+                resultBuffer.capacity(),
+                roh);
+    }
+
     // ── metadata / time ───────────────────────────────────────────────────
 
     /** Return the DB runtime id. */
@@ -1330,6 +1387,17 @@ public final class Db extends NativeObject {
             int entryCount,
             long writeOptionsHandle);
 
+    private static native void putBytesDirectChunksWithOptions(
+            long nativeHandle,
+            int bucket,
+            int column,
+            long[] chunkAddresses,
+            int[] chunkLengths,
+            int[] keyLengths,
+            int[] valueLengths,
+            int entryCount,
+            long writeOptionsHandle);
+
     private static native void mergeBytes(
             long nativeHandle, int bucket, byte[] key, int column, byte[] value);
 
@@ -1422,6 +1490,17 @@ public final class Db extends NativeObject {
 
     private static native int multiGetEncodedDirectWithOptions(
             long nativeHandle, long ioAddress, int ioCapacity, long readOptionsHandle);
+
+    private static native int multiGetBytesDirectChunksWithOptions(
+            long nativeHandle,
+            long[] chunkAddresses,
+            int[] chunkLengths,
+            int[] buckets,
+            int[] keyLengths,
+            int keyCount,
+            long resultAddress,
+            int resultCapacity,
+            long readOptionsHandle);
 
     static native ByteBuffer getLastDirectOverflowBuffer();
 
