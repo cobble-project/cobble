@@ -47,6 +47,7 @@ pub fn prune_shard_snapshot(
         config.snapshot_only_track,
         config.snapshot_disable_incremental_base_link,
         Vec::new(),
+        config.time_provider.create(),
     );
     for entry in &loaded {
         snapshot_manager.import_snapshot_from_manifest(

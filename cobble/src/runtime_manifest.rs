@@ -32,6 +32,9 @@ const RUNTIME_MANIFEST_PREFIX: &str = "MANIFEST-";
 pub(crate) struct RuntimeManifest {
     pub(crate) generation: u64,
     pub(crate) seq_id: u64,
+    /// Logical database time when this persisted layout was observed. Zero means unknown.
+    #[serde(default)]
+    pub(crate) timestamp_seconds: u32,
     /// Declares which process owns compaction for this observed layout.
     ///
     /// Manifests written before this field existed are writer-managed.
@@ -53,6 +56,9 @@ pub(crate) struct RuntimeIncrementalManifest {
     pub(crate) generation: u64,
     pub(crate) base_generation: u64,
     pub(crate) seq_id: u64,
+    /// Logical database time when this persisted layout was observed. Zero means unknown.
+    #[serde(default)]
+    pub(crate) timestamp_seconds: u32,
     #[serde(default)]
     pub(crate) compaction_mode: CompactionMode,
     #[serde(default)]
@@ -145,6 +151,7 @@ pub(crate) fn build_runtime_manifest(
         generation: current.generation,
         base_generation: base.generation,
         seq_id: current.seq_id,
+        timestamp_seconds: current.timestamp_seconds,
         compaction_mode: current.compaction_mode,
         topology_epoch: current.topology_epoch,
         latest_schema_id: current.latest_schema_id,
@@ -528,6 +535,7 @@ fn apply_runtime_incremental(
     let manifest = RuntimeManifest {
         generation: incremental.generation,
         seq_id: incremental.seq_id,
+        timestamp_seconds: incremental.timestamp_seconds,
         compaction_mode: incremental.compaction_mode,
         topology_epoch: incremental.topology_epoch,
         latest_schema_id: incremental.latest_schema_id,

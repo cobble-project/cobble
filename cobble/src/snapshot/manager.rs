@@ -20,6 +20,7 @@ use crate::file::{
 use crate::lsm::{LSMTreeVersion, Level};
 use crate::paths::schema_file_relative_path;
 use crate::schema::SchemaManager;
+use crate::time::TimeProvider;
 use crate::vlog::VlogVersion;
 use log::warn;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -56,6 +57,7 @@ pub(crate) struct SnapshotManager {
     materialize_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     materialize_done: Arc<Condvar>,
     upload_runtime: Arc<Runtime>,
+    time_provider: Arc<dyn TimeProvider>,
 }
 
 impl Clone for SnapshotManager {
@@ -73,6 +75,7 @@ impl Clone for SnapshotManager {
             materialize_worker: Arc::clone(&self.materialize_worker),
             materialize_done: Arc::clone(&self.materialize_done),
             upload_runtime: Arc::clone(&self.upload_runtime),
+            time_provider: Arc::clone(&self.time_provider),
         }
     }
 }
@@ -237,6 +240,7 @@ impl SnapshotManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         file_manager: Arc<FileManager>,
         schema_manager: Arc<SchemaManager>,
@@ -245,6 +249,7 @@ impl SnapshotManager {
         snapshot_only_track: bool,
         snapshot_disable_incremental_base_link: bool,
         bucket_ranges: Vec<RangeInclusive<u16>>,
+        time_provider: Arc<dyn TimeProvider>,
     ) -> Self {
         let upload_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -259,9 +264,11 @@ impl SnapshotManager {
             snapshot_disable_incremental_base_link,
             bucket_ranges,
             upload_runtime,
+            time_provider,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_for_maintenance(
         file_manager: Arc<FileManager>,
         schema_manager: Arc<SchemaManager>,
@@ -270,6 +277,7 @@ impl SnapshotManager {
         snapshot_only_track: bool,
         snapshot_disable_incremental_base_link: bool,
         bucket_ranges: Vec<RangeInclusive<u16>>,
+        time_provider: Arc<dyn TimeProvider>,
     ) -> Self {
         let upload_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -284,6 +292,7 @@ impl SnapshotManager {
             snapshot_disable_incremental_base_link,
             bucket_ranges,
             upload_runtime,
+            time_provider,
         )
     }
 
@@ -297,6 +306,7 @@ impl SnapshotManager {
         snapshot_disable_incremental_base_link: bool,
         bucket_ranges: Vec<RangeInclusive<u16>>,
         upload_runtime: Runtime,
+        time_provider: Arc<dyn TimeProvider>,
     ) -> Self {
         Self {
             file_manager,
@@ -320,6 +330,7 @@ impl SnapshotManager {
             materialize_worker: Arc::new(Mutex::new(None)),
             materialize_done: Arc::new(Condvar::new()),
             upload_runtime: Arc::new(upload_runtime),
+            time_provider,
         }
     }
 
@@ -351,6 +362,7 @@ impl SnapshotManager {
         state.next_id += 1;
         let manifest_path = self.file_manager.metadata_path(&snapshot_manifest_name(id));
         let mut snapshot = DbSnapshot::new(id, &manifest_path, callback);
+        snapshot.timestamp_seconds = self.time_provider.now_seconds();
         snapshot.bucket_ranges = self.bucket_ranges.read().unwrap().clone();
         let snapshot = Arc::new(snapshot);
         state.snapshots.insert(id, Arc::clone(&snapshot));
@@ -640,6 +652,7 @@ impl SnapshotManager {
             collect_schema_ids_from_lsm_versions(&lsm_versions, manifest.latest_schema_id);
         let snapshot = Arc::new(DbSnapshot {
             id: snapshot_id,
+            timestamp_seconds: manifest.timestamp_seconds,
             manifest_path,
             base_snapshot_id,
             lsm_versions,
@@ -873,6 +886,7 @@ impl SnapshotManager {
                     .unwrap_or_else(|| s.manifest_path.clone());
                 SnapshotManifestInfo {
                     id: s.id,
+                    timestamp_seconds: s.timestamp_seconds,
                     manifest_path,
                     bucket_ranges: s.bucket_ranges.clone(),
                     latest_schema_id: s.latest_schema_id,

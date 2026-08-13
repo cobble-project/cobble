@@ -3,6 +3,27 @@ use crate::config::{CompactionMode, VolumeDescriptor, VolumeUsageKind};
 use crate::file::{File, SequentialWriteFile};
 
 #[test]
+fn ttl_cutoff_uses_the_observed_manifest_timestamp() {
+    let observation = DedicatedObservation {
+        source: DedicatedCompactionSource::Runtime {
+            generation: 7,
+            seq_id: 11,
+        },
+        compaction_mode: CompactionMode::Dedicated,
+        timestamp_seconds: 1_234,
+        topology_epoch: 0,
+        latest_schema_id: 0,
+        tree_scopes: Vec::new(),
+        tree_levels: Vec::new(),
+        vlog_files: Vec::new(),
+        truncation_cursors: Vec::new(),
+    };
+
+    assert_eq!(observation.ttl_cutoff_seconds(true), 1_234);
+    assert_eq!(observation.ttl_cutoff_seconds(false), 0);
+}
+
+#[test]
 fn dedicated_compactor_uses_writer_property_volumes() {
     let meta_dir = tempfile::tempdir().unwrap();
     let writer_data_dir = tempfile::tempdir().unwrap();

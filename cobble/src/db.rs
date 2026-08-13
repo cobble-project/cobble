@@ -1196,7 +1196,6 @@ impl Db {
         F: Fn(Result<crate::coordinator::ShardSnapshotInput>) + Send + Sync + 'static,
     {
         let db_id = self.id.clone();
-        let timestamp_seconds = self.now_seconds();
         let schema_manager = Arc::clone(&self.schema_manager);
         let wrapper: SnapshotCallback = Arc::new(move |result: Result<SnapshotManifestInfo>| {
             callback(result.and_then(|info| {
@@ -1209,7 +1208,7 @@ impl Db {
                     db_id: db_id.clone(),
                     snapshot_id: info.id,
                     manifest_path: info.manifest_path,
-                    timestamp_seconds,
+                    timestamp_seconds: info.timestamp_seconds,
                     data_size_bytes: info.data_size_bytes,
                     incremental_data_size_bytes: info.incremental_data_size_bytes,
                 })
@@ -1408,7 +1407,7 @@ impl Db {
             db_id: self.id.clone(),
             snapshot_id,
             manifest_path,
-            timestamp_seconds: 0,
+            timestamp_seconds: manifest.timestamp_seconds,
             data_size_bytes: manifest.data_size_bytes,
             incremental_data_size_bytes: manifest.incremental_data_size_bytes,
         })
@@ -1590,6 +1589,7 @@ impl Db {
             config.snapshot_only_track,
             config.snapshot_disable_incremental_base_link,
             bucket_ranges.clone(),
+            Arc::clone(&time_provider),
         );
 
         // Memtable manager setup
@@ -1628,6 +1628,7 @@ impl Db {
                     Arc::clone(&db_state),
                     Arc::clone(&db_lifecycle),
                     config.compaction_mode,
+                    Arc::clone(&time_provider),
                 )?,
             ))
         } else {

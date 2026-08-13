@@ -79,6 +79,7 @@ fn decode_manifest_v2_backward_compatible_defaults_max_expired_at() {
         ManifestPayload::Snapshot(s) => {
             let file = &s.tree_levels[0][0].files[0];
             assert_eq!(file.max_expired_at, 0);
+            assert_eq!(s.timestamp_seconds, 0);
         }
         _ => panic!("expected snapshot payload"),
     }

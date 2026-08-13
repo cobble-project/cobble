@@ -7,8 +7,8 @@ use crate::snapshot::SnapshotLifecycleState;
 use crate::r#type::encode_merge_separated_array;
 use crate::{
     CompactionMode, DbBuilder, DbGovernance, GovernanceMode, MemtableType, ReadOptions,
-    RuntimeManifestMode, ScanOptions, U32CounterMergeOperator, U64CounterMergeOperator,
-    VolumeDescriptor, VolumeUsageKind, WriteOptions,
+    RuntimeManifestMode, ScanOptions, TimeProviderKind, U32CounterMergeOperator,
+    U64CounterMergeOperator, VolumeDescriptor, VolumeUsageKind, WriteOptions,
 };
 use bytes::BytesMut;
 use serial_test::serial;
@@ -1212,6 +1212,7 @@ fn runtime_manifest_embedded_mode_publishes_initial_flush_and_final_state() {
     let mut config = config_with_small_memtable(root);
     config.runtime_manifest_mode = RuntimeManifestMode::Enabled;
     config.governance_mode = GovernanceMode::Noop;
+    config.time_provider = TimeProviderKind::Manual;
     let db = open_db(config);
     let store = runtime_manifest_store(&db);
 
@@ -1238,6 +1239,7 @@ fn runtime_manifest_embedded_mode_publishes_initial_flush_and_final_state() {
     );
 
     let current_seq_id = db.db_state.load().seq_id;
+    db.set_time(11);
     db.runtime_manifest_publisher
         .as_ref()
         .expect("enabled runtime manifest publisher")
@@ -1250,7 +1252,9 @@ fn runtime_manifest_embedded_mode_publishes_initial_flush_and_final_state() {
         "coalesced no-op observations must not consume generations"
     );
     assert!(barrier.manifest.seq_id >= current_seq_id);
+    assert_eq!(barrier.manifest.timestamp_seconds, 11);
 
+    db.set_time(22);
     db.put(0, b"runtime-key", 0, vec![b'x'; 96]).unwrap();
     db.memtable_manager.flush_active().unwrap();
     db.memtable_manager.wait_for_flushes();
@@ -1263,6 +1267,7 @@ fn runtime_manifest_embedded_mode_publishes_initial_flush_and_final_state() {
             .flat_map(|levels| levels.iter())
             .any(|level| !level.files.is_empty())
     );
+    assert_eq!(flushed.manifest.timestamp_seconds, 22);
 
     db.advance_truncation_cursor_by_id(0, DEFAULT_COLUMN_FAMILY_ID, b"runtime-key")
         .unwrap();

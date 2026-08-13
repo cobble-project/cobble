@@ -57,6 +57,8 @@ impl SnapshotLifecycleState {
 #[derive(Clone)]
 pub(crate) struct DbSnapshot {
     pub id: u64,
+    /// Logical database time captured when this snapshot was created.
+    pub timestamp_seconds: u32,
     pub manifest_path: String,
     pub base_snapshot_id: Option<u64>,
     // Per-tree LSM versions without tracked file references.
@@ -92,6 +94,7 @@ pub(crate) struct DbSnapshot {
 #[derive(Clone)]
 pub(crate) struct SnapshotManifestInfo {
     pub id: u64,
+    pub timestamp_seconds: u32,
     pub manifest_path: String,
     pub bucket_ranges: Vec<RangeInclusive<u16>>,
     pub latest_schema_id: u64,
@@ -106,6 +109,7 @@ impl DbSnapshot {
     pub(crate) fn new(id: u64, manifest_path: &str, callback: Option<SnapshotCallback>) -> Self {
         Self {
             id,
+            timestamp_seconds: 0,
             manifest_path: manifest_path.to_string(),
             base_snapshot_id: None,
             lsm_versions: vec![],

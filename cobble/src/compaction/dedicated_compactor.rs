@@ -37,7 +37,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::runtime_manifest::{LoadedRuntimeManifest, RuntimeManifestStore};
 use crate::schema::SchemaManager;
 use crate::snapshot::manifest::{list_snapshot_manifest_ids, load_manifest_for_snapshot};
-use crate::time::{ManualTimeProvider, TimeProvider};
+use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::util::normalize_storage_path_to_url;
 use crate::writer_options::WriterOptionsFactory;
@@ -70,7 +70,6 @@ pub struct DedicatedCompactor {
     executor: CompactionExecutor,
     db_lifecycle: Arc<DbLifecycle>,
     compaction_metrics: Arc<CompactionTaskMetrics>,
-    time_provider: Arc<dyn TimeProvider>,
     stop: Arc<AtomicBool>,
 }
 
@@ -309,6 +308,7 @@ pub(crate) enum DedicatedCompactionStep {
 struct DedicatedObservation {
     source: DedicatedCompactionSource,
     compaction_mode: CompactionMode,
+    timestamp_seconds: u32,
     topology_epoch: u64,
     latest_schema_id: u64,
     tree_scopes: Vec<LSMTreeScope>,
@@ -324,6 +324,14 @@ struct RebuiltObservation {
 }
 
 impl DedicatedObservation {
+    fn ttl_cutoff_seconds(&self, ttl_enabled: bool) -> u32 {
+        if ttl_enabled {
+            self.timestamp_seconds
+        } else {
+            0
+        }
+    }
+
     fn from_runtime(loaded: LoadedRuntimeManifest) -> Self {
         let manifest = loaded.manifest;
         Self {
@@ -332,6 +340,7 @@ impl DedicatedObservation {
                 seq_id: manifest.seq_id,
             },
             compaction_mode: manifest.compaction_mode,
+            timestamp_seconds: manifest.timestamp_seconds,
             topology_epoch: manifest.topology_epoch,
             latest_schema_id: manifest.latest_schema_id,
             tree_scopes: manifest.tree_scopes,
@@ -352,6 +361,7 @@ impl DedicatedObservation {
                 seq_id: manifest.seq_id,
             },
             compaction_mode,
+            timestamp_seconds: manifest.timestamp_seconds,
             topology_epoch: manifest.topology_epoch,
             latest_schema_id: manifest.latest_schema_id,
             tree_scopes: manifest.tree_scopes,
@@ -403,7 +413,6 @@ impl DedicatedCompactor {
         let executor =
             CompactionExecutor::new_without_runtime(compaction_config, Arc::clone(&db_lifecycle));
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new(&db_id));
-        let time_provider = config.time_provider.create();
         let poll_interval = Duration::from_millis(config.compaction_dedicated_poll_interval_ms);
         // Compute the heartbeat interval as orphan_min_age / 3 (in ms), capped at poll_interval.
         // This ensures the lease is refreshed well before the orphan sweep considers it stale,
@@ -427,7 +436,6 @@ impl DedicatedCompactor {
             executor,
             db_lifecycle,
             compaction_metrics,
-            time_provider,
             stop: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -534,11 +542,7 @@ impl DedicatedCompactor {
             let mut policy = Self::make_policy(self.config.compaction_policy);
             // Sample time once per task. Planning, file-level expiration, and rewrite filtering
             // must use the same cutoff even when a large compaction runs for several seconds.
-            let now_seconds = if self.config.ttl_enabled {
-                self.time_provider.now_seconds()
-            } else {
-                0
-            };
+            let now_seconds = observation.ttl_cutoff_seconds(self.config.ttl_enabled);
             let policy_context = CompactionPolicyContext {
                 truncation_cursors: Some(&rebuilt.truncation_cursors),
                 tree_scope: Some(tree_scope),

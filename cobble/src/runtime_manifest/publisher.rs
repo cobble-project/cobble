@@ -13,6 +13,7 @@ use crate::manifest_model::{
     manifest_truncation_cursors,
 };
 use crate::schema::SchemaManager;
+use crate::time::TimeProvider;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -37,6 +38,7 @@ struct RuntimeManifestPublisher {
     db_state: Arc<DbStateHandle>,
     lifecycle: Arc<DbLifecycle>,
     compaction_mode: CompactionMode,
+    time_provider: Arc<dyn TimeProvider>,
     publication: Mutex<PublicationState>,
     stop: AtomicBool,
 }
@@ -57,6 +59,7 @@ impl RuntimeManifestPublisherHandle {
         db_state: Arc<DbStateHandle>,
         lifecycle: Arc<DbLifecycle>,
         compaction_mode: CompactionMode,
+        time_provider: Arc<dyn TimeProvider>,
     ) -> Result<Self> {
         let store = RuntimeManifestStore::new(Arc::clone(&file_manager));
         let current = store.load_current()?;
@@ -68,6 +71,7 @@ impl RuntimeManifestPublisherHandle {
             db_state,
             lifecycle,
             compaction_mode,
+            time_provider,
             publication: Mutex::new(PublicationState {
                 current,
                 next_generation,
@@ -298,6 +302,7 @@ impl RuntimeManifestPublisher {
             generation,
             latest_schema_id,
             self.compaction_mode,
+            self.time_provider.now_seconds(),
         )?;
 
         if !force
@@ -393,11 +398,13 @@ fn runtime_manifest_from_state(
     generation: u64,
     latest_schema_id: u64,
     compaction_mode: CompactionMode,
+    timestamp_seconds: u32,
 ) -> Result<RuntimeManifest> {
     let tree_versions = state.multi_lsm_version.tree_versions_cloned();
     Ok(RuntimeManifest {
         generation,
         seq_id: state.seq_id,
+        timestamp_seconds,
         compaction_mode,
         topology_epoch: state.topology_epoch,
         latest_schema_id,

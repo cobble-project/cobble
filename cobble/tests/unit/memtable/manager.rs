@@ -159,6 +159,7 @@ fn active_snapshot_capture_end_excludes_later_tail_and_restores() {
         false,
         false,
         vec![0..=u16::MAX],
+        Arc::new(crate::time::SystemTimeProvider),
     );
     let active = Arc::new(RwLock::new(ActiveMemtable {
         id: Uuid::new_v4(),
@@ -251,6 +252,7 @@ fn incremental_snapshot_scheduling_seals_active_before_later_writes() {
         false,
         false,
         vec![0..=u16::MAX],
+        Arc::new(crate::time::SystemTimeProvider),
     );
     let manager = MemtableManager::new(
         file_manager,
@@ -688,6 +690,7 @@ fn hash_capacity_full_rotation_uses_recommended_bucket_count() {
         false,
         false,
         vec![0..=u16::MAX],
+        Arc::new(crate::time::SystemTimeProvider),
     );
     let manager = MemtableManager::new(
         Arc::clone(&file_manager),
@@ -1415,6 +1418,7 @@ fn test_restore_active_memtable_snapshot_to_l0_stays_in_matching_column_family_s
         false,
         false,
         vec![0u16..=0u16],
+        Arc::new(crate::time::SystemTimeProvider),
     );
     let snapshot_write = MemtableManager::write_active_memtable_snapshot_data(
         1,
@@ -1571,6 +1575,7 @@ fn test_restore_active_memtable_snapshot_to_l0_preserves_shared_vlog_across_scop
         false,
         false,
         vec![0u16..=0u16],
+        Arc::new(crate::time::SystemTimeProvider),
     );
     let snapshot_write = MemtableManager::write_active_memtable_snapshot_data(
         1,

@@ -24,13 +24,17 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Snapshot manifests version 2 are the Cobble 0.3 format. Version 3 adds the 0.4 file metadata,
-/// replica origins, topology epoch, and WAL recovery fields.
+/// replica origins, topology epoch, and WAL recovery fields. Optional fields added within version
+/// 3 must retain safe defaults so current readers can consume earlier version-3 manifests.
 pub(crate) const MANIFEST_VERSION_CURRENT: u32 = 3;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ManifestSnapshot {
     pub(crate) version: u32,
     pub(crate) id: u64,
+    /// Logical database time when this snapshot was captured. Zero means unknown.
+    #[serde(default)]
+    pub(crate) timestamp_seconds: u32,
     pub(crate) seq_id: u64,
     #[serde(default)]
     pub(crate) topology_epoch: u64,
@@ -56,6 +60,9 @@ pub(crate) struct ManifestSnapshot {
 pub(crate) struct ManifestIncrementalSnapshot {
     pub(crate) version: u32,
     pub(crate) id: u64,
+    /// Logical database time when this snapshot was captured. Zero means unknown.
+    #[serde(default)]
+    pub(crate) timestamp_seconds: u32,
     pub(crate) seq_id: u64,
     #[serde(default)]
     pub(crate) topology_epoch: u64,
@@ -174,6 +181,7 @@ pub(crate) fn load_manifest_entry(
                     &incremental.tree_level_edits,
                 )?;
                 resolved.version = incremental.version;
+                resolved.timestamp_seconds = incremental.timestamp_seconds;
                 resolved.topology_epoch = incremental.topology_epoch;
                 resolved.wal_checkpoint_id = incremental.wal_checkpoint_id;
                 resolved.wal_volume = incremental.wal_volume;
@@ -248,6 +256,7 @@ pub(crate) fn load_manifest_chain(
                     &manifest.tree_level_edits,
                 )?;
                 resolved_base.version = manifest.version;
+                resolved_base.timestamp_seconds = manifest.timestamp_seconds;
                 resolved_base.topology_epoch = manifest.topology_epoch;
                 resolved_base.wal_checkpoint_id = manifest.wal_checkpoint_id;
                 resolved_base.wal_volume = manifest.wal_volume;
@@ -327,6 +336,7 @@ pub(crate) fn load_manifest_chain_from_path(
                     &manifest.tree_level_edits,
                 )?;
                 resolved_base.version = manifest.version;
+                resolved_base.timestamp_seconds = manifest.timestamp_seconds;
                 resolved_base.topology_epoch = manifest.topology_epoch;
                 resolved_base.wal_checkpoint_id = manifest.wal_checkpoint_id;
                 resolved_base.wal_volume = manifest.wal_volume;
@@ -492,6 +502,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             ManifestPayload::IncrementalSnapshot(ManifestIncrementalSnapshot {
                 version: MANIFEST_VERSION_CURRENT,
                 id: snapshot.id,
+                timestamp_seconds: snapshot.timestamp_seconds,
                 seq_id: snapshot.seq_id,
                 topology_epoch: snapshot.topology_epoch,
                 wal_checkpoint_id: snapshot.wal_checkpoint_id,
@@ -512,6 +523,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             ManifestPayload::Snapshot(ManifestSnapshot {
                 version: MANIFEST_VERSION_CURRENT,
                 id: snapshot.id,
+                timestamp_seconds: snapshot.timestamp_seconds,
                 seq_id: snapshot.seq_id,
                 topology_epoch: snapshot.topology_epoch,
                 wal_checkpoint_id: snapshot.wal_checkpoint_id,
@@ -532,6 +544,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
         ManifestPayload::Snapshot(ManifestSnapshot {
             version: MANIFEST_VERSION_CURRENT,
             id: snapshot.id,
+            timestamp_seconds: snapshot.timestamp_seconds,
             seq_id: snapshot.seq_id,
             topology_epoch: snapshot.topology_epoch,
             wal_checkpoint_id: snapshot.wal_checkpoint_id,

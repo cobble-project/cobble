@@ -745,6 +745,44 @@ fn test_db_ttl_put_get_with_manual_time() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_snapshot_manifest_captures_manual_time() {
+    let root = "/tmp/db_it_snapshot_timestamp";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_mib(1),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        time_provider: TimeProviderKind::Manual,
+        block_cache_size: Size::from_const(0),
+        ..Config::default()
+    };
+    let db = open_db(config);
+    db.set_time(1_234);
+    db.put(0, b"key", 0, b"value").unwrap();
+
+    let snapshot_id = db.snapshot().unwrap();
+    let manifest: JsonValue =
+        serde_json::from_str(&wait_for_manifest_in_db(root, db.id(), snapshot_id)).unwrap();
+    assert_eq!(
+        manifest
+            .get("timestamp_seconds")
+            .and_then(JsonValue::as_u64),
+        Some(1_234)
+    );
+    assert_eq!(
+        db.shard_snapshot_input(snapshot_id)
+            .unwrap()
+            .timestamp_seconds,
+        1_234
+    );
+
+    db.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_ttl_default_ttl_with_manual_time() {
     let root = "/tmp/db_it_ttl_default";
     cleanup_test_root(root);

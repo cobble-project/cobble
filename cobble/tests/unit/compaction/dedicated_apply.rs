@@ -197,6 +197,7 @@ fn snapshot_tree_lookup_uses_scope_instead_of_current_index() {
     let manifest = crate::snapshot::manifest::ManifestSnapshot {
         version: crate::snapshot::manifest::MANIFEST_VERSION_CURRENT,
         id: 7,
+        timestamp_seconds: 0,
         seq_id: 11,
         topology_epoch: 0,
         wal_checkpoint_id: 0,
