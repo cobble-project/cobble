@@ -28,6 +28,7 @@ fn manifest(generation: u64, levels: Vec<Vec<ManifestLevel>>) -> RuntimeManifest
     RuntimeManifest {
         generation,
         seq_id: generation,
+        compaction_mode: CompactionMode::Embedded,
         topology_epoch: 0,
         latest_schema_id: 1,
         bucket_ranges: vec![0..=0],
@@ -99,6 +100,68 @@ fn full_round_trip_and_atomic_current_publication() {
     let loaded = store.load_current().unwrap().unwrap();
     assert_eq!(loaded.chain_depth, 1);
     assert_eq!(loaded.manifest, current);
+}
+
+#[test]
+fn missing_compaction_mode_defaults_to_embedded_for_full_and_incremental_manifests() {
+    let envelope = RuntimeManifestEnvelope::full(manifest(1, vec![levels(&[1], &[])]));
+    let mut value = serde_json::to_value(envelope).unwrap();
+    value["manifest"]["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("compaction_mode");
+
+    let decoded = decode_runtime_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let RuntimeManifestPayload::Full(decoded) = decoded.manifest else {
+        panic!("expected full manifest");
+    };
+    assert_eq!(decoded.compaction_mode, CompactionMode::Embedded);
+
+    let base = manifest(1, vec![levels(&[1], &[])]);
+    let current = manifest(2, vec![levels(&[1, 2], &[])]);
+    let envelope = build_runtime_manifest(current, Some(&loaded(base, 1))).unwrap();
+    let mut value = serde_json::to_value(envelope).unwrap();
+    value["manifest"]["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("compaction_mode");
+    let decoded = decode_runtime_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let RuntimeManifestPayload::Incremental(decoded) = decoded.manifest else {
+        panic!("expected incremental manifest");
+    };
+    assert_eq!(decoded.compaction_mode, CompactionMode::Embedded);
+}
+
+#[test]
+fn compaction_mode_change_forces_a_full_manifest() {
+    let base = manifest(1, vec![levels(&[1], &[])]);
+    let mut current = manifest(2, vec![levels(&[1, 2], &[])]);
+    current.compaction_mode = CompactionMode::Dedicated;
+
+    assert!(matches!(
+        build_runtime_manifest(current, Some(&loaded(base, 1)))
+            .unwrap()
+            .manifest,
+        RuntimeManifestPayload::Full(_)
+    ));
+}
+
+#[test]
+fn dedicated_compaction_mode_survives_an_incremental_manifest() {
+    let mut base = manifest(1, vec![levels(&[1], &[])]);
+    base.compaction_mode = CompactionMode::Dedicated;
+    let mut current = manifest(2, vec![levels(&[1, 2], &[])]);
+    current.compaction_mode = CompactionMode::Dedicated;
+
+    let envelope = build_runtime_manifest(current.clone(), Some(&loaded(base.clone(), 1))).unwrap();
+    let RuntimeManifestPayload::Incremental(incremental) = envelope.manifest else {
+        panic!("expected incremental manifest");
+    };
+    assert_eq!(incremental.compaction_mode, CompactionMode::Dedicated);
+    assert_eq!(
+        apply_runtime_incremental(&base, &incremental).unwrap(),
+        current
+    );
 }
 
 #[test]
@@ -231,6 +294,7 @@ fn descriptor_change_falls_back_to_full_and_incremental_rejects_wrong_base_and_r
         generation: 2,
         base_generation: 99,
         seq_id: 2,
+        compaction_mode: CompactionMode::Embedded,
         topology_epoch: 0,
         latest_schema_id: 1,
         tree_level_edits: Vec::new(),
@@ -248,6 +312,7 @@ fn descriptor_change_falls_back_to_full_and_incremental_rejects_wrong_base_and_r
         generation: 2,
         base_generation: 1,
         seq_id: 0,
+        compaction_mode: CompactionMode::Embedded,
         topology_epoch: 0,
         latest_schema_id: 1,
         tree_level_edits: Vec::new(),
@@ -364,6 +429,7 @@ fn load_rejects_missing_base_cycle_duplicate_ids_and_corrupt_current() {
             generation: 2,
             base_generation: 1,
             seq_id: 2,
+            compaction_mode: CompactionMode::Embedded,
             topology_epoch: 0,
             latest_schema_id: 1,
             tree_level_edits: Vec::new(),
@@ -386,6 +452,7 @@ fn load_rejects_missing_base_cycle_duplicate_ids_and_corrupt_current() {
             generation: 3,
             base_generation: 4,
             seq_id: 3,
+            compaction_mode: CompactionMode::Embedded,
             topology_epoch: 0,
             latest_schema_id: 1,
             tree_level_edits: Vec::new(),
@@ -399,6 +466,7 @@ fn load_rejects_missing_base_cycle_duplicate_ids_and_corrupt_current() {
             generation: 4,
             base_generation: 3,
             seq_id: 4,
+            compaction_mode: CompactionMode::Embedded,
             topology_epoch: 0,
             latest_schema_id: 1,
             tree_level_edits: Vec::new(),
@@ -452,6 +520,7 @@ fn load_rejects_an_incremental_with_an_incomplete_resulting_order() {
             generation: 2,
             base_generation: 1,
             seq_id: 2,
+            compaction_mode: CompactionMode::Embedded,
             topology_epoch: 0,
             latest_schema_id: 1,
             tree_level_edits: vec![RuntimeTreeLevelEdit {

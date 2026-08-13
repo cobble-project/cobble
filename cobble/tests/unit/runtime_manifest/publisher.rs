@@ -5,6 +5,7 @@ fn manifest(generation: u64) -> RuntimeManifest {
     RuntimeManifest {
         generation,
         seq_id: generation,
+        compaction_mode: CompactionMode::Embedded,
         topology_epoch: 0,
         latest_schema_id: 0,
         bucket_ranges: Vec::new(),
@@ -23,6 +24,7 @@ fn incremental_envelope(generation: u64, base_generation: u64) -> RuntimeManifes
             generation,
             base_generation,
             seq_id: generation,
+            compaction_mode: CompactionMode::Embedded,
             topology_epoch: 0,
             latest_schema_id: 0,
             tree_level_edits: Vec::new(),

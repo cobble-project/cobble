@@ -1627,6 +1627,7 @@ impl Db {
                     Arc::clone(&schema_manager),
                     Arc::clone(&db_state),
                     Arc::clone(&db_lifecycle),
+                    config.compaction_mode,
                 )?,
             ))
         } else {

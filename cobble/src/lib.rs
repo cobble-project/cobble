@@ -139,8 +139,12 @@ mod write_batch;
 mod writer_options;
 
 pub use compaction::RemoteCompactionServer;
-pub use compaction::dedicated_compactor::DedicatedCompactor;
-pub use compaction::dedicated_service::DedicatedCompactionService;
+pub use compaction::dedicated_compactor::{
+    DedicatedCompactionExecution, DedicatedCompactionExecutor, DedicatedCompactionPlan,
+    DedicatedCompactionPlanStatus, DedicatedCompactionPlanner, DedicatedCompactionPlanning,
+    DedicatedCompactor,
+};
+pub use compaction::dedicated_service::{DedicatedCompactionMonitor, DedicatedCompactionService};
 pub use config::{
     CompactionMode, CompactionPolicyKind, Config, GovernanceMode, MemtableType,
     PrimaryVolumeOffloadPolicyKind, ReadOptions, RemoteCompactionFailureMode, RuntimeManifestMode,

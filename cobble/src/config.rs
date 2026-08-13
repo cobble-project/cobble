@@ -942,11 +942,6 @@ pub struct Config {
     /// Compression algorithm per level (index by level number).
     pub sst_compression_by_level: Vec<SstCompressionAlgorithm>,
     /// Whether TTL is enabled. If false, TTL metadata is ignored.
-    ///
-    /// **Known limitation:** TTL is not supported with `CompactionMode::Dedicated`. The config
-    /// validator rejects `ttl_enabled = true` combined with `compaction_mode = dedicated` because
-    /// the dedicated compactor process has no shared clock for expiration decisions. File-level TTL
-    /// cleanup is fully supported in `Embedded` and `Remote` compaction modes.
     pub ttl_enabled: bool,
     /// Default TTL duration (in seconds). None means no expiration by default.
     pub default_ttl_seconds: Option<u32>,
@@ -1501,13 +1496,6 @@ impl Config {
                 "compaction_mode=dedicated cannot be used with compaction_remote_addr".to_string(),
             ));
         }
-        if self.compaction_mode == CompactionMode::Dedicated && self.ttl_enabled {
-            return Err(Error::ConfigError(
-                "compaction_mode=dedicated does not yet support TTL; \
-                 disable ttl_enabled or use compaction_mode=embedded"
-                    .to_string(),
-            ));
-        }
         self.validate_wal()?;
         self.validate_dedicated_compaction()?;
         Ok(())
@@ -1538,8 +1526,8 @@ impl Config {
 
     /// Validates dedicated-compaction-specific config constraints.
     ///
-    /// This is `pub` so that the `DedicatedCompactor` (in a different crate) can re-validate
-    /// after CLI overrides (e.g. `--poll-interval`) that bypass `Config::from_path`.
+    /// This is public so callers can revalidate CLI overrides, such as `--poll-interval`, that
+    /// are applied after `Config::from_path`.
     pub fn validate_dedicated_compaction(&self) -> Result<()> {
         if self.compaction_mode != CompactionMode::Dedicated {
             return Ok(());

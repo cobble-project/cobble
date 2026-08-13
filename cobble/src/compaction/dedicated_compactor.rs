@@ -23,7 +23,7 @@ use crate::compaction::{
     CompactionConfig, CompactionExecutor, CompactionTask, CompactionTaskMetrics,
     build_compaction_config, build_writer_options, make_data_file_builder_factory,
 };
-use crate::config::Config;
+use crate::config::{CompactionMode, Config};
 use crate::db_state::LSMTreeScope;
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
@@ -37,8 +37,12 @@ use crate::metrics_manager::MetricsManager;
 use crate::runtime_manifest::{LoadedRuntimeManifest, RuntimeManifestStore};
 use crate::schema::SchemaManager;
 use crate::snapshot::manifest::{list_snapshot_manifest_ids, load_manifest_for_snapshot};
+use crate::time::{ManualTimeProvider, TimeProvider};
+use crate::ttl::{TTLProvider, TtlConfig};
+use crate::util::normalize_storage_path_to_url;
 use crate::writer_options::WriterOptionsFactory;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -66,18 +70,227 @@ pub struct DedicatedCompactor {
     executor: CompactionExecutor,
     db_lifecycle: Arc<DbLifecycle>,
     compaction_metrics: Arc<CompactionTaskMetrics>,
+    time_provider: Arc<dyn TimeProvider>,
     stop: Arc<AtomicBool>,
 }
 
-/// Lightweight availability result used by the multi-DB service scanner.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DedicatedCompactorProbe {
-    /// A durable writer observation exists and its referenced files and schemas are readable.
-    Ready,
-    /// The writer has not published its first configured observation yet.
+const DEDICATED_COMPACTION_PLAN_VERSION: u32 = 1;
+
+/// A portable compaction plan produced from one durable DB observation.
+///
+/// Planning does not mutate the DB or create output files. The plan may be queued, serialized,
+/// and executed by another process. Execution revalidates the durable observation and returns
+/// [`DedicatedCompactionExecution::Stale`] when the writer has advanced in the meantime.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DedicatedCompactionPlan {
+    version: u32,
+    job_id: String,
+    db_id: String,
+    volume_paths: Vec<String>,
+    source: DedicatedCompactionSource,
+    topology_epoch: u64,
+    tree_idx: usize,
+    tree_scope: LSMTreeScope,
+    input_level: u8,
+    output_level: u8,
+    base_file_id: u64,
+    trivial_move: bool,
+    drop_truncated: bool,
+    drop_expired: bool,
+    now_seconds: u32,
+}
+
+impl DedicatedCompactionPlan {
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    pub fn db_id(&self) -> &str {
+        &self.db_id
+    }
+
+    /// Resolves DB-specific volume paths onto caller-owned credentials and storage options.
+    pub fn execution_config(&self, base_config: &Config) -> Result<Config> {
+        if base_config.volumes.len() != self.volume_paths.len() {
+            return Err(Error::ConfigError(format!(
+                "Dedicated compaction plan for DB {} has {} volumes, but the executor config has {}",
+                self.db_id,
+                self.volume_paths.len(),
+                base_config.volumes.len()
+            )));
+        }
+        let mut config = base_config.clone();
+        for (volume, path) in config.volumes.iter_mut().zip(&self.volume_paths) {
+            volume.base_dir = apply_plan_volume_path(&volume.base_dir, path)?;
+        }
+        Ok(config)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|err| Error::InvalidState(format!("Failed to encode compaction plan: {err}")))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let plan: Self = serde_json::from_slice(bytes).map_err(|err| {
+            Error::InvalidState(format!("Failed to decode compaction plan: {err}"))
+        })?;
+        if plan.version != DEDICATED_COMPACTION_PLAN_VERSION {
+            return Err(Error::InvalidState(format!(
+                "Unsupported dedicated compaction plan version {} (expected {})",
+                plan.version, DEDICATED_COMPACTION_PLAN_VERSION
+            )));
+        }
+        if plan.volume_paths.is_empty() {
+            return Err(Error::InvalidState(
+                "Dedicated compaction plan has no volume paths".to_string(),
+            ));
+        }
+        for path in &plan.volume_paths {
+            let sanitized = sanitized_absolute_volume_path(path).map_err(|err| {
+                Error::InvalidState(format!(
+                    "Invalid dedicated compaction plan volume path {path}: {err}"
+                ))
+            })?;
+            if sanitized != *path {
+                return Err(Error::InvalidState(format!(
+                    "Dedicated compaction plan volume path must be absolute and credential-free: {path}"
+                )));
+            }
+        }
+        Ok(plan)
+    }
+
+    fn policy_plan(&self) -> crate::compaction::policy::CompactionPlan {
+        crate::compaction::policy::CompactionPlan {
+            input_level: self.input_level,
+            output_level: self.output_level,
+            base_file_id: self.base_file_id,
+            trivial_move: self.trivial_move,
+            drop_truncated: self.drop_truncated,
+            drop_expired: self.drop_expired,
+        }
+    }
+}
+
+/// Outcome of one non-mutating planning attempt.
+#[derive(Clone, Debug)]
+pub enum DedicatedCompactionPlanning {
+    Plan(DedicatedCompactionPlan),
     WaitingForObservation,
-    /// A previously published result is still waiting for the writer to consume it.
     WaitingForResult,
+    NoPlan,
+}
+
+/// Outcome of executing a previously produced plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DedicatedCompactionExecution {
+    ResultPublished { job_id: String },
+    WaitingForResult,
+    Stale,
+}
+
+/// Durable status of an emitted plan, used by monitors that do not receive executor callbacks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DedicatedCompactionPlanStatus {
+    Pending,
+    ResultPublished,
+    Stale,
+}
+
+/// Read-only planner for one Cobble DB.
+pub struct DedicatedCompactionPlanner {
+    inner: DedicatedCompactor,
+}
+
+impl DedicatedCompactionPlanner {
+    pub fn open(config: Config, db_id: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            inner: DedicatedCompactor::open(config, db_id)?,
+        })
+    }
+
+    pub fn open_with_resolver(
+        config: Config,
+        db_id: impl Into<String>,
+        resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: DedicatedCompactor::open_with_resolver(config, db_id, resolver)?,
+        })
+    }
+
+    pub fn plan(&self) -> Result<DedicatedCompactionPlanning> {
+        self.inner.plan_once()
+    }
+
+    pub fn status(&self, plan: &DedicatedCompactionPlan) -> Result<DedicatedCompactionPlanStatus> {
+        self.inner.plan_status(plan)
+    }
+}
+
+struct DedicatedCompactionPlanExecutor {
+    inner: DedicatedCompactor,
+}
+
+impl DedicatedCompactionPlanExecutor {
+    fn open_with_resolver(
+        config: Config,
+        db_id: impl Into<String>,
+        resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: DedicatedCompactor::open_with_resolver(config, db_id, resolver)?,
+        })
+    }
+
+    fn open_for_plan(
+        base_config: &Config,
+        plan: &DedicatedCompactionPlan,
+        resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        Self::open_with_resolver(plan.execution_config(base_config)?, plan.db_id(), resolver)
+    }
+
+    fn execute(&self, plan: &DedicatedCompactionPlan) -> Result<DedicatedCompactionExecution> {
+        self.inner.execute_plan(plan)
+    }
+}
+
+/// Long-lived executor for portable plans produced by a dedicated compaction monitor.
+///
+/// The executor owns credentials and storage options. Plans only identify their DB and volume
+/// paths, so they can be serialized into a queue without exposing credentials. Each execution
+/// uses a short-lived per-DB context so writer-side runtime-manifest guards are released promptly.
+pub struct DedicatedCompactionExecutor {
+    base_config: Config,
+    resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+}
+
+impl DedicatedCompactionExecutor {
+    pub fn open(config: Config) -> Result<Self> {
+        Self::open_with_resolver(config, None)
+    }
+
+    pub fn open_with_resolver(
+        config: Config,
+        resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        config.validate_dedicated_compactor()?;
+        Ok(Self {
+            base_config: config,
+            resolver,
+        })
+    }
+
+    pub fn execute(&self, plan: &DedicatedCompactionPlan) -> Result<DedicatedCompactionExecution> {
+        DedicatedCompactionPlanExecutor::open_for_plan(
+            &self.base_config,
+            plan,
+            self.resolver.clone(),
+        )?
+        .execute(plan)
+    }
 }
 
 /// Result of one non-blocking scheduling step.
@@ -95,6 +308,7 @@ pub(crate) enum DedicatedCompactionStep {
 
 struct DedicatedObservation {
     source: DedicatedCompactionSource,
+    compaction_mode: CompactionMode,
     topology_epoch: u64,
     latest_schema_id: u64,
     tree_scopes: Vec<LSMTreeScope>,
@@ -117,6 +331,7 @@ impl DedicatedObservation {
                 generation: loaded.generation,
                 seq_id: manifest.seq_id,
             },
+            compaction_mode: manifest.compaction_mode,
             topology_epoch: manifest.topology_epoch,
             latest_schema_id: manifest.latest_schema_id,
             tree_scopes: manifest.tree_scopes,
@@ -129,12 +344,14 @@ impl DedicatedObservation {
     fn from_snapshot(
         snapshot_id: u64,
         manifest: crate::snapshot::manifest::ManifestSnapshot,
+        compaction_mode: CompactionMode,
     ) -> Self {
         Self {
             source: DedicatedCompactionSource::Snapshot {
                 snapshot_id,
                 seq_id: manifest.seq_id,
             },
+            compaction_mode,
             topology_epoch: manifest.topology_epoch,
             latest_schema_id: manifest.latest_schema_id,
             tree_scopes: manifest.tree_scopes,
@@ -156,7 +373,6 @@ impl DedicatedCompactor {
     }
 
     /// Opens a dedicated compactor with an optional merge operator resolver.
-    #[allow(clippy::too_many_arguments)]
     pub fn open_with_resolver(
         process_config: Config,
         db_id: impl Into<String>,
@@ -187,6 +403,7 @@ impl DedicatedCompactor {
         let executor =
             CompactionExecutor::new_without_runtime(compaction_config, Arc::clone(&db_lifecycle));
         let compaction_metrics = Arc::new(CompactionTaskMetrics::new(&db_id));
+        let time_provider = config.time_provider.create();
         let poll_interval = Duration::from_millis(config.compaction_dedicated_poll_interval_ms);
         // Compute the heartbeat interval as orphan_min_age / 3 (in ms), capped at poll_interval.
         // This ensures the lease is refreshed well before the orphan sweep considers it stale,
@@ -210,6 +427,7 @@ impl DedicatedCompactor {
             executor,
             db_lifecycle,
             compaction_metrics,
+            time_provider,
             stop: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -253,27 +471,34 @@ impl DedicatedCompactor {
         Ok(())
     }
 
-    /// Validates that this shard is ready to be scheduled without executing compaction.
-    ///
-    /// This is intentionally more than a directory probe: the scanner verifies the selected
-    /// runtime/snapshot manifest, all referenced files, schemas, VLOG descriptors, and
-    /// truncation cursors before consuming a worker slot.
-    pub(crate) fn probe(&self) -> Result<DedicatedCompactorProbe> {
-        let existing_jobs = crate::compaction::dedicated::list_dedicated_compaction_result_job_ids(
-            &self.file_manager,
-        )?;
-        if !existing_jobs.is_empty() {
-            return Ok(DedicatedCompactorProbe::WaitingForResult);
-        }
-        let Some(observation) = self.load_observation()? else {
-            return Ok(DedicatedCompactorProbe::WaitingForObservation);
-        };
-        let _rebuilt = self.rebuild_observation(&observation)?;
-        Ok(DedicatedCompactorProbe::Ready)
-    }
-
     /// Executes one scheduling step without sleeping or waiting for writer acknowledgement.
     pub(crate) fn run_once_step(&self) -> Result<DedicatedCompactionStep> {
+        let plan = match self.plan_once()? {
+            DedicatedCompactionPlanning::Plan(plan) => plan,
+            DedicatedCompactionPlanning::WaitingForObservation => {
+                return Ok(DedicatedCompactionStep::WaitingForObservation);
+            }
+            DedicatedCompactionPlanning::WaitingForResult => {
+                return Ok(DedicatedCompactionStep::WaitingForResult);
+            }
+            DedicatedCompactionPlanning::NoPlan => return Ok(DedicatedCompactionStep::NoPlan),
+        };
+        match self.execute_plan(&plan)? {
+            DedicatedCompactionExecution::ResultPublished { job_id } => {
+                Ok(DedicatedCompactionStep::ResultPublished { job_id })
+            }
+            DedicatedCompactionExecution::WaitingForResult => {
+                Ok(DedicatedCompactionStep::WaitingForResult)
+            }
+            DedicatedCompactionExecution::Stale => Ok(DedicatedCompactionStep::NoPlan),
+        }
+    }
+
+    fn plan_once(&self) -> Result<DedicatedCompactionPlanning> {
+        if self.config.compaction_mode != CompactionMode::Dedicated {
+            debug!("writer config owns compaction; skipping dedicated planning");
+            return Ok(DedicatedCompactionPlanning::NoPlan);
+        }
         // Step 1: Check if there's an unprocessed result. If so, wait for the writer to delete it.
         let existing_jobs = crate::compaction::dedicated::list_dedicated_compaction_result_job_ids(
             &self.file_manager,
@@ -283,7 +508,7 @@ impl DedicatedCompactor {
                 "waiting for writer to consume {} existing result(s)",
                 existing_jobs.len()
             );
-            return Ok(DedicatedCompactionStep::WaitingForResult);
+            return Ok(DedicatedCompactionPlanning::WaitingForResult);
         }
 
         // Step 2: Read the configured durable writer observation source. Runtime manifests are
@@ -291,47 +516,33 @@ impl DedicatedCompactor {
         // started yet, not that we should silently fall back to a snapshot.
         let Some(observation) = self.load_observation()? else {
             debug!("no dedicated compaction observation is available; waiting for writer");
-            return Ok(DedicatedCompactionStep::WaitingForObservation);
+            return Ok(DedicatedCompactionPlanning::WaitingForObservation);
         };
+        if observation.compaction_mode != CompactionMode::Dedicated {
+            debug!("writer owns compaction; skipping dedicated planning");
+            return Ok(DedicatedCompactionPlanning::NoPlan);
+        }
         let rebuilt = self.rebuild_observation(&observation)?;
         let tree_scopes = &observation.tree_scopes;
 
-        // Advance the compactor's file-id allocator past all file ids in the manifest.
-        // The compactor's FileManager is a separate instance from the writer's, so its
-        // `next_file_id` starts at 1. Without this, the executor would allocate output file
-        // ids (1, 2, ...) that collide with the writer's canonical ids already registered
-        // readonly via `build_tree_versions_from_manifest`. A collision causes
-        // `register_data_file` to silently keep the old path (via `or_insert_with`), so the
-        // compactor would publish input descriptors with the wrong (output) paths, and the
-        // writer's fingerprint matching would fail.
-        let max_manifest_file_id = observation
-            .tree_levels
-            .iter()
-            .flat_map(|levels| levels.iter())
-            .flat_map(|level| level.files.iter())
-            .map(|f| f.file_id)
-            .max()
-            .unwrap_or(0);
-        let next = self.file_manager.peek_next_file_id();
-        if next <= max_manifest_file_id {
-            self.file_manager.set_next_file_id(max_manifest_file_id + 1);
-        }
-
-        // Step 4: For each tree, try to select a compaction plan.
+        // For each tree, try to select a compaction plan.
         let compaction_config = build_compaction_config(&self.config, self.config.num_columns)?;
         for (tree_idx, tree_version) in rebuilt.tree_versions.iter().enumerate() {
             let Some(tree_scope) = tree_scopes.get(tree_idx) else {
                 continue;
             };
             let mut policy = Self::make_policy(self.config.compaction_policy);
-            // Dedicated compaction runs in a separate process without a shared clock, so TTL is
-            // disabled here (now_seconds = 0). The config validator rejects `ttl_enabled + dedicated`
-            // (see `Config::validate`); the `drop_expired` validation in `publish_drop_result` is
-            // correct but unreachable until cross-process TTL clock sync is implemented.
+            // Sample time once per task. Planning, file-level expiration, and rewrite filtering
+            // must use the same cutoff even when a large compaction runs for several seconds.
+            let now_seconds = if self.config.ttl_enabled {
+                self.time_provider.now_seconds()
+            } else {
+                0
+            };
             let policy_context = CompactionPolicyContext {
                 truncation_cursors: Some(&rebuilt.truncation_cursors),
                 tree_scope: Some(tree_scope),
-                now_seconds: 0,
+                now_seconds,
             };
             let plan =
                 policy.pick_with_context(&tree_version.levels, compaction_config, policy_context);
@@ -339,41 +550,145 @@ impl DedicatedCompactor {
                 continue;
             };
 
-            // Step 5-11: Execute the compaction and publish the result.
             let job_id = Uuid::new_v4().to_string();
             debug!(
                 "selected compaction plan tree={} {} job_id={}",
                 tree_idx, plan, job_id
             );
 
-            match self.execute_and_publish(
+            return Ok(DedicatedCompactionPlanning::Plan(DedicatedCompactionPlan {
+                version: DEDICATED_COMPACTION_PLAN_VERSION,
+                job_id,
+                db_id: self.db_id.clone(),
+                volume_paths: self
+                    .config
+                    .volumes
+                    .iter()
+                    .map(|volume| sanitized_absolute_volume_path(&volume.base_dir))
+                    .collect::<Result<Vec<_>>>()?,
+                source: observation.source.clone(),
+                topology_epoch: observation.topology_epoch,
                 tree_idx,
-                tree_scope,
-                &tree_version.levels,
-                &plan,
-                &compaction_config,
-                &rebuilt.truncation_cursors,
-                &rebuilt.schema_manager,
-                &observation.source,
-                observation.topology_epoch,
-                &job_id,
-                policy_context.now_seconds,
-            ) {
-                Ok(true) => {
-                    return Ok(DedicatedCompactionStep::ResultPublished { job_id });
-                }
-                Ok(false) => return Ok(DedicatedCompactionStep::NoPlan),
-                Err(err) => {
-                    warn!(
-                        "compaction job {} failed: {}; will retry on next iteration",
-                        job_id, err
-                    );
-                    return Err(err);
-                }
-            }
+                tree_scope: tree_scope.clone(),
+                input_level: plan.input_level,
+                output_level: plan.output_level,
+                base_file_id: plan.base_file_id,
+                trivial_move: plan.trivial_move,
+                drop_truncated: plan.drop_truncated,
+                drop_expired: plan.drop_expired,
+                now_seconds,
+            }));
         }
 
-        Ok(DedicatedCompactionStep::NoPlan)
+        Ok(DedicatedCompactionPlanning::NoPlan)
+    }
+
+    fn execute_plan(
+        &self,
+        planned: &DedicatedCompactionPlan,
+    ) -> Result<DedicatedCompactionExecution> {
+        if self.config.compaction_mode != CompactionMode::Dedicated {
+            return Ok(DedicatedCompactionExecution::Stale);
+        }
+        if planned.version != DEDICATED_COMPACTION_PLAN_VERSION {
+            return Err(Error::InvalidState(format!(
+                "Unsupported dedicated compaction plan version {} (expected {})",
+                planned.version, DEDICATED_COMPACTION_PLAN_VERSION
+            )));
+        }
+        if planned.db_id != self.db_id {
+            return Err(Error::InvalidState(format!(
+                "Dedicated compaction plan DB {} cannot be executed by DB {}",
+                planned.db_id, self.db_id
+            )));
+        }
+        let existing_jobs = crate::compaction::dedicated::list_dedicated_compaction_result_job_ids(
+            &self.file_manager,
+        )?;
+        if !existing_jobs.is_empty() {
+            return Ok(DedicatedCompactionExecution::WaitingForResult);
+        }
+        let Some(observation) = self.load_observation()? else {
+            return Ok(DedicatedCompactionExecution::Stale);
+        };
+        if observation.compaction_mode != CompactionMode::Dedicated
+            || observation.source != planned.source
+            || observation.topology_epoch != planned.topology_epoch
+            || observation.tree_scopes.get(planned.tree_idx) != Some(&planned.tree_scope)
+        {
+            return Ok(DedicatedCompactionExecution::Stale);
+        }
+        let rebuilt = self.rebuild_observation(&observation)?;
+        let Some(tree_version) = rebuilt.tree_versions.get(planned.tree_idx) else {
+            return Ok(DedicatedCompactionExecution::Stale);
+        };
+        self.advance_file_id_allocator(&observation);
+        let compaction_config = build_compaction_config(&self.config, self.config.num_columns)?;
+        let policy_plan = planned.policy_plan();
+        let published = self.execute_and_publish(
+            planned.tree_idx,
+            &planned.tree_scope,
+            &tree_version.levels,
+            &policy_plan,
+            &compaction_config,
+            &rebuilt.truncation_cursors,
+            &rebuilt.schema_manager,
+            &planned.source,
+            planned.topology_epoch,
+            &planned.job_id,
+            planned.now_seconds,
+        )?;
+        if published {
+            Ok(DedicatedCompactionExecution::ResultPublished {
+                job_id: planned.job_id.clone(),
+            })
+        } else {
+            Ok(DedicatedCompactionExecution::Stale)
+        }
+    }
+
+    fn plan_status(&self, plan: &DedicatedCompactionPlan) -> Result<DedicatedCompactionPlanStatus> {
+        if self.config.compaction_mode != CompactionMode::Dedicated {
+            return Ok(DedicatedCompactionPlanStatus::Stale);
+        }
+        if plan.db_id != self.db_id {
+            return Err(Error::InvalidState(format!(
+                "Dedicated compaction plan DB {} cannot be inspected by DB {}",
+                plan.db_id, self.db_id
+            )));
+        }
+        let existing_jobs = crate::compaction::dedicated::list_dedicated_compaction_result_job_ids(
+            &self.file_manager,
+        )?;
+        if existing_jobs.iter().any(|job_id| job_id == &plan.job_id) {
+            return Ok(DedicatedCompactionPlanStatus::ResultPublished);
+        }
+        let Some(observation) = self.load_observation()? else {
+            return Ok(DedicatedCompactionPlanStatus::Stale);
+        };
+        if observation.compaction_mode != CompactionMode::Dedicated
+            || observation.source != plan.source
+            || observation.topology_epoch != plan.topology_epoch
+            || observation.tree_scopes.get(plan.tree_idx) != Some(&plan.tree_scope)
+        {
+            return Ok(DedicatedCompactionPlanStatus::Stale);
+        }
+        Ok(DedicatedCompactionPlanStatus::Pending)
+    }
+
+    fn advance_file_id_allocator(&self, observation: &DedicatedObservation) {
+        let max_manifest_file_id = observation
+            .tree_levels
+            .iter()
+            .flat_map(|levels| levels.iter())
+            .flat_map(|level| level.files.iter())
+            .map(|file| file.file_id)
+            .max()
+            .unwrap_or(0);
+        let next = self.file_manager.peek_next_file_id();
+        if next <= max_manifest_file_id {
+            self.file_manager.set_next_file_id(max_manifest_file_id + 1);
+        }
     }
 
     fn rebuild_observation(
@@ -444,6 +759,7 @@ impl DedicatedCompactor {
         Ok(Some(DedicatedObservation::from_snapshot(
             snapshot_id,
             manifest,
+            self.config.compaction_mode,
         )))
     }
 
@@ -468,7 +784,10 @@ impl DedicatedCompactor {
         // them.
         write_job_lease(&self.file_manager, job_id)?;
         let still_current = self.load_observation()?.is_some_and(|current| {
-            current.source == *source && current.topology_epoch == topology_epoch
+            self.config.compaction_mode == CompactionMode::Dedicated
+                && current.compaction_mode == CompactionMode::Dedicated
+                && current.source == *source
+                && current.topology_epoch == topology_epoch
         });
         if !still_current {
             cleanup_job_dir(&self.file_manager, job_id)?;
@@ -511,6 +830,7 @@ impl DedicatedCompactor {
                 source,
                 topology_epoch,
                 job_id,
+                now_seconds,
             )
         };
 
@@ -563,6 +883,7 @@ impl DedicatedCompactor {
         source: &DedicatedCompactionSource,
         topology_epoch: u64,
         job_id: &str,
+        now_seconds: u32,
     ) -> Result<()> {
         let runs = build_runs_for_plan(levels, plan, compaction_config);
         if runs.is_empty() {
@@ -588,6 +909,13 @@ impl DedicatedCompactor {
         let sst_metrics = self.metrics_manager.sst_iterator_metrics();
 
         // Construct the compaction task with job-namespace output paths and readonly outputs.
+        let ttl_provider = Arc::new(TTLProvider::new(
+            &TtlConfig {
+                enabled: self.config.ttl_enabled,
+                default_ttl_seconds: self.config.default_ttl_seconds,
+            },
+            Arc::new(ManualTimeProvider::new(now_seconds)),
+        ));
         let task = CompactionTask::new(
             Arc::clone(&self.compaction_metrics),
             sst_metrics,
@@ -597,7 +925,7 @@ impl DedicatedCompactor {
             Arc::clone(&self.file_manager),
             file_builder_factory,
             compaction_config.output_file_type,
-            Arc::new(crate::ttl::TTLProvider::disabled()),
+            ttl_provider,
             Arc::clone(schema_manager),
         )
         .with_writer_options_factory(writer_options_factory)
@@ -846,6 +1174,63 @@ impl DedicatedCompactor {
             }
         }
     }
+}
+
+fn sanitized_absolute_volume_path(path: &str) -> Result<String> {
+    let normalized = normalize_storage_path_to_url(path)?;
+    let mut url = url::Url::parse(&normalized)?;
+    if !url.username().is_empty() {
+        url.set_username("").map_err(|_| {
+            Error::ConfigError(format!("Cannot sanitize compaction volume path {path}"))
+        })?;
+    }
+    if url.password().is_some() {
+        url.set_password(None).map_err(|_| {
+            Error::ConfigError(format!("Cannot sanitize compaction volume path {path}"))
+        })?;
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn apply_plan_volume_path(configured_path: &str, plan_path: &str) -> Result<String> {
+    let configured = normalize_storage_path_to_url(configured_path)?;
+    let configured_url = url::Url::parse(&configured)?;
+    let mut plan_url = url::Url::parse(plan_path).map_err(|err| {
+        Error::InvalidState(format!(
+            "Invalid absolute volume path in dedicated compaction plan: {err}"
+        ))
+    })?;
+    if !plan_url.username().is_empty()
+        || plan_url.password().is_some()
+        || plan_url.query().is_some()
+        || plan_url.fragment().is_some()
+    {
+        return Err(Error::InvalidState(
+            "Dedicated compaction plan volume paths must not contain credentials, query options, or fragments"
+                .to_string(),
+        ));
+    }
+    if configured_url.scheme() != plan_url.scheme() {
+        return Err(Error::ConfigError(format!(
+            "Dedicated compaction plan volume scheme {} does not match executor scheme {}",
+            plan_url.scheme(),
+            configured_url.scheme()
+        )));
+    }
+    if !configured_url.username().is_empty() {
+        plan_url
+            .set_username(configured_url.username())
+            .map_err(|_| Error::ConfigError("Invalid executor volume username".to_string()))?;
+    }
+    if configured_url.password().is_some() {
+        plan_url
+            .set_password(configured_url.password())
+            .map_err(|_| Error::ConfigError("Invalid executor volume password".to_string()))?;
+    }
+    plan_url.set_query(configured_url.query());
+    Ok(plan_url.to_string())
 }
 
 /// Handle for the lease heartbeat thread. Stops and joins the thread when dropped.

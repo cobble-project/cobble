@@ -79,6 +79,12 @@ fn test_runtime_manifest_mode_resolution() {
 }
 
 #[test]
+fn dedicated_compaction_accepts_ttl() {
+    Config::from_json_str(r#"{"compaction_mode":"dedicated","ttl_enabled":true}"#)
+        .expect("dedicated TTL should be supported");
+}
+
+#[test]
 fn test_pinned_metadata_level_minus_one_disables_pinning() {
     let config = Config::from_json_str(r#"{"sst_pinned_metadata_max_level":-1}"#).unwrap();
 

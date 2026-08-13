@@ -1219,6 +1219,7 @@ fn runtime_manifest_embedded_mode_publishes_initial_flush_and_final_state() {
         .load_current()
         .unwrap()
         .expect("initial runtime manifest");
+    assert_eq!(initial.manifest.compaction_mode, CompactionMode::Embedded);
     assert!(
         initial
             .manifest
@@ -1427,6 +1428,7 @@ fn dedicated_runtime_mode_publishes_flush_without_auto_snapshot() {
 
     let store = runtime_manifest_store(&db);
     let runtime = wait_for_runtime_generation_at_least(&store, 2);
+    assert_eq!(runtime.manifest.compaction_mode, CompactionMode::Dedicated);
     assert!(
         runtime
             .manifest

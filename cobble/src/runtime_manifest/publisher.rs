@@ -2,6 +2,7 @@ use super::{
     LoadedRuntimeManifest, RuntimeManifest, RuntimeManifestEnvelope, RuntimeManifestPayload,
     RuntimeManifestStore, build_runtime_manifest,
 };
+use crate::config::CompactionMode;
 use crate::db_state::{DbState, DbStateHandle};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
@@ -35,6 +36,7 @@ struct RuntimeManifestPublisher {
     schema_manager: Arc<SchemaManager>,
     db_state: Arc<DbStateHandle>,
     lifecycle: Arc<DbLifecycle>,
+    compaction_mode: CompactionMode,
     publication: Mutex<PublicationState>,
     stop: AtomicBool,
 }
@@ -54,6 +56,7 @@ impl RuntimeManifestPublisherHandle {
         schema_manager: Arc<SchemaManager>,
         db_state: Arc<DbStateHandle>,
         lifecycle: Arc<DbLifecycle>,
+        compaction_mode: CompactionMode,
     ) -> Result<Self> {
         let store = RuntimeManifestStore::new(Arc::clone(&file_manager));
         let current = store.load_current()?;
@@ -64,6 +67,7 @@ impl RuntimeManifestPublisherHandle {
             schema_manager,
             db_state,
             lifecycle,
+            compaction_mode,
             publication: Mutex::new(PublicationState {
                 current,
                 next_generation,
@@ -293,6 +297,7 @@ impl RuntimeManifestPublisher {
             self.file_manager.as_ref(),
             generation,
             latest_schema_id,
+            self.compaction_mode,
         )?;
 
         if !force
@@ -387,11 +392,13 @@ fn runtime_manifest_from_state(
     file_manager: &FileManager,
     generation: u64,
     latest_schema_id: u64,
+    compaction_mode: CompactionMode,
 ) -> Result<RuntimeManifest> {
     let tree_versions = state.multi_lsm_version.tree_versions_cloned();
     Ok(RuntimeManifest {
         generation,
         seq_id: state.seq_id,
+        compaction_mode,
         topology_epoch: state.topology_epoch,
         latest_schema_id,
         bucket_ranges: state.bucket_ranges.clone(),
@@ -465,7 +472,8 @@ fn manifest_vlog_files(
 }
 
 fn same_persisted_state(current: &RuntimeManifest, next: &RuntimeManifest) -> bool {
-    current.topology_epoch == next.topology_epoch
+    current.compaction_mode == next.compaction_mode
+        && current.topology_epoch == next.topology_epoch
         && current.latest_schema_id == next.latest_schema_id
         && current.bucket_ranges == next.bucket_ranges
         && current.lsm_tree_bucket_ranges == next.lsm_tree_bucket_ranges

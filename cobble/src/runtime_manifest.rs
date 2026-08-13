@@ -5,6 +5,7 @@
 //! points, while runtime manifests are a compact, append-only observation stream
 //! for services such as a dedicated compactor.
 
+use crate::config::CompactionMode;
 use crate::db_state::LSMTreeScope;
 use crate::error::{Error, Result};
 use crate::file::{File, FileManager, MetadataReader, SequentialWriteFile};
@@ -19,7 +20,8 @@ use std::sync::Arc;
 pub(crate) mod publisher;
 
 /// Runtime manifests version 2 are the Cobble 0.3 format. Version 3 adds the 0.4 file metadata,
-/// replica origins, and topology epochs.
+/// replica origins, and topology epochs. Optional fields added within version 3 must retain safe
+/// defaults so current readers can consume manifests written before the field existed.
 pub(crate) const RUNTIME_MANIFEST_VERSION_CURRENT: u32 = 3;
 pub(crate) const MAX_RUNTIME_MANIFEST_CHAIN_DEPTH: usize = 64;
 const RUNTIME_MANIFEST_DIR: &str = "runtime";
@@ -30,6 +32,11 @@ const RUNTIME_MANIFEST_PREFIX: &str = "MANIFEST-";
 pub(crate) struct RuntimeManifest {
     pub(crate) generation: u64,
     pub(crate) seq_id: u64,
+    /// Declares which process owns compaction for this observed layout.
+    ///
+    /// Manifests written before this field existed are writer-managed.
+    #[serde(default)]
+    pub(crate) compaction_mode: CompactionMode,
     #[serde(default)]
     pub(crate) topology_epoch: u64,
     pub(crate) latest_schema_id: u64,
@@ -46,6 +53,8 @@ pub(crate) struct RuntimeIncrementalManifest {
     pub(crate) generation: u64,
     pub(crate) base_generation: u64,
     pub(crate) seq_id: u64,
+    #[serde(default)]
+    pub(crate) compaction_mode: CompactionMode,
     #[serde(default)]
     pub(crate) topology_epoch: u64,
     pub(crate) latest_schema_id: u64,
@@ -125,6 +134,7 @@ pub(crate) fn build_runtime_manifest(
     validate_runtime_manifest(&base.manifest)?;
     if current.seq_id < base.manifest.seq_id
         || base.chain_depth >= MAX_RUNTIME_MANIFEST_CHAIN_DEPTH
+        || base.manifest.compaction_mode != current.compaction_mode
         || !has_same_runtime_topology(&base.manifest, &current)
         || retained_file_descriptors_changed(&base.manifest, &current)?
     {
@@ -135,6 +145,7 @@ pub(crate) fn build_runtime_manifest(
         generation: current.generation,
         base_generation: base.generation,
         seq_id: current.seq_id,
+        compaction_mode: current.compaction_mode,
         topology_epoch: current.topology_epoch,
         latest_schema_id: current.latest_schema_id,
         tree_level_edits: build_runtime_tree_level_edits(&base.manifest, &current)?,
@@ -517,6 +528,7 @@ fn apply_runtime_incremental(
     let manifest = RuntimeManifest {
         generation: incremental.generation,
         seq_id: incremental.seq_id,
+        compaction_mode: incremental.compaction_mode,
         topology_epoch: incremental.topology_epoch,
         latest_schema_id: incremental.latest_schema_id,
         bucket_ranges: base.bucket_ranges.clone(),

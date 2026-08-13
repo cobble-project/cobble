@@ -14,7 +14,9 @@
 //! - The manifest reflects the compacted state.
 //! - Restart after compaction preserves all data.
 use cobble::{
-    CompactionMode, CompactionPolicyKind, Config, Db, DbBuilder, DedicatedCompactionService,
+    CompactionMode, CompactionPolicyKind, Config, Db, DbBuilder, DedicatedCompactionExecution,
+    DedicatedCompactionExecutor, DedicatedCompactionPlan, DedicatedCompactionPlanStatus,
+    DedicatedCompactionPlanner, DedicatedCompactionPlanning, DedicatedCompactionService,
     DedicatedCompactor, RuntimeManifestMode, VolumeDescriptor, VolumeUsageKind,
 };
 use serial_test::serial;
@@ -181,6 +183,48 @@ fn runtime_current_exists(root: &str) -> bool {
         })
     }
     walk(std::path::Path::new(root))
+}
+
+fn runtime_generation(root: &str) -> Option<u64> {
+    fn walk(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
+                && path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    == Some("runtime")
+            {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    let bytes = std::fs::read(walk(std::path::Path::new(root))?).ok()?;
+    let payload = bytes.get(..bytes.len().checked_sub(8)?)?;
+    std::str::from_utf8(payload).ok()?.trim().parse().ok()
+}
+
+fn wait_for_plan(planner: &DedicatedCompactionPlanner) -> DedicatedCompactionPlan {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        match planner.plan().expect("plan dedicated compaction") {
+            DedicatedCompactionPlanning::Plan(plan) => return plan,
+            DedicatedCompactionPlanning::WaitingForObservation
+            | DedicatedCompactionPlanning::WaitingForResult
+            | DedicatedCompactionPlanning::NoPlan => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    panic!("dedicated compaction plan was not produced before timeout");
 }
 
 fn current_runtime_manifest_references_path(root: &str, path: &str) -> bool {
@@ -421,6 +465,130 @@ fn test_dedicated_compaction_basic() {
     }
 
     db.close().expect("close");
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn dedicated_plan_can_be_queued_serialized_and_executed_separately() {
+    let root = "/tmp/dedicated_compaction_plan_execute";
+    cleanup_test_root(root);
+    let db_id = "dedicated-plan-execute";
+    let mut config = dedicated_config(root);
+    config.volumes[0].access_id = Some("plan-access-id-must-not-leak".to_string());
+    config.volumes[0].secret_key = Some("plan-secret-must-not-leak".to_string());
+    let db = open_db_with_id(config.clone(), db_id);
+    let value = vec![b'p'; 1024];
+    for i in 0..40u32 {
+        db.put(0, format!("plan-{i:08}").as_bytes(), 0, &value)
+            .unwrap();
+    }
+    assert!(wait_for(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || runtime_current_exists(root) && count_data_files(root) >= 2
+    ));
+
+    let planner = DedicatedCompactionPlanner::open(config.clone(), db_id).unwrap();
+    let mut published = false;
+    for _ in 0..10 {
+        let plan = wait_for_plan(&planner);
+        let encoded = plan.encode().unwrap();
+        assert!(
+            !encoded
+                .windows(b"plan-access-id-must-not-leak".len())
+                .any(|window| { window == b"plan-access-id-must-not-leak" })
+        );
+        assert!(
+            !encoded
+                .windows(b"plan-secret-must-not-leak".len())
+                .any(|window| { window == b"plan-secret-must-not-leak" })
+        );
+        let decoded = DedicatedCompactionPlan::decode(&encoded).unwrap();
+        assert_eq!(decoded.job_id(), plan.job_id());
+        assert_eq!(decoded.db_id(), db_id);
+        let execution_config = decoded.execution_config(&config).unwrap();
+        assert_eq!(
+            execution_config.volumes[0].secret_key.as_deref(),
+            Some("plan-secret-must-not-leak")
+        );
+        let executor = DedicatedCompactionExecutor::open(config.clone()).unwrap();
+        match executor.execute(&decoded).unwrap() {
+            DedicatedCompactionExecution::ResultPublished { .. } => {
+                published = true;
+                break;
+            }
+            DedicatedCompactionExecution::Stale => continue,
+            DedicatedCompactionExecution::WaitingForResult => {
+                panic!("no result existed before this executor published one")
+            }
+        }
+    }
+    assert!(
+        published,
+        "a stable queued plan should eventually be executed"
+    );
+    assert!(wait_for(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || count_compaction_results(root) == 0 && count_snapshots(root) > 0
+    ));
+    for i in 0..40u32 {
+        verify_get(&db, 0, format!("plan-{i:08}").as_bytes(), &value);
+    }
+
+    db.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn queued_plan_becomes_stale_after_writer_observation_advances() {
+    let root = "/tmp/dedicated_compaction_stale_plan";
+    cleanup_test_root(root);
+    let db_id = "dedicated-stale-plan";
+    let config = dedicated_config(root);
+    let db = open_db_with_id(config.clone(), db_id);
+    let value = vec![b's'; 1024];
+    for i in 0..40u32 {
+        db.put(0, format!("before-{i:08}").as_bytes(), 0, &value)
+            .unwrap();
+    }
+    assert!(wait_for(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || runtime_generation(root).is_some()
+    ));
+
+    let planner = DedicatedCompactionPlanner::open(config.clone(), db_id).unwrap();
+    let plan = wait_for_plan(&planner);
+    assert_eq!(
+        planner.status(&plan).unwrap(),
+        DedicatedCompactionPlanStatus::Pending
+    );
+    let planned_generation = runtime_generation(root).unwrap();
+    for i in 0..40u32 {
+        db.put(0, format!("after-{i:08}").as_bytes(), 0, &value)
+            .unwrap();
+    }
+    assert!(wait_for(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || runtime_generation(root).is_some_and(|generation| generation > planned_generation)
+    ));
+    assert_eq!(
+        planner.status(&plan).unwrap(),
+        DedicatedCompactionPlanStatus::Stale
+    );
+
+    let executor = DedicatedCompactionExecutor::open(config).unwrap();
+    assert_eq!(
+        executor.execute(&plan).unwrap(),
+        DedicatedCompactionExecution::Stale
+    );
+    assert_eq!(count_compaction_results(root), 0);
+
+    db.close().unwrap();
     cleanup_test_root(root);
 }
 
@@ -723,6 +891,34 @@ fn dedicated_compaction_disabled_runtime_manifests_uses_snapshots() {
     for i in 0..40u32 {
         verify_get(&db, 0, format!("snapshot-{i:08}").as_bytes(), &value);
     }
+    db.close().expect("close");
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn dedicated_planner_skips_writer_managed_runtime_manifest() {
+    let root = "/tmp/dedicated_compaction_writer_managed";
+    cleanup_test_root(root);
+    let db_id = "dedicated-compaction-writer-managed".to_string();
+    let mut config = dedicated_config(root);
+    config.compaction_mode = CompactionMode::Embedded;
+    config.runtime_manifest_mode = RuntimeManifestMode::Enabled;
+
+    let db = open_db_with_id(config.clone(), &db_id);
+    assert!(
+        wait_for(Duration::from_secs(10), Duration::from_millis(100), || {
+            runtime_current_exists(root)
+        }),
+        "embedded writer should publish its explicit runtime manifest"
+    );
+
+    let planner = DedicatedCompactionPlanner::open(config, &db_id).expect("open planner");
+    assert!(matches!(
+        planner.plan().expect("plan"),
+        DedicatedCompactionPlanning::NoPlan
+    ));
+
     db.close().expect("close");
     cleanup_test_root(root);
 }
