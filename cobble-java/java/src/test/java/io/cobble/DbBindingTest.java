@@ -74,6 +74,21 @@ class DbBindingTest {
     }
 
     @Test
+    void configSerializesDedicatedCompactionOptions() {
+        Config config = new Config();
+        config.compactionMode = Config.CompactionMode.DEDICATED;
+        config.runtimeManifestMode = Config.RuntimeManifestMode.AUTO;
+        config.compactionDedicatedPollIntervalMs = 250L;
+        config.compactionOrphanMinAgeMs = 30_000L;
+
+        String json = config.toJson();
+        assertTrue(json.contains("\"compaction_mode\":\"dedicated\""));
+        assertTrue(json.contains("\"runtime_manifest_mode\":\"auto\""));
+        assertTrue(json.contains("\"compaction_dedicated_poll_interval_ms\":250"));
+        assertTrue(json.contains("\"compaction_orphan_min_age_ms\":30000"));
+    }
+
+    @Test
     void nativeMetricsAreExposedAsTypedImmutableSamples() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-metrics-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);

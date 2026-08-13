@@ -75,6 +75,18 @@ public final class Config {
     /** How to react when a transient remote compaction failure occurs. */
     public RemoteCompactionFailureMode compactionRemoteFailureMode;
 
+    /** Whether compaction runs in the writer or through a shared-storage dedicated process. */
+    public CompactionMode compactionMode;
+
+    /** Controls publication of runtime manifests used by dedicated compaction. */
+    public RuntimeManifestMode runtimeManifestMode;
+
+    /** Poll interval in milliseconds for dedicated compaction results. */
+    public Long compactionDedicatedPollIntervalMs;
+
+    /** Minimum age in milliseconds before abandoned dedicated compaction jobs may be removed. */
+    public Long compactionOrphanMinAgeMs;
+
     /** Block cache memory size in bytes (0 means disabled). */
     public Integer blockCacheSize;
 
@@ -300,6 +312,22 @@ public final class Config {
         FALLBACK_LOCAL,
         @SerializedName("skip")
         SKIP
+    }
+
+    public enum CompactionMode {
+        @SerializedName("embedded")
+        EMBEDDED,
+        @SerializedName("dedicated")
+        DEDICATED
+    }
+
+    public enum RuntimeManifestMode {
+        @SerializedName("auto")
+        AUTO,
+        @SerializedName("enabled")
+        ENABLED,
+        @SerializedName("disabled")
+        DISABLED
     }
 
     public enum PrimaryVolumeOffloadPolicyKind {

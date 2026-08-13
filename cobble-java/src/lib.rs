@@ -9,6 +9,7 @@
 
 mod coordinator;
 mod db;
+mod dedicated_compaction;
 mod metrics;
 mod process_file_systems;
 mod read_only_db;
