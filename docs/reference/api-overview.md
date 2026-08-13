@@ -84,6 +84,8 @@ fails.
 |------|-------------|
 | `RemoteCompactionServer` | Remote compaction worker server |
 | `RemoteCompactionFailureMode` | Writer behavior for transient remote compaction failures (`FallbackLocal` or `Skip`) |
+| `DedicatedCompactionMonitor` | Discover DBs and produce portable dedicated compaction plans |
+| `DedicatedCompactionExecutor` | Revalidate and execute queued dedicated compaction plans |
 
 ### Key Operations
 

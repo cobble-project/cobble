@@ -25,7 +25,7 @@ cargo run -p cobble-cli -- --help
 | Command | Description | Required args |
 |---------|-------------|---------------|
 | `remote-compactor` | Start a remote compaction server process | none |
-| `compact` | Run a multi-DB shared-storage dedicated compactor | `--config <path> <directory>...` |
+| `compact` | Run a multi-DB shared-storage dedicated compactor | `--config <path> <path-or-url>...` |
 | `web-monitor` | Start the monitor HTTP server/UI | `--config <path>` |
 
 ### `remote-compactor`
@@ -43,26 +43,23 @@ cobble-cli remote-compactor --config ./config.yaml --bind 127.0.0.1:18888
 cobble-cli compact \
   --config ./config.yaml \
   --workers 4 \
-  /var/lib/cobble/orders \
-  /var/lib/cobble/customers/shard-0
+  /var/lib/cobble \
+  s3://state-bucket/cobble
 ```
 
 - `--config <path>`: writer-compatible Cobble configuration with access to the same metadata and
   data volumes.
-- Each positional directory can be either a DB directory or a parent whose immediate child
-  directories are DBs. Repeat directories as needed; canonical duplicates are ignored.
+- Each positional value can be a DB directory or a local/object-storage prefix containing DBs.
+  Discovery is recursive and bounded; repeat paths as needed and duplicates are ignored.
 - `--workers <n>`: maximum number of DB shards compacted concurrently. Defaults to
   `compaction_threads`.
-- `--scan-interval <ms>`: directory scan and result/observation poll interval. Defaults to
+- `--scan-interval <ms>`: interval for discovering and checking DBs. Defaults to
   `compaction_dedicated_poll_interval_ms`.
 
-The process derives each `db_id` from the DB directory name; no DB ID argument is required. One
-scanner validates manifests and referenced files, then dispatches eligible shards to the worker
-pool. A shard has at most one in-flight compaction.
-
-The process can start before its writers. It keeps scanning unavailable paths and parent
-directories. With the default `runtime_manifest_mode: auto`, a discovered shard waits for its
-writer's first runtime manifest.
+The process derives each `db_id` from the DB directory name; no DB ID argument is required. The
+config file must contain a metadata/data volume that is an ancestor of every storage URL being
+scanned, including credentials and backend options. The process can start before its writers and
+continues checking the configured paths. Only DBs configured for dedicated compaction are handled.
 
 ### `web-monitor`
 

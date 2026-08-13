@@ -463,6 +463,41 @@ try (CobbleCliProcess process =
 }
 ```
 
+The same wrapper can run the shared-storage dedicated compactor for local paths or storage URLs:
+
+```java
+import java.util.Arrays;
+
+try (CobbleCliProcess process =
+        CobbleCli.startDedicatedCompactor(
+                Paths.get("config.yaml"),
+                Arrays.asList("s3://state-bucket/cobble"),
+                4,
+                1000L)) {
+    process.waitFor();
+}
+```
+
+Schedulers can keep discovery and execution independent. The monitor produces portable plans and
+the executor revalidates each plan immediately before compaction:
+
+```java
+try (DedicatedCompactionMonitor monitor =
+                DedicatedCompactionMonitor.scan(
+                        Paths.get("config.yaml"), "s3://state-bucket/cobble");
+        DedicatedCompactionExecutor executor =
+                DedicatedCompactionExecutor.open(Paths.get("config.yaml"))) {
+    for (DedicatedCompactionPlan plan : monitor.poll()) {
+        executor.execute(plan);
+    }
+}
+```
+
+Use `watchDatabases` instead of `scan` when the scheduler already has an exact list of DB
+directories. A serialized `DedicatedCompactionPlan` can be placed on an external queue; it does not
+contain storage credentials. Its volume locations are absolute, while credentials and storage
+options are applied from the executor config.
+
 For custom redirection or environment variables, build a `ProcessBuilder` first:
 
 ```java

@@ -48,39 +48,27 @@ credentials only from its own process configuration.
 
 ## Dedicated Compaction
 
-Dedicated compaction uses a standalone process and shared storage instead of a network request.
-Configure the writer with `compaction_mode: dedicated`, then run:
+Dedicated compaction moves compaction work out of the writer process. Configure the writer with
+`compaction_mode: dedicated`, then start the compactor:
 
 ```bash
 cobble-cli compact \
   --config ./config.yaml \
   --workers 4 \
-  /var/lib/cobble/orders \
-  /var/lib/cobble/customers/shard-0
+  s3://state-bucket1/cobble \
+  s3://state-bucket2/cobble
 ```
 
-Each directory may be a DB directory or an immediate parent of multiple DB directories. The
-compactor derives the DB ID from each DB directory name, so startup does not require a DB ID list.
-One scanner thread continuously discovers and validates shards; a bounded worker pool compacts
-different shards concurrently while preserving one in-flight job per shard.
+Each path may point to one Cobble DB or a parent directory containing multiple DBs. `--workers`
+controls how many DBs can be compacted concurrently. Only DBs configured for dedicated compaction
+are processed.
 
-The writers and compactor must access every configured metadata and data volume. The compactor may
-start before the writers; it keeps scanning and each shard waits until its writer publishes
-`PROPERTIES` and its first runtime manifest. Volume order, usage kinds, priorities, paths, and
-limits come from `PROPERTIES`; credentials come only from the compactor process configuration.
+The writer and compactor must be able to access all configured storage volumes. Put storage
+credentials in the compactor configuration rather than in command-line paths. When TTL is enabled,
+keep their host clocks synchronized.
 
-Expand, shrink, and column-family tree creation are serialized with dedicated result application.
-Results and snapshot proofs locate trees by stable scope rather than by the mutable tree index. A
-writer rejects expand/shrink while an unconsumed result or unproven in-memory edit exists; retry the
-rescale after the result has been consumed.
-
-With `runtime_manifest_mode: auto` (the default), a dedicated writer publishes the current
-persisted LSM layout and the compactor observes it. Set the mode to `disabled` to use snapshot
-manifests instead. Runtime manifests are observations, not recovery points: snapshots still provide
-recovery and prove that an applied compaction result is durable.
-
-Runtime manifest generations are retained. Safe reclamation is deferred until readers can hold a
-cross-process lease on the chain they opened.
+The default `runtime_manifest_mode: auto` is recommended. Set it to `disabled` only when the
+compactor must use snapshot manifests instead.
 
 ## Tuning Compaction Behavior
 
