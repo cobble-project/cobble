@@ -251,6 +251,35 @@ class CobbleCliTest {
                 CobbleCli.remoteCompactorArgs(null, null));
     }
 
+    @Test
+    void dedicatedCompactorArgsAreBuiltCorrectly() {
+        Path cfg = Paths.get("/tmp/cobble-test.json");
+        assertEquals(
+                Arrays.asList(
+                        "compact",
+                        "--config",
+                        cfg.toAbsolutePath().toString(),
+                        "--workers",
+                        "3",
+                        "--scan-interval",
+                        "250",
+                        "/shared/op-a",
+                        "s3://state-bucket/checkpoints/shared"),
+                CobbleCli.dedicatedCompactorArgs(
+                        cfg,
+                        Arrays.asList("/shared/op-a", "s3://state-bucket/checkpoints/shared"),
+                        3,
+                        250L));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> CobbleCli.dedicatedCompactorArgs(cfg, Collections.emptyList(), null, null));
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        CobbleCli.dedicatedCompactorArgs(
+                                cfg, Collections.singletonList(" "), null, null));
+    }
+
     /** Binds and immediately closes a server socket to reserve a transient free TCP port. */
     private static int findFreePort() throws IOException {
         try (java.net.ServerSocket socket = new java.net.ServerSocket(0)) {

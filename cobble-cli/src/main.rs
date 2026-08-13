@@ -2,7 +2,6 @@ use cobble::{Config, DedicatedCompactionService, RemoteCompactionServer};
 use cobble_web_monitor::{MonitorConfig, MonitorConfigSource, MonitorServer};
 use log::LevelFilter::Info;
 use std::error::Error;
-use std::path::PathBuf;
 use std::time::Duration;
 
 fn main() {
@@ -119,7 +118,7 @@ fn print_usage() {
          cobble-cli remote-compactor [--config <path>] [--bind <host:port>]\n  \
          cobble-cli web-monitor --config <path> [--bind <host:port>]\n  \
          cobble-cli compact --config <path> [--workers <n>] [--scan-interval <ms>] \
-<directory> [<directory> ...]\n"
+<path-or-url> [<path-or-url> ...]\n"
     );
 }
 
@@ -127,7 +126,7 @@ fn run_compact(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Err
     let mut config_path: Option<String> = None;
     let mut worker_count: Option<usize> = None;
     let mut scan_interval_ms: Option<u64> = None;
-    let mut paths = Vec::<PathBuf>::new();
+    let mut paths = Vec::<String>::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {
@@ -137,10 +136,10 @@ fn run_compact(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Err
                 );
             }
             "--path" => {
-                paths.push(PathBuf::from(
+                paths.push(
                     args.next()
-                        .ok_or("compact --path requires a directory argument")?,
-                ));
+                        .ok_or("compact --path requires a path or storage URL")?,
+                );
             }
             "--workers" => {
                 let value = args
@@ -169,7 +168,7 @@ fn run_compact(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Err
             _ if arg.starts_with('-') => {
                 return Err(format!("Unknown argument: {}", arg).into());
             }
-            _ => paths.push(PathBuf::from(arg)),
+            _ => paths.push(arg),
         }
     }
 
@@ -187,7 +186,8 @@ fn run_compact(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Err
     let scan_interval = Duration::from_millis(
         scan_interval_ms.unwrap_or(config.compaction_dedicated_poll_interval_ms),
     );
-    let service = DedicatedCompactionService::open(config, paths, worker_count, scan_interval)?;
+    let service =
+        DedicatedCompactionService::open_storage_paths(config, paths, worker_count, scan_interval)?;
     service.run()?;
     Ok(())
 }

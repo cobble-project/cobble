@@ -232,6 +232,17 @@ public final class CobbleCli {
     }
 
     /**
+     * Starts the shared-storage dedicated compactor for one or more DB paths or parent prefixes.
+     * Paths may be local or storage URLs. The process continuously discovers shards until it is
+     * closed.
+     */
+    public static CobbleCliProcess startDedicatedCompactor(
+            Path config, List<String> paths, Integer workers, Long scanIntervalMillis)
+            throws IOException {
+        return start(dedicatedCompactorArgs(config, paths, workers, scanIntervalMillis));
+    }
+
+    /**
      * Convenience entry point: starts {@code cobble-cli web-monitor} with the given config and bind
      * address. {@code config} is required by {@code web-monitor}; {@code bindAddr} may be {@code
      * null}.
@@ -252,6 +263,43 @@ public final class CobbleCli {
         if (bindAddr != null && !bindAddr.isEmpty()) {
             args.add("--bind");
             args.add(bindAddr);
+        }
+        return args;
+    }
+
+    /** Builds the argument list for the shared-storage {@code compact} service. */
+    static List<String> dedicatedCompactorArgs(
+            Path config, List<String> paths, Integer workers, Long scanIntervalMillis) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        if (paths == null || paths.isEmpty()) {
+            throw new IllegalArgumentException("paths must not be empty");
+        }
+        if (workers != null && workers <= 0) {
+            throw new IllegalArgumentException("workers must be positive");
+        }
+        if (scanIntervalMillis != null && scanIntervalMillis <= 0) {
+            throw new IllegalArgumentException("scanIntervalMillis must be positive");
+        }
+
+        List<String> args = new ArrayList<>();
+        args.add("compact");
+        args.add("--config");
+        args.add(config.toAbsolutePath().toString());
+        if (workers != null) {
+            args.add("--workers");
+            args.add(workers.toString());
+        }
+        if (scanIntervalMillis != null) {
+            args.add("--scan-interval");
+            args.add(scanIntervalMillis.toString());
+        }
+        for (String path : paths) {
+            if (path == null || path.trim().isEmpty()) {
+                throw new IllegalArgumentException("paths must not contain null or blank values");
+            }
+            args.add(path);
         }
         return args;
     }
