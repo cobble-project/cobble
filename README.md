@@ -55,6 +55,7 @@ Optional remote/storage-service features exposed by Cobble are:
 - `storage-oss`
 - `storage-s3`
 - `storage-ftp`
+- `storage-goosefs`
 - `storage-hdfs`
 - `storage-sftp`
 

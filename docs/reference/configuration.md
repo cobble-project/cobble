@@ -31,6 +31,7 @@ Optional feature mapping:
 | `storage-alluxio` | `services-alluxio` |
 | `storage-cos` | `services-cos` |
 | `storage-ftp` | `services-ftp` |
+| `storage-goosefs` | `services-goosefs` |
 | `storage-hdfs` | `services-hdfs` |
 | `storage-oss` | `services-oss` |
 | `storage-s3` | `services-s3` |

@@ -15,6 +15,7 @@ storage-all = [
     "storage-alluxio",
     "storage-cos",
     "storage-ftp",
+    "storage-goosefs",
     "storage-hdfs",
     "storage-oss",
     "storage-s3",
@@ -23,6 +24,7 @@ storage-all = [
 storage-alluxio = ["cobble/storage-alluxio", "cobble-web-monitor/storage-alluxio"]
 storage-cos = ["cobble/storage-cos", "cobble-web-monitor/storage-cos"]
 storage-ftp = ["cobble/storage-ftp", "cobble-web-monitor/storage-ftp"]
+storage-goosefs = ["cobble/storage-goosefs", "cobble-web-monitor/storage-goosefs"]
 storage-hdfs = ["cobble/storage-hdfs", "cobble-web-monitor/storage-hdfs"]
 storage-oss = ["cobble/storage-oss", "cobble-web-monitor/storage-oss"]
 storage-s3 = ["cobble/storage-s3", "cobble-web-monitor/storage-s3"]
