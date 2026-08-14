@@ -227,6 +227,30 @@ fn wait_for_plan(planner: &DedicatedCompactionPlanner) -> DedicatedCompactionPla
     panic!("dedicated compaction plan was not produced before timeout");
 }
 
+fn wait_for_pending_plan(planner: &DedicatedCompactionPlanner) -> DedicatedCompactionPlan {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        match planner.plan().expect("plan dedicated compaction") {
+            DedicatedCompactionPlanning::Plan(plan) => match planner
+                .status(&plan)
+                .expect("inspect dedicated compaction plan")
+            {
+                DedicatedCompactionPlanStatus::Pending => return plan,
+                DedicatedCompactionPlanStatus::Stale => continue,
+                DedicatedCompactionPlanStatus::ResultPublished => {
+                    panic!("a newly planned compaction unexpectedly has a published result")
+                }
+            },
+            DedicatedCompactionPlanning::WaitingForObservation
+            | DedicatedCompactionPlanning::WaitingForResult
+            | DedicatedCompactionPlanning::NoPlan => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    panic!("pending dedicated compaction plan was not produced before timeout");
+}
+
 fn current_runtime_manifest_references_path(root: &str, path: &str) -> bool {
     fn metadata_payload(path: &std::path::Path) -> Option<Vec<u8>> {
         let bytes = std::fs::read(path).ok()?;
@@ -561,11 +585,7 @@ fn queued_plan_becomes_stale_after_writer_observation_advances() {
     ));
 
     let planner = DedicatedCompactionPlanner::open(config.clone(), db_id).unwrap();
-    let plan = wait_for_plan(&planner);
-    assert_eq!(
-        planner.status(&plan).unwrap(),
-        DedicatedCompactionPlanStatus::Pending
-    );
+    let plan = wait_for_pending_plan(&planner);
     let planned_generation = runtime_generation(root).unwrap();
     for i in 0..40u32 {
         db.put(0, format!("after-{i:08}").as_bytes(), 0, &value)
