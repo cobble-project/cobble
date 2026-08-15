@@ -191,7 +191,10 @@ jobs:
     # storage-hdfs is excluded: opendal-service-hdfs -> hdrs -> hdfs-sys links
     # libjvm + libhdfs (Hadoop native, JNI). The windows-latest runner has no
     # Hadoop distribution, so a vendored build of libhdfs is not feasible.
-    name: Windows check (storage-all except hdfs)
+    # storage-sftp is excluded: opendal-service-sftp -> openssh-sftp-client ->
+    # openssh, which uses std::os::unix APIs and is unix-only via
+    # compile_error!("This crate can only be used on unix").
+    name: Windows check (storage-all except hdfs and sftp)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -225,5 +228,5 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-build-target-
 
-      - name: cargo check (storage-all except hdfs)
-        run: cargo check -p cobble --features storage-alluxio,storage-cos,storage-ftp,storage-goosefs,storage-oss,storage-s3,storage-sftp
+      - name: cargo check (storage-all except hdfs and sftp)
+        run: cargo check -p cobble --features storage-alluxio,storage-cos,storage-ftp,storage-goosefs,storage-oss,storage-s3
