@@ -74,7 +74,9 @@ fn list_wal_objects(
         .region("us-east-1")
         .access_key_id(access_id)
         .secret_access_key(secret_key);
-    let operator = Operator::new(builder).unwrap().finish();
+    // OpenDAL ≥ 0.58: `Operator::new` returns a finished `Operator` directly
+    // (the previous `.finish()` builder terminator was removed, see opendal #7743).
+    let operator = Operator::new(builder).unwrap();
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(operator.list(&format!("{db_id}/wal/")))
