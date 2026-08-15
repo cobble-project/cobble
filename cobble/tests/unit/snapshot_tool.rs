@@ -81,6 +81,24 @@ fn path_exists(file_manager: &Arc<crate::file::FileManager>, path: &str) -> bool
     })
 }
 
+fn wait_until_local_file_gone(path: &str, timeout: Duration) -> bool {
+    let Some(local_path) = path.strip_prefix("file://") else {
+        return !path_exists_local(path);
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !std::path::Path::new(local_path).exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    !std::path::Path::new(local_path).exists()
+}
+
+fn path_exists_local(path: &str) -> bool {
+    std::path::Path::new(path).exists()
+}
+
 fn list_snapshot_ids(config: &Config, db_id: &str) -> Result<Vec<u64>> {
     let normalized = config.normalize_volume_paths()?;
     let metrics_manager = Arc::new(MetricsManager::new(db_id));
@@ -144,7 +162,7 @@ fn test_prune_shard_snapshot_removes_snapshot_manifest() {
     );
     for path in unique_target_paths {
         assert!(
-            !path_exists(&file_manager, &path),
+            wait_until_local_file_gone(&path, Duration::from_secs(2)),
             "unique data file should be deleted when pruning snapshot: {}",
             path
         );

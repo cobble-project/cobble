@@ -186,3 +186,47 @@ jobs:
       
       - name: Run clippy
         run: cargo clippy -- -D warnings
+
+  windows-check:
+    # storage-hdfs is excluded: opendal-service-hdfs -> hdrs -> hdfs-sys links
+    # libjvm + libhdfs (Hadoop native, JNI). The windows-latest runner has no
+    # Hadoop distribution, so a vendored build of libhdfs is not feasible.
+    # storage-sftp is excluded: opendal-service-sftp -> openssh-sftp-client ->
+    # openssh, which uses std::os::unix APIs and is unix-only via
+    # compile_error!("This crate can only be used on unix").
+    name: Windows check (storage-all except hdfs and sftp)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+
+      - name: cargo check (storage-all except hdfs and sftp)
+        run: cargo check -p cobble --features storage-alluxio,storage-cos,storage-ftp,storage-goosefs,storage-oss,storage-s3

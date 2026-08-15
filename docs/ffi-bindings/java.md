@@ -535,7 +535,7 @@ If you want to customize your java APIs, you can compile by yourself. The Java b
 For the full feature list and usage examples, refer to `cobble`:
 https://crates.io/crates/cobble
 
-Java native build commands use `--features storage-all` on `cobble-java`, so Java artifacts include all Cobble optional OpenDAL backend features (`alluxio`, `cos`, `oss`, `s3`, `ftp`, `hdfs`, `sftp`).
+Java native build commands use `--features storage-all` on `cobble-java`, so Java artifacts include all Cobble optional OpenDAL backend features (`alluxio`, `cos`, `oss`, `s3`, `ftp`, `goosefs`, `hdfs`, `sftp`).
 
 ```bash
 # Local debug build (current platform only, includes debug + release JNI libs and CLI binaries)

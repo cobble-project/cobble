@@ -3,7 +3,7 @@ use crate::file::file_system::FileSystem;
 use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::file::opendal_file::{OpendalRandomAccessFile, OpendalSequentialWriteFile};
 use ::opendal::layers::{RetryLayer, TimeoutLayer};
-use ::opendal::{Entry, ErrorKind, Metadata, Operator, Scheme};
+use ::opendal::{Entry, ErrorKind, Metadata, Operator};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -128,6 +128,31 @@ fn resolve_s3_bucket_root_endpoint(
     Ok((bucket, root, endpoint))
 }
 
+const GOOSEFS_DEFAULT_MASTER_PORT: u16 = 9200;
+
+/// Resolve GooseFS `master_addr` and `root` from a volume URL.
+///
+/// Supported forms:
+/// - `goosefs://10.0.0.1:9200/data`
+/// - `goosefs://10.0.0.1/data` (port defaults to 9200)
+/// - `goosefs:///?master_addr=10.0.0.1:9200,10.0.0.2:9200&root=/data` (HA)
+fn resolve_goosefs_master_addr_root(
+    url: &Url,
+    query_options: &mut HashMap<String, String>,
+) -> (Option<String>, String) {
+    let master_addr = query_options.remove("master_addr").or_else(|| {
+        let host = url.host_str()?.trim();
+        if host.is_empty() {
+            return None;
+        }
+        let port = url.port().unwrap_or(GOOSEFS_DEFAULT_MASTER_PORT);
+        Some(format!("{host}:{port}"))
+    });
+    let default_root = normalize_root(url.path());
+    let root = normalize_root(&query_options.remove("root").unwrap_or(default_root));
+    (master_addr, root)
+}
+
 impl FileSystem for OpendalFileSystem {
     fn init(
         url: &Url,
@@ -135,26 +160,18 @@ impl FileSystem for OpendalFileSystem {
         access_key: Option<String>,
         custom_options: Option<HashMap<String, String>>,
     ) -> Result<Self> {
-        let scheme = match url.scheme().to_lowercase().as_str() {
-            "file" => "fs",
-            other => other,
+        let mut scheme = url.scheme().to_ascii_lowercase();
+        if scheme == "file" {
+            scheme = "fs".to_string();
         }
-        .parse::<Scheme>()
-        .map_err(|e| {
-            Error::FileSystemError(format!(
-                "Unsupported scheme '{}': {}. Enable the matching cobble storage feature (for example: storage-s3, storage-oss, storage-cos, storage-alluxio).",
-                url.scheme(),
-                e
-            ))
-        })?;
         let mut query_options: HashMap<String, String> = url.query_pairs().into_owned().collect();
         let mut options: HashMap<String, String> = HashMap::new();
-        match scheme {
-            Scheme::Fs => {
+        match scheme.as_str() {
+            "fs" => {
                 // For local fs, we only need to set the root path
                 options.insert("root".to_string(), url.path().to_string());
             }
-            Scheme::S3 => {
+            "s3" => {
                 let (bucket, root, endpoint) =
                     resolve_s3_bucket_root_endpoint(url, &mut query_options)?;
                 options.insert("bucket".to_string(), bucket);
@@ -184,6 +201,17 @@ impl FileSystem for OpendalFileSystem {
                     options.insert("secret_access_key".to_string(), secret_access_key);
                 }
             }
+            "goosefs" => {
+                let (master_addr, root) = resolve_goosefs_master_addr_root(url, &mut query_options);
+                if let Some(master_addr) = master_addr {
+                    options.insert("master_addr".to_string(), master_addr);
+                }
+                options.insert("root".to_string(), root);
+                let auth_username = access_id.or_else(|| query_options.remove("auth_username"));
+                if let Some(auth_username) = auth_username.filter(|name| !name.is_empty()) {
+                    options.insert("auth_username".to_string(), auth_username);
+                }
+            }
             _ => {
                 // Other schemes: preserve previous host/path-based behavior.
                 let host = url.host_str().unwrap_or("");
@@ -208,10 +236,14 @@ impl FileSystem for OpendalFileSystem {
         if let Some(custom_options) = custom_options {
             options.extend(custom_options);
         }
-        let op = Operator::via_iter(scheme, options).map_err(|e| {
-            Error::FileSystemError(format!("Failed to create opendal operator: {}", e))
+        let op = Operator::via_iter(&scheme, options).map_err(|e| {
+            Error::FileSystemError(format!(
+                "Failed to create opendal operator for scheme '{}': {}. Enable the matching cobble storage feature (for example: storage-s3, storage-oss, storage-cos, storage-alluxio, storage-goosefs).",
+                scheme,
+                e
+            ))
         })?;
-        let op = if scheme == Scheme::Fs {
+        let op = if scheme == "fs" {
             op.layer(retry_layer())
         } else {
             layer_remote_operator(op, REMOTE_OPERATION_TIMEOUT, REMOTE_IO_TIMEOUT)
@@ -277,7 +309,7 @@ impl FileSystem for OpendalFileSystem {
                 Ok(()) => Ok(()),
                 Err(rename_err) => {
                     if rename_err.kind() == ErrorKind::Unsupported {
-                        let copy_result: opendal::Result<()> = self.op.copy(from, to).await;
+                        let copy_result: opendal::Result<Metadata> = self.op.copy(from, to).await;
                         copy_result.map_err(|copy_err| {
                             Error::IoError(format!(
                                 "Failed to copy {} to {} during rename fallback: {}",

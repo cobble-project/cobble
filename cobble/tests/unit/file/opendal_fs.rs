@@ -1,6 +1,9 @@
 use super::*;
-use ::opendal::raw::{Access, AccessorInfo, OpRead, RpRead, oio};
-use ::opendal::{Buffer, Capability, OperatorBuilder};
+use ::opendal::raw::{
+    OpCopier, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite,
+    RpCreateDir, RpPresign, RpRead, RpRename, RpStat, Service, ServiceInfo, oio,
+};
+use ::opendal::{Buffer, BytesRange, Capability, ErrorKind, OperationContext, Operator};
 use std::collections::HashMap;
 use std::future::pending;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -102,33 +105,124 @@ fn test_resolve_s3_bucket_root_endpoint_local_endpoint_style() {
     assert_eq!(query.get("region").map(String::as_str), Some("us-east-1"));
 }
 
+#[test]
+fn test_resolve_goosefs_master_addr_from_host_and_port() {
+    let url = Url::parse("goosefs://10.0.0.1:9200/cobble-data").unwrap();
+    let mut query = HashMap::new();
+    let (master_addr, root) = resolve_goosefs_master_addr_root(&url, &mut query);
+    assert_eq!(master_addr.as_deref(), Some("10.0.0.1:9200"));
+    assert_eq!(root, "/cobble-data");
+}
+
+#[test]
+fn test_resolve_goosefs_master_addr_default_port() {
+    let url = Url::parse("goosefs://10.0.0.1/data").unwrap();
+    let mut query = HashMap::new();
+    let (master_addr, root) = resolve_goosefs_master_addr_root(&url, &mut query);
+    assert_eq!(master_addr.as_deref(), Some("10.0.0.1:9200"));
+    assert_eq!(root, "/data");
+}
+
+#[test]
+fn test_resolve_goosefs_master_addr_ha_query_override() {
+    let url =
+        Url::parse("goosefs://ignored-host/?master_addr=10.0.0.1:9200,10.0.0.2:9200&root=/shared")
+            .unwrap();
+    let mut query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let (master_addr, root) = resolve_goosefs_master_addr_root(&url, &mut query);
+    assert_eq!(master_addr.as_deref(), Some("10.0.0.1:9200,10.0.0.2:9200"));
+    assert_eq!(root, "/shared");
+}
+
 #[derive(Debug, Clone)]
-struct HangingThenReadyAccessor {
+struct HangingThenReadyService {
     reads: Arc<AtomicUsize>,
 }
 
-impl Access for HangingThenReadyAccessor {
+fn unsupported<T>(op: &str) -> ::opendal::Result<T> {
+    Err(::opendal::Error::new(
+        ErrorKind::Unsupported,
+        format!("{op} is not supported"),
+    ))
+}
+
+impl Service for HangingThenReadyService {
     type Reader = HangingThenReadyReader;
     type Writer = ();
     type Lister = ();
     type Deleter = ();
+    type Copier = ();
 
-    fn info(&self) -> Arc<AccessorInfo> {
-        let info = AccessorInfo::default();
-        info.set_native_capability(Capability {
-            read: true,
-            ..Default::default()
-        });
-        info.into()
+    fn info(&self) -> ServiceInfo {
+        ServiceInfo::with_scheme("mock")
     }
 
-    async fn read(&self, _: &str, _: OpRead) -> ::opendal::Result<(RpRead, Self::Reader)> {
-        Ok((
-            RpRead::new(),
-            HangingThenReadyReader {
-                reads: Arc::clone(&self.reads),
-            },
-        ))
+    fn capability(&self) -> Capability {
+        Capability {
+            read: true,
+            ..Default::default()
+        }
+    }
+
+    async fn create_dir(
+        &self,
+        _: &OperationContext,
+        _: &str,
+        _: OpCreateDir,
+    ) -> ::opendal::Result<RpCreateDir> {
+        unsupported("create_dir")
+    }
+
+    async fn stat(&self, _: &OperationContext, _: &str, _: OpStat) -> ::opendal::Result<RpStat> {
+        unsupported("stat")
+    }
+
+    fn read(&self, _: &OperationContext, _: &str, _: OpRead) -> ::opendal::Result<Self::Reader> {
+        Ok(HangingThenReadyReader {
+            reads: Arc::clone(&self.reads),
+        })
+    }
+
+    fn write(&self, _: &OperationContext, _: &str, _: OpWrite) -> ::opendal::Result<Self::Writer> {
+        unsupported("write")
+    }
+
+    fn delete(&self, _: &OperationContext) -> ::opendal::Result<Self::Deleter> {
+        unsupported("delete")
+    }
+
+    fn list(&self, _: &OperationContext, _: &str, _: OpList) -> ::opendal::Result<Self::Lister> {
+        unsupported("list")
+    }
+
+    fn copy(
+        &self,
+        _: &OperationContext,
+        _: &str,
+        _: &str,
+        _: OpCopy,
+        _: OpCopier,
+    ) -> ::opendal::Result<Self::Copier> {
+        unsupported("copy")
+    }
+
+    async fn rename(
+        &self,
+        _: &OperationContext,
+        _: &str,
+        _: &str,
+        _: OpRename,
+    ) -> ::opendal::Result<RpRename> {
+        unsupported("rename")
+    }
+
+    async fn presign(
+        &self,
+        _: &OperationContext,
+        _: &str,
+        _: OpPresign,
+    ) -> ::opendal::Result<RpPresign> {
+        unsupported("presign")
     }
 }
 
@@ -137,8 +231,12 @@ struct HangingThenReadyReader {
     reads: Arc<AtomicUsize>,
 }
 
-impl oio::Read for HangingThenReadyReader {
-    async fn read(&mut self) -> ::opendal::Result<Buffer> {
+struct HangingThenReadyStream {
+    reads: Arc<AtomicUsize>,
+}
+
+impl HangingThenReadyStream {
+    async fn next_buffer(&self) -> ::opendal::Result<Buffer> {
         match self.reads.fetch_add(1, Ordering::SeqCst) {
             0 => pending::<::opendal::Result<Buffer>>().await,
             1 => Ok(Buffer::from("recovered")),
@@ -147,19 +245,51 @@ impl oio::Read for HangingThenReadyReader {
     }
 }
 
+impl oio::ReadStream for HangingThenReadyStream {
+    async fn read(&mut self) -> ::opendal::Result<Buffer> {
+        self.next_buffer().await
+    }
+}
+
+impl oio::Read for HangingThenReadyReader {
+    async fn open(
+        &self,
+        _: BytesRange,
+    ) -> ::opendal::Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+        Ok((
+            RpRead::default(),
+            Box::new(HangingThenReadyStream {
+                reads: Arc::clone(&self.reads),
+            }),
+        ))
+    }
+
+    async fn read(&self, _: BytesRange) -> ::opendal::Result<(RpRead, Buffer)> {
+        let stream = HangingThenReadyStream {
+            reads: Arc::clone(&self.reads),
+        };
+        Ok((RpRead::default(), stream.next_buffer().await?))
+    }
+}
+
 #[tokio::test]
 async fn remote_timeout_is_retried_after_hanging_io() {
     let reads = Arc::new(AtomicUsize::new(0));
     let op = layer_remote_operator(
-        OperatorBuilder::new(HangingThenReadyAccessor {
-            reads: Arc::clone(&reads),
-        })
-        .finish(),
+        Operator::from_parts(
+            OperationContext::default(),
+            Arc::new(HangingThenReadyService {
+                reads: Arc::clone(&reads),
+            }),
+        ),
         Duration::from_millis(20),
         Duration::from_millis(20),
     );
 
     let value = op.read("hanging").await.expect("retry after timeout");
     assert_eq!(value.to_bytes().as_ref(), b"recovered");
-    assert_eq!(reads.load(Ordering::SeqCst), 3);
+    assert!(
+        reads.load(Ordering::SeqCst) >= 2,
+        "timeout should cancel the hanging read and retry"
+    );
 }

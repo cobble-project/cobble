@@ -17,6 +17,7 @@ storage-all = [
     "storage-alluxio",
     "storage-cos",
     "storage-ftp",
+    "storage-goosefs",
     "storage-hdfs",
     "storage-oss",
     "storage-s3",
@@ -25,6 +26,7 @@ storage-all = [
 storage-alluxio = ["opendal/services-alluxio"]
 storage-cos = ["opendal/services-cos"]
 storage-ftp = ["opendal/services-ftp"]
+storage-goosefs = ["opendal/services-goosefs"]
 storage-hdfs = ["opendal/services-hdfs"]
 storage-oss = ["opendal/services-oss"]
 storage-s3 = ["opendal/services-s3"]
@@ -39,7 +41,14 @@ foyer = "0.22.3"
 log = { workspace = true, features = ["serde"] }
 log4rs = "1.3.0"
 metrics = "0.22.3"
-opendal = { version = "0.55.0", default-features = false, features = ["services-fs"] }
+opendal = { version = "0.58.1", default-features = false, features = [
+    "auto-register-services",
+    "executors-tokio",
+    "http-transport-reqwest",
+    "layers-retry",
+    "layers-timeout",
+    "services-fs",
+] }
 rand = "0.8.5"
 serial_test = { workspace = true }
 thiserror = { workspace = true }

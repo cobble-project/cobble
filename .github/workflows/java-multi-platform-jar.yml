@@ -117,7 +117,7 @@ jobs:
             # Windows currently doesn't support these OpenDAL backends in our build:
             # - storage-sftp (openssh crate is unix-only)
             # - storage-hdfs (depends on unix-only libc constants)
-            build_features: storage-alluxio,storage-cos,storage-ftp,storage-oss,storage-s3
+            build_features: storage-alluxio,storage-cos,storage-ftp,storage-goosefs,storage-oss,storage-s3
 
     steps:
       - name: Checkout
