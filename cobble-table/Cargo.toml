@@ -1,0 +1,16 @@
+[package]
+name = "cobble-table"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Schema and table APIs for Cobble"
+repository.workspace = true
+homepage.workspace = true
+keywords = ["database", "schema", "table"]
+categories = ["database-implementations"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
