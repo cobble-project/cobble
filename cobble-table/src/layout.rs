@@ -3,51 +3,44 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-pub const LAYOUT_VERSION_CURRENT: u32 = 1;
-pub const COBBLE_TABLE_CODEC_V1: &str = "cobble-table-v1";
+pub(crate) const LAYOUT_VERSION_CURRENT: u32 = 1;
+pub(crate) const COBBLE_TABLE_CODEC_V1: &str = "cobble-table-v1";
 
 /// Stable SHA-256 identity of a schema and its compiled physical layout.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct LayoutFingerprint(String);
-
-impl LayoutFingerprint {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+pub(crate) struct LayoutFingerprint(String);
 
 /// Storage semantics of a value column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ValueStorage {
+pub(crate) enum ValueStorage {
     Replace,
 }
 
 /// Mapping of one semantic field to one Cobble value column.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ValueColumnLayout {
-    pub field_id: FieldId,
-    pub column_index: u16,
-    pub storage: ValueStorage,
+pub(crate) struct ValueColumnLayout {
+    pub(crate) field_id: FieldId,
+    pub(crate) column_index: u16,
+    pub(crate) storage: ValueStorage,
 }
 
-/// Persisted physical mapping compiled from a [`TableSchema`].
+/// Internal physical mapping compiled from a [`TableSchema`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordLayoutDescriptor {
-    pub version: u32,
-    pub codec: String,
-    pub schema_version: u64,
-    pub key_fields: Vec<FieldId>,
-    pub bucket_fields: Vec<FieldId>,
-    pub value_columns: Vec<ValueColumnLayout>,
-    pub fingerprint: LayoutFingerprint,
+pub(crate) struct RecordLayoutDescriptor {
+    pub(crate) version: u32,
+    pub(crate) codec: String,
+    pub(crate) key_fields: Vec<FieldId>,
+    pub(crate) bucket_fields: Vec<FieldId>,
+    pub(crate) value_columns: Vec<ValueColumnLayout>,
+    pub(crate) fingerprint: LayoutFingerprint,
 }
 
-pub struct LayoutCompiler;
+pub(crate) struct LayoutCompiler;
 
 impl LayoutCompiler {
-    pub fn compile(schema: &TableSchema) -> Result<RecordLayoutDescriptor> {
+    pub(crate) fn compile(schema: &TableSchema) -> Result<RecordLayoutDescriptor> {
         schema.validate()?;
         let key_fields = schema.primary_key.clone();
         let bucket_fields = schema.bucket_key.clone();
@@ -57,9 +50,8 @@ impl LayoutCompiler {
             if key_set.contains(&field.id) {
                 continue;
             }
-            let column_index = u16::try_from(value_columns.len()).map_err(|_| {
-                TableError::InvalidLayout("table has more than 65536 value columns".to_string())
-            })?;
+            let column_index = u16::try_from(value_columns.len())
+                .map_err(|_| TableError::internal("table has more than 65536 value columns"))?;
             value_columns.push(ValueColumnLayout {
                 field_id: field.id,
                 column_index,
@@ -70,7 +62,6 @@ impl LayoutCompiler {
         Ok(RecordLayoutDescriptor {
             version: LAYOUT_VERSION_CURRENT,
             codec: COBBLE_TABLE_CODEC_V1.to_string(),
-            schema_version: schema.version,
             key_fields,
             bucket_fields,
             value_columns,
@@ -80,28 +71,22 @@ impl LayoutCompiler {
 }
 
 impl RecordLayoutDescriptor {
-    pub fn validate_against(&self, schema: &TableSchema) -> Result<()> {
+    pub(crate) fn validate_against(&self, schema: &TableSchema) -> Result<()> {
         schema.validate()?;
         if self.version != LAYOUT_VERSION_CURRENT {
-            return Err(TableError::InvalidLayout(format!(
+            return Err(TableError::internal(format!(
                 "unsupported layout version: {}",
                 self.version
             )));
         }
         if self.codec != COBBLE_TABLE_CODEC_V1 {
-            return Err(TableError::InvalidLayout(format!(
+            return Err(TableError::internal(format!(
                 "unsupported table codec: {}",
                 self.codec
             )));
         }
-        if self.schema_version != schema.version {
-            return Err(TableError::InvalidLayout(format!(
-                "layout schema version {} does not match schema version {}",
-                self.schema_version, schema.version
-            )));
-        }
         if self.key_fields != schema.primary_key || self.bucket_fields != schema.bucket_key {
-            return Err(TableError::InvalidLayout(
+            return Err(TableError::internal(
                 "layout key fields do not match the table schema".to_string(),
             ));
         }
@@ -114,7 +99,7 @@ impl RecordLayoutDescriptor {
             .map(|field| field.id)
             .collect::<Vec<_>>();
         if self.value_columns.len() != expected_value_fields.len() {
-            return Err(TableError::InvalidLayout(
+            return Err(TableError::internal(
                 "layout does not map every value field".to_string(),
             ));
         }
@@ -128,7 +113,7 @@ impl RecordLayoutDescriptor {
                 || column.field_id != field_id
                 || column.storage != ValueStorage::Replace
             {
-                return Err(TableError::InvalidLayout(
+                return Err(TableError::internal(
                     "value columns must follow schema order with contiguous indices".to_string(),
                 ));
             }
@@ -141,7 +126,7 @@ impl RecordLayoutDescriptor {
             &self.value_columns,
         )?;
         if self.fingerprint != expected {
-            return Err(TableError::InvalidLayout(
+            return Err(TableError::internal(
                 "layout fingerprint does not match its schema and mapping".to_string(),
             ));
         }
@@ -172,7 +157,8 @@ fn fingerprint(
         key_fields,
         bucket_fields,
         value_columns,
-    })?;
+    })
+    .map_err(|error| TableError::internal(error.to_string()))?;
     let digest = Sha256::digest(payload);
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {

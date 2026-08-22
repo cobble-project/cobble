@@ -9,18 +9,18 @@ mod codec;
 mod error;
 mod layout;
 mod logical_type;
+#[allow(dead_code)]
 mod metadata;
 mod schema;
+
+#[cfg(test)]
+#[path = "../tests/unit/metadata.rs"]
+mod metadata_tests;
 
 pub use bucket::BucketHash;
 pub use codec::{KeyCodec, Value, ValueCodec};
 pub use error::{Result, TableError};
-pub use layout::{
-    COBBLE_TABLE_CODEC_V1, LAYOUT_VERSION_CURRENT, LayoutCompiler, LayoutFingerprint,
-    RecordLayoutDescriptor, ValueColumnLayout, ValueStorage,
-};
 pub use logical_type::{
     DataField, ExtensionType, FieldId, LogicalType, LogicalTypeKind, TimestampKind,
 };
-pub use metadata::{TABLE_METADATA_FORMAT, TABLE_METADATA_VERSION_CURRENT, TableMetadata};
 pub use schema::TableSchema;

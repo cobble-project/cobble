@@ -98,6 +98,21 @@ class TableCodecTest {
                                 LogicalTypes.list(LogicalTypes.int32()),
                                 ByteBuffer.wrap(
                                         new byte[] {(byte) 0xff, (byte) 0xff, (byte) 0xff, 0x7f})));
+
+        String metadataJson =
+                new String(
+                        Files.readAllBytes(
+                                Paths.get(
+                                        "..",
+                                        "..",
+                                        "spec",
+                                        "table",
+                                        "fixtures",
+                                        "table_metadata_v1.json")),
+                        "UTF-8");
+        TableMetadata metadata = TableMetadata.fromJson(metadataJson);
+        assertEquals("cobble-table-v1", metadata.layout().codec());
+        assertEquals(metadata, TableMetadata.fromJson(metadata.toJson()));
         assertThrows(
                 IllegalArgumentException.class,
                 () ->

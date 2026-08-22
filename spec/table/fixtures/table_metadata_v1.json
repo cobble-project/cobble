@@ -2,7 +2,6 @@
   "format": "cobble-table",
   "version": 1,
   "schema": {
-    "version": 7,
     "fields": [
       {
         "id": 1,
@@ -66,7 +65,6 @@
   "layout": {
     "version": 1,
     "codec": "cobble-table-v1",
-    "schema_version": 7,
     "key_fields": [
       1,
       2
@@ -91,6 +89,6 @@
         "storage": "replace"
       }
     ],
-    "fingerprint": "57d0dfb44304875dc360957f1b304510d7b44deb1d533ae9e0da01b41389b38a"
+    "fingerprint": "9b8730886ca9d5b2624a5d0d6700dbac7db447254311a08dea8b9477d86e1d7c"
   }
 }

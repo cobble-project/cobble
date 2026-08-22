@@ -1,10 +1,8 @@
-use cobble_table::{
-    DataField, FieldId, LogicalType, TableError, TableMetadata, TableSchema, TimestampKind,
-};
+use crate::metadata::TableMetadata;
+use crate::{DataField, FieldId, LogicalType, TableError, TableSchema, TimestampKind};
 
 fn fixture_schema() -> TableSchema {
     TableSchema::new(
-        7,
         vec![
             DataField::new(1, "tenant", LogicalType::string()).unwrap(),
             DataField::new(2, "id", LogicalType::int64()).unwrap(),
@@ -34,16 +32,14 @@ fn table_metadata_contract_and_validation() {
     assert_eq!(metadata.layout.key_fields, vec![FieldId(1), FieldId(2)]);
     assert_eq!(metadata.layout.bucket_fields, vec![FieldId(1)]);
     assert_eq!(metadata.layout.value_columns.len(), 3);
-    assert_eq!(metadata.layout.fingerprint.as_str().len(), 64);
 
-    let encoded = metadata.to_pretty_json().unwrap();
+    let encoded = metadata.to_json().unwrap();
     assert_eq!(TableMetadata::from_json(&encoded).unwrap(), metadata);
 
-    let fixture = include_bytes!("../../spec/table/fixtures/table_metadata_v1.json");
+    let fixture = include_bytes!("../../../spec/table/fixtures/table_metadata_v1.json");
     assert_eq!(TableMetadata::from_json(fixture).unwrap(), metadata);
 
     let nullable_key = TableSchema::new(
-        1,
         vec![DataField::new(1, "id", LogicalType::int64().nullable()).unwrap()],
         vec![FieldId(1)],
         vec![FieldId(1)],
@@ -51,7 +47,6 @@ fn table_metadata_contract_and_validation() {
     assert!(matches!(nullable_key, Err(TableError::InvalidSchema(_))));
 
     let non_prefix_bucket = TableSchema::new(
-        1,
         vec![
             DataField::new(1, "tenant", LogicalType::string()).unwrap(),
             DataField::new(2, "id", LogicalType::int64()).unwrap(),

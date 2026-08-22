@@ -5,7 +5,6 @@ use std::collections::{HashMap, HashSet};
 /// User-visible semantic schema of a table.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchema {
-    pub version: u64,
     pub fields: Vec<DataField>,
     pub primary_key: Vec<FieldId>,
     pub bucket_key: Vec<FieldId>,
@@ -13,13 +12,11 @@ pub struct TableSchema {
 
 impl TableSchema {
     pub fn new(
-        version: u64,
         fields: Vec<DataField>,
         primary_key: Vec<FieldId>,
         bucket_key: Vec<FieldId>,
     ) -> Result<Self> {
         let schema = Self {
-            version,
             fields,
             primary_key,
             bucket_key,
