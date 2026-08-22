@@ -4,12 +4,16 @@
 //! versioned cross-language codec, while specialized structures such as lists
 //! and priority queues keep their existing APIs and storage semantics.
 
+mod bucket;
+mod codec;
 mod error;
 mod layout;
 mod logical_type;
 mod metadata;
 mod schema;
 
+pub use bucket::BucketHash;
+pub use codec::{KeyCodec, Value, ValueCodec};
 pub use error::{Result, TableError};
 pub use layout::{
     COBBLE_TABLE_CODEC_V1, LAYOUT_VERSION_CURRENT, LayoutCompiler, LayoutFingerprint,

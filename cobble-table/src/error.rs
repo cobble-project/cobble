@@ -15,4 +15,13 @@ pub enum TableError {
 
     #[error("failed to encode or decode table metadata: {0}")]
     MetadataCodec(#[from] serde_json::Error),
+
+    #[error("table codec error: {0}")]
+    Codec(String),
+}
+
+impl TableError {
+    pub(crate) fn codec(message: impl Into<String>) -> Self {
+        Self::Codec(message.into())
+    }
 }

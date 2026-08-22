@@ -40,9 +40,32 @@ String, and Binary. Floating-point and nested values are not V1 key types.
 
 ## Binary codec
 
-The exact key, value, row, and JNI batch encodings will be specified with shared golden vectors in
-Phase 2. Persisted values must always declare `codec = "cobble-table-v1"`; readers reject unknown
-codec identifiers rather than guessing.
+Encoding is schema-directed: bytes contain no type tag. All key fields must be non-null and are
+concatenated in primary-key order. Signed fixed-width integers, Decimal, Date, Time, and the
+seconds portion of Timestamp use big-endian two's-complement with their first byte XORed by
+`0x80`, so unsigned byte comparison preserves signed order. Timestamp nanos are unsigned
+big-endian. String and Binary keys escape every `00` as `00 ff` and terminate with `00 00`.
+
+Values use a `00` / `01` marker only for nullable nodes. Fixed-width scalar payloads are
+little-endian; String and Binary payloads are their raw bytes. Decimal width is four bytes for
+precision 1--9, eight for 10--18, and sixteen for 19--38. Time and Timestamp precision is 0--9;
+Time is an i64 nanos-of-day and Timestamp is i64 seconds followed by u32 nanos. List and Map
+start with a u32 little-endian count; every child uses `u32 little-endian length + payload`.
+Struct has its schema fields in order, each with the same length-delimited child format. Extension
+encodes exactly its declared physical type.
+
+Rust `ValueCodec::decode_bytes(Bytes)` returns Binary values that retain the input allocation via
+`Bytes` reference counting, so callers need not keep another input handle alive. Java
+`ValueCodec.decode(ByteBuffer)` returns Binary values as borrowed read-only slices, including
+nested values; if their backing buffer will be reused or mutated, applications must copy them.
+
+`BucketHash` applies Java `Arrays.hashCode(byte[])` semantics (signed bytes, wrapping i32) to the
+encoded bucket-key prefix and then uses `floorMod`. Bucket counts are in `[1, 65536]`.
+
+The comprehensive cross-language vectors are in
+[`fixtures/cobble_table_v1_codec.json`](fixtures/cobble_table_v1_codec.json). Persisted values
+must always declare `codec = "cobble-table-v1"`; readers reject unknown codec identifiers rather
+than guessing.
 
 ## Evolution
 
