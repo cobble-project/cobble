@@ -160,6 +160,12 @@ public final class KeyCodec {
     }
 
     public static List<Value> decode(List<LogicalType> types, ByteBuffer input) {
+        return decodeOwned(types, input);
+    }
+
+    // Key-compatible types are scalars. Escaped binary is decoded into a fresh array, so every
+    // returned value remains valid after the input buffer is reused.
+    static List<Value> decodeOwned(List<LogicalType> types, ByteBuffer input) {
         List<Value> values = new ArrayList<Value>(types.size());
         for (LogicalType type : types) values.add(decodeOne(type, input));
         if (input.hasRemaining()) throw new IllegalArgumentException("trailing key bytes");
@@ -218,7 +224,7 @@ public final class KeyCodec {
             case STRING:
                 return Value.string(decodeUtf8(readEscaped(input)));
             case BINARY:
-                return Value.binary(readEscaped(input));
+                return Value.binaryOwned(readEscaped(input));
             default:
                 throw new IllegalArgumentException("type cannot be used as a key");
         }

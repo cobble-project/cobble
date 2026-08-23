@@ -175,6 +175,10 @@ public final class Value {
         return binary(ByteBuffer.wrap(java.util.Arrays.copyOf(value, value.length)));
     }
 
+    static Value binaryOwned(byte[] value) {
+        return new Value(Kind.BINARY, ByteBuffer.wrap(value).asReadOnlyBuffer());
+    }
+
     public static Value list(List<Value> value) {
         return new Value(Kind.LIST, Collections.unmodifiableList(new ArrayList<Value>(value)));
     }

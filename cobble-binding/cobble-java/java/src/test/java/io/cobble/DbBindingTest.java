@@ -8,6 +8,7 @@ import io.cobble.table.LogicalTypes;
 import io.cobble.table.RecordType;
 import io.cobble.table.Table;
 import io.cobble.table.TableKey;
+import io.cobble.table.TableProjection;
 import io.cobble.table.TableScanCursor;
 import io.cobble.table.TableSchema;
 import io.cobble.table.Value;
@@ -117,17 +118,113 @@ class DbBindingTest {
                 assertEquals(row3, direct.values());
             }
 
+            try (TableProjection projection =
+                    table.projectByNames(Arrays.asList("note", "tenant", "payload"))) {
+                List<Value> projected1 = Arrays.asList(row1.get(4), row1.get(0), row1.get(2));
+                List<Value> projected2 = Arrays.asList(row2.get(4), row2.get(0), row2.get(2));
+                assertEquals(projected1, projection.get(key1));
+                assertEquals(
+                        Arrays.asList(projected2, projected1, projected2, null),
+                        projection.multiGet(Arrays.asList(key2, key1, key2, missing)));
+                List<List<Value>> projectedScan = new ArrayList<List<Value>>();
+                try (TableScanCursor cursor = projection.scanBounds(key1.bucket(), key1, missing)) {
+                    for (List<Value> row : cursor) projectedScan.add(row);
+                }
+                assertEquals(
+                        Arrays.asList(
+                                projected1,
+                                projected2,
+                                Arrays.asList(row3.get(4), row3.get(0), row3.get(2))),
+                        projectedScan);
+            }
+            try (TableProjection keyProjection =
+                            table.projectByNames(Collections.singletonList("id"));
+                    TableProjection valueProjection =
+                            table.projectByNames(Collections.singletonList("nested"))) {
+                assertEquals(Collections.singletonList(row1.get(1)), keyProjection.get(key1));
+                assertNull(keyProjection.get(missing));
+                List<List<Value>> keyScan = new ArrayList<List<Value>>();
+                try (TableScanCursor cursor =
+                        keyProjection.scanBounds(key1.bucket(), key1, missing)) {
+                    for (List<Value> row : cursor) keyScan.add(row);
+                }
+                assertEquals(
+                        Arrays.asList(
+                                Collections.singletonList(row1.get(1)),
+                                Collections.singletonList(row2.get(1)),
+                                Collections.singletonList(row3.get(1))),
+                        keyScan);
+                assertEquals(Collections.singletonList(row2.get(3)), valueProjection.get(key2));
+                List<List<Value>> valueScan = new ArrayList<List<Value>>();
+                try (TableScanCursor cursor =
+                        valueProjection.scanBounds(key1.bucket(), key1, missing)) {
+                    for (List<Value> row : cursor) valueScan.add(row);
+                }
+                assertEquals(
+                        Arrays.asList(
+                                Collections.singletonList(row1.get(3)),
+                                Collections.singletonList(row2.get(3)),
+                                Collections.singletonList(row3.get(3))),
+                        valueScan);
+            }
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> table.projectByNames(Collections.emptyList()));
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> table.projectByNames(Arrays.asList("tenant", "tenant")));
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> table.projectByNames(Collections.singletonList("missing")));
+
+            table.delete(key1);
+            assertNull(table.get(key1));
+            table.deleteBatch(Arrays.asList(key2, key3, key2));
+            assertNull(table.get(key2));
+            assertNull(table.get(key3));
+
             TableSchema keySchema =
                     new TableSchema(
-                            Collections.singletonList(
-                                    new DataField(11, "key", LogicalTypes.int64())),
-                            Collections.singletonList(11L),
+                            Arrays.asList(
+                                    new DataField(11, "tenant", LogicalTypes.int64()),
+                                    new DataField(12, "key", LogicalTypes.binary())),
+                            Arrays.asList(11L, 12L),
                             Collections.singletonList(11L));
             try (Table keys = Table.create(db, "keys", keySchema)) {
-                List<Value> keyOnly = Collections.singletonList(Value.int64(7));
-                TableKey key = keys.keyBuilder().push(Value.int64(7)).build();
+                List<Value> keyOnly = Arrays.asList(Value.int64(1), Value.binary(new byte[] {7}));
+                List<Value> secondKeyOnly =
+                        Arrays.asList(Value.int64(1), Value.binary(new byte[] {8}));
+                TableKey key = keys.keyBuilder().push(keyOnly.get(0)).push(keyOnly.get(1)).build();
+                TableKey secondKey =
+                        keys.keyBuilder()
+                                .push(secondKeyOnly.get(0))
+                                .push(secondKeyOnly.get(1))
+                                .build();
                 keys.put(keyOnly);
+                keys.put(secondKeyOnly);
                 assertEquals(keyOnly, keys.get(key));
+                try (TableScanCursor cursor = keys.scan(key.bucket())) {
+                    List<Value> firstScanned = cursor.nextRow();
+                    assertEquals(secondKeyOnly, cursor.nextRow());
+                    assertNull(cursor.nextRow());
+                    assertEquals(keyOnly, firstScanned);
+                }
+                try (TableProjection keyOnlyProjection =
+                        keys.projectByNames(Collections.singletonList("key"))) {
+                    assertEquals(
+                            Collections.singletonList(keyOnly.get(1)), keyOnlyProjection.get(key));
+                    try (TableScanCursor cursor = keyOnlyProjection.scan(key.bucket())) {
+                        List<Value> firstProjected = cursor.nextRow();
+                        assertEquals(
+                                Collections.singletonList(secondKeyOnly.get(1)), cursor.nextRow());
+                        assertNull(cursor.nextRow());
+                        assertEquals(Collections.singletonList(keyOnly.get(1)), firstProjected);
+                    }
+                    keys.delete(key);
+                    assertNull(keys.get(key));
+                    assertNull(keyOnlyProjection.get(key));
+                    assertEquals(secondKeyOnly, keys.get(secondKey));
+                }
             }
         }
     }

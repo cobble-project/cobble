@@ -1,13 +1,13 @@
 use crate::db::db_from_handle_or_throw;
 use crate::util::{
-    decode_java_bytes, decode_java_string, decode_u16, throw_illegal_argument, throw_illegal_state,
-    to_java_string_or_throw,
+    decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_u16,
+    throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use cobble_binding::Db;
 use cobble_table::{Table, TableError, TableSchema};
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JByteBuffer, JClass, JString};
+use jni::objects::{JByteArray, JByteBuffer, JClass, JIntArray, JObjectArray, JString};
 use jni::sys::{jint, jlong, jstring};
 
 #[unsafe(no_mangle)]
@@ -155,6 +155,73 @@ pub extern "system" fn Java_io_cobble_table_Table_putEncodedDirectNative(
         }
     };
     put_encoded(&mut env, db, bucket, key, payload, write_options_handle);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_Table_deleteNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    db_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    write_options_handle: jlong,
+) {
+    let Some(db) = db_from_handle_or_throw(&mut env, db_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_argument(&mut env, error);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_argument(&mut env, error);
+            return;
+        }
+    };
+    let Some(write_options) = write_options_from_handle_or_throw(&mut env, write_options_handle)
+    else {
+        return;
+    };
+    if let Err(error) = db.delete_row_with_options(bucket, &key, write_options.write_options()) {
+        throw_illegal_state(&mut env, error.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_Table_deleteBatchNative<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    db_handle: jlong,
+    buckets: JIntArray<'local>,
+    keys: JObjectArray<'local>,
+    write_options_handle: jlong,
+) {
+    let Some(db) = db_from_handle_or_throw(&mut env, db_handle) else {
+        return;
+    };
+    let keys = match decode_multi_get_keys(&mut env, &buckets, &keys) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_argument(&mut env, error);
+            return;
+        }
+    };
+    let Some(write_options) = write_options_from_handle_or_throw(&mut env, write_options_handle)
+    else {
+        return;
+    };
+    let borrowed = keys
+        .iter()
+        .map(|(bucket, key)| (*bucket, key.as_slice()))
+        .collect::<Vec<_>>();
+    if let Err(error) = db.delete_rows_with_options(&borrowed, write_options.write_options()) {
+        throw_illegal_state(&mut env, error.to_string());
+    }
 }
 
 fn table_open_response(env: &mut JNIEnv, db: &Db, schema: &TableSchema) -> jstring {

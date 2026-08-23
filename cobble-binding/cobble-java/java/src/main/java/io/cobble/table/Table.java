@@ -82,6 +82,12 @@ public final class Table implements AutoCloseable {
         return new TableKeyBuilder(compiled);
     }
 
+    /** Compiles a reusable typed projection from top-level field names. */
+    public TableProjection projectByNames(List<String> fieldNames) {
+        ensureUsable();
+        return new TableProjection(this, fieldNames);
+    }
+
     /** Writes one full row in schema field order. */
     public void put(List<Value> row) {
         ensureUsable();
@@ -129,6 +135,32 @@ public final class Table implements AutoCloseable {
                 0,
                 rowLength,
                 writeOptions.getNativeHandle());
+    }
+
+    /** Deletes one complete row. */
+    public void delete(TableKey key) {
+        ensureUsable();
+        Objects.requireNonNull(key, "key");
+        deleteNative(
+                db.getNativeHandle(),
+                key.bucket(),
+                key.encodedInternal(),
+                writeOptions.getNativeHandle());
+    }
+
+    /** Deletes complete rows in one native batch. Each row is atomic. */
+    public void deleteBatch(List<TableKey> primaryKeys) {
+        ensureUsable();
+        Objects.requireNonNull(primaryKeys, "primaryKeys");
+        if (primaryKeys.isEmpty()) return;
+        int[] buckets = new int[primaryKeys.size()];
+        byte[][] keys = new byte[primaryKeys.size()][];
+        for (int i = 0; i < primaryKeys.size(); i++) {
+            TableKey key = Objects.requireNonNull(primaryKeys.get(i), "primaryKey");
+            buckets[i] = key.bucket();
+            keys[i] = key.encodedInternal();
+        }
+        deleteBatchNative(db.getNativeHandle(), buckets, keys, writeOptions.getNativeHandle());
     }
 
     /** Returns one owned typed row, or {@code null} when absent. */
@@ -207,7 +239,12 @@ public final class Table implements AutoCloseable {
                         directEnd,
                         end == null ? 0 : end.length,
                         scanOptions),
-                compiled);
+                new TableScanCursor.RowDecoder() {
+                    @Override
+                    public List<Value> decode(DirectScanEntry entry) {
+                        return decodeDirectScannedRowOwned(compiled, entry);
+                    }
+                });
     }
 
     @Override
@@ -311,10 +348,7 @@ public final class Table implements AutoCloseable {
     }
 
     static List<Value> decodeDirectScannedRowOwned(Compiled compiled, DirectScanEntry entry) {
-        ByteBuffer encodedKey = entry.getKey();
-        byte[] key = new byte[encodedKey.remaining()];
-        encodedKey.get(key);
-        List<Value> keyValues = KeyCodec.decode(compiled.keyTypes, ByteBuffer.wrap(key));
+        List<Value> keyValues = KeyCodec.decodeOwned(compiled.keyTypes, entry.getKey());
         DirectColumns columns = entry.columnsView();
         if (columns.size() != compiled.physicalColumns)
             throw new IllegalStateException("table row has an incompatible physical layout");
@@ -338,7 +372,7 @@ public final class Table implements AutoCloseable {
             throw new IllegalArgumentException("row field count does not match schema");
     }
 
-    private void ensureUsable() {
+    void ensureUsable() {
         if (closed) throw new IllegalStateException("table is closed");
         ensureDbOpen(db);
     }
@@ -352,7 +386,7 @@ public final class Table implements AutoCloseable {
         if (!buffer.isDirect()) throw new IllegalArgumentException(name + " must be direct");
     }
 
-    private static void validateBound(int bucket, TableKey key) {
+    static void validateBound(int bucket, TableKey key) {
         if (key != null && key.bucket() != bucket)
             throw new IllegalArgumentException("table scan bound belongs to a different bucket");
     }
@@ -361,7 +395,7 @@ public final class Table implements AutoCloseable {
         return range(buffer, 0, end);
     }
 
-    private static ByteBuffer directCopy(byte[] bytes) {
+    static ByteBuffer directCopy(byte[] bytes) {
         if (bytes == null) return null;
         ByteBuffer direct = ByteBuffer.allocateDirect(bytes.length);
         direct.put(bytes);
@@ -394,6 +428,18 @@ public final class Table implements AutoCloseable {
             this.schema = schema;
             this.totalBuckets = totalBuckets;
         }
+    }
+
+    Db dbInternal() {
+        return db;
+    }
+
+    String nameInternal() {
+        return name;
+    }
+
+    Compiled compiledInternal() {
+        return compiled;
     }
 
     static final class Compiled {
@@ -485,4 +531,10 @@ public final class Table implements AutoCloseable {
             int rowOffset,
             int rowLength,
             long writeOptionsHandle);
+
+    private static native void deleteNative(
+            long dbHandle, int bucket, byte[] key, long writeOptionsHandle);
+
+    private static native void deleteBatchNative(
+            long dbHandle, int[] buckets, byte[][] keys, long writeOptionsHandle);
 }

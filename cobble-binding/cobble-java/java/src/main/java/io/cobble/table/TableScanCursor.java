@@ -10,22 +10,26 @@ import java.util.NoSuchElementException;
 
 /** Native-backed typed scan cursor. A cursor supports one traversal and must be closed. */
 public final class TableScanCursor implements AutoCloseable, Iterable<List<Value>> {
+    interface RowDecoder {
+        List<Value> decode(DirectScanEntry entry);
+    }
+
     private final Db db;
     private final DirectScanCursor inner;
-    private final Table.Compiled compiled;
+    private final RowDecoder decoder;
     private boolean iteratorCreated;
 
-    TableScanCursor(Db db, DirectScanCursor inner, Table.Compiled compiled) {
+    TableScanCursor(Db db, DirectScanCursor inner, RowDecoder decoder) {
         this.db = db;
         this.inner = inner;
-        this.compiled = compiled;
+        this.decoder = decoder;
     }
 
     /** Returns the next owned typed row, or {@code null} when exhausted. */
     public List<Value> nextRow() {
         if (db.isDisposed()) throw new IllegalStateException("database is closed");
         DirectScanEntry entry = inner.nextEntry();
-        return entry == null ? null : Table.decodeDirectScannedRowOwned(compiled, entry);
+        return entry == null ? null : decoder.decode(entry);
     }
 
     @Override
