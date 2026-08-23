@@ -1,6 +1,5 @@
 package io.cobble.table;
 
-import io.cobble.Db;
 import io.cobble.DirectColumns;
 import io.cobble.DirectScanEntry;
 import io.cobble.ReadOptions;
@@ -17,11 +16,12 @@ import java.util.Set;
 /**
  * A reusable typed field projection over one table.
  *
- * <p>The projection owns its read and scan options. Close its cursors and the projection before
- * closing the table; {@link #close()} must not race another operation.
+ * <p>The projection owns its read and scan options and keeps the database reachable independently
+ * of the table handle. Close its cursors and the projection before closing the database; {@link
+ * #close()} must not race another operation.
  */
 public final class TableProjection implements AutoCloseable {
-    private final Table table;
+    private final TableReadBackend reads;
     private final Table.Compiled compiled;
     private final Source[] sources;
     private final boolean hasKeyFields;
@@ -30,9 +30,13 @@ public final class TableProjection implements AutoCloseable {
     private final ScanOptions scanOptions;
     private volatile boolean closed;
 
-    TableProjection(Table table, List<String> fieldNames) {
-        this.table = table;
-        this.compiled = table.compiledInternal();
+    TableProjection(
+            TableReadBackend reads,
+            String tableName,
+            Table.Compiled compiled,
+            List<String> fieldNames) {
+        this.reads = reads;
+        this.compiled = compiled;
         Objects.requireNonNull(fieldNames, "fieldNames");
         if (fieldNames.isEmpty())
             throw new IllegalArgumentException("table projection must contain at least one field");
@@ -63,16 +67,15 @@ public final class TableProjection implements AutoCloseable {
         int[] columns = toIntArray(physicalColumns);
         this.sources = sourceList.toArray(new Source[sourceList.size()]);
         this.hasKeyFields = selectsKey;
-        this.readOptions = ReadOptions.forColumnsInFamily(table.nameInternal(), columns);
-        this.scanOptions = new ScanOptions().columnFamily(table.nameInternal()).columns(columns);
+        this.readOptions = ReadOptions.forColumnsInFamily(tableName, columns);
+        this.scanOptions = new ScanOptions().columnFamily(tableName).columns(columns);
     }
 
     /** Reads one projected row, or {@code null} when absent. */
     public List<Value> get(TableKey key) {
         ensureUsable();
         Objects.requireNonNull(key, "key");
-        byte[][] columns =
-                table.dbInternal().getWithOptions(key.bucket(), key.encodedInternal(), readOptions);
+        byte[][] columns = reads.get(key.bucket(), key.encodedInternal(), readOptions);
         return columns == null ? null : decodeRow(key.valuesInternal(), columns);
     }
 
@@ -87,7 +90,7 @@ public final class TableProjection implements AutoCloseable {
             buckets[i] = key.bucket();
             keys[i] = key.encodedInternal();
         }
-        byte[][][] columns = table.dbInternal().multiGetWithOptions(buckets, keys, readOptions);
+        byte[][][] columns = reads.multiGet(buckets, keys, readOptions);
         List<List<Value>> rows = new ArrayList<List<Value>>(columns.length);
         for (int i = 0; i < columns.length; i++)
             rows.add(
@@ -109,19 +112,10 @@ public final class TableProjection implements AutoCloseable {
         Table.validateBound(bucket, endExclusive);
         byte[] start = startInclusive == null ? null : startInclusive.encodedInternal();
         byte[] end = endExclusive == null ? null : endExclusive.encodedInternal();
-        ByteBuffer directStart = Table.directCopy(start);
-        ByteBuffer directEnd = Table.directCopy(end);
         final TableProjection projection = this;
-        Db db = table.dbInternal();
         return new TableScanCursor(
-                db,
-                db.scanDirectWithOptions(
-                        bucket,
-                        directStart,
-                        start == null ? 0 : start.length,
-                        directEnd,
-                        end == null ? 0 : end.length,
-                        scanOptions),
+                reads.owner(),
+                reads.scan(bucket, start, end, scanOptions),
                 new TableScanCursor.RowDecoder() {
                     @Override
                     public List<Value> decode(DirectScanEntry entry) {
@@ -182,7 +176,7 @@ public final class TableProjection implements AutoCloseable {
 
     private void ensureUsable() {
         if (closed) throw new IllegalStateException("table projection is closed");
-        table.ensureUsable();
+        reads.ensureOpen();
     }
 
     private static int indexOf(int[] values, int target) {

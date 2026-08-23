@@ -881,6 +881,28 @@ public final class Db extends NativeObject {
         return new DirectScanCursor(handle, directBufferPool);
     }
 
+    /**
+     * Open a direct scan cursor with heap key bounds and explicit options.
+     *
+     * <p>The cursor still exposes zero-copy rows through its pooled direct output buffer. Passing
+     * {@code null} for either bound leaves that side open.
+     */
+    public DirectScanCursor scanDirectWithOptions(
+            int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, ScanOptions options) {
+        long scanOptionsHandle = options == null ? 0L : options.nativeHandle;
+        long handle =
+                openScanCursor(
+                        nativeHandle,
+                        bucket,
+                        startKeyInclusive,
+                        endKeyExclusive,
+                        scanOptionsHandle);
+        if (handle == 0L) {
+            throw new IllegalStateException("failed to open direct scan cursor");
+        }
+        return new DirectScanCursor(handle, directBufferPool);
+    }
+
     private static void validateOptionalDirectScanBound(
             String name, ByteBuffer key, int keyLength) {
         if (key == null) {

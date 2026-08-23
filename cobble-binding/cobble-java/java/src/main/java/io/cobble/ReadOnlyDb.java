@@ -6,6 +6,8 @@ package io.cobble;
  * <p>Use this for direct snapshot reads without write capability.
  */
 public final class ReadOnlyDb extends NativeObject {
+    private static final DirectBufferPool DIRECT_BUFFER_POOL = DirectBufferPool.defaults();
+
     private ReadOnlyDb(long nativeHandle) {
         super(nativeHandle);
     }
@@ -128,6 +130,28 @@ public final class ReadOnlyDb extends NativeObject {
             throw new IllegalStateException("failed to open readonly scan cursor");
         }
         return new ScanCursor(handle);
+    }
+
+    /**
+     * Open a zero-copy direct scan cursor with heap key bounds and explicit options.
+     *
+     * <p>Passing {@code null} for either bound leaves that side open. Each returned raw entry is
+     * valid only until the cursor advances or closes.
+     */
+    public DirectScanCursor scanDirectWithOptions(
+            int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, ScanOptions options) {
+        long scanOptionsHandle = options == null ? 0L : options.nativeHandle;
+        long handle =
+                openScanCursor(
+                        nativeHandle,
+                        bucket,
+                        startKeyInclusive,
+                        endKeyExclusive,
+                        scanOptionsHandle);
+        if (handle == 0L) {
+            throw new IllegalStateException("failed to open readonly direct scan cursor");
+        }
+        return new DirectScanCursor(handle, DIRECT_BUFFER_POOL);
     }
 
     /**

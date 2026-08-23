@@ -1,8 +1,8 @@
 package io.cobble.table;
 
-import io.cobble.Db;
 import io.cobble.DirectScanCursor;
 import io.cobble.DirectScanEntry;
+import io.cobble.NativeObject;
 
 import java.util.Iterator;
 import java.util.List;
@@ -14,20 +14,20 @@ public final class TableScanCursor implements AutoCloseable, Iterable<List<Value
         List<Value> decode(DirectScanEntry entry);
     }
 
-    private final Db db;
+    private final NativeObject owner;
     private final DirectScanCursor inner;
     private final RowDecoder decoder;
     private boolean iteratorCreated;
 
-    TableScanCursor(Db db, DirectScanCursor inner, RowDecoder decoder) {
-        this.db = db;
+    TableScanCursor(NativeObject owner, DirectScanCursor inner, RowDecoder decoder) {
+        this.owner = owner;
         this.inner = inner;
         this.decoder = decoder;
     }
 
     /** Returns the next owned typed row, or {@code null} when exhausted. */
     public List<Value> nextRow() {
-        if (db.isDisposed()) throw new IllegalStateException("database is closed");
+        if (owner.isDisposed()) throw new IllegalStateException("database is closed");
         DirectScanEntry entry = inner.nextEntry();
         return entry == null ? null : decoder.decode(entry);
     }

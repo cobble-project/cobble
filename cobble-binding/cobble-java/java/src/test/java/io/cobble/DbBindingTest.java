@@ -5,6 +5,7 @@ import io.cobble.structured.Row;
 import io.cobble.table.DataField;
 import io.cobble.table.DirectTableRow;
 import io.cobble.table.LogicalTypes;
+import io.cobble.table.ReadOnlyTable;
 import io.cobble.table.RecordType;
 import io.cobble.table.Table;
 import io.cobble.table.TableKey;
@@ -224,6 +225,90 @@ class DbBindingTest {
                     assertNull(keys.get(key));
                     assertNull(keyOnlyProjection.get(key));
                     assertEquals(secondKeyOnly, keys.get(secondKey));
+                    keys.put(keyOnly);
+                }
+            }
+
+            table.put(row2);
+            table.put(row3);
+            ShardSnapshot snapshot = db.snapshot();
+            try (ReadOnlyDb readOnlyDb = ReadOnlyDb.open(config, snapshot.snapshotId, db.id());
+                    ReadOnlyTable readOnly = ReadOnlyTable.open(readOnlyDb, "events")) {
+                assertEquals(schema, readOnly.schema());
+                TableKey readOnlyKey2 =
+                        readOnly.keyBuilder().push(row2.get(0)).push(row2.get(1)).build();
+                TableKey readOnlyKey3 =
+                        readOnly.keyBuilder().push(row3.get(0)).push(row3.get(1)).build();
+                TableKey readOnlyMissing =
+                        readOnly.keyBuilder().push(row1.get(0)).push(row1.get(1)).build();
+                TableKey readOnlyEnd =
+                        readOnly.keyBuilder()
+                                .push(Value.string("tenant-a"))
+                                .push(Value.int64(99))
+                                .build();
+                assertEquals(row2, readOnly.get(readOnlyKey2));
+                assertNull(readOnly.get(readOnlyMissing));
+                assertEquals(
+                        Arrays.asList(row3, row2, row3, null),
+                        readOnly.multiGet(
+                                Arrays.asList(
+                                        readOnlyKey3,
+                                        readOnlyKey2,
+                                        readOnlyKey3,
+                                        readOnlyMissing)));
+                try (TableProjection projection =
+                                readOnly.projectByNames(Arrays.asList("payload", "tenant"));
+                        TableProjection keyProjection =
+                                readOnly.projectByNames(Collections.singletonList("id"));
+                        TableProjection valueProjection =
+                                readOnly.projectByNames(Collections.singletonList("nested"))) {
+                    assertEquals(
+                            Arrays.asList(row2.get(2), row2.get(0)), projection.get(readOnlyKey2));
+                    assertEquals(
+                            Collections.singletonList(row2.get(1)),
+                            keyProjection.get(readOnlyKey2));
+                    assertEquals(
+                            Collections.singletonList(row3.get(3)),
+                            valueProjection.get(readOnlyKey3));
+                    List<List<Value>> projected = new ArrayList<List<Value>>();
+                    try (TableScanCursor cursor =
+                            valueProjection.scanBounds(
+                                    readOnlyKey2.bucket(), readOnlyKey2, readOnlyKey3)) {
+                        for (List<Value> row : cursor) projected.add(row);
+                    }
+                    assertEquals(
+                            Collections.singletonList(Collections.singletonList(row2.get(3))),
+                            projected);
+                }
+                List<List<Value>> rows = new ArrayList<List<Value>>();
+                try (TableScanCursor cursor =
+                        readOnly.scanBounds(readOnlyKey2.bucket(), readOnlyKey2, readOnlyEnd)) {
+                    for (List<Value> row : cursor) rows.add(row);
+                }
+                assertEquals(Arrays.asList(row2, row3), rows);
+            }
+
+            try (ReadOnlyDb readOnlyDb = ReadOnlyDb.open(config, snapshot.snapshotId, db.id());
+                    ReadOnlyTable keys = ReadOnlyTable.open(readOnlyDb, "keys")) {
+                TableKey firstKey =
+                        keys.keyBuilder()
+                                .push(Value.int64(1))
+                                .push(Value.binary(new byte[] {7}))
+                                .build();
+                try (TableScanCursor cursor = keys.scan(firstKey.bucket())) {
+                    List<Value> first = cursor.nextRow();
+                    assertNotNull(cursor.nextRow());
+                    assertNull(cursor.nextRow());
+                    assertEquals(
+                            Arrays.asList(Value.int64(1), Value.binary(new byte[] {7})), first);
+                }
+                try (TableProjection projection =
+                                keys.projectByNames(Collections.singletonList("key"));
+                        TableScanCursor cursor = projection.scan(firstKey.bucket())) {
+                    List<Value> first = cursor.nextRow();
+                    assertNotNull(cursor.nextRow());
+                    assertNull(cursor.nextRow());
+                    assertEquals(Collections.singletonList(Value.binary(new byte[] {7})), first);
                 }
             }
         }

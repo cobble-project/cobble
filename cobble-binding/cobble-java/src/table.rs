@@ -1,11 +1,12 @@
 use crate::db::db_from_handle_or_throw;
+use crate::read_only_db::read_only_db_from_handle_or_throw;
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_u16,
     throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use cobble_binding::Db;
-use cobble_table::{Table, TableError, TableSchema};
+use cobble_table::{ReadOnlyTable, Table, TableError, TableSchema};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JByteBuffer, JClass, JIntArray, JObjectArray, JString};
 use jni::sys::{jint, jlong, jstring};
@@ -49,7 +50,7 @@ pub extern "system" fn Java_io_cobble_table_Table_createNative(
             return std::ptr::null_mut();
         }
     };
-    table_open_response(&mut env, db, table.schema())
+    table_open_response(&mut env, db.total_buckets(), table.schema())
 }
 
 #[unsafe(no_mangle)]
@@ -76,7 +77,34 @@ pub extern "system" fn Java_io_cobble_table_Table_openNative(
             return std::ptr::null_mut();
         }
     };
-    table_open_response(&mut env, db, table.schema())
+    table_open_response(&mut env, db.total_buckets(), table.schema())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_ReadOnlyTable_openNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    db_handle: jlong,
+    name: JString,
+) -> jstring {
+    let Some(db) = read_only_db_from_handle_or_throw(&mut env, db_handle) else {
+        return std::ptr::null_mut();
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_argument(&mut env, error);
+            return std::ptr::null_mut();
+        }
+    };
+    let table = match ReadOnlyTable::open(db, name) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_table_error(&mut env, error);
+            return std::ptr::null_mut();
+        }
+    };
+    table_open_response(&mut env, db.total_buckets(), table.schema())
 }
 
 #[unsafe(no_mangle)]
@@ -224,10 +252,10 @@ pub extern "system" fn Java_io_cobble_table_Table_deleteBatchNative<'local>(
     }
 }
 
-fn table_open_response(env: &mut JNIEnv, db: &Db, schema: &TableSchema) -> jstring {
+fn table_open_response(env: &mut JNIEnv, total_buckets: u32, schema: &TableSchema) -> jstring {
     let response = match serde_json::to_string(&serde_json::json!({
         "schema": schema,
-        "total_buckets": db.total_buckets(),
+        "total_buckets": total_buckets,
     })) {
         Ok(value) => value,
         Err(error) => {

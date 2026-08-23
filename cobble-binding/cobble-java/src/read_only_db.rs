@@ -276,7 +276,7 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_id(
     to_java_string_or_throw(&mut env, db.id().to_string())
 }
 
-fn read_only_db_from_handle_or_throw(
+pub(crate) fn read_only_db_from_handle_or_throw(
     env: &mut JNIEnv,
     native_handle: jlong,
 ) -> Option<&'static ReadOnlyDb> {

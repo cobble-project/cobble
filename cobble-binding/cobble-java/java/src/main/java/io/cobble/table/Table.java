@@ -26,6 +26,7 @@ import java.util.Set;
  */
 public final class Table implements AutoCloseable {
     private final Db db;
+    private final TableReadBackend reads;
     private final String name;
     private final Compiled compiled;
     private final ReadOptions readOptions;
@@ -35,6 +36,7 @@ public final class Table implements AutoCloseable {
 
     private Table(Db db, String name, OpenInfo openInfo) {
         this.db = Objects.requireNonNull(db, "db");
+        this.reads = TableReadBackend.writable(db);
         this.name = Objects.requireNonNull(name, "name");
         this.compiled = Compiled.from(openInfo.schema, openInfo.totalBuckets);
         int[] columns = physicalColumns(compiled.physicalColumns);
@@ -85,7 +87,7 @@ public final class Table implements AutoCloseable {
     /** Compiles a reusable typed projection from top-level field names. */
     public TableProjection projectByNames(List<String> fieldNames) {
         ensureUsable();
-        return new TableProjection(this, fieldNames);
+        return new TableProjection(reads, name, compiled, fieldNames);
     }
 
     /** Writes one full row in schema field order. */
@@ -167,8 +169,8 @@ public final class Table implements AutoCloseable {
     public List<Value> get(TableKey key) {
         ensureUsable();
         Objects.requireNonNull(key, "key");
-        byte[][] columns = db.getWithOptions(key.bucket(), key.encodedInternal(), readOptions);
-        return columns == null ? null : assembleRow(key.valuesInternal(), columns);
+        byte[][] columns = reads.get(key.bucket(), key.encodedInternal(), readOptions);
+        return columns == null ? null : assembleRow(compiled, key.valuesInternal(), columns);
     }
 
     /** Reads keys in one native multi-get while preserving input order and duplicates. */
@@ -182,13 +184,14 @@ public final class Table implements AutoCloseable {
             buckets[i] = key.bucket();
             keys[i] = key.encodedInternal();
         }
-        byte[][][] columns = db.multiGetWithOptions(buckets, keys, readOptions);
+        byte[][][] columns = reads.multiGet(buckets, keys, readOptions);
         List<List<Value>> rows = new ArrayList<List<Value>>(columns.length);
         for (int i = 0; i < columns.length; i++)
             rows.add(
                     columns[i] == null
                             ? null
-                            : assembleRow(primaryKeys.get(i).valuesInternal(), columns[i]));
+                            : assembleRow(
+                                    compiled, primaryKeys.get(i).valuesInternal(), columns[i]));
         return Collections.unmodifiableList(rows);
     }
 
@@ -228,17 +231,9 @@ public final class Table implements AutoCloseable {
         validateBound(bucket, endExclusive);
         byte[] start = startInclusive == null ? null : startInclusive.encodedInternal();
         byte[] end = endExclusive == null ? null : endExclusive.encodedInternal();
-        ByteBuffer directStart = directCopy(start);
-        ByteBuffer directEnd = directCopy(end);
         return new TableScanCursor(
-                db,
-                db.scanDirectWithOptions(
-                        bucket,
-                        directStart,
-                        start == null ? 0 : start.length,
-                        directEnd,
-                        end == null ? 0 : end.length,
-                        scanOptions),
+                reads.owner(),
+                reads.scan(bucket, start, end, scanOptions),
                 new TableScanCursor.RowDecoder() {
                     @Override
                     public List<Value> decode(DirectScanEntry entry) {
@@ -314,7 +309,7 @@ public final class Table implements AutoCloseable {
         }
     }
 
-    private List<Value> assembleRow(List<Value> primaryKey, byte[][] columns) {
+    static List<Value> assembleRow(Compiled compiled, List<Value> primaryKey, byte[][] columns) {
         if (columns.length != compiled.physicalColumns)
             throw new IllegalStateException("table row has an incompatible physical layout");
         ArrayList<Value> row = emptyRow(compiled.schema.fields().size());
@@ -374,7 +369,7 @@ public final class Table implements AutoCloseable {
 
     void ensureUsable() {
         if (closed) throw new IllegalStateException("table is closed");
-        ensureDbOpen(db);
+        reads.ensureOpen();
     }
 
     private static void ensureDbOpen(Db db) {
@@ -395,13 +390,6 @@ public final class Table implements AutoCloseable {
         return range(buffer, 0, end);
     }
 
-    static ByteBuffer directCopy(byte[] bytes) {
-        if (bytes == null) return null;
-        ByteBuffer direct = ByteBuffer.allocateDirect(bytes.length);
-        direct.put(bytes);
-        return direct;
-    }
-
     private static ByteBuffer range(ByteBuffer buffer, int start, int end) {
         ByteBuffer range = buffer.duplicate();
         ((Buffer) range).clear();
@@ -414,7 +402,7 @@ public final class Table implements AutoCloseable {
         return new ArrayList<Value>(Collections.nCopies(size, (Value) null));
     }
 
-    private static int[] physicalColumns(int count) {
+    static int[] physicalColumns(int count) {
         int[] columns = new int[count];
         for (int i = 0; i < count; i++) columns[i] = i;
         return columns;
@@ -428,18 +416,6 @@ public final class Table implements AutoCloseable {
             this.schema = schema;
             this.totalBuckets = totalBuckets;
         }
-    }
-
-    Db dbInternal() {
-        return db;
-    }
-
-    String nameInternal() {
-        return name;
-    }
-
-    Compiled compiledInternal() {
-        return compiled;
     }
 
     static final class Compiled {
