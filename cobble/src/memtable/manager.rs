@@ -2110,6 +2110,7 @@ impl MemtableManager {
                     Arc::clone(&source_schema),
                     Arc::clone(&target_schema),
                     Arc::clone(&self.schema_manager),
+                    column_family_id,
                 ))
             };
             let iter: DynKvIterator = if let Some(columns) = selected_columns {
@@ -2169,6 +2170,7 @@ impl MemtableManager {
                     Arc::clone(&immutable.schema),
                     Arc::clone(&target_schema),
                     Arc::clone(&self.schema_manager),
+                    column_family_id,
                 ))
             };
             let iter: DynKvIterator = if let Some(columns) = selected_columns {

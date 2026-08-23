@@ -555,10 +555,15 @@ impl Schema {
         Arc::new(Self::new(0, 0, Vec::new()))
     }
 
-    fn evolution(&self) -> BuiltinSchemaEvolution {
-        self.default_family()
+    fn evolution_in_family(&self, column_family_id: u8) -> Result<BuiltinSchemaEvolution> {
+        self.column_family_by_id(column_family_id)
             .map(|family| family.evolution.clone())
-            .unwrap_or(BuiltinSchemaEvolution::Noop)
+            .ok_or_else(|| {
+                Error::InvalidState(format!(
+                    "schema {} is missing column family {}",
+                    self.version, column_family_id
+                ))
+            })
     }
 
     pub(crate) fn column_metadata(&self) -> Cow<'_, [Option<JsonValue>]> {
@@ -628,7 +633,6 @@ impl Schema {
 pub(crate) struct SchemaManager {
     latest_schema: Arc<ArcSwap<Schema>>,
     schemas: Arc<RwLock<BTreeMap<u64, Arc<Schema>>>>,
-    evolutions: Arc<RwLock<BTreeMap<u64, BuiltinSchemaEvolution>>>,
     max_persisted_schema_id: Arc<RwLock<Option<u64>>>,
     next_version: Arc<AtomicU64>,
     resolver: Option<Arc<dyn MergeOperatorResolver>>,
@@ -663,15 +667,10 @@ impl SchemaManager {
             return Self {
                 latest_schema: Arc::new(ArcSwap::from(initial)),
                 schemas: Arc::new(RwLock::new(versions)),
-                evolutions: Arc::new(RwLock::new(BTreeMap::new())),
                 max_persisted_schema_id: Arc::new(RwLock::new(None)),
                 next_version: Arc::new(AtomicU64::new(1)),
                 resolver,
             };
-        }
-        let mut evolutions = BTreeMap::new();
-        for schema in versions.values() {
-            evolutions.insert(schema.version(), schema.evolution());
         }
         let (max_version, latest) = versions
             .iter()
@@ -681,7 +680,6 @@ impl SchemaManager {
         Self {
             latest_schema: Arc::new(ArcSwap::from(latest)),
             schemas: Arc::new(RwLock::new(versions)),
-            evolutions: Arc::new(RwLock::new(evolutions)),
             max_persisted_schema_id: Arc::new(RwLock::new(Some(max_version))),
             next_version: Arc::new(AtomicU64::new(max_version.saturating_add(1))),
             resolver,
@@ -762,7 +760,6 @@ impl SchemaManager {
         Self {
             latest_schema: Arc::new(ArcSwap::from(initial)),
             schemas: Arc::new(RwLock::new(versions)),
-            evolutions: Arc::new(RwLock::new(BTreeMap::new())),
             max_persisted_schema_id: Arc::new(RwLock::new(None)),
             next_version: Arc::new(AtomicU64::new(next_version)),
             resolver: None,
@@ -834,24 +831,20 @@ impl SchemaManager {
         );
         let version = self.next_version.fetch_add(1, Ordering::SeqCst);
         let schema = Arc::new(Schema::new_with_column_families(version, column_families));
-        let evolution = schema.evolution();
         self.latest_schema.store(Arc::clone(&schema));
         self.schemas
             .write()
             .unwrap()
             .insert(schema.version(), Arc::clone(&schema));
-        self.evolutions
-            .write()
-            .unwrap()
-            .insert(schema.version(), evolution);
         schema
     }
 
-    pub(crate) fn evolve_value(
+    pub(crate) fn evolve_value_in_family(
         &self,
         mut value: Value,
         from_schema_id: u64,
         to_schema_id: u64,
+        column_family_id: u8,
     ) -> Result<Value> {
         if from_schema_id == to_schema_id {
             return Ok(value);
@@ -862,15 +855,14 @@ impl SchemaManager {
                 from_schema_id, to_schema_id
             )));
         }
-        let evolutions = self.evolutions.read().unwrap();
+        let schemas = self.schemas.read().unwrap();
         for schema_id in (from_schema_id + 1)..=to_schema_id {
-            let evolution = evolutions.get(&schema_id).ok_or_else(|| {
-                Error::InvalidState(format!(
-                    "Missing schema evolution for version {}",
-                    schema_id
-                ))
+            let schema = schemas.get(&schema_id).ok_or_else(|| {
+                Error::InvalidState(format!("Missing schema for version {}", schema_id))
             })?;
-            value = evolution.evolve(value)?;
+            value = schema
+                .evolution_in_family(column_family_id)?
+                .evolve(value)?;
         }
         Ok(value)
     }
@@ -994,10 +986,6 @@ impl SchemaManager {
             .write()
             .unwrap()
             .insert(schema.version(), Arc::clone(&schema));
-        self.evolutions
-            .write()
-            .unwrap()
-            .insert(schema.version(), schema.evolution());
         let current_latest_version = self.latest_schema.load().version();
         if schema.version() > current_latest_version {
             self.latest_schema.store(Arc::clone(&schema));

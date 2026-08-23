@@ -11,6 +11,7 @@ pub(crate) struct SchemaEvolvingIterator<I> {
     source_schema: Arc<Schema>,
     target_schema: Arc<Schema>,
     schema_manager: Arc<SchemaManager>,
+    column_family_id: u8,
 }
 
 impl<I> SchemaEvolvingIterator<I> {
@@ -19,12 +20,14 @@ impl<I> SchemaEvolvingIterator<I> {
         source_schema: Arc<Schema>,
         target_schema: Arc<Schema>,
         schema_manager: Arc<SchemaManager>,
+        column_family_id: u8,
     ) -> Self {
         Self {
             inner,
             source_schema,
             target_schema,
             schema_manager,
+            column_family_id,
         }
     }
 
@@ -44,11 +47,16 @@ impl<I> SchemaEvolvingIterator<I> {
     }
 
     fn evolve_value(&self, kv_value: KvValue) -> Result<KvValue> {
-        let value = kv_value.into_decoded(self.source_schema.num_columns())?;
-        let evolved = self.schema_manager.evolve_value(
+        let source_num_columns = self
+            .source_schema
+            .num_columns_in_family(self.column_family_id)
+            .unwrap_or(0);
+        let value = kv_value.into_decoded(source_num_columns)?;
+        let evolved = self.schema_manager.evolve_value_in_family(
             value,
             self.source_schema.version(),
             self.target_schema.version(),
+            self.column_family_id,
         )?;
         Ok(KvValue::Decoded(evolved))
     }

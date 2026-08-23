@@ -88,7 +88,9 @@ fn test_schema_evolution_add_column() {
         ValueType::Put,
         Bytes::from_static(b"v"),
     ))]);
-    let evolved = manager.evolve_value(value, 0, 1).unwrap();
+    let evolved = manager
+        .evolve_value_in_family(value, 0, 1, DEFAULT_COLUMN_FAMILY_ID)
+        .unwrap();
     assert_eq!(evolved.columns().len(), 2);
     assert!(evolved.columns()[1].is_none());
 }
@@ -108,7 +110,9 @@ fn test_schema_evolution_add_column_with_default() {
         ValueType::Put,
         Bytes::from_static(b"v"),
     ))]);
-    let evolved = manager.evolve_value(value, 0, 1).unwrap();
+    let evolved = manager
+        .evolve_value_in_family(value, 0, 1, DEFAULT_COLUMN_FAMILY_ID)
+        .unwrap();
     assert_eq!(evolved.columns().len(), 2);
     let default_column = evolved.columns()[1].as_ref().unwrap();
     assert_eq!(*default_column.value_type(), ValueType::Put);
@@ -128,7 +132,9 @@ fn test_schema_evolution_delete_column() {
         Some(Column::new(ValueType::Put, Bytes::from_static(b"v0"))),
         Some(Column::new(ValueType::Put, Bytes::from_static(b"v1"))),
     ]);
-    let evolved = manager.evolve_value(value, 0, 1).unwrap();
+    let evolved = manager
+        .evolve_value_in_family(value, 0, 1, DEFAULT_COLUMN_FAMILY_ID)
+        .unwrap();
     assert_eq!(evolved.columns().len(), 1);
     assert_eq!(
         evolved.columns()[0].as_ref().unwrap().data().as_ref(),

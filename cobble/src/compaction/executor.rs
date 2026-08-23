@@ -624,6 +624,7 @@ impl CompactionExecutor {
                             Arc::clone(&source_schema),
                             Arc::clone(&target_schema),
                             Arc::clone(&schema_manager),
+                            column_family_id,
                         ))
                     };
                 if file.vlog_file_seq_offset == 0 {

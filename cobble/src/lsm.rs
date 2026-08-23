@@ -1409,6 +1409,7 @@ impl LSMTree {
                         Arc::clone(&source_schema),
                         Arc::clone(&target_schema),
                         Arc::clone(&schema_manager),
+                        column_family_id,
                     ))
                 };
                 let iter: DynKvIterator = if file.vlog_file_seq_offset == 0 {
@@ -1681,7 +1682,12 @@ impl LSMTree {
                 if self.ttl_provider.expired(&value.expired_at) {
                     return Ok(false);
                 }
-                let value = schema_manager.evolve_value(value, file.schema_id, target_schema_id)?;
+                let value = schema_manager.evolve_value_in_family(
+                    value,
+                    file.schema_id,
+                    target_schema_id,
+                    column_family_id,
+                )?;
                 if let Some(mask) = terminal_mask.as_deref_mut() {
                     let evolved_mask = value.terminal_mask();
                     for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {

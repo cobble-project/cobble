@@ -2029,10 +2029,11 @@ impl Db {
                                     .num_columns_in_family(column_family_id)
                                     .unwrap_or(0),
                             )?;
-                            self.schema_manager.evolve_value(
+                            self.schema_manager.evolve_value_in_family(
                                 decoded,
                                 source_schema.version(),
                                 schema.version(),
+                                column_family_id,
                             )?
                         };
                         if let Some(mask) = terminal_mask.as_mut() {
@@ -2207,10 +2208,11 @@ impl Db {
                                 .num_columns_in_family(column_family_id)
                                 .unwrap_or(0),
                         )?;
-                        self.schema_manager.evolve_value(
+                        self.schema_manager.evolve_value_in_family(
                             decoded,
                             source_schema.version(),
                             schema.version(),
+                            column_family_id,
                         )?
                     };
                     // Keep the established multi-column terminal-mask behavior unchanged.
