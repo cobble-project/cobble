@@ -34,7 +34,7 @@ impl CatalogStore {
     }
 
     pub(super) fn write(&self, relative_path: &str, payload: &[u8]) -> Result<()> {
-        let path = self.path(relative_path)?;
+        let path = self.path(relative_path);
         if let Some((parent, _)) = path.rsplit_once('/') {
             self.ensure_dir(parent)?;
         }
@@ -53,17 +53,16 @@ impl CatalogStore {
     }
 
     pub(super) fn read(&self, relative_path: &str) -> Result<Bytes> {
-        let file = self.file_system.open_read(&self.path(relative_path)?)?;
+        let file = self.file_system.open_read(&self.path(relative_path))?;
         file.read_at(0, file.size())
     }
 
     pub(super) fn exists(&self, relative_path: &str) -> Result<bool> {
-        self.file_system.exists(&self.path(relative_path)?)
+        self.file_system.exists(&self.path(relative_path))
     }
 
-    fn path(&self, relative_path: &str) -> Result<String> {
-        validate_relative_path(relative_path)?;
-        Ok(format!("{}/{}", self.prefix, relative_path))
+    fn path(&self, relative_path: &str) -> String {
+        format!("{}/{}", self.prefix, relative_path)
     }
 
     fn ensure_dir(&self, path: &str) -> Result<()> {
@@ -102,20 +101,6 @@ fn write_all(
 fn validate_segment(label: &str, value: &str) -> Result<()> {
     if value.is_empty() || value == "." || value == ".." || value.contains(['/', '\\']) {
         return Err(Error::ConfigError(format!("invalid {label}: {value}")));
-    }
-    Ok(())
-}
-
-fn validate_relative_path(value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.starts_with('/')
-        || value
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-    {
-        return Err(Error::ConfigError(format!(
-            "invalid catalog metadata path: {value}"
-        )));
     }
     Ok(())
 }

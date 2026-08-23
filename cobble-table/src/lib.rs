@@ -20,8 +20,8 @@ mod metadata_tests;
 
 pub use bucket::BucketHash;
 pub use catalog::{
-    Catalog, CatalogError, CatalogResult, CatalogTable, FileCatalog, FileCatalogConfig, TableId,
-    TableIdentifier,
+    Catalog, CatalogError, CatalogResult, CatalogSchemaId, CatalogTable, FileCatalog,
+    FileCatalogConfig, SchemaChange, TableId, TableIdentifier,
 };
 pub use codec::{KeyCodec, Value, ValueCodec};
 pub use error::{Result, TableError};

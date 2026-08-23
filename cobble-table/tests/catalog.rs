@@ -1,7 +1,7 @@
 use cobble::{Config, VolumeDescriptor, VolumeUsageKind};
 use cobble_table::{
-    Catalog, CatalogError, DataField, FileCatalog, FileCatalogConfig, LogicalType, TableIdentifier,
-    TableSchema,
+    Catalog, CatalogError, CatalogSchemaId, DataField, FileCatalog, FileCatalogConfig, LogicalType,
+    SchemaChange, TableIdentifier, TableSchema,
 };
 use std::sync::Arc;
 
@@ -25,6 +25,8 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
     let accounts = TableIdentifier::new(analytics.clone(), "accounts");
     let events = TableIdentifier::new(analytics.clone(), "events");
     let schema = table_schema();
+    let schema_one = schema_after_add();
+    let schema_two = schema_after_changes();
 
     let (accounts_id, events_id) = {
         let catalog = Arc::new(FileCatalog::open(&config, open_config.clone()).unwrap());
@@ -54,6 +56,8 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         assert_ne!(accounts_table.table_id(), events_table.table_id());
         assert_eq!(accounts_table.table_id().as_u32(), 1);
         assert_eq!(events_table.table_id().as_u32(), 2);
+        assert_eq!(accounts_table.catalog_schema_id().as_u32(), 0);
+        assert_eq!(events_table.catalog_schema_id().as_u32(), 0);
         assert!(matches!(
             catalog.create_table(accounts.clone(), schema.clone()),
             Err(CatalogError::TableAlreadyExists(_))
@@ -61,6 +65,77 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         assert!(matches!(
             catalog.drop_namespace(&analytics),
             Err(CatalogError::NamespaceNotEmpty(_))
+        ));
+
+        let evolved = catalog
+            .evolve_schema(
+                &accounts,
+                vec![SchemaChange::AddField(
+                    DataField::new(4, "region", LogicalType::string().nullable()).unwrap(),
+                )],
+            )
+            .unwrap();
+        assert_eq!(evolved.catalog_schema_id().as_u32(), 1);
+        assert_eq!(evolved.schema(), &schema_one);
+        assert_eq!(second.load_table(&accounts).unwrap().schema(), &schema_one);
+        assert_eq!(
+            second
+                .load_table_schema(&accounts, CatalogSchemaId::from(0))
+                .unwrap(),
+            schema
+        );
+        let evolved = second
+            .evolve_schema(
+                &accounts,
+                vec![
+                    SchemaChange::AddField(
+                        DataField::new(5, "state", LogicalType::int32().nullable()).unwrap(),
+                    ),
+                    SchemaChange::RenameField {
+                        field_id: 5.into(),
+                        new_name: "status".to_string(),
+                    },
+                    SchemaChange::RenameField {
+                        field_id: 3.into(),
+                        new_name: "body".to_string(),
+                    },
+                    SchemaChange::RenameField {
+                        field_id: 4.into(),
+                        new_name: "zone".to_string(),
+                    },
+                    SchemaChange::DropField(4.into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(evolved.catalog_schema_id().as_u32(), 2);
+        assert_eq!(evolved.schema(), &schema_two);
+        assert_eq!(
+            catalog
+                .load_table_schema(&accounts, CatalogSchemaId::from(1))
+                .unwrap(),
+            schema_one
+        );
+        assert!(matches!(
+            catalog.evolve_schema(&accounts, vec![SchemaChange::DropField(1.into())]),
+            Err(CatalogError::InvalidSchemaEvolution(_))
+        ));
+        assert!(matches!(
+            catalog.evolve_schema(
+                &accounts,
+                vec![SchemaChange::AddField(
+                    DataField::new(6, "required", LogicalType::string()).unwrap()
+                )]
+            ),
+            Err(CatalogError::InvalidSchemaEvolution(_))
+        ));
+        assert!(matches!(
+            catalog.evolve_schema(
+                &accounts,
+                vec![SchemaChange::AddField(
+                    DataField::new(4, "reused", LogicalType::int32().nullable()).unwrap()
+                )]
+            ),
+            Err(CatalogError::InvalidSchemaEvolution(_))
         ));
         assert!(matches!(
             catalog.rename_table(
@@ -74,7 +149,8 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
             .rename_table(&accounts, "customers".to_string())
             .unwrap();
         assert_eq!(customers.table_id(), accounts_table.table_id());
-        assert_eq!(customers.schema(), &schema);
+        assert_eq!(customers.catalog_schema_id().as_u32(), 2);
+        assert_eq!(customers.schema(), &schema_two);
         assert!(!catalog.table_exists(&accounts).unwrap());
         assert!(matches!(
             catalog.rename_table(&events, " customers ".to_string()),
@@ -92,7 +168,24 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         let customers = TableIdentifier::new(analytics.clone(), "customers");
         let loaded = catalog.load_table(&customers).unwrap();
         assert_eq!(loaded.table_id(), accounts_id);
-        assert_eq!(loaded.schema(), &schema);
+        assert_eq!(loaded.catalog_schema_id().as_u32(), 2);
+        assert_eq!(loaded.schema(), &schema_two);
+        assert_eq!(
+            catalog
+                .load_table_schema(&customers, CatalogSchemaId::from(0))
+                .unwrap(),
+            schema
+        );
+        assert_eq!(
+            catalog
+                .load_table_schema(&customers, CatalogSchemaId::from(1))
+                .unwrap(),
+            schema_one
+        );
+        assert!(matches!(
+            catalog.load_table_schema(&customers, CatalogSchemaId::from(3)),
+            Err(CatalogError::SchemaNotFound { .. })
+        ));
         let tables = catalog.list_tables(&analytics).unwrap();
         assert_eq!(
             tables.iter().map(TableIdentifier::name).collect::<Vec<_>>(),
@@ -101,6 +194,14 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         assert_eq!(
             catalog.load_table(&tables[1]).unwrap().table_id(),
             events_id
+        );
+        assert_eq!(
+            catalog
+                .load_table(&tables[1])
+                .unwrap()
+                .catalog_schema_id()
+                .as_u32(),
+            0
         );
         assert!(matches!(
             catalog.load_table(&accounts),
@@ -142,6 +243,26 @@ fn table_schema() -> TableSchema {
             DataField::new(1, "tenant", LogicalType::string()).unwrap(),
             DataField::new(2, "id", LogicalType::int64()).unwrap(),
             DataField::new(3, "payload", LogicalType::binary().nullable()).unwrap(),
+        ],
+        vec![1.into(), 2.into()],
+        vec![1.into()],
+    )
+    .unwrap()
+}
+
+fn schema_after_add() -> TableSchema {
+    let mut fields = table_schema().fields;
+    fields.push(DataField::new(4, "region", LogicalType::string().nullable()).unwrap());
+    TableSchema::new(fields, vec![1.into(), 2.into()], vec![1.into()]).unwrap()
+}
+
+fn schema_after_changes() -> TableSchema {
+    TableSchema::new(
+        vec![
+            DataField::new(1, "tenant", LogicalType::string()).unwrap(),
+            DataField::new(2, "id", LogicalType::int64()).unwrap(),
+            DataField::new(3, "body", LogicalType::binary().nullable()).unwrap(),
+            DataField::new(5, "status", LogicalType::int32().nullable()).unwrap(),
         ],
         vec![1.into(), 2.into()],
         vec![1.into()],

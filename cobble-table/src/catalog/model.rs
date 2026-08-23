@@ -1,4 +1,4 @@
-use crate::TableSchema;
+use crate::{DataField, FieldId, TableSchema};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
@@ -21,6 +21,46 @@ impl Display for TableId {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.0, formatter)
     }
+}
+
+/// Per-table catalog schema identity, starting at zero and increasing monotonically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CatalogSchemaId(u32);
+
+impl CatalogSchemaId {
+    pub(crate) const INITIAL: Self = Self(0);
+
+    pub(crate) fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for CatalogSchemaId {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+impl Display for CatalogSchemaId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, formatter)
+    }
+}
+
+/// An explicit, top-level catalog schema change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchemaChange {
+    /// Append a new nullable value field.
+    AddField(DataField),
+    /// Rename a field while retaining its stable field id.
+    RenameField { field_id: FieldId, new_name: String },
+    /// Drop a non-key field.
+    DropField(FieldId),
 }
 
 /// A semantic table name with an extensible, multi-component namespace.
@@ -63,6 +103,7 @@ impl TableIdentifier {
 pub struct CatalogTable {
     pub(crate) identifier: TableIdentifier,
     pub(crate) table_id: TableId,
+    pub(crate) catalog_schema_id: CatalogSchemaId,
     pub(crate) schema: TableSchema,
 }
 
@@ -73,6 +114,10 @@ impl CatalogTable {
 
     pub fn table_id(&self) -> TableId {
         self.table_id
+    }
+
+    pub fn catalog_schema_id(&self) -> CatalogSchemaId {
+        self.catalog_schema_id
     }
 
     pub fn schema(&self) -> &TableSchema {

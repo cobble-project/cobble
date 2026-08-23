@@ -1,10 +1,11 @@
 use super::catalog_store::CatalogStore;
-use super::model::{CatalogTable, FileCatalogConfig, TableId, TableIdentifier};
-use crate::metadata::TableMetadata;
-use crate::{TableError, TableSchema};
+use super::model::{
+    CatalogSchemaId, CatalogTable, FileCatalogConfig, SchemaChange, TableId, TableIdentifier,
+};
+use crate::{DataField, FieldId, LogicalType, LogicalTypeKind, TableError, TableSchema};
 use cobble::Config;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use thiserror::Error;
 use uuid::Uuid;
@@ -28,6 +29,13 @@ pub enum CatalogError {
     TableAlreadyExists(TableIdentifier),
     #[error("table not found: {0:?}")]
     TableNotFound(TableIdentifier),
+    #[error("catalog schema {catalog_schema_id} not found for table {table:?}")]
+    SchemaNotFound {
+        table: TableIdentifier,
+        catalog_schema_id: CatalogSchemaId,
+    },
+    #[error("invalid catalog schema evolution: {0}")]
+    InvalidSchemaEvolution(String),
     #[error("invalid catalog metadata: {0}")]
     InvalidMetadata(String),
     #[error(transparent)]
@@ -47,6 +55,16 @@ pub trait Catalog: Send + Sync {
         schema: TableSchema,
     ) -> CatalogResult<CatalogTable>;
     fn load_table(&self, identifier: &TableIdentifier) -> CatalogResult<CatalogTable>;
+    fn load_table_schema(
+        &self,
+        identifier: &TableIdentifier,
+        catalog_schema_id: CatalogSchemaId,
+    ) -> CatalogResult<TableSchema>;
+    fn evolve_schema(
+        &self,
+        identifier: &TableIdentifier,
+        changes: Vec<SchemaChange>,
+    ) -> CatalogResult<CatalogTable>;
     fn list_tables(&self, namespace: &[String]) -> CatalogResult<Vec<TableIdentifier>>;
     fn table_exists(&self, identifier: &TableIdentifier) -> CatalogResult<bool>;
     fn rename_table(
@@ -104,6 +122,7 @@ struct NamespaceManifest {
 struct TableEntry {
     name: String,
     table_id: TableId,
+    catalog_schema_id: CatalogSchemaId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -112,14 +131,23 @@ struct TableIdentity {
     version: u32,
     table_id: TableId,
     physical_name: String,
-    metadata: TableMetadata,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TableSchemaRecord {
+    format: String,
+    version: u32,
+    table_id: TableId,
+    catalog_schema_id: CatalogSchemaId,
+    schema: TableSchema,
+    used_field_ids: Vec<FieldId>,
 }
 
 /// File-backed table catalog.
 ///
 /// Operations are serialized across handles in this process and refresh CURRENT before every
-/// read or mutation. Phase 1 still requires one active catalog mutator across processes;
-/// distributed locking is intentionally outside this phase.
+/// read or mutation. One active catalog mutator is still required across processes; distributed
+/// locking is intentionally outside this implementation.
 pub struct FileCatalog {
     store: CatalogStore,
     state: Mutex<CatalogManifest>,
@@ -162,7 +190,6 @@ impl FileCatalog {
         manifest: &'a CatalogManifest,
         namespace: &[String],
     ) -> CatalogResult<&'a NamespaceEntry> {
-        validate_namespace(namespace)?;
         Self::namespace_entry(manifest, namespace)
             .ok_or_else(|| CatalogError::NamespaceNotFound(namespace.to_vec()))
     }
@@ -181,33 +208,56 @@ impl FileCatalog {
                 "namespace manifest does not match CURRENT or catalog entry".to_string(),
             ));
         }
-        validate_namespace_manifest(&manifest)?;
         Ok(manifest)
     }
 
     fn load_identity(&self, table_id: TableId) -> CatalogResult<TableIdentity> {
         let identity: TableIdentity = read_json(&self.store, &table_identity_path(table_id))?;
         validate_header(&identity.format, identity.version)?;
-        if identity.table_id != table_id || identity.physical_name != physical_table_name(table_id)
-        {
-            return Err(CatalogError::InvalidMetadata(format!(
-                "table identity does not match {table_id}"
-            )));
-        }
-        identity.metadata.validate()?;
+        debug_assert_eq!(identity.table_id, table_id);
+        debug_assert_eq!(identity.physical_name, physical_table_name(table_id));
         Ok(identity)
+    }
+
+    fn load_schema(
+        &self,
+        table_id: TableId,
+        catalog_schema_id: CatalogSchemaId,
+    ) -> CatalogResult<TableSchemaRecord> {
+        let path = table_schema_path(table_id, catalog_schema_id);
+        let record: TableSchemaRecord = read_json(&self.store, &path)?;
+        validate_header(&record.format, record.version)?;
+        debug_assert_eq!(record.table_id, table_id);
+        debug_assert_eq!(record.catalog_schema_id, catalog_schema_id);
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(record.schema.validate().is_ok());
+            debug_assert!(
+                record
+                    .used_field_ids
+                    .windows(2)
+                    .all(|window| window[0] < window[1])
+            );
+            debug_assert!(
+                schema_field_ids(&record.schema)
+                    .iter()
+                    .all(|field_id| record.used_field_ids.binary_search(field_id).is_ok())
+            );
+        }
+        Ok(record)
     }
 
     fn catalog_table(
         identifier: TableIdentifier,
         identity: TableIdentity,
-    ) -> CatalogResult<CatalogTable> {
-        identity.metadata.validate()?;
-        Ok(CatalogTable {
+        schema: TableSchemaRecord,
+    ) -> CatalogTable {
+        CatalogTable {
             identifier,
             table_id: identity.table_id,
-            schema: identity.metadata.schema,
-        })
+            catalog_schema_id: schema.catalog_schema_id,
+            schema: schema.schema,
+        }
     }
 
     fn commit_catalog(
@@ -313,6 +363,7 @@ impl Catalog for FileCatalog {
         schema: TableSchema,
     ) -> CatalogResult<CatalogTable> {
         validate_identifier(&identifier)?;
+        schema.validate()?;
         self.with_current(|current| {
             let namespace_entry =
                 Self::required_namespace(current, identifier.namespace())?.clone();
@@ -324,7 +375,6 @@ impl Catalog for FileCatalog {
             {
                 return Err(CatalogError::TableAlreadyExists(identifier));
             }
-            let metadata = TableMetadata::compile(schema)?;
             let table_id = TableId::new(current.next_table_id);
             let mut next = current.clone();
             next.generation += 1;
@@ -337,19 +387,32 @@ impl Catalog for FileCatalog {
                 version: CATALOG_VERSION,
                 table_id,
                 physical_name: physical_table_name(table_id),
-                metadata,
             };
             write_json(&self.store, &table_identity_path(table_id), &identity)?;
+            let schema = TableSchemaRecord {
+                format: CATALOG_FORMAT.to_string(),
+                version: CATALOG_VERSION,
+                table_id,
+                catalog_schema_id: CatalogSchemaId::INITIAL,
+                used_field_ids: schema_field_ids(&schema),
+                schema,
+            };
+            write_json(
+                &self.store,
+                &table_schema_path(table_id, schema.catalog_schema_id),
+                &schema,
+            )?;
             namespace.generation += 1;
             namespace.tables.push(TableEntry {
                 name: identifier.name().to_string(),
                 table_id,
+                catalog_schema_id: schema.catalog_schema_id,
             });
             namespace
                 .tables
                 .sort_by(|left, right| left.name.cmp(&right.name));
             self.commit_namespace(&namespace_entry, &namespace)?;
-            Self::catalog_table(identifier, identity)
+            Ok(Self::catalog_table(identifier, identity, schema))
         })
     }
 
@@ -363,7 +426,85 @@ impl Catalog for FileCatalog {
                 .iter()
                 .find(|entry| entry.name == identifier.name())
                 .ok_or_else(|| CatalogError::TableNotFound(identifier.clone()))?;
-            Self::catalog_table(identifier.clone(), self.load_identity(entry.table_id)?)
+            let identity = self.load_identity(entry.table_id)?;
+            let schema = self.load_schema(entry.table_id, entry.catalog_schema_id)?;
+            Ok(Self::catalog_table(identifier.clone(), identity, schema))
+        })
+    }
+
+    fn load_table_schema(
+        &self,
+        identifier: &TableIdentifier,
+        catalog_schema_id: CatalogSchemaId,
+    ) -> CatalogResult<TableSchema> {
+        validate_identifier(identifier)?;
+        self.with_current(|current| {
+            let namespace_entry = Self::required_namespace(current, identifier.namespace())?;
+            let namespace = self.load_namespace(namespace_entry)?;
+            let entry = namespace
+                .tables
+                .iter()
+                .find(|entry| entry.name == identifier.name())
+                .ok_or_else(|| CatalogError::TableNotFound(identifier.clone()))?;
+            if catalog_schema_id > entry.catalog_schema_id {
+                return Err(CatalogError::SchemaNotFound {
+                    table: identifier.clone(),
+                    catalog_schema_id,
+                });
+            }
+            Ok(self.load_schema(entry.table_id, catalog_schema_id)?.schema)
+        })
+    }
+
+    fn evolve_schema(
+        &self,
+        identifier: &TableIdentifier,
+        changes: Vec<SchemaChange>,
+    ) -> CatalogResult<CatalogTable> {
+        validate_identifier(identifier)?;
+        self.with_current(|current| {
+            let namespace_entry =
+                Self::required_namespace(current, identifier.namespace())?.clone();
+            let mut namespace = self.load_namespace(&namespace_entry)?;
+            let entry_index = namespace
+                .tables
+                .iter()
+                .position(|entry| entry.name == identifier.name())
+                .ok_or_else(|| CatalogError::TableNotFound(identifier.clone()))?;
+            let table_id = namespace.tables[entry_index].table_id;
+            let current_catalog_schema_id = namespace.tables[entry_index].catalog_schema_id;
+            let current_schema = self.load_schema(table_id, current_catalog_schema_id)?;
+            let mut used_field_ids = current_schema
+                .used_field_ids
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let next_schema =
+                apply_schema_changes(current_schema.schema, changes, &mut used_field_ids)?;
+            let next_catalog_schema_id = current_catalog_schema_id.next().ok_or_else(|| {
+                CatalogError::InvalidSchemaEvolution("schema id space exhausted".to_string())
+            })?;
+            let record = TableSchemaRecord {
+                format: CATALOG_FORMAT.to_string(),
+                version: CATALOG_VERSION,
+                table_id,
+                catalog_schema_id: next_catalog_schema_id,
+                schema: next_schema,
+                used_field_ids: sorted_field_ids(used_field_ids),
+            };
+            write_json(
+                &self.store,
+                &table_schema_path(table_id, next_catalog_schema_id),
+                &record,
+            )?;
+            namespace.tables[entry_index].catalog_schema_id = next_catalog_schema_id;
+            namespace.generation += 1;
+            self.commit_namespace(&namespace_entry, &namespace)?;
+            Ok(Self::catalog_table(
+                identifier.clone(),
+                self.load_identity(table_id)?,
+                record,
+            ))
         })
     }
 
@@ -421,13 +562,16 @@ impl Catalog for FileCatalog {
             }
             let entry = &mut namespace.tables[source_index];
             let table_id = entry.table_id;
+            let catalog_schema_id = entry.catalog_schema_id;
             entry.name = new_identifier.name().to_string();
             namespace.generation += 1;
             namespace
                 .tables
                 .sort_by(|left, right| left.name.cmp(&right.name));
             self.commit_namespace(&namespace_entry, &namespace)?;
-            Self::catalog_table(new_identifier, self.load_identity(table_id)?)
+            let identity = self.load_identity(table_id)?;
+            let schema = self.load_schema(table_id, catalog_schema_id)?;
+            Ok(Self::catalog_table(new_identifier, identity, schema))
         })
     }
 
@@ -463,7 +607,6 @@ fn load_catalog_manifest(store: &CatalogStore) -> CatalogResult<CatalogManifest>
             "catalog generation does not match CURRENT".to_string(),
         ));
     }
-    validate_catalog_manifest(&manifest)?;
     Ok(manifest)
 }
 
@@ -489,40 +632,6 @@ fn validate_header(format: &str, version: u32) -> CatalogResult<()> {
         return Err(CatalogError::InvalidMetadata(format!(
             "unsupported format/version: {format}/{version}"
         )));
-    }
-    Ok(())
-}
-
-fn validate_catalog_manifest(manifest: &CatalogManifest) -> CatalogResult<()> {
-    validate_header(&manifest.format, manifest.version)?;
-    for entry in &manifest.namespaces {
-        validate_namespace(&entry.namespace)?;
-    }
-    let mut namespaces = manifest
-        .namespaces
-        .iter()
-        .map(|entry| &entry.namespace)
-        .collect::<Vec<_>>();
-    namespaces.sort();
-    if namespaces.windows(2).any(|window| window[0] == window[1]) {
-        return Err(CatalogError::InvalidMetadata(
-            "duplicate namespace in catalog manifest".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_namespace_manifest(manifest: &NamespaceManifest) -> CatalogResult<()> {
-    let mut names = manifest
-        .tables
-        .iter()
-        .map(|entry| entry.name.as_str())
-        .collect::<Vec<_>>();
-    names.sort_unstable();
-    if names.windows(2).any(|window| window[0] == window[1]) {
-        return Err(CatalogError::InvalidMetadata(
-            "duplicate table name in namespace manifest".to_string(),
-        ));
     }
     Ok(())
 }
@@ -558,11 +667,136 @@ fn namespace_prefix(namespace_id: Uuid) -> String {
 }
 
 fn table_identity_path(table_id: TableId) -> String {
-    format!("tables/TABLE-{table_id}")
+    format!("tables/TABLE-{table_id}/IDENTITY")
 }
 
 fn physical_table_name(table_id: TableId) -> String {
     format!("t{table_id}")
+}
+
+fn table_schema_path(table_id: TableId, schema_id: CatalogSchemaId) -> String {
+    format!(
+        "tables/TABLE-{table_id}/schemas/SCHEMA-{}",
+        schema_id.as_u32()
+    )
+}
+
+fn apply_schema_changes(
+    mut schema: TableSchema,
+    changes: Vec<SchemaChange>,
+    used_field_ids: &mut HashSet<FieldId>,
+) -> CatalogResult<TableSchema> {
+    if changes.is_empty() {
+        return Err(CatalogError::InvalidSchemaEvolution(
+            "schema changes must not be empty".to_string(),
+        ));
+    }
+    let key_ids = schema
+        .primary_key
+        .iter()
+        .chain(&schema.bucket_key)
+        .copied()
+        .collect::<HashSet<_>>();
+
+    for change in changes {
+        match change {
+            SchemaChange::AddField(field) => {
+                let mut added_ids = HashSet::new();
+                collect_field_ids(&field, &mut added_ids);
+                if let Some(reused) = added_ids.intersection(used_field_ids).next() {
+                    return Err(CatalogError::InvalidSchemaEvolution(format!(
+                        "field {} already exists",
+                        reused.0
+                    )));
+                }
+                if !field.logical_type.nullable {
+                    return Err(CatalogError::InvalidSchemaEvolution(format!(
+                        "added field '{}' must be nullable",
+                        field.name
+                    )));
+                }
+                used_field_ids.extend(added_ids);
+                schema.fields.push(field);
+            }
+            SchemaChange::RenameField { field_id, new_name } => {
+                let field = schema
+                    .fields
+                    .iter_mut()
+                    .find(|field| field.id == field_id)
+                    .ok_or_else(|| {
+                        CatalogError::InvalidSchemaEvolution(format!(
+                            "field {} does not exist",
+                            field_id.0
+                        ))
+                    })?;
+                field.name = new_name;
+            }
+            SchemaChange::DropField(field_id) => {
+                if key_ids.contains(&field_id) {
+                    return Err(CatalogError::InvalidSchemaEvolution(format!(
+                        "key field {} cannot be dropped",
+                        field_id.0
+                    )));
+                }
+                let index = schema
+                    .fields
+                    .iter()
+                    .position(|field| field.id == field_id)
+                    .ok_or_else(|| {
+                        CatalogError::InvalidSchemaEvolution(format!(
+                            "field {} does not exist",
+                            field_id.0
+                        ))
+                    })?;
+                schema.fields.remove(index);
+            }
+        }
+    }
+    TableSchema::new(schema.fields, schema.primary_key, schema.bucket_key)
+        .map_err(|error| CatalogError::InvalidSchemaEvolution(error.to_string()))
+}
+
+fn schema_field_ids(schema: &TableSchema) -> Vec<FieldId> {
+    let mut field_ids = HashSet::new();
+    for field in &schema.fields {
+        collect_field_ids(field, &mut field_ids);
+    }
+    sorted_field_ids(field_ids)
+}
+
+fn sorted_field_ids(field_ids: HashSet<FieldId>) -> Vec<FieldId> {
+    let mut field_ids = field_ids.into_iter().collect::<Vec<_>>();
+    field_ids.sort_unstable();
+    field_ids
+}
+
+fn collect_field_ids(field: &DataField, field_ids: &mut HashSet<FieldId>) {
+    field_ids.insert(field.id);
+    collect_type_field_ids(&field.logical_type, field_ids);
+}
+
+fn collect_type_field_ids(logical_type: &LogicalType, field_ids: &mut HashSet<FieldId>) {
+    match &logical_type.kind {
+        LogicalTypeKind::List { element_type } => {
+            collect_type_field_ids(element_type, field_ids);
+        }
+        LogicalTypeKind::Map {
+            key_type,
+            value_type,
+        } => {
+            collect_type_field_ids(key_type, field_ids);
+            collect_type_field_ids(value_type, field_ids);
+        }
+        LogicalTypeKind::Struct { fields } => {
+            for field in fields {
+                collect_field_ids(field, field_ids);
+            }
+        }
+        LogicalTypeKind::Extension { extension } => {
+            collect_type_field_ids(&extension.physical_type, field_ids);
+        }
+        _ => {}
+    }
 }
 
 fn read_json<T: DeserializeOwned>(store: &CatalogStore, path: &str) -> CatalogResult<T> {
