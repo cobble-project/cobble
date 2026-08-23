@@ -1,5 +1,5 @@
 use cobble::{Config, DbBuilder, VolumeDescriptor};
-use cobble_table::{DataField, LogicalType, Table, TableKey, TableSchema, Value};
+use cobble_table::{DataField, LogicalType, ReadOnlyTable, Table, TableKey, TableSchema, Value};
 use std::sync::mpsc;
 
 #[test]
@@ -192,6 +192,84 @@ fn table_runtime_create_open_and_typed_rows() {
     receiver.recv().unwrap().unwrap();
     db.close().unwrap();
 
+    let read_only =
+        cobble::ReadOnlyDb::open_with_db_id(config.clone(), snapshot_id, "table-runtime").unwrap();
+    {
+        let table = ReadOnlyTable::open(&read_only, "events").unwrap();
+        assert_eq!(table.schema(), &schema);
+        let key2 = build_read_only_key(
+            &table,
+            &[Value::String("tenant-a".to_string()), Value::Int64(2)],
+        );
+        let missing = build_read_only_key(
+            &table,
+            &[Value::String("tenant-a".to_string()), Value::Int64(9)],
+        );
+        assert_eq!(table.get(&key2).unwrap(), Some(row2.clone()));
+        assert_eq!(table.get(&missing).unwrap(), None);
+        assert_eq!(
+            table
+                .multi_get(&[key2.clone(), missing.clone(), key2.clone()])
+                .unwrap(),
+            vec![Some(row2.clone()), None, Some(row2.clone())]
+        );
+        let projection = table.project_by_names(&["tenant", "attributes"]).unwrap();
+        assert_eq!(
+            projection.get(&key2).unwrap(),
+            Some(vec![row2[0].clone(), row2[4].clone()])
+        );
+        assert_eq!(
+            table.project_by_names(&["id"]).unwrap().get(&key2).unwrap(),
+            Some(vec![row2[1].clone()])
+        );
+        assert_eq!(
+            table
+                .scan_bounds(key2.bucket(), Some(&key2), Some(&missing))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![row2.clone()]
+        );
+        assert_eq!(
+            table
+                .project_by_names(&["name"])
+                .unwrap()
+                .scan_bounds(key2.bucket(), Some(&key2), Some(&missing))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![vec![row2[2].clone()]]
+        );
+
+        let detached_projection = {
+            let handle = ReadOnlyTable::open(&read_only, "events").unwrap();
+            handle.project_by_names(&["id"]).unwrap()
+        };
+        assert_eq!(
+            detached_projection.get(&key2).unwrap(),
+            Some(vec![row2[1].clone()])
+        );
+        let detached_scan = {
+            let handle = ReadOnlyTable::open(&read_only, "events").unwrap();
+            handle
+                .scan_bounds(key2.bucket(), Some(&key2), Some(&missing))
+                .unwrap()
+        };
+        assert_eq!(
+            detached_scan.collect::<Result<Vec<_>, _>>().unwrap(),
+            vec![row2.clone()]
+        );
+
+        let keys = ReadOnlyTable::open(&read_only, "keys").unwrap();
+        let key = build_read_only_key(&keys, &[Value::Int64(42)]);
+        assert_eq!(keys.get(&key).unwrap(), Some(vec![Value::Int64(42)]));
+        assert_eq!(
+            keys.project_by_names(&["id"]).unwrap().get(&key).unwrap(),
+            Some(vec![Value::Int64(42)])
+        );
+    }
+    drop(read_only);
+
     let reopened = cobble::Db::open_from_snapshot(config, snapshot_id, "table-runtime").unwrap();
     {
         let table = Table::open(&reopened, "events").unwrap();
@@ -208,6 +286,14 @@ fn table_runtime_create_open_and_typed_rows() {
 }
 
 fn build_key(table: &Table<'_>, values: &[Value]) -> TableKey {
+    let mut builder = table.key_builder();
+    for value in values {
+        builder.push(value.clone());
+    }
+    builder.build().unwrap()
+}
+
+fn build_read_only_key(table: &ReadOnlyTable<'_>, values: &[Value]) -> TableKey {
     let mut builder = table.key_builder();
     for value in values {
         builder.push(value.clone());

@@ -247,6 +247,15 @@ impl ReadOnlyDb {
         self.schema_manager.latest_schema()
     }
 
+    /// Return the configured bucket count for this snapshot view.
+    pub fn total_buckets(&self) -> u32 {
+        self.lsm_tree
+            .db_state()
+            .load()
+            .multi_lsm_version
+            .total_buckets()
+    }
+
     /// Return the metrics samples for this database.
     pub fn metrics(&self) -> Vec<crate::MetricSample> {
         metrics_registry::snapshot_metrics(Some(self.metrics_manager.db_id()))

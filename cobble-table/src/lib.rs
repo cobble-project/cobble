@@ -24,4 +24,6 @@ pub use logical_type::{
     DataField, ExtensionType, FieldId, LogicalType, LogicalTypeKind, TimestampKind,
 };
 pub use schema::TableSchema;
-pub use table::{ProjectedTableScan, Table, TableKey, TableKeyBuilder, TableProjection, TableScan};
+pub use table::{
+    ProjectedTableScan, ReadOnlyTable, Table, TableKey, TableKeyBuilder, TableProjection, TableScan,
+};

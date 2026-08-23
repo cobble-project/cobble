@@ -2,7 +2,9 @@ use crate::codec::KeyCodec;
 use crate::metadata::TableMetadata;
 use crate::{BucketHash, FieldId, LogicalType, Result, TableError, TableSchema, Value, ValueCodec};
 use bytes::Bytes;
-use cobble::{ColumnFamilyOptions, Db, DbIterator, ReadOptions, ScanOptions, WriteOptions};
+use cobble::{
+    ColumnFamilyOptions, Db, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, Schema, WriteOptions,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -60,9 +62,54 @@ struct ProjectionPlan {
     has_key_fields: bool,
 }
 
-/// A reusable typed projection over one table.
-pub struct TableProjection<'table, 'db> {
-    table: &'table Table<'db>,
+#[derive(Clone, Copy)]
+enum TableReadBackend<'db> {
+    Writable(&'db Db),
+    ReadOnly(&'db ReadOnlyDb),
+}
+
+impl<'db> TableReadBackend<'db> {
+    fn get_with_options(
+        self,
+        bucket: u16,
+        key: &[u8],
+        options: &ReadOptions,
+    ) -> cobble::Result<Option<Vec<Option<Bytes>>>> {
+        match self {
+            Self::Writable(db) => db.get_with_options(bucket, key, options),
+            Self::ReadOnly(db) => db.get_with_options(bucket, key, options),
+        }
+    }
+
+    fn multi_get_with_options(
+        self,
+        keys: &[(u16, &[u8])],
+        options: &ReadOptions,
+    ) -> cobble::Result<Vec<Option<Vec<Option<Bytes>>>>> {
+        match self {
+            Self::Writable(db) => db.multi_get_with_options(keys, options),
+            Self::ReadOnly(db) => db.multi_get_with_options(keys, options),
+        }
+    }
+
+    fn scan_with_options_bounds(
+        self,
+        bucket: u16,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        options: &ScanOptions,
+    ) -> cobble::Result<DbIterator<'db>> {
+        match self {
+            Self::Writable(db) => db.scan_with_options_bounds(bucket, start, end, options),
+            Self::ReadOnly(db) => db.scan_with_options_bounds(bucket, start, end, options),
+        }
+    }
+}
+
+/// A reusable typed projection over one table or fixed snapshot table.
+pub struct TableProjection<'db> {
+    backend: TableReadBackend<'db>,
+    compiled: Arc<CompiledTable>,
     plan: Arc<ProjectionPlan>,
     read_options: ReadOptions,
     scan_options: ScanOptions,
@@ -105,6 +152,15 @@ pub struct Table<'db> {
     write_options: WriteOptions,
 }
 
+/// Typed read-only access to one table in a fixed shard snapshot.
+pub struct ReadOnlyTable<'db> {
+    db: &'db ReadOnlyDb,
+    name: String,
+    compiled: Arc<CompiledTable>,
+    read_options: ReadOptions,
+    scan_options: ScanOptions,
+}
+
 impl<'db> Table<'db> {
     /// Create a table or reopen it when its persisted schema is identical.
     pub fn create(db: &'db Db, name: impl Into<String>, schema: TableSchema) -> Result<Self> {
@@ -141,17 +197,7 @@ impl<'db> Table<'db> {
     pub fn open(db: &'db Db, name: impl Into<String>) -> Result<Self> {
         let name = validate_name(name.into())?;
         let current = db.current_schema();
-        let id = current
-            .column_family_ids()
-            .get(&name)
-            .copied()
-            .ok_or_else(|| TableError::InvalidSchema(format!("unknown table '{name}'")))?;
-        let metadata = load_metadata(&current.column_family_options_in_family(id))?;
-        if current.num_columns_in_family(id) != Some(metadata.layout.value_columns.len().max(1)) {
-            return Err(TableError::InvalidSchema(format!(
-                "table '{name}' has an incompatible physical column count"
-            )));
-        }
+        let metadata = load_table_metadata(&current, &name)?;
         Self::from_metadata(db, name, metadata)
     }
 
@@ -172,74 +218,13 @@ impl<'db> Table<'db> {
     pub fn project_by_names<S: AsRef<str>>(
         &self,
         field_names: &[S],
-    ) -> Result<TableProjection<'_, 'db>> {
-        if field_names.is_empty() {
-            return Err(TableError::InvalidSchema(
-                "table projection must contain at least one field".to_string(),
-            ));
-        }
-        let mut seen = std::collections::HashSet::with_capacity(field_names.len());
-        let mut sources = Vec::with_capacity(field_names.len());
-        let mut physical_columns = Vec::new();
-        let mut has_key_fields = false;
-        for field_name in field_names {
-            let field_name = field_name.as_ref();
-            if !seen.insert(field_name) {
-                return Err(TableError::InvalidSchema(format!(
-                    "duplicate projection field: '{field_name}'"
-                )));
-            }
-            let schema_position = self
-                .compiled
-                .schema
-                .fields
-                .iter()
-                .position(|field| field.name == field_name)
-                .ok_or_else(|| {
-                    TableError::InvalidSchema(format!(
-                        "projection field '{field_name}' does not exist"
-                    ))
-                })?;
-            if let Some(key_index) = self
-                .compiled
-                .key_positions
-                .iter()
-                .position(|position| *position == schema_position)
-            {
-                sources.push(ProjectedFieldSource::Key(key_index));
-                has_key_fields = true;
-            } else {
-                let physical_column = self
-                    .compiled
-                    .value_positions
-                    .iter()
-                    .position(|position| *position == schema_position)
-                    .expect("compiled table maps every non-key field");
-                let projected_column = physical_columns.len();
-                physical_columns.push(physical_column);
-                sources.push(ProjectedFieldSource::Value {
-                    projected_column,
-                    physical_column,
-                });
-            }
-        }
-        if physical_columns.is_empty() {
-            physical_columns.push(0);
-        }
-        let plan = Arc::new(ProjectionPlan {
-            sources,
-            has_key_fields,
-        });
-        Ok(TableProjection {
-            table: self,
-            plan,
-            read_options: ReadOptions::for_columns_in_family(
-                self.name.clone(),
-                physical_columns.clone(),
-            ),
-            scan_options: ScanOptions::for_columns(physical_columns)
-                .with_column_family(self.name.clone()),
-        })
+    ) -> Result<TableProjection<'db>> {
+        build_projection(
+            TableReadBackend::Writable(self.db),
+            &self.name,
+            Arc::clone(&self.compiled),
+            field_names,
+        )
     }
 
     /// Write one full row in schema field order.
@@ -334,8 +319,8 @@ impl<'db> Table<'db> {
         start_key_inclusive: Option<&TableKey>,
         end_key_exclusive: Option<&TableKey>,
     ) -> Result<TableScan<'db>> {
-        self.validate_bound(bucket, start_key_inclusive)?;
-        self.validate_bound(bucket, end_key_exclusive)?;
+        validate_bound(bucket, start_key_inclusive)?;
+        validate_bound(bucket, end_key_exclusive)?;
         Ok(TableScan {
             inner: self.db.scan_with_options_bounds(
                 bucket,
@@ -348,44 +333,7 @@ impl<'db> Table<'db> {
     }
 
     fn from_metadata(db: &'db Db, name: String, metadata: TableMetadata) -> Result<Self> {
-        metadata.validate()?;
-        let positions = metadata
-            .schema
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(position, field)| (field.id, position))
-            .collect::<HashMap<FieldId, usize>>();
-        let key_positions = metadata
-            .layout
-            .key_fields
-            .iter()
-            .map(|id| positions[id])
-            .collect::<Vec<_>>();
-        let key_types = key_positions
-            .iter()
-            .map(|position| metadata.schema.fields[*position].logical_type.clone())
-            .collect::<Vec<_>>();
-        let value_positions = metadata
-            .layout
-            .value_columns
-            .iter()
-            .map(|column| positions[&column.field_id])
-            .collect::<Vec<_>>();
-        let value_types = value_positions
-            .iter()
-            .map(|position| metadata.schema.fields[*position].logical_type.clone())
-            .collect::<Vec<_>>();
-        let compiled = Arc::new(CompiledTable {
-            schema: metadata.schema,
-            key_positions,
-            key_types,
-            bucket_key_fields: metadata.layout.bucket_fields.len(),
-            value_positions,
-            value_types,
-            physical_columns: metadata.layout.value_columns.len().max(1),
-            bucket_hash: BucketHash::new(db.total_buckets())?,
-        });
+        let compiled = compile_table(metadata, db.total_buckets())?;
         Ok(Self {
             db,
             name: name.clone(),
@@ -412,18 +360,6 @@ impl<'db> Table<'db> {
         ))
     }
 
-    fn validate_bound(&self, bucket: u16, key: Option<&TableKey>) -> Result<()> {
-        let Some(key) = key else {
-            return Ok(());
-        };
-        if key.inner.bucket != bucket {
-            return Err(TableError::codec(
-                "table scan bound belongs to a different bucket",
-            ));
-        }
-        Ok(())
-    }
-
     fn assemble_row_from_key_values(
         &self,
         primary_key: &[Value],
@@ -433,15 +369,112 @@ impl<'db> Table<'db> {
     }
 }
 
-impl TableProjection<'_, '_> {
+impl<'db> ReadOnlyTable<'db> {
+    /// Open a table from metadata stored in this snapshot's schema.
+    pub fn open(db: &'db ReadOnlyDb, name: impl Into<String>) -> Result<Self> {
+        let name = validate_name(name.into())?;
+        let current = db.current_schema();
+        let metadata = load_table_metadata(&current, &name)?;
+        let compiled = compile_table(metadata, db.total_buckets())?;
+        Ok(Self {
+            db,
+            name: name.clone(),
+            compiled,
+            read_options: ReadOptions::default().with_column_family(name.clone()),
+            scan_options: ScanOptions::default().with_column_family(name),
+        })
+    }
+
+    /// Return the persisted semantic schema of this table.
+    pub fn schema(&self) -> &TableSchema {
+        &self.compiled.schema
+    }
+
+    /// Start building one primary key in schema order.
+    pub fn key_builder(&self) -> TableKeyBuilder {
+        TableKeyBuilder {
+            compiled: Arc::clone(&self.compiled),
+            values: Vec::with_capacity(self.compiled.key_positions.len()),
+        }
+    }
+
+    /// Compile a reusable read projection from top-level field names.
+    pub fn project_by_names<S: AsRef<str>>(
+        &self,
+        field_names: &[S],
+    ) -> Result<TableProjection<'db>> {
+        build_projection(
+            TableReadBackend::ReadOnly(self.db),
+            &self.name,
+            Arc::clone(&self.compiled),
+            field_names,
+        )
+    }
+
+    /// Read one row by primary key.
+    pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
+        self.db
+            .get_with_options(key.inner.bucket, &key.inner.encoded, &self.read_options)?
+            .map(|columns| {
+                assemble_row_from_key_values(&self.compiled, &key.inner.values, &columns)
+            })
+            .transpose()
+    }
+
+    /// Read many primary keys while preserving order and duplicates.
+    pub fn multi_get(&self, keys: &[TableKey]) -> Result<Vec<Option<Vec<Value>>>> {
+        let requests = keys
+            .iter()
+            .map(|key| (key.inner.bucket, key.inner.encoded.as_slice()))
+            .collect::<Vec<_>>();
+        self.db
+            .multi_get_with_options(&requests, &self.read_options)?
+            .into_iter()
+            .zip(keys)
+            .map(|(columns, key)| {
+                columns
+                    .map(|columns| {
+                        assemble_row_from_key_values(&self.compiled, &key.inner.values, &columns)
+                    })
+                    .transpose()
+            })
+            .collect()
+    }
+
+    /// Scan all rows in one bucket.
+    pub fn scan(&self, bucket: u16) -> Result<TableScan<'db>> {
+        self.scan_bounds(bucket, None, None)
+    }
+
+    /// Scan one bucket from an inclusive primary-key bound to an exclusive bound.
+    pub fn scan_bounds(
+        &self,
+        bucket: u16,
+        start_key_inclusive: Option<&TableKey>,
+        end_key_exclusive: Option<&TableKey>,
+    ) -> Result<TableScan<'db>> {
+        validate_bound(bucket, start_key_inclusive)?;
+        validate_bound(bucket, end_key_exclusive)?;
+        Ok(TableScan {
+            inner: self.db.scan_with_options_bounds(
+                bucket,
+                start_key_inclusive.map(|key| key.inner.encoded.as_slice()),
+                end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
+                &self.scan_options,
+            )?,
+            compiled: Arc::clone(&self.compiled),
+        })
+    }
+}
+
+impl TableProjection<'_> {
     /// Read one projected row.
     pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
-        self.table
-            .db
+        self.backend
             .get_with_options(key.inner.bucket, &key.inner.encoded, &self.read_options)?
             .map(|columns| {
                 assemble_projected_row(
-                    &self.table.compiled,
+                    &self.compiled,
                     &self.plan,
                     Some(&key.inner.values),
                     &columns,
@@ -456,8 +489,7 @@ impl TableProjection<'_, '_> {
             .iter()
             .map(|key| (key.inner.bucket, key.inner.encoded.as_slice()))
             .collect::<Vec<_>>();
-        self.table
-            .db
+        self.backend
             .multi_get_with_options(&requests, &self.read_options)?
             .into_iter()
             .zip(keys)
@@ -465,7 +497,7 @@ impl TableProjection<'_, '_> {
                 columns
                     .map(|columns| {
                         assemble_projected_row(
-                            &self.table.compiled,
+                            &self.compiled,
                             &self.plan,
                             Some(&key.inner.values),
                             &columns,
@@ -488,16 +520,16 @@ impl TableProjection<'_, '_> {
         start_key_inclusive: Option<&TableKey>,
         end_key_exclusive: Option<&TableKey>,
     ) -> Result<ProjectedTableScan<'_>> {
-        self.table.validate_bound(bucket, start_key_inclusive)?;
-        self.table.validate_bound(bucket, end_key_exclusive)?;
+        validate_bound(bucket, start_key_inclusive)?;
+        validate_bound(bucket, end_key_exclusive)?;
         Ok(ProjectedTableScan {
-            inner: self.table.db.scan_with_options_bounds(
+            inner: self.backend.scan_with_options_bounds(
                 bucket,
                 start_key_inclusive.map(|key| key.inner.encoded.as_slice()),
                 end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
                 &self.scan_options,
             )?,
-            compiled: Arc::clone(&self.table.compiled),
+            compiled: Arc::clone(&self.compiled),
             plan: Arc::clone(&self.plan),
         })
     }
@@ -611,6 +643,141 @@ fn decode_value_columns(
             .and_then(|value| value.as_ref())
             .ok_or_else(|| TableError::codec("table row is missing a value column"))?;
         row[*position] = ValueCodec::decode_bytes_validated(logical_type, value.clone())?;
+    }
+    Ok(())
+}
+
+fn build_projection<'db, S: AsRef<str>>(
+    backend: TableReadBackend<'db>,
+    name: &str,
+    compiled: Arc<CompiledTable>,
+    field_names: &[S],
+) -> Result<TableProjection<'db>> {
+    if field_names.is_empty() {
+        return Err(TableError::InvalidSchema(
+            "table projection must contain at least one field".to_string(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(field_names.len());
+    let mut sources = Vec::with_capacity(field_names.len());
+    let mut physical_columns = Vec::new();
+    let mut has_key_fields = false;
+    for field_name in field_names {
+        let field_name = field_name.as_ref();
+        if !seen.insert(field_name) {
+            return Err(TableError::InvalidSchema(format!(
+                "duplicate projection field: '{field_name}'"
+            )));
+        }
+        let schema_position = compiled
+            .schema
+            .fields
+            .iter()
+            .position(|field| field.name == field_name)
+            .ok_or_else(|| {
+                TableError::InvalidSchema(format!("projection field '{field_name}' does not exist"))
+            })?;
+        if let Some(key_index) = compiled
+            .key_positions
+            .iter()
+            .position(|position| *position == schema_position)
+        {
+            sources.push(ProjectedFieldSource::Key(key_index));
+            has_key_fields = true;
+        } else {
+            let physical_column = compiled
+                .value_positions
+                .iter()
+                .position(|position| *position == schema_position)
+                .expect("compiled table maps every non-key field");
+            let projected_column = physical_columns.len();
+            physical_columns.push(physical_column);
+            sources.push(ProjectedFieldSource::Value {
+                projected_column,
+                physical_column,
+            });
+        }
+    }
+    if physical_columns.is_empty() {
+        physical_columns.push(0);
+    }
+    Ok(TableProjection {
+        backend,
+        compiled,
+        plan: Arc::new(ProjectionPlan {
+            sources,
+            has_key_fields,
+        }),
+        read_options: ReadOptions::for_columns_in_family(
+            name.to_string(),
+            physical_columns.clone(),
+        ),
+        scan_options: ScanOptions::for_columns(physical_columns)
+            .with_column_family(name.to_string()),
+    })
+}
+
+fn compile_table(metadata: TableMetadata, total_buckets: u32) -> Result<Arc<CompiledTable>> {
+    metadata.validate()?;
+    let positions = metadata
+        .schema
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(position, field)| (field.id, position))
+        .collect::<HashMap<FieldId, usize>>();
+    let key_positions = metadata
+        .layout
+        .key_fields
+        .iter()
+        .map(|id| positions[id])
+        .collect::<Vec<_>>();
+    let key_types = key_positions
+        .iter()
+        .map(|position| metadata.schema.fields[*position].logical_type.clone())
+        .collect::<Vec<_>>();
+    let value_positions = metadata
+        .layout
+        .value_columns
+        .iter()
+        .map(|column| positions[&column.field_id])
+        .collect::<Vec<_>>();
+    let value_types = value_positions
+        .iter()
+        .map(|position| metadata.schema.fields[*position].logical_type.clone())
+        .collect::<Vec<_>>();
+    Ok(Arc::new(CompiledTable {
+        schema: metadata.schema,
+        key_positions,
+        key_types,
+        bucket_key_fields: metadata.layout.bucket_fields.len(),
+        value_positions,
+        value_types,
+        physical_columns: metadata.layout.value_columns.len().max(1),
+        bucket_hash: BucketHash::new(total_buckets)?,
+    }))
+}
+
+fn load_table_metadata(schema: &Schema, name: &str) -> Result<TableMetadata> {
+    let id = schema
+        .column_family_ids()
+        .get(name)
+        .copied()
+        .ok_or_else(|| TableError::InvalidSchema(format!("unknown table '{name}'")))?;
+    let metadata = load_metadata(&schema.column_family_options_in_family(id))?;
+    if schema.num_columns_in_family(id) != Some(metadata.layout.value_columns.len().max(1)) {
+        return Err(TableError::InvalidSchema(format!(
+            "table '{name}' has an incompatible physical column count"
+        )));
+    }
+    Ok(metadata)
+}
+
+fn validate_bound(bucket: u16, key: Option<&TableKey>) -> Result<()> {
+    if key.is_some_and(|key| key.inner.bucket != bucket) {
+        return Err(TableError::codec(
+            "table scan bound belongs to a different bucket",
+        ));
     }
     Ok(())
 }
