@@ -4,6 +4,7 @@ members = [
     "cobble-bench",
     "cobble-cli",
     "cobble-cluster",
+    "cobble-cpp",
     "cobble",
     "cobble-java",
     "cobble-data-structure",

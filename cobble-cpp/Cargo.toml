@@ -37,7 +37,7 @@ bytes = { workspace = true }
 cobble = { workspace = true }
 cxx = "1.0.186"
 serde_json = { workspace = true }
+size = { workspace = true }
 
 [build-dependencies]
 cxx-build = "1.0.186"
-
