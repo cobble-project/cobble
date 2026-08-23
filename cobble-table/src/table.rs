@@ -17,6 +17,61 @@ struct CompiledTable {
     bucket_hash: BucketHash,
 }
 
+struct TableKeyData {
+    values: Vec<Value>,
+    bucket: u16,
+    encoded: Vec<u8>,
+}
+
+/// A validated and encoded primary key for a table.
+///
+/// Cloning a key is cheap and shares its encoded bytes and typed values.
+#[derive(Clone)]
+pub struct TableKey {
+    inner: Arc<TableKeyData>,
+}
+
+impl TableKey {
+    /// Return the bucket selected for this key.
+    #[must_use]
+    pub fn bucket(&self) -> u16 {
+        self.inner.bucket
+    }
+}
+
+/// Incrementally builds one table primary key in schema order.
+pub struct TableKeyBuilder {
+    compiled: Arc<CompiledTable>,
+    values: Vec<Value>,
+}
+
+impl TableKeyBuilder {
+    /// Append the next primary-key field.
+    pub fn push(&mut self, value: Value) -> &mut Self {
+        self.values.push(value);
+        self
+    }
+
+    /// Validate and encode the complete primary key.
+    pub fn build(self) -> Result<TableKey> {
+        let mut encoded = Vec::new();
+        let prefix_end = KeyCodec::encode_row_with_prefix_validated(
+            &self.compiled.key_types,
+            &self.values,
+            self.compiled.bucket_key_fields,
+            &mut encoded,
+        )?;
+        let bucket = self.compiled.bucket_hash.bucket(&encoded[..prefix_end]);
+        Ok(TableKey {
+            inner: Arc::new(TableKeyData {
+                values: self.values,
+                bucket,
+                encoded,
+            }),
+        })
+    }
+}
+
 /// Typed access to one table-backed Cobble column family.
 pub struct Table<'db> {
     db: &'db Db,
@@ -82,23 +137,12 @@ impl<'db> Table<'db> {
         &self.compiled.schema
     }
 
-    /// Encode a primary key and return its bucket and raw Cobble key bytes.
-    pub fn encode_key(&self, primary_key: &[Value]) -> Result<(u16, Vec<u8>)> {
-        let (encoded, prefix_end) = self.encode_primary_key(primary_key)?;
-        Ok((
-            self.compiled.bucket_hash.bucket(&encoded[..prefix_end]),
-            encoded,
-        ))
-    }
-
-    /// Return the bucket assigned to a primary key.
-    pub fn bucket_for_key(&self, primary_key: &[Value]) -> Result<u16> {
-        let prefix = KeyCodec::encode_prefix_validated(
-            &self.compiled.key_types,
-            primary_key,
-            self.compiled.bucket_key_fields,
-        )?;
-        Ok(self.compiled.bucket_hash.bucket(&prefix))
+    /// Start building one primary key in schema order.
+    pub fn key_builder(&self) -> TableKeyBuilder {
+        TableKeyBuilder {
+            compiled: Arc::clone(&self.compiled),
+            values: Vec::with_capacity(self.compiled.key_positions.len()),
+        }
     }
 
     /// Write one full row in schema field order.
@@ -132,32 +176,26 @@ impl<'db> Table<'db> {
     }
 
     /// Read one row by primary key.
-    pub fn get(&self, primary_key: &[Value]) -> Result<Option<Vec<Value>>> {
-        let (bucket, key) = self.encode_key(primary_key)?;
+    pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
         self.db
-            .get_with_options(bucket, &key, &self.read_options)?
-            .map(|columns| self.assemble_row_from_key_values(primary_key, &columns))
+            .get_with_options(key.inner.bucket, &key.inner.encoded, &self.read_options)?
+            .map(|columns| self.assemble_row_from_key_values(&key.inner.values, &columns))
             .transpose()
     }
 
     /// Read many primary keys with one core multi-get, preserving order and duplicates.
-    pub fn multi_get<K: AsRef<[Value]>>(
-        &self,
-        primary_keys: &[K],
-    ) -> Result<Vec<Option<Vec<Value>>>> {
-        let encoded = primary_keys
-            .iter()
-            .map(|key| self.encode_key(key.as_ref()))
-            .collect::<Result<Vec<_>>>()?;
+    pub fn multi_get(&self, keys: &[TableKey]) -> Result<Vec<Option<Vec<Value>>>> {
+        let mut requests = Vec::with_capacity(keys.len());
+        for key in keys {
+            requests.push((key.inner.bucket, key.inner.encoded.as_slice()));
+        }
         self.db
-            .multi_get_with_options(&encoded, &self.read_options)?
+            .multi_get_with_options(&requests, &self.read_options)?
             .into_iter()
-            .zip(primary_keys)
-            .map(|(columns, primary_key)| {
+            .zip(keys)
+            .map(|(columns, key)| {
                 columns
-                    .map(|columns| {
-                        self.assemble_row_from_key_values(primary_key.as_ref(), &columns)
-                    })
+                    .map(|columns| self.assemble_row_from_key_values(&key.inner.values, &columns))
                     .transpose()
             })
             .collect()
@@ -172,20 +210,16 @@ impl<'db> Table<'db> {
     pub fn scan_bounds(
         &self,
         bucket: u16,
-        start_key_inclusive: Option<&[Value]>,
-        end_key_exclusive: Option<&[Value]>,
+        start_key_inclusive: Option<&TableKey>,
+        end_key_exclusive: Option<&TableKey>,
     ) -> Result<TableScan<'db>> {
-        let start = start_key_inclusive
-            .map(|key| self.encode_primary_key(key).map(|(key, _)| key))
-            .transpose()?;
-        let end = end_key_exclusive
-            .map(|key| self.encode_primary_key(key).map(|(key, _)| key))
-            .transpose()?;
+        self.validate_bound(bucket, start_key_inclusive)?;
+        self.validate_bound(bucket, end_key_exclusive)?;
         Ok(TableScan {
             inner: self.db.scan_with_options_bounds(
                 bucket,
-                start.as_deref(),
-                end.as_deref(),
+                start_key_inclusive.map(|key| key.inner.encoded.as_slice()),
+                end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
                 &self.scan_options,
             )?,
             compiled: Arc::clone(&self.compiled),
@@ -257,15 +291,16 @@ impl<'db> Table<'db> {
         ))
     }
 
-    fn encode_primary_key(&self, primary_key: &[Value]) -> Result<(Vec<u8>, usize)> {
-        let mut encoded = Vec::new();
-        let prefix_end = KeyCodec::encode_row_with_prefix_validated(
-            &self.compiled.key_types,
-            primary_key,
-            self.compiled.bucket_key_fields,
-            &mut encoded,
-        )?;
-        Ok((encoded, prefix_end))
+    fn validate_bound(&self, bucket: u16, key: Option<&TableKey>) -> Result<()> {
+        let Some(key) = key else {
+            return Ok(());
+        };
+        if key.inner.bucket != bucket {
+            return Err(TableError::codec(
+                "table scan bound belongs to a different bucket",
+            ));
+        }
+        Ok(())
     }
 
     fn assemble_row_from_key_values(

@@ -104,25 +104,6 @@ impl KeyCodec {
         result
     }
 
-    /// Encodes only the bucket-key prefix for already validated table types.
-    pub(crate) fn encode_prefix_validated(
-        types: &[LogicalType],
-        values: &[Value],
-        prefix_fields: usize,
-    ) -> Result<Vec<u8>> {
-        if types.len() != values.len() {
-            return Err(TableError::codec(
-                "key field count does not match value count",
-            ));
-        }
-        debug_assert!(prefix_fields <= types.len());
-        let mut encoded = Vec::new();
-        for (logical_type, value) in types.iter().zip(values).take(prefix_fields) {
-            encode_key(logical_type, value, &mut encoded)?;
-        }
-        Ok(encoded)
-    }
-
     /// Encodes selected fields from a row whose logical types were validated at table creation.
     pub(crate) fn encode_row_from_positions_validated(
         types: &[LogicalType],

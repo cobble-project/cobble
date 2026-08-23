@@ -1,5 +1,5 @@
 use cobble::{Config, DbBuilder, VolumeDescriptor};
-use cobble_table::{DataField, LogicalType, Table, TableSchema, Value};
+use cobble_table::{DataField, LogicalType, Table, TableKey, TableSchema, Value};
 use std::sync::mpsc;
 
 #[test]
@@ -61,6 +61,12 @@ fn table_runtime_create_open_and_typed_rows() {
                 .schema(),
             &schema
         );
+        let mut incomplete = table.key_builder();
+        incomplete.push(key1[0].clone());
+        assert!(incomplete.build().is_err());
+        let key1 = build_key(&table, &key1);
+        let key2 = build_key(&table, &key2);
+        let missing = build_key(&table, &missing);
         table.put(&row1).unwrap();
         table.put(&row2).unwrap();
         assert_eq!(table.get(&key1).unwrap(), Some(row1.clone()));
@@ -75,8 +81,12 @@ fn table_runtime_create_open_and_typed_rows() {
                 None
             ]
         );
-        let bucket = table.bucket_for_key(&key1).unwrap();
-        assert_eq!(bucket, table.encode_key(&key1).unwrap().0);
+        let bucket = key1.bucket();
+        assert!(
+            table
+                .scan_bounds((bucket + 1) % 8, Some(&key1), None)
+                .is_err()
+        );
         let rows = table
             .scan_bounds(bucket, Some(&key1), Some(&missing))
             .unwrap()
@@ -96,8 +106,13 @@ fn table_runtime_create_open_and_typed_rows() {
         )
         .unwrap();
         let key_only = vec![Value::Int64(42)];
+        let key_only_key = {
+            let mut builder = keys.key_builder();
+            builder.push(Value::Int64(42));
+            builder.build().unwrap()
+        };
         keys.put(&key_only).unwrap();
-        assert_eq!(keys.get(&key_only).unwrap(), Some(key_only));
+        assert_eq!(keys.get(&key_only_key).unwrap(), Some(key_only));
     }
     let (sender, receiver) = mpsc::sync_channel(1);
     let snapshot_id = db
@@ -109,14 +124,22 @@ fn table_runtime_create_open_and_typed_rows() {
     let reopened = cobble::Db::open_from_snapshot(config, snapshot_id, "table-runtime").unwrap();
     {
         let table = Table::open(&reopened, "events").unwrap();
-        assert_eq!(table.get(&key2).unwrap(), Some(row2));
-        assert_eq!(
-            Table::open(&reopened, "keys")
-                .unwrap()
-                .get(&[Value::Int64(42)])
-                .unwrap(),
-            Some(vec![Value::Int64(42)])
+        let key2 = build_key(
+            &table,
+            &[Value::String("tenant-a".to_string()), Value::Int64(2)],
         );
+        assert_eq!(table.get(&key2).unwrap(), Some(row2));
+        let keys = Table::open(&reopened, "keys").unwrap();
+        let key = build_key(&keys, &[Value::Int64(42)]);
+        assert_eq!(keys.get(&key).unwrap(), Some(vec![Value::Int64(42)]));
     }
     reopened.close().unwrap();
+}
+
+fn build_key(table: &Table<'_>, values: &[Value]) -> TableKey {
+    let mut builder = table.key_builder();
+    for value in values {
+        builder.push(value.clone());
+    }
+    builder.build().unwrap()
 }
