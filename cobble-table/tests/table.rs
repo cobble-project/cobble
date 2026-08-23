@@ -94,6 +94,57 @@ fn table_runtime_create_open_and_typed_rows() {
             .unwrap();
         assert_eq!(rows, vec![row1.clone(), row2.clone()]);
 
+        let projection = table
+            .project_by_names(&["attributes", "tenant", "name"])
+            .unwrap();
+        let projected1 = vec![row1[4].clone(), row1[0].clone(), row1[2].clone()];
+        let projected2 = vec![row2[4].clone(), row2[0].clone(), row2[2].clone()];
+        assert_eq!(projection.get(&key1).unwrap(), Some(projected1.clone()));
+        assert_eq!(
+            projection
+                .multi_get(&[key2.clone(), key1.clone(), key2.clone(), missing.clone()])
+                .unwrap(),
+            vec![
+                Some(projected2.clone()),
+                Some(projected1.clone()),
+                Some(projected2.clone()),
+                None
+            ]
+        );
+        assert_eq!(
+            projection
+                .scan_bounds(bucket, Some(&key1), Some(&missing))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![projected1, projected2]
+        );
+        let key_projection = table.project_by_names(&["id"]).unwrap();
+        assert_eq!(
+            key_projection.get(&key1).unwrap(),
+            Some(vec![row1[1].clone()])
+        );
+        assert_eq!(key_projection.get(&missing).unwrap(), None);
+        let value_projection = table.project_by_names(&["tags"]).unwrap();
+        assert_eq!(
+            value_projection.get(&key2).unwrap(),
+            Some(vec![row2[3].clone()])
+        );
+        assert_eq!(
+            value_projection
+                .scan_bounds(bucket, Some(&key1), Some(&missing))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![vec![row1[3].clone()], vec![row2[3].clone()]]
+        );
+        assert!(table.project_by_names::<&str>(&[]).is_err());
+        assert!(table.project_by_names(&["tenant", "tenant"]).is_err());
+        assert!(table.project_by_names(&["missing"]).is_err());
+
+        table.delete(&key1).unwrap();
+        assert_eq!(table.get(&key1).unwrap(), None);
+
         let keys = Table::create(
             &db,
             "keys",
@@ -106,13 +157,33 @@ fn table_runtime_create_open_and_typed_rows() {
         )
         .unwrap();
         let key_only = vec![Value::Int64(42)];
-        let key_only_key = {
-            let mut builder = keys.key_builder();
-            builder.push(Value::Int64(42));
-            builder.build().unwrap()
-        };
+        let key_only_key = build_key(&keys, &key_only);
+        let (other_key_only, other_key_only_key) = (43..100)
+            .map(|value| {
+                let row = vec![Value::Int64(value)];
+                let key = build_key(&keys, &row);
+                (row, key)
+            })
+            .find(|(_, key)| key.bucket() != key_only_key.bucket())
+            .unwrap();
         keys.put(&key_only).unwrap();
+        keys.put(&other_key_only).unwrap();
         assert_eq!(keys.get(&key_only_key).unwrap(), Some(key_only));
+        let key_only_projection = keys.project_by_names(&["id"]).unwrap();
+        assert_eq!(
+            key_only_projection.get(&key_only_key).unwrap(),
+            Some(vec![Value::Int64(42)])
+        );
+        keys.delete_batch(&[
+            key_only_key.clone(),
+            other_key_only_key.clone(),
+            key_only_key.clone(),
+        ])
+        .unwrap();
+        assert_eq!(keys.get(&key_only_key).unwrap(), None);
+        assert_eq!(keys.get(&other_key_only_key).unwrap(), None);
+        assert_eq!(key_only_projection.get(&key_only_key).unwrap(), None);
+        keys.put(&[Value::Int64(42)]).unwrap();
     }
     let (sender, receiver) = mpsc::sync_channel(1);
     let snapshot_id = db

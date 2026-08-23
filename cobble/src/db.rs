@@ -804,16 +804,7 @@ impl Db {
         self.write_ref(bucket, key, column, ValueType::Put, value, options)
     }
 
-    /// Insert all physical columns for one key as one atomic row update.
-    pub fn put_columns<K, V>(&self, bucket: u16, key: K, columns: &[V]) -> Result<()>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        self.put_columns_with_options(bucket, key, columns, &self.default_write_options)
-    }
-
-    /// Insert all physical columns for one key as one atomic row update with write options.
+    #[doc(hidden)]
     pub fn put_columns_with_options<K, V>(
         &self,
         bucket: u16,
@@ -961,6 +952,74 @@ impl Db {
         K: AsRef<[u8]>,
     {
         self.write_ref(bucket, key, column, ValueType::Delete, [], options)
+    }
+
+    #[doc(hidden)]
+    pub fn delete_row_with_options<K>(
+        &self,
+        bucket: u16,
+        key: K,
+        options: &WriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.delete_rows_with_options(&[(bucket, key.as_ref())], options)
+    }
+
+    #[doc(hidden)]
+    pub fn delete_rows_with_options(
+        &self,
+        keys: &[(u16, &[u8])],
+        options: &WriteOptions,
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let _access = self.begin_access()?;
+        let schema = self.schema_manager.latest_schema();
+        self.ensure_multi_lsm_scopes_for_schema_if_dirty(schema.as_ref())?;
+        let column_family_id = options.resolve_column_family_id_cached(schema.as_ref())?;
+        let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
+        let expired_at = self.ttl_provider.get_expiration_timestamp(None);
+        let count = std::cell::Cell::new(0u64);
+        let entries = keys
+            .iter()
+            .inspect(|_| count.set(count.get() + 1))
+            .map(|(bucket, key)| {
+                let columns = (0..num_columns)
+                    .map(|_| Some(RefColumn::new(ValueType::Delete, &[])))
+                    .collect();
+                (
+                    RefKey::new_with_column_family(*bucket, column_family_id, key),
+                    RefValue::new_with_expired_at(columns, expired_at),
+                )
+            });
+        let result = if let Some(wal_writer) = &self.wal_writer {
+            let mut guard = wal_writer.lock_for_schema(schema.version())?;
+            let (result, completion) = {
+                let mut batch = guard.begin_batch();
+                let result = self.memtable_manager.put_validated_batch_with_callback(
+                    entries,
+                    num_columns,
+                    |key, value| batch.append_ref(schema.version(), key, value, num_columns),
+                );
+                let completion = batch.commit();
+                (result, completion)
+            };
+            drop(guard);
+            if let Some(completion) = completion {
+                self.finish_partially_applied_wal_batch(completion, options.await_durable, result)
+            } else {
+                result
+            }
+        } else {
+            self.memtable_manager
+                .put_validated_batch(entries, num_columns)
+        };
+        let decision = self.memtable_manager.record_adaptive_write(count.get());
+        self.apply_adaptive_decision(decision);
+        result
     }
 
     /// Merge a value into the given bucket and column.

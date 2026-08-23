@@ -45,6 +45,29 @@ pub struct TableKeyBuilder {
     values: Vec<Value>,
 }
 
+enum ProjectedFieldSource {
+    Key(usize),
+    Value {
+        /// Position in the compact column list returned by the projection read options.
+        projected_column: usize,
+        /// Position in the table's physical value columns, used to select its logical type.
+        physical_column: usize,
+    },
+}
+
+struct ProjectionPlan {
+    sources: Vec<ProjectedFieldSource>,
+    has_key_fields: bool,
+}
+
+/// A reusable typed projection over one table.
+pub struct TableProjection<'table, 'db> {
+    table: &'table Table<'db>,
+    plan: Arc<ProjectionPlan>,
+    read_options: ReadOptions,
+    scan_options: ScanOptions,
+}
+
 impl TableKeyBuilder {
     /// Append the next primary-key field.
     pub fn push(&mut self, value: Value) -> &mut Self {
@@ -145,6 +168,80 @@ impl<'db> Table<'db> {
         }
     }
 
+    /// Compile a reusable read projection from top-level field names.
+    pub fn project_by_names<S: AsRef<str>>(
+        &self,
+        field_names: &[S],
+    ) -> Result<TableProjection<'_, 'db>> {
+        if field_names.is_empty() {
+            return Err(TableError::InvalidSchema(
+                "table projection must contain at least one field".to_string(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(field_names.len());
+        let mut sources = Vec::with_capacity(field_names.len());
+        let mut physical_columns = Vec::new();
+        let mut has_key_fields = false;
+        for field_name in field_names {
+            let field_name = field_name.as_ref();
+            if !seen.insert(field_name) {
+                return Err(TableError::InvalidSchema(format!(
+                    "duplicate projection field: '{field_name}'"
+                )));
+            }
+            let schema_position = self
+                .compiled
+                .schema
+                .fields
+                .iter()
+                .position(|field| field.name == field_name)
+                .ok_or_else(|| {
+                    TableError::InvalidSchema(format!(
+                        "projection field '{field_name}' does not exist"
+                    ))
+                })?;
+            if let Some(key_index) = self
+                .compiled
+                .key_positions
+                .iter()
+                .position(|position| *position == schema_position)
+            {
+                sources.push(ProjectedFieldSource::Key(key_index));
+                has_key_fields = true;
+            } else {
+                let physical_column = self
+                    .compiled
+                    .value_positions
+                    .iter()
+                    .position(|position| *position == schema_position)
+                    .expect("compiled table maps every non-key field");
+                let projected_column = physical_columns.len();
+                physical_columns.push(physical_column);
+                sources.push(ProjectedFieldSource::Value {
+                    projected_column,
+                    physical_column,
+                });
+            }
+        }
+        if physical_columns.is_empty() {
+            physical_columns.push(0);
+        }
+        let plan = Arc::new(ProjectionPlan {
+            sources,
+            has_key_fields,
+        });
+        Ok(TableProjection {
+            table: self,
+            plan,
+            read_options: ReadOptions::for_columns_in_family(
+                self.name.clone(),
+                physical_columns.clone(),
+            ),
+            scan_options: ScanOptions::for_columns(physical_columns)
+                .with_column_family(self.name.clone()),
+        })
+    }
+
     /// Write one full row in schema field order.
     pub fn put(&self, row: &[Value]) -> Result<()> {
         self.put_bound(row, &self.write_options)
@@ -154,6 +251,30 @@ impl<'db> Table<'db> {
     pub fn put_with_options(&self, row: &[Value], options: &WriteOptions) -> Result<()> {
         let options = options.bound_to_column_family(self.name.clone());
         self.put_bound(row, &options)
+    }
+
+    /// Delete one complete row.
+    pub fn delete(&self, key: &TableKey) -> Result<()> {
+        self.db.delete_row_with_options(
+            key.inner.bucket,
+            key.inner.encoded.as_slice(),
+            &self.write_options,
+        )?;
+        Ok(())
+    }
+
+    /// Delete complete rows in one batch without cloning encoded keys.
+    pub fn delete_batch(&self, keys: &[TableKey]) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let requests = keys
+            .iter()
+            .map(|key| (key.inner.bucket, key.inner.encoded.as_slice()))
+            .collect::<Vec<_>>();
+        self.db
+            .delete_rows_with_options(&requests, &self.write_options)?;
+        Ok(())
     }
 
     fn put_bound(&self, row: &[Value], options: &WriteOptions) -> Result<()> {
@@ -312,10 +433,103 @@ impl<'db> Table<'db> {
     }
 }
 
+impl TableProjection<'_, '_> {
+    /// Read one projected row.
+    pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
+        self.table
+            .db
+            .get_with_options(key.inner.bucket, &key.inner.encoded, &self.read_options)?
+            .map(|columns| {
+                assemble_projected_row(
+                    &self.table.compiled,
+                    &self.plan,
+                    Some(&key.inner.values),
+                    &columns,
+                )
+            })
+            .transpose()
+    }
+
+    /// Read projected rows in input order, preserving duplicates and misses.
+    pub fn multi_get(&self, keys: &[TableKey]) -> Result<Vec<Option<Vec<Value>>>> {
+        let requests = keys
+            .iter()
+            .map(|key| (key.inner.bucket, key.inner.encoded.as_slice()))
+            .collect::<Vec<_>>();
+        self.table
+            .db
+            .multi_get_with_options(&requests, &self.read_options)?
+            .into_iter()
+            .zip(keys)
+            .map(|(columns, key)| {
+                columns
+                    .map(|columns| {
+                        assemble_projected_row(
+                            &self.table.compiled,
+                            &self.plan,
+                            Some(&key.inner.values),
+                            &columns,
+                        )
+                    })
+                    .transpose()
+            })
+            .collect()
+    }
+
+    /// Scan projected rows in one bucket.
+    pub fn scan(&self, bucket: u16) -> Result<ProjectedTableScan<'_>> {
+        self.scan_bounds(bucket, None, None)
+    }
+
+    /// Scan projected rows over cached primary-key bounds.
+    pub fn scan_bounds(
+        &self,
+        bucket: u16,
+        start_key_inclusive: Option<&TableKey>,
+        end_key_exclusive: Option<&TableKey>,
+    ) -> Result<ProjectedTableScan<'_>> {
+        self.table.validate_bound(bucket, start_key_inclusive)?;
+        self.table.validate_bound(bucket, end_key_exclusive)?;
+        Ok(ProjectedTableScan {
+            inner: self.table.db.scan_with_options_bounds(
+                bucket,
+                start_key_inclusive.map(|key| key.inner.encoded.as_slice()),
+                end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
+                &self.scan_options,
+            )?,
+            compiled: Arc::clone(&self.table.compiled),
+            plan: Arc::clone(&self.plan),
+        })
+    }
+}
+
 /// Iterator over typed rows from a bucket-scoped table scan.
 pub struct TableScan<'db> {
     inner: DbIterator<'db>,
     compiled: Arc<CompiledTable>,
+}
+
+/// Iterator over projected typed rows from a bucket-scoped scan.
+pub struct ProjectedTableScan<'db> {
+    inner: DbIterator<'db>,
+    compiled: Arc<CompiledTable>,
+    plan: Arc<ProjectionPlan>,
+}
+
+impl Iterator for ProjectedTableScan<'_> {
+    type Item = Result<Vec<Value>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|row| {
+            let (key, columns) = row?;
+            let key_values = self
+                .plan
+                .has_key_fields
+                .then(|| KeyCodec::decode_row_validated(&self.compiled.key_types, &key))
+                .transpose()?;
+            assemble_projected_row(&self.compiled, &self.plan, key_values.as_deref(), &columns)
+        })
+    }
 }
 
 impl Iterator for TableScan<'_> {
@@ -348,6 +562,36 @@ fn assemble_row_from_key_values(
         row[*position] = value.clone();
     }
     decode_value_columns(compiled, &mut row, columns)?;
+    Ok(row)
+}
+
+fn assemble_projected_row(
+    compiled: &CompiledTable,
+    plan: &ProjectionPlan,
+    key_values: Option<&[Value]>,
+    columns: &[Option<Bytes>],
+) -> Result<Vec<Value>> {
+    let mut row = Vec::with_capacity(plan.sources.len());
+    for source in &plan.sources {
+        match source {
+            ProjectedFieldSource::Key(key_index) => {
+                row.push(key_values.expect("projection decoded key fields")[*key_index].clone());
+            }
+            ProjectedFieldSource::Value {
+                projected_column,
+                physical_column,
+            } => {
+                let value = columns
+                    .get(*projected_column)
+                    .and_then(|value| value.as_ref())
+                    .ok_or_else(|| TableError::codec("table row is missing a value column"))?;
+                row.push(ValueCodec::decode_bytes_validated(
+                    &compiled.value_types[*physical_column],
+                    value.clone(),
+                )?);
+            }
+        }
+    }
     Ok(row)
 }
 
