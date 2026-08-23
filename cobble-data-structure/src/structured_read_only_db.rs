@@ -94,7 +94,7 @@ impl StructuredReadOnlyDb {
             .transpose()
     }
 
-    pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<StructuredDbIterator<'static>> {
+    pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<StructuredDbIterator> {
         self.scan_with_options(bucket, range, &self.default_scan_options)
     }
 
@@ -103,7 +103,7 @@ impl StructuredReadOnlyDb {
         bucket: u16,
         range: Range<&[u8]>,
         options: &StructuredScanOptions,
-    ) -> Result<StructuredDbIterator<'static>> {
+    ) -> Result<StructuredDbIterator> {
         let inner = self
             .db
             .scan_with_options(bucket, range, options.as_cobble())?;

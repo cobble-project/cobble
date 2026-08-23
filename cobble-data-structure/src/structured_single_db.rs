@@ -345,20 +345,16 @@ impl StructuredSingleDb {
             .transpose()
     }
 
-    pub fn scan<'a>(
-        &'a self,
-        bucket: u16,
-        range: Range<&[u8]>,
-    ) -> Result<StructuredDbIterator<'a>> {
+    pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<StructuredDbIterator> {
         self.scan_with_options(bucket, range, &self.default_scan_options)
     }
 
-    pub fn scan_with_options<'a>(
-        &'a self,
+    pub fn scan_with_options(
+        &self,
         bucket: u16,
         range: Range<&[u8]>,
         options: &StructuredScanOptions,
-    ) -> Result<StructuredDbIterator<'a>> {
+    ) -> Result<StructuredDbIterator> {
         let inner = self
             .db
             .scan_with_options(bucket, range, options.as_cobble())?;
@@ -366,13 +362,13 @@ impl StructuredSingleDb {
         Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
-    pub fn scan_raw_bounds<'a>(
-        &'a self,
+    pub fn scan_raw_bounds(
+        &self,
         bucket: u16,
         start_key_inclusive: Option<&[u8]>,
         end_key_exclusive: Option<&[u8]>,
         options: &StructuredScanOptions,
-    ) -> Result<DbIterator<'a>> {
+    ) -> Result<DbIterator> {
         self.db.db().scan_with_options_bounds(
             bucket,
             start_key_inclusive,

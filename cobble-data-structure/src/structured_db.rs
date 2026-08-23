@@ -1584,20 +1584,16 @@ impl StructuredDb {
             .transpose()
     }
 
-    pub fn scan<'a>(
-        &'a self,
-        bucket: u16,
-        range: Range<&[u8]>,
-    ) -> Result<StructuredDbIterator<'a>> {
+    pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<StructuredDbIterator> {
         self.scan_with_options(bucket, range, &self.default_scan_options)
     }
 
-    pub fn scan_with_options<'a>(
-        &'a self,
+    pub fn scan_with_options(
+        &self,
         bucket: u16,
         range: Range<&[u8]>,
         options: &StructuredScanOptions,
-    ) -> Result<StructuredDbIterator<'a>> {
+    ) -> Result<StructuredDbIterator> {
         let inner = self
             .db
             .scan_with_options(bucket, range, options.as_cobble())?;
@@ -1605,12 +1601,12 @@ impl StructuredDb {
         Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
-    pub fn scan_bounds<'a>(
-        &'a self,
+    pub fn scan_bounds(
+        &self,
         bucket: u16,
         start_key_inclusive: Option<&[u8]>,
         end_key_exclusive: Option<&[u8]>,
-    ) -> Result<StructuredDbIterator<'a>> {
+    ) -> Result<StructuredDbIterator> {
         self.scan_with_options_bounds(
             bucket,
             start_key_inclusive,
@@ -1619,13 +1615,13 @@ impl StructuredDb {
         )
     }
 
-    pub fn scan_with_options_bounds<'a>(
-        &'a self,
+    pub fn scan_with_options_bounds(
+        &self,
         bucket: u16,
         start_key_inclusive: Option<&[u8]>,
         end_key_exclusive: Option<&[u8]>,
         options: &StructuredScanOptions,
-    ) -> Result<StructuredDbIterator<'a>> {
+    ) -> Result<StructuredDbIterator> {
         let inner = self.db.scan_with_options_bounds(
             bucket,
             start_key_inclusive,
@@ -1705,23 +1701,23 @@ impl StructuredDb {
         self.db.get_with_options(bucket, key, options.as_cobble())
     }
 
-    pub fn scan_raw<'a>(
-        &'a self,
+    pub fn scan_raw(
+        &self,
         bucket: u16,
         range: Range<&[u8]>,
         options: &StructuredScanOptions,
-    ) -> Result<DbIterator<'a>> {
+    ) -> Result<DbIterator> {
         self.db
             .scan_with_options(bucket, range, options.as_cobble())
     }
 
-    pub fn scan_raw_bounds<'a>(
-        &'a self,
+    pub fn scan_raw_bounds(
+        &self,
         bucket: u16,
         start_key_inclusive: Option<&[u8]>,
         end_key_exclusive: Option<&[u8]>,
         options: &StructuredScanOptions,
-    ) -> Result<DbIterator<'a>> {
+    ) -> Result<DbIterator> {
         self.db.scan_with_options_bounds(
             bucket,
             start_key_inclusive,
@@ -1777,15 +1773,15 @@ pub type DataStructureDb = StructuredDb;
 
 // ── StructuredDbIterator ────────────────────────────────────────────────────
 
-pub struct StructuredDbIterator<'a> {
-    inner: DbIterator<'a>,
+pub struct StructuredDbIterator {
+    inner: DbIterator,
     structured_schema: Arc<StructuredColumnFamilySchema>,
     now_seconds: u32,
 }
 
-impl<'a> StructuredDbIterator<'a> {
+impl StructuredDbIterator {
     pub(crate) fn new(
-        inner: DbIterator<'a>,
+        inner: DbIterator,
         structured_schema: Arc<StructuredColumnFamilySchema>,
         now_seconds: u32,
     ) -> Self {
@@ -1822,7 +1818,7 @@ impl<'a> StructuredDbIterator<'a> {
     }
 }
 
-impl Iterator for StructuredDbIterator<'_> {
+impl Iterator for StructuredDbIterator {
     type Item = Result<(Bytes, Vec<Option<StructuredColumnValue>>)>;
 
     fn next(&mut self) -> Option<Self::Item> {

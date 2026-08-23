@@ -100,11 +100,7 @@ impl StructuredReader {
             .transpose()
     }
 
-    pub fn scan(
-        &mut self,
-        bucket_id: u16,
-        range: Range<&[u8]>,
-    ) -> Result<StructuredDbIterator<'static>> {
+    pub fn scan(&mut self, bucket_id: u16, range: Range<&[u8]>) -> Result<StructuredDbIterator> {
         let default_options = self.default_scan_options.clone();
         self.scan_with_options(bucket_id, range, &default_options)
     }
@@ -114,7 +110,7 @@ impl StructuredReader {
         bucket_id: u16,
         range: Range<&[u8]>,
         options: &StructuredScanOptions,
-    ) -> Result<StructuredDbIterator<'static>> {
+    ) -> Result<StructuredDbIterator> {
         let inner = self
             .reader
             .scan_with_options(bucket_id, range, options.as_cobble())?;

@@ -219,11 +219,11 @@ impl<'a> PriorityQueue<'a> {
         Ok(rows)
     }
 
-    fn scan_raw_bounds<'b>(
-        &'b self,
+    fn scan_raw_bounds(
+        &self,
         bucket: u16,
         scan_options: &StructuredScanOptions,
-    ) -> Result<DbIterator<'b>> {
+    ) -> Result<DbIterator> {
         match self.backend {
             PriorityQueueBackend::StructuredDb(db) => {
                 db.scan_raw_bounds(bucket, None, None, scan_options)
