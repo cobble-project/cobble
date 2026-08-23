@@ -4,4 +4,3 @@ fn main() {
         .compile("cobble-cpp-bridge");
     println!("cargo:rerun-if-changed=src/lib.rs");
 }
-
