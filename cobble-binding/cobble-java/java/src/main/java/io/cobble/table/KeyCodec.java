@@ -38,6 +38,61 @@ public final class KeyCodec {
         }
     }
 
+    static int encodeToWithPrefix(
+            List<LogicalType> types, List<Value> values, int prefixFields, ByteBuffer out) {
+        int start = out.position();
+        try {
+            if (types.size() != values.size())
+                throw new IllegalArgumentException("key field count does not match value count");
+            if (prefixFields < 0 || prefixFields > types.size())
+                throw new IllegalArgumentException("invalid key prefix field count");
+            int prefixEnd = start;
+            for (int i = 0; i < types.size(); i++) {
+                encodeTo(types.get(i), values.get(i), out);
+                if (i + 1 == prefixFields) prefixEnd = out.position();
+            }
+            return prefixEnd;
+        } catch (RuntimeException | Error error) {
+            ((Buffer) out).position(start);
+            throw error;
+        }
+    }
+
+    static int encodedSizeFromPositions(List<LogicalType> types, List<Value> row, int[] positions) {
+        assert types.size() == positions.length;
+        int size = 0;
+        for (int i = 0; i < positions.length; i++) {
+            int position = positions[i];
+            assert position >= 0 && position < row.size();
+            size = checkedAdd(size, encodedSize(types.get(i), row.get(position)));
+        }
+        return size;
+    }
+
+    static int encodeFromPositionsToWithPrefix(
+            List<LogicalType> types,
+            List<Value> row,
+            int[] positions,
+            int prefixFields,
+            ByteBuffer out) {
+        int start = out.position();
+        try {
+            assert types.size() == positions.length;
+            assert prefixFields >= 0 && prefixFields <= positions.length;
+            int prefixEnd = start;
+            for (int i = 0; i < positions.length; i++) {
+                int position = positions[i];
+                assert position >= 0 && position < row.size();
+                encodeTo(types.get(i), row.get(position), out);
+                if (i + 1 == prefixFields) prefixEnd = out.position();
+            }
+            return prefixEnd;
+        } catch (RuntimeException | Error error) {
+            ((Buffer) out).position(start);
+            throw error;
+        }
+    }
+
     public static void encodeTo(LogicalType type, Value value, ByteBuffer out) {
         int start = out.position();
         try {

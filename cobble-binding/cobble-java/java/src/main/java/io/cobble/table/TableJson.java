@@ -29,6 +29,13 @@ final class TableJson {
         return metadataFromObject(object(json));
     }
 
+    static Table.OpenInfo openInfoFromJson(String json) {
+        JsonObject value = object(json);
+        return new Table.OpenInfo(
+                schemaFromObject(requiredObject(value, "schema")),
+                requiredInt(value, "total_buckets"));
+    }
+
     private static JsonObject schemaObject(TableSchema schema) {
         JsonObject object = new JsonObject();
         object.add("fields", fieldsObject(schema.fields()));

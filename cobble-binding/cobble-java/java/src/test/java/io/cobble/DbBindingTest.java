@@ -2,6 +2,14 @@ package io.cobble;
 
 import io.cobble.structured.ColumnValue;
 import io.cobble.structured.Row;
+import io.cobble.table.DataField;
+import io.cobble.table.DirectTableRow;
+import io.cobble.table.LogicalTypes;
+import io.cobble.table.RecordType;
+import io.cobble.table.Table;
+import io.cobble.table.TableScanCursor;
+import io.cobble.table.TableSchema;
+import io.cobble.table.Value;
 
 import org.junit.jupiter.api.Test;
 
@@ -23,6 +31,100 @@ import java.util.concurrent.ExecutionException;
 import static org.junit.jupiter.api.Assertions.*;
 
 class DbBindingTest {
+
+    @Test
+    void tableApiUsesLocalCodecsAndRawJniRows() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-table-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(8);
+        TableSchema schema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1, "tenant", LogicalTypes.string()),
+                                new DataField(2, "id", LogicalTypes.int64()),
+                                new DataField(3, "payload", LogicalTypes.binary()),
+                                new DataField(
+                                        4,
+                                        "nested",
+                                        LogicalTypes.struct(
+                                                new RecordType(
+                                                        Collections.singletonList(
+                                                                new DataField(
+                                                                        5,
+                                                                        "blob",
+                                                                        LogicalTypes.binary()
+                                                                                .nullable()))))),
+                                new DataField(6, "note", LogicalTypes.string().nullable())),
+                        Arrays.asList(1L, 2L),
+                        Collections.singletonList(1L));
+        List<Value> row1 =
+                Arrays.asList(
+                        Value.string("tenant-a"),
+                        Value.int64(1),
+                        Value.binary(new byte[] {1, 2, 3}),
+                        Value.struct(Collections.singletonList(Value.binary(new byte[] {4, 5}))),
+                        Value.nullValue());
+        List<Value> row2 =
+                Arrays.asList(
+                        Value.string("tenant-a"),
+                        Value.int64(2),
+                        Value.binary(new byte[] {6, 7}),
+                        Value.struct(Collections.singletonList(Value.nullValue())),
+                        Value.string("second"));
+        List<Value> row3 =
+                Arrays.asList(
+                        Value.string("tenant-a"),
+                        Value.int64(3),
+                        Value.binary(new byte[] {8, 9}),
+                        Value.struct(Collections.singletonList(Value.binary(new byte[] {10}))),
+                        Value.string("direct"));
+        List<Value> key1 = Arrays.asList(row1.get(0), row1.get(1));
+        List<Value> key2 = Arrays.asList(row2.get(0), row2.get(1));
+        List<Value> key3 = Arrays.asList(row3.get(0), row3.get(1));
+        List<Value> missing = Arrays.asList(Value.string("tenant-a"), Value.int64(99));
+
+        try (Db db = Db.open(config);
+                Table table = Table.create(db, "events", schema);
+                Table reopened = Table.open(db, "events")) {
+            assertEquals(schema, reopened.schema());
+            table.put(row1);
+            table.put(row2);
+
+            ByteBuffer directKey = ByteBuffer.allocateDirect(256);
+            ByteBuffer directRow = ByteBuffer.allocateDirect(512);
+            table.putDirect(row3, directKey, directRow);
+            assertEquals(row1, table.get(key1));
+            assertEquals(
+                    Arrays.asList(row2, row1, row2, null),
+                    table.multiGet(Arrays.asList(key2, key1, key2, missing)));
+            assertEquals(table.bucketForKey(key1), table.bucketForKey(key2));
+            assertEquals(row1, reopened.get(key1));
+
+            List<List<Value>> scanned = new ArrayList<List<Value>>();
+            try (TableScanCursor cursor =
+                    table.scanBounds(table.bucketForKey(key1), key1, missing)) {
+                for (List<Value> row : cursor) scanned.add(row);
+            }
+            assertEquals(Arrays.asList(row1, row2, row3), scanned);
+            assertEquals(row1, scanned.get(0));
+
+            try (DirectTableRow direct = table.getDirect(key3, directKey)) {
+                assertNotNull(direct);
+                assertEquals(row3, direct.values());
+            }
+
+            TableSchema keySchema =
+                    new TableSchema(
+                            Collections.singletonList(
+                                    new DataField(11, "key", LogicalTypes.int64())),
+                            Collections.singletonList(11L),
+                            Collections.singletonList(11L));
+            try (Table keys = Table.create(db, "keys", keySchema)) {
+                List<Value> keyOnly = Collections.singletonList(Value.int64(7));
+                keys.put(keyOnly);
+                assertEquals(keyOnly, keys.get(keyOnly));
+            }
+        }
+    }
 
     @Test
     void readonlyLoadTriggerIsExposedOnDb() throws IOException {

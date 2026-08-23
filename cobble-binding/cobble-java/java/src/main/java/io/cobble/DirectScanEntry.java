@@ -8,11 +8,24 @@ public final class DirectScanEntry {
     private final int bucket;
     private final ByteBuffer key;
     private final DirectEncodedRow row;
+    private final ByteBuffer encoded;
+    private final int rowOffset;
+    private final int rowLength;
+    private DirectColumns columns;
 
-    DirectScanEntry(int bucket, ByteBuffer key, DirectEncodedRow row) {
+    DirectScanEntry(
+            int bucket,
+            ByteBuffer key,
+            DirectEncodedRow row,
+            ByteBuffer encoded,
+            int rowOffset,
+            int rowLength) {
         this.bucket = bucket;
         this.key = key;
         this.row = row;
+        this.encoded = encoded;
+        this.rowOffset = rowOffset;
+        this.rowLength = rowLength;
     }
 
     static DirectScanEntry decode(ByteBuffer encoded, int encodedLength) {
@@ -36,7 +49,10 @@ public final class DirectScanEntry {
         return new DirectScanEntry(
                 bucket,
                 DirectIoUtils.slice(encoded, keyOffset, keyLength, "direct scan row"),
-                new DirectEncodedRow(address + rowOffset, rowLength, null));
+                new DirectEncodedRow(address + rowOffset, rowLength, null),
+                encoded,
+                rowOffset,
+                rowLength);
     }
 
     /** Returns the scanned bucket id, or {@code -1} when unavailable. */
@@ -46,6 +62,22 @@ public final class DirectScanEntry {
 
     public ByteBuffer getKey() {
         return key.duplicate();
+    }
+
+    /**
+     * Returns zero-copy physical columns for this encoded row.
+     *
+     * <p>The view is valid only until its scan cursor advances or closes. Closing this no-op view
+     * is optional; it does not extend the row lifetime.
+     */
+    public DirectColumns columnsView() {
+        if (columns == null)
+            columns =
+                    DirectColumns.decode(
+                            DirectIoUtils.slice(encoded, rowOffset, rowLength, "direct scan row"),
+                            rowLength,
+                            null);
+        return columns;
     }
 
     public int size() {

@@ -32,6 +32,7 @@ storage-sftp = ["cobble-binding/storage-sftp"]
 
 [dependencies]
 cobble-binding = { workspace = true }
+cobble-table = { workspace = true }
 bytes = { workspace = true }
 jni = "0.21"
 serde = { workspace = true, features = ["derive"] }

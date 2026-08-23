@@ -67,6 +67,13 @@ class TableCodecTest {
         assertEquals(fixture.get("value_hex").getAsString(), hex(encoded));
         Value decoded = ValueCodec.decode(type, direct);
         assertEquals(value, decoded);
+        ByteBuffer ownedInput = ByteBuffer.allocateDirect(encoded.length);
+        ownedInput.put(encoded);
+        ((Buffer) ownedInput).flip();
+        Value owned = ValueCodec.decodeOwned(type, ownedInput);
+        ((Buffer) ownedInput).clear();
+        while (ownedInput.hasRemaining()) ownedInput.put((byte) 0);
+        assertEquals(value, owned);
         List<LogicalType> orderedTypes =
                 Arrays.asList(
                         LogicalTypes.int8(),

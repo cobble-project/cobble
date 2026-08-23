@@ -320,18 +320,11 @@ pub(crate) fn decode_multi_get_keys<'local>(
 ///
 /// Format: `i32 num_keys`, then per key: `i32 bucket`, `i32 key_length`, `key_bytes`.
 ///
-/// # Safety
-///
-/// The caller must ensure `addr` points to at least `capacity` readable bytes.
-pub(crate) fn decode_packed_multi_get_keys(
-    addr: *const u8,
-    capacity: usize,
-) -> Result<Vec<(u16, Vec<u8>)>, String> {
+pub(crate) fn decode_packed_multi_get_keys(buf: &[u8]) -> Result<Vec<(u16, &[u8])>, String> {
+    let capacity = buf.len();
     if capacity < 4 {
         return Err("IO buffer too small for multi-get key header".to_string());
     }
-    // SAFETY: caller guarantees `addr..addr+capacity` is valid.
-    let buf = unsafe { std::slice::from_raw_parts(addr, capacity) };
     let num_keys = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     // Reject malformed headers before allocating. Each key needs at least 8 bytes
     // (i32 bucket + i32 key_length) in addition to the 4-byte count prefix.
@@ -375,7 +368,7 @@ pub(crate) fn decode_packed_multi_get_keys(
         {
             return Err(format!("IO buffer too small for multi-get key {} bytes", i));
         }
-        let key = buf[offset..offset + key_len].to_vec();
+        let key = &buf[offset..offset + key_len];
         offset += key_len;
         keys.push((bucket as u16, key));
     }

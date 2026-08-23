@@ -25,5 +25,6 @@ mod structured_scan_options;
 mod structured_single_db;
 mod structured_write_batch;
 mod structured_write_options;
+mod table;
 mod util;
 mod write_options;

@@ -34,7 +34,14 @@ public final class ValueCodec {
     }
 
     public static Value decode(LogicalType type, ByteBuffer input) {
-        Value value = decodeValue(type, input);
+        Value value = decodeValue(type, input, false);
+        if (input.hasRemaining()) throw new IllegalArgumentException("trailing value bytes");
+        return value;
+    }
+
+    /** Decodes a value while copying every binary leaf out of the input buffer. */
+    public static Value decodeOwned(LogicalType type, ByteBuffer input) {
+        Value value = decodeValue(type, input, true);
         if (input.hasRemaining()) throw new IllegalArgumentException("trailing value bytes");
         return value;
     }
@@ -164,8 +171,8 @@ public final class ValueCodec {
         }
     }
 
-    private static Value decodeValue(LogicalType type, ByteBuffer input) {
-        if (!type.isNullable()) return decodeNonNull(type, input);
+    private static Value decodeValue(LogicalType type, ByteBuffer input, boolean ownedBinary) {
+        if (!type.isNullable()) return decodeNonNull(type, input, ownedBinary);
         KeyCodec.requireRemaining(input, 1);
         byte marker = input.get();
         if (marker == 0) {
@@ -173,10 +180,10 @@ public final class ValueCodec {
             return Value.nullValue();
         }
         if (marker != 1) throw new IllegalArgumentException("invalid nullable marker");
-        return decodeNonNull(type, input);
+        return decodeNonNull(type, input, ownedBinary);
     }
 
-    private static Value decodeNonNull(LogicalType type, ByteBuffer input) {
+    private static Value decodeNonNull(LogicalType type, ByteBuffer input, boolean ownedBinary) {
         switch (type.kind()) {
             case BOOLEAN:
                 return Value.bool(readBoolExact(input));
@@ -255,6 +262,11 @@ public final class ValueCodec {
                 return Value.string(readUtf8(input));
             case BINARY:
                 {
+                    if (ownedBinary) {
+                        byte[] bytes = new byte[input.remaining()];
+                        input.get(bytes);
+                        return Value.binary(ByteBuffer.wrap(bytes));
+                    }
                     ByteBuffer slice = input.asReadOnlyBuffer().slice();
                     ((Buffer) input).position(input.limit());
                     return Value.binary(slice);
@@ -266,7 +278,7 @@ public final class ValueCodec {
                         throw new IllegalArgumentException("list count exceeds encoded frames");
                     List<Value> values = new ArrayList<Value>(count);
                     for (int i = 0; i < count; i++)
-                        values.add(readFramed(list(type).elementType(), input));
+                        values.add(readFramed(list(type).elementType(), input, ownedBinary));
                     return finish(input, Value.list(values));
                 }
             case MAP:
@@ -279,8 +291,8 @@ public final class ValueCodec {
                     for (int i = 0; i < count; i++)
                         entries.add(
                                 new AbstractMap.SimpleImmutableEntry<Value, Value>(
-                                        readFramed(map(type).keyType(), input),
-                                        readFramed(map(type).valueType(), input)));
+                                        readFramed(map(type).keyType(), input, ownedBinary),
+                                        readFramed(map(type).valueType(), input, ownedBinary)));
                     return finish(input, Value.map(entries));
                 }
             case STRUCT:
@@ -288,13 +300,13 @@ public final class ValueCodec {
                     List<Value> values =
                             new ArrayList<Value>(struct(type).recordType().fields().size());
                     for (DataField field : struct(type).recordType().fields())
-                        values.add(readFramed(field.logicalType(), input));
+                        values.add(readFramed(field.logicalType(), input, ownedBinary));
                     return finish(input, Value.struct(values));
                 }
             case EXTENSION:
                 return Value.extension(
                         extension(type).typeId(),
-                        decodeValue(extension(type).physicalType(), input));
+                        decodeValue(extension(type).physicalType(), input, ownedBinary));
             default:
                 throw new AssertionError(type.kind());
         }
@@ -479,14 +491,14 @@ public final class ValueCodec {
         encodeValue(type, value, out);
     }
 
-    private static Value readFramed(LogicalType type, ByteBuffer input) {
+    private static Value readFramed(LogicalType type, ByteBuffer input, boolean ownedBinary) {
         int length = getU32Le(input);
         if (length < 0) throw new IllegalArgumentException("nested value length exceeds i32");
         KeyCodec.requireRemaining(input, length);
         ByteBuffer child = input.slice();
         ((Buffer) child).limit(length);
         ((Buffer) input).position(input.position() + length);
-        return decode(type, child);
+        return ownedBinary ? decodeOwned(type, child) : decode(type, child);
     }
 
     private static int getCount(ByteBuffer input) {

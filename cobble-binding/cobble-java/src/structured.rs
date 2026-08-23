@@ -2460,7 +2460,9 @@ pub extern "system" fn Java_io_cobble_structured_Db_multiGetEncodedDirectWithOpt
             return 0;
         }
     };
-    let keys_vec = match decode_packed_multi_get_keys(direct_addr, io_capacity) {
+    // SAFETY: the Java direct buffer address remains valid for this native call.
+    let input = unsafe { std::slice::from_raw_parts(direct_addr, io_capacity) };
+    let keys_vec = match decode_packed_multi_get_keys(input) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
@@ -2482,6 +2484,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_multiGetEncodedDirectWithOpt
             return 0;
         }
     };
+    drop(keys_vec);
     let encoded = match encode_multi_get_structured_payload(&results) {
         Ok(v) => v,
         Err(err) => {

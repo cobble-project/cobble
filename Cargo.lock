@@ -689,6 +689,7 @@ version = "0.5.0"
 dependencies = [
  "bytes",
  "cobble-binding",
+ "cobble-table",
  "jni 0.21.1",
  "serde",
  "serde_json",
