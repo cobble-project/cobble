@@ -42,9 +42,10 @@ let db = Db::open_from_snapshot_with_recovery_mode(
 )?;
 ```
 
-`Db::resume` defaults to `LatestWithWal`, while `Db::open_from_snapshot` and `SingleDb::resume`
-default to `SnapshotOnly`. Their `*_with_recovery_mode` variants let the caller choose explicitly.
-This choice is independent of whether WAL is enabled for new writes in the current configuration.
+`Db::resume` defaults to `LatestWithWal`, while `Db::resume_from_snapshot`,
+`Db::open_from_snapshot`, and `SingleDb::resume` default to `SnapshotOnly`. Their
+`*_with_recovery_mode` variants let the caller choose explicitly. This choice is independent of
+whether WAL is enabled for new writes in the current configuration.
 
 The snapshot manifest records the WAL checkpoint and storage route used for replay. Recovery uses
 that recorded route even if the current configuration selects a different WAL volume for new
@@ -52,3 +53,11 @@ writes. Storage credentials are not persisted and must still be supplied by the 
 
 WAL replay does not create a snapshot. The next normal snapshot includes the recovered writes and,
 after successful publication, removes WAL segments that are no longer needed.
+
+## Limitation: Active Snapshot Switch
+
+A historical active switch does not truncate or fork WAL. This keeps the latest snapshot and its
+WAL tail recoverable, but writes made after the switch do not form an independently recoverable
+branch based on the historical snapshot. See
+[Active Snapshot Switch](snapshot#active-snapshot-switch) for the complete lifecycle and recovery
+semantics.

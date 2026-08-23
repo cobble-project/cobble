@@ -106,6 +106,46 @@ fn test_multi_lsm_rejects_overlap_in_same_column_family() {
     ));
 }
 
+#[test]
+fn test_store_advances_sequence_allocator_past_restored_state() {
+    let handle = DbStateHandle::new();
+    let current = handle.load();
+    handle.store(DbState {
+        seq_id: 41,
+        topology_epoch: current.topology_epoch,
+        bucket_ranges: current.bucket_ranges.clone(),
+        multi_lsm_version: current.multi_lsm_version.clone(),
+        vlog_version: current.vlog_version.clone(),
+        active: current.active.clone(),
+        immutables: current.immutables.clone(),
+        truncation_cursors: current.truncation_cursors.clone(),
+        suggested_base_snapshot_id: current.suggested_base_snapshot_id,
+    });
+
+    assert_eq!(handle.load().seq_id, 41);
+    assert_eq!(handle.allocate_seq_id(), 42);
+
+    // Storing a lower sequence later must not move the allocator backwards.
+    let current = handle.load();
+    handle.store(DbState {
+        seq_id: 7,
+        topology_epoch: current.topology_epoch,
+        bucket_ranges: current.bucket_ranges.clone(),
+        multi_lsm_version: current.multi_lsm_version.clone(),
+        vlog_version: current.vlog_version.clone(),
+        active: current.active.clone(),
+        immutables: current.immutables.clone(),
+        truncation_cursors: current.truncation_cursors.clone(),
+        suggested_base_snapshot_id: current.suggested_base_snapshot_id,
+    });
+    assert_eq!(handle.allocate_seq_id(), 43);
+
+    handle.advance_next_seq_id(100);
+    assert_eq!(handle.allocate_seq_id(), 100);
+    handle.advance_next_seq_id(50);
+    assert_eq!(handle.allocate_seq_id(), 101);
+}
+
 impl MultiLSMTreeVersion {
     pub(crate) fn from_parts(
         total_buckets: u32,

@@ -281,6 +281,45 @@ fn test_failed_snapshot_completes_callback_and_releases_snapshot() {
 
 #[test]
 #[serial(file)]
+fn test_zero_snapshot_retention_fails_before_db_runtime_start() {
+    let root = "/tmp/db_zero_snapshot_retention";
+    cleanup_test_root(root);
+    let db_id = "zero-snapshot-retention";
+    let mut invalid = config_with_small_memtable(root);
+    invalid.snapshot_retention = Some(0);
+    let total_buckets = invalid.total_buckets;
+    let error = match DbBuilder::new(invalid)
+        .db_id(db_id)
+        .bucket_ranges(vec![full_bucket_range(total_buckets)])
+        .open()
+    {
+        Ok(db) => {
+            db.close().unwrap();
+            panic!("zero snapshot retention unexpectedly opened a DB")
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(error, Error::ConfigError(_)));
+    assert!(error.to_string().contains("snapshot_retention"));
+    assert!(
+        !std::path::Path::new(root).join(db_id).exists(),
+        "invalid retention must fail before the DB runtime creates its root"
+    );
+
+    let mut valid = config_with_small_memtable(root);
+    valid.snapshot_retention = Some(1);
+    let total_buckets = valid.total_buckets;
+    let db = DbBuilder::new(valid)
+        .db_id(db_id)
+        .bucket_ranges(vec![full_bucket_range(total_buckets)])
+        .open()
+        .expect("retention of one snapshot is valid");
+    db.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
 fn test_snapshot_callback_completes_when_flush_worker_is_unavailable() {
     let root = "/tmp/db_snapshot_flush_worker_unavailable";
     cleanup_test_root(root);
@@ -1091,6 +1130,106 @@ fn test_db_builder_uses_custom_governance() {
         &["db-builder-governed".to_string()]
     );
     drop(unregister_calls);
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn test_switch_to_snapshot_reregisters_existing_governance() {
+    let root = "/tmp/db_switch_snapshot_governance";
+    cleanup_test_root(root);
+    let mut config = config_with_small_memtable(root);
+    config.active_memtable_incremental_snapshot_ratio = 0.0;
+    config.snapshot_on_flush = false;
+    config.value_separation_threshold = Some(Size::from_const(1));
+    let total_buckets = config.total_buckets;
+    let ranges = vec![full_bucket_range(total_buckets)];
+    let governance = Arc::new(RecordingGovernance::default());
+    let mut db = DbBuilder::new(config)
+        .db_id("db-switch-governed")
+        .bucket_ranges(ranges.clone())
+        .governance(Arc::clone(&governance) as Arc<dyn DbGovernance>)
+        .open()
+        .unwrap();
+    let snapshot_and_wait = |db: &Db| {
+        let (tx, rx) = mpsc::channel();
+        let snapshot_id = db
+            .snapshot_with_callback(move |result| tx.send(result).unwrap())
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("snapshot callback")
+            .unwrap();
+        snapshot_id
+    };
+    let separated_value = vec![b'x'; 96];
+    db.put(0, b"before", 0, &separated_value).unwrap();
+    let first_snapshot_id = snapshot_and_wait(&db);
+    db.put(0, b"after", 0, &separated_value).unwrap();
+    let _ = snapshot_and_wait(&db);
+    db.put(0, b"uncheckpointed", 0, &separated_value).unwrap();
+    db.memtable_manager.flush_active().unwrap();
+    assert!(
+        db.memtable_manager
+            .wait_for_flushes()
+            .into_iter()
+            .all(|result| result.is_ok())
+    );
+    let old_next_file_id = db.file_manager.peek_next_file_id();
+    let old_next_vlog_file_seq = db.vlog_store.next_file_seq();
+    let old_next_state_seq_id = db.db_state.next_seq_id();
+
+    let first_manifest = load_manifest_for_snapshot(&db.file_manager, first_snapshot_id).unwrap();
+    let target_file_ids = crate::snapshot::manifest::manifest_data_file_refs(&first_manifest)
+        .map(|(file_id, _, _)| file_id)
+        .collect::<Vec<_>>();
+    assert!(!target_file_ids.is_empty());
+    assert!(
+        target_file_ids
+            .iter()
+            .all(|file_id| db.file_manager.has_data_file(*file_id))
+    );
+    db.preflight_switch_to_snapshot(first_snapshot_id, None)
+        .unwrap();
+    assert!(
+        target_file_ids
+            .iter()
+            .all(|file_id| db.file_manager.has_data_file(*file_id)),
+        "preflight must not unregister active logical files"
+    );
+    assert!(db.get(0, b"before").unwrap().is_some());
+    assert!(db.get(0, b"after").unwrap().is_some());
+
+    db.switch_to_snapshot(first_snapshot_id).unwrap();
+    assert!(db.get(0, b"before").unwrap().is_some());
+    assert!(db.get(0, b"after").unwrap().is_none());
+    assert!(db.get(0, b"uncheckpointed").unwrap().is_none());
+    assert!(db.file_manager.peek_next_file_id() >= old_next_file_id);
+    assert!(db.vlog_store.next_file_seq() >= old_next_vlog_file_seq);
+    assert!(db.db_state.next_seq_id() >= old_next_state_seq_id);
+
+    db.put(0, b"post-switch-allocation", 0, &separated_value)
+        .unwrap();
+    db.memtable_manager.flush_active().unwrap();
+    assert!(
+        db.memtable_manager
+            .wait_for_flushes()
+            .into_iter()
+            .all(|result| result.is_ok())
+    );
+    assert!(db.file_manager.peek_next_file_id() > old_next_file_id);
+    assert!(db.vlog_store.next_file_seq() > old_next_vlog_file_seq);
+    assert!(db.db_state.next_seq_id() > old_next_state_seq_id);
+    {
+        let register_calls = governance.register_calls.lock().unwrap();
+        assert_eq!(register_calls.len(), 2);
+        assert_eq!(register_calls[1].0, "db-switch-governed");
+        assert_eq!(register_calls[1].1, ranges);
+        assert_eq!(register_calls[1].2, total_buckets);
+    }
+    assert_eq!(governance.unregister_calls.lock().unwrap().len(), 1);
+
+    db.close().unwrap();
+    assert_eq!(governance.unregister_calls.lock().unwrap().len(), 2);
     cleanup_test_root(root);
 }
 

@@ -1096,6 +1096,7 @@ pub(crate) struct HybridCacheVolumePlan {
 impl Config {
     pub(crate) fn normalize_volume_paths(&self) -> Result<Self> {
         self.validate_wal()?;
+        self.validate_snapshot_retention()?;
         let mut copied = self.clone();
         for volume in &mut copied.volumes {
             volume.base_dir = normalize_storage_path_to_url(&volume.base_dir)?;
@@ -1497,7 +1498,17 @@ impl Config {
             ));
         }
         self.validate_wal()?;
+        self.validate_snapshot_retention()?;
         self.validate_dedicated_compaction()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_snapshot_retention(&self) -> Result<()> {
+        if self.snapshot_retention == Some(0) {
+            return Err(Error::ConfigError(
+                "snapshot_retention must be greater than 0 when configured".to_string(),
+            ));
+        }
         Ok(())
     }
 

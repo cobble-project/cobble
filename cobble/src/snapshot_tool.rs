@@ -11,6 +11,8 @@ use std::sync::Arc;
 ///
 /// This helper always runs with noop governance to avoid affecting runtime
 /// ownership coordination when invoked out-of-band by lifecycle managers.
+/// Calls that mutate snapshot metadata for the same DB must be externally
+/// serialized across processes; this helper does not provide distributed fencing.
 pub fn prune_shard_snapshot(
     config: Config,
     db_id: impl Into<String>,

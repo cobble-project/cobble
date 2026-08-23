@@ -459,6 +459,15 @@ impl DbStateHandle {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(crate) fn advance_next_seq_id(&self, min_next_seq_id: u64) {
+        self.next_seq_id
+            .fetch_max(min_next_seq_id, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn next_seq_id(&self) -> u64 {
+        self.next_seq_id.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub(crate) fn load(&self) -> Arc<DbState> {
         self.current.load_full()
     }
@@ -617,6 +626,15 @@ impl DbStateHandle {
     }
 
     pub(crate) fn store(&self, new_version: DbState) {
+        // Publish the allocator advance before the state itself. A thread that observes the new
+        // state must never allocate its sequence id (or an older one), otherwise stale flush or
+        // compaction work could pass a CAS after restore. Advancing early may leave harmless gaps
+        // when stores race, while publishing the state first would allow ABA.
+        let min_next_seq_id = new_version
+            .seq_id
+            .checked_add(1)
+            .expect("DbState sequence id exhausted");
+        self.advance_next_seq_id(min_next_seq_id);
         self.current.store(Arc::new(new_version));
         self.changed.notify_all();
     }

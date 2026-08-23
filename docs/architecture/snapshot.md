@@ -52,3 +52,34 @@ However, this can be inefficient for workloads with small, frequent updates, as 
 To address this, Cobble offers an **incremental snapshot** option (`active_memtable_incremental_snapshot_ratio`) that includes the active memtable's contents directly in the snapshot if it's below a certain fill ratio. This avoids unnecessary flushes while still capturing recent writes in the snapshot.
 
 On restore, the serialized memtable data is replayed into the new active memtable, seamlessly continuing from where the snapshot left off.
+
+## Active Snapshot Switch
+
+`Db::switch_to_snapshot(snapshot_id)` switches a running database handle to an existing shard
+snapshot. It uses the normal restore path to rebuild the database runtime, including file tracking,
+schema state, WAL state, background workers, and governance registration. The operation must not
+run concurrently with `get` or `put` calls on the same handle.
+
+The target is validated before the current runtime is closed. A validation failure leaves the
+existing handle usable. Once close has started, a later restore failure leaves the old handle
+closed and the caller must recover it explicitly.
+
+The switch changes only the current runtime. It does not create a snapshot or persist the selected
+snapshot as the database's new default:
+
+- If snapshots `S1`, `S2`, and `S3` exist, switching to `S1` does not delete `S2` or `S3`.
+- Restarting with ordinary `Db::resume` still selects the greatest available snapshot, `S3`.
+- Restarting at `S1` again requires `Db::resume_from_snapshot(..., S1, ...)`.
+- The next successfully published snapshot receives an ID greater than every existing snapshot;
+  in this example it is `S4`, not a replacement for `S2` or `S3`.
+- Newer snapshots remain under the normal expiration and retention policy. Retention is applied
+  only after the new snapshot has been published successfully.
+
+The switch also does not truncate or fork the existing WAL. This keeps the `S3` recovery path
+available if the caller abandons the switch, but writes made after switching to `S1` do not form an
+independently recoverable `S1` WAL branch. Applications must account for this limitation before
+allowing writes between a historical switch and the next snapshot.
+
+Snapshot metadata changes for the same database, including active switch, snapshot publication,
+and pruning from another process, must be externally serialized. This version does not provide
+distributed fencing for concurrent cross-process snapshot writers.

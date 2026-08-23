@@ -35,7 +35,7 @@ use crate::r#type::{
 };
 use crate::vlog::{VlogEdit, VlogStore};
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
-use log::{debug, trace, warn};
+use log::{debug, trace};
 use metrics::{Counter, counter};
 use std::ops::{ControlFlow, Range};
 use std::time::Duration;
@@ -1523,19 +1523,13 @@ impl MemtableManager {
                 snapshot_job.wal_checkpoint_id,
                 snapshot_job.wal_volume.clone(),
             )
-        {
-            if let Err(err) = snapshot_job
+            && let Err(err) = snapshot_job
                 .manager
                 .schedule_materialize(snapshot_job.snapshot_id)
-            {
-                snapshot_job
-                    .manager
-                    .fail_snapshot(snapshot_job.snapshot_id, err);
-                return;
-            }
-            if let Err(err) = snapshot_job.manager.process_retention() {
-                warn!("failed to process snapshot retention: {}", err);
-            }
+        {
+            snapshot_job
+                .manager
+                .fail_snapshot(snapshot_job.snapshot_id, err);
         }
     }
 

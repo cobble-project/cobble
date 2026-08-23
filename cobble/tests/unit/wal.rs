@@ -416,6 +416,122 @@ fn wal_async_writes_snapshot_barriers_and_resume_replay() {
 }
 
 #[test]
+fn switch_to_historical_snapshot_does_not_replay_newer_wal_tail() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = format!("file://{}", temp.path().display());
+    let config = Config {
+        wal_enabled: true,
+        wal_flush_interval_ms: 1,
+        snapshot_on_flush: false,
+        volumes: vec![VolumeDescriptor::new(
+            root,
+            vec![
+                VolumeUsageKind::Meta,
+                VolumeUsageKind::PrimaryDataPriorityHigh,
+                VolumeUsageKind::Wal,
+            ],
+        )],
+        ..Config::default()
+    };
+    let db_id = "wal-active-snapshot-switch";
+    let mut db = DbBuilder::new(config.clone())
+        .bucket_ranges(vec![0..=0])
+        .db_id(db_id)
+        .open()
+        .unwrap();
+    let snapshot_and_wait = |db: &crate::Db| {
+        let (tx, rx) = mpsc::channel();
+        let snapshot_id = db
+            .snapshot_with_callback(move |result| tx.send(result).unwrap())
+            .unwrap();
+        rx.recv().unwrap().unwrap();
+        snapshot_id
+    };
+
+    db.put(0, b"historical", 0, b"historical-value").unwrap();
+    let historical_snapshot_id = snapshot_and_wait(&db);
+    db.put(0, b"newer-snapshot", 0, b"newer-value").unwrap();
+    let newer_snapshot_id = snapshot_and_wait(&db);
+    db.put(0, b"newer-wal-tail", 0, b"tail-value").unwrap();
+
+    let list_manifests = || {
+        let mut ids = std::fs::read_dir(temp.path().join(db_id).join("snapshot"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()?
+                    .strip_prefix("SNAPSHOT-")?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    let manifests_before_switch = list_manifests();
+    assert!(manifests_before_switch.contains(&historical_snapshot_id));
+    assert!(manifests_before_switch.contains(&newer_snapshot_id));
+    db.switch_to_snapshot(historical_snapshot_id).unwrap();
+    assert_eq!(
+        list_manifests(),
+        manifests_before_switch,
+        "switch must not publish a rollback snapshot"
+    );
+    assert!(db.get(0, b"historical").unwrap().is_some());
+    assert!(db.get(0, b"newer-snapshot").unwrap().is_none());
+    assert!(db.get(0, b"newer-wal-tail").unwrap().is_none());
+    db.close().unwrap();
+
+    let resumed = crate::Db::resume_from_snapshot(config, historical_snapshot_id, db_id).unwrap();
+    assert!(resumed.get(0, b"historical").unwrap().is_some());
+    assert!(resumed.get(0, b"newer-snapshot").unwrap().is_none());
+    assert!(resumed.get(0, b"newer-wal-tail").unwrap().is_none());
+    resumed.close().unwrap();
+}
+
+#[test]
+fn resume_from_latest_snapshot_defaults_to_exact_wal_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = format!("file://{}", temp.path().display());
+    let config = Config {
+        wal_enabled: true,
+        wal_flush_interval_ms: 1,
+        snapshot_on_flush: false,
+        volumes: vec![VolumeDescriptor::new(
+            root,
+            vec![
+                VolumeUsageKind::Meta,
+                VolumeUsageKind::PrimaryDataPriorityHigh,
+                VolumeUsageKind::Wal,
+            ],
+        )],
+        ..Config::default()
+    };
+    let db_id = "wal-latest-snapshot-switch";
+    let db = DbBuilder::new(config.clone())
+        .bucket_ranges(vec![0..=0])
+        .db_id(db_id)
+        .open()
+        .unwrap();
+    db.put(0, b"snapshotted", 0, b"snapshot-value").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let latest_snapshot_id = db
+        .snapshot_with_callback(move |result| tx.send(result).unwrap())
+        .unwrap();
+    rx.recv().unwrap().unwrap();
+    db.put(0, b"excluded-wal-tail", 0, b"tail-value").unwrap();
+
+    db.force_close();
+
+    let resumed = crate::Db::resume_from_snapshot(config, latest_snapshot_id, db_id).unwrap();
+    assert!(resumed.get(0, b"snapshotted").unwrap().is_some());
+    assert!(resumed.get(0, b"excluded-wal-tail").unwrap().is_none());
+    resumed.close().unwrap();
+}
+
+#[test]
 fn recovery_modes_control_wal_replay_without_creating_snapshots() {
     let temp = tempfile::tempdir().unwrap();
     let root = format!("file://{}", temp.path().display());
@@ -469,7 +585,7 @@ fn recovery_modes_control_wal_replay_without_creating_snapshots() {
     assert_eq!(manifests_before[1..], [old_snapshot_id, latest_snapshot_id]);
 
     // A non-latest selected snapshot never receives the tail, even when WAL replay is requested.
-    let historical = crate::Db::open_from_snapshot_with_recovery_mode(
+    let historical = crate::Db::resume_from_snapshot_with_recovery_mode(
         wal_config.clone(),
         old_snapshot_id,
         db_id,
@@ -497,7 +613,7 @@ fn recovery_modes_control_wal_replay_without_creating_snapshots() {
         ],
         ..wal_config.clone()
     };
-    let latest = crate::Db::open_from_snapshot_with_recovery_mode(
+    let latest = crate::Db::resume_from_snapshot_with_recovery_mode(
         route_change_config.clone(),
         latest_snapshot_id,
         db_id,

@@ -111,6 +111,9 @@ db.load_readonly_files_to_primary() -> Result<usize>
 
 ```rust
 Db::open(config, bucket_ranges) -> Result<Db>
+Db::resume(config, db_id) -> Result<Db>
+Db::resume_from_snapshot(config, snapshot_id, db_id) -> Result<Db>
+Db::resume_from_snapshot_with_recovery_mode(config, snapshot_id, db_id, recovery_mode) -> Result<Db>
 Db::open_from_snapshot(config, snapshot_id, db_id) -> Result<Db>
 Db::open_from_snapshot_with_recovery_mode(config, snapshot_id, db_id, recovery_mode) -> Result<Db>
 Db::resume_with_recovery_mode(config, db_id, recovery_mode) -> Result<Db>
@@ -131,6 +134,7 @@ read_only.scan_with_options(bucket, range, &scan_options) -> Result<DbIterator<'
 read_only.scan_with_options_bounds(bucket, start_key_inclusive, end_key_exclusive, &scan_options) -> Result<DbIterator<'static>>
 db.snapshot() -> Result<u64>
 db.snapshot_with_callback(callback) -> Result<u64>
+db.switch_to_snapshot(snapshot_id) -> Result<()>
 db.switch_memtable_type(memtable_type, flush_current) -> Result<()>
 db.cancel_snapshot(snapshot_id) -> Result<bool>
 db.expire_snapshot(snapshot_id) -> Result<bool>
@@ -148,6 +152,11 @@ exact source manifest path.
 
 Use `RecoveryMode::SnapshotOnly` for an exact snapshot restore or `RecoveryMode::LatestWithWal` to
 replay the latest snapshot's durable WAL tail. See [Write-Ahead Log](../architecture/wal).
+
+`switch_to_snapshot` is runtime-only until a later snapshot is published. It deliberately keeps
+the existing WAL tail so the latest state remains recoverable, but it does not create an isolated
+WAL branch for writes based on the historical snapshot. See
+[Active Snapshot Switch](../architecture/snapshot#active-snapshot-switch).
 
 Snapshot lifecycle notes:
 

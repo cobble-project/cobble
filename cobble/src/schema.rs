@@ -773,6 +773,18 @@ impl SchemaManager {
         self.latest_schema.load_full()
     }
 
+    /// Selects the writable schema for a restored historical state while retaining every loaded
+    /// schema version in the registry. `next_version` deliberately remains above the largest
+    /// loaded version so future schema ids cannot collide with snapshots that are still managed.
+    pub(crate) fn select_latest_schema_for_restore(&self, schema_id: u64) -> Result<()> {
+        self.latest_schema.store(self.schema(schema_id)?);
+        Ok(())
+    }
+
+    pub(crate) fn merge_operator_resolver(&self) -> Option<Arc<dyn MergeOperatorResolver>> {
+        self.resolver.as_ref().map(Arc::clone)
+    }
+
     pub(crate) fn current_num_columns(&self) -> usize {
         self.latest_schema.load().num_columns()
     }

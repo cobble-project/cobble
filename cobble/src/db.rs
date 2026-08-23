@@ -344,7 +344,7 @@ impl Db {
         let db_lifecycle = Arc::new(DbLifecycle::new_initializing());
         // Fresh open starts from an empty DbState, so bucket-range layout must be initialized here.
         db_state.configure_multi_lsm(config.total_buckets, &bucket_ranges)?;
-        let db = match Self::open_with_state(
+        let mut db = match Self::open_with_state(
             config,
             file_manager,
             db_state,
@@ -372,6 +372,7 @@ impl Db {
             db.force_close();
             return Err(err);
         }
+        db.start_dedicated_poller();
         Ok(db)
     }
 
@@ -1424,12 +1425,39 @@ impl Db {
         ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id)
     }
 
+    /// Starts result consumption only after the caller has finished constructing the complete
+    /// writable state. Restore paths deliberately call this after snapshot takeover, active
+    /// memtable restoration, and WAL replay so a persisted result cannot race startup.
+    fn start_dedicated_poller(&mut self) {
+        if self.config.compaction_mode != crate::config::CompactionMode::Dedicated
+            || self.dedicated_poller.is_some()
+        {
+            return;
+        }
+        self.dedicated_poller = Some(
+            crate::compaction::dedicated_poller::DedicatedCompactionPollerHandle::start(
+                Arc::clone(&self.file_manager),
+                Arc::clone(&self.lsm_tree),
+                self.snapshot_manager.clone(),
+                Arc::clone(&self.memtable_manager),
+                Arc::clone(&self.schema_manager),
+                Arc::clone(&self.db_lifecycle),
+                Arc::clone(&self.db_state),
+                self.runtime_manifest_publisher.as_ref().map(Arc::clone),
+                Arc::clone(&self.lsm_topology_lock),
+                Duration::from_millis(self.config.compaction_dedicated_poll_interval_ms),
+                self.config.clone(),
+            ),
+        );
+    }
+
     /// Initialize the Db runtime from a pre-loaded DbState.
     ///
     /// Sets up all runtime components: TTL provider, LSM tree with block
     /// cache and multi-LSM bucket mapping, compaction worker (local or
     /// remote), VLOG store, snapshot manager, and memtable manager with
-    /// flush/reclaim workers. Called by both fresh open and restore paths.
+    /// flush/reclaim workers. The dedicated result poller remains stopped until the caller has
+    /// finished fresh-open or restore initialization. Called by both fresh open and restore paths.
     #[allow(clippy::too_many_arguments)]
     fn open_with_state(
         config: Config,
@@ -1701,28 +1729,6 @@ impl Db {
             publisher.start();
         }
 
-        // Start the dedicated compaction result poller if in dedicated mode.
-        let dedicated_poller = if config.compaction_mode == crate::config::CompactionMode::Dedicated
-        {
-            let poller =
-                crate::compaction::dedicated_poller::DedicatedCompactionPollerHandle::start(
-                    Arc::clone(&file_manager),
-                    Arc::clone(&lsm_tree),
-                    snapshot_manager.clone(),
-                    Arc::clone(&memtable_manager),
-                    Arc::clone(&schema_manager),
-                    Arc::clone(&db_lifecycle),
-                    Arc::clone(&db_state),
-                    runtime_manifest_publisher.as_ref().map(Arc::clone),
-                    Arc::clone(&lsm_topology_lock),
-                    Duration::from_millis(config.compaction_dedicated_poll_interval_ms),
-                    config.clone(),
-                );
-            Some(poller)
-        } else {
-            None
-        };
-
         Ok(Self {
             id,
             db_governance,
@@ -1742,7 +1748,7 @@ impl Db {
             default_scan_options: ScanOptions::default(),
             time_provider,
             ttl_provider,
-            dedicated_poller,
+            dedicated_poller: None,
             primary_tiering_worker,
             adoption_coordinator,
             runtime_manifest_publisher,

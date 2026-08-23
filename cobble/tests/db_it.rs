@@ -55,6 +55,23 @@ fn wait_for_missing(path: &str) {
     assert!(!Path::new(path).exists(), "path still exists: {}", path);
 }
 
+fn local_snapshot_manifest_ids(root: &str, db_id: &str) -> Vec<u64> {
+    let mut ids = std::fs::read_dir(Path::new(root).join(db_id).join("snapshot"))
+        .expect("read snapshot directory")
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_prefix("SNAPSHOT-")?
+                .parse()
+                .ok()
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
 fn decode_u64_counter(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().expect("u64 counter bytes"))
 }
@@ -2250,6 +2267,362 @@ fn test_db_resume_takes_over_snapshot_lifecycle() {
     assert!(writable.expire_snapshot(snapshot_id).unwrap());
     wait_for_missing(&manifest_path);
     writable.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_resume_from_historical_snapshot_keeps_snapshot_lifecycle() {
+    let root = "/tmp/db_resume_from_historical_snapshot";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_const(128),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        total_buckets: 8,
+        block_cache_size: Size::from_const(0),
+        snapshot_on_flush: false,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config.clone());
+    db.put(0, b"base", 0, b"base-value").unwrap();
+    let base_snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), base_snapshot_id);
+
+    db.put(0, b"selected", 0, b"selected-value").unwrap();
+    let selected_snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), selected_snapshot_id);
+
+    let mut newer_schema = db.update_schema();
+    newer_schema.add_column(1, None, None, None).unwrap();
+    newer_schema.commit();
+    db.put(0, b"newer-1", 0, b"newer-value-1").unwrap();
+    db.put(0, b"newer-schema", 1, b"newer-schema-value")
+        .unwrap();
+    let newer_snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), newer_snapshot_id);
+    db.put(0, b"newer-2", 0, b"newer-value-2").unwrap();
+    let latest_snapshot_id = db.snapshot().unwrap();
+    let latest_manifest = wait_for_manifest_in_db(root, db.id(), latest_snapshot_id);
+    let latest_manifest_json: JsonValue = serde_json::from_str(&latest_manifest).unwrap();
+    let latest_state_seq_id = latest_manifest_json
+        .get("seq_id")
+        .and_then(JsonValue::as_u64)
+        .expect("latest snapshot seq_id");
+    let db_id = db.id().to_string();
+    db.close().unwrap();
+
+    let newer_manifest_path = format!(
+        "{}/{}",
+        root,
+        bucket_snapshot_manifest_path(&db_id, newer_snapshot_id)
+    );
+    let latest_manifest_path = format!(
+        "{}/{}",
+        root,
+        bucket_snapshot_manifest_path(&db_id, latest_snapshot_id)
+    );
+    let mut resume_config = config.clone();
+    resume_config.snapshot_retention = Some(1);
+    let resumed = Db::resume_from_snapshot(resume_config, selected_snapshot_id, db_id.clone())
+        .expect("resume historical snapshot");
+    assert!(resumed.get(0, b"base").unwrap().is_some());
+    assert!(resumed.get(0, b"selected").unwrap().is_some());
+    assert!(resumed.get(0, b"newer-1").unwrap().is_none());
+    assert!(resumed.get(0, b"newer-2").unwrap().is_none());
+
+    // The full registry is retained for lifecycle accounting, but the writable schema is the one
+    // selected by the historical manifest. Its next id still skips the newer persisted schema.
+    let mut restored_schema = resumed.update_schema();
+    restored_schema.add_column(1, None, None, None).unwrap();
+    restored_schema.commit();
+    resumed
+        .put(0, b"restored-schema", 1, b"restored-schema-value")
+        .unwrap();
+
+    // Snapshots newer than the selected state are still owned by the resumed manager.
+    assert_eq!(
+        resumed
+            .shard_snapshot_input(latest_snapshot_id)
+            .unwrap()
+            .snapshot_id,
+        latest_snapshot_id
+    );
+    assert!(resumed.expire_snapshot(latest_snapshot_id).unwrap());
+    wait_for_missing(&latest_manifest_path);
+
+    // Allocation advances past every manifest found at resume time, even after the latest one is
+    // explicitly expired. Creating the new snapshot also runs normal retention over the imported
+    // chain, which expires the remaining newer snapshot.
+    resumed
+        .put(0, b"after-resume", 0, b"after-resume-value")
+        .unwrap();
+    resumed
+        .advance_truncation_cursor_by_id(0, 0, b"after-historical-resume")
+        .unwrap();
+    let new_snapshot_id = resumed.snapshot().unwrap();
+    assert!(new_snapshot_id > latest_snapshot_id);
+    let new_manifest = wait_for_manifest_in_db(root, resumed.id(), new_snapshot_id);
+    let new_manifest_json: JsonValue = serde_json::from_str(&new_manifest).unwrap();
+    assert!(
+        new_manifest_json
+            .get("seq_id")
+            .and_then(JsonValue::as_u64)
+            .is_some_and(|seq_id| seq_id > latest_state_seq_id),
+        "new state sequence must advance past snapshots newer than the resume target"
+    );
+    wait_for_missing(&newer_manifest_path);
+    resumed.close().unwrap();
+
+    let missing_snapshot_id = new_snapshot_id.saturating_add(100);
+    let error = match Db::resume_from_snapshot(config, missing_snapshot_id, db_id) {
+        Ok(db) => {
+            db.close().unwrap();
+            panic!("missing snapshot id should fail");
+        }
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains(&format!(
+            "Snapshot {} manifest not found",
+            missing_snapshot_id
+        )),
+        "unexpected error: {error}"
+    );
+
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_failed_snapshot_publication_does_not_run_retention() {
+    let root = "/tmp/db_failed_snapshot_publication_retention";
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_const(128),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        total_buckets: 8,
+        block_cache_size: Size::from_const(0),
+        snapshot_retention: None,
+        snapshot_on_flush: false,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config.clone());
+    db.put(0, b"s1", 0, b"value-1").unwrap();
+    let first_snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), first_snapshot_id);
+    db.put(0, b"s2", 0, b"value-2").unwrap();
+    let second_snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), second_snapshot_id);
+    db.put(0, b"s3", 0, b"value-3").unwrap();
+    let third_snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), third_snapshot_id);
+    let db_id = db.id().to_string();
+    db.close().unwrap();
+
+    let mut resume_config = config.clone();
+    resume_config.snapshot_retention = Some(1);
+    let resumed = Db::resume_from_snapshot(resume_config, first_snapshot_id, db_id.clone())
+        .expect("resume historical snapshot");
+    resumed.put(0, b"s4", 0, b"value-4").unwrap();
+
+    let failed_snapshot_id = third_snapshot_id + 1;
+    let failed_manifest_path =
+        Path::new(root).join(bucket_snapshot_manifest_path(&db_id, failed_snapshot_id));
+    std::fs::create_dir_all(&failed_manifest_path).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let allocated_snapshot_id = resumed
+        .snapshot_with_callback(move |result| tx.send(result).unwrap())
+        .unwrap();
+    assert_eq!(allocated_snapshot_id, failed_snapshot_id);
+    assert!(
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("failed snapshot callback")
+            .is_err(),
+        "manifest publication must fail while its destination is a directory"
+    );
+
+    let second_manifest_path =
+        Path::new(root).join(bucket_snapshot_manifest_path(&db_id, second_snapshot_id));
+    let third_manifest_path =
+        Path::new(root).join(bucket_snapshot_manifest_path(&db_id, third_snapshot_id));
+    assert!(second_manifest_path.is_file());
+    assert!(third_manifest_path.is_file());
+    assert!(!failed_manifest_path.is_file());
+    if failed_manifest_path.exists() {
+        std::fs::remove_dir(&failed_manifest_path).unwrap();
+    }
+    assert_eq!(
+        local_snapshot_manifest_ids(root, &db_id),
+        vec![first_snapshot_id, second_snapshot_id, third_snapshot_id]
+    );
+    resumed.close().unwrap();
+
+    let latest = Db::resume(config, db_id).expect("resume latest successful snapshot");
+    assert!(latest.get(0, b"s1").unwrap().is_some());
+    assert!(latest.get(0, b"s2").unwrap().is_some());
+    assert!(latest.get(0, b"s3").unwrap().is_some());
+    assert!(latest.get(0, b"s4").unwrap().is_none());
+    latest.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_switch_to_snapshot_requires_explicit_resume_until_next_snapshot() {
+    let root = "/tmp/db_switch_to_snapshot";
+    cleanup_test_root(root);
+    let mut config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+        memtable_capacity: Size::from_const(256),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        total_buckets: 8,
+        block_cache_size: Size::from_const(0),
+        snapshot_retention: Some(3),
+        snapshot_on_flush: false,
+        value_separation_threshold: Some(Size::from_const(8)),
+        active_memtable_incremental_snapshot_ratio: 0.0,
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let mut db = open_db(config.clone());
+    let base_value = vec![b'a'; 96];
+    let newer_value_1 = vec![b'b'; 96];
+    let newer_value_2 = vec![b'c'; 96];
+
+    db.put(0, b"base", 0, &base_value).unwrap();
+    let first_snapshot_id = db.snapshot().unwrap();
+    let _ = wait_for_manifest_in_db(root, db.id(), first_snapshot_id);
+    db.put(0, b"newer-1", 0, &newer_value_1).unwrap();
+    let second_snapshot_id = db.snapshot().unwrap();
+    let second_manifest = wait_for_manifest_in_db(root, db.id(), second_snapshot_id);
+    let second_manifest_json: JsonValue = serde_json::from_str(&second_manifest).unwrap();
+    assert_eq!(
+        second_manifest_json
+            .get("base_snapshot_id")
+            .and_then(JsonValue::as_u64),
+        Some(first_snapshot_id)
+    );
+    db.put(0, b"newer-2", 0, &newer_value_2).unwrap();
+    let third_snapshot_id = db.snapshot().unwrap();
+    let third_manifest = wait_for_manifest_in_db(root, db.id(), third_snapshot_id);
+    let third_manifest_json: JsonValue = serde_json::from_str(&third_manifest).unwrap();
+    assert_eq!(
+        third_manifest_json
+            .get("base_snapshot_id")
+            .and_then(JsonValue::as_u64),
+        Some(second_snapshot_id)
+    );
+    let max_vlog_seq_before_switch = third_manifest_json
+        .get("vlog_files")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|file| file.get("file_seq").and_then(JsonValue::as_u64))
+        .max()
+        .expect("forced VLOG file before switch");
+    let db_id = db.id().to_string();
+
+    let missing_snapshot_id = third_snapshot_id.saturating_add(100);
+    let error = db
+        .switch_to_snapshot(missing_snapshot_id)
+        .expect_err("missing switch target must fail preflight");
+    let error_message = error.to_string();
+    assert!(error_message.contains(&missing_snapshot_id.to_string()));
+    assert!(error_message.contains("not found"));
+    assert!(db.get(0, b"newer-2").unwrap().is_some());
+    db.put(0, b"after-failed-preflight", 0, b"still-open")
+        .unwrap();
+
+    db.switch_to_snapshot(first_snapshot_id)
+        .expect("switch to first snapshot");
+    assert_eq!(
+        db.get(0, b"base").unwrap().unwrap()[0].as_deref(),
+        Some(base_value.as_slice())
+    );
+    assert!(db.get(0, b"newer-1").unwrap().is_none());
+    assert!(db.get(0, b"newer-2").unwrap().is_none());
+    assert!(db.get(0, b"after-failed-preflight").unwrap().is_none());
+    assert_eq!(
+        local_snapshot_manifest_ids(root, &db_id),
+        vec![first_snapshot_id, second_snapshot_id, third_snapshot_id],
+        "switch must not publish an extra snapshot"
+    );
+
+    let second_manifest_path = format!(
+        "{}/{}",
+        root,
+        bucket_snapshot_manifest_path(&db_id, second_snapshot_id)
+    );
+    let third_manifest_path = format!(
+        "{}/{}",
+        root,
+        bucket_snapshot_manifest_path(&db_id, third_snapshot_id)
+    );
+    db.close().unwrap();
+
+    let latest = Db::resume(config.clone(), db_id.clone()).expect("resume latest snapshot");
+    assert_eq!(
+        latest.get(0, b"base").unwrap().unwrap()[0].as_deref(),
+        Some(base_value.as_slice())
+    );
+    assert_eq!(
+        latest.get(0, b"newer-1").unwrap().unwrap()[0].as_deref(),
+        Some(newer_value_1.as_slice())
+    );
+    assert_eq!(
+        latest.get(0, b"newer-2").unwrap().unwrap()[0].as_deref(),
+        Some(newer_value_2.as_slice())
+    );
+    latest.close().unwrap();
+
+    config.snapshot_retention = Some(1);
+    let db = Db::resume_from_snapshot(config.clone(), first_snapshot_id, db_id.clone())
+        .expect("explicitly resume switched snapshot");
+    assert_eq!(
+        db.get(0, b"base").unwrap().unwrap()[0].as_deref(),
+        Some(base_value.as_slice())
+    );
+    assert!(db.get(0, b"newer-1").unwrap().is_none());
+    assert!(db.get(0, b"newer-2").unwrap().is_none());
+
+    let post_switch_value = vec![b'd'; 96];
+    db.put(0, b"post-switch", 0, &post_switch_value).unwrap();
+    let post_switch_snapshot_id = db.snapshot().unwrap();
+    assert_eq!(post_switch_snapshot_id, third_snapshot_id + 1);
+    let post_switch_manifest = wait_for_manifest_in_db(root, db.id(), post_switch_snapshot_id);
+    let post_switch_manifest_json: JsonValue = serde_json::from_str(&post_switch_manifest).unwrap();
+    let max_vlog_seq_after_switch = post_switch_manifest_json
+        .get("vlog_files")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|file| file.get("file_seq").and_then(JsonValue::as_u64))
+        .max()
+        .expect("forced VLOG file after switch");
+    assert!(max_vlog_seq_after_switch > max_vlog_seq_before_switch);
+    wait_for_missing(&second_manifest_path);
+    wait_for_missing(&third_manifest_path);
+    db.close().unwrap();
+
+    let resumed = Db::resume(config, db_id).expect("resume new active snapshot");
+    assert_eq!(
+        resumed.get(0, b"base").unwrap().unwrap()[0].as_deref(),
+        Some(base_value.as_slice())
+    );
+    assert!(resumed.get(0, b"newer-1").unwrap().is_none());
+    assert!(resumed.get(0, b"newer-2").unwrap().is_none());
+    assert_eq!(
+        resumed.get(0, b"post-switch").unwrap().unwrap()[0].as_deref(),
+        Some(post_switch_value.as_slice())
+    );
+    resumed.close().unwrap();
     cleanup_test_root(root);
 }
 

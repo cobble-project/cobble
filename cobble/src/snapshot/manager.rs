@@ -873,6 +873,11 @@ impl SnapshotManager {
         };
         if result.is_err() {
             self.cleanup_unpublished_snapshot(id);
+        } else if let Err(err) = self.process_retention() {
+            warn!(
+                "failed to process snapshot retention after publication: {}",
+                err
+            );
         }
         let manifest_info = if result.is_err() {
             None

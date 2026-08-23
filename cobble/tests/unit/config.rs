@@ -45,6 +45,22 @@ fn wal_is_opt_in_and_requires_one_explicit_volume() {
 }
 
 #[test]
+fn snapshot_retention_must_be_positive_when_configured() {
+    let mut direct = Config::default();
+    direct.snapshot_retention = Some(0);
+    let error = direct.normalize_volume_paths().unwrap_err();
+    assert!(matches!(error, Error::ConfigError(_)));
+    assert!(error.to_string().contains("snapshot_retention"));
+
+    let error = Config::from_json_str(r#"{"snapshot_retention":0}"#).unwrap_err();
+    assert!(matches!(error, Error::ConfigError(_)));
+    assert!(error.to_string().contains("snapshot_retention"));
+
+    Config::from_json_str(r#"{"snapshot_retention":1}"#)
+        .expect("retention of one snapshot is valid");
+}
+
+#[test]
 fn test_resolved_write_stall_limit() {
     let mut config = Config::default();
     assert_eq!(config.resolved_write_stall_limit(), 32);
