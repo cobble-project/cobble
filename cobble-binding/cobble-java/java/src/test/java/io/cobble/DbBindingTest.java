@@ -7,6 +7,7 @@ import io.cobble.table.DirectTableRow;
 import io.cobble.table.LogicalTypes;
 import io.cobble.table.RecordType;
 import io.cobble.table.Table;
+import io.cobble.table.TableKey;
 import io.cobble.table.TableScanCursor;
 import io.cobble.table.TableSchema;
 import io.cobble.table.Value;
@@ -77,15 +78,18 @@ class DbBindingTest {
                         Value.binary(new byte[] {8, 9}),
                         Value.struct(Collections.singletonList(Value.binary(new byte[] {10}))),
                         Value.string("direct"));
-        List<Value> key1 = Arrays.asList(row1.get(0), row1.get(1));
-        List<Value> key2 = Arrays.asList(row2.get(0), row2.get(1));
-        List<Value> key3 = Arrays.asList(row3.get(0), row3.get(1));
-        List<Value> missing = Arrays.asList(Value.string("tenant-a"), Value.int64(99));
-
         try (Db db = Db.open(config);
                 Table table = Table.create(db, "events", schema);
                 Table reopened = Table.open(db, "events")) {
             assertEquals(schema, reopened.schema());
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> table.keyBuilder().push(Value.string("tenant-a")).build());
+            TableKey key1 = table.keyBuilder().push(row1.get(0)).push(row1.get(1)).build();
+            TableKey key2 = table.keyBuilder().push(row2.get(0)).push(row2.get(1)).build();
+            TableKey key3 = table.keyBuilder().push(row3.get(0)).push(row3.get(1)).build();
+            TableKey missing =
+                    table.keyBuilder().push(Value.string("tenant-a")).push(Value.int64(99)).build();
             table.put(row1);
             table.put(row2);
 
@@ -96,12 +100,13 @@ class DbBindingTest {
             assertEquals(
                     Arrays.asList(row2, row1, row2, null),
                     table.multiGet(Arrays.asList(key2, key1, key2, missing)));
-            assertEquals(table.bucketForKey(key1), table.bucketForKey(key2));
-            assertEquals(row1, reopened.get(key1));
+            assertEquals(key1.bucket(), key2.bucket());
+            TableKey reopenedKey1 =
+                    reopened.keyBuilder().push(row1.get(0)).push(row1.get(1)).build();
+            assertEquals(row1, reopened.get(reopenedKey1));
 
             List<List<Value>> scanned = new ArrayList<List<Value>>();
-            try (TableScanCursor cursor =
-                    table.scanBounds(table.bucketForKey(key1), key1, missing)) {
+            try (TableScanCursor cursor = table.scanBounds(key1.bucket(), key1, missing)) {
                 for (List<Value> row : cursor) scanned.add(row);
             }
             assertEquals(Arrays.asList(row1, row2, row3), scanned);
@@ -120,8 +125,9 @@ class DbBindingTest {
                             Collections.singletonList(11L));
             try (Table keys = Table.create(db, "keys", keySchema)) {
                 List<Value> keyOnly = Collections.singletonList(Value.int64(7));
+                TableKey key = keys.keyBuilder().push(Value.int64(7)).build();
                 keys.put(keyOnly);
-                assertEquals(keyOnly, keys.get(keyOnly));
+                assertEquals(keyOnly, keys.get(key));
             }
         }
     }

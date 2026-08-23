@@ -76,20 +76,10 @@ public final class Table implements AutoCloseable {
         return compiled.schema;
     }
 
-    /** Returns the bucket selected by the bucket-key prefix of a complete primary key. */
-    public int bucketForKey(List<Value> primaryKey) {
+    /** Starts building one primary key in schema order. */
+    public TableKeyBuilder keyBuilder() {
         ensureUsable();
-        requirePrimaryKey(primaryKey);
-        int prefixSize = 0;
-        for (int i = 0; i < compiled.bucketKeyFields; i++)
-            prefixSize =
-                    KeyCodec.checkedAdd(
-                            prefixSize,
-                            KeyCodec.encodedSize(compiled.keyTypes.get(i), primaryKey.get(i)));
-        ByteBuffer prefix = ByteBuffer.allocate(prefixSize);
-        for (int i = 0; i < compiled.bucketKeyFields; i++)
-            KeyCodec.encodeTo(compiled.keyTypes.get(i), primaryKey.get(i), prefix);
-        return compiled.bucketHash.bucket(prefix.array());
+        return new TableKeyBuilder(compiled);
     }
 
     /** Writes one full row in schema field order. */
@@ -142,28 +132,31 @@ public final class Table implements AutoCloseable {
     }
 
     /** Returns one owned typed row, or {@code null} when absent. */
-    public List<Value> get(List<Value> primaryKey) {
+    public List<Value> get(TableKey key) {
         ensureUsable();
-        EncodedKey key = encodePrimaryKey(primaryKey);
-        byte[][] columns = db.getWithOptions(key.bucket, key.bytes, readOptions);
-        return columns == null ? null : assembleRow(primaryKey, columns);
+        Objects.requireNonNull(key, "key");
+        byte[][] columns = db.getWithOptions(key.bucket(), key.encodedInternal(), readOptions);
+        return columns == null ? null : assembleRow(key.valuesInternal(), columns);
     }
 
     /** Reads keys in one native multi-get while preserving input order and duplicates. */
-    public List<List<Value>> multiGet(List<? extends List<Value>> primaryKeys) {
+    public List<List<Value>> multiGet(List<TableKey> primaryKeys) {
         ensureUsable();
         Objects.requireNonNull(primaryKeys, "primaryKeys");
         int[] buckets = new int[primaryKeys.size()];
         byte[][] keys = new byte[primaryKeys.size()][];
         for (int i = 0; i < primaryKeys.size(); i++) {
-            EncodedKey encoded = encodePrimaryKey(primaryKeys.get(i));
-            buckets[i] = encoded.bucket;
-            keys[i] = encoded.bytes;
+            TableKey key = Objects.requireNonNull(primaryKeys.get(i), "primaryKey");
+            buckets[i] = key.bucket();
+            keys[i] = key.encodedInternal();
         }
         byte[][][] columns = db.multiGetWithOptions(buckets, keys, readOptions);
         List<List<Value>> rows = new ArrayList<List<Value>>(columns.length);
         for (int i = 0; i < columns.length; i++)
-            rows.add(columns[i] == null ? null : assembleRow(primaryKeys.get(i), columns[i]));
+            rows.add(
+                    columns[i] == null
+                            ? null
+                            : assembleRow(primaryKeys.get(i).valuesInternal(), columns[i]));
         return Collections.unmodifiableList(rows);
     }
 
@@ -173,20 +166,18 @@ public final class Table implements AutoCloseable {
      * <p>Binary values, including nested binary values, remain valid only until the returned row is
      * closed. The key buffer is overwritten from position zero.
      */
-    public DirectTableRow getDirect(List<Value> primaryKey, ByteBuffer keyBuffer) {
+    public DirectTableRow getDirect(TableKey key, ByteBuffer keyBuffer) {
         ensureUsable();
+        Objects.requireNonNull(key, "key");
         requireDirect(keyBuffer, "keyBuffer");
         ((Buffer) keyBuffer).clear();
-        int prefixEnd =
-                KeyCodec.encodeToWithPrefix(
-                        compiled.keyTypes, primaryKey, compiled.bucketKeyFields, keyBuffer);
-        int keyLength = keyBuffer.position();
-        int bucket = compiled.bucketHash.bucket(prefix(keyBuffer, prefixEnd));
+        keyBuffer.put(key.encodedInternal());
         DirectColumns columns =
-                db.getDirectColumnsWithOptions(bucket, keyBuffer, keyLength, readOptions);
+                db.getDirectColumnsWithOptions(
+                        key.bucket(), keyBuffer, key.encodedInternal().length, readOptions);
         if (columns == null) return null;
         try {
-            return new DirectTableRow(columns, assembleDirectRow(primaryKey, columns));
+            return new DirectTableRow(columns, assembleDirectRow(key.valuesInternal(), columns));
         } catch (RuntimeException error) {
             columns.close();
             throw error;
@@ -199,11 +190,12 @@ public final class Table implements AutoCloseable {
     }
 
     /** Opens a typed scan over an inclusive/exclusive primary-key range in one bucket. */
-    public TableScanCursor scanBounds(
-            int bucket, List<Value> startInclusive, List<Value> endExclusive) {
+    public TableScanCursor scanBounds(int bucket, TableKey startInclusive, TableKey endExclusive) {
         ensureUsable();
-        byte[] start = startInclusive == null ? null : encodePrimaryKey(startInclusive).bytes;
-        byte[] end = endExclusive == null ? null : encodePrimaryKey(endExclusive).bytes;
+        validateBound(bucket, startInclusive);
+        validateBound(bucket, endExclusive);
+        byte[] start = startInclusive == null ? null : startInclusive.encodedInternal();
+        byte[] end = endExclusive == null ? null : endExclusive.encodedInternal();
         ByteBuffer directStart = directCopy(start);
         ByteBuffer directEnd = directCopy(end);
         return new TableScanCursor(
@@ -225,18 +217,6 @@ public final class Table implements AutoCloseable {
         scanOptions.close();
         readOptions.close();
         writeOptions.close();
-    }
-
-    private EncodedKey encodePrimaryKey(List<Value> primaryKey) {
-        requirePrimaryKey(primaryKey);
-        int size = KeyCodec.encodedSize(compiled.keyTypes, primaryKey);
-        ByteBuffer output = ByteBuffer.allocate(size);
-        int prefixEnd =
-                KeyCodec.encodeToWithPrefix(
-                        compiled.keyTypes, primaryKey, compiled.bucketKeyFields, output);
-        return new EncodedKey(
-                compiled.bucketHash.bucket(ByteBuffer.wrap(output.array(), 0, prefixEnd)),
-                output.array());
     }
 
     private EncodedKey encodeRowKeyValidated(List<Value> row) {
@@ -352,12 +332,6 @@ public final class Table implements AutoCloseable {
         return Collections.unmodifiableList(row);
     }
 
-    private void requirePrimaryKey(List<Value> primaryKey) {
-        Objects.requireNonNull(primaryKey, "primaryKey");
-        if (primaryKey.size() != compiled.keyPositions.length)
-            throw new IllegalArgumentException("primary key field count does not match schema");
-    }
-
     private void requireRow(List<Value> row) {
         Objects.requireNonNull(row, "row");
         if (row.size() != compiled.schema.fields().size())
@@ -376,6 +350,11 @@ public final class Table implements AutoCloseable {
     private static void requireDirect(ByteBuffer buffer, String name) {
         Objects.requireNonNull(buffer, name);
         if (!buffer.isDirect()) throw new IllegalArgumentException(name + " must be direct");
+    }
+
+    private static void validateBound(int bucket, TableKey key) {
+        if (key != null && key.bucket() != bucket)
+            throw new IllegalArgumentException("table scan bound belongs to a different bucket");
     }
 
     private static ByteBuffer prefix(ByteBuffer buffer, int end) {
