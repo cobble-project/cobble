@@ -22,7 +22,6 @@ public final class ValueCodec {
     public static void encodeTo(LogicalType type, Value value, ByteBuffer out) {
         int start = out.position();
         try {
-            type.validate();
             encodeValue(type, value, out);
         } catch (RuntimeException | Error error) {
             ((Buffer) out).position(start);
@@ -31,12 +30,10 @@ public final class ValueCodec {
     }
 
     public static int encodedSize(LogicalType type, Value value) {
-        type.validate();
         return sizeValue(type, value);
     }
 
     public static Value decode(LogicalType type, ByteBuffer input) {
-        type.validate();
         Value value = decodeValue(type, input);
         if (input.hasRemaining()) throw new IllegalArgumentException("trailing value bytes");
         return value;
@@ -60,16 +57,16 @@ public final class ValueCodec {
                 out.put((byte) (KeyCodec.bool(value) ? 1 : 0));
                 return;
             case INT8:
-                out.put((Byte) KeyCodec.require(value, Value.Kind.INT8));
+                KeyCodec.putOrdered(out, (Byte) KeyCodec.require(value, Value.Kind.INT8), 1);
                 return;
             case INT16:
-                putI16Le(out, (Short) KeyCodec.require(value, Value.Kind.INT16));
+                KeyCodec.putOrdered(out, (Short) KeyCodec.require(value, Value.Kind.INT16), 2);
                 return;
             case INT32:
-                putI32Le(out, (Integer) KeyCodec.require(value, Value.Kind.INT32));
+                KeyCodec.putOrdered(out, (Integer) KeyCodec.require(value, Value.Kind.INT32), 4);
                 return;
             case INT64:
-                putI64Le(out, (Long) KeyCodec.require(value, Value.Kind.INT64));
+                KeyCodec.putOrdered(out, (Long) KeyCodec.require(value, Value.Kind.INT64), 8);
                 return;
             case FLOAT32:
                 putI32Le(
@@ -88,20 +85,20 @@ public final class ValueCodec {
                     Value.Decimal decimal =
                             (Value.Decimal) KeyCodec.require(value, Value.Kind.DECIMAL);
                     KeyCodec.validateDecimal(type, decimal);
-                    putFixedLe(
+                    KeyCodec.putOrdered(
                             out,
                             decimal.unscaled,
                             KeyCodec.decimalWidth(decimal(type).precision()));
                     return;
                 }
             case DATE:
-                putI32Le(out, (Integer) KeyCodec.require(value, Value.Kind.DATE));
+                KeyCodec.putOrdered(out, (Integer) KeyCodec.require(value, Value.Kind.DATE), 4);
                 return;
             case TIME:
                 {
                     long nanos = (Long) KeyCodec.require(value, Value.Kind.TIME);
                     KeyCodec.validateTime(time(type).precision(), nanos);
-                    putI64Le(out, nanos);
+                    KeyCodec.putOrdered(out, nanos, 8);
                     return;
                 }
             case TIMESTAMP:
@@ -109,8 +106,8 @@ public final class ValueCodec {
                     Value.Timestamp timestamp =
                             (Value.Timestamp) KeyCodec.require(value, Value.Kind.TIMESTAMP);
                     KeyCodec.validateTimestamp(type, timestamp);
-                    putI64Le(out, timestamp.seconds);
-                    putI32Le(out, timestamp.nanos);
+                    KeyCodec.putOrdered(out, timestamp.seconds, 8);
+                    KeyCodec.putU32Be(out, timestamp.nanos);
                     return;
                 }
             case STRING:
@@ -186,22 +183,22 @@ public final class ValueCodec {
             case INT8:
                 {
                     exact(input, 1);
-                    return Value.int8(input.get());
+                    return Value.int8((byte) KeyCodec.readOrderedLong(input, 1));
                 }
             case INT16:
                 {
                     exact(input, 2);
-                    return Value.int16(getI16Le(input));
+                    return Value.int16((short) KeyCodec.readOrderedLong(input, 2));
                 }
             case INT32:
                 {
                     exact(input, 4);
-                    return Value.int32(getI32Le(input));
+                    return Value.int32((int) KeyCodec.readOrderedLong(input, 4));
                 }
             case INT64:
                 {
                     exact(input, 8);
-                    return Value.int64(getI64Le(input));
+                    return Value.int64(KeyCodec.readOrderedLong(input, 8));
                 }
             case FLOAT32:
                 {
@@ -218,7 +215,7 @@ public final class ValueCodec {
                     DecimalType typeValue = decimal(type);
                     int width = KeyCodec.decimalWidth(typeValue.precision());
                     exact(input, width);
-                    BigInteger unscaled = getFixedLe(input, width);
+                    BigInteger unscaled = KeyCodec.readOrderedBigInteger(input, width);
                     Value.Decimal value =
                             new Value.Decimal(typeValue.precision(), typeValue.scale(), unscaled);
                     KeyCodec.validateDecimal(type, value);
@@ -227,20 +224,20 @@ public final class ValueCodec {
             case DATE:
                 {
                     exact(input, 4);
-                    return Value.date(getI32Le(input));
+                    return Value.date((int) KeyCodec.readOrderedLong(input, 4));
                 }
             case TIME:
                 {
                     exact(input, 8);
-                    long value = getI64Le(input);
+                    long value = KeyCodec.readOrderedLong(input, 8);
                     KeyCodec.validateTime(time(type).precision(), value);
                     return Value.time(value);
                 }
             case TIMESTAMP:
                 {
                     exact(input, 12);
-                    long seconds = getI64Le(input);
-                    int nanos = getI32Le(input);
+                    long seconds = KeyCodec.readOrderedLong(input, 8);
+                    int nanos = KeyCodec.getU32Be(input);
                     Value.Timestamp value =
                             new Value.Timestamp(
                                     timestamp(type).precision(),
@@ -517,15 +514,6 @@ public final class ValueCodec {
         return getI32Le(input);
     }
 
-    private static void putI16Le(ByteBuffer out, short value) {
-        out.put((byte) value).put((byte) (value >>> 8));
-    }
-
-    private static short getI16Le(ByteBuffer input) {
-        KeyCodec.requireRemaining(input, 2);
-        return (short) ((input.get() & 255) | ((input.get() & 255) << 8));
-    }
-
     private static void putI32Le(ByteBuffer out, int value) {
         out.put((byte) value)
                 .put((byte) (value >>> 8))
@@ -550,25 +538,6 @@ public final class ValueCodec {
         long value = 0;
         for (int i = 0; i < 8; i++) value |= (long) (input.get() & 255) << (8 * i);
         return value;
-    }
-
-    private static void putFixedLe(ByteBuffer out, BigInteger value, int width) {
-        byte[] raw = value.toByteArray();
-        for (int i = 0; i < width; i++) {
-            int source = raw.length - 1 - i;
-            out.put(source >= 0 ? raw[source] : (byte) (value.signum() < 0 ? 0xff : 0));
-        }
-    }
-
-    private static BigInteger getFixedLe(ByteBuffer input, int width) {
-        byte[] raw = new byte[width];
-        input.get(raw);
-        for (int i = 0; i < width / 2; i++) {
-            byte swap = raw[i];
-            raw[i] = raw[width - 1 - i];
-            raw[width - 1 - i] = swap;
-        }
-        return new BigInteger(raw);
     }
 
     private static String readUtf8(ByteBuffer input) {

@@ -49,7 +49,6 @@ public final class KeyCodec {
     }
 
     private static void encodeScalar(LogicalType type, Value value, ByteBuffer out) {
-        type.validate();
         if (!type.isKeyCompatible())
             throw new IllegalArgumentException("type cannot be used as a key");
         switch (type.kind()) {
@@ -57,32 +56,32 @@ public final class KeyCodec {
                 out.put((byte) (bool(value) ? 1 : 0));
                 return;
             case INT8:
-                ordered(out, BigInteger.valueOf((Byte) require(value, Value.Kind.INT8)), 1);
+                putOrdered(out, (Byte) require(value, Value.Kind.INT8), 1);
                 return;
             case INT16:
-                ordered(out, BigInteger.valueOf((Short) require(value, Value.Kind.INT16)), 2);
+                putOrdered(out, (Short) require(value, Value.Kind.INT16), 2);
                 return;
             case INT32:
-                ordered(out, BigInteger.valueOf((Integer) require(value, Value.Kind.INT32)), 4);
+                putOrdered(out, (Integer) require(value, Value.Kind.INT32), 4);
                 return;
             case INT64:
-                ordered(out, BigInteger.valueOf((Long) require(value, Value.Kind.INT64)), 8);
+                putOrdered(out, (Long) require(value, Value.Kind.INT64), 8);
                 return;
             case DECIMAL:
                 {
                     Value.Decimal decimal = (Value.Decimal) require(value, Value.Kind.DECIMAL);
                     validateDecimal(type, decimal);
-                    ordered(out, decimal.unscaled, decimalWidth(decimal(type).precision()));
+                    putOrdered(out, decimal.unscaled, decimalWidth(decimal(type).precision()));
                     return;
                 }
             case DATE:
-                ordered(out, BigInteger.valueOf((Integer) require(value, Value.Kind.DATE)), 4);
+                putOrdered(out, (Integer) require(value, Value.Kind.DATE), 4);
                 return;
             case TIME:
                 {
                     long nanos = (Long) require(value, Value.Kind.TIME);
                     validateTime(time(type).precision(), nanos);
-                    ordered(out, BigInteger.valueOf(nanos), 8);
+                    putOrdered(out, nanos, 8);
                     return;
                 }
             case TIMESTAMP:
@@ -90,7 +89,7 @@ public final class KeyCodec {
                     Value.Timestamp timestamp =
                             (Value.Timestamp) require(value, Value.Kind.TIMESTAMP);
                     validateTimestamp(type, timestamp);
-                    ordered(out, BigInteger.valueOf(timestamp.seconds), 8);
+                    putOrdered(out, timestamp.seconds, 8);
                     putU32Be(out, timestamp.nanos);
                     return;
                 }
@@ -113,40 +112,40 @@ public final class KeyCodec {
     }
 
     public static Value decodeOne(LogicalType type, ByteBuffer input) {
-        type.validate();
         if (!type.isKeyCompatible())
             throw new IllegalArgumentException("type cannot be used as a key");
         switch (type.kind()) {
             case BOOLEAN:
                 return Value.bool(readBool(input));
             case INT8:
-                return Value.int8((byte) readOrdered(input, 1).longValue());
+                return Value.int8((byte) readOrderedLong(input, 1));
             case INT16:
-                return Value.int16((short) readOrdered(input, 2).longValue());
+                return Value.int16((short) readOrderedLong(input, 2));
             case INT32:
-                return Value.int32(readOrdered(input, 4).intValue());
+                return Value.int32((int) readOrderedLong(input, 4));
             case INT64:
-                return Value.int64(readOrdered(input, 8).longValue());
+                return Value.int64(readOrderedLong(input, 8));
             case DECIMAL:
                 {
                     DecimalType typeValue = decimal(type);
-                    BigInteger value = readOrdered(input, decimalWidth(typeValue.precision()));
+                    BigInteger value =
+                            readOrderedBigInteger(input, decimalWidth(typeValue.precision()));
                     Value.Decimal decimal =
                             new Value.Decimal(typeValue.precision(), typeValue.scale(), value);
                     validateDecimal(type, decimal);
                     return Value.decimal(typeValue.precision(), typeValue.scale(), value);
                 }
             case DATE:
-                return Value.date(readOrdered(input, 4).intValue());
+                return Value.date((int) readOrderedLong(input, 4));
             case TIME:
                 {
-                    long value = readOrdered(input, 8).longValue();
+                    long value = readOrderedLong(input, 8);
                     validateTime(time(type).precision(), value);
                     return Value.time(value);
                 }
             case TIMESTAMP:
                 {
-                    long seconds = readOrdered(input, 8).longValue();
+                    long seconds = readOrderedLong(input, 8);
                     int nanos = getU32Be(input);
                     Value.Timestamp value =
                             new Value.Timestamp(
@@ -171,7 +170,6 @@ public final class KeyCodec {
     }
 
     static int encodedSize(LogicalType type, Value value) {
-        type.validate();
         if (!type.isKeyCompatible())
             throw new IllegalArgumentException("type cannot be used as a key");
         switch (type.kind()) {
@@ -416,13 +414,32 @@ public final class KeyCodec {
         }
     }
 
-    private static void ordered(ByteBuffer out, BigInteger value, int width) {
+    static void putOrdered(ByteBuffer out, long value, int width) {
+        for (int shift = (width - 1) * 8; shift >= 0; shift -= 8) {
+            byte current = (byte) (value >>> shift);
+            out.put(shift == (width - 1) * 8 ? (byte) (current ^ 0x80) : current);
+        }
+    }
+
+    static long readOrderedLong(ByteBuffer input, int width) {
+        requireRemaining(input, width);
+        long value = 0;
+        for (int index = 0; index < width; index++) {
+            int current = input.get() & 0xff;
+            if (index == 0) current ^= 0x80;
+            value = (value << 8) | current;
+        }
+        int shift = (8 - width) * 8;
+        return value << shift >> shift;
+    }
+
+    static void putOrdered(ByteBuffer out, BigInteger value, int width) {
         byte[] raw = fixed(value, width);
         raw[0] ^= (byte) 0x80;
         out.put(raw);
     }
 
-    private static BigInteger readOrdered(ByteBuffer input, int width) {
+    static BigInteger readOrderedBigInteger(ByteBuffer input, int width) {
         requireRemaining(input, width);
         byte[] raw = new byte[width];
         input.get(raw);

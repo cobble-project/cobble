@@ -41,11 +41,24 @@ impl TableMetadata {
         self.layout.validate_against(&self.schema)
     }
 
-    pub(crate) fn to_json(&self) -> Result<Vec<u8>> {
+    pub(crate) fn to_value(&self) -> Result<serde_json::Value> {
         self.validate()?;
+        serde_json::to_value(self).map_err(|error| TableError::internal(error.to_string()))
+    }
+
+    pub(crate) fn from_value(value: &serde_json::Value) -> Result<Self> {
+        let metadata: Self = serde_json::from_value(value.clone())
+            .map_err(|error| TableError::internal(error.to_string()))?;
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn to_json(&self) -> Result<Vec<u8>> {
         serde_json::to_vec(self).map_err(|error| TableError::internal(error.to_string()))
     }
 
+    #[cfg(test)]
     pub(crate) fn from_json(bytes: &[u8]) -> Result<Self> {
         let metadata: Self = serde_json::from_slice(bytes)
             .map_err(|error| TableError::internal(error.to_string()))?;

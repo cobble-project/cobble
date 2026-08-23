@@ -74,6 +74,75 @@ impl KeyCodec {
         result
     }
 
+    /// Encodes a row whose logical types were already validated when its table was opened.
+    pub(crate) fn encode_row_with_prefix_validated(
+        types: &[LogicalType],
+        values: &[Value],
+        prefix_fields: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<usize> {
+        let start = out.len();
+        let result = (|| {
+            if types.len() != values.len() {
+                return Err(TableError::codec(
+                    "key field count does not match value count",
+                ));
+            }
+            debug_assert!(prefix_fields <= types.len());
+            let mut prefix_end = start;
+            for (index, (logical_type, value)) in types.iter().zip(values).enumerate() {
+                encode_key(logical_type, value, out)?;
+                if index + 1 == prefix_fields {
+                    prefix_end = out.len();
+                }
+            }
+            Ok(prefix_end - start)
+        })();
+        if result.is_err() {
+            out.truncate(start);
+        }
+        result
+    }
+
+    /// Encodes only the bucket-key prefix for already validated table types.
+    pub(crate) fn encode_prefix_validated(
+        types: &[LogicalType],
+        values: &[Value],
+        prefix_fields: usize,
+    ) -> Result<Vec<u8>> {
+        if types.len() != values.len() {
+            return Err(TableError::codec(
+                "key field count does not match value count",
+            ));
+        }
+        debug_assert!(prefix_fields <= types.len());
+        let mut encoded = Vec::new();
+        for (logical_type, value) in types.iter().zip(values).take(prefix_fields) {
+            encode_key(logical_type, value, &mut encoded)?;
+        }
+        Ok(encoded)
+    }
+
+    /// Encodes selected fields from a row whose logical types were validated at table creation.
+    pub(crate) fn encode_row_from_positions_validated(
+        types: &[LogicalType],
+        row: &[Value],
+        positions: &[usize],
+        prefix_fields: usize,
+    ) -> Result<(Vec<u8>, usize)> {
+        debug_assert_eq!(types.len(), positions.len());
+        debug_assert!(prefix_fields <= types.len());
+        let mut encoded = Vec::new();
+        let mut prefix_end = 0;
+        for (index, (logical_type, position)) in types.iter().zip(positions).enumerate() {
+            encode_key(logical_type, &row[*position], &mut encoded)?;
+            if index + 1 == prefix_fields {
+                prefix_end = encoded.len();
+            }
+        }
+        Ok((encoded, prefix_end))
+    }
+
     fn append_row(types: &[LogicalType], values: &[Value], out: &mut Vec<u8>) -> Result<()> {
         if types.len() != values.len() {
             return Err(TableError::codec(
@@ -95,16 +164,44 @@ impl KeyCodec {
     }
 
     pub fn decode_row(types: &[LogicalType], encoded: &[u8]) -> Result<Vec<Value>> {
+        for logical_type in types {
+            logical_type.validate()?;
+        }
+        Self::decode_row_validated(types, encoded)
+    }
+
+    /// Decodes a key with types validated at table creation.
+    pub(crate) fn decode_row_validated(
+        types: &[LogicalType],
+        encoded: &[u8],
+    ) -> Result<Vec<Value>> {
         let mut offset = 0;
         let mut values = Vec::with_capacity(types.len());
         for logical_type in types {
-            logical_type.validate()?;
             let (value, consumed) = decode_key(logical_type, &encoded[offset..])?;
             offset += consumed;
             values.push(value);
         }
         ensure_consumed(encoded.len(), offset)?;
         Ok(values)
+    }
+
+    /// Decodes a key directly into its row positions for an already validated table layout.
+    pub(crate) fn decode_row_into_positions_validated(
+        types: &[LogicalType],
+        encoded: &[u8],
+        positions: &[usize],
+        row: &mut [Value],
+    ) -> Result<()> {
+        debug_assert_eq!(types.len(), positions.len());
+        debug_assert!(positions.iter().all(|position| *position < row.len()));
+        let mut offset = 0;
+        for (logical_type, position) in types.iter().zip(positions) {
+            let (value, consumed) = decode_key(logical_type, &encoded[offset..])?;
+            row[*position] = value;
+            offset += consumed;
+        }
+        ensure_consumed(encoded.len(), offset)
     }
 
     pub fn decode_scalar(logical_type: &LogicalType, encoded: &[u8]) -> Result<Value> {
@@ -136,6 +233,13 @@ impl ValueCodec {
         result
     }
 
+    /// Encodes a value whose logical type was validated at table creation.
+    pub(crate) fn encode_validated(logical_type: &LogicalType, value: &Value) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        encode_value(logical_type, value, &mut out)?;
+        Ok(out)
+    }
+
     pub fn encoded_size(logical_type: &LogicalType, value: &Value) -> Result<usize> {
         logical_type.validate()?;
         value_size(logical_type, value)
@@ -150,6 +254,14 @@ impl ValueCodec {
     /// slice of `encoded`; retain the returned value only while retaining that allocation.
     pub fn decode_bytes(logical_type: &LogicalType, encoded: Bytes) -> Result<Value> {
         logical_type.validate()?;
+        decode_value(logical_type, Input::Owned(encoded))
+    }
+
+    /// Decodes a value with a logical type validated at table creation.
+    pub(crate) fn decode_bytes_validated(
+        logical_type: &LogicalType,
+        encoded: Bytes,
+    ) -> Result<Value> {
         decode_value(logical_type, Input::Owned(encoded))
     }
 }
@@ -330,16 +442,10 @@ fn encode_value(logical_type: &LogicalType, value: &Value, out: &mut Vec<u8>) ->
 fn encode_non_null(logical_type: &LogicalType, value: &Value, out: &mut Vec<u8>) -> Result<()> {
     match (&logical_type.kind, value) {
         (LogicalTypeKind::Boolean, Value::Boolean(value)) => out.push(u8::from(*value)),
-        (LogicalTypeKind::Int8, Value::Int8(value)) => out.push(*value as u8),
-        (LogicalTypeKind::Int16, Value::Int16(value)) => {
-            out.extend_from_slice(&value.to_le_bytes())
-        }
-        (LogicalTypeKind::Int32, Value::Int32(value)) => {
-            out.extend_from_slice(&value.to_le_bytes())
-        }
-        (LogicalTypeKind::Int64, Value::Int64(value)) => {
-            out.extend_from_slice(&value.to_le_bytes())
-        }
+        (LogicalTypeKind::Int8, Value::Int8(value)) => ordered_i128(*value as i128, 1, out),
+        (LogicalTypeKind::Int16, Value::Int16(value)) => ordered_i128(*value as i128, 2, out),
+        (LogicalTypeKind::Int32, Value::Int32(value)) => ordered_i128(*value as i128, 4, out),
+        (LogicalTypeKind::Int64, Value::Int64(value)) => ordered_i128(*value as i128, 8, out),
         (LogicalTypeKind::Float32, Value::Float32(value)) => {
             out.extend_from_slice(&value.to_le_bytes())
         }
@@ -361,12 +467,12 @@ fn encode_non_null(logical_type: &LogicalType, value: &Value, out: &mut Vec<u8>)
                 *actual_scale,
                 *unscaled,
             )?;
-            append_fixed_le(*unscaled, decimal_width(*precision), out);
+            ordered_i128(*unscaled, decimal_width(*precision), out);
         }
-        (LogicalTypeKind::Date, Value::Date(value)) => out.extend_from_slice(&value.to_le_bytes()),
+        (LogicalTypeKind::Date, Value::Date(value)) => ordered_i128(*value as i128, 4, out),
         (LogicalTypeKind::Time { precision }, Value::Time(value)) => {
             validate_time(*value, *precision)?;
-            out.extend_from_slice(&value.to_le_bytes());
+            ordered_i128(*value as i128, 8, out);
         }
         (
             LogicalTypeKind::Timestamp {
@@ -388,8 +494,8 @@ fn encode_non_null(logical_type: &LogicalType, value: &Value, out: &mut Vec<u8>)
                 *seconds,
                 *nanos,
             )?;
-            out.extend_from_slice(&seconds.to_le_bytes());
-            out.extend_from_slice(&nanos.to_le_bytes());
+            ordered_i128(*seconds as i128, 8, out);
+            out.extend_from_slice(&nanos.to_be_bytes());
         }
         (LogicalTypeKind::String, Value::String(value)) => out.extend_from_slice(value.as_bytes()),
         (LogicalTypeKind::Binary, Value::Binary(value)) => out.extend_from_slice(value),
@@ -452,24 +558,16 @@ fn decode_non_null(logical_type: &LogicalType, input: Input<'_>) -> Result<Value
     let bytes = input.bytes();
     match &logical_type.kind {
         LogicalTypeKind::Boolean => Ok(Value::Boolean(read_bool_exact(bytes)?)),
-        LogicalTypeKind::Int8 => Ok(Value::Int8(read_exact::<1>(bytes)?[0] as i8)),
-        LogicalTypeKind::Int16 => Ok(Value::Int16(i16::from_le_bytes(read_exact(bytes)?))),
-        LogicalTypeKind::Int32 => Ok(Value::Int32(i32::from_le_bytes(read_exact(bytes)?))),
-        LogicalTypeKind::Int64 => Ok(Value::Int64(i64::from_le_bytes(read_exact(bytes)?))),
+        LogicalTypeKind::Int8 => Ok(Value::Int8(read_ordered_exact(bytes, 1)? as i8)),
+        LogicalTypeKind::Int16 => Ok(Value::Int16(read_ordered_exact(bytes, 2)? as i16)),
+        LogicalTypeKind::Int32 => Ok(Value::Int32(read_ordered_exact(bytes, 4)? as i32)),
+        LogicalTypeKind::Int64 => Ok(Value::Int64(read_ordered_exact(bytes, 8)? as i64)),
         LogicalTypeKind::Float32 => Ok(Value::Float32(f32::from_le_bytes(read_exact(bytes)?))),
         LogicalTypeKind::Float64 => Ok(Value::Float64(f64::from_le_bytes(read_exact(bytes)?))),
         LogicalTypeKind::Decimal { precision, scale } => {
             let width = decimal_width(*precision);
-            if bytes.len() != width {
-                return Err(TableError::codec("invalid decimal length"));
-            }
-            let mut fixed = [if bytes[width - 1] & 0x80 == 0 {
-                0
-            } else {
-                0xff
-            }; 16];
-            fixed[..width].copy_from_slice(bytes);
-            let unscaled = i128::from_le_bytes(fixed);
+            require_exact_len(bytes, width)?;
+            let unscaled = read_ordered(bytes, width)?;
             validate_decimal(*precision, *scale, *precision, *scale, unscaled)?;
             Ok(Value::Decimal {
                 precision: *precision,
@@ -477,9 +575,9 @@ fn decode_non_null(logical_type: &LogicalType, input: Input<'_>) -> Result<Value
                 unscaled,
             })
         }
-        LogicalTypeKind::Date => Ok(Value::Date(i32::from_le_bytes(read_exact(bytes)?))),
+        LogicalTypeKind::Date => Ok(Value::Date(read_ordered_exact(bytes, 4)? as i32)),
         LogicalTypeKind::Time { precision } => {
-            let value = i64::from_le_bytes(read_exact(bytes)?);
+            let value = read_ordered_exact(bytes, 8)? as i64;
             validate_time(value, *precision)?;
             Ok(Value::Time(value))
         }
@@ -488,8 +586,8 @@ fn decode_non_null(logical_type: &LogicalType, input: Input<'_>) -> Result<Value
             timestamp_kind,
         } => {
             require_exact_len(bytes, 12)?;
-            let seconds = i64::from_le_bytes(bytes[..8].try_into().unwrap());
-            let nanos = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+            let seconds = read_ordered(bytes, 8)? as i64;
+            let nanos = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
             validate_timestamp(
                 *precision,
                 *timestamp_kind,
@@ -734,8 +832,9 @@ fn read_ordered(bytes: &[u8], width: usize) -> Result<i128> {
     Ok(i128::from_be_bytes(fixed))
 }
 
-fn append_fixed_le(value: i128, width: usize, out: &mut Vec<u8>) {
-    out.extend_from_slice(&value.to_le_bytes()[..width]);
+fn read_ordered_exact(bytes: &[u8], width: usize) -> Result<i128> {
+    require_exact_len(bytes, width)?;
+    read_ordered(bytes, width)
 }
 
 fn append_escaped(bytes: &[u8], out: &mut Vec<u8>) {

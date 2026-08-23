@@ -30,6 +30,59 @@ fn codec_contract_vectors_round_trip_and_reject_invalid_input() {
         encoded.len()
     );
     assert_eq!(ValueCodec::decode(&value_type, &encoded).unwrap(), value);
+    let ordered_values = vec![
+        (LogicalType::int8(), Value::Int8(-1), Value::Int8(1)),
+        (LogicalType::int16(), Value::Int16(-2), Value::Int16(2)),
+        (LogicalType::int32(), Value::Int32(-3), Value::Int32(3)),
+        (LogicalType::int64(), Value::Int64(-4), Value::Int64(4)),
+        (
+            LogicalType::decimal(20, 2),
+            Value::Decimal {
+                precision: 20,
+                scale: 2,
+                unscaled: -42,
+            },
+            Value::Decimal {
+                precision: 20,
+                scale: 2,
+                unscaled: 42,
+            },
+        ),
+        (LogicalType::date(), Value::Date(-1), Value::Date(1)),
+        (
+            LogicalType::time(6),
+            Value::Time(123_000_000),
+            Value::Time(124_000_000),
+        ),
+        (
+            LogicalType::timestamp(3, TimestampKind::WithoutTimeZone),
+            Value::Timestamp {
+                precision: 3,
+                timestamp_kind: TimestampKind::WithoutTimeZone,
+                seconds: -3,
+                nanos: 123_000_000,
+            },
+            Value::Timestamp {
+                precision: 3,
+                timestamp_kind: TimestampKind::WithoutTimeZone,
+                seconds: -2,
+                nanos: 123_000_000,
+            },
+        ),
+    ];
+    for (logical_type, lower, upper) in ordered_values {
+        let lower_value = ValueCodec::encode(&logical_type, &lower).unwrap();
+        let upper_value = ValueCodec::encode(&logical_type, &upper).unwrap();
+        assert!(lower_value < upper_value);
+        assert_eq!(
+            lower_value,
+            KeyCodec::encode_scalar(&logical_type, &lower).unwrap()
+        );
+        assert_eq!(
+            upper_value,
+            KeyCodec::encode_scalar(&logical_type, &upper).unwrap()
+        );
+    }
     let owned = Bytes::from(encoded.clone());
     let decoded = ValueCodec::decode_bytes(&value_type, owned.clone()).unwrap();
     assert_eq!(decoded, value);

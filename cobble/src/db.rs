@@ -426,6 +426,11 @@ impl Db {
         self.schema_manager.latest_schema()
     }
 
+    /// Return the configured number of logical buckets.
+    pub fn total_buckets(&self) -> u32 {
+        self.config.total_buckets
+    }
+
     /// Return the metrics samples for this database.
     pub fn metrics(&self) -> Vec<crate::MetricSample> {
         metrics_registry::snapshot_metrics(Some(&self.id))
@@ -797,6 +802,70 @@ impl Db {
         V: AsRef<[u8]>,
     {
         self.write_ref(bucket, key, column, ValueType::Put, value, options)
+    }
+
+    /// Insert all physical columns for one key as one atomic row update.
+    pub fn put_columns<K, V>(&self, bucket: u16, key: K, columns: &[V]) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.put_columns_with_options(bucket, key, columns, &self.default_write_options)
+    }
+
+    /// Insert all physical columns for one key as one atomic row update with write options.
+    pub fn put_columns_with_options<K, V>(
+        &self,
+        bucket: u16,
+        key: K,
+        columns: &[V],
+        options: &WriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let _access = self.begin_access()?;
+        let schema = self.schema_manager.latest_schema();
+        self.ensure_multi_lsm_scopes_for_schema_if_dirty(schema.as_ref())?;
+        let column_family_id = options.resolve_column_family_id_cached(schema.as_ref())?;
+        let num_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
+        if columns.len() != num_columns {
+            return Err(Error::IoError(format!(
+                "row column count {} does not match column family {} count {}",
+                columns.len(),
+                column_family_id,
+                num_columns
+            )));
+        }
+        let columns = columns
+            .iter()
+            .map(|value| Some(RefColumn::new(ValueType::Put, value.as_ref())))
+            .collect();
+        let expired_at = self.ttl_provider.get_expiration_timestamp(
+            if schema.value_has_ttl_in_family(column_family_id) {
+                options.ttl_seconds
+            } else {
+                None
+            },
+        );
+        let record = RefValue::new_with_expired_at(columns, expired_at);
+        let key = RefKey::new_with_column_family(bucket, column_family_id, key.as_ref());
+        let result = if let Some(wal_writer) = &self.wal_writer {
+            self.put_ref_with_wal(
+                wal_writer,
+                schema.version(),
+                num_columns,
+                &key,
+                &record,
+                options.await_durable,
+            )
+        } else {
+            self.memtable_manager.put(&key, &record)
+        };
+        let decision = self.memtable_manager.record_adaptive_write(1);
+        self.apply_adaptive_decision(decision);
+        result
     }
 
     /// Inserts byte values into one bucket and column using one database access.
@@ -1847,17 +1916,24 @@ impl Db {
             return Ok(Vec::new());
         }
         let key_count = keys.len() as u64;
-        let mut unique = Vec::<(u16, Vec<u8>)>::new();
-        let mut positions = Vec::with_capacity(keys.len());
-        let mut seen = HashMap::<(u16, Vec<u8>), usize>::new();
-        for (bucket, key) in keys {
-            let entry = (*bucket, key.as_ref().to_vec());
+        let mut unique = Vec::<(u16, &[u8])>::with_capacity(keys.len());
+        let mut positions: Option<Vec<usize>> = None;
+        let mut seen = HashMap::<(u16, &[u8]), usize>::with_capacity(keys.len());
+        for (input_index, (bucket, key)) in keys.iter().enumerate() {
+            let entry = (*bucket, key.as_ref());
             let next = unique.len();
-            let index = *seen.entry(entry.clone()).or_insert_with(|| {
+            let index = *seen.entry(entry).or_insert_with(|| {
                 unique.push(entry);
                 next
             });
-            positions.push(index);
+            if let Some(positions) = positions.as_mut() {
+                positions.push(index);
+            } else if index != input_index {
+                let mut duplicate_positions = Vec::with_capacity(keys.len());
+                duplicate_positions.extend(0..input_index);
+                duplicate_positions.push(index);
+                positions = Some(duplicate_positions);
+            }
         }
 
         let snapshot = self.db_state.load();
@@ -1868,10 +1944,10 @@ impl Db {
         let mask_size = base_decode_mask.len();
         let mut requests = Vec::with_capacity(unique.len());
         for (bucket, key) in unique {
-            let encoded_key = encode_key(bucket, column_family_id, key.as_slice());
+            let encoded_key = encode_key(bucket, column_family_id, key);
             let mut terminal_mask = (num_columns > 1).then(|| vec![0u8; mask_size]);
             let mut values = Vec::new();
-            let mut stopped = snapshot.key_is_truncated(bucket, column_family_id, key.as_slice());
+            let mut stopped = snapshot.key_is_truncated(bucket, column_family_id, key);
             if !stopped {
                 self.memtable_manager.get_all_with_snapshot_until(
                     Arc::clone(&snapshot),
@@ -2000,10 +2076,13 @@ impl Db {
                 return Err(err);
             }
         };
-        let result: Result<Vec<_>> = Ok(positions
-            .into_iter()
-            .map(|index| unique_results[index].clone())
-            .collect());
+        let result: Result<Vec<_>> = match positions {
+            None => Ok(unique_results),
+            Some(positions) => Ok(positions
+                .into_iter()
+                .map(|index| unique_results[index].clone())
+                .collect()),
+        };
         let decision = self.memtable_manager.record_adaptive_point_read(key_count);
         self.apply_adaptive_decision(decision);
         result

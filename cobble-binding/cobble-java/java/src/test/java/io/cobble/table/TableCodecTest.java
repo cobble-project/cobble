@@ -67,6 +67,54 @@ class TableCodecTest {
         assertEquals(fixture.get("value_hex").getAsString(), hex(encoded));
         Value decoded = ValueCodec.decode(type, direct);
         assertEquals(value, decoded);
+        List<LogicalType> orderedTypes =
+                Arrays.asList(
+                        LogicalTypes.int8(),
+                        LogicalTypes.int16(),
+                        LogicalTypes.int32(),
+                        LogicalTypes.int64(),
+                        LogicalTypes.decimal(20, 2),
+                        LogicalTypes.date(),
+                        LogicalTypes.time(6),
+                        LogicalTypes.timestamp(3, TimestampKind.WITHOUT_TIME_ZONE));
+        List<Value> lowerValues =
+                Arrays.asList(
+                        Value.int8((byte) -1),
+                        Value.int16((short) -2),
+                        Value.int32(-3),
+                        Value.int64(-4),
+                        Value.decimal(20, 2, BigInteger.valueOf(-42)),
+                        Value.date(-1),
+                        Value.time(123000000L),
+                        Value.timestamp(3, TimestampKind.WITHOUT_TIME_ZONE, -3, 123000000));
+        List<Value> upperValues =
+                Arrays.asList(
+                        Value.int8((byte) 1),
+                        Value.int16((short) 2),
+                        Value.int32(3),
+                        Value.int64(4),
+                        Value.decimal(20, 2, BigInteger.valueOf(42)),
+                        Value.date(1),
+                        Value.time(124000000L),
+                        Value.timestamp(3, TimestampKind.WITHOUT_TIME_ZONE, -2, 123000000));
+        for (int index = 0; index < orderedTypes.size(); index++) {
+            LogicalType orderedType = orderedTypes.get(index);
+            byte[] lower = ValueCodec.encode(orderedType, lowerValues.get(index));
+            byte[] upper = ValueCodec.encode(orderedType, upperValues.get(index));
+            assertEquals(
+                    hex(
+                            KeyCodec.encode(
+                                    Collections.singletonList(orderedType),
+                                    Collections.singletonList(lowerValues.get(index)))),
+                    hex(lower));
+            assertEquals(
+                    hex(
+                            KeyCodec.encode(
+                                    Collections.singletonList(orderedType),
+                                    Collections.singletonList(upperValues.get(index)))),
+                    hex(upper));
+            assertEquals(true, compareUnsigned(lower, upper) < 0);
+        }
         @SuppressWarnings("unchecked")
         List<Value> fields = (List<Value>) decoded.raw();
         assertEquals(true, ((ByteBuffer) fields.get(12).raw()).isDirect());
@@ -245,5 +293,13 @@ class TableCodecTest {
         StringBuilder builder = new StringBuilder(bytes.length * 2);
         for (byte value : bytes) builder.append(String.format("%02x", value & 0xff));
         return builder.toString();
+    }
+
+    private static int compareUnsigned(byte[] left, byte[] right) {
+        for (int index = 0; index < Math.min(left.length, right.length); index++) {
+            int comparison = Integer.compare(left[index] & 0xff, right[index] & 0xff);
+            if (comparison != 0) return comparison;
+        }
+        return Integer.compare(left.length, right.length);
     }
 }

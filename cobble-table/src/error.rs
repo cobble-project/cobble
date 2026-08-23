@@ -11,6 +11,9 @@ pub enum TableError {
     #[error("table codec error: {0}")]
     Codec(String),
 
+    #[error(transparent)]
+    Storage(#[from] cobble::Error),
+
     #[doc(hidden)]
     #[error("internal table error: {0}")]
     Internal(String),

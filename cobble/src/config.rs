@@ -513,6 +513,16 @@ impl WriteOptions {
         self
     }
 
+    /// Return equivalent options bound to a column family with a fresh resolution cache.
+    pub fn bound_to_column_family(&self, column_family: impl Into<String>) -> Self {
+        Self {
+            ttl_seconds: self.ttl_seconds,
+            column_family: Some(column_family.into()),
+            await_durable: self.await_durable,
+            cached_column_family_id: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+
     pub(crate) fn column_family(&self) -> Option<&str> {
         self.column_family.as_deref()
     }

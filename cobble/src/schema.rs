@@ -426,7 +426,7 @@ impl Schema {
         }
     }
 
-    pub(crate) fn num_columns_in_family(&self, column_family_id: u8) -> Option<usize> {
+    pub fn num_columns_in_family(&self, column_family_id: u8) -> Option<usize> {
         self.column_family_by_id(column_family_id)
             .map(ColumnFamily::visible_num_columns)
     }

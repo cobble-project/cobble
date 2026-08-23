@@ -1,4 +1,4 @@
-//! Table schema and physical layout contracts for Cobble.
+//! Typed table schemas, codecs, and runtime access for Cobble.
 //!
 //! `cobble-table` is independent from `cobble-data-structure`: table rows use a
 //! versioned cross-language codec, while specialized structures such as lists
@@ -9,9 +9,9 @@ mod codec;
 mod error;
 mod layout;
 mod logical_type;
-#[allow(dead_code)]
 mod metadata;
 mod schema;
+mod table;
 
 #[cfg(test)]
 #[path = "../tests/unit/metadata.rs"]
@@ -24,3 +24,4 @@ pub use logical_type::{
     DataField, ExtensionType, FieldId, LogicalType, LogicalTypeKind, TimestampKind,
 };
 pub use schema::TableSchema;
+pub use table::{Table, TableScan};
