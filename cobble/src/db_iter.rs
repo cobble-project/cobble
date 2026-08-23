@@ -1,7 +1,7 @@
 //! This module defines the `DbIterator` struct, which provides an iterator over key-value pairs in the database.
 use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_state::DbState;
-use crate::db_status::DbAccessGuard;
+use crate::db_status::OwnedDbAccessGuard;
 use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::iterator::{DeduplicatingIterator, MergingIterator, TruncationFilterIterator};
@@ -18,13 +18,16 @@ use std::sync::Arc;
 pub(crate) type BucketedRow = (u16, Bytes, Vec<Option<Bytes>>);
 type DecodedRow = (Key, Vec<Option<Bytes>>);
 
-pub(crate) struct DbIteratorOptions<'a> {
+pub(crate) struct DbIteratorOptions {
     pub(crate) end_bound: Option<(Bytes, bool)>,
     pub(crate) lower_bound_exclusive: Option<Bytes>,
     pub(crate) max_rows: Option<usize>,
     pub(crate) snapshot: Arc<DbState>,
-    pub(crate) memtable_manager: Option<&'a MemtableManager>,
-    pub(crate) access_guard: Option<DbAccessGuard<'a>>,
+    /// Retains the mutable table manager while this cursor may still read its
+    /// snapshot-backed iterators.
+    pub(crate) memtable_manager: Option<Arc<MemtableManager>>,
+    /// Keeps the database lifecycle access open until the cursor is dropped.
+    pub(crate) access_guard: Option<OwnedDbAccessGuard>,
     pub(crate) vlog_store: Arc<VlogStore>,
     pub(crate) ttl_provider: Arc<TTLProvider>,
     /// Effective schema for merge and value resolution.
@@ -35,12 +38,12 @@ pub(crate) struct DbIteratorOptions<'a> {
     pub(crate) should_stop_at_block_boundary: bool,
 }
 
-pub struct DbIterator<'a> {
+pub struct DbIterator {
     inner: DeduplicatingIterator<TruncationFilterIterator<MergingIterator<DynKvIterator>>>,
     end_bound: Option<(Bytes, bool)>,
     snapshot: Arc<DbState>,
-    memtable_manager: Option<&'a MemtableManager>,
-    _access_guard: Option<DbAccessGuard<'a>>,
+    _memtable_manager: Option<Arc<MemtableManager>>,
+    _access_guard: Option<OwnedDbAccessGuard>,
     vlog_store: Arc<VlogStore>,
     ttl_provider: Arc<TTLProvider>,
     schema: Arc<Schema>,
@@ -56,11 +59,11 @@ pub struct DbIterator<'a> {
     stopped_at_block_boundary: bool,
 }
 
-impl<'a> DbIterator<'a> {
+impl DbIterator {
     pub(crate) fn new(
         mut memtable_iters: Vec<DynKvIterator>,
         mut lsm_iters: Vec<DynKvIterator>,
-        options: DbIteratorOptions<'a>,
+        options: DbIteratorOptions,
     ) -> Self {
         let schema = options.schema;
         let num_columns = schema
@@ -80,7 +83,7 @@ impl<'a> DbIterator<'a> {
             inner,
             end_bound: options.end_bound,
             snapshot: options.snapshot,
-            memtable_manager: options.memtable_manager,
+            _memtable_manager: options.memtable_manager,
             _access_guard: options.access_guard,
             vlog_store: options.vlog_store,
             ttl_provider: options.ttl_provider,
@@ -213,7 +216,7 @@ impl<'a> DbIterator<'a> {
     }
 }
 
-impl Iterator for DbIterator<'_> {
+impl Iterator for DbIterator {
     type Item = Result<(Bytes, Vec<Option<Bytes>>)>;
 
     fn next(&mut self) -> Option<Self::Item> {

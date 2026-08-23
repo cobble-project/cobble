@@ -434,7 +434,7 @@ impl ReadOnlyDb {
         })
     }
 
-    pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<DbIterator<'static>> {
+    pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<DbIterator> {
         self.scan_with_options(bucket, range, &self.default_scan_options)
     }
 
@@ -443,7 +443,7 @@ impl ReadOnlyDb {
         bucket: u16,
         start_key_inclusive: Option<&[u8]>,
         end_key_exclusive: Option<&[u8]>,
-    ) -> Result<DbIterator<'static>> {
+    ) -> Result<DbIterator> {
         self.scan_with_options_bounds(
             bucket,
             start_key_inclusive,
@@ -457,7 +457,7 @@ impl ReadOnlyDb {
         bucket: u16,
         range: Range<&[u8]>,
         options: &ScanOptions,
-    ) -> Result<DbIterator<'static>> {
+    ) -> Result<DbIterator> {
         self.scan_with_options_bounds(bucket, Some(range.start), Some(range.end), options)
     }
 
@@ -467,7 +467,7 @@ impl ReadOnlyDb {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         options: &ScanOptions,
-    ) -> Result<DbIterator<'static>> {
+    ) -> Result<DbIterator> {
         let snapshot = self.lsm_tree.db_state().load();
         let schema = self.schema_manager.latest_schema();
         let resolved_scan_options = options.resolve_cached(&schema)?;
@@ -509,7 +509,7 @@ impl ReadOnlyDb {
             end_bound.as_ref().map(|(end, _)| end.as_ref()),
             options.preload_scan_cursor_block(),
         )?;
-        let mut iter: DbIterator<'static> = DbIterator::new(
+        let mut iter = DbIterator::new(
             Vec::new(),
             lsm_iters,
             DbIteratorOptions {

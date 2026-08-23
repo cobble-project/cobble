@@ -2184,16 +2184,16 @@ impl Db {
         result
     }
 
-    pub fn scan<'a>(&'a self, bucket: u16, range: Range<&[u8]>) -> Result<DbIterator<'a>> {
+    pub fn scan(&self, bucket: u16, range: Range<&[u8]>) -> Result<DbIterator> {
         self.scan_with_options(bucket, range, &self.default_scan_options)
     }
 
-    pub fn scan_bounds<'a>(
-        &'a self,
+    pub fn scan_bounds(
+        &self,
         bucket: u16,
         start_key_inclusive: Option<&[u8]>,
         end_key_exclusive: Option<&[u8]>,
-    ) -> Result<DbIterator<'a>> {
+    ) -> Result<DbIterator> {
         self.scan_with_options_bounds(
             bucket,
             start_key_inclusive,
@@ -2202,23 +2202,23 @@ impl Db {
         )
     }
 
-    pub fn scan_with_options<'a>(
-        &'a self,
+    pub fn scan_with_options(
+        &self,
         bucket: u16,
         range: Range<&[u8]>,
         options: &ScanOptions,
-    ) -> Result<DbIterator<'a>> {
+    ) -> Result<DbIterator> {
         self.scan_with_options_bounds(bucket, Some(range.start), Some(range.end), options)
     }
 
-    pub fn scan_with_options_bounds<'a>(
-        &'a self,
+    pub fn scan_with_options_bounds(
+        &self,
         bucket: u16,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         options: &ScanOptions,
-    ) -> Result<DbIterator<'a>> {
-        let access_guard = self.begin_access()?;
+    ) -> Result<DbIterator> {
+        let access_guard = self.db_lifecycle.begin_owned_access()?;
         let decision = self.memtable_manager.record_adaptive_range_scan();
         self.apply_adaptive_decision(decision);
         let snapshot = self.db_state.load();
@@ -2291,7 +2291,7 @@ impl Db {
                     .map(|cursor| encode_scan_key(bucket, column_family_id, cursor)),
                 max_rows: options.max_rows(),
                 snapshot,
-                memtable_manager: Some(self.memtable_manager.as_ref()),
+                memtable_manager: Some(Arc::clone(&self.memtable_manager)),
                 access_guard: Some(access_guard),
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),

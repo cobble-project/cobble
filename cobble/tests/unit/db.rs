@@ -2708,6 +2708,34 @@ fn test_db_get_with_projected_merge_operator_column() {
 
 #[test]
 #[serial(file)]
+fn test_db_scan_cursor_outlives_temporary_db_borrow() {
+    fn scan_from_borrowed_db(db: &Db) -> crate::DbIterator {
+        db.scan(0, b"".as_slice()..b"\xff".as_slice())
+            .expect("create scan cursor")
+    }
+
+    let root = "/tmp/db_scan_cursor_owns_access";
+    cleanup_test_root(root);
+    let db = open_db(config_with_small_memtable(root));
+    db.put(0, b"k1", 0, b"v1").unwrap();
+
+    let mut iter = {
+        let temporary_borrow = &db;
+        scan_from_borrowed_db(temporary_borrow)
+    };
+
+    let (key, columns) = iter.next().unwrap().unwrap();
+    assert_eq!(key.as_ref(), b"k1");
+    assert_eq!(columns[0].as_deref(), Some(b"v1".as_slice()));
+    assert!(iter.next().is_none());
+
+    drop(iter);
+    db.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
 fn test_db_scan_holds_snapshot_until_drop() {
     let root = "/tmp/db_scan_snapshot";
     cleanup_test_root(root);

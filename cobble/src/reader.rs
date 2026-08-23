@@ -301,7 +301,7 @@ impl Reader {
         db.get_with_options(bucket_id, key, options)
     }
 
-    pub fn scan(&mut self, bucket_id: u16, range: Range<&[u8]>) -> Result<DbIterator<'static>> {
+    pub fn scan(&mut self, bucket_id: u16, range: Range<&[u8]>) -> Result<DbIterator> {
         self.scan_with_options(bucket_id, range, &ScanOptions::default())
     }
 
@@ -310,7 +310,7 @@ impl Reader {
         bucket_id: u16,
         range: Range<&[u8]>,
         options: &ScanOptions,
-    ) -> Result<DbIterator<'static>> {
+    ) -> Result<DbIterator> {
         if self.auto_refresh {
             self.refresh_if_changed(false)?;
         }

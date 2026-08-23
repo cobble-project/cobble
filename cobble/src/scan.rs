@@ -205,7 +205,7 @@ pub struct ScanSplitScanner {
     db: ReadOnlyDb,
     buckets: Vec<u16>,
     current_bucket_index: usize,
-    current_iter: Option<DbIterator<'static>>,
+    current_iter: Option<DbIterator>,
     bounds: ScanSplitScannerBounds,
     scan_options: Option<ScanOptions>,
     skip_start_key_once: bool,

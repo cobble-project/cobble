@@ -251,20 +251,16 @@ impl SingleDb {
         self.db.get_with_options(bucket, key, options)
     }
 
-    pub fn scan<'a>(
-        &'a self,
-        bucket: u16,
-        range: std::ops::Range<&[u8]>,
-    ) -> Result<crate::DbIterator<'a>> {
+    pub fn scan(&self, bucket: u16, range: std::ops::Range<&[u8]>) -> Result<crate::DbIterator> {
         self.scan_with_options(bucket, range, &crate::ScanOptions::default())
     }
 
-    pub fn scan_with_options<'a>(
-        &'a self,
+    pub fn scan_with_options(
+        &self,
         bucket: u16,
         range: std::ops::Range<&[u8]>,
         options: &crate::ScanOptions,
-    ) -> Result<crate::DbIterator<'a>> {
+    ) -> Result<crate::DbIterator> {
         self.db.scan_with_options(bucket, range, options)
     }
 

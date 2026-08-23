@@ -775,18 +775,20 @@ fn test_scan_max_rows_shadow_allowance_disables_deeper_collected_limits_after_sk
         Arc::new(DbStateHandle::new()),
         Arc::clone(&metrics_manager),
     ));
-    let manager = MemtableManager::new(
-        Arc::clone(&file_manager),
-        Arc::clone(&lsm_tree),
-        MemtableManagerOptions {
-            memtable_capacity: 4096,
-            buffer_count: 2,
-            num_columns: 1,
-            write_stall_limit: 8,
-            ..MemtableManagerOptions::default()
-        },
-    )
-    .unwrap();
+    let manager = Arc::new(
+        MemtableManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&lsm_tree),
+            MemtableManagerOptions {
+                memtable_capacity: 4096,
+                buffer_count: 2,
+                num_columns: 1,
+                write_stall_limit: 8,
+                ..MemtableManagerOptions::default()
+            },
+        )
+        .unwrap(),
+    );
     manager.open().unwrap();
 
     let schema = manager.schema_manager.latest_schema();
@@ -870,7 +872,7 @@ fn test_scan_max_rows_shadow_allowance_disables_deeper_collected_limits_after_sk
             lower_bound_exclusive: None,
             max_rows: Some(1),
             snapshot,
-            memtable_manager: Some(&manager),
+            memtable_manager: Some(Arc::clone(&manager)),
             access_guard: None,
             vlog_store: Arc::clone(&manager.vlog_store),
             ttl_provider: manager.lsm_tree.ttl_provider(),
