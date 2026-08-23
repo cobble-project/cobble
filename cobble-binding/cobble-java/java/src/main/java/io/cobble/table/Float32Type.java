@@ -1,12 +1,12 @@
 package io.cobble.table;
 
 public final class Float32Type extends PrimitiveType {
-    public Float32Type(boolean nullable) {
+    Float32Type(boolean nullable) {
         super(Kind.FLOAT32, nullable);
     }
 
     @Override
-    public Float32Type withNullability(boolean nullable) {
+    Float32Type withNullability(boolean nullable) {
         return LogicalTypes.float32(nullable);
     }
 

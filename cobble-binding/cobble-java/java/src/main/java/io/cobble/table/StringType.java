@@ -1,12 +1,12 @@
 package io.cobble.table;
 
 public final class StringType extends PrimitiveType {
-    public StringType(boolean nullable) {
+    StringType(boolean nullable) {
         super(Kind.STRING, nullable);
     }
 
     @Override
-    public StringType withNullability(boolean nullable) {
+    StringType withNullability(boolean nullable) {
         return LogicalTypes.string(nullable);
     }
 

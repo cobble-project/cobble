@@ -44,7 +44,7 @@ impl ExtensionType {
         Ok(extension)
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.type_id.trim().is_empty() {
             return Err(TableError::InvalidSchema(
                 "extension type id must not be empty".to_string(),
@@ -198,7 +198,7 @@ impl LogicalType {
         self
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         match &self.kind {
             LogicalTypeKind::Decimal { precision, scale }
                 if *precision == 0 || *precision > 38 || scale > precision =>
@@ -280,7 +280,7 @@ impl DataField {
         Ok(field)
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             return Err(TableError::InvalidSchema(format!(
                 "field {} name must not be empty",

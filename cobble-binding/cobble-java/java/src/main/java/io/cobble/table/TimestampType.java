@@ -6,7 +6,7 @@ public final class TimestampType extends LogicalType {
     private final int precision;
     private final TimestampKind timestampKind;
 
-    public TimestampType(int precision, TimestampKind timestampKind, boolean nullable) {
+    TimestampType(int precision, TimestampKind timestampKind, boolean nullable) {
         super(Kind.TIMESTAMP, nullable);
         this.precision = precision;
         this.timestampKind = Objects.requireNonNull(timestampKind, "timestampKind");
@@ -22,7 +22,7 @@ public final class TimestampType extends LogicalType {
     }
 
     @Override
-    public TimestampType withNullability(boolean nullable) {
+    TimestampType withNullability(boolean nullable) {
         return new TimestampType(precision, timestampKind, nullable);
     }
 
@@ -37,7 +37,7 @@ public final class TimestampType extends LogicalType {
     }
 
     @Override
-    public void validate() {
+    void validate() {
         if (precision < 0 || precision > 9)
             throw new IllegalArgumentException("invalid timestamp precision");
     }

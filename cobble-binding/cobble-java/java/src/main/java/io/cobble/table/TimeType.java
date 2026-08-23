@@ -5,7 +5,7 @@ import java.util.Objects;
 public final class TimeType extends LogicalType {
     private final int precision;
 
-    public TimeType(int precision, boolean nullable) {
+    TimeType(int precision, boolean nullable) {
         super(Kind.TIME, nullable);
         this.precision = precision;
         validate();
@@ -16,7 +16,7 @@ public final class TimeType extends LogicalType {
     }
 
     @Override
-    public TimeType withNullability(boolean nullable) {
+    TimeType withNullability(boolean nullable) {
         return new TimeType(precision, nullable);
     }
 
@@ -31,7 +31,7 @@ public final class TimeType extends LogicalType {
     }
 
     @Override
-    public void validate() {
+    void validate() {
         if (precision < 0 || precision > 9)
             throw new IllegalArgumentException("invalid time precision");
     }

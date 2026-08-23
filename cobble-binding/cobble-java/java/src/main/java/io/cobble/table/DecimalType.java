@@ -5,7 +5,7 @@ import java.util.Objects;
 public final class DecimalType extends LogicalType {
     private final int precision, scale;
 
-    public DecimalType(int precision, int scale, boolean nullable) {
+    DecimalType(int precision, int scale, boolean nullable) {
         super(Kind.DECIMAL, nullable);
         this.precision = precision;
         this.scale = scale;
@@ -21,7 +21,7 @@ public final class DecimalType extends LogicalType {
     }
 
     @Override
-    public DecimalType withNullability(boolean nullable) {
+    DecimalType withNullability(boolean nullable) {
         return new DecimalType(precision, scale, nullable);
     }
 
@@ -36,7 +36,7 @@ public final class DecimalType extends LogicalType {
     }
 
     @Override
-    public void validate() {
+    void validate() {
         if (precision < 1 || precision > 38 || scale < 0 || scale > precision)
             throw new IllegalArgumentException("invalid decimal precision/scale");
     }

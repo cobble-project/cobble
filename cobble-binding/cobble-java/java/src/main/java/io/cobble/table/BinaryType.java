@@ -1,12 +1,12 @@
 package io.cobble.table;
 
 public final class BinaryType extends PrimitiveType {
-    public BinaryType(boolean nullable) {
+    BinaryType(boolean nullable) {
         super(Kind.BINARY, nullable);
     }
 
     @Override
-    public BinaryType withNullability(boolean nullable) {
+    BinaryType withNullability(boolean nullable) {
         return LogicalTypes.binary(nullable);
     }
 

@@ -40,7 +40,7 @@ public abstract class LogicalType {
         return nullable;
     }
 
-    public abstract LogicalType withNullability(boolean nullable);
+    abstract LogicalType withNullability(boolean nullable);
 
     public LogicalType nullable() {
         return withNullability(true);
@@ -50,9 +50,9 @@ public abstract class LogicalType {
         return withNullability(false);
     }
 
-    public void validate() {}
+    void validate() {}
 
-    public final boolean isKeyCompatible() {
+    final boolean isKeyCompatible() {
         if (nullable) return false;
         switch (kind) {
             case BOOLEAN:

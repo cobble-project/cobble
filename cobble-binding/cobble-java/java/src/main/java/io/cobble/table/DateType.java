@@ -1,12 +1,12 @@
 package io.cobble.table;
 
 public final class DateType extends PrimitiveType {
-    public DateType(boolean nullable) {
+    DateType(boolean nullable) {
         super(Kind.DATE, nullable);
     }
 
     @Override
-    public DateType withNullability(boolean nullable) {
+    DateType withNullability(boolean nullable) {
         return LogicalTypes.date(nullable);
     }
 

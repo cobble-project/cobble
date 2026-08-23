@@ -5,7 +5,7 @@ import java.util.Objects;
 public final class StructType extends LogicalType {
     private final RecordType recordType;
 
-    public StructType(RecordType recordType, boolean nullable) {
+    StructType(RecordType recordType, boolean nullable) {
         super(Kind.STRUCT, nullable);
         this.recordType = Objects.requireNonNull(recordType, "recordType");
         validate();
@@ -16,7 +16,7 @@ public final class StructType extends LogicalType {
     }
 
     @Override
-    public StructType withNullability(boolean nullable) {
+    StructType withNullability(boolean nullable) {
         return new StructType(recordType, nullable);
     }
 
@@ -31,7 +31,7 @@ public final class StructType extends LogicalType {
     }
 
     @Override
-    public void validate() {
+    void validate() {
         recordType.validate();
     }
 

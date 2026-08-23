@@ -5,7 +5,7 @@ import java.util.Objects;
 public final class MapType extends LogicalType {
     private final LogicalType keyType, valueType;
 
-    public MapType(LogicalType keyType, LogicalType valueType, boolean nullable) {
+    MapType(LogicalType keyType, LogicalType valueType, boolean nullable) {
         super(Kind.MAP, nullable);
         this.keyType = Objects.requireNonNull(keyType, "keyType");
         this.valueType = Objects.requireNonNull(valueType, "valueType");
@@ -21,7 +21,7 @@ public final class MapType extends LogicalType {
     }
 
     @Override
-    public MapType withNullability(boolean nullable) {
+    MapType withNullability(boolean nullable) {
         return new MapType(keyType, valueType, nullable);
     }
 
@@ -36,7 +36,7 @@ public final class MapType extends LogicalType {
     }
 
     @Override
-    public void validate() {
+    void validate() {
         if (keyType.isNullable())
             throw new IllegalArgumentException("map keys must not be nullable");
         keyType.validate();

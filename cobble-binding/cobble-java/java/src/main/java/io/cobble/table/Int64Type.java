@@ -1,12 +1,12 @@
 package io.cobble.table;
 
 public final class Int64Type extends PrimitiveType {
-    public Int64Type(boolean nullable) {
+    Int64Type(boolean nullable) {
         super(Kind.INT64, nullable);
     }
 
     @Override
-    public Int64Type withNullability(boolean nullable) {
+    Int64Type withNullability(boolean nullable) {
         return LogicalTypes.int64(nullable);
     }
 

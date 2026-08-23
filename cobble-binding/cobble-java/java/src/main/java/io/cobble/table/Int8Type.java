@@ -1,12 +1,12 @@
 package io.cobble.table;
 
 public final class Int8Type extends PrimitiveType {
-    public Int8Type(boolean nullable) {
+    Int8Type(boolean nullable) {
         super(Kind.INT8, nullable);
     }
 
     @Override
-    public Int8Type withNullability(boolean nullable) {
+    Int8Type withNullability(boolean nullable) {
         return LogicalTypes.int8(nullable);
     }
 

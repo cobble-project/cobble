@@ -25,7 +25,7 @@ impl TableSchema {
         Ok(schema)
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.fields.is_empty() {
             return Err(TableError::InvalidSchema(
                 "table must contain at least one field".to_string(),

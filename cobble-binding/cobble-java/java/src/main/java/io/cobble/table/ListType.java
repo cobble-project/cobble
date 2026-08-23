@@ -5,7 +5,7 @@ import java.util.Objects;
 public final class ListType extends LogicalType {
     private final LogicalType elementType;
 
-    public ListType(LogicalType elementType, boolean nullable) {
+    ListType(LogicalType elementType, boolean nullable) {
         super(Kind.LIST, nullable);
         this.elementType = Objects.requireNonNull(elementType, "elementType");
         validate();
@@ -16,7 +16,7 @@ public final class ListType extends LogicalType {
     }
 
     @Override
-    public ListType withNullability(boolean nullable) {
+    ListType withNullability(boolean nullable) {
         return new ListType(elementType, nullable);
     }
 
@@ -31,7 +31,7 @@ public final class ListType extends LogicalType {
     }
 
     @Override
-    public void validate() {
+    void validate() {
         elementType.validate();
     }
 

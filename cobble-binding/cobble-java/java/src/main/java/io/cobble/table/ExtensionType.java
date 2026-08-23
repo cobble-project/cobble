@@ -10,7 +10,7 @@ public final class ExtensionType extends LogicalType {
     private final JsonElement parameters;
     private final LogicalType physicalType;
 
-    public ExtensionType(
+    ExtensionType(
             String typeId, String parametersJson, LogicalType physicalType, boolean nullable) {
         super(Kind.EXTENSION, nullable);
         this.typeId = Objects.requireNonNull(typeId, "typeId");
@@ -32,7 +32,7 @@ public final class ExtensionType extends LogicalType {
     }
 
     @Override
-    public ExtensionType withNullability(boolean nullable) {
+    ExtensionType withNullability(boolean nullable) {
         return new ExtensionType(typeId, parameters.toString(), physicalType, nullable);
     }
 
@@ -47,7 +47,7 @@ public final class ExtensionType extends LogicalType {
     }
 
     @Override
-    public void validate() {
+    void validate() {
         if (typeId.trim().isEmpty())
             throw new IllegalArgumentException("extension type id must not be empty");
         physicalType.validate();

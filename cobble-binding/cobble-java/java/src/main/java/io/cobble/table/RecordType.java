@@ -20,7 +20,7 @@ public final class RecordType {
         return fields;
     }
 
-    public void validate() {
+    void validate() {
         Set<Long> ids = new HashSet<Long>();
         Set<String> names = new HashSet<String>();
         for (DataField field : fields) {
