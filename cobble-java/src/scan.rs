@@ -223,12 +223,12 @@ pub(crate) struct ScanCursorHandle {
 }
 
 enum ScanCursorIter {
-    Db(Box<DbIterator<'static>>),
+    Db(Box<DbIterator>),
     Split(Box<ScanSplitScanner>),
 }
 
 impl ScanCursorHandle {
-    pub(crate) fn from_static_iter(iter: DbIterator<'static>) -> ScanCursorHandle {
+    pub(crate) fn from_static_iter(iter: DbIterator) -> ScanCursorHandle {
         ScanCursorHandle {
             inner: Box::new(StaticScanCursorInner {
                 iter: ScanCursorIter::Db(Box::new(iter)),

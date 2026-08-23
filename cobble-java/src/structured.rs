@@ -2849,11 +2849,6 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredScanCursor(
             }
         }
     };
-    // SAFETY: StructuredDbIterator borrows from DataStructureDb which is alive as long as
-    // the Java Db object keeps the native handle.
-    let iter = unsafe {
-        std::mem::transmute::<StructuredDbIterator<'_>, StructuredDbIterator<'static>>(iter)
-    };
     let cursor = StructuredScanCursorHandle::new(iter);
     Box::into_raw(Box::new(cursor)) as jlong
 }
@@ -2909,9 +2904,6 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredDirectScanCurs
                 return 0;
             }
         }
-    };
-    let iter = unsafe {
-        std::mem::transmute::<StructuredDbIterator<'_>, StructuredDbIterator<'static>>(iter)
     };
     let cursor = StructuredScanCursorHandle::new(iter);
     Box::into_raw(Box::new(cursor)) as jlong
@@ -3405,12 +3397,12 @@ pub(crate) struct StructuredScanCursorHandle {
 }
 
 pub(crate) enum StructuredScanCursorIter {
-    Db(Box<StructuredDbIterator<'static>>),
+    Db(Box<StructuredDbIterator>),
     Split(Box<StructuredScanSplitScanner>),
 }
 
 impl StructuredScanCursorHandle {
-    pub(crate) fn new(iter: StructuredDbIterator<'static>) -> Self {
+    pub(crate) fn new(iter: StructuredDbIterator) -> Self {
         Self {
             iter: StructuredScanCursorIter::Db(Box::new(iter)),
             exhausted: false,

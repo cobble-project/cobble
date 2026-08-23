@@ -777,14 +777,6 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_openStructuredScanCurs
             }
         }
     };
-    // SAFETY: StructuredDbIterator borrows from StructuredSingleDb which is alive as long as
-    // the Java SingleDb object keeps the native handle.
-    let iter = unsafe {
-        std::mem::transmute::<
-            cobble_data_structure::StructuredDbIterator<'_>,
-            cobble_data_structure::StructuredDbIterator<'static>,
-        >(iter)
-    };
     let cursor = StructuredScanCursorHandle::new(iter);
     Box::into_raw(Box::new(cursor)) as jlong
 }
