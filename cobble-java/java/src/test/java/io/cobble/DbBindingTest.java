@@ -490,6 +490,52 @@ class DbBindingTest {
     }
 
     @Test
+    void structuredResumeFromSnapshotAndActiveSwitchFlow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-structured-active-switch-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        config.walEnabled = false;
+
+        String dbId;
+        long snapshot1;
+        try (io.cobble.structured.Db db = io.cobble.structured.Db.open(config)) {
+            dbId = db.id();
+            db.put(
+                    0,
+                    "base".getBytes(StandardCharsets.UTF_8),
+                    0,
+                    "v1".getBytes(StandardCharsets.UTF_8));
+            snapshot1 = db.snapshot().snapshotId;
+            db.put(
+                    0,
+                    "newer".getBytes(StandardCharsets.UTF_8),
+                    0,
+                    "v2".getBytes(StandardCharsets.UTF_8));
+            db.updateSchema().addListColumn(0, io.cobble.structured.ListConfig.defaults()).commit();
+            assertTrue(
+                    db.currentSchema().getColumnType(0)
+                            instanceof io.cobble.structured.Schema.ColumnType.List);
+            assertTrue(db.snapshot().snapshotId > snapshot1);
+
+            db.switchToSnapshot(snapshot1);
+            assertTrue(
+                    db.currentSchema().getColumnType(0)
+                            instanceof io.cobble.structured.Schema.ColumnType.Bytes);
+            assertArrayEquals(
+                    "v1".getBytes(StandardCharsets.UTF_8),
+                    db.get(0, "base".getBytes(StandardCharsets.UTF_8)).getBytes(0));
+            assertNull(db.get(0, "newer".getBytes(StandardCharsets.UTF_8)));
+        }
+
+        try (io.cobble.structured.Db historical =
+                io.cobble.structured.Db.resumeFromSnapshot(config, snapshot1, dbId)) {
+            assertArrayEquals(
+                    "v1".getBytes(StandardCharsets.UTF_8),
+                    historical.get(0, "base".getBytes(StandardCharsets.UTF_8)).getBytes(0));
+            assertNull(historical.get(0, "newer".getBytes(StandardCharsets.UTF_8)));
+        }
+    }
+
+    @Test
     void snapshotReadonlyReaderAndCoordinatorFlow() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-snapshot-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
@@ -721,6 +767,59 @@ class DbBindingTest {
                             valueBytes("restore-v", i), resumed.get(0, keyBytes("restore", i), 0));
                 }
             }
+        }
+    }
+
+    @Test
+    void resumeFromSnapshotAndActiveSwitchFlow() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-active-switch-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        config.walEnabled = false;
+        Path configPath = writeConfigFile(dataDir, config);
+
+        String dbId;
+        long snapshot1;
+        try (Db db = Db.open(config)) {
+            dbId = db.id();
+            db.put(
+                    0,
+                    "base".getBytes(StandardCharsets.UTF_8),
+                    0,
+                    "v1".getBytes(StandardCharsets.UTF_8));
+            snapshot1 = db.snapshot().snapshotId;
+
+            db.put(
+                    0,
+                    "newer".getBytes(StandardCharsets.UTF_8),
+                    0,
+                    "v2".getBytes(StandardCharsets.UTF_8));
+            long snapshot2 = db.snapshot().snapshotId;
+            assertTrue(snapshot2 > snapshot1);
+
+            db.switchToSnapshot(snapshot1);
+            assertArrayEquals(
+                    "v1".getBytes(StandardCharsets.UTF_8),
+                    db.get(0, "base".getBytes(StandardCharsets.UTF_8), 0));
+            assertNull(db.get(0, "newer".getBytes(StandardCharsets.UTF_8), 0));
+        }
+
+        try (Db historical = Db.resumeFromSnapshot(config, snapshot1, dbId)) {
+            assertArrayEquals(
+                    "v1".getBytes(StandardCharsets.UTF_8),
+                    historical.get(0, "base".getBytes(StandardCharsets.UTF_8), 0));
+            assertNull(historical.get(0, "newer".getBytes(StandardCharsets.UTF_8), 0));
+        }
+
+        try (Db historical =
+                Db.resumeFromSnapshot(
+                        configPath.toString(), snapshot1, dbId, RecoveryMode.SNAPSHOT_ONLY)) {
+            assertNull(historical.get(0, "newer".getBytes(StandardCharsets.UTF_8), 0));
+        }
+
+        try (Db latest = Db.resume(config, dbId, RecoveryMode.SNAPSHOT_ONLY)) {
+            assertArrayEquals(
+                    "v2".getBytes(StandardCharsets.UTF_8),
+                    latest.get(0, "newer".getBytes(StandardCharsets.UTF_8), 0));
         }
     }
 

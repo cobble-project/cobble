@@ -1135,6 +1135,46 @@ impl StructuredDb {
         )?)
     }
 
+    /// Resume an exact historical snapshot without replaying WAL.
+    pub fn resume_from_snapshot(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+    ) -> Result<Self> {
+        Self::resume_from_snapshot_with_resolver(config, snapshot_id, db_id, None)
+    }
+
+    /// Resume an exact historical snapshot with a custom merge-operator resolver.
+    pub fn resume_from_snapshot_with_resolver(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        Self::from_db(Db::resume_from_snapshot_with_resolver(
+            config,
+            snapshot_id,
+            db_id,
+            Some(combined_resolver(resolver)),
+        )?)
+    }
+
+    /// Resume a selected snapshot using the requested WAL recovery behavior.
+    pub fn resume_from_snapshot_with_recovery_mode(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+        recovery_mode: RecoveryMode,
+    ) -> Result<Self> {
+        Self::from_db(Db::resume_from_snapshot_with_recovery_mode_and_resolver(
+            config,
+            snapshot_id,
+            db_id,
+            recovery_mode,
+            Some(combined_resolver(None)),
+        )?)
+    }
+
     pub fn expand_bucket(
         &self,
         source_db_id: impl Into<String>,
@@ -1598,6 +1638,13 @@ impl StructuredDb {
 
     pub fn snapshot(&self) -> Result<u64> {
         self.db.snapshot()
+    }
+
+    /// Switch this running handle to an exact historical snapshot.
+    pub fn switch_to_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
+        self.db
+            .switch_to_snapshot_with_resolver(snapshot_id, Some(combined_resolver(None)))?;
+        self.reload_schema()
     }
 
     /// Change the memtable implementation for future rotations.

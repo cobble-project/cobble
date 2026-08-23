@@ -1332,6 +1332,41 @@ fn resume_structured_db(
     }
 }
 
+fn resume_structured_db_from_snapshot(
+    env: &mut JNIEnv,
+    config: Config,
+    snapshot_id: jlong,
+    db_id: JString,
+    recovery_mode: RecoveryMode,
+) -> jlong {
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    let db_id = match decode_java_string(env, db_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    match DataStructureDb::resume_from_snapshot_with_recovery_mode(
+        config,
+        snapshot_id,
+        db_id,
+        recovery_mode,
+    ) {
+        Ok(db) => Box::into_raw(Box::new(db)) as jlong,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            0
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_structured_Db_resumeHandleWithRecoveryMode(
     mut env: JNIEnv,
@@ -1390,6 +1425,126 @@ pub extern "system" fn Java_io_cobble_structured_Db_resumeHandleFromJsonWithReco
         }
     };
     resume_structured_db(&mut env, config, db_id, recovery_mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_resumeFromSnapshotHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+) -> jlong {
+    let config_path = match decode_java_string(&mut env, config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(&config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    resume_structured_db_from_snapshot(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        RecoveryMode::SnapshotOnly,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_resumeFromSnapshotHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+) -> jlong {
+    let config_json = match decode_java_string(&mut env, config_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
+    };
+    resume_structured_db_from_snapshot(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        RecoveryMode::SnapshotOnly,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_resumeFromSnapshotHandleWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let config_path = match decode_java_string(&mut env, config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(&config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_structured_db_from_snapshot(&mut env, config, snapshot_id, db_id, recovery_mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_resumeFromSnapshotHandleFromJsonWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let config_json = match decode_java_string(&mut env, config_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_structured_db_from_snapshot(&mut env, config, snapshot_id, db_id, recovery_mode)
 }
 
 // ── dispose ─────────────────────────────────────────────────────────────────
@@ -3021,6 +3176,28 @@ pub extern "system" fn Java_io_cobble_structured_Db_switchMemtableType(
         }
     };
     if let Err(err) = db.switch_memtable_type(memtable_type, flush_current == JNI_TRUE) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_switchToSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    snapshot_id: jlong,
+) {
+    let Some(db) = db_from_handle_mut(&mut env, handle) else {
+        return;
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    if let Err(err) = db.switch_to_snapshot(snapshot_id) {
         throw_illegal_state(&mut env, err.to_string());
     }
 }

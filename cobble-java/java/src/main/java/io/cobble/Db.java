@@ -340,6 +340,65 @@ public final class Db extends NativeObject {
         return wrapOpenedDb(nativeHandle);
     }
 
+    /** Resume a writable DB from an exact snapshot without replaying WAL. */
+    public static Db resumeFromSnapshot(String configPath, long snapshotId, String dbId) {
+        NativeLoader.load();
+        long nativeHandle = resumeFromSnapshotHandle(configPath, snapshotId, dbId);
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("failed to resume db from snapshot");
+        }
+        return wrapOpenedDb(nativeHandle);
+    }
+
+    /** Resume a selected snapshot with explicit WAL recovery behavior. */
+    public static Db resumeFromSnapshot(
+            String configPath, long snapshotId, String dbId, RecoveryMode recoveryMode) {
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle =
+                resumeFromSnapshotHandleWithRecoveryMode(
+                        configPath, snapshotId, dbId, recoveryMode.ordinal());
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("failed to resume db from snapshot with recovery mode");
+        }
+        return wrapOpenedDb(nativeHandle);
+    }
+
+    /** Resume a writable DB from an exact snapshot without replaying WAL. */
+    public static Db resumeFromSnapshot(Config config, long snapshotId, String dbId) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle = resumeFromSnapshotHandleFromJson(config.toJson(), snapshotId, dbId);
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("failed to resume db from snapshot config json");
+        }
+        return wrapOpenedDb(nativeHandle);
+    }
+
+    /** Resume a selected snapshot with explicit WAL recovery behavior. */
+    public static Db resumeFromSnapshot(
+            Config config, long snapshotId, String dbId, RecoveryMode recoveryMode) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        if (recoveryMode == null) {
+            throw new IllegalArgumentException("recoveryMode must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle =
+                resumeFromSnapshotHandleFromJsonWithRecoveryMode(
+                        config.toJson(), snapshotId, dbId, recoveryMode.ordinal());
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException(
+                    "failed to resume db from snapshot config json with recovery mode");
+        }
+        return wrapOpenedDb(nativeHandle);
+    }
+
     /**
      * Put one column value for a key.
      *
@@ -1039,6 +1098,17 @@ public final class Db extends NativeObject {
                 nativeHandle, memtableType.name().toLowerCase(Locale.ROOT), flushCurrent);
     }
 
+    /**
+     * Switch this active handle to an exact historical snapshot.
+     *
+     * <p>The call must not overlap reads or writes on this handle. It does not create a snapshot;
+     * after a restart, use {@link #resumeFromSnapshot(Config, long, String)} again to select the
+     * historical snapshot until a later snapshot has been published.
+     */
+    public void switchToSnapshot(long snapshotId) {
+        switchToSnapshot(nativeHandle, snapshotId);
+    }
+
     /** Expand bucket ownership by importing data from another shard snapshot. */
     public long expandBucket(
             String sourceDbId,
@@ -1252,6 +1322,18 @@ public final class Db extends NativeObject {
     private static native long resumeHandleFromJsonWithRecoveryMode(
             String configJson, String dbId, int recoveryMode);
 
+    private static native long resumeFromSnapshotHandle(
+            String configPath, long snapshotId, String dbId);
+
+    private static native long resumeFromSnapshotHandleFromJson(
+            String configJson, long snapshotId, String dbId);
+
+    private static native long resumeFromSnapshotHandleWithRecoveryMode(
+            String configPath, long snapshotId, String dbId, int recoveryMode);
+
+    private static native long resumeFromSnapshotHandleFromJsonWithRecoveryMode(
+            String configJson, long snapshotId, String dbId, int recoveryMode);
+
     private static native void put(
             long nativeHandle, int bucket, byte[] key, int column, byte[] value);
 
@@ -1353,6 +1435,8 @@ public final class Db extends NativeObject {
 
     private static native void switchMemtableType(
             long nativeHandle, String memtableType, boolean flushCurrent);
+
+    private static native void switchToSnapshot(long nativeHandle, long snapshotId);
 
     private static native String id(long nativeHandle);
 

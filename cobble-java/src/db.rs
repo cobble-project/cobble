@@ -392,6 +392,42 @@ fn resume_db(
     Box::into_raw(Box::new(db)) as jlong
 }
 
+fn resume_db_from_snapshot(
+    env: &mut JNIEnv,
+    config: Config,
+    snapshot_id: jlong,
+    db_id: JString,
+    recovery_mode: RecoveryMode,
+) -> jlong {
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    let db_id = match decode_java_string(env, db_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return 0;
+        }
+    };
+    let db = match Db::resume_from_snapshot_with_recovery_mode(
+        config,
+        snapshot_id,
+        db_id,
+        recovery_mode,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(db)) as jlong
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Db_resumeHandleFromJson(
     mut env: JNIEnv,
@@ -470,6 +506,126 @@ pub extern "system" fn Java_io_cobble_Db_resumeHandleFromJsonWithRecoveryMode(
         }
     };
     resume_db(&mut env, config, db_id, recovery_mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_resumeFromSnapshotHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    resume_db_from_snapshot(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        RecoveryMode::SnapshotOnly,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_resumeFromSnapshotHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    resume_db_from_snapshot(
+        &mut env,
+        config,
+        snapshot_id,
+        db_id,
+        RecoveryMode::SnapshotOnly,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_resumeFromSnapshotHandleWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_db_from_snapshot(&mut env, config, snapshot_id, db_id, recovery_mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_resumeFromSnapshotHandleFromJsonWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    snapshot_id: jlong,
+    db_id: JString,
+    recovery_mode_value: jint,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_db_from_snapshot(&mut env, config, snapshot_id, db_id, recovery_mode)
 }
 
 fn open_db(env: &mut JNIEnv, config: Config) -> jlong {
@@ -1723,6 +1879,28 @@ pub extern "system" fn Java_io_cobble_Db_switchMemtableType(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_switchToSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    snapshot_id: jlong,
+) {
+    let Some(db) = db_from_handle_mut_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    if let Err(err) = db.switch_to_snapshot(snapshot_id) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Db_expireSnapshot(
     mut env: JNIEnv,
     _class: JClass,
@@ -1931,6 +2109,16 @@ pub(crate) fn db_from_handle_or_throw(
     }
     // SAFETY: `native_handle` is created from `Box<Db>` and valid until `disposeInternal`.
     Some(unsafe { &*(native_handle as *const Db) })
+}
+
+fn db_from_handle_mut_or_throw(env: &mut JNIEnv, native_handle: jlong) -> Option<&'static mut Db> {
+    if native_handle == 0 {
+        throw_illegal_state(env, "db handle is disposed".to_string());
+        return None;
+    }
+    // SAFETY: `native_handle` is created from `Box<Db>` and Java serializes active snapshot
+    // switching against all other operations on the same handle.
+    Some(unsafe { &mut *(native_handle as *mut Db) })
 }
 
 fn direct_buffer_pool_config_array(

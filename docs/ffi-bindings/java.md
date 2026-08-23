@@ -74,10 +74,21 @@ Db restoredFromManifest = Db.restoreWithManifest("config.yaml", input.manifestPa
 // Restore the latest snapshot and replay its durable WAL tail
 Db recovered = Db.restore(
         "config.yaml", input.snapshotId, db.id(), RecoveryMode.LATEST_WITH_WAL);
+
+// Resume this db identity from an exact historical snapshot without replaying WAL
+Db historical = Db.resumeFromSnapshot("config.yaml", input.snapshotId, db.id());
+
+// Switch an active handle to an exact historical snapshot
+db.switchToSnapshot(input.snapshotId);
 ```
 
 The same `RecoveryMode` overloads are available on raw and structured `Db` and on `SingleDb`. See
 [Write-Ahead Log](../architecture/wal) for the two recovery modes.
+
+Raw and structured `Db` both expose `resumeFromSnapshot(...)` and `switchToSnapshot(...)`.
+The active switch is runtime-only, must not overlap other calls on the same handle, and does not
+create a snapshot. See [Active Snapshot Switch](../architecture/snapshot#active-snapshot-switch)
+for its restart and WAL lifecycle limitations.
 
 Load referenced files from `Readonly` volumes into primary storage with:
 
