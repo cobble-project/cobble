@@ -1,0 +1,60 @@
+name: C++ binding CI
+
+on:
+  push:
+    paths:
+      - "cobble-cpp/**"
+      - "cobble/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/cpp-ci.yml"
+  pull_request:
+    paths:
+      - "cobble-cpp/**"
+      - "cobble/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/cpp-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Test Rust bridge
+        run: cargo test -p cobble-cpp
+      - name: Lint Rust bridge
+        run: cargo clippy -p cobble-cpp --all-targets -- -D warnings
+
+  cpp:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-26, windows-2025-vs2026]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure
+        run: >-
+          cmake -S cobble-cpp -B build/cobble-cpp
+          -DCMAKE_BUILD_TYPE=Release
+          -DCOBBLE_CPP_BUILD_TESTS=ON
+          -DCOBBLE_CPP_BUILD_EXAMPLES=ON
+      - name: Build
+        run: cmake --build build/cobble-cpp --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build/cobble-cpp -C Release --output-on-failure
+      - name: Install
+        run: >-
+          cmake --install build/cobble-cpp --config Release
+          --prefix build/cobble-cpp-install

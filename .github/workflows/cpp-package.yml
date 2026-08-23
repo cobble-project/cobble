@@ -1,0 +1,55 @@
+name: Package C++ binding
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            artifact: cobble-cpp-macos-arm64
+            features: storage-all
+          - os: macos-26-intel
+            artifact: cobble-cpp-macos-x64
+            features: storage-all
+          - os: ubuntu-24.04
+            artifact: cobble-cpp-linux-x64
+            features: storage-all
+          - os: ubuntu-24.04-arm
+            artifact: cobble-cpp-linux-arm64
+            features: storage-all
+          - os: windows-2025-vs2026
+            artifact: cobble-cpp-windows-x64
+            features: storage-alluxio,storage-cos,storage-ftp,storage-goosefs,storage-oss,storage-s3
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure
+        run: >-
+          cmake -S cobble-cpp -B build/cobble-cpp
+          -DCMAKE_BUILD_TYPE=Release
+          -DCOBBLE_CPP_BUILD_TESTS=ON
+          -DCOBBLE_CPP_CARGO_FEATURES=${{ matrix.features }}
+      - name: Build
+        run: cmake --build build/cobble-cpp --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build/cobble-cpp -C Release --output-on-failure
+      - name: Install package tree
+        run: >-
+          cmake --install build/cobble-cpp --config Release
+          --prefix build/package
+      - name: Upload package tree
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/package
+          if-no-files-found: error
