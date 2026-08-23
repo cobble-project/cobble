@@ -135,6 +135,12 @@ pub struct FileSystemRegistry {
     registered: DashMap<String, Arc<dyn FileSystem>>,
 }
 
+impl Default for FileSystemRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileSystemRegistry {
     pub fn new() -> Self {
         Self {
