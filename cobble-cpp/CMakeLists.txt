@@ -8,6 +8,11 @@ if(NOT CMAKE_MATCH_1)
   message(FATAL_ERROR "Could not read the Cobble workspace version")
 endif()
 
+if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING
+      "Minimum macOS version for both Rust and C++ objects")
+endif()
+
 project(cobble-cpp VERSION "${CMAKE_MATCH_1}" LANGUAGES CXX)
 
 include(CMakePackageConfigHelpers)
@@ -49,11 +54,16 @@ if(COBBLE_CPP_CARGO_FEATURES)
        "${COBBLE_CPP_CARGO_FEATURES}")
 endif()
 
+set(COBBLE_CARGO_ENV "CARGO_TARGET_DIR=${COBBLE_CARGO_TARGET_DIR}")
+if(APPLE)
+  list(APPEND COBBLE_CARGO_ENV
+       "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+endif()
+
 add_custom_target(
   cobble_cpp_cargo
   COMMAND
-    "${CMAKE_COMMAND}" -E env
-    "CARGO_TARGET_DIR=${COBBLE_CARGO_TARGET_DIR}"
+    "${CMAKE_COMMAND}" -E env ${COBBLE_CARGO_ENV}
     "${COBBLE_CARGO_EXECUTABLE}" build --manifest-path
     "${COBBLE_WORKSPACE_ROOT}/Cargo.toml" -p cobble-cpp
     $<IF:$<CONFIG:Debug>,--profile=dev,--release> ${COBBLE_CARGO_FEATURE_ARGS}
