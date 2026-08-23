@@ -82,4 +82,3 @@ synchronization.
 
 Release all scan cursors before an explicit `Database::Close`. Normal RAII
 destruction is safe because every cursor retains its database owner.
-

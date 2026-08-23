@@ -38,4 +38,3 @@ If a caller buffer is too small, `NextBatchInto` returns
 `BufferStatus::kBufferTooSmall` and the exact `bytes_required`. It retains the
 pending rows, so a retry with a sufficiently large buffer produces the same
 batch without skipping scan results.
-

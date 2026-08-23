@@ -3,4 +3,3 @@
 include("${CMAKE_CURRENT_LIST_DIR}/cobble-cpp-targets.cmake")
 
 check_required_components(cobble-cpp)
-
