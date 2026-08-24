@@ -606,6 +606,10 @@ fn native_database_set_time(db: &NativeDatabase, unix_seconds: u32) {
 }
 
 fn open_database(config: Config) -> BridgeResult<Box<NativeDatabase>> {
+    // Static libraries do not reliably run OpenDAL's constructor-based
+    // registration. Initialize the enabled storage services and default HTTP
+    // transport before URI-backed storage is first used.
+    opendal::install_default();
     SingleDb::open(config)
         .map(|db| Box::new(NativeDatabase { db: Arc::new(db) }))
         .map_err(format_cobble_error)
@@ -616,6 +620,7 @@ fn resume_database(
     snapshot_id: u64,
     recovery_mode: RecoveryMode,
 ) -> BridgeResult<Box<NativeDatabase>> {
+    opendal::install_default();
     SingleDb::resume_with_recovery_mode(config, snapshot_id, recovery_mode)
         .map(|db| Box::new(NativeDatabase { db: Arc::new(db) }))
         .map_err(format_cobble_error)
