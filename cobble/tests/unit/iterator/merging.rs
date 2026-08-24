@@ -8,6 +8,7 @@ struct BoundaryMockIterator {
     pause_after_index: Option<usize>,
     should_stop_at_block_boundary: bool,
     pending_resume: bool,
+    remaining_resume_boundaries: usize,
     stopped_at_block_boundary: bool,
 }
 
@@ -30,8 +31,14 @@ impl BoundaryMockIterator {
             pause_after_index,
             should_stop_at_block_boundary: false,
             pending_resume: false,
+            remaining_resume_boundaries: 0,
             stopped_at_block_boundary: false,
         }
+    }
+
+    fn with_resume_boundaries(mut self, count: usize) -> Self {
+        self.remaining_resume_boundaries = count;
+        self
     }
 }
 
@@ -60,6 +67,11 @@ impl<'a> KvIterator<'a> for BoundaryMockIterator {
         }
         self.stopped_at_block_boundary = false;
         if self.pending_resume {
+            if self.should_stop_at_block_boundary && self.remaining_resume_boundaries > 0 {
+                self.remaining_resume_boundaries -= 1;
+                self.stopped_at_block_boundary = true;
+                return Ok(false);
+            }
             self.pending_resume = false;
             self.index += 1;
             return Ok(self.index < self.entries.len());
@@ -77,7 +89,7 @@ impl<'a> KvIterator<'a> for BoundaryMockIterator {
     }
 
     fn valid(&self) -> bool {
-        self.index < self.entries.len()
+        !self.stopped_at_block_boundary && self.index < self.entries.len()
     }
 
     fn key(&self) -> Result<Option<&[u8]>> {
@@ -250,20 +262,22 @@ fn test_merging_iterator_many() {
 
 #[test]
 fn test_merging_iterator_resumes_after_child_boundary_stop() {
-    let iter1 = BoundaryMockIterator::new(vec![(b"a".as_slice(), b"1"), (b"e", b"5")], Some(0));
+    let iter1 = BoundaryMockIterator::new(vec![(b"a".as_slice(), b"1"), (b"e", b"5")], Some(0))
+        .with_resume_boundaries(1);
     let iter2 = BoundaryMockIterator::new(vec![(b"b".as_slice(), b"2"), (b"c", b"3")], None);
     let mut merger = MergingIterator::new(vec![iter1, iter2]);
     merger.set_stop_at_block_boundary(true);
     merger.seek_to_first().unwrap();
 
     let mut keys: Vec<Bytes> = vec![merger.take_current().unwrap().unwrap().0];
+    let mut boundary_keys = Vec::new();
     loop {
         if merger.next().unwrap() {
             keys.push(merger.take_current().unwrap().unwrap().0);
             continue;
         }
         if merger.stopped_at_block_boundary() {
-            assert_eq!(keys.last().unwrap().as_ref(), b"c");
+            boundary_keys.push(keys.last().cloned().unwrap());
             merger.clear_stop_at_block_boundary();
             continue;
         }
@@ -278,6 +292,10 @@ fn test_merging_iterator_resumes_after_child_boundary_stop() {
             Bytes::from_static(b"c"),
             Bytes::from_static(b"e"),
         ]
+    );
+    assert_eq!(
+        boundary_keys,
+        vec![Bytes::from_static(b"a"), Bytes::from_static(b"a")]
     );
 }
 

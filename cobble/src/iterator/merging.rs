@@ -158,12 +158,12 @@ impl<I> MergingIterator<I> {
                 }
                 continue;
             }
-            if iter.valid() && iter.key()?.is_some() {
-                self.push_heap(idx)?;
-            }
         }
-        self.current_idx = self.heap.first().copied();
-        Ok(())
+        // Child resumption can move from one physical file or block to
+        // another. Rebuild from every currently valid child so the next row is
+        // selected globally, including children that remained parked in the
+        // heap while the boundary was surfaced.
+        self.rebuild_heap()
     }
 }
 
@@ -204,7 +204,12 @@ where
                 return Ok(false);
             }
             self.resume_paused_iterators()?;
-            if self.current_idx.is_none() && !self.paused_iterators.is_empty() {
+            if !self.paused_iterators.is_empty() {
+                // A child can encounter another physical boundary while
+                // resuming (for example, a data-block boundary followed by a
+                // file boundary). Its next key is still unknown, so rows from
+                // the parked heap cannot yet be returned safely.
+                self.current_idx = None;
                 self.stopped_at_block_boundary = true;
                 return Ok(false);
             }
@@ -217,15 +222,27 @@ where
         };
 
         // Advance the iterator that had the minimum
+        let mut stopped_at_child_boundary = false;
         if let Some(iter) = self.iterators.get_mut(iter_idx) {
             let advanced = iter.next()?;
             if !advanced {
                 if iter.stopped_at_block_boundary() {
                     self.paused_iterators.push(iter_idx);
+                    stopped_at_child_boundary = true;
                 }
             } else if iter.valid() && iter.key()?.is_some() {
                 self.push_heap(iter_idx)?;
             }
+        }
+
+        // Once any child pauses, its next key is unknown until that child is
+        // resumed. Do not expose rows from the remaining heap in the meantime:
+        // they may sort after the paused child's next block. Keep the heap
+        // intact and rebuild the globally ordered position after clear/resume.
+        if stopped_at_child_boundary {
+            self.current_idx = None;
+            self.stopped_at_block_boundary = true;
+            return Ok(false);
         }
 
         // Update current_idx to the new minimum
