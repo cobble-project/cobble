@@ -30,8 +30,12 @@ cmake --build build/cobble-cpp --parallel
 ctest --test-dir build/cobble-cpp --output-on-failure
 ```
 
-CTest runs both a focused API test and a bulk end-to-end test. The latter
-writes 20,000 two-column rows (12.8 MB of values) across 16 buckets, verifies
+CTest runs a focused binding test, a complete public-API/snapshot-recovery
+test, and a bulk end-to-end test. The API test covers JSON and file-based
+open/resume, both recovery modes, WAL replay, TTL, mutation and projection
+options, caller-owned buffers, multi-run block-boundary resume, and snapshot
+retention/expiration. The bulk test writes 20,000 two-column rows (12.8 MB of
+values) across 16 buckets, verifies
 point reads, both scan ownership modes, snapshot creation, close, resume, and a
 second full scan of the restored database.
 
@@ -46,6 +50,29 @@ cmake -S cobble-cpp -B build/cobble-cpp \
   -DCMAKE_BUILD_TYPE=Release \
   -DCOBBLE_CPP_CARGO_FEATURES="storage-s3,storage-oss"
 ```
+
+The S3 protocol test is opt-in because it needs an existing S3-compatible
+endpoint and bucket. Enable `storage-s3` and the test target, then provide the
+test credentials when running CTest:
+
+```bash
+cmake -S cobble-cpp -B build/cobble-cpp-s3 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCOBBLE_CPP_BUILD_TESTS=ON \
+  -DCOBBLE_CPP_BUILD_S3_E2E_TEST=ON \
+  -DCOBBLE_CPP_CARGO_FEATURES=storage-s3
+cmake --build build/cobble-cpp-s3 --parallel
+COBBLE_S3_ENDPOINT=http://127.0.0.1:9000 \
+COBBLE_S3_BUCKET=cobble-cpp-test \
+COBBLE_S3_ACCESS_ID=rustfsadmin \
+COBBLE_S3_SECRET_KEY=rustfsadmin \
+ctest --test-dir build/cobble-cpp-s3 -R cobble_cpp_s3_e2e \
+  --output-on-failure
+```
+
+The test writes 512 rows, materializes an S3-backed snapshot, closes the
+database, resumes that exact snapshot, and verifies point reads plus a full
+ordered scan. CI runs the same flow against a pinned RustFS container.
 
 ## Use from CMake
 

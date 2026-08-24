@@ -58,3 +58,52 @@ jobs:
         run: >-
           cmake --install build/cobble-cpp --config Release
           --prefix build/cobble-cpp-install
+
+  s3-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Start local S3 service (RustFS)
+        run: |
+          set -euo pipefail
+          docker run -d --rm --name cobble-cpp-s3 \
+            -p 9000:9000 rustfs/rustfs:1.0.0-alpha.91
+          for i in {1..60}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9000/ || true)
+            if [ "$code" != "000" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs cobble-cpp-s3 || true
+          exit 1
+      - name: Create test bucket
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y awscli
+          export AWS_ACCESS_KEY_ID=rustfsadmin
+          export AWS_SECRET_ACCESS_KEY=rustfsadmin
+          export AWS_DEFAULT_REGION=us-east-1
+          aws --endpoint-url http://127.0.0.1:9000 s3api head-bucket --bucket cobble-cpp-test || \
+            aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket cobble-cpp-test
+      - name: Configure
+        run: >-
+          cmake -S cobble-cpp -B build/cobble-cpp
+          -DCMAKE_BUILD_TYPE=Release
+          -DCOBBLE_CPP_BUILD_TESTS=ON
+          -DCOBBLE_CPP_BUILD_S3_E2E_TEST=ON
+          -DCOBBLE_CPP_CARGO_FEATURES=storage-s3
+      - name: Build
+        run: cmake --build build/cobble-cpp --config Release --parallel
+      - name: Test S3 snapshot and resume
+        env:
+          COBBLE_S3_ENDPOINT: http://127.0.0.1:9000
+          COBBLE_S3_BUCKET: cobble-cpp-test
+          COBBLE_S3_ACCESS_ID: rustfsadmin
+          COBBLE_S3_SECRET_KEY: rustfsadmin
+        run: ctest --test-dir build/cobble-cpp -C Release -R cobble_cpp_s3_e2e --output-on-failure
+      - name: Stop local S3 service
+        if: always()
+        run: docker rm -f cobble-cpp-s3 >/dev/null 2>&1 || true

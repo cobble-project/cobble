@@ -20,6 +20,8 @@ include(GNUInstallDirs)
 
 option(COBBLE_CPP_BUILD_TESTS "Build the C++ binding tests" OFF)
 option(COBBLE_CPP_BUILD_EXAMPLES "Build the C++ binding examples" OFF)
+option(COBBLE_CPP_BUILD_S3_E2E_TEST
+       "Build the C++ S3 snapshot/resume integration test" OFF)
 set(COBBLE_CPP_CARGO_FEATURES "" CACHE STRING
     "Comma-separated Cargo features for cobble-cpp")
 
@@ -142,6 +144,17 @@ if(COBBLE_CPP_BUILD_TESTS)
   add_test(NAME cobble_cpp_api_coverage COMMAND cobble_cpp_api_coverage_test)
   set_tests_properties(cobble_cpp_api_coverage PROPERTIES TIMEOUT 180)
 
+  if(COBBLE_CPP_BUILD_S3_E2E_TEST)
+    add_executable(cobble_cpp_s3_e2e_test tests/s3_e2e_test.cpp)
+    target_link_libraries(cobble_cpp_s3_e2e_test PRIVATE cobble::cobble)
+    add_test(NAME cobble_cpp_s3_e2e COMMAND cobble_cpp_s3_e2e_test)
+    set_tests_properties(cobble_cpp_s3_e2e PROPERTIES TIMEOUT 180)
+  endif()
+endif()
+
+if(COBBLE_CPP_BUILD_S3_E2E_TEST AND NOT COBBLE_CPP_BUILD_TESTS)
+  message(FATAL_ERROR
+          "COBBLE_CPP_BUILD_S3_E2E_TEST requires COBBLE_CPP_BUILD_TESTS=ON")
 endif()
 
 install(
