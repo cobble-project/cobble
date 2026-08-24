@@ -136,6 +136,12 @@ if(COBBLE_CPP_BUILD_TESTS)
   target_link_libraries(cobble_cpp_bulk_e2e_test PRIVATE cobble::cobble)
   add_test(NAME cobble_cpp_bulk_e2e COMMAND cobble_cpp_bulk_e2e_test)
   set_tests_properties(cobble_cpp_bulk_e2e PROPERTIES TIMEOUT 180)
+
+  add_executable(cobble_cpp_api_coverage_test tests/api_coverage_test.cpp)
+  target_link_libraries(cobble_cpp_api_coverage_test PRIVATE cobble::cobble)
+  add_test(NAME cobble_cpp_api_coverage COMMAND cobble_cpp_api_coverage_test)
+  set_tests_properties(cobble_cpp_api_coverage PROPERTIES TIMEOUT 180)
+
 endif()
 
 install(
