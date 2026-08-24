@@ -158,12 +158,17 @@ impl<I> MergingIterator<I> {
                 }
                 continue;
             }
+            if iter.valid() && iter.key()?.is_some() {
+                self.push_heap(idx)?;
+            }
         }
-        // Child resumption can move from one physical file or block to
-        // another. Rebuild from every currently valid child so the next row is
-        // selected globally, including children that remained parked in the
-        // heap while the boundary was surfaced.
-        self.rebuild_heap()
+        // The paused child was removed by pop_heap(), while every other child
+        // stayed in a valid heap. Incrementally reinsert each resumed child;
+        // only expose the root after every child has a comparable next key.
+        if self.paused_iterators.is_empty() {
+            self.current_idx = self.heap.first().copied();
+        }
+        Ok(())
     }
 }
 
