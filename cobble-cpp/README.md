@@ -30,6 +30,11 @@ cmake --build build/cobble-cpp --parallel
 ctest --test-dir build/cobble-cpp --output-on-failure
 ```
 
+CTest runs both a focused API test and a bulk end-to-end test. The latter
+writes 20,000 two-column rows (12.8 MB of values) across 16 buckets, verifies
+point reads, both scan ownership modes, snapshot creation, close, resume, and a
+second full scan of the restored database.
+
 The default build produces the shared target `cobble::cobble`. Cargo builds the
 private Rust static library as part of the CMake build.
 

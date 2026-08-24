@@ -2,12 +2,12 @@
 
 #include <algorithm>
 #include <array>
-#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -15,12 +15,25 @@
 
 namespace {
 
+#define CHECK(condition)                                                     \
+  do {                                                                       \
+    if (!(condition)) {                                                      \
+      throw std::runtime_error("check failed: " #condition);                \
+    }                                                                        \
+  } while (false)
+
 cobble::BytesView Bytes(std::string_view value) {
   return {reinterpret_cast<const std::uint8_t*>(value.data()), value.size()};
 }
 
 std::string String(cobble::BytesView value) {
   return {reinterpret_cast<const char*>(value.data()), value.size()};
+}
+
+std::string FileUrl(const std::filesystem::path& path) {
+  const auto generic = path.generic_string();
+  return "file://" + std::string(generic.starts_with('/') ? "" : "/") +
+         generic;
 }
 
 std::uint16_t U16(const std::uint8_t* value) {
@@ -46,33 +59,33 @@ std::uint64_t U64(const std::uint8_t* value) {
 
 void VerifyEncodedBatch(const std::vector<std::uint8_t>& encoded,
                         std::size_t expected_rows) {
-  assert(encoded.size() >= 24);
-  assert(std::memcmp(encoded.data(), "CBRB", 4) == 0);
-  assert(U16(encoded.data() + 4) == 1);
-  assert(U16(encoded.data() + 6) == 24);
-  assert(U32(encoded.data() + 12) == expected_rows);
-  assert(U64(encoded.data() + 16) == encoded.size());
+  CHECK(encoded.size() >= 24);
+  CHECK(std::memcmp(encoded.data(), "CBRB", 4) == 0);
+  CHECK(U16(encoded.data() + 4) == 1);
+  CHECK(U16(encoded.data() + 6) == 24);
+  CHECK(U32(encoded.data() + 12) == expected_rows);
+  CHECK(U64(encoded.data() + 16) == encoded.size());
 
   std::size_t offset = 24;
   for (std::size_t row = 0; row < expected_rows; ++row) {
-    assert(offset + 12 <= encoded.size());
-    assert(U16(encoded.data() + offset) == 0);
+    CHECK(offset + 12 <= encoded.size());
+    CHECK(U16(encoded.data() + offset) == 0);
     const auto key_length = U32(encoded.data() + offset + 4);
     const auto column_count = U32(encoded.data() + offset + 8);
     offset += 12;
-    assert(offset + key_length <= encoded.size());
+    CHECK(offset + key_length <= encoded.size());
     offset += key_length;
     for (std::size_t column = 0; column < column_count; ++column) {
-      assert(offset + 8 <= encoded.size());
+      CHECK(offset + 8 <= encoded.size());
       const auto length = U64(encoded.data() + offset);
       offset += 8;
       if (length != std::numeric_limits<std::uint64_t>::max()) {
-        assert(length <= encoded.size() - offset);
+        CHECK(length <= encoded.size() - offset);
         offset += static_cast<std::size_t>(length);
       }
     }
   }
-  assert(offset == encoded.size());
+  CHECK(offset == encoded.size());
 }
 
 }  // namespace
@@ -84,68 +97,68 @@ int main() {
   std::filesystem::remove_all(root);
 
   const std::string config =
-      R"({"volumes":[{"base_dir":"file://)" + root.string() +
+      R"({"volumes":[{"base_dir":")" + FileUrl(root) +
       R"(","kinds":["meta","primary_data_priority_high"]}],"num_columns":2,"total_buckets":16,"block_cache_size":0})";
 
   {
     auto db = cobble::Database::Open(config);
-    assert(!cobble::Version().empty());
+    CHECK(!cobble::Version().empty());
 
     db.Put(0, Bytes("key-1"), 0, Bytes("value-1-0"));
     db.Put(0, Bytes("key-1"), 1, Bytes("value-1-1"));
 
     auto row = db.Get(0, Bytes("key-1"));
-    assert(row.found());
-    assert(row.column_count() == 2);
-    assert(String(row.column(0)) == "value-1-0");
-    assert(String(row.column(1)) == "value-1-1");
+    CHECK(row.found());
+    CHECK(row.column_count() == 2);
+    CHECK(String(row.column(0)) == "value-1-0");
+    CHECK(String(row.column(1)) == "value-1-1");
 
     auto missing = db.Get(0, Bytes("missing"));
-    assert(!missing.found());
+    CHECK(!missing.found());
 
     cobble::ReadOptions one_column;
     one_column.columns = {1};
     std::array<std::uint8_t, 2> small = {0xAA, 0xBB};
     const auto too_small =
         db.GetColumnInto(0, Bytes("key-1"), small, one_column);
-    assert(too_small.status == cobble::BufferStatus::kBufferTooSmall);
-    assert(too_small.bytes_required == std::string_view("value-1-1").size());
-    assert((small == std::array<std::uint8_t, 2>{0xAA, 0xBB}));
+    CHECK(too_small.status == cobble::BufferStatus::kBufferTooSmall);
+    CHECK(too_small.bytes_required == std::string_view("value-1-1").size());
+    CHECK((small == std::array<std::uint8_t, 2>{0xAA, 0xBB}));
 
     std::vector<std::uint8_t> value(too_small.bytes_required);
     const auto copied =
         db.GetColumnInto(0, Bytes("key-1"), value, one_column);
-    assert(copied.status == cobble::BufferStatus::kOk);
-    assert(String(value) == "value-1-1");
+    CHECK(copied.status == cobble::BufferStatus::kOk);
+    CHECK(String(value) == "value-1-1");
 
     cobble::WriteBatch batch;
     batch.Put(0, Bytes("key-2"), 0, Bytes("value-2-0"));
     batch.Put(0, Bytes("key-3"), 0, Bytes("value-3-0"));
     batch.Delete(0, Bytes("key-1"), 0);
-    assert(batch.size() == 3);
+    CHECK(batch.size() == 3);
     db.Write(std::move(batch));
 
     auto scan = db.Scan(0, Bytes("key-1"), Bytes("key-4"));
     auto owned = scan.Next(16);
-    assert(owned.row_count() == 3);
-    assert(String(owned.key(0)) == "key-1");
-    assert(!owned.has_column(0, 0));
-    assert(String(owned.column(0, 1)) == "value-1-1");
-    assert(String(owned.key(1)) == "key-2");
-    assert(String(owned.column(1, 0)) == "value-2-0");
-    assert(owned.end());
+    CHECK(owned.row_count() == 3);
+    CHECK(String(owned.key(0)) == "key-1");
+    CHECK(!owned.has_column(0, 0));
+    CHECK(String(owned.column(0, 1)) == "value-1-1");
+    CHECK(String(owned.key(1)) == "key-2");
+    CHECK(String(owned.column(1, 0)) == "value-2-0");
+    CHECK(owned.end());
 
     auto encoded_scan = db.Scan(0, std::nullopt, std::nullopt);
     std::array<std::uint8_t, 1> tiny{};
     const auto pending = encoded_scan.NextBatchInto(16, tiny);
-    assert(pending.status == cobble::BufferStatus::kBufferTooSmall);
-    assert(pending.bytes_required > tiny.size());
+    CHECK(pending.status == cobble::BufferStatus::kBufferTooSmall);
+    CHECK(pending.bytes_required > tiny.size());
 
     std::vector<std::uint8_t> encoded(pending.bytes_required);
     const auto encoded_result = encoded_scan.NextBatchInto(16, encoded);
-    assert(encoded_result.status == cobble::BufferStatus::kOk);
-    assert(encoded_result.bytes_written == encoded.size());
-    assert(encoded_result.row_count == 3);
+    CHECK(encoded_result.status == cobble::BufferStatus::kOk);
+    CHECK(encoded_result.bytes_written == encoded.size());
+    CHECK(encoded_result.row_count == 3);
     VerifyEncodedBatch(encoded, 3);
 
     const auto snapshot = db.Snapshot();
@@ -159,8 +172,8 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
     }
-    assert(materialized);
-    assert(db.SnapshotManifestJson(snapshot).find("\"id\":") !=
+    CHECK(materialized);
+    CHECK(db.SnapshotManifestJson(snapshot).find("\"id\":") !=
            std::string::npos);
   }
 
@@ -170,7 +183,7 @@ int main() {
   } catch (const cobble::Error& error) {
     saw_config_error = error.code() == cobble::ErrorCode::kConfiguration;
   }
-  assert(saw_config_error);
+  CHECK(saw_config_error);
 
   std::filesystem::remove_all(root);
 }
