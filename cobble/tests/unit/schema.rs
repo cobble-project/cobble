@@ -117,6 +117,16 @@ fn test_schema_evolution_add_column_with_default() {
     let default_column = evolved.columns()[1].as_ref().unwrap();
     assert_eq!(*default_column.value_type(), ValueType::Put);
     assert_eq!(default_column.data().as_ref(), b"default");
+
+    let deleted = Value::new(vec![Some(Column::new(ValueType::Delete, Bytes::new()))]);
+    let evolved = manager
+        .evolve_value_in_family(deleted, 0, 1, DEFAULT_COLUMN_FAMILY_ID)
+        .unwrap();
+    assert!(evolved.columns().iter().all(|column| {
+        column
+            .as_ref()
+            .is_some_and(|column| *column.value_type() == ValueType::Delete)
+    }));
 }
 
 #[test]
@@ -139,6 +149,63 @@ fn test_schema_evolution_delete_column() {
     assert_eq!(
         evolved.columns()[0].as_ref().unwrap().data().as_ref(),
         b"v0"
+    );
+}
+
+#[test]
+fn test_schema_evolution_remaps_columns_atomically() {
+    let manager = Arc::new(SchemaManager::new(3));
+    let mut builder = manager.builder();
+    builder
+        .remap_columns(
+            None,
+            vec![
+                ColumnRemap::Source(2),
+                ColumnRemap::Default(Bytes::from_static(b"new")),
+                ColumnRemap::Source(0),
+            ],
+        )
+        .unwrap();
+    let schema = builder.commit();
+    let schema_file = schema_to_file(&schema);
+    let restored = schema_from_file(&schema_file, None).unwrap();
+    manager
+        .schemas
+        .write()
+        .unwrap()
+        .insert(1, Arc::new(restored));
+
+    let value = Value::new(vec![
+        Some(Column::new(ValueType::Put, Bytes::from_static(b"v0"))),
+        Some(Column::new(ValueType::Put, Bytes::from_static(b"v1"))),
+        Some(Column::new(ValueType::Put, Bytes::from_static(b"v2"))),
+    ]);
+    let evolved = manager
+        .evolve_value_in_family(value, 0, 1, DEFAULT_COLUMN_FAMILY_ID)
+        .unwrap();
+    let columns = evolved.columns();
+    assert_eq!(columns.len(), 3);
+    assert_eq!(columns[0].as_ref().unwrap().data().as_ref(), b"v2");
+    assert_eq!(columns[1].as_ref().unwrap().data().as_ref(), b"new");
+    assert_eq!(columns[2].as_ref().unwrap().data().as_ref(), b"v0");
+    let deleted = Value::new(vec![
+        Some(Column::new(ValueType::Delete, Bytes::new())),
+        Some(Column::new(ValueType::Delete, Bytes::new())),
+        Some(Column::new(ValueType::Delete, Bytes::new())),
+    ]);
+    let evolved = manager
+        .evolve_value_in_family(deleted, 0, 1, DEFAULT_COLUMN_FAMILY_ID)
+        .unwrap();
+    assert!(evolved.columns().iter().all(|column| {
+        column
+            .as_ref()
+            .is_some_and(|column| *column.value_type() == ValueType::Delete)
+    }));
+    assert!(
+        Arc::new(SchemaManager::new(2))
+            .builder()
+            .remap_columns(None, vec![ColumnRemap::Source(0), ColumnRemap::Source(0)])
+            .is_err()
     );
 }
 

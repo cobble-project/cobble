@@ -1,3 +1,4 @@
+use crate::catalog::{CatalogSchemaId, TableId};
 use crate::layout::{LayoutCompiler, RecordLayoutDescriptor};
 use crate::{Result, TableError, TableSchema};
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,14 @@ pub(crate) struct TableMetadata {
     pub(crate) version: u32,
     pub(crate) schema: TableSchema,
     pub(crate) layout: RecordLayoutDescriptor,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) catalog_binding: Option<CatalogBinding>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CatalogBinding {
+    pub(crate) table_id: TableId,
+    pub(crate) catalog_schema_id: CatalogSchemaId,
 }
 
 impl TableMetadata {
@@ -22,7 +31,21 @@ impl TableMetadata {
             version: TABLE_METADATA_VERSION_CURRENT,
             schema,
             layout,
+            catalog_binding: None,
         })
+    }
+
+    pub(crate) fn compile_catalog(
+        schema: TableSchema,
+        table_id: TableId,
+        catalog_schema_id: CatalogSchemaId,
+    ) -> Result<Self> {
+        let mut metadata = Self::compile(schema)?;
+        metadata.catalog_binding = Some(CatalogBinding {
+            table_id,
+            catalog_schema_id,
+        });
+        Ok(metadata)
     }
 
     pub(crate) fn validate(&self) -> Result<()> {

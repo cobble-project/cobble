@@ -332,7 +332,11 @@ impl<'db> Table<'db> {
         })
     }
 
-    fn from_metadata(db: &'db Db, name: String, metadata: TableMetadata) -> Result<Self> {
+    pub(crate) fn from_metadata(
+        db: &'db Db,
+        name: String,
+        metadata: TableMetadata,
+    ) -> Result<Self> {
         let compiled = compile_table(metadata, db.total_buckets())?;
         Ok(Self {
             db,

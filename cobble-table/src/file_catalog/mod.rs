@@ -1,80 +1,79 @@
-use super::catalog_store::CatalogStore;
-use super::model::{
-    CatalogSchemaId, CatalogTable, FileCatalogConfig, SchemaChange, TableId, TableIdentifier,
+use self::catalog_store::CatalogStore;
+use crate::catalog::{
+    Catalog, CatalogError, CatalogResult, CatalogSchemaId, CatalogTable, SchemaChange, TableId,
+    TableIdentifier,
 };
-use crate::{DataField, FieldId, LogicalType, LogicalTypeKind, TableError, TableSchema};
-use cobble::Config;
+use crate::metadata::TableMetadata;
+use crate::{
+    DataField, FieldId, LogicalType, LogicalTypeKind, Table, TableError, TableSchema, Value,
+    ValueCodec,
+};
+use cobble::{ColumnFamilyOptions, ColumnRemap, Config, Db};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use thiserror::Error;
 use uuid::Uuid;
+
+mod catalog_store;
+
+impl From<cobble::Error> for CatalogError {
+    fn from(error: cobble::Error) -> Self {
+        Self::Backend(Box::new(error))
+    }
+}
 
 const CATALOG_FORMAT: &str = "cobble-table-catalog";
 const CATALOG_VERSION: u32 = 1;
-pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum CatalogError {
-    #[error("invalid catalog identifier: {0}")]
-    InvalidIdentifier(String),
-    #[error("namespace already exists: {0:?}")]
-    NamespaceAlreadyExists(Vec<String>),
-    #[error("namespace not found: {0:?}")]
-    NamespaceNotFound(Vec<String>),
-    #[error("namespace is not empty: {0:?}")]
-    NamespaceNotEmpty(Vec<String>),
-    #[error("table already exists: {0:?}")]
-    TableAlreadyExists(TableIdentifier),
-    #[error("table not found: {0:?}")]
-    TableNotFound(TableIdentifier),
-    #[error("catalog schema {catalog_schema_id} not found for table {table:?}")]
-    SchemaNotFound {
-        table: TableIdentifier,
-        catalog_schema_id: CatalogSchemaId,
-    },
-    #[error("invalid catalog schema evolution: {0}")]
-    InvalidSchemaEvolution(String),
-    #[error("invalid catalog metadata: {0}")]
-    InvalidMetadata(String),
-    #[error(transparent)]
-    Storage(#[from] cobble::Error),
-    #[error(transparent)]
-    Table(#[from] TableError),
+/// Runtime-only configuration for a file catalog.
+///
+/// Volume descriptors and credentials remain in [`cobble::Config`] and are never written into
+/// catalog metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileCatalogConfig {
+    storage_id: String,
 }
 
-/// Semantic catalog operations.
-pub trait Catalog: Send + Sync {
-    fn create_namespace(&self, namespace: Vec<String>) -> CatalogResult<()>;
-    fn list_namespaces(&self) -> CatalogResult<Vec<Vec<String>>>;
-    fn drop_namespace(&self, namespace: &[String]) -> CatalogResult<()>;
-    fn create_table(
-        &self,
-        identifier: TableIdentifier,
-        schema: TableSchema,
-    ) -> CatalogResult<CatalogTable>;
-    fn load_table(&self, identifier: &TableIdentifier) -> CatalogResult<CatalogTable>;
-    fn load_table_schema(
-        &self,
-        identifier: &TableIdentifier,
-        catalog_schema_id: CatalogSchemaId,
-    ) -> CatalogResult<TableSchema>;
-    fn evolve_schema(
-        &self,
-        identifier: &TableIdentifier,
-        changes: Vec<SchemaChange>,
-    ) -> CatalogResult<CatalogTable>;
-    fn list_tables(&self, namespace: &[String]) -> CatalogResult<Vec<TableIdentifier>>;
-    fn table_exists(&self, identifier: &TableIdentifier) -> CatalogResult<bool>;
-    fn rename_table(
-        &self,
-        identifier: &TableIdentifier,
-        new_name: String,
-    ) -> CatalogResult<CatalogTable>;
-    fn drop_table(&self, identifier: &TableIdentifier) -> CatalogResult<()>;
+impl FileCatalogConfig {
+    pub fn new(storage_id: impl Into<String>) -> Self {
+        Self {
+            storage_id: storage_id.into(),
+        }
+    }
+
+    pub fn storage_id(&self) -> &str {
+        &self.storage_id
+    }
 }
 
+/// One catalog schema version materialized into a shard's core schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardSchemaMapping {
+    table_id: TableId,
+    db_id: String,
+    catalog_schema_id: CatalogSchemaId,
+    core_schema_id: u64,
+}
+
+impl ShardSchemaMapping {
+    pub fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    pub fn db_id(&self) -> &str {
+        &self.db_id
+    }
+
+    pub fn catalog_schema_id(&self) -> CatalogSchemaId {
+        self.catalog_schema_id
+    }
+
+    pub fn core_schema_id(&self) -> u64 {
+        self.core_schema_id
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CurrentPointer {
     format: String,
@@ -143,6 +142,16 @@ struct TableSchemaRecord {
     used_field_ids: Vec<FieldId>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ShardSchemaMappingFile {
+    format: String,
+    version: u32,
+    table_id: TableId,
+    db_id: String,
+    catalog_schema_id: CatalogSchemaId,
+    core_schema_id: u64,
+}
+
 /// File-backed table catalog.
 ///
 /// Operations are serialized across handles in this process and refresh CURRENT before every
@@ -164,6 +173,144 @@ impl FileCatalog {
             state: Mutex::new(manifest),
             operation_lock,
         })
+    }
+
+    /// Materialize the current catalog schema into one writable shard.
+    ///
+    /// Calls for a shard must not run concurrently with other core schema updates.
+    pub fn materialize_table<'db>(
+        &self,
+        db: &'db Db,
+        identifier: &TableIdentifier,
+    ) -> CatalogResult<Table<'db>> {
+        let table = self.load_table(identifier)?;
+        let physical_name = physical_table_name(table.table_id);
+        let target =
+            TableMetadata::compile_catalog(table.schema, table.table_id, table.catalog_schema_id)?;
+        let current = db.current_schema();
+        let core_schema_id = if let Some(column_family_id) =
+            current.column_family_ids().get(&physical_name).copied()
+        {
+            let options = current.column_family_options_in_family(column_family_id);
+            let existing = options.metadata.as_ref().ok_or_else(|| {
+                TableError::InvalidSchema(format!(
+                    "column family '{physical_name}' is not a catalog table"
+                ))
+            })?;
+            let existing = TableMetadata::from_value(existing)?;
+            let binding = existing.catalog_binding.ok_or_else(|| {
+                TableError::InvalidSchema(format!(
+                    "column family '{physical_name}' is not a catalog table"
+                ))
+            })?;
+            if binding.table_id != table.table_id {
+                return Err(TableError::InvalidSchema(format!(
+                    "column family '{physical_name}' belongs to another catalog table"
+                ))
+                .into());
+            }
+            if binding.catalog_schema_id > table.catalog_schema_id {
+                return Err(TableError::InvalidSchema(format!(
+                    "catalog schema {} cannot replace newer materialized schema {}",
+                    table.catalog_schema_id, binding.catalog_schema_id
+                ))
+                .into());
+            }
+            if binding.catalog_schema_id == table.catalog_schema_id {
+                if existing != target
+                    || current.num_columns_in_family(column_family_id)
+                        != Some(target.layout.value_columns.len().max(1))
+                {
+                    return Err(TableError::InvalidSchema(
+                        "materialized table metadata does not match the catalog".to_string(),
+                    )
+                    .into());
+                }
+                current.version()
+            } else {
+                let remap = build_column_remap(&existing, &target)?;
+                let mut builder = db.update_schema();
+                builder.remap_columns(Some(physical_name.clone()), remap)?;
+                builder.set_column_family_options(
+                    Some(physical_name.clone()),
+                    ColumnFamilyOptions {
+                        metadata: Some(target.to_value()?),
+                        ..ColumnFamilyOptions::default()
+                    },
+                )?;
+                builder.commit().version()
+            }
+        } else {
+            let mut builder = db.update_schema();
+            builder.ensure_column_family_exists(physical_name.clone())?;
+            for column in 0..target.layout.value_columns.len().max(1) {
+                builder.add_column(column, None, None, Some(physical_name.clone()))?;
+            }
+            builder.set_column_family_options(
+                Some(physical_name.clone()),
+                ColumnFamilyOptions {
+                    metadata: Some(target.to_value()?),
+                    ..ColumnFamilyOptions::default()
+                },
+            )?;
+            builder.commit().version()
+        };
+
+        self.write_schema_mapping(ShardSchemaMappingFile {
+            format: CATALOG_FORMAT.to_string(),
+            version: CATALOG_VERSION,
+            table_id: table.table_id,
+            db_id: db.id().to_string(),
+            catalog_schema_id: table.catalog_schema_id,
+            core_schema_id,
+        })?;
+        Table::from_metadata(db, physical_name, target).map_err(Into::into)
+    }
+
+    /// Load the core schema id used for one table schema on a shard.
+    pub fn load_shard_schema_mapping(
+        &self,
+        identifier: &TableIdentifier,
+        db_id: &str,
+        catalog_schema_id: CatalogSchemaId,
+    ) -> CatalogResult<ShardSchemaMapping> {
+        let table = self.load_table(identifier)?;
+        if catalog_schema_id > table.catalog_schema_id {
+            return Err(CatalogError::SchemaNotFound {
+                table: identifier.clone(),
+                catalog_schema_id,
+            });
+        }
+        let mapping: ShardSchemaMappingFile = read_json(
+            &self.store,
+            &schema_mapping_path(table.table_id, db_id, catalog_schema_id),
+        )?;
+        validate_header(&mapping.format, mapping.version)?;
+        validate_schema_mapping_key(&mapping, table.table_id, db_id, catalog_schema_id)?;
+        Ok(ShardSchemaMapping {
+            table_id: mapping.table_id,
+            db_id: mapping.db_id,
+            catalog_schema_id: mapping.catalog_schema_id,
+            core_schema_id: mapping.core_schema_id,
+        })
+    }
+
+    fn write_schema_mapping(&self, mapping: ShardSchemaMappingFile) -> CatalogResult<()> {
+        let path = schema_mapping_path(mapping.table_id, &mapping.db_id, mapping.catalog_schema_id);
+        if self.store.exists(&path)? {
+            let existing: ShardSchemaMappingFile = read_json(&self.store, &path)?;
+            validate_header(&existing.format, existing.version)?;
+            validate_schema_mapping_key(
+                &existing,
+                mapping.table_id,
+                &mapping.db_id,
+                mapping.catalog_schema_id,
+            )?;
+            if existing.core_schema_id <= mapping.core_schema_id {
+                return Ok(());
+            }
+        }
+        write_json(&self.store, &path, &mapping)
     }
 
     fn with_current<T>(
@@ -679,6 +826,100 @@ fn table_schema_path(table_id: TableId, schema_id: CatalogSchemaId) -> String {
         "tables/TABLE-{table_id}/schemas/SCHEMA-{}",
         schema_id.as_u32()
     )
+}
+
+fn schema_mapping_path(
+    table_id: TableId,
+    db_id: &str,
+    catalog_schema_id: CatalogSchemaId,
+) -> String {
+    let digest = Sha256::digest(db_id.as_bytes());
+    let mut shard = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut shard, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    format!(
+        "tables/TABLE-{table_id}/shards/{shard}/SCHEMA-{}",
+        catalog_schema_id.as_u32()
+    )
+}
+
+fn validate_schema_mapping_key(
+    mapping: &ShardSchemaMappingFile,
+    table_id: TableId,
+    db_id: &str,
+    catalog_schema_id: CatalogSchemaId,
+) -> CatalogResult<()> {
+    if mapping.table_id != table_id
+        || mapping.db_id != db_id
+        || mapping.catalog_schema_id != catalog_schema_id
+    {
+        return Err(CatalogError::InvalidMetadata(
+            "shard schema mapping does not match its lookup key".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn build_column_remap(
+    existing: &TableMetadata,
+    target: &TableMetadata,
+) -> CatalogResult<Vec<ColumnRemap>> {
+    if existing.layout.key_fields != target.layout.key_fields
+        || existing.layout.bucket_fields != target.layout.bucket_fields
+    {
+        return Err(TableError::InvalidSchema(
+            "catalog evolution changed the table key".to_string(),
+        )
+        .into());
+    }
+    let existing_fields = existing
+        .schema
+        .fields
+        .iter()
+        .map(|field| (field.id, field))
+        .collect::<HashMap<_, _>>();
+    for field in &target.schema.fields {
+        if let Some(previous) = existing_fields.get(&field.id)
+            && previous.logical_type != field.logical_type
+        {
+            return Err(TableError::InvalidSchema(format!(
+                "catalog evolution changed the type of field {}",
+                field.id.0
+            ))
+            .into());
+        }
+    }
+
+    if target.layout.value_columns.is_empty() {
+        return Ok(vec![ColumnRemap::Default(Vec::new().into())]);
+    }
+    let existing_columns = existing
+        .layout
+        .value_columns
+        .iter()
+        .map(|column| (column.field_id, usize::from(column.column_index)))
+        .collect::<HashMap<_, _>>();
+    let target_fields = target
+        .schema
+        .fields
+        .iter()
+        .map(|field| (field.id, &field.logical_type))
+        .collect::<HashMap<_, _>>();
+    target
+        .layout
+        .value_columns
+        .iter()
+        .map(|column| {
+            if let Some(source) = existing_columns.get(&column.field_id) {
+                return Ok(ColumnRemap::Source(*source));
+            }
+            let logical_type = target_fields[&column.field_id];
+            Ok(ColumnRemap::Default(
+                ValueCodec::encode_validated(logical_type, &Value::Null)?.into(),
+            ))
+        })
+        .collect()
 }
 
 fn apply_schema_changes(

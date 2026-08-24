@@ -124,24 +124,3 @@ impl CatalogTable {
         &self.schema
     }
 }
-
-/// Runtime-only configuration for a file catalog.
-///
-/// Volume descriptors and credentials remain in [`cobble::Config`] and are never written into
-/// catalog metadata.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileCatalogConfig {
-    storage_id: String,
-}
-
-impl FileCatalogConfig {
-    pub fn new(storage_id: impl Into<String>) -> Self {
-        Self {
-            storage_id: storage_id.into(),
-        }
-    }
-
-    pub fn storage_id(&self) -> &str {
-        &self.storage_id
-    }
-}

@@ -5,9 +5,10 @@
 //! and priority queues keep their existing APIs and storage semantics.
 
 mod bucket;
-mod catalog;
+pub mod catalog;
 mod codec;
 mod error;
+pub mod file_catalog;
 mod layout;
 mod logical_type;
 mod metadata;
@@ -19,10 +20,6 @@ mod table;
 mod metadata_tests;
 
 pub use bucket::BucketHash;
-pub use catalog::{
-    Catalog, CatalogError, CatalogResult, CatalogSchemaId, CatalogTable, FileCatalog,
-    FileCatalogConfig, SchemaChange, TableId, TableIdentifier,
-};
 pub use codec::{KeyCodec, Value, ValueCodec};
 pub use error::{Result, TableError};
 pub use logical_type::{

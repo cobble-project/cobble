@@ -165,6 +165,17 @@ enum BuiltinSchemaEvolution {
     ColumnDelete {
         indexes: Arc<Vec<usize>>,
     },
+    ColumnRemap {
+        columns: Arc<Vec<ColumnRemap>>,
+    },
+}
+
+/// One target column in an atomic schema remap.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColumnRemap {
+    Source(usize),
+    Default(Bytes),
 }
 
 impl SchemaEvolution for BuiltinSchemaEvolution {
@@ -173,6 +184,7 @@ impl SchemaEvolution for BuiltinSchemaEvolution {
             Self::Noop => "noop",
             Self::ColumnAdd { .. } => "column_add",
             Self::ColumnDelete { .. } => "column_delete",
+            Self::ColumnRemap { .. } => "column_remap",
         }
     }
 
@@ -185,6 +197,7 @@ impl SchemaEvolution for BuiltinSchemaEvolution {
                 indexes,
                 default_values,
             } => {
+                let whole_row_delete = is_whole_row_delete(&columns);
                 if indexes.len() != default_values.len() {
                     return Err(Error::InvalidState(format!(
                         "Column add evolution indexes/defaults length mismatch: {} != {}",
@@ -200,12 +213,14 @@ impl SchemaEvolution for BuiltinSchemaEvolution {
                             columns.len()
                         )));
                     }
-                    columns.insert(
-                        index,
+                    let column = if whole_row_delete {
+                        Some(Column::new(ValueType::Delete, Bytes::new()))
+                    } else {
                         default_value
                             .as_ref()
-                            .map(|bytes| Column::new(ValueType::Put, bytes.clone())),
-                    );
+                            .map(|bytes| Column::new(ValueType::Put, bytes.clone()))
+                    };
+                    columns.insert(index, column);
                 }
             }
             Self::ColumnDelete { indexes } => {
@@ -220,9 +235,63 @@ impl SchemaEvolution for BuiltinSchemaEvolution {
                     columns.remove(index);
                 }
             }
+            Self::ColumnRemap { columns: remap } => {
+                let mut source = columns;
+                let source_len = source.len();
+                columns = Vec::with_capacity(remap.len());
+                let mut moved_sources = 0;
+                let mut moved_sources_are_deletes = true;
+                let mut whole_row_delete = None;
+                for target in remap.iter() {
+                    columns.push(match target {
+                        ColumnRemap::Source(index) => {
+                            let column = source
+                                .get_mut(*index)
+                                .ok_or_else(|| {
+                                    Error::InvalidState(format!(
+                                        "Cannot remap source column {index} from {} columns",
+                                        source_len
+                                    ))
+                                })?
+                                .take();
+                            moved_sources += 1;
+                            moved_sources_are_deletes &= is_delete_column(column.as_ref());
+                            column
+                        }
+                        ColumnRemap::Default(bytes) => {
+                            let deleted = *whole_row_delete.get_or_insert_with(|| {
+                                source_len != 0
+                                    && moved_sources_are_deletes
+                                    && source.iter().filter(|column| column.is_none()).count()
+                                        == moved_sources
+                                    && source
+                                        .iter()
+                                        .filter_map(Option::as_ref)
+                                        .all(|column| is_delete_column(Some(column)))
+                            });
+                            if deleted {
+                                Some(Column::new(ValueType::Delete, Bytes::new()))
+                            } else {
+                                Some(Column::new(ValueType::Put, bytes.clone()))
+                            }
+                        }
+                    });
+                }
+            }
         }
         Ok(Value::new_with_expired_at(columns, expired_at))
     }
+}
+
+fn is_delete_column(column: Option<&Column>) -> bool {
+    column.is_some_and(|column| *column.value_type() == ValueType::Delete)
+}
+
+fn is_whole_row_delete(columns: &[Option<Column>]) -> bool {
+    !columns.is_empty()
+        && columns
+            .iter()
+            .all(|column| is_delete_column(column.as_ref()))
 }
 
 impl BuiltinSchemaEvolution {
@@ -232,13 +301,14 @@ impl BuiltinSchemaEvolution {
             Self::ColumnAdd { indexes, .. } | Self::ColumnDelete { indexes } => {
                 Some(indexes.as_ref())
             }
+            Self::ColumnRemap { .. } => None,
         }
     }
 
     fn default_values(&self) -> Option<&[Option<Bytes>]> {
         match self {
             Self::ColumnAdd { default_values, .. } => Some(default_values.as_ref()),
-            Self::Noop | Self::ColumnDelete { .. } => None,
+            Self::Noop | Self::ColumnDelete { .. } | Self::ColumnRemap { .. } => None,
         }
     }
 }
@@ -251,6 +321,27 @@ fn encode_evolution(
     Option<Vec<usize>>,
     Option<Vec<Option<Vec<u8>>>>,
 ) {
+    if let BuiltinSchemaEvolution::ColumnRemap { columns } = evolution {
+        let indexes = columns
+            .iter()
+            .map(|column| match column {
+                ColumnRemap::Source(index) => *index,
+                ColumnRemap::Default(_) => 0,
+            })
+            .collect();
+        let defaults = columns
+            .iter()
+            .map(|column| match column {
+                ColumnRemap::Source(_) => None,
+                ColumnRemap::Default(bytes) => Some(bytes.to_vec()),
+            })
+            .collect();
+        return (
+            Some(evolution.id().to_string()),
+            Some(indexes),
+            Some(defaults),
+        );
+    }
     (
         Some(evolution.id().to_string()),
         evolution.indexes().map(|indexes| indexes.to_vec()),
@@ -300,6 +391,39 @@ fn decode_evolution(
                 )
             })?),
         }),
+        Some("column_remap") => {
+            let indexes = evolution_indexes.ok_or_else(|| {
+                Error::FileFormatError(
+                    "Missing evolution_indexes for column_remap schema evolution".to_string(),
+                )
+            })?;
+            let defaults = evolution_default_values.ok_or_else(|| {
+                Error::FileFormatError(
+                    "Missing evolution_default_values for column_remap schema evolution"
+                        .to_string(),
+                )
+            })?;
+            if indexes.len() != defaults.len() {
+                return Err(Error::FileFormatError(
+                    "column_remap sources/defaults length mismatch".to_string(),
+                ));
+            }
+            let mut sources = BTreeSet::new();
+            let columns = indexes
+                .into_iter()
+                .zip(defaults)
+                .map(|(index, default)| match (index, default) {
+                    (0, Some(default)) => Ok(ColumnRemap::Default(Bytes::from(default))),
+                    (index, None) if sources.insert(index) => Ok(ColumnRemap::Source(index)),
+                    _ => Err(Error::FileFormatError(
+                        "invalid column_remap target".to_string(),
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(BuiltinSchemaEvolution::ColumnRemap {
+                columns: Arc::new(columns),
+            })
+        }
         Some(id) => Err(Error::InvalidState(format!(
             "Unknown schema evolution id '{}'",
             id
@@ -1357,6 +1481,62 @@ impl SchemaBuilder {
         Ok(())
     }
 
+    /// Atomically replace all columns in one family from old sources or fixed defaults.
+    #[doc(hidden)]
+    pub fn remap_columns(
+        &mut self,
+        column_family: Option<String>,
+        columns: Vec<ColumnRemap>,
+    ) -> Result<()> {
+        let family_position = self.resolve_existing_family_position(column_family)?;
+        if !matches!(
+            self.column_families[family_position].evolution,
+            BuiltinSchemaEvolution::Noop
+        ) {
+            return Err(Error::InvalidState(
+                "Cannot mix column remap with other schema evolution in one commit".to_string(),
+            ));
+        }
+        let old_columns = self.column_families[family_position].num_columns();
+        let mut used_sources = vec![false; old_columns];
+        for column in &columns {
+            if let ColumnRemap::Source(index) = column {
+                if *index >= old_columns {
+                    return Err(Error::InvalidState(format!(
+                        "Cannot remap source column {index} from {old_columns} columns"
+                    )));
+                }
+                if std::mem::replace(&mut used_sources[*index], true) {
+                    return Err(Error::InvalidState(format!(
+                        "Cannot remap source column {index} more than once"
+                    )));
+                }
+            }
+        }
+
+        let family = &mut self.column_families[family_position];
+        let old_operators = std::mem::take(&mut family.operators);
+        let old_metadata = std::mem::take(&mut family.column_metadata);
+        family.operators = columns
+            .iter()
+            .map(|column| match column {
+                ColumnRemap::Source(index) => Arc::clone(&old_operators[*index]),
+                ColumnRemap::Default(_) => default_merge_operator(),
+            })
+            .collect();
+        family.column_metadata = columns
+            .iter()
+            .map(|column| match column {
+                ColumnRemap::Source(index) => old_metadata[*index].clone(),
+                ColumnRemap::Default(_) => None,
+            })
+            .collect();
+        family.evolution = BuiltinSchemaEvolution::ColumnRemap {
+            columns: Arc::new(columns),
+        };
+        Ok(())
+    }
+
     /// Commit the schema changes and return the new schema.
     pub fn commit(self) -> Arc<Schema> {
         self.manager
@@ -1446,7 +1626,11 @@ impl SchemaBuilder {
             )));
         }
         let evolution = &mut self.column_families[family_position].evolution;
-        if matches!(evolution, BuiltinSchemaEvolution::ColumnDelete { .. }) {
+        if matches!(
+            evolution,
+            BuiltinSchemaEvolution::ColumnDelete { .. }
+                | BuiltinSchemaEvolution::ColumnRemap { .. }
+        ) {
             return Err(Error::InvalidState(
                 "Cannot mix add and delete schema evolution in one commit".to_string(),
             ));
@@ -1465,7 +1649,8 @@ impl SchemaBuilder {
                 Arc::make_mut(existing_indexes).extend(indexes);
                 Arc::make_mut(existing_default_values).extend(default_values);
             }
-            BuiltinSchemaEvolution::ColumnDelete { .. } => unreachable!(),
+            BuiltinSchemaEvolution::ColumnDelete { .. }
+            | BuiltinSchemaEvolution::ColumnRemap { .. } => unreachable!(),
         }
         Ok(())
     }
@@ -1476,7 +1661,10 @@ impl SchemaBuilder {
         index: usize,
     ) -> Result<()> {
         let evolution = &mut self.column_families[family_position].evolution;
-        if matches!(evolution, BuiltinSchemaEvolution::ColumnAdd { .. }) {
+        if matches!(
+            evolution,
+            BuiltinSchemaEvolution::ColumnAdd { .. } | BuiltinSchemaEvolution::ColumnRemap { .. }
+        ) {
             return Err(Error::InvalidState(
                 "Cannot mix add and delete schema evolution in one commit".to_string(),
             ));
@@ -1490,7 +1678,8 @@ impl SchemaBuilder {
             BuiltinSchemaEvolution::ColumnDelete { indexes } => {
                 Arc::make_mut(indexes).push(index);
             }
-            BuiltinSchemaEvolution::ColumnAdd { .. } => unreachable!(),
+            BuiltinSchemaEvolution::ColumnAdd { .. }
+            | BuiltinSchemaEvolution::ColumnRemap { .. } => unreachable!(),
         }
         Ok(())
     }

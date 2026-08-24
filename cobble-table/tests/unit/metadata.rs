@@ -34,6 +34,11 @@ fn table_metadata_contract_and_validation() {
     assert_eq!(metadata.layout.value_columns.len(), 3);
 
     let encoded = metadata.to_json().unwrap();
+    assert!(
+        !encoded
+            .windows(b"catalog_binding".len())
+            .any(|window| window == b"catalog_binding")
+    );
     assert_eq!(TableMetadata::from_json(&encoded).unwrap(), metadata);
 
     let fixture = include_bytes!("../../../spec/table/fixtures/table_metadata_v1.json");
