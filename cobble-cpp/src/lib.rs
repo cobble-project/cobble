@@ -268,7 +268,7 @@ fn native_database_close(db: &NativeDatabase) -> BridgeResult<()> {
 }
 
 fn native_database_version() -> String {
-    cobble::build_version_string().to_owned()
+    cobble::ffi::build_version_string().to_owned()
 }
 
 fn native_database_put(

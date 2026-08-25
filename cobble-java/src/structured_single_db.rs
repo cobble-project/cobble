@@ -19,6 +19,7 @@ use crate::util::{
 };
 use bytes::Bytes;
 use cobble::Config;
+use cobble_data_structure::ffi as structured_ffi;
 use cobble_data_structure::{StructuredColumnValue, StructuredSingleDb};
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -78,13 +79,14 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_directBufferPoolConfig
     let Some(db) = single_db_from_handle(&mut env, handle) else {
         return std::ptr::null_mut();
     };
-    let (buffer_size_bytes, pool_size) = match db.jni_direct_buffer_pool_config() {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
-            return std::ptr::null_mut();
-        }
-    };
+    let (buffer_size_bytes, pool_size) =
+        match structured_ffi::single_db_direct_buffer_pool_config(db) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return std::ptr::null_mut();
+            }
+        };
     direct_buffer_pool_config_array(&mut env, buffer_size_bytes, pool_size)
 }
 
@@ -153,7 +155,7 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_newPriorityQueue(
             return 0;
         }
     };
-    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+    let direct_buffer_pool_config = match structured_ffi::single_db_direct_buffer_pool_config(db) {
         Ok(config) => config,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -186,7 +188,7 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_getPriorityQueue(
             return 0;
         }
     };
-    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+    let direct_buffer_pool_config = match structured_ffi::single_db_direct_buffer_pool_config(db) {
         Ok(config) => config,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -219,7 +221,7 @@ pub extern "system" fn Java_io_cobble_structured_SingleDb_getOrNewPriorityQueue(
             return 0;
         }
     };
-    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+    let direct_buffer_pool_config = match structured_ffi::single_db_direct_buffer_pool_config(db) {
         Ok(config) => config,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());

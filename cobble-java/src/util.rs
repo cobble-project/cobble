@@ -30,12 +30,12 @@ impl From<String> for FrameError {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Utils_versionString(env: JNIEnv, class: JClass) -> jstring {
-    native_string(env, class, cobble::build_version_string())
+    native_string(env, class, cobble::ffi::build_version_string())
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Utils_buildCommitId(env: JNIEnv, class: JClass) -> jstring {
-    native_string(env, class, cobble::build_commit_short_id())
+    native_string(env, class, cobble::ffi::build_commit_short_id())
 }
 
 fn native_string(env: JNIEnv, _class: JClass, value: &'static str) -> jstring {

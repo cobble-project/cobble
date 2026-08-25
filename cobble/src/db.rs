@@ -406,7 +406,8 @@ impl Db {
         Ok(marked)
     }
 
-    pub fn jni_direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
+    #[cfg(feature = "ffi")]
+    pub(crate) fn jni_direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
         Ok((
             self.config.jni_direct_buffer_size_bytes()?,
             self.config.jni_direct_buffer_pool_size,

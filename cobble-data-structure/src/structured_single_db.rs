@@ -38,8 +38,9 @@ impl StructuredSingleDb {
         &self.db
     }
 
-    pub fn jni_direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
-        self.db.db().jni_direct_buffer_pool_config()
+    #[cfg(feature = "ffi")]
+    pub(crate) fn jni_direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
+        cobble::ffi::db_direct_buffer_pool_config(self.db.db())
     }
 
     pub fn current_schema(&self) -> StructuredSchema {
@@ -362,7 +363,7 @@ impl StructuredSingleDb {
         Ok(StructuredDbIterator::new(inner, projected_schema, 0))
     }
 
-    pub fn scan_raw_bounds(
+    pub(crate) fn scan_raw_bounds(
         &self,
         bucket: u16,
         start_key_inclusive: Option<&[u8]>,

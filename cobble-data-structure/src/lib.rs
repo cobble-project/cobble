@@ -52,6 +52,9 @@
 //!
 #![crate_type = "lib"]
 
+#[cfg(feature = "ffi")]
+#[doc(hidden)]
+pub mod ffi;
 mod list;
 mod priority_queue;
 mod structured_db;

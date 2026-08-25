@@ -2,6 +2,7 @@ use crate::structured::db_from_handle;
 use crate::structured_read_options::structured_read_options_from_handle_or_throw;
 use crate::structured_write_options::structured_write_options_from_handle_or_throw;
 use crate::util::{decode_u16, throw_illegal_argument, throw_illegal_state};
+use cobble_data_structure::ffi as structured_ffi;
 use cobble_data_structure::{StructuredColumnValue, StructuredWriteOptions};
 use jni::JNIEnv;
 use jni::objects::{JClass, JIntArray, JLongArray};
@@ -172,7 +173,9 @@ pub extern "system" fn Java_io_cobble_structured_Db_putBytesDirectChunksWithOpti
     let borrowed = entries
         .iter()
         .map(|(key, value)| (key.as_ref(), value.as_ref()));
-    if let Err(error) = db.put_bytes_batch_with_options(bucket, column, borrowed, options) {
+    if let Err(error) =
+        structured_ffi::db_put_bytes_batch_with_options(db, bucket, column, borrowed, options)
+    {
         throw_illegal_state(&mut env, error.to_string());
     }
 }
@@ -358,7 +361,8 @@ fn write_batch(
     options: &StructuredWriteOptions,
 ) -> Result<(), String> {
     validate_batch(encoded, entry_count)?;
-    db.put_bytes_batch_with_options(
+    structured_ffi::db_put_bytes_batch_with_options(
+        db,
         bucket,
         column,
         DirectBatchEntries::new(encoded, entry_count),

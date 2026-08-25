@@ -11,6 +11,7 @@ use crate::util::{
     write_payload_to_io_or_cached_overflow,
 };
 use crate::write_options::write_options_from_handle_or_throw;
+use cobble::ffi as cobble_ffi;
 use cobble::{Config, Db, RecoveryMode};
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -739,7 +740,7 @@ pub extern "system" fn Java_io_cobble_Db_directBufferPoolConfig(
     let Some(db) = db_from_handle_or_throw(&mut env, native_handle) else {
         return std::ptr::null_mut();
     };
-    let (buffer_size_bytes, pool_size) = match db.jni_direct_buffer_pool_config() {
+    let (buffer_size_bytes, pool_size) = match cobble_ffi::db_direct_buffer_pool_config(db) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());

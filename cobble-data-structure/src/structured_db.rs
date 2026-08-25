@@ -225,6 +225,7 @@ pub(crate) fn encode_for_write(
     }
 }
 
+#[cfg(feature = "ffi")]
 fn ensure_list_column(
     schema: &StructuredSchema,
     column_family: Option<&str>,
@@ -1359,7 +1360,8 @@ impl StructuredDb {
     }
 
     /// Writes byte-column entries through the core put-batch fast path.
-    pub fn put_bytes_batch_with_options<'a, I>(
+    #[cfg(feature = "ffi")]
+    pub(crate) fn put_bytes_batch_with_options<'a, I>(
         &self,
         bucket: u16,
         column: u16,
@@ -1389,7 +1391,14 @@ impl StructuredDb {
             .put_column_batch_with_options(bucket, column, entries, options.as_cobble())
     }
 
-    pub fn put_encoded_list<K, B>(&self, bucket: u16, key: K, column: u16, encoded: B) -> Result<()>
+    #[cfg(feature = "ffi")]
+    pub(crate) fn put_encoded_list<K, B>(
+        &self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        encoded: B,
+    ) -> Result<()>
     where
         K: AsRef<[u8]>,
         B: Into<Bytes>,
@@ -1403,7 +1412,8 @@ impl StructuredDb {
         )
     }
 
-    pub fn put_encoded_list_with_options<K, B>(
+    #[cfg(feature = "ffi")]
+    pub(crate) fn put_encoded_list_with_options<K, B>(
         &self,
         bucket: u16,
         key: K,
@@ -1452,7 +1462,8 @@ impl StructuredDb {
             .merge_with_options(bucket, key, column, encoded, options.as_cobble())
     }
 
-    pub fn merge_encoded_list<K, B>(
+    #[cfg(feature = "ffi")]
+    pub(crate) fn merge_encoded_list<K, B>(
         &self,
         bucket: u16,
         key: K,
@@ -1472,7 +1483,8 @@ impl StructuredDb {
         )
     }
 
-    pub fn merge_encoded_list_with_options<K, B>(
+    #[cfg(feature = "ffi")]
+    pub(crate) fn merge_encoded_list_with_options<K, B>(
         &self,
         bucket: u16,
         key: K,
@@ -1692,7 +1704,8 @@ impl StructuredDb {
         self.db.now_seconds()
     }
 
-    pub fn get_raw_with_options(
+    #[cfg(test)]
+    pub(crate) fn get_raw_with_options(
         &self,
         bucket: u16,
         key: &[u8],
@@ -1701,17 +1714,7 @@ impl StructuredDb {
         self.db.get_with_options(bucket, key, options.as_cobble())
     }
 
-    pub fn scan_raw(
-        &self,
-        bucket: u16,
-        range: Range<&[u8]>,
-        options: &StructuredScanOptions,
-    ) -> Result<DbIterator> {
-        self.db
-            .scan_with_options(bucket, range, options.as_cobble())
-    }
-
-    pub fn scan_raw_bounds(
+    pub(crate) fn scan_raw_bounds(
         &self,
         bucket: u16,
         start_key_inclusive: Option<&[u8]>,
@@ -1748,8 +1751,9 @@ impl StructuredDb {
         self.db.close()
     }
 
-    pub fn jni_direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
-        self.db.jni_direct_buffer_pool_config()
+    #[cfg(feature = "ffi")]
+    pub(crate) fn jni_direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
+        cobble::ffi::db_direct_buffer_pool_config(&self.db)
     }
 }
 

@@ -22,6 +22,7 @@ use crate::util::{
 };
 use bytes::Bytes;
 use cobble::{Config, RecoveryMode};
+use cobble_data_structure::ffi as structured_ffi;
 use cobble_data_structure::{
     DataStructureDb, PriorityQueue as CobblePriorityQueue, StructuredColumnValue,
     StructuredDbIterator, StructuredScanSplit, StructuredScanSplitScanner,
@@ -213,7 +214,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_directBufferPoolConfig(
     let Some(db) = db_from_handle(&mut env, handle) else {
         return std::ptr::null_mut();
     };
-    let (buffer_size_bytes, pool_size) = match db.jni_direct_buffer_pool_config() {
+    let (buffer_size_bytes, pool_size) = match structured_ffi::db_direct_buffer_pool_config(db) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -325,7 +326,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_newPriorityQueue(
     let Some(db) = db_from_handle_mut(&mut env, handle) else {
         return 0;
     };
-    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+    let direct_buffer_pool_config = match structured_ffi::db_direct_buffer_pool_config(db) {
         Ok(config) => config,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -358,7 +359,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_getPriorityQueue(
     let Some(db) = db_from_handle(&mut env, handle) else {
         return 0;
     };
-    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+    let direct_buffer_pool_config = match structured_ffi::db_direct_buffer_pool_config(db) {
         Ok(config) => config,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -391,7 +392,7 @@ pub extern "system" fn Java_io_cobble_structured_Db_getOrNewPriorityQueue(
     let Some(db) = db_from_handle_mut(&mut env, handle) else {
         return 0;
     };
-    let direct_buffer_pool_config = match db.jni_direct_buffer_pool_config() {
+    let direct_buffer_pool_config = match structured_ffi::db_direct_buffer_pool_config(db) {
         Ok(config) => config,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -2718,9 +2719,9 @@ fn apply_encoded_list_direct_with_options(
     let encoded = Bytes::copy_from_slice(encoded_list);
     let result = if write_options_handle == 0 {
         if merge {
-            db.merge_encoded_list(bucket, key, column, encoded)
+            structured_ffi::db_merge_encoded_list(db, bucket, key, column, encoded)
         } else {
-            db.put_encoded_list(bucket, key, column, encoded)
+            structured_ffi::db_put_encoded_list(db, bucket, key, column, encoded)
         }
     } else {
         let Some(wo) = structured_write_options_from_handle_or_throw(env, write_options_handle)
@@ -2728,9 +2729,23 @@ fn apply_encoded_list_direct_with_options(
             return;
         };
         if merge {
-            db.merge_encoded_list_with_options(bucket, key, column, encoded, wo.write_options())
+            structured_ffi::db_merge_encoded_list_with_options(
+                db,
+                bucket,
+                key,
+                column,
+                encoded,
+                wo.write_options(),
+            )
         } else {
-            db.put_encoded_list_with_options(bucket, key, column, encoded, wo.write_options())
+            structured_ffi::db_put_encoded_list_with_options(
+                db,
+                bucket,
+                key,
+                column,
+                encoded,
+                wo.write_options(),
+            )
         }
     };
     if let Err(err) = result {

@@ -1193,7 +1193,7 @@ impl Config {
         size_to_u64("log_max_file_size", self.log_max_file_size).map_err(Error::ConfigError)
     }
 
-    pub fn jni_direct_buffer_size_bytes(&self) -> Result<usize> {
+    pub(crate) fn jni_direct_buffer_size_bytes(&self) -> Result<usize> {
         size_to_usize("jni_direct_buffer_size", self.jni_direct_buffer_size)
             .map_err(Error::ConfigError)
     }

@@ -104,6 +104,9 @@ mod db_iter;
 mod db_state;
 mod db_status;
 mod error;
+#[cfg(feature = "ffi")]
+#[doc(hidden)]
+pub mod ffi;
 mod file;
 mod format;
 mod governance;
@@ -186,12 +189,4 @@ pub mod test_utils {
     pub use crate::file::metadata_io::{
         encode_metadata_payload_for_test, read_metadata_payload_from_path_for_test,
     };
-}
-
-pub fn build_commit_short_id() -> &'static str {
-    util::build_commit_short_id()
-}
-
-pub fn build_version_string() -> &'static str {
-    util::build_version_string()
 }

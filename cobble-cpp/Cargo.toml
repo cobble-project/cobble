@@ -34,7 +34,7 @@ storage-sftp = ["cobble/storage-sftp"]
 
 [dependencies]
 bytes = { workspace = true }
-cobble = { workspace = true }
+cobble = { workspace = true, features = ["ffi"] }
 cxx = "1.0.186"
 opendal = { version = "0.58.1", default-features = false }
 serde_json = { workspace = true }
