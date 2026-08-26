@@ -27,11 +27,7 @@ ShardSnapshot ToShardSnapshot(const ffi::NativeShardSnapshot& native) {
   return shard;
 }
 
-}  // namespace detail
-
-namespace {
-
-GlobalSnapshot ToSnapshot(const ffi::NativeSnapshot& native) {
+GlobalSnapshot ToGlobalSnapshot(const ffi::NativeSnapshot& native) {
   GlobalSnapshot result{
       native.version,
       native.id,
@@ -51,7 +47,7 @@ GlobalSnapshot ToSnapshot(const ffi::NativeSnapshot& native) {
   return result;
 }
 
-}  // namespace
+}  // namespace detail
 
 struct PendingSnapshot::Impl {
   explicit Impl(rust::Box<ffi::NativePendingSnapshot> native_snapshot)
@@ -92,7 +88,7 @@ GlobalSnapshot PendingSnapshot::Wait() {
                 "PendingSnapshot has been moved from");
   }
   auto impl = std::move(impl_);
-  return ToSnapshot(detail::Translate(
+  return detail::ToGlobalSnapshot(detail::Translate(
       [&] { return ffi::native_pending_snapshot_wait(*impl->native); }));
 }
 
@@ -115,7 +111,7 @@ GlobalSnapshot Database::TakeSnapshot() const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Database has been moved from");
   }
-  return ToSnapshot(detail::Translate(
+  return detail::ToGlobalSnapshot(detail::Translate(
       [&] { return ffi::native_database_take_snapshot(*impl_->native); }));
 }
 
@@ -133,7 +129,7 @@ GlobalSnapshot Database::GetSnapshot(SnapshotId snapshot) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Database has been moved from");
   }
-  return ToSnapshot(detail::Translate([&] {
+  return detail::ToGlobalSnapshot(detail::Translate([&] {
     return ffi::native_database_get_snapshot_typed(*impl_->native, snapshot);
   }));
 }
@@ -147,7 +143,7 @@ std::vector<GlobalSnapshot> Database::ListGlobalSnapshots() const {
   std::vector<GlobalSnapshot> result;
   result.reserve(native.size());
   for (const auto& snapshot : native) {
-    result.push_back(ToSnapshot(snapshot));
+    result.push_back(detail::ToGlobalSnapshot(snapshot));
   }
   return result;
 }

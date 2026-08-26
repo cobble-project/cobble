@@ -1,6 +1,6 @@
 use crate::{database::NativeDatabase, ffi};
 
-fn metrics(samples: Vec<cobble_binding::MetricSample>) -> Vec<ffi::NativeMetric> {
+pub(crate) fn metrics(samples: Vec<cobble_binding::MetricSample>) -> Vec<ffi::NativeMetric> {
     samples
         .into_iter()
         .map(|sample| {

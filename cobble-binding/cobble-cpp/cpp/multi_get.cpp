@@ -152,4 +152,32 @@ OwnedMultiGetResult Db::MultiGet(std::span<const MultiGetKey> keys,
       std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
 }
 
+OwnedMultiGetResult ReadOnlyDb::MultiGet(
+    std::span<const MultiGetKey> keys, const ReadOptions& options) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "ReadOnlyDb has been moved from");
+  }
+  auto native = CallMultiGet(keys, options, [&](auto address, auto count,
+                                                const auto& native_options) {
+    return ffi::native_read_only_database_multi_get(
+        *impl_->native, address, count, native_options);
+  });
+  return OwnedMultiGetResult(
+      std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
+}
+
+OwnedMultiGetResult Reader::MultiGet(std::span<const MultiGetKey> keys,
+                                     const ReadOptions& options) {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Reader has been moved from");
+  }
+  auto native = CallMultiGet(keys, options, [&](auto address, auto count,
+                                                const auto& native_options) {
+    return ffi::native_reader_multi_get(*impl_->native, address, count,
+                                        native_options);
+  });
+  return OwnedMultiGetResult(
+      std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
+}
+
 }  // namespace cobble

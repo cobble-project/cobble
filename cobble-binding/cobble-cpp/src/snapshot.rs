@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use std::{collections::BTreeMap, ops::RangeInclusive, sync::mpsc};
 
 use crate::{
     BridgeResult,
@@ -21,7 +21,9 @@ fn family((name, id): (String, u8)) -> ffi::NativeFamily {
     ffi::NativeFamily { name, id }
 }
 
-fn shard_snapshot(value: cobble_binding::ShardSnapshotInput) -> ffi::NativeShardSnapshot {
+pub(crate) fn shard_snapshot(
+    value: cobble_binding::ShardSnapshotInput,
+) -> ffi::NativeShardSnapshot {
     ffi::NativeShardSnapshot {
         ranges: value
             .ranges
@@ -41,7 +43,9 @@ fn shard_snapshot(value: cobble_binding::ShardSnapshotInput) -> ffi::NativeShard
     }
 }
 
-fn shard_snapshot_ref(value: cobble_binding::ShardSnapshotRef) -> ffi::NativeShardSnapshot {
+pub(crate) fn shard_snapshot_ref(
+    value: cobble_binding::ShardSnapshotRef,
+) -> ffi::NativeShardSnapshot {
     ffi::NativeShardSnapshot {
         ranges: value
             .ranges
@@ -61,7 +65,7 @@ fn shard_snapshot_ref(value: cobble_binding::ShardSnapshotRef) -> ffi::NativeSha
     }
 }
 
-fn snapshot(value: cobble_binding::GlobalSnapshotManifest) -> ffi::NativeSnapshot {
+pub(crate) fn snapshot(value: cobble_binding::GlobalSnapshotManifest) -> ffi::NativeSnapshot {
     ffi::NativeSnapshot {
         version: value.version,
         id: value.id,
@@ -74,6 +78,74 @@ fn snapshot(value: cobble_binding::GlobalSnapshotManifest) -> ffi::NativeSnapsho
             .collect(),
         watermark_seconds: value.watermark_seconds,
     }
+}
+
+fn native_families(values: Vec<ffi::NativeFamily>) -> BridgeResult<BTreeMap<String, u8>> {
+    let mut by_name = BTreeMap::new();
+    let mut by_id = BTreeMap::new();
+    for value in values {
+        if value.name.is_empty() {
+            return Err(input_error("column family name must not be empty"));
+        }
+        if by_name.insert(value.name.clone(), value.id).is_some() {
+            return Err(input_error("duplicate column family name"));
+        }
+        if by_id.insert(value.id, value.name.clone()).is_some() {
+            return Err(input_error("duplicate column family id"));
+        }
+    }
+    Ok(by_name)
+}
+
+fn native_ranges(values: Vec<ffi::NativeRange>) -> BridgeResult<Vec<RangeInclusive<u16>>> {
+    if values.is_empty() {
+        return Err(input_error("shard snapshot ranges must not be empty"));
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            if value.first > value.last {
+                return Err(input_error("shard snapshot range is reversed"));
+            }
+            Ok(value.first..=value.last)
+        })
+        .collect()
+}
+
+pub(crate) fn shard_snapshot_input(
+    value: ffi::NativeShardSnapshot,
+) -> BridgeResult<cobble_binding::ShardSnapshotInput> {
+    if value.db_id.is_empty() || value.manifest_path.is_empty() {
+        return Err(input_error(
+            "shard snapshot db_id and manifest_path must not be empty",
+        ));
+    }
+    Ok(cobble_binding::ShardSnapshotInput {
+        ranges: native_ranges(value.ranges)?,
+        column_family_ids: native_families(value.families)?,
+        db_id: value.db_id,
+        snapshot_id: value.snapshot_id,
+        manifest_path: value.manifest_path,
+        timestamp_seconds: value.timestamp_seconds,
+        data_size_bytes: value.data_size_bytes,
+        incremental_data_size_bytes: value.incremental_data_size_bytes,
+    })
+}
+
+pub(crate) fn shard_snapshot_reference(
+    value: ffi::NativeShardSnapshot,
+) -> BridgeResult<cobble_binding::ShardSnapshotRef> {
+    let input = shard_snapshot_input(value)?;
+    Ok(cobble_binding::ShardSnapshotRef {
+        ranges: input.ranges,
+        column_family_ids: input.column_family_ids,
+        db_id: input.db_id,
+        snapshot_id: input.snapshot_id,
+        manifest_path: input.manifest_path,
+        timestamp_seconds: input.timestamp_seconds,
+        data_size_bytes: input.data_size_bytes,
+        incremental_data_size_bytes: input.incremental_data_size_bytes,
+    })
 }
 
 pub(crate) fn native_sharded_database_snapshot(

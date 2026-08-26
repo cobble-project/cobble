@@ -16,6 +16,10 @@ The raw API includes:
   listing, and inspection;
 - typed shard snapshots, active snapshot switching, and bucket
   expand/adopt/shrink operations;
+- current or pinned multi-shard `Reader` handles and exact-snapshot
+  `ReadOnlyDb` handles;
+- typed `DbCoordinator` global-snapshot materialization and binary-safe scan
+  plans, splits, and resumable split scanners;
 - typed raw schema inspection/evolution, lifecycle controls, and labeled
   metrics.
 
@@ -46,7 +50,10 @@ lifecycle/metrics, typed snapshots, snapshot retention/expiration, active
 snapshot switching, and bucket rescaling. The bulk test writes 20,000
 two-column rows (12.8 MB of values) across 16 buckets, verifies
 point reads, both scan ownership modes, snapshot creation, close, resume, and a
-second full scan of the restored database.
+second full scan of the restored database. A read-surface capability test also
+covers current and pinned readers, read-only exact snapshots, coordinator range
+validation, binary split boundaries, malformed split JSON, and owned plus
+caller-buffer split scans.
 
 The default build produces the shared target `cobble::cobble`. Cargo builds the
 private Rust static library as part of the CMake build.
@@ -98,7 +105,8 @@ not need to include a generated `cxx` header. `cobble.hpp` remains the complete
 compatibility umbrella; consumers that prefer narrower dependencies can include
 `types.hpp`, `options.hpp`, `write_batch.hpp`, `scan.hpp`, `multi_get.hpp`,
 `schema.hpp`, `snapshot.hpp`, `metrics.hpp`, `lifecycle.hpp`, `rescale.hpp`,
-`single_db.hpp`, `database.hpp`, or `db.hpp` directly.
+`single_db.hpp`, `database.hpp`, `db.hpp`, `read_only_db.hpp`, `reader.hpp`,
+`coordinator.hpp`, or `scan_plan.hpp` directly.
 
 ## Data ownership and zero-copy paths
 
@@ -106,20 +114,25 @@ Input `BytesView` values are borrowed for the synchronous call and cross the
 C++/Rust boundary as `rust::Slice`, without an interop copy. Cobble may still
 encode or retain the data internally as required by the storage operation.
 
-`Database::Get`, `Db::Get`, and `ScanCursor::Next` return move-only RAII objects whose
-payload remains in Rust `Bytes` allocations. Their key and column accessors
-return `std::span` views without copying payload into `std::vector` or
-`std::string`.
+`Database::Get`, `Db::Get`, `ReadOnlyDb::Get`, `Reader::Get`, and
+`ScanCursor::Next` return move-only RAII objects whose payload remains in Rust
+`Bytes` allocations. Their key and column accessors return `std::span` views
+without copying payload into `std::vector` or `std::string`.
 
-`Database::MultiGet` and `Db::MultiGet` cross the bridge once. Their descriptor
-array borrows the original C++ key spans synchronously, so key payloads are not
-concatenated or copied at the binding boundary. `OwnedMultiGetResult` keeps the
-returned Rust `Bytes` allocations alive and exposes zero-copy column views.
+`Database::MultiGet`, `Db::MultiGet`, `ReadOnlyDb::MultiGet`, and
+`Reader::MultiGet` cross the bridge once. Their descriptor array borrows the
+original C++ key spans synchronously, so key payloads are not concatenated or
+copied at the binding boundary. `OwnedMultiGetResult` keeps the returned Rust
+`Bytes` allocations alive and exposes zero-copy column views.
 
-For reusable C++ memory, `Database::GetColumnInto`, `Db::GetColumnInto`, and
-`ScanCursor::NextBatchInto` write into a caller-owned span. A too-small scan
-buffer reports the required size and retains the pending rows so retrying does
-not skip data.
+For reusable C++ memory, every raw read handle provides `GetColumnInto`, and
+`ScanCursor::NextBatchInto` writes scans into a caller-owned span. A too-small
+scan buffer reports the required size and retains the pending rows so retrying
+does not skip data.
+
+`ScanPlan` and typed split DTOs own their binary boundary keys. Constructing a
+plan from `BytesView` copies those cold-path metadata bytes once; split JSON is
+provided for durable compatibility and is not used on the scan data path.
 
 The full ownership contract is recorded in [DESIGN.md](DESIGN.md).
 

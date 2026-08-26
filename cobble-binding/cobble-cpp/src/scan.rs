@@ -9,7 +9,7 @@ use crate::{
     options::{checked_nonzero_usize, checked_u64, checked_usize, to_scan_options},
 };
 use bytes::Bytes;
-use cobble_binding::DbIterator;
+use cobble_binding::{DbIterator, ScanSplitScanner};
 
 pub(crate) struct NativeBatchRow {
     pub(crate) bucket: u16,
@@ -24,12 +24,93 @@ pub(crate) struct NativeBatch {
 }
 
 pub(crate) struct NativeScanCursor {
-    bucket: u16,
-    iterator: DbIterator,
+    iterator: NativeScanIterator,
     pending_row: Option<NativeBatchRow>,
     pending_batch: Option<NativeBatch>,
     // Drop the iterator/access guard before the final database owner.
-    _owner: NativeDatabaseOwner,
+    _owner: Option<NativeDatabaseOwner>,
+}
+
+// The cursor itself is already heap allocated for the opaque CXX handle. Keep
+// both iterators inline to avoid another allocation and pointer chase per scan.
+#[allow(clippy::large_enum_variant)]
+enum NativeScanIterator {
+    Db { bucket: u16, iterator: DbIterator },
+    Split(ScanSplitScanner),
+}
+
+impl NativeScanIterator {
+    fn next_row(&mut self) -> BridgeResult<Option<NativeBatchRow>> {
+        match self {
+            Self::Db { bucket, iterator } => iterator
+                .next()
+                .transpose()
+                .map_err(format_cobble_error)
+                .map(|row| {
+                    row.map(|(key, columns)| NativeBatchRow {
+                        bucket: *bucket,
+                        key,
+                        columns,
+                    })
+                }),
+            Self::Split(scanner) => {
+                scanner
+                    .next()
+                    .transpose()
+                    .map_err(format_cobble_error)
+                    .map(|row| {
+                        row.map(|(bucket, key, columns)| NativeBatchRow {
+                            bucket,
+                            key,
+                            columns,
+                        })
+                    })
+            }
+        }
+    }
+
+    fn stopped_at_block_boundary(&self) -> bool {
+        match self {
+            Self::Db { iterator, .. } => iterator.stopped_at_block_boundary(),
+            Self::Split(_) => false,
+        }
+    }
+
+    fn clear_stop_at_block_boundary(&mut self) -> BridgeResult<()> {
+        match self {
+            Self::Db { iterator, .. } => {
+                iterator.clear_stop_at_block_boundary();
+                Ok(())
+            }
+            Self::Split(_) => Err(input_error(
+                "block-boundary resume is not supported for split scanners",
+            )),
+        }
+    }
+}
+
+pub(crate) fn native_scan_cursor_from_db_iterator(
+    bucket: u16,
+    iterator: DbIterator,
+    owner: Option<NativeDatabaseOwner>,
+) -> Box<NativeScanCursor> {
+    Box::new(NativeScanCursor {
+        iterator: NativeScanIterator::Db { bucket, iterator },
+        pending_row: None,
+        pending_batch: None,
+        _owner: owner,
+    })
+}
+
+pub(crate) fn native_scan_cursor_from_split_scanner(
+    scanner: ScanSplitScanner,
+) -> Box<NativeScanCursor> {
+    Box::new(NativeScanCursor {
+        iterator: NativeScanIterator::Split(scanner),
+        pending_row: None,
+        pending_batch: None,
+        _owner: None,
+    })
 }
 
 pub(crate) fn native_database_scan(
@@ -52,13 +133,11 @@ pub(crate) fn native_database_scan(
             &scan_options,
         )
         .map_err(format_cobble_error)?;
-    Ok(Box::new(NativeScanCursor {
+    Ok(native_scan_cursor_from_db_iterator(
         bucket,
         iterator,
-        pending_row: None,
-        pending_batch: None,
-        _owner: NativeDatabaseOwner::single(db),
-    }))
+        Some(NativeDatabaseOwner::single(db)),
+    ))
 }
 
 pub(crate) fn native_sharded_database_scan(
@@ -79,13 +158,11 @@ pub(crate) fn native_sharded_database_scan(
             &to_scan_options(options)?,
         )
         .map_err(format_cobble_error)?;
-    Ok(Box::new(NativeScanCursor {
+    Ok(native_scan_cursor_from_db_iterator(
         bucket,
         iterator,
-        pending_row: None,
-        pending_batch: None,
-        _owner: NativeDatabaseOwner::sharded(db),
-    }))
+        Some(NativeDatabaseOwner::sharded(db)),
+    ))
 }
 
 pub(crate) fn native_scan_cursor_next_owned(
@@ -133,7 +210,9 @@ pub(crate) fn native_scan_cursor_next_batch_into(
     ))
 }
 
-pub(crate) fn native_scan_cursor_resume_after_block_boundary(cursor: &mut NativeScanCursor) {
+pub(crate) fn native_scan_cursor_resume_after_block_boundary(
+    cursor: &mut NativeScanCursor,
+) -> BridgeResult<()> {
     if cursor
         .pending_batch
         .as_ref()
@@ -141,7 +220,7 @@ pub(crate) fn native_scan_cursor_resume_after_block_boundary(cursor: &mut Native
     {
         cursor.pending_batch = None;
     }
-    cursor.iterator.clear_stop_at_block_boundary();
+    cursor.iterator.clear_stop_at_block_boundary()
 }
 
 pub(crate) fn native_row_found(row: &NativeRow) -> bool {
@@ -238,18 +317,7 @@ fn read_batch(cursor: &mut NativeScanCursor, max_rows: u64) -> BridgeResult<Nati
     })
 }
 fn next_cursor_row(cursor: &mut NativeScanCursor) -> BridgeResult<Option<NativeBatchRow>> {
-    cursor
-        .iterator
-        .next()
-        .transpose()
-        .map_err(format_cobble_error)
-        .map(|row| {
-            row.map(|(key, columns)| NativeBatchRow {
-                bucket: cursor.bucket,
-                key,
-                columns,
-            })
-        })
+    cursor.iterator.next_row()
 }
 fn batch_row(batch: &NativeBatch, row: u64) -> BridgeResult<&NativeBatchRow> {
     batch

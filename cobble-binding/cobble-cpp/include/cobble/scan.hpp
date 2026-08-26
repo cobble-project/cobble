@@ -59,6 +59,9 @@ class COBBLE_CPP_API ScanCursor final {
 
   friend class Database;
   friend class Db;
+  friend class ReadOnlyDb;
+  friend class Reader;
+  friend struct ScanSplit;
 };
 
 }  // namespace cobble

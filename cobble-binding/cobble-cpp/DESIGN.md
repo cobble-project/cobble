@@ -6,8 +6,10 @@ The C++ API wraps both `SingleDb` and the sharded `Db` raw bucket/key/column
 data model. It includes database open/resume/restore, point and multi-key
 reads, writes, write batches, range scans, raw schema evolution, metrics,
 runtime lifecycle controls, typed global and shard snapshot operations, active
-snapshot switching, and bucket rescaling. Table codecs and structured Table
-schema APIs are intentionally outside this binding.
+snapshot switching, bucket rescaling, current and pinned multi-shard readers,
+exact-snapshot read-only databases, coordinator operations, and distributed
+scan planning. Table codecs and structured Table schema APIs are intentionally
+outside this binding.
 
 The public C++ header does not expose generated `cxx` types or Rust storage
 layout. This leaves room to evolve the Rust bridge without changing every C++
@@ -18,13 +20,15 @@ consumer and keeps the public API usable from ordinary CMake projects.
 `cobble.hpp` is a compatibility umbrella over the standalone public headers:
 `types.hpp`, `options.hpp`, `write_batch.hpp`, `scan.hpp`, `multi_get.hpp`,
 `schema.hpp`, `snapshot.hpp`, `metrics.hpp`, `lifecycle.hpp`, `rescale.hpp`,
-`single_db.hpp`, `database.hpp`, and `db.hpp`.
+`single_db.hpp`, `database.hpp`, `db.hpp`, `read_only_db.hpp`, `reader.hpp`,
+`coordinator.hpp`, and `scan_plan.hpp`.
 The C++ implementation is split by the same responsibilities, with private
 bridge, conversion, error-translation, and PImpl declarations under
 `cpp/detail`. Rust keeps the `cxx` declaration in `src/lib.rs` so the generated
 header and `cobble::ffi` namespace stay stable; database, write-batch, scan,
-multi-get, snapshot, schema, metrics, lifecycle, options, encoding, and error
-behavior live in focused private modules.
+multi-get, snapshot, schema, metrics, lifecycle, read-only, reader,
+coordinator, distributed-scan, options, encoding, and error behavior live in
+focused private modules.
 
 This is a source-organization boundary only: neither the C++ public ABI nor
 the CBRB caller-buffer format changes.
@@ -55,6 +59,14 @@ transfer once and is consumed by `Write`.
 Owned row and batch views remain valid only while their owning C++ object is
 alive. Caller-buffer views remain valid only until that buffer is modified or
 destroyed.
+
+Scan-plan and split boundaries are owned byte vectors so zero bytes and bytes
+above `0x7f` retain their exact ordering and never acquire text semantics. A
+synchronous `BytesView` setter performs one cold-path metadata copy. Split JSON
+is a compatibility/persistence representation; scanner creation uses the typed
+DTO and performs no JSON conversion. Core-to-C++ snapshot and split metadata is
+copied, but row, key, and value payloads keep the owned or caller-buffer paths
+above.
 
 ## Lifetime and concurrency
 
@@ -95,6 +107,21 @@ replay; `ResumeFromSnapshot` means the exact snapshot boundary without WAL
 replay. Bucket expand uses typed optional snapshot/range inputs and a typed
 storage mode, while adoption wait uses `std::chrono::milliseconds`.
 
+`ReadOnlyDb` owns the exact shard manifest selected by `(snapshot_id, db_id)`.
+Its cursors retain a concrete read-only owner. `Reader` owns the core reader;
+its iterators retain their own database arcs, so a cursor remains valid after
+the C++ reader handle is destroyed. Current readers may refresh to the latest
+global snapshot; pinned readers reject refresh with
+`ErrorCode::kInvalidState`. Reader methods are synchronous and mutable, and
+callers provide external synchronization.
+
+`DbCoordinator::MaterializeGlobalSnapshot` accepts typed shard snapshots. The
+binding verifies that every inclusive range is within `total_buckets` and that
+the ranges collectively cover every bucket exactly once before calling the
+core, which additionally verifies column-family consistency. Scan split
+scanners reject block-boundary stopping at construction because the distributed
+scanner cannot resume that core state safely.
+
 ## ABI and compatibility
 
 The public API requires C++20 for `std::span`. Implementation classes use PImpl,
@@ -110,7 +137,6 @@ error category and message.
 
 - Table logical types, codecs, and structured rows
 - C++ callbacks for custom merge operators or filesystems
-- Distributed shard orchestration or metadata coordination
 - Borrowing C++ memory beyond a synchronous call
 - Async operations that retain arbitrary C++ spans
 

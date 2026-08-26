@@ -18,7 +18,7 @@ struct KeyDescriptor {
 }
 
 pub(crate) struct NativeMultiGetResult {
-    rows: Vec<Option<Vec<Option<Bytes>>>>,
+    pub(crate) rows: Vec<Option<Vec<Option<Bytes>>>>,
 }
 
 /// Borrows the caller's key buffers for one synchronous `multi_get` call.
@@ -29,7 +29,7 @@ pub(crate) struct NativeMultiGetResult {
 /// values created by the private C++ wrapper. Every non-empty descriptor must
 /// point to a readable key buffer that remains alive until this function
 /// returns. No borrowed address escapes this call.
-unsafe fn borrowed_keys<'a>(
+pub(crate) unsafe fn borrowed_keys<'a>(
     descriptor_address: usize,
     count: u64,
 ) -> BridgeResult<Vec<(u16, &'a [u8])>> {

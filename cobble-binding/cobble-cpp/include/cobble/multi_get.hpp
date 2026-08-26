@@ -34,6 +34,8 @@ class COBBLE_CPP_API OwnedMultiGetResult final {
   std::unique_ptr<Impl> impl_;
   friend class Database;
   friend class Db;
+  friend class ReadOnlyDb;
+  friend class Reader;
 };
 
 }  // namespace cobble

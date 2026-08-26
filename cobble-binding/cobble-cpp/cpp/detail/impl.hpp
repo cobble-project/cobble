@@ -41,4 +41,22 @@ struct Db::Impl {
   rust::Box<ffi::NativeShardedDatabase> native;
 };
 
+struct ReadOnlyDb::Impl {
+  explicit Impl(rust::Box<ffi::NativeReadOnlyDatabase> native_database)
+      : native(std::move(native_database)) {}
+  rust::Box<ffi::NativeReadOnlyDatabase> native;
+};
+
+struct Reader::Impl {
+  explicit Impl(rust::Box<ffi::NativeReader> native_reader)
+      : native(std::move(native_reader)) {}
+  rust::Box<ffi::NativeReader> native;
+};
+
+struct DbCoordinator::Impl {
+  explicit Impl(rust::Box<ffi::NativeCoordinator> native_coordinator)
+      : native(std::move(native_coordinator)) {}
+  rust::Box<ffi::NativeCoordinator> native;
+};
+
 }  // namespace cobble

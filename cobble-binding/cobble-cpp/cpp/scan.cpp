@@ -102,7 +102,9 @@ void ScanCursor::ResumeAfterBlockBoundary() {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "ScanCursor has been moved from");
   }
-  ffi::native_scan_cursor_resume_after_block_boundary(*impl_->native);
+  detail::Translate([&] {
+    ffi::native_scan_cursor_resume_after_block_boundary(*impl_->native);
+  });
 }
 
 }  // namespace cobble

@@ -16,8 +16,15 @@ pub(crate) struct NativeDatabase {
 }
 
 pub(crate) enum NativeDatabaseOwner {
-    Single { _owner: Arc<SingleDb> },
-    Sharded { _owner: Arc<cobble_binding::Db> },
+    Single {
+        _owner: Arc<SingleDb>,
+    },
+    Sharded {
+        _owner: Arc<cobble_binding::Db>,
+    },
+    ReadOnly {
+        _owner: Arc<cobble_binding::ReadOnlyDb>,
+    },
 }
 
 impl NativeDatabaseOwner {
@@ -29,6 +36,12 @@ impl NativeDatabaseOwner {
 
     pub(crate) fn sharded(db: &crate::sharded_db::NativeShardedDatabase) -> Self {
         Self::Sharded {
+            _owner: Arc::clone(&db.db),
+        }
+    }
+
+    pub(crate) fn read_only(db: &crate::read_only_db::NativeReadOnlyDatabase) -> Self {
+        Self::ReadOnly {
             _owner: Arc::clone(&db.db),
         }
     }

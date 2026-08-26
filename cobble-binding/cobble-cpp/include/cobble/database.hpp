@@ -42,6 +42,8 @@ class COBBLE_CPP_API OwnedRow final {
 
   friend class Database;
   friend class Db;
+  friend class ReadOnlyDb;
+  friend class Reader;
 };
 
 class COBBLE_CPP_API Database final {

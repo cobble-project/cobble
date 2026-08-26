@@ -48,7 +48,7 @@ fn resolve_operator(
     merge_operator_by_id(operator_id, metadata.as_ref(), None).map_err(format_cobble_error)
 }
 
-fn native_schema(schema: &Schema) -> BridgeResult<ffi::NativeSchema> {
+pub(crate) fn native_schema(schema: &Schema) -> BridgeResult<ffi::NativeSchema> {
     let family_ids = schema.column_family_ids();
     let mut column_families = Vec::with_capacity(family_ids.len());
     for (name, column_count) in schema.column_families() {

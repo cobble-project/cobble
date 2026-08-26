@@ -4,19 +4,24 @@
 //! exposes only opaque Rust owners, shared option/result values, and borrowed
 //! byte slices to that wrapper.
 
+mod coordinator;
 mod database;
+mod distributed_scan;
 mod encoding;
 mod error;
 mod lifecycle;
 mod metrics;
 mod multi_get;
 mod options;
+mod read_only_db;
+mod reader;
 mod scan;
 mod schema;
 mod sharded_db;
 mod snapshot;
 mod write_batch;
 
+use coordinator::*;
 use database::{
     NativeDatabase, NativeRow, native_database_close, native_database_delete,
     native_database_expire_snapshot, native_database_get, native_database_get_column_into,
@@ -26,6 +31,7 @@ use database::{
     native_database_snapshot, native_database_snapshot_manifest_json, native_database_version,
     native_database_write_batch,
 };
+use distributed_scan::*;
 use error::BridgeResult;
 use lifecycle::{
     native_database_load_readonly_files_to_primary, native_database_now_seconds,
@@ -39,6 +45,8 @@ use multi_get::{
     native_multi_get_column_count, native_multi_get_found, native_multi_get_has_column,
     native_multi_get_row_count, native_sharded_database_multi_get,
 };
+use read_only_db::*;
+use reader::*;
 use scan::{
     NativeBatch, NativeScanCursor, native_batch_bucket, native_batch_column,
     native_batch_column_count, native_batch_end, native_batch_has_column, native_batch_key,
@@ -124,6 +132,19 @@ mod ffi {
         shards: Vec<NativeShardSnapshot>,
         watermark_seconds: u32,
     }
+    struct NativeScanSplit {
+        shard: NativeShardSnapshot,
+        has_start: bool,
+        start: Vec<u8>,
+        has_end: bool,
+        end: Vec<u8>,
+        has_start_after: bool,
+        start_after_bucket: u16,
+        start_after_key: Vec<u8>,
+        has_end_at: bool,
+        end_at_bucket: u16,
+        end_at_key: Vec<u8>,
+    }
     struct NativeMetric {
         name: String,
         labels: Vec<NativeMetricLabel>,
@@ -159,6 +180,9 @@ mod ffi {
     extern "Rust" {
         type NativeDatabase;
         type NativeShardedDatabase;
+        type NativeReadOnlyDatabase;
+        type NativeReader;
+        type NativeCoordinator;
         type NativeWriteBatch;
         type NativeRow;
         type NativeScanCursor;
@@ -240,7 +264,9 @@ mod ffi {
             max_rows: u64,
             output: &mut [u8],
         ) -> Result<NativeBufferResult>;
-        fn native_scan_cursor_resume_after_block_boundary(cursor: &mut NativeScanCursor);
+        fn native_scan_cursor_resume_after_block_boundary(
+            cursor: &mut NativeScanCursor,
+        ) -> Result<()>;
         fn native_write_batch_new() -> Box<NativeWriteBatch>;
         fn native_write_batch_len(batch: &NativeWriteBatch) -> u64;
         fn native_write_batch_put(
@@ -548,6 +574,137 @@ mod ffi {
             db: &NativeShardedDatabase,
             ranges: Vec<NativeRange>,
         ) -> Result<u64>;
+
+        fn native_read_only_database_open(
+            config_json: &str,
+            snapshot_id: u64,
+            db_id: &str,
+        ) -> Result<Box<NativeReadOnlyDatabase>>;
+        fn native_read_only_database_open_file(
+            config_path: &str,
+            snapshot_id: u64,
+            db_id: &str,
+        ) -> Result<Box<NativeReadOnlyDatabase>>;
+        fn native_read_only_database_id(db: &NativeReadOnlyDatabase) -> &str;
+        fn native_read_only_database_get(
+            db: &NativeReadOnlyDatabase,
+            bucket: u16,
+            key: &[u8],
+            options: &NativeReadOptions,
+        ) -> Result<Box<NativeRow>>;
+        fn native_read_only_database_get_column_into(
+            db: &NativeReadOnlyDatabase,
+            bucket: u16,
+            key: &[u8],
+            output: &mut [u8],
+            options: &NativeReadOptions,
+        ) -> Result<NativeBufferResult>;
+        fn native_read_only_database_multi_get(
+            db: &NativeReadOnlyDatabase,
+            descriptors: usize,
+            count: u64,
+            options: &NativeReadOptions,
+        ) -> Result<Box<NativeMultiGetResult>>;
+        fn native_read_only_database_scan(
+            db: &NativeReadOnlyDatabase,
+            bucket: u16,
+            start: &[u8],
+            has_start: bool,
+            end: &[u8],
+            has_end: bool,
+            options: &NativeScanOptions,
+        ) -> Result<Box<NativeScanCursor>>;
+        fn native_read_only_database_current_schema(
+            db: &NativeReadOnlyDatabase,
+        ) -> Result<NativeSchema>;
+        fn native_read_only_database_metrics(db: &NativeReadOnlyDatabase) -> Vec<NativeMetric>;
+
+        fn native_reader_open_current(config_json: &str) -> Result<Box<NativeReader>>;
+        fn native_reader_open_current_file(config_path: &str) -> Result<Box<NativeReader>>;
+        fn native_reader_open(config_json: &str, snapshot_id: u64) -> Result<Box<NativeReader>>;
+        fn native_reader_open_file(
+            config_path: &str,
+            snapshot_id: u64,
+        ) -> Result<Box<NativeReader>>;
+        fn native_reader_refresh(reader: &mut NativeReader) -> Result<()>;
+        fn native_reader_get(
+            reader: &mut NativeReader,
+            bucket: u16,
+            key: &[u8],
+            options: &NativeReadOptions,
+        ) -> Result<Box<NativeRow>>;
+        fn native_reader_get_column_into(
+            reader: &mut NativeReader,
+            bucket: u16,
+            key: &[u8],
+            output: &mut [u8],
+            options: &NativeReadOptions,
+        ) -> Result<NativeBufferResult>;
+        fn native_reader_multi_get(
+            reader: &mut NativeReader,
+            descriptors: usize,
+            count: u64,
+            options: &NativeReadOptions,
+        ) -> Result<Box<NativeMultiGetResult>>;
+        fn native_reader_scan(
+            reader: &mut NativeReader,
+            bucket: u16,
+            start: &[u8],
+            end: &[u8],
+            options: &NativeScanOptions,
+        ) -> Result<Box<NativeScanCursor>>;
+        fn native_reader_mode(reader: &NativeReader) -> u8;
+        fn native_reader_has_configured_snapshot(reader: &NativeReader) -> bool;
+        fn native_reader_configured_snapshot(reader: &NativeReader) -> u64;
+        fn native_reader_current_global_snapshot(reader: &NativeReader) -> NativeSnapshot;
+        fn native_reader_list_global_snapshots(
+            reader: &NativeReader,
+        ) -> Result<Vec<NativeSnapshot>>;
+
+        fn native_coordinator_open(config_json: &str) -> Result<Box<NativeCoordinator>>;
+        fn native_coordinator_open_file(config_path: &str) -> Result<Box<NativeCoordinator>>;
+        fn native_coordinator_materialize_global_snapshot(
+            coordinator: &NativeCoordinator,
+            total_buckets: u32,
+            snapshot_id: u64,
+            shards: Vec<NativeShardSnapshot>,
+        ) -> Result<NativeSnapshot>;
+        fn native_coordinator_get_global_snapshot(
+            coordinator: &NativeCoordinator,
+            snapshot_id: u64,
+        ) -> Result<NativeSnapshot>;
+        fn native_coordinator_list_global_snapshots(
+            coordinator: &NativeCoordinator,
+        ) -> Result<Vec<NativeSnapshot>>;
+        fn native_coordinator_load_current_global_snapshot(
+            coordinator: &NativeCoordinator,
+        ) -> Result<Vec<NativeSnapshot>>;
+        fn native_coordinator_retain_snapshot(
+            coordinator: &NativeCoordinator,
+            snapshot_id: u64,
+        ) -> bool;
+        fn native_coordinator_expire_snapshot(
+            coordinator: &NativeCoordinator,
+            snapshot_id: u64,
+        ) -> Result<bool>;
+
+        fn native_scan_split_split_after(
+            split: NativeScanSplit,
+            bucket: u16,
+            key: &[u8],
+        ) -> Result<Vec<NativeScanSplit>>;
+        fn native_scan_split_to_json(split: NativeScanSplit) -> Result<String>;
+        fn native_scan_split_from_json(json: &str) -> Result<NativeScanSplit>;
+        fn native_scan_split_open_scanner(
+            config_json: &str,
+            split: NativeScanSplit,
+            options: &NativeScanOptions,
+        ) -> Result<Box<NativeScanCursor>>;
+        fn native_scan_split_open_scanner_file(
+            config_path: &str,
+            split: NativeScanSplit,
+            options: &NativeScanOptions,
+        ) -> Result<Box<NativeScanCursor>>;
     }
 }
 
