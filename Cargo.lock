@@ -630,6 +630,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cobble-binding"
+version = "0.5.0"
+dependencies = [
+ "cobble",
+ "cobble-data-structure",
+]
+
+[[package]]
 name = "cobble-cli"
 version = "0.5.0"
 dependencies = [
@@ -654,7 +662,7 @@ name = "cobble-cpp"
 version = "0.5.0"
 dependencies = [
  "bytes",
- "cobble",
+ "cobble-binding",
  "cxx",
  "cxx-build",
  "opendal",
@@ -680,8 +688,7 @@ name = "cobble-java"
 version = "0.5.0"
 dependencies = [
  "bytes",
- "cobble",
- "cobble-data-structure",
+ "cobble-binding",
  "jni 0.21.1",
  "serde",
  "serde_json",

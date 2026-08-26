@@ -3,15 +3,21 @@ name: C++ binding CI
 on:
   push:
     paths:
-      - "cobble-cpp/**"
+      - "cobble-binding/Cargo.toml"
+      - "cobble-binding/src/**"
+      - "cobble-binding/cobble-cpp/**"
       - "cobble/**"
+      - "cobble-data-structure/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/cpp-ci.yml"
   pull_request:
     paths:
-      - "cobble-cpp/**"
+      - "cobble-binding/Cargo.toml"
+      - "cobble-binding/src/**"
+      - "cobble-binding/cobble-cpp/**"
       - "cobble/**"
+      - "cobble-data-structure/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/cpp-ci.yml"
@@ -46,7 +52,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Configure
         run: >-
-          cmake -S cobble-cpp -B build/cobble-cpp
+          cmake -S cobble-binding/cobble-cpp -B build/cobble-cpp
           -DCMAKE_BUILD_TYPE=Release
           -DCOBBLE_CPP_BUILD_TESTS=ON
           -DCOBBLE_CPP_BUILD_EXAMPLES=ON
@@ -90,7 +96,7 @@ jobs:
             aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket cobble-cpp-test
       - name: Configure
         run: >-
-          cmake -S cobble-cpp -B build/cobble-cpp
+          cmake -S cobble-binding/cobble-cpp -B build/cobble-cpp
           -DCMAKE_BUILD_TYPE=Release
           -DCOBBLE_CPP_BUILD_TESTS=ON
           -DCOBBLE_CPP_BUILD_S3_E2E_TEST=ON

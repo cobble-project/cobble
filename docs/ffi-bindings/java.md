@@ -542,7 +542,7 @@ If you want to customize your java APIs, you can compile by yourself. The Java b
 1. **Native library** (Rust → shared library via `cdylib`)
 2. **Java API** (Maven project with JNI wrappers)
 
-`cobble-java` re-exposes `storage-*` features and forwards them to both `cobble` and `cobble-data-structure`.
+`cobble-java` re-exposes `storage-*` features and forwards them through the internal `cobble-binding` crate.
 For the full feature list and usage examples, refer to `cobble`:
 https://crates.io/crates/cobble
 
@@ -550,7 +550,7 @@ Java native build commands use `--features storage-all` on `cobble-java`, so Jav
 
 ```bash
 # Local debug build (current platform only, includes debug + release JNI libs and CLI binaries)
-cd cobble-java/java
+cd cobble-binding/cobble-java/java
 ./mvnw package
 ```
 

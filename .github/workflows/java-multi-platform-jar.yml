@@ -58,11 +58,11 @@ jobs:
             python3 - <<'PY'
           import xml.etree.ElementTree as ET
 
-          root = ET.parse("cobble-java/java/pom.xml").getroot()
+          root = ET.parse("cobble-binding/cobble-java/java/pom.xml").getroot()
           namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
           version = root.findtext("m:version", namespaces=namespace)
           if not version:
-              raise SystemExit("Missing project version in cobble-java/java/pom.xml")
+              raise SystemExit("Missing project version in cobble-binding/cobble-java/java/pom.xml")
           print(version.strip())
           PY
           )"
@@ -184,7 +184,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_sha }}
 
       - name: Clean staged native resources
-        run: rm -rf cobble-java/java/src/main/resources/native
+        run: rm -rf cobble-binding/cobble-java/java/src/main/resources/native
 
       - name: Download all native artifacts
         uses: actions/download-artifact@v5
@@ -197,7 +197,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p cobble-java/java/src/main/resources
+          mkdir -p cobble-binding/cobble-java/java/src/main/resources
           shopt -s nullglob
           archives=(native-archives/*.tar.gz)
           if [[ ${#archives[@]} -eq 0 ]]; then
@@ -205,12 +205,12 @@ jobs:
             exit 1
           fi
           for archive in "${archives[@]}"; do
-            tar -xzf "${archive}" -C cobble-java/java/src/main/resources
+            tar -xzf "${archive}" -C cobble-binding/cobble-java/java/src/main/resources
           done
 
           while IFS= read -r file; do
             [[ -z "${file}" ]] && continue
-            full_path="cobble-java/java/src/main/resources/${file}"
+            full_path="cobble-binding/cobble-java/java/src/main/resources/${file}"
             if [[ ! -s "${full_path}" ]]; then
               echo "Missing or empty native artifact: ${full_path}" >&2
               exit 1
@@ -224,11 +224,11 @@ jobs:
           java-version: "17"
 
       - name: Build Java jar (skip local native build)
-        working-directory: cobble-java/java
+        working-directory: cobble-binding/cobble-java/java
         run: ./mvnw --quiet -DskipTests -Dexec.skip=true -Dcobble.skip.local.native.copy=true package
 
       - name: Verify packaged native resources
-        working-directory: cobble-java/java
+        working-directory: cobble-binding/cobble-java/java
         shell: bash
         run: |
           set -euo pipefail
@@ -249,7 +249,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: cobble-java-multi-platform-jar
-          path: cobble-java/java/target/cobble-*.jar
+          path: cobble-binding/cobble-java/java/target/cobble-*.jar
           if-no-files-found: error
 
   publish-packages:
@@ -269,7 +269,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_sha }}
 
       - name: Clean staged native resources
-        run: rm -rf cobble-java/java/src/main/resources/native
+        run: rm -rf cobble-binding/cobble-java/java/src/main/resources/native
 
       - name: Download all native artifacts
         uses: actions/download-artifact@v5
@@ -282,7 +282,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p cobble-java/java/src/main/resources
+          mkdir -p cobble-binding/cobble-java/java/src/main/resources
           shopt -s nullglob
           archives=(native-archives/*.tar.gz)
           if [[ ${#archives[@]} -eq 0 ]]; then
@@ -290,12 +290,12 @@ jobs:
             exit 1
           fi
           for archive in "${archives[@]}"; do
-            tar -xzf "${archive}" -C cobble-java/java/src/main/resources
+            tar -xzf "${archive}" -C cobble-binding/cobble-java/java/src/main/resources
           done
 
           while IFS= read -r file; do
             [[ -z "${file}" ]] && continue
-            full_path="cobble-java/java/src/main/resources/${file}"
+            full_path="cobble-binding/cobble-java/java/src/main/resources/${file}"
             if [[ ! -s "${full_path}" ]]; then
               echo "Missing or empty native artifact: ${full_path}" >&2
               exit 1
@@ -327,14 +327,14 @@ jobs:
 
       - name: Set release version from tag
         if: github.event_name == 'release'
-        working-directory: cobble-java/java
+        working-directory: cobble-binding/cobble-java/java
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           ./mvnw --quiet versions:set -DnewVersion="${TAG}" -DgenerateBackupPoms=false
 
       - name: Verify SNAPSHOT version
         if: github.event_name == 'workflow_dispatch'
-        working-directory: cobble-java/java
+        working-directory: cobble-binding/cobble-java/java
         run: |
           set -euo pipefail
           version="$(./mvnw --quiet help:evaluate -Dexpression=project.version -DforceStdout)"
@@ -361,5 +361,5 @@ jobs:
           gpg --batch --list-secret-keys --keyid-format LONG
 
       - name: Publish to Maven Central (Portal plugin)
-        working-directory: cobble-java/java
+        working-directory: cobble-binding/cobble-java/java
         run: ./mvnw --batch-mode -Prelease-publish -Dgpg.passphrase="${MAVEN_GPG_PASSPHRASE}" -DskipTests -Dexec.skip=true -Dcobble.skip.local.native.copy=true deploy -s ~/.m2/settings.xml

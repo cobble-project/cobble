@@ -1,0 +1,409 @@
+use crate::read_options::read_options_from_handle_or_throw;
+use crate::scan::{ScanCursorHandle, decode_scan_open_args};
+use crate::util::{
+    decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_u16,
+    decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
+    to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
+};
+use cobble_binding::{Config, Reader, ReaderConfig};
+use jni::JNIEnv;
+use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
+use jni::sys::{jint, jlong, jobject, jstring};
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_openCurrentHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let reader_config = ReaderConfig::from_config(&config);
+    let reader = match Reader::open_current(reader_config) {
+        Ok(reader) => reader,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(reader)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_openCurrentHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    let reader_config = ReaderConfig::from_config(&config);
+    let reader = match Reader::open_current(reader_config) {
+        Ok(reader) => reader,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(reader)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_openHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    global_snapshot_id: jlong,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let reader_config = ReaderConfig::from_config(&config);
+    let reader = match Reader::open(reader_config, snapshot_id) {
+        Ok(reader) => reader,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(reader)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_openHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    global_snapshot_id: jlong,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    let reader_config = ReaderConfig::from_config(&config);
+    let reader = match Reader::open(reader_config, snapshot_id) {
+        Ok(reader) => reader,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(reader)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_disposeInternal(
+    mut env: JNIEnv,
+    _obj: JObject,
+    native_handle: jlong,
+) {
+    if native_handle == 0 {
+        throw_illegal_state(&mut env, "reader handle is already disposed".to_string());
+        return;
+    }
+    let ptr = native_handle as *mut Reader;
+    // SAFETY: `native_handle` is returned by `Reader.open*Handle` from `Box<Reader>`.
+    let _boxed = unsafe { Box::from_raw(ptr) };
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_refresh(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) {
+    let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    if let Err(err) = reader.refresh() {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_get(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    read_options_handle: jlong,
+) -> jobject {
+    let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let values = match if read_options_handle == 0 {
+        reader.get(bucket, &key)
+    } else {
+        let Some(read_options_handle) =
+            read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        reader.get_with_options(bucket, &key, read_options_handle.read_options())
+    } {
+        Ok(values) => values,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let Some(columns) = values else {
+        return std::ptr::null_mut();
+    };
+    match to_java_optional_bytes_2d(&mut env, columns.as_slice()) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_multiGet<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    native_handle: jlong,
+    buckets: JIntArray<'local>,
+    keys: JObjectArray<'local>,
+    read_options_handle: jlong,
+) -> jobject {
+    let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let keys_vec = match decode_multi_get_keys(&mut env, &buckets, &keys) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let results = match if read_options_handle == 0 {
+        reader.multi_get(keys_vec.as_slice())
+    } else {
+        let Some(read_options_handle) =
+            read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        reader.multi_get_with_options(keys_vec.as_slice(), read_options_handle.read_options())
+    } {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match to_java_optional_bytes_3d(&mut env, results.as_slice()) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_openScanCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    start_key_inclusive: JByteArray,
+    end_key_exclusive: JByteArray,
+    scan_options_handle: jlong,
+) -> jlong {
+    let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    let Some(args) = decode_scan_open_args(
+        &mut env,
+        bucket,
+        start_key_inclusive,
+        end_key_exclusive,
+        scan_options_handle,
+    ) else {
+        return 0;
+    };
+    let iter = match args.scan_options_handle {
+        Some(scan_options_handle) => match reader.scan_with_options(
+            args.bucket,
+            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+            scan_options_handle.scan_options(),
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        },
+        None => match reader.scan(
+            args.bucket,
+            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        },
+    };
+    Box::into_raw(Box::new(ScanCursorHandle::from_static_iter(iter))) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_readMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jstring {
+    let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    match env.new_string(reader.read_mode()) {
+        Ok(s) => s.into_raw(),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_configuredSnapshotId(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jlong {
+    let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
+        return -1;
+    };
+    match reader.configured_snapshot_id() {
+        Some(id) => id as jlong,
+        None => -1,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_listGlobalSnapshotsJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jstring {
+    let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let manifests = match reader.list_global_snapshot_manifests() {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let json = match serde_json::to_string(&manifests) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    to_java_string_or_throw(&mut env, json)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_currentGlobalSnapshotJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jstring {
+    let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let manifest = reader.current_global_snapshot();
+    let json = match serde_json::to_string(manifest) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    to_java_string_or_throw(&mut env, json)
+}
+
+fn reader_from_handle_or_throw(
+    env: &mut JNIEnv,
+    native_handle: jlong,
+) -> Option<&'static mut Reader> {
+    if native_handle == 0 {
+        throw_illegal_state(env, "reader handle is disposed".to_string());
+        return None;
+    }
+    // SAFETY: `native_handle` is created from `Box<Reader>` and valid until `disposeInternal`.
+    Some(unsafe { &mut *(native_handle as *mut Reader) })
+}

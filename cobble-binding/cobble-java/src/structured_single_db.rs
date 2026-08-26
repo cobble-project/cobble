@@ -1,0 +1,1041 @@
+// JNI bridge for io.cobble.structured.SingleDb
+//
+// Wraps StructuredSingleDb from cobble-data-structure.
+// Typed put/merge accept both bytes (byte[]) and list (byte[][]).
+// Typed get returns Object[] where each element is null | byte[] | byte[][].
+
+use crate::structured::{
+    StructuredScanCursorHandle, StructuredSchemaBuilderHandle, decode_write_bytes_args,
+    decode_write_list_args, direct_buffer_pool_config_array, new_priority_queue_handle,
+    to_java_multi_typed_columns, to_java_typed_columns,
+};
+use crate::structured_read_options::structured_read_options_from_handle_or_throw;
+use crate::structured_scan_options::decode_structured_scan_open_args;
+use crate::structured_write_options::structured_write_options_from_handle_or_throw;
+use crate::util::{
+    complete_future_exceptionally, complete_future_with_string, decode_java_bytes_ref,
+    decode_java_string, decode_multi_get_keys, decode_u16, decode_u32, decode_u64_from_jlong,
+    parse_config_json, throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
+};
+use bytes::Bytes;
+use cobble_binding::Config;
+use cobble_binding::structured::ffi as structured_ffi;
+use cobble_binding::structured::{StructuredColumnValue, StructuredSingleDb};
+use jni::JNIEnv;
+use jni::JavaVM;
+use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jintArray, jlong, jobject, jstring};
+
+// ── open ────────────────────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_openHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+) -> jlong {
+    let config_path = match decode_java_string(&mut env, config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(&config_path) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    open_structured_single_db(&mut env, config)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_openHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+) -> jlong {
+    let config_json = match decode_java_string(&mut env, config_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
+    };
+    open_structured_single_db(&mut env, config)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_directBufferPoolConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jintArray {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let (buffer_size_bytes, pool_size) =
+        match structured_ffi::single_db_direct_buffer_pool_config(db) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return std::ptr::null_mut();
+            }
+        };
+    direct_buffer_pool_config_array(&mut env, buffer_size_bytes, pool_size)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_currentSchemaJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    match serde_json::to_string(&db.current_schema()) {
+        Ok(v) => to_java_string_or_throw(&mut env, v),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_createSchemaBuilder(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    let Some(db) = single_db_from_handle_mut(&mut env, handle) else {
+        return 0;
+    };
+    let builder = unsafe {
+        // JNI builder handle owns the lifetime; Java must commit/dispose before SingleDb disposal.
+        let builder =
+            (&mut *(db as *mut cobble_binding::structured::StructuredSingleDb)).update_schema();
+        std::mem::transmute::<
+            cobble_binding::structured::StructuredSchemaBuilder<
+                '_,
+                cobble_binding::structured::StructuredSingleDb,
+            >,
+            cobble_binding::structured::StructuredSchemaBuilder<
+                'static,
+                cobble_binding::structured::StructuredSingleDb,
+            >,
+        >(builder)
+    };
+    let handle = StructuredSchemaBuilderHandle::SingleDb(builder);
+    Box::into_raw(Box::new(handle)) as jlong
+}
+
+// ── priority queue ─────────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_newPriorityQueue(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+) -> jlong {
+    let Some(db) = single_db_from_handle_mut(&mut env, handle) else {
+        return 0;
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let direct_buffer_pool_config = match structured_ffi::single_db_direct_buffer_pool_config(db) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    match db.new_priority_queue(name) {
+        Ok(queue) => new_priority_queue_handle(queue, direct_buffer_pool_config),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_getPriorityQueue(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+) -> jlong {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let direct_buffer_pool_config = match structured_ffi::single_db_direct_buffer_pool_config(db) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    match db.get_priority_queue(name) {
+        Ok(queue) => new_priority_queue_handle(queue, direct_buffer_pool_config),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_getOrNewPriorityQueue(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+) -> jlong {
+    let Some(db) = single_db_from_handle_mut(&mut env, handle) else {
+        return 0;
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let direct_buffer_pool_config = match structured_ffi::single_db_direct_buffer_pool_config(db) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    match db.get_or_new_priority_queue(name) {
+        Ok(queue) => new_priority_queue_handle(queue, direct_buffer_pool_config),
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+fn open_structured_single_db(env: &mut JNIEnv, config: Config) -> jlong {
+    match StructuredSingleDb::open(config) {
+        Ok(db) => Box::into_raw(Box::new(db)) as jlong,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            0
+        }
+    }
+}
+
+// ── dispose ─────────────────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_disposeInternal(
+    mut env: JNIEnv,
+    _obj: JObject,
+    native_handle: jlong,
+) {
+    if native_handle == 0 {
+        throw_illegal_state(
+            &mut env,
+            "structured single db handle is already disposed".to_string(),
+        );
+        return;
+    }
+    let db = unsafe { Box::from_raw(native_handle as *mut StructuredSingleDb) };
+    if let Err(err) = db.close() {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+// ── bytes put / merge ───────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_putBytes(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let Some((bucket, column, key, value_bytes)) =
+        decode_write_bytes_args(&mut env, bucket, column, key, value)
+    else {
+        return;
+    };
+    if let Err(err) = db.put(
+        bucket,
+        key,
+        column,
+        StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
+    ) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_putBytesWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+    write_options_handle: jlong,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let Some((bucket, col, key, value_bytes)) =
+        decode_write_bytes_args(&mut env, bucket, column, key, value)
+    else {
+        return;
+    };
+    let result = if write_options_handle == 0 {
+        db.put(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
+        )
+    } else {
+        let Some(wo) =
+            structured_write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.put_with_options(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
+            wo.write_options(),
+        )
+    };
+    if let Err(err) = result {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_mergeBytes(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let Some((bucket, column, key, value_bytes)) =
+        decode_write_bytes_args(&mut env, bucket, column, key, value)
+    else {
+        return;
+    };
+    if let Err(err) = db.merge(
+        bucket,
+        key,
+        column,
+        StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
+    ) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_mergeBytesWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+    write_options_handle: jlong,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let Some((bucket, col, key, value_bytes)) =
+        decode_write_bytes_args(&mut env, bucket, column, key, value)
+    else {
+        return;
+    };
+    let result = if write_options_handle == 0 {
+        db.merge(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
+        )
+    } else {
+        let Some(wo) =
+            structured_write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.merge_with_options(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::Bytes(Bytes::from(value_bytes)),
+            wo.write_options(),
+        )
+    };
+    if let Err(err) = result {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+// ── list put / merge ────────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_putList(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    elements: JObjectArray,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let Some((bucket, column, key, list)) =
+        decode_write_list_args(&mut env, bucket, column, key, elements)
+    else {
+        return;
+    };
+    if let Err(err) = db.put(bucket, key, column, StructuredColumnValue::List(list)) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_putListWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    elements: JObjectArray,
+    write_options_handle: jlong,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let Some((bucket, col, key, list)) =
+        decode_write_list_args(&mut env, bucket, column, key, elements)
+    else {
+        return;
+    };
+    let result = if write_options_handle == 0 {
+        db.put(bucket, key, col, StructuredColumnValue::List(list))
+    } else {
+        let Some(wo) =
+            structured_write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.put_with_options(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::List(list),
+            wo.write_options(),
+        )
+    };
+    if let Err(err) = result {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_mergeList(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    elements: JObjectArray,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let Some((bucket, column, key, list)) =
+        decode_write_list_args(&mut env, bucket, column, key, elements)
+    else {
+        return;
+    };
+    if let Err(err) = db.merge(bucket, key, column, StructuredColumnValue::List(list)) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_mergeListWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    elements: JObjectArray,
+    write_options_handle: jlong,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let Some((bucket, col, key, list)) =
+        decode_write_list_args(&mut env, bucket, column, key, elements)
+    else {
+        return;
+    };
+    let result = if write_options_handle == 0 {
+        db.merge(bucket, key, col, StructuredColumnValue::List(list))
+    } else {
+        let Some(wo) =
+            structured_write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.merge_with_options(
+            bucket,
+            key,
+            col,
+            StructuredColumnValue::List(list),
+            wo.write_options(),
+        )
+    };
+    if let Err(err) = result {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+// ── delete ──────────────────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_deleteWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    write_options_handle: jlong,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match crate::util::decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let result = if write_options_handle == 0 {
+        db.delete(bucket, key, column)
+    } else {
+        let Some(wo) =
+            structured_write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.delete_with_options(bucket, key, column, wo.write_options())
+    };
+    if let Err(err) = result {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+// ── typed get ───────────────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_getTyped<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray<'local>,
+) -> jobject {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let key_bytes = match decode_java_bytes_ref(&mut env, &key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let values = match db.get(bucket, &key_bytes) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let Some(columns) = values else {
+        return std::ptr::null_mut();
+    };
+    match to_java_typed_columns(&mut env, columns) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_getTypedWithOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    key: JByteArray<'local>,
+    read_options_handle: jlong,
+) -> jobject {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let key_bytes = match decode_java_bytes_ref(&mut env, &key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let values = match if read_options_handle == 0 {
+        db.get(bucket, &key_bytes)
+    } else {
+        let Some(ro) = structured_read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        db.get_with_options(bucket, &key_bytes, ro.read_options())
+    } {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let Some(columns) = values else {
+        return std::ptr::null_mut();
+    };
+    match to_java_typed_columns(&mut env, columns) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_multiGetTyped<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+    buckets: JIntArray<'local>,
+    keys: JObjectArray<'local>,
+    read_options_handle: jlong,
+) -> jobject {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let keys_vec = match decode_multi_get_keys(&mut env, &buckets, &keys) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let results = match if read_options_handle == 0 {
+        db.multi_get(keys_vec.as_slice())
+    } else {
+        let Some(ro) = structured_read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        db.multi_get_with_options(keys_vec.as_slice(), ro.read_options())
+    } {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match to_java_multi_typed_columns(&mut env, results) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// ── typed scan ──────────────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_openStructuredScanCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bucket: jint,
+    start_key_inclusive: JByteArray,
+    end_key_exclusive: JByteArray,
+    scan_options_handle: jlong,
+) -> jlong {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    let Some(args) = decode_structured_scan_open_args(
+        &mut env,
+        bucket,
+        start_key_inclusive,
+        end_key_exclusive,
+        scan_options_handle,
+    ) else {
+        return 0;
+    };
+    let range = args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice();
+    let iter = if let Some(scan_options_handle) = args.scan_options_handle {
+        match db.scan_with_options(args.bucket, range, scan_options_handle.scan_options()) {
+            Ok(iter) => iter,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        }
+    } else {
+        match db.scan(args.bucket, range) {
+            Ok(iter) => iter,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        }
+    };
+    let cursor = StructuredScanCursorHandle::new(iter);
+    Box::into_raw(Box::new(cursor)) as jlong
+}
+
+// ── metadata / time ─────────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_nowSeconds(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    db.db().db().now_seconds() as jint
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_setTime(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    next_seconds: jint,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let next = match decode_u32("nextSeconds", next_seconds) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    db.set_time(next);
+}
+
+// ── snapshot lifecycle ──────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_asyncSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    future: JObject,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let vm = match env.get_java_vm() {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, format!("failed to get java vm: {}", err));
+            return;
+        }
+    };
+    let future_ref = match env.new_global_ref(future) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, format!("failed to create global ref: {}", err));
+            return;
+        }
+    };
+    match db.snapshot_with_callback(move |result| {
+        complete_snapshot_json_future(
+            &vm,
+            &future_ref,
+            result.map(|manifest| serde_json::to_string(&manifest).unwrap_or_default()),
+        );
+    }) {
+        Ok(_) => {}
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_retainSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    snapshot_id: jlong,
+) -> jboolean {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return JNI_FALSE;
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return JNI_FALSE;
+        }
+    };
+    match db.retain_snapshot(snapshot_id) {
+        Ok(true) => JNI_TRUE,
+        Ok(false) => JNI_FALSE,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_loadReadonlyFilesToPrimary(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return 0;
+    };
+    match db.load_readonly_files_to_primary() {
+        Ok(marked) => marked as jlong,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_switchMemtableType(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    memtable_type: JString,
+    flush_current: jboolean,
+) {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return;
+    };
+    let type_str = match decode_java_string(&mut env, memtable_type) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let memtable_type = match type_str.as_str() {
+        "hash" => cobble_binding::MemtableType::Hash,
+        "skiplist" => cobble_binding::MemtableType::Skiplist,
+        "vec" => cobble_binding::MemtableType::Vec,
+        "adaptive" => cobble_binding::MemtableType::Adaptive,
+        other => {
+            throw_illegal_argument(
+                &mut env,
+                format!(
+                    "unknown memtable type '{}': expected hash, skiplist, vec, or adaptive",
+                    other
+                ),
+            );
+            return;
+        }
+    };
+    if let Err(err) = db.switch_memtable_type(memtable_type, flush_current == JNI_TRUE) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_expireSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    snapshot_id: jlong,
+) -> jboolean {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return JNI_FALSE;
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return JNI_FALSE;
+        }
+    };
+    match db.expire_snapshot(snapshot_id) {
+        Ok(true) => JNI_TRUE,
+        Ok(false) => JNI_FALSE,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_SingleDb_listSnapshotsJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let Some(db) = single_db_from_handle(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let snapshots = match db.list_snapshots() {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let json = match serde_json::to_string(&snapshots) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    to_java_string_or_throw(&mut env, json)
+}
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+fn single_db_from_handle(env: &mut JNIEnv, handle: jlong) -> Option<&'static StructuredSingleDb> {
+    if handle == 0 {
+        throw_illegal_state(env, "structured single db handle is disposed".to_string());
+        return None;
+    }
+    Some(unsafe { &*(handle as *const StructuredSingleDb) })
+}
+
+fn single_db_from_handle_mut(
+    env: &mut JNIEnv,
+    handle: jlong,
+) -> Option<&'static mut StructuredSingleDb> {
+    if handle == 0 {
+        throw_illegal_state(env, "structured single db handle is disposed".to_string());
+        return None;
+    }
+    Some(unsafe { &mut *(handle as *mut StructuredSingleDb) })
+}
+
+fn complete_snapshot_json_future(
+    vm: &JavaVM,
+    future: &GlobalRef,
+    result: cobble_binding::Result<String>,
+) {
+    let mut env = match vm.attach_current_thread() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    match result {
+        Ok(json) => {
+            let _ = complete_future_with_string(&mut env, future.as_obj(), &json).or_else(|_| {
+                complete_future_exceptionally(
+                    &mut env,
+                    future.as_obj(),
+                    "failed to allocate json string",
+                )
+            });
+        }
+        Err(err) => {
+            let _ = complete_future_exceptionally(&mut env, future.as_obj(), &err.to_string());
+        }
+    }
+}

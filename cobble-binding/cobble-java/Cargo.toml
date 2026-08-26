@@ -1,0 +1,39 @@
+[package]
+name = "cobble-java"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "cobblejni"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+storage-all = [
+    "storage-alluxio",
+    "storage-cos",
+    "storage-ftp",
+    "storage-goosefs",
+    "storage-hdfs",
+    "storage-oss",
+    "storage-s3",
+    "storage-sftp",
+]
+storage-alluxio = ["cobble-binding/storage-alluxio"]
+storage-cos = ["cobble-binding/storage-cos"]
+storage-ftp = ["cobble-binding/storage-ftp"]
+storage-goosefs = ["cobble-binding/storage-goosefs"]
+storage-hdfs = ["cobble-binding/storage-hdfs"]
+storage-oss = ["cobble-binding/storage-oss"]
+storage-s3 = ["cobble-binding/storage-s3"]
+storage-sftp = ["cobble-binding/storage-sftp"]
+
+[dependencies]
+cobble-binding = { workspace = true }
+bytes = { workspace = true }
+jni = "0.21"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+size = { workspace = true }

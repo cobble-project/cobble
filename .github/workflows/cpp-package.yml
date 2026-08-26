@@ -41,7 +41,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Configure
         run: >-
-          cmake -S cobble-cpp -B build/cobble-cpp
+          cmake -S cobble-binding/cobble-cpp -B build/cobble-cpp
           -DCMAKE_BUILD_TYPE=${{ matrix.profile.cmake }}
           -DCOBBLE_CPP_BUILD_TESTS=ON
           -DCOBBLE_CPP_CARGO_FEATURES=${{ matrix.platform.features }}

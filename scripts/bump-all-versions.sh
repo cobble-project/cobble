@@ -10,7 +10,7 @@ Bump repository package versions in one shot:
       * [workspace.package].version
       * [package].version
       * local path dependency inline-table versions (path + version)
-  - Java binding: cobble-java/java/pom.xml project version
+  - Java binding: cobble-binding/cobble-java/java/pom.xml project version
 
 Options:
   --java-snapshot     Set Java project version to <new-version>-SNAPSHOT
@@ -144,7 +144,7 @@ if [[ "${OLD_VERSION}" != "${NEW_VERSION}" ]]; then
 fi
 
 if [[ "${UPDATE_JAVA}" -eq 1 ]]; then
-  POM_FILE="${REPO_ROOT}/cobble-java/java/pom.xml"
+  POM_FILE="${REPO_ROOT}/cobble-binding/cobble-java/java/pom.xml"
   if [[ -f "${POM_FILE}" ]]; then
     CURRENT_JAVA_VERSION="$(perl -0777 -ne 'if (m{<project\b.*?<version>\s*([^<]+)\s*</version>}s) { print $1; }' "${POM_FILE}")"
     JAVA_VERSION="${NEW_VERSION}"

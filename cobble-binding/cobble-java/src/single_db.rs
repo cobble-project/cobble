@@ -1,0 +1,930 @@
+use crate::read_options::read_options_from_handle_or_throw;
+use crate::scan::{ScanCursorHandle, decode_scan_open_args};
+use crate::util::{
+    complete_future_exceptionally, complete_future_with_string, decode_java_bytes,
+    decode_java_string, decode_multi_get_keys, decode_recovery_mode, decode_u16, decode_u32,
+    decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
+    to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
+};
+use crate::write_options::write_options_from_handle_or_throw;
+use cobble_binding::{Config, RecoveryMode, SingleDb};
+use jni::JNIEnv;
+use jni::JavaVM;
+use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
+use jni::sys::{JNI_TRUE, jboolean, jint, jlong, jobject};
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let db = match SingleDb::open(config) {
+        Ok(db) => db,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(db)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    let db = match SingleDb::open(config) {
+        Ok(db) => db,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(db)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openFromGlobalSnapshotHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    global_snapshot_id: jlong,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let global_snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_single_db(
+        &mut env,
+        config,
+        global_snapshot_id,
+        RecoveryMode::SnapshotOnly,
+    )
+}
+
+fn resume_single_db(
+    env: &mut JNIEnv,
+    config: Config,
+    global_snapshot_id: u64,
+    recovery_mode: RecoveryMode,
+) -> jlong {
+    let db = match SingleDb::resume_with_recovery_mode(config, global_snapshot_id, recovery_mode) {
+        Ok(db) => db,
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            return 0;
+        }
+    };
+    Box::into_raw(Box::new(db)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openFromGlobalSnapshotHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    global_snapshot_id: jlong,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    let global_snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_single_db(
+        &mut env,
+        config,
+        global_snapshot_id,
+        RecoveryMode::SnapshotOnly,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openFromGlobalSnapshotHandleWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    global_snapshot_id: jlong,
+    recovery_mode_value: jint,
+) -> jlong {
+    let path = match decode_java_string(&mut env, config_path) {
+        Ok(path) => path,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let config = match Config::from_path(path) {
+        Ok(config) => config,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
+    };
+    let global_snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_single_db(&mut env, config, global_snapshot_id, recovery_mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openFromGlobalSnapshotHandleFromJsonWithRecoveryMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    global_snapshot_id: jlong,
+    recovery_mode_value: jint,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    let global_snapshot_id = match decode_u64_from_jlong("globalSnapshotId", global_snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
+        Ok(mode) => mode,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    resume_single_db(&mut env, config, global_snapshot_id, recovery_mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_disposeInternal(
+    mut env: JNIEnv,
+    _obj: JObject,
+    native_handle: jlong,
+) {
+    if native_handle == 0 {
+        throw_illegal_state(&mut env, "single db handle is already disposed".to_string());
+        return;
+    }
+    let ptr = native_handle as *mut SingleDb;
+    // SAFETY: `native_handle` is returned by `SingleDb.openHandle` from `Box<SingleDb>`.
+    let boxed = unsafe { Box::from_raw(ptr) };
+    if let Err(err) = boxed.close() {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_put(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let value = match decode_java_bytes(&mut env, value) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    if let Err(err) = db.put(bucket, key, column, value) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_putWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+    write_options_handle: jlong,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let value = match decode_java_bytes(&mut env, value) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let result = if write_options_handle == 0 {
+        db.put(bucket, key, column, value)
+    } else {
+        let Some(write_options_handle) =
+            write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.put_with_options(
+            bucket,
+            key,
+            column,
+            value,
+            write_options_handle.write_options(),
+        )
+    };
+    if let Err(err) = result {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_merge(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let value = match decode_java_bytes(&mut env, value) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    if let Err(err) = db.merge(bucket, key, column, value) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_mergeWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    value: JByteArray,
+    write_options_handle: jlong,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let value = match decode_java_bytes(&mut env, value) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let result = if write_options_handle == 0 {
+        db.merge(bucket, key, column, value)
+    } else {
+        let Some(write_options_handle) =
+            write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.merge_with_options(
+            bucket,
+            key,
+            column,
+            value,
+            write_options_handle.write_options(),
+        )
+    };
+    if let Err(err) = result {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_get(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    read_options_handle: jlong,
+) -> jobject {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let values = match if read_options_handle == 0 {
+        db.get(bucket, &key)
+    } else {
+        let Some(read_options_handle) =
+            read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        db.get_with_options(bucket, &key, read_options_handle.read_options())
+    } {
+        Ok(values) => values,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let Some(columns) = values else {
+        return std::ptr::null_mut();
+    };
+    match to_java_optional_bytes_2d(&mut env, columns.as_slice()) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_multiGet<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    native_handle: jlong,
+    buckets: JIntArray<'local>,
+    keys: JObjectArray<'local>,
+    read_options_handle: jlong,
+) -> jobject {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let keys_vec = match decode_multi_get_keys(&mut env, &buckets, &keys) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let results = match if read_options_handle == 0 {
+        db.multi_get(keys_vec.as_slice())
+    } else {
+        let Some(read_options_handle) =
+            read_options_from_handle_or_throw(&mut env, read_options_handle)
+        else {
+            return std::ptr::null_mut();
+        };
+        db.multi_get_with_options(keys_vec.as_slice(), read_options_handle.read_options())
+    } {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match to_java_optional_bytes_3d(&mut env, results.as_slice()) {
+        Ok(array) => array,
+        Err(err) => {
+            throw_illegal_state(&mut env, err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_delete(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    if let Err(err) = db.delete(bucket, key, column) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_deleteWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    key: JByteArray,
+    column: jint,
+    write_options_handle: jlong,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let column = match decode_u16("column", column) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let key = match decode_java_bytes(&mut env, key) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let result = if write_options_handle == 0 {
+        db.delete(bucket, key, column)
+    } else {
+        let Some(write_options_handle) =
+            write_options_from_handle_or_throw(&mut env, write_options_handle)
+        else {
+            return;
+        };
+        db.delete_with_options(bucket, key, column, write_options_handle.write_options())
+    };
+    if let Err(err) = result {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_setTime(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    next_seconds: jint,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let next = match decode_u32("nextSeconds", next_seconds) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    db.set_time(next);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_asyncSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    snapshot_future_json: JObject,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    if snapshot_future_json.is_null() {
+        throw_illegal_argument(&mut env, "snapshotFutureJson must not be null".to_string());
+        return;
+    }
+    let future = match env.new_global_ref(snapshot_future_json) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return;
+        }
+    };
+    let vm = match env.get_java_vm() {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return;
+        }
+    };
+    if let Err(err) = db.snapshot_with_callback(move |result| {
+        complete_snapshot_json_future(
+            &vm,
+            &future,
+            result.map(|manifest| serde_json::to_string(&manifest).unwrap_or_default()),
+        );
+    }) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_retainSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    snapshot_id: jlong,
+) -> jni::sys::jboolean {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return jni::sys::JNI_FALSE;
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    match db.retain_snapshot(snapshot_id) {
+        Ok(true) => jni::sys::JNI_TRUE,
+        Ok(false) => jni::sys::JNI_FALSE,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            jni::sys::JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_loadReadonlyFilesToPrimary(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jlong {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    match db.load_readonly_files_to_primary() {
+        Ok(marked) => marked as jlong,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_switchMemtableType(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    memtable_type: JString,
+    flush_current: jboolean,
+) {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let type_str = match decode_java_string(&mut env, memtable_type) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return;
+        }
+    };
+    let memtable_type = match type_str.as_str() {
+        "hash" => cobble_binding::MemtableType::Hash,
+        "skiplist" => cobble_binding::MemtableType::Skiplist,
+        "vec" => cobble_binding::MemtableType::Vec,
+        "adaptive" => cobble_binding::MemtableType::Adaptive,
+        other => {
+            throw_illegal_argument(
+                &mut env,
+                format!(
+                    "unknown memtable type '{}': expected hash, skiplist, vec, or adaptive",
+                    other
+                ),
+            );
+            return;
+        }
+    };
+    if let Err(err) = db.switch_memtable_type(memtable_type, flush_current == JNI_TRUE) {
+        throw_illegal_state(&mut env, err.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_expireSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    snapshot_id: jlong,
+) -> jni::sys::jboolean {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return jni::sys::JNI_FALSE;
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    match db.expire_snapshot(snapshot_id) {
+        Ok(true) => jni::sys::JNI_TRUE,
+        Ok(false) => jni::sys::JNI_FALSE,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            jni::sys::JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_listSnapshotsJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jni::sys::jstring {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let snapshots = match db.list_snapshots() {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let json = match serde_json::to_string(&snapshots) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    to_java_string_or_throw(&mut env, json)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SingleDb_openScanCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    start_key_inclusive: JByteArray,
+    end_key_exclusive: JByteArray,
+    scan_options_handle: jlong,
+) -> jlong {
+    let Some(db) = single_db_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    let Some(args) = decode_scan_open_args(
+        &mut env,
+        bucket,
+        start_key_inclusive,
+        end_key_exclusive,
+        scan_options_handle,
+    ) else {
+        return 0;
+    };
+    let iter = match args.scan_options_handle {
+        Some(scan_options_handle) => match db.scan_with_options(
+            args.bucket,
+            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+            scan_options_handle.scan_options(),
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        },
+        None => match db.scan(
+            args.bucket,
+            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                return 0;
+            }
+        },
+    };
+    Box::into_raw(Box::new(ScanCursorHandle::from_static_iter(iter))) as jlong
+}
+
+fn single_db_from_handle_or_throw(
+    env: &mut JNIEnv,
+    native_handle: jlong,
+) -> Option<&'static SingleDb> {
+    if native_handle == 0 {
+        throw_illegal_state(env, "single db handle is disposed".to_string());
+        return None;
+    }
+    // SAFETY: `native_handle` is created from `Box<SingleDb>` and valid until `disposeInternal`.
+    Some(unsafe { &*(native_handle as *const SingleDb) })
+}
+
+fn complete_snapshot_json_future(
+    vm: &JavaVM,
+    future: &GlobalRef,
+    result: cobble_binding::Result<String>,
+) {
+    let mut env = match vm.attach_current_thread() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    match result {
+        Ok(json) => {
+            let _ = complete_future_with_string(&mut env, future.as_obj(), &json).or_else(|_| {
+                complete_future_exceptionally(
+                    &mut env,
+                    future.as_obj(),
+                    "failed to allocate json string",
+                )
+            });
+        }
+        Err(err) => {
+            let _ = complete_future_exceptionally(&mut env, future.as_obj(), &err.to_string());
+        }
+    }
+}

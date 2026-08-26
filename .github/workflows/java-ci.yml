@@ -6,7 +6,9 @@ on:
     paths:
       - ".github/workflows/java-ci.yml"
       - ".github/workflows/java-multi-platform-jar.yml"
-      - "cobble-java/**"
+      - "cobble-binding/Cargo.toml"
+      - "cobble-binding/src/**"
+      - "cobble-binding/cobble-java/**"
       - "cobble/**"
       - "cobble-data-structure/**"
       - "Cargo.toml"
@@ -16,7 +18,9 @@ on:
     paths:
       - ".github/workflows/java-ci.yml"
       - ".github/workflows/java-multi-platform-jar.yml"
-      - "cobble-java/**"
+      - "cobble-binding/Cargo.toml"
+      - "cobble-binding/src/**"
+      - "cobble-binding/cobble-java/**"
       - "cobble/**"
       - "cobble-data-structure/**"
       - "Cargo.toml"
@@ -66,9 +70,9 @@ jobs:
             ${{ runner.os }}-java-ci-cargo-git-
 
       - name: Check Java formatting
-        working-directory: cobble-java/java
+        working-directory: cobble-binding/cobble-java/java
         run: ./mvnw --batch-mode --no-transfer-progress spotless:check
 
       - name: Run Java tests
-        working-directory: cobble-java/java
+        working-directory: cobble-binding/cobble-java/java
         run: ./mvnw --batch-mode --no-transfer-progress test

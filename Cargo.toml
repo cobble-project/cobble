@@ -2,11 +2,12 @@
 resolver = "3"
 members = [
     "cobble-bench",
+    "cobble-binding",
+    "cobble-binding/cobble-cpp",
+    "cobble-binding/cobble-java",
     "cobble-cli",
     "cobble-cluster",
-    "cobble-cpp",
     "cobble",
-    "cobble-java",
     "cobble-data-structure",
     "cobble-web-monitor",
 ]
@@ -22,6 +23,7 @@ homepage = "https://cobble-project.github.io/cobble/latest/"
 [workspace.dependencies]
 arc-swap = "1.7.1"
 cobble = { path = "cobble", version = "0.5.0" }
+cobble-binding = { path = "cobble-binding", version = "0.5.0" }
 cobble-data-structure = { path = "cobble-data-structure", version = "0.5.0" }
 cobble-web-monitor = { path = "cobble-web-monitor", version = "0.5.0" }
 bytes = "1.11.0"
