@@ -98,7 +98,7 @@ impl<'db> TableReadBackend<'db> {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         options: &ScanOptions,
-    ) -> cobble::Result<DbIterator<'db>> {
+    ) -> cobble::Result<DbIterator> {
         match self {
             Self::Writable(db) => db.scan_with_options_bounds(bucket, start, end, options),
             Self::ReadOnly(db) => db.scan_with_options_bounds(bucket, start, end, options),
@@ -308,7 +308,7 @@ impl<'db> Table<'db> {
     }
 
     /// Scan all rows in one bucket.
-    pub fn scan(&self, bucket: u16) -> Result<TableScan<'db>> {
+    pub fn scan(&self, bucket: u16) -> Result<TableScan> {
         self.scan_bounds(bucket, None, None)
     }
 
@@ -318,7 +318,7 @@ impl<'db> Table<'db> {
         bucket: u16,
         start_key_inclusive: Option<&TableKey>,
         end_key_exclusive: Option<&TableKey>,
-    ) -> Result<TableScan<'db>> {
+    ) -> Result<TableScan> {
         validate_bound(bucket, start_key_inclusive)?;
         validate_bound(bucket, end_key_exclusive)?;
         Ok(TableScan {
@@ -446,7 +446,7 @@ impl<'db> ReadOnlyTable<'db> {
     }
 
     /// Scan all rows in one bucket.
-    pub fn scan(&self, bucket: u16) -> Result<TableScan<'db>> {
+    pub fn scan(&self, bucket: u16) -> Result<TableScan> {
         self.scan_bounds(bucket, None, None)
     }
 
@@ -456,7 +456,7 @@ impl<'db> ReadOnlyTable<'db> {
         bucket: u16,
         start_key_inclusive: Option<&TableKey>,
         end_key_exclusive: Option<&TableKey>,
-    ) -> Result<TableScan<'db>> {
+    ) -> Result<TableScan> {
         validate_bound(bucket, start_key_inclusive)?;
         validate_bound(bucket, end_key_exclusive)?;
         Ok(TableScan {
@@ -513,7 +513,7 @@ impl TableProjection<'_> {
     }
 
     /// Scan projected rows in one bucket.
-    pub fn scan(&self, bucket: u16) -> Result<ProjectedTableScan<'_>> {
+    pub fn scan(&self, bucket: u16) -> Result<ProjectedTableScan> {
         self.scan_bounds(bucket, None, None)
     }
 
@@ -523,7 +523,7 @@ impl TableProjection<'_> {
         bucket: u16,
         start_key_inclusive: Option<&TableKey>,
         end_key_exclusive: Option<&TableKey>,
-    ) -> Result<ProjectedTableScan<'_>> {
+    ) -> Result<ProjectedTableScan> {
         validate_bound(bucket, start_key_inclusive)?;
         validate_bound(bucket, end_key_exclusive)?;
         Ok(ProjectedTableScan {
@@ -540,19 +540,19 @@ impl TableProjection<'_> {
 }
 
 /// Iterator over typed rows from a bucket-scoped table scan.
-pub struct TableScan<'db> {
-    inner: DbIterator<'db>,
+pub struct TableScan {
+    inner: DbIterator,
     compiled: Arc<CompiledTable>,
 }
 
 /// Iterator over projected typed rows from a bucket-scoped scan.
-pub struct ProjectedTableScan<'db> {
-    inner: DbIterator<'db>,
+pub struct ProjectedTableScan {
+    inner: DbIterator,
     compiled: Arc<CompiledTable>,
     plan: Arc<ProjectionPlan>,
 }
 
-impl Iterator for ProjectedTableScan<'_> {
+impl Iterator for ProjectedTableScan {
     type Item = Result<Vec<Value>>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -568,7 +568,7 @@ impl Iterator for ProjectedTableScan<'_> {
     }
 }
 
-impl Iterator for TableScan<'_> {
+impl Iterator for TableScan {
     type Item = Result<Vec<Value>>;
 
     fn next(&mut self) -> Option<Self::Item> {
