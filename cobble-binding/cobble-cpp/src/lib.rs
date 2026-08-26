@@ -7,8 +7,13 @@
 mod database;
 mod encoding;
 mod error;
+mod lifecycle;
+mod metrics;
+mod multi_get;
 mod options;
 mod scan;
+mod schema;
+mod snapshot;
 mod write_batch;
 
 use database::{
@@ -21,6 +26,16 @@ use database::{
     native_database_write_batch,
 };
 use error::BridgeResult;
+use lifecycle::{
+    native_database_load_readonly_files_to_primary, native_database_now_seconds,
+    native_database_switch_memtable_type,
+};
+use metrics::native_database_metrics;
+use multi_get::{
+    NativeMultiGetResult, native_database_multi_get, native_multi_get_column,
+    native_multi_get_column_count, native_multi_get_found, native_multi_get_has_column,
+    native_multi_get_row_count,
+};
 use scan::{
     NativeBatch, NativeScanCursor, native_batch_bucket, native_batch_column,
     native_batch_column_count, native_batch_end, native_batch_has_column, native_batch_key,
@@ -29,11 +44,23 @@ use scan::{
     native_scan_cursor_next_batch_into, native_scan_cursor_next_owned,
     native_scan_cursor_resume_after_block_boundary,
 };
+use schema::{
+    NativeSchemaBuilder, native_database_current_schema, native_database_update_schema,
+    native_schema_builder_add_column, native_schema_builder_commit,
+    native_schema_builder_delete_column, native_schema_builder_set_column_family_ttl,
+    native_schema_builder_set_column_operator,
+};
+use snapshot::{
+    NativePendingSnapshot, native_database_get_snapshot_typed,
+    native_database_list_snapshots_typed, native_database_start_snapshot,
+    native_database_take_snapshot, native_pending_snapshot_id, native_pending_snapshot_wait,
+};
 use write_batch::{
     NativeWriteBatch, native_write_batch_delete, native_write_batch_len, native_write_batch_merge,
     native_write_batch_new, native_write_batch_put,
 };
 
+#[allow(clippy::too_many_arguments)]
 #[cxx::bridge(namespace = "cobble::ffi")]
 mod ffi {
     struct NativeReadOptions {
@@ -61,6 +88,63 @@ mod ffi {
         bytes_required: u64,
         row_count: u64,
     }
+    struct NativeRange {
+        first: u16,
+        last: u16,
+    }
+    struct NativeFamily {
+        name: String,
+        id: u8,
+    }
+    struct NativeShardSnapshot {
+        ranges: Vec<NativeRange>,
+        families: Vec<NativeFamily>,
+        db_id: String,
+        snapshot_id: u64,
+        manifest_path: String,
+        timestamp_seconds: u32,
+        data_size_bytes: u64,
+        incremental_data_size_bytes: u64,
+    }
+    struct NativeSnapshot {
+        version: u32,
+        id: u64,
+        total_buckets: u32,
+        families: Vec<NativeFamily>,
+        shards: Vec<NativeShardSnapshot>,
+        watermark_seconds: u32,
+    }
+    struct NativeMetric {
+        name: String,
+        labels: Vec<NativeMetricLabel>,
+        kind: u8,
+        counter: u64,
+        gauge: f64,
+        count: u64,
+        sum: f64,
+        min: f64,
+        max: f64,
+    }
+    struct NativeMetricLabel {
+        key: String,
+        value: String,
+    }
+    struct NativeMergeOperator {
+        id: String,
+        has_metadata: bool,
+        metadata_json: String,
+    }
+    struct NativeSchemaFamily {
+        name: String,
+        id: u8,
+        column_count: u64,
+        value_has_ttl: bool,
+        merge_operators: Vec<NativeMergeOperator>,
+    }
+    struct NativeSchema {
+        version: u64,
+        column_families: Vec<NativeSchemaFamily>,
+    }
 
     extern "Rust" {
         type NativeDatabase;
@@ -68,6 +152,9 @@ mod ffi {
         type NativeRow;
         type NativeScanCursor;
         type NativeBatch;
+        type NativeMultiGetResult;
+        type NativePendingSnapshot;
+        type NativeSchemaBuilder;
         fn native_database_open(config_json: &str) -> Result<Box<NativeDatabase>>;
         fn native_database_open_file(config_path: &str) -> Result<Box<NativeDatabase>>;
         fn native_database_resume(
@@ -188,6 +275,79 @@ mod ffi {
             snapshot_id: u64,
         ) -> Result<String>;
         fn native_database_set_time(db: &NativeDatabase, unix_seconds: u32);
+        fn native_database_multi_get(
+            db: &NativeDatabase,
+            descriptors: usize,
+            count: u64,
+            options: &NativeReadOptions,
+        ) -> Result<Box<NativeMultiGetResult>>;
+        fn native_multi_get_row_count(rows: &NativeMultiGetResult) -> u64;
+        fn native_multi_get_found(rows: &NativeMultiGetResult, row: u64) -> bool;
+        fn native_multi_get_column_count(rows: &NativeMultiGetResult, row: u64) -> Result<u64>;
+        fn native_multi_get_has_column(rows: &NativeMultiGetResult, row: u64, column: u64) -> bool;
+        fn native_multi_get_column(
+            rows: &NativeMultiGetResult,
+            row: u64,
+            column: u64,
+        ) -> Result<&[u8]>;
+        fn native_database_start_snapshot(
+            db: &NativeDatabase,
+        ) -> Result<Box<NativePendingSnapshot>>;
+        fn native_pending_snapshot_id(pending: &NativePendingSnapshot) -> u64;
+        fn native_pending_snapshot_wait(
+            pending: &mut NativePendingSnapshot,
+        ) -> Result<NativeSnapshot>;
+        fn native_database_take_snapshot(db: &NativeDatabase) -> Result<NativeSnapshot>;
+        fn native_database_get_snapshot_typed(
+            db: &NativeDatabase,
+            snapshot_id: u64,
+        ) -> Result<NativeSnapshot>;
+        fn native_database_list_snapshots_typed(db: &NativeDatabase)
+        -> Result<Vec<NativeSnapshot>>;
+        fn native_database_now_seconds(db: &NativeDatabase) -> u32;
+        fn native_database_switch_memtable_type(
+            db: &NativeDatabase,
+            kind: u8,
+            flush_current: bool,
+        ) -> Result<()>;
+        fn native_database_load_readonly_files_to_primary(db: &NativeDatabase) -> Result<u64>;
+        fn native_database_current_schema(db: &NativeDatabase) -> Result<NativeSchema>;
+        fn native_database_update_schema(db: &NativeDatabase) -> Box<NativeSchemaBuilder>;
+        fn native_schema_builder_set_column_operator(
+            builder: &mut NativeSchemaBuilder,
+            has_family: bool,
+            family: &str,
+            column: u64,
+            operator_id: &str,
+            has_metadata: bool,
+            metadata_json: &str,
+        ) -> Result<()>;
+        fn native_schema_builder_add_column(
+            builder: &mut NativeSchemaBuilder,
+            column: u64,
+            has_operator: bool,
+            operator_id: &str,
+            has_metadata: bool,
+            metadata_json: &str,
+            has_default_value: bool,
+            default_value: &[u8],
+            has_family: bool,
+            family: &str,
+        ) -> Result<()>;
+        fn native_schema_builder_delete_column(
+            builder: &mut NativeSchemaBuilder,
+            has_family: bool,
+            family: &str,
+            column: u64,
+        ) -> Result<()>;
+        fn native_schema_builder_set_column_family_ttl(
+            builder: &mut NativeSchemaBuilder,
+            has_family: bool,
+            family: &str,
+            value_has_ttl: bool,
+        ) -> Result<()>;
+        fn native_schema_builder_commit(builder: Box<NativeSchemaBuilder>) -> Result<NativeSchema>;
+        fn native_database_metrics(db: &NativeDatabase) -> Vec<NativeMetric>;
     }
 }
 

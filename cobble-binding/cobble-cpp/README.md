@@ -4,13 +4,16 @@
 built with [`cxx`](https://cxx.rs/) and presents an ordinary C++ header and
 CMake target; generated bridge types are private implementation details.
 
-The initial API includes:
+The raw single-node API includes:
 
 - single-node database open and snapshot resume;
-- point get, put, delete, and merge operations;
+- point and one-crossing multi-get, put, delete, and merge operations;
 - atomic write batches;
 - projected range scans with owned or caller-buffer results;
-- global snapshot creation, retention, expiration, listing, and inspection.
+- synchronous and asynchronous typed global snapshots, retention, expiration,
+  listing, and inspection;
+- typed raw schema inspection/evolution, lifecycle controls, and labeled
+  metrics.
 
 Table codecs and structured Table rows are not part of this binding.
 
@@ -31,9 +34,11 @@ ctest --test-dir build/cobble-cpp --output-on-failure
 ```
 
 CTest runs a focused binding test, a complete public-API/snapshot-recovery
-test, and a bulk end-to-end test. The API test covers JSON and file-based
+test, a raw `SingleDb` capability test, and a bulk end-to-end test. The tests
+cover JSON and file-based
 open/resume, both recovery modes, WAL replay, TTL, mutation and projection
-options, caller-owned buffers, multi-run block-boundary resume, and snapshot
+options, caller-owned buffers, multi-run block-boundary resume, one-crossing
+multi-get, schema evolution, lifecycle/metrics, typed snapshots, and snapshot
 retention/expiration. The bulk test writes 20,000 two-column rows (12.8 MB of
 values) across 16 buckets, verifies
 point reads, both scan ownership modes, snapshot creation, close, resume, and a
@@ -87,8 +92,9 @@ target_compile_features(my_app PRIVATE cxx_std_20)
 The package installs `cobble/cobble.hpp` and the shared library. Consumers do
 not need to include a generated `cxx` header. `cobble.hpp` remains the complete
 compatibility umbrella; consumers that prefer narrower dependencies can include
-`types.hpp`, `options.hpp`, `write_batch.hpp`, `scan.hpp`, or `database.hpp`
-directly.
+`types.hpp`, `options.hpp`, `write_batch.hpp`, `scan.hpp`, `multi_get.hpp`,
+`schema.hpp`, `snapshot.hpp`, `metrics.hpp`, `lifecycle.hpp`, `single_db.hpp`,
+or `database.hpp` directly.
 
 ## Data ownership and zero-copy paths
 
@@ -100,6 +106,11 @@ encode or retain the data internally as required by the storage operation.
 payload remains in Rust `Bytes` allocations. Their key and column accessors
 return `std::span` views without copying payload into `std::vector` or
 `std::string`.
+
+`Database::MultiGet` crosses the bridge once. Its descriptor array borrows the
+original C++ key spans synchronously, so key payloads are not concatenated or
+copied at the binding boundary. `OwnedMultiGetResult` keeps the returned Rust
+`Bytes` allocations alive and exposes zero-copy column views.
 
 For reusable C++ memory, `Database::GetColumnInto` and
 `ScanCursor::NextBatchInto` write into a caller-owned span. A too-small scan
@@ -115,5 +126,6 @@ and the Cobble error message. Database methods that take a const handle may be
 called concurrently. A scan cursor is mutable and requires external
 synchronization.
 
-Release all scan cursors before an explicit `Database::Close`. Normal RAII
-destruction is safe because every cursor retains its database owner.
+Release all scan cursors and schema builders before an explicit
+`Database::Close`. Normal RAII destruction is safe because these dependent
+objects retain their database owner.

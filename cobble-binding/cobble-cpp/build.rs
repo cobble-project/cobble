@@ -7,8 +7,13 @@ fn main() {
         "src/database.rs",
         "src/encoding.rs",
         "src/error.rs",
+        "src/lifecycle.rs",
+        "src/metrics.rs",
+        "src/multi_get.rs",
         "src/options.rs",
         "src/scan.rs",
+        "src/schema.rs",
+        "src/snapshot.rs",
         "src/write_batch.rs",
     ] {
         println!("cargo:rerun-if-changed={source}");

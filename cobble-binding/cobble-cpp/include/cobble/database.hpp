@@ -8,8 +8,13 @@
 #include <string_view>
 #include <vector>
 
+#include <cobble/lifecycle.hpp>
+#include <cobble/metrics.hpp>
+#include <cobble/multi_get.hpp>
 #include <cobble/options.hpp>
 #include <cobble/scan.hpp>
+#include <cobble/schema.hpp>
+#include <cobble/snapshot.hpp>
 #include <cobble/types.hpp>
 #include <cobble/write_batch.hpp>
 
@@ -70,6 +75,8 @@ class COBBLE_CPP_API Database final {
   [[nodiscard]] BufferResult GetColumnInto(
       BucketId bucket, BytesView key, MutableBytesView output,
       const ReadOptions& options) const;
+  [[nodiscard]] OwnedMultiGetResult MultiGet(std::span<const MultiGetKey> keys,
+                                              const ReadOptions& options = {}) const;
 
   [[nodiscard]] ScanCursor Scan(
       BucketId bucket, std::optional<BytesView> start_inclusive,
@@ -77,12 +84,22 @@ class COBBLE_CPP_API Database final {
       const ScanOptions& options = {}) const;
 
   [[nodiscard]] SnapshotId Snapshot() const;
+  [[nodiscard]] GlobalSnapshot TakeSnapshot() const;
+  [[nodiscard]] PendingSnapshot StartSnapshot() const;
+  [[nodiscard]] GlobalSnapshot GetSnapshot(SnapshotId snapshot) const;
+  [[nodiscard]] std::vector<GlobalSnapshot> ListGlobalSnapshots() const;
   [[nodiscard]] bool RetainSnapshot(SnapshotId snapshot) const;
   [[nodiscard]] bool ExpireSnapshot(SnapshotId snapshot) const;
   [[nodiscard]] std::vector<SnapshotId> ListSnapshots() const;
   [[nodiscard]] std::string SnapshotManifestJson(SnapshotId snapshot) const;
 
   void SetTime(std::uint32_t unix_seconds) const;
+  [[nodiscard]] std::uint32_t NowSeconds() const;
+  void SwitchMemtableType(MemtableType type, bool flush_current) const;
+  [[nodiscard]] std::size_t LoadReadonlyFilesToPrimary() const;
+  [[nodiscard]] Schema CurrentSchema() const;
+  [[nodiscard]] SchemaBuilder UpdateSchema() const;
+  [[nodiscard]] std::vector<MetricSample> Metrics() const;
   void Close() const;
 
  private:
