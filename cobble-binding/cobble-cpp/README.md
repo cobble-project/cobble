@@ -27,9 +27,8 @@ The separate `<cobble/structured.hpp>` entry point adds typed BYTES/LIST
 `structured::Db` and `structured::SingleDb` APIs without changing the raw
 umbrella or ABI. This surface includes point CRUD, reusable projected reads,
 detached staged schema evolution, typed snapshot/lifecycle controls, recovery,
-and sharded rescaling. Batch, multi-get, scan/split, and priority-queue APIs are
-kept out of this initial structured surface and will be added as dedicated
-modules.
+sharded rescaling, one-crossing batch and multi-get operations, owned and
+caller-buffer scans, typed distributed scan plans, and detached priority queues.
 
 ## Requirements
 
@@ -92,9 +91,10 @@ ctest --test-dir build/cobble-cpp-s3 -R cobble_cpp_s3_e2e \
   --output-on-failure
 ```
 
-The test writes 512 rows, materializes an S3-backed snapshot, closes the
-database, resumes that exact snapshot, and verifies point reads plus a full
-ordered scan. CI runs the same flow against a pinned RustFS container.
+The test writes 512 raw rows and 384 structured BYTES+LIST rows under separate
+S3 prefixes. It materializes snapshots, closes both databases, resumes
+the exact snapshots with `SnapshotOnly`, and verifies point reads plus full
+ordered scans. CI runs the same flow against a pinned RustFS container.
 
 ## Use from CMake
 
