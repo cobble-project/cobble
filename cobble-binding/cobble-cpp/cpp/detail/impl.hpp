@@ -35,4 +35,10 @@ struct Database::Impl {
   rust::Box<ffi::NativeDatabase> native;
 };
 
+struct Db::Impl {
+  explicit Impl(rust::Box<ffi::NativeShardedDatabase> native_database)
+      : native(std::move(native_database)) {}
+  rust::Box<ffi::NativeShardedDatabase> native;
+};
+
 }  // namespace cobble

@@ -88,7 +88,8 @@ add_dependencies(cobble_cpp_rust cobble_cpp_cargo)
 add_library(cobble_cpp SHARED cpp/convert.cpp cpp/error.cpp cpp/options.cpp
                               cpp/write_batch.cpp cpp/scan.cpp cpp/database.cpp
                               cpp/multi_get.cpp cpp/snapshot.cpp cpp/schema.cpp
-                              cpp/lifecycle.cpp cpp/metrics.cpp cpp/version.cpp)
+                              cpp/lifecycle.cpp cpp/metrics.cpp
+                              cpp/sharded_db.cpp cpp/rescale.cpp cpp/version.cpp)
 add_library(cobble::cobble ALIAS cobble_cpp)
 add_dependencies(cobble_cpp cobble_cpp_cargo)
 
@@ -154,6 +155,14 @@ if(COBBLE_CPP_BUILD_TESTS)
   add_test(NAME cobble_cpp_raw_single_db_capability
            COMMAND cobble_cpp_raw_single_db_capability_test)
   set_tests_properties(cobble_cpp_raw_single_db_capability PROPERTIES TIMEOUT 180)
+
+  add_executable(cobble_cpp_sharded_db_capability_test
+                 tests/sharded_db_capability_test.cpp)
+  target_link_libraries(cobble_cpp_sharded_db_capability_test
+                        PRIVATE cobble::cobble)
+  add_test(NAME cobble_cpp_sharded_db_capability
+           COMMAND cobble_cpp_sharded_db_capability_test)
+  set_tests_properties(cobble_cpp_sharded_db_capability PROPERTIES TIMEOUT 240)
 
   if(COBBLE_CPP_BUILD_S3_E2E_TEST)
     add_executable(cobble_cpp_s3_e2e_test tests/s3_e2e_test.cpp)

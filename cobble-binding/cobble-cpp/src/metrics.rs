@@ -1,8 +1,7 @@
 use crate::{database::NativeDatabase, ffi};
 
-pub(crate) fn native_database_metrics(db: &NativeDatabase) -> Vec<ffi::NativeMetric> {
-    db.db
-        .metrics()
+fn metrics(samples: Vec<cobble_binding::MetricSample>) -> Vec<ffi::NativeMetric> {
+    samples
         .into_iter()
         .map(|sample| {
             let labels = sample
@@ -47,4 +46,14 @@ pub(crate) fn native_database_metrics(db: &NativeDatabase) -> Vec<ffi::NativeMet
             }
         })
         .collect()
+}
+
+pub(crate) fn native_database_metrics(db: &NativeDatabase) -> Vec<ffi::NativeMetric> {
+    metrics(db.db.metrics())
+}
+
+pub(crate) fn native_sharded_database_metrics(
+    db: &crate::sharded_db::NativeShardedDatabase,
+) -> Vec<ffi::NativeMetric> {
+    metrics(db.db.metrics())
 }

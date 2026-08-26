@@ -44,6 +44,25 @@ static_assert(offsetof(KeyDescriptor, length) == kLengthOffset);
 static_assert(alignof(KeyDescriptor) == kDescriptorAlignment);
 static_assert(sizeof(KeyDescriptor) == kDescriptorSize);
 
+template <typename Call>
+rust::Box<ffi::NativeMultiGetResult> CallMultiGet(
+    std::span<const MultiGetKey> keys, const ReadOptions& options, Call&& call) {
+  if (keys.size() > std::numeric_limits<std::uint64_t>::max()) {
+    throw Error(ErrorCode::kInput, "multi-get key count does not fit in u64");
+  }
+
+  std::vector<KeyDescriptor> descriptors;
+  descriptors.reserve(keys.size());
+  for (const auto& key : keys) {
+    descriptors.push_back({key.bucket, 0, key.key.data(), key.key.size()});
+  }
+  const auto native_options = detail::ToNative(options);
+  return detail::Translate([&] {
+    return call(reinterpret_cast<std::size_t>(descriptors.data()),
+                descriptors.size(), native_options);
+  });
+}
+
 }  // namespace
 
 struct OwnedMultiGetResult::Impl {
@@ -110,21 +129,24 @@ OwnedMultiGetResult Database::MultiGet(
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Database has been moved from");
   }
-  if (keys.size() > std::numeric_limits<std::uint64_t>::max()) {
-    throw Error(ErrorCode::kInput, "multi-get key count does not fit in u64");
-  }
-
-  std::vector<KeyDescriptor> descriptors;
-  descriptors.reserve(keys.size());
-  for (const auto& key : keys) {
-    descriptors.push_back({key.bucket, 0, key.key.data(), key.key.size()});
-  }
-  const auto native_options = detail::ToNative(options);
-  auto native = detail::Translate([&] {
+  auto native = CallMultiGet(keys, options, [&](auto address, auto count,
+                                                const auto& native_options) {
     return ffi::native_database_multi_get(
-        *impl_->native,
-        reinterpret_cast<std::size_t>(descriptors.data()), descriptors.size(),
-        native_options);
+        *impl_->native, address, count, native_options);
+  });
+  return OwnedMultiGetResult(
+      std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
+}
+
+OwnedMultiGetResult Db::MultiGet(std::span<const MultiGetKey> keys,
+                                 const ReadOptions& options) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  auto native = CallMultiGet(keys, options, [&](auto address, auto count,
+                                                const auto& native_options) {
+    return ffi::native_sharded_database_multi_get(
+        *impl_->native, address, count, native_options);
   });
   return OwnedMultiGetResult(
       std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));

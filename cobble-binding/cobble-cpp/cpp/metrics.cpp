@@ -2,15 +2,13 @@
 
 #include <utility>
 
+#include "detail/convert.hpp"
 #include "detail/impl.hpp"
 
 namespace cobble {
 
-std::vector<MetricSample> Database::Metrics() const {
-  if (!impl_) {
-    throw Error(ErrorCode::kInvalidState, "Database has been moved from");
-  }
-  auto native = ffi::native_database_metrics(*impl_->native);
+std::vector<MetricSample> detail::ToMetrics(
+    rust::Vec<ffi::NativeMetric> native) {
   std::vector<MetricSample> result;
   result.reserve(native.size());
   for (const auto& sample : native) {
@@ -41,6 +39,21 @@ std::vector<MetricSample> Database::Metrics() const {
         {std::string(sample.name), std::move(labels), std::move(value)});
   }
   return result;
+}
+
+std::vector<MetricSample> Database::Metrics() const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Database has been moved from");
+  }
+  return detail::ToMetrics(ffi::native_database_metrics(*impl_->native));
+}
+
+std::vector<MetricSample> Db::Metrics() const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  return detail::ToMetrics(
+      ffi::native_sharded_database_metrics(*impl_->native));
 }
 
 }  // namespace cobble

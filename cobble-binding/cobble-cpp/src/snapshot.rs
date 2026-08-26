@@ -12,8 +12,53 @@ pub(crate) struct NativePendingSnapshot {
     receiver: Option<mpsc::Receiver<BridgeResult<cobble_binding::GlobalSnapshotManifest>>>,
 }
 
+pub(crate) struct NativePendingShardSnapshot {
+    id: u64,
+    receiver: Option<mpsc::Receiver<BridgeResult<cobble_binding::ShardSnapshotInput>>>,
+}
+
 fn family((name, id): (String, u8)) -> ffi::NativeFamily {
     ffi::NativeFamily { name, id }
+}
+
+fn shard_snapshot(value: cobble_binding::ShardSnapshotInput) -> ffi::NativeShardSnapshot {
+    ffi::NativeShardSnapshot {
+        ranges: value
+            .ranges
+            .into_iter()
+            .map(|range| ffi::NativeRange {
+                first: *range.start(),
+                last: *range.end(),
+            })
+            .collect(),
+        families: value.column_family_ids.into_iter().map(family).collect(),
+        db_id: value.db_id,
+        snapshot_id: value.snapshot_id,
+        manifest_path: value.manifest_path,
+        timestamp_seconds: value.timestamp_seconds,
+        data_size_bytes: value.data_size_bytes,
+        incremental_data_size_bytes: value.incremental_data_size_bytes,
+    }
+}
+
+fn shard_snapshot_ref(value: cobble_binding::ShardSnapshotRef) -> ffi::NativeShardSnapshot {
+    ffi::NativeShardSnapshot {
+        ranges: value
+            .ranges
+            .into_iter()
+            .map(|range| ffi::NativeRange {
+                first: *range.start(),
+                last: *range.end(),
+            })
+            .collect(),
+        families: value.column_family_ids.into_iter().map(family).collect(),
+        db_id: value.db_id,
+        snapshot_id: value.snapshot_id,
+        manifest_path: value.manifest_path,
+        timestamp_seconds: value.timestamp_seconds,
+        data_size_bytes: value.data_size_bytes,
+        incremental_data_size_bytes: value.incremental_data_size_bytes,
+    }
 }
 
 fn snapshot(value: cobble_binding::GlobalSnapshotManifest) -> ffi::NativeSnapshot {
@@ -25,26 +70,91 @@ fn snapshot(value: cobble_binding::GlobalSnapshotManifest) -> ffi::NativeSnapsho
         shards: value
             .shard_snapshots
             .into_iter()
-            .map(|shard| ffi::NativeShardSnapshot {
-                ranges: shard
-                    .ranges
-                    .into_iter()
-                    .map(|range| ffi::NativeRange {
-                        first: *range.start(),
-                        last: *range.end(),
-                    })
-                    .collect(),
-                families: shard.column_family_ids.into_iter().map(family).collect(),
-                db_id: shard.db_id,
-                snapshot_id: shard.snapshot_id,
-                manifest_path: shard.manifest_path,
-                timestamp_seconds: shard.timestamp_seconds,
-                data_size_bytes: shard.data_size_bytes,
-                incremental_data_size_bytes: shard.incremental_data_size_bytes,
-            })
+            .map(shard_snapshot_ref)
             .collect(),
         watermark_seconds: value.watermark_seconds,
     }
+}
+
+pub(crate) fn native_sharded_database_snapshot(
+    db: &crate::sharded_db::NativeShardedDatabase,
+) -> BridgeResult<u64> {
+    db.db.snapshot().map_err(format_cobble_error)
+}
+
+pub(crate) fn native_sharded_database_start_snapshot(
+    db: &crate::sharded_db::NativeShardedDatabase,
+) -> BridgeResult<Box<NativePendingShardSnapshot>> {
+    let (sender, receiver) = mpsc::channel();
+    let id = db
+        .db
+        .snapshot_with_callback(move |result| {
+            let _ = sender.send(result.map_err(format_cobble_error));
+        })
+        .map_err(format_cobble_error)?;
+    Ok(Box::new(NativePendingShardSnapshot {
+        id,
+        receiver: Some(receiver),
+    }))
+}
+
+pub(crate) fn native_pending_shard_snapshot_id(pending: &NativePendingShardSnapshot) -> u64 {
+    pending.id
+}
+
+pub(crate) fn native_pending_shard_snapshot_wait(
+    pending: &mut NativePendingShardSnapshot,
+) -> BridgeResult<ffi::NativeShardSnapshot> {
+    let receiver = pending
+        .receiver
+        .take()
+        .ok_or_else(|| input_error("pending shard snapshot was already waited"))?;
+    receiver
+        .recv()
+        .map_err(|_| input_error("shard snapshot completion channel closed"))?
+        .map(shard_snapshot)
+}
+
+pub(crate) fn native_sharded_database_take_snapshot(
+    db: &crate::sharded_db::NativeShardedDatabase,
+) -> BridgeResult<ffi::NativeShardSnapshot> {
+    let mut pending = native_sharded_database_start_snapshot(db)?;
+    native_pending_shard_snapshot_wait(&mut pending)
+}
+
+pub(crate) fn native_sharded_database_cancel_snapshot(
+    db: &crate::sharded_db::NativeShardedDatabase,
+    snapshot_id: u64,
+) -> BridgeResult<bool> {
+    db.db
+        .cancel_snapshot(snapshot_id)
+        .map_err(format_cobble_error)
+}
+
+pub(crate) fn native_sharded_database_get_shard_snapshot(
+    db: &crate::sharded_db::NativeShardedDatabase,
+    snapshot_id: u64,
+) -> BridgeResult<ffi::NativeShardSnapshot> {
+    db.db
+        .shard_snapshot_input(snapshot_id)
+        .map(shard_snapshot)
+        .map_err(format_cobble_error)
+}
+
+pub(crate) fn native_sharded_database_retain_snapshot(
+    db: &crate::sharded_db::NativeShardedDatabase,
+    snapshot_id: u64,
+) -> bool {
+    db.db.retain_snapshot(snapshot_id)
+}
+
+pub(crate) fn native_sharded_database_expire_snapshot(
+    db: &crate::sharded_db::NativeShardedDatabase,
+    snapshot_id: u64,
+) -> BridgeResult<bool> {
+    db.db
+        .expire_snapshot(snapshot_id)
+        .map_err(format_cobble_error)
 }
 
 pub(crate) fn native_database_start_snapshot(

@@ -15,5 +15,10 @@ std::size_t ToSize(std::uint64_t value, std::string_view field);
 BytesView ToView(rust::Slice<const Byte> value) noexcept;
 BufferStatus ToBufferStatus(std::uint8_t status);
 BufferResult ToBufferResult(const ffi::NativeBufferResult& native);
+rust::Vec<ffi::NativeRange> ToNativeRanges(
+    std::span<const BucketRange> ranges);
+ShardSnapshot ToShardSnapshot(const ffi::NativeShardSnapshot& native);
+Schema ToSchema(const ffi::NativeSchema& native);
+std::vector<MetricSample> ToMetrics(rust::Vec<ffi::NativeMetric> native);
 
 }  // namespace cobble::detail

@@ -13,6 +13,7 @@ fn main() {
         "src/options.rs",
         "src/scan.rs",
         "src/schema.rs",
+        "src/sharded_db.rs",
         "src/snapshot.rs",
         "src/write_batch.rs",
     ] {

@@ -2,11 +2,12 @@
 
 ## Scope
 
-The first stable C++ API wraps `SingleDb` and the raw bucket/key/column data
-model. It includes database open/resume, point and multi-key reads, writes,
-write batches, range scans, raw schema evolution, metrics, runtime lifecycle
-controls, and typed global snapshot operations. Table codecs and structured
-Table schema APIs are intentionally outside this binding.
+The C++ API wraps both `SingleDb` and the sharded `Db` raw bucket/key/column
+data model. It includes database open/resume/restore, point and multi-key
+reads, writes, write batches, range scans, raw schema evolution, metrics,
+runtime lifecycle controls, typed global and shard snapshot operations, active
+snapshot switching, and bucket rescaling. Table codecs and structured Table
+schema APIs are intentionally outside this binding.
 
 The public C++ header does not expose generated `cxx` types or Rust storage
 layout. This leaves room to evolve the Rust bridge without changing every C++
@@ -16,8 +17,8 @@ consumer and keeps the public API usable from ordinary CMake projects.
 
 `cobble.hpp` is a compatibility umbrella over the standalone public headers:
 `types.hpp`, `options.hpp`, `write_batch.hpp`, `scan.hpp`, `multi_get.hpp`,
-`schema.hpp`, `snapshot.hpp`, `metrics.hpp`, `lifecycle.hpp`, `single_db.hpp`,
-and `database.hpp`.
+`schema.hpp`, `snapshot.hpp`, `metrics.hpp`, `lifecycle.hpp`, `rescale.hpp`,
+`single_db.hpp`, `database.hpp`, and `db.hpp`.
 The C++ implementation is split by the same responsibilities, with private
 bridge, conversion, error-translation, and PImpl declarations under
 `cpp/detail`. Rust keeps the `cxx` declaration in `src/lib.rs` so the generated
@@ -58,11 +59,14 @@ destroyed.
 ## Lifetime and concurrency
 
 `Database` remains the ABI-compatible class name, while `SingleDb` is its
-canonical source-level alias. Database handles are move-only and safe for
-concurrent calls to operations that take a const handle. Scan cursors are move-only and require external
-synchronization. A cursor retains both an owned core iterator and a database
-owner so destroying the original database handle cannot invalidate the cursor
-or make database shutdown wait on a cursor owned by the same object graph.
+canonical source-level alias. The sharded `Db` is an independent PImpl class,
+so adding it does not change the existing class layout. Database handles are
+move-only and safe for concurrent calls to operations that take a const
+handle. Scan cursors are move-only and require external synchronization. A
+cursor retains both an owned core iterator and a concrete `SingleDb`-or-`Db`
+owner, without a trait-object dispatch layer, so destroying the original
+database handle cannot invalidate the cursor or make database shutdown wait on
+a cursor owned by the same object graph.
 
 Explicit close requires outstanding cursors and schema builders to be released
 first. Normal C++ RAII destruction is ordered safely by their retained database
@@ -74,6 +78,22 @@ ensuring the guard is released before the final database owner during commit or
 destruction. Pending snapshots are move-only, single-consumer handles; waiting
 consumes their native handle, while destruction without waiting does not cancel
 the underlying snapshot.
+
+`Db::SwitchToSnapshot` performs a controlled restart on the existing handle.
+It uses exclusive ownership of the core `Arc` rather than a global lock or
+unsafe aliasing. A retained cursor or schema builder makes that ownership
+unavailable, so the operation reports `ErrorCode::kInvalidState` and tells the
+caller to release those children. Callers must externally serialize the switch
+with other operations and cross-process snapshot metadata mutation.
+
+`Db::Open(config)` parses and validates `total_buckets` in the inclusive range
+1..=65536 before constructing the full bucket range. Explicit opens accept
+inclusive `BucketRange` spans, reject empty/reversed/out-of-bounds input, and
+leave normalization and the final non-overlap check to the core database.
+Recovery defaults are deliberate: `Resume` means the latest snapshot with WAL
+replay; `ResumeFromSnapshot` means the exact snapshot boundary without WAL
+replay. Bucket expand uses typed optional snapshot/range inputs and a typed
+storage mode, while adoption wait uses `std::chrono::milliseconds`.
 
 ## ABI and compatibility
 
@@ -90,7 +110,7 @@ error category and message.
 
 - Table logical types, codecs, and structured rows
 - C++ callbacks for custom merge operators or filesystems
-- Distributed shard orchestration APIs
+- Distributed shard orchestration or metadata coordination
 - Borrowing C++ memory beyond a synchronous call
 - Async operations that retain arbitrary C++ spans
 

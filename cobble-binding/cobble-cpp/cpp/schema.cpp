@@ -8,7 +8,7 @@
 #include "detail/impl.hpp"
 
 namespace cobble {
-namespace {
+namespace detail {
 
 Schema ToSchema(const ffi::NativeSchema& native) {
   Schema result{native.version, {}};
@@ -35,6 +35,10 @@ Schema ToSchema(const ffi::NativeSchema& native) {
   }
   return result;
 }
+
+}  // namespace detail
+
+namespace {
 
 std::string_view OptionalStringView(const std::optional<std::string>& value) {
   return value ? std::string_view(*value) : std::string_view{};
@@ -134,7 +138,7 @@ Schema SchemaBuilder::Commit() {
                 "SchemaBuilder has already been consumed");
   }
   auto impl = std::move(impl_);
-  return ToSchema(detail::Translate([&] {
+  return detail::ToSchema(detail::Translate([&] {
     return ffi::native_schema_builder_commit(std::move(impl->native));
   }));
 }
@@ -143,7 +147,7 @@ Schema Database::CurrentSchema() const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Database has been moved from");
   }
-  return ToSchema(detail::Translate(
+  return detail::ToSchema(detail::Translate(
       [&] { return ffi::native_database_current_schema(*impl_->native); }));
 }
 
@@ -152,6 +156,24 @@ SchemaBuilder Database::UpdateSchema() const {
     throw Error(ErrorCode::kInvalidState, "Database has been moved from");
   }
   auto native = ffi::native_database_update_schema(*impl_->native);
+  return SchemaBuilder(
+      std::make_unique<SchemaBuilder::Impl>(std::move(native)));
+}
+
+Schema Db::CurrentSchema() const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  return detail::ToSchema(detail::Translate([&] {
+    return ffi::native_sharded_database_current_schema(*impl_->native);
+  }));
+}
+
+SchemaBuilder Db::UpdateSchema() const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  auto native = ffi::native_sharded_database_update_schema(*impl_->native);
   return SchemaBuilder(
       std::make_unique<SchemaBuilder::Impl>(std::move(native)));
 }

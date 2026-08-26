@@ -58,6 +58,7 @@ class COBBLE_CPP_API SchemaBuilder final {
   std::unique_ptr<Impl> impl_;
 
   friend class Database;
+  friend class Db;
 };
 
 }  // namespace cobble

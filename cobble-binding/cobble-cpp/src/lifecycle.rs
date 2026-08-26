@@ -37,3 +37,48 @@ pub(crate) fn native_database_load_readonly_files_to_primary(
         })
         .map_err(format_cobble_error)
 }
+
+pub(crate) fn native_sharded_database_now_seconds(
+    db: &crate::sharded_db::NativeShardedDatabase,
+) -> u32 {
+    db.db.now_seconds()
+}
+
+pub(crate) fn native_sharded_database_set_time(
+    db: &crate::sharded_db::NativeShardedDatabase,
+    unix_seconds: u32,
+) {
+    db.db.set_time(unix_seconds);
+}
+
+pub(crate) fn native_sharded_database_switch_memtable_type(
+    db: &crate::sharded_db::NativeShardedDatabase,
+    kind: u8,
+    flush_current: bool,
+) -> BridgeResult<()> {
+    let memtable_type = match kind {
+        0 => cobble_binding::MemtableType::Hash,
+        1 => cobble_binding::MemtableType::Skiplist,
+        2 => cobble_binding::MemtableType::Vec,
+        3 => cobble_binding::MemtableType::Adaptive,
+        _ => return Err(input_error("unknown memtable type")),
+    };
+    db.db
+        .switch_memtable_type(memtable_type, flush_current)
+        .map_err(format_cobble_error)
+}
+
+pub(crate) fn native_sharded_database_load_readonly_files_to_primary(
+    db: &crate::sharded_db::NativeShardedDatabase,
+) -> BridgeResult<u64> {
+    db.db
+        .load_readonly_files_to_primary()
+        .and_then(|count| {
+            u64::try_from(count).map_err(|_| {
+                cobble_binding::Error::InvalidState(
+                    "readonly file count does not fit in u64".to_string(),
+                )
+            })
+        })
+        .map_err(format_cobble_error)
+}

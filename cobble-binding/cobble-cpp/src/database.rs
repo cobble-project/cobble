@@ -15,6 +15,25 @@ pub(crate) struct NativeDatabase {
     pub(crate) db: Arc<SingleDb>,
 }
 
+pub(crate) enum NativeDatabaseOwner {
+    Single { _owner: Arc<SingleDb> },
+    Sharded { _owner: Arc<cobble_binding::Db> },
+}
+
+impl NativeDatabaseOwner {
+    pub(crate) fn single(db: &NativeDatabase) -> Self {
+        Self::Single {
+            _owner: Arc::clone(&db.db),
+        }
+    }
+
+    pub(crate) fn sharded(db: &crate::sharded_db::NativeShardedDatabase) -> Self {
+        Self::Sharded {
+            _owner: Arc::clone(&db.db),
+        }
+    }
+}
+
 pub(crate) struct NativeRow {
     pub(crate) columns: Option<Vec<Option<Bytes>>>,
 }

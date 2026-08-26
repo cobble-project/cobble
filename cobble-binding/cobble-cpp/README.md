@@ -4,14 +4,18 @@
 built with [`cxx`](https://cxx.rs/) and presents an ordinary C++ header and
 CMake target; generated bridge types are private implementation details.
 
-The raw single-node API includes:
+The raw API includes:
 
-- single-node database open and snapshot resume;
+- `SingleDb` open and global-snapshot resume;
+- sharded `Db` open over all buckets or explicit inclusive bucket ranges;
+- exact-snapshot, latest-with-WAL, new-database, and manifest recovery;
 - point and one-crossing multi-get, put, delete, and merge operations;
 - atomic write batches;
 - projected range scans with owned or caller-buffer results;
 - synchronous and asynchronous typed global snapshots, retention, expiration,
   listing, and inspection;
+- typed shard snapshots, active snapshot switching, and bucket
+  expand/adopt/shrink operations;
 - typed raw schema inspection/evolution, lifecycle controls, and labeled
   metrics.
 
@@ -34,13 +38,13 @@ ctest --test-dir build/cobble-cpp --output-on-failure
 ```
 
 CTest runs a focused binding test, a complete public-API/snapshot-recovery
-test, a raw `SingleDb` capability test, and a bulk end-to-end test. The tests
-cover JSON and file-based
-open/resume, both recovery modes, WAL replay, TTL, mutation and projection
-options, caller-owned buffers, multi-run block-boundary resume, one-crossing
-multi-get, schema evolution, lifecycle/metrics, typed snapshots, and snapshot
-retention/expiration. The bulk test writes 20,000 two-column rows (12.8 MB of
-values) across 16 buckets, verifies
+test, raw `SingleDb` and sharded `Db` capability tests, and a bulk end-to-end
+test. The tests cover JSON and file-based open/resume, both recovery modes, WAL
+replay, TTL, mutation and projection options, caller-owned buffers, multi-run
+block-boundary resume, one-crossing multi-get, schema evolution,
+lifecycle/metrics, typed snapshots, snapshot retention/expiration, active
+snapshot switching, and bucket rescaling. The bulk test writes 20,000
+two-column rows (12.8 MB of values) across 16 buckets, verifies
 point reads, both scan ownership modes, snapshot creation, close, resume, and a
 second full scan of the restored database.
 
@@ -93,8 +97,8 @@ The package installs `cobble/cobble.hpp` and the shared library. Consumers do
 not need to include a generated `cxx` header. `cobble.hpp` remains the complete
 compatibility umbrella; consumers that prefer narrower dependencies can include
 `types.hpp`, `options.hpp`, `write_batch.hpp`, `scan.hpp`, `multi_get.hpp`,
-`schema.hpp`, `snapshot.hpp`, `metrics.hpp`, `lifecycle.hpp`, `single_db.hpp`,
-or `database.hpp` directly.
+`schema.hpp`, `snapshot.hpp`, `metrics.hpp`, `lifecycle.hpp`, `rescale.hpp`,
+`single_db.hpp`, `database.hpp`, or `db.hpp` directly.
 
 ## Data ownership and zero-copy paths
 
@@ -102,17 +106,17 @@ Input `BytesView` values are borrowed for the synchronous call and cross the
 C++/Rust boundary as `rust::Slice`, without an interop copy. Cobble may still
 encode or retain the data internally as required by the storage operation.
 
-`Database::Get` and `ScanCursor::Next` return move-only RAII objects whose
+`Database::Get`, `Db::Get`, and `ScanCursor::Next` return move-only RAII objects whose
 payload remains in Rust `Bytes` allocations. Their key and column accessors
 return `std::span` views without copying payload into `std::vector` or
 `std::string`.
 
-`Database::MultiGet` crosses the bridge once. Its descriptor array borrows the
-original C++ key spans synchronously, so key payloads are not concatenated or
-copied at the binding boundary. `OwnedMultiGetResult` keeps the returned Rust
-`Bytes` allocations alive and exposes zero-copy column views.
+`Database::MultiGet` and `Db::MultiGet` cross the bridge once. Their descriptor
+array borrows the original C++ key spans synchronously, so key payloads are not
+concatenated or copied at the binding boundary. `OwnedMultiGetResult` keeps the
+returned Rust `Bytes` allocations alive and exposes zero-copy column views.
 
-For reusable C++ memory, `Database::GetColumnInto` and
+For reusable C++ memory, `Database::GetColumnInto`, `Db::GetColumnInto`, and
 `ScanCursor::NextBatchInto` write into a caller-owned span. A too-small scan
 buffer reports the required size and retains the pending rows so retrying does
 not skip data.
@@ -127,5 +131,12 @@ called concurrently. A scan cursor is mutable and requires external
 synchronization.
 
 Release all scan cursors and schema builders before an explicit
-`Database::Close`. Normal RAII destruction is safe because these dependent
-objects retain their database owner.
+`Database::Close` or `Db::Close`. Normal RAII destruction is safe because these
+dependent objects retain their database owner.
+
+`Db::SwitchToSnapshot` is an exclusive operation on the same handle. It fails
+with `ErrorCode::kInvalidState` while a scan cursor or schema builder retains
+that database; release those children and externally serialize the switch with
+other operations. `Db::Resume` selects the latest snapshot and replays the WAL
+by default, while `Db::ResumeFromSnapshot` selects the exact snapshot boundary
+without WAL replay by default.

@@ -1,10 +1,6 @@
-use bytes::Bytes;
-use cobble_binding::DbIterator;
-use std::sync::Arc;
-
 use crate::{
     BridgeResult,
-    database::{NativeDatabase, NativeRow},
+    database::{NativeDatabase, NativeDatabaseOwner, NativeRow},
     encoding::{
         STATUS_BUFFER_TOO_SMALL, batch_encoded_len, batch_status, buffer_result, encode_batch_into,
     },
@@ -12,6 +8,8 @@ use crate::{
     ffi,
     options::{checked_nonzero_usize, checked_u64, checked_usize, to_scan_options},
 };
+use bytes::Bytes;
+use cobble_binding::DbIterator;
 
 pub(crate) struct NativeBatchRow {
     pub(crate) bucket: u16,
@@ -26,11 +24,12 @@ pub(crate) struct NativeBatch {
 }
 
 pub(crate) struct NativeScanCursor {
-    _owner: Arc<cobble_binding::SingleDb>,
     bucket: u16,
     iterator: DbIterator,
     pending_row: Option<NativeBatchRow>,
     pending_batch: Option<NativeBatch>,
+    // Drop the iterator/access guard before the final database owner.
+    _owner: NativeDatabaseOwner,
 }
 
 pub(crate) fn native_database_scan(
@@ -54,11 +53,38 @@ pub(crate) fn native_database_scan(
         )
         .map_err(format_cobble_error)?;
     Ok(Box::new(NativeScanCursor {
-        _owner: Arc::clone(&db.db),
         bucket,
         iterator,
         pending_row: None,
         pending_batch: None,
+        _owner: NativeDatabaseOwner::single(db),
+    }))
+}
+
+pub(crate) fn native_sharded_database_scan(
+    db: &crate::sharded_db::NativeShardedDatabase,
+    bucket: u16,
+    start: &[u8],
+    has_start: bool,
+    end: &[u8],
+    has_end: bool,
+    options: &ffi::NativeScanOptions,
+) -> BridgeResult<Box<NativeScanCursor>> {
+    let iterator = db
+        .db
+        .scan_with_options_bounds(
+            bucket,
+            has_start.then_some(start),
+            has_end.then_some(end),
+            &to_scan_options(options)?,
+        )
+        .map_err(format_cobble_error)?;
+    Ok(Box::new(NativeScanCursor {
+        bucket,
+        iterator,
+        pending_row: None,
+        pending_batch: None,
+        _owner: NativeDatabaseOwner::sharded(db),
     }))
 }
 

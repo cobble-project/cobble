@@ -100,6 +100,23 @@ pub(crate) fn native_database_multi_get(
     }))
 }
 
+pub(crate) fn native_sharded_database_multi_get(
+    db: &crate::sharded_db::NativeShardedDatabase,
+    descriptor_address: usize,
+    count: u64,
+    options: &ffi::NativeReadOptions,
+) -> BridgeResult<Box<NativeMultiGetResult>> {
+    // SAFETY: this function is called only by the private C++ wrapper, and the
+    // borrowed descriptors are consumed before returning across the bridge.
+    let keys = unsafe { borrowed_keys(descriptor_address, count)? };
+    Ok(Box::new(NativeMultiGetResult {
+        rows: db
+            .db
+            .multi_get_with_options(&keys, &to_read_options(options)?)
+            .map_err(format_cobble_error)?,
+    }))
+}
+
 fn row(rows: &NativeMultiGetResult, index: u64) -> BridgeResult<&Option<Vec<Option<Bytes>>>> {
     rows.rows
         .get(checked_usize(index, "multi-get row index")?)

@@ -71,4 +71,17 @@ BufferResult ToBufferResult(const ffi::NativeBufferResult& native) {
           ToSize(native.row_count, "row_count")};
 }
 
+rust::Vec<ffi::NativeRange> ToNativeRanges(
+    std::span<const BucketRange> ranges) {
+  rust::Vec<ffi::NativeRange> native;
+  native.reserve(ranges.size());
+  for (const auto& range : ranges) {
+    ffi::NativeRange value;
+    value.first = range.start_inclusive;
+    value.last = range.end_inclusive;
+    native.push_back(value);
+  }
+  return native;
+}
+
 }  // namespace cobble::detail

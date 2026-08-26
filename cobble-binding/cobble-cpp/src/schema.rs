@@ -1,11 +1,11 @@
 use bytes::Bytes;
-use cobble_binding::{MergeOperator, Schema, SchemaBuilder, SingleDb, merge_operator_by_id};
+use cobble_binding::{MergeOperator, Schema, SchemaBuilder, merge_operator_by_id};
 use serde_json::Value;
 use std::sync::Arc;
 
 use crate::{
     BridgeResult,
-    database::NativeDatabase,
+    database::{NativeDatabase, NativeDatabaseOwner},
     error::{format_cobble_error, input_error},
     ffi,
     options::checked_usize,
@@ -15,7 +15,7 @@ pub(crate) struct NativeSchemaBuilder {
     // Field order is intentional: release the builder's DB access guard before
     // dropping the last possible database owner.
     builder: SchemaBuilder,
-    _owner: Arc<SingleDb>,
+    _owner: NativeDatabaseOwner,
 }
 
 fn optional_family(has_family: bool, family: &str) -> BridgeResult<Option<String>> {
@@ -94,7 +94,22 @@ pub(crate) fn native_database_current_schema(
 pub(crate) fn native_database_update_schema(db: &NativeDatabase) -> Box<NativeSchemaBuilder> {
     Box::new(NativeSchemaBuilder {
         builder: db.db.update_schema(),
-        _owner: Arc::clone(&db.db),
+        _owner: NativeDatabaseOwner::single(db),
+    })
+}
+
+pub(crate) fn native_sharded_database_current_schema(
+    db: &crate::sharded_db::NativeShardedDatabase,
+) -> BridgeResult<ffi::NativeSchema> {
+    native_schema(db.db.current_schema().as_ref())
+}
+
+pub(crate) fn native_sharded_database_update_schema(
+    db: &crate::sharded_db::NativeShardedDatabase,
+) -> Box<NativeSchemaBuilder> {
+    Box::new(NativeSchemaBuilder {
+        builder: db.db.update_schema(),
+        _owner: NativeDatabaseOwner::sharded(db),
     })
 }
 

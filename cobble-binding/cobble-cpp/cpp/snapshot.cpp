@@ -6,6 +6,29 @@
 #include "detail/impl.hpp"
 
 namespace cobble {
+namespace detail {
+
+ShardSnapshot ToShardSnapshot(const ffi::NativeShardSnapshot& native) {
+  ShardSnapshot shard;
+  shard.db_id = std::string(native.db_id);
+  shard.snapshot_id = native.snapshot_id;
+  shard.manifest_path = std::string(native.manifest_path);
+  shard.timestamp_seconds = native.timestamp_seconds;
+  shard.data_size_bytes = native.data_size_bytes;
+  shard.incremental_data_size_bytes = native.incremental_data_size_bytes;
+  shard.ranges.reserve(native.ranges.size());
+  for (const auto& range : native.ranges) {
+    shard.ranges.push_back({range.first, range.last});
+  }
+  shard.column_families.reserve(native.families.size());
+  for (const auto& family : native.families) {
+    shard.column_families.push_back({std::string(family.name), family.id});
+  }
+  return shard;
+}
+
+}  // namespace detail
+
 namespace {
 
 GlobalSnapshot ToSnapshot(const ffi::NativeSnapshot& native) {
@@ -23,24 +46,7 @@ GlobalSnapshot ToSnapshot(const ffi::NativeSnapshot& native) {
   }
   result.shards.reserve(native.shards.size());
   for (const auto& native_shard : native.shards) {
-    ShardSnapshot shard;
-    shard.db_id = std::string(native_shard.db_id);
-    shard.snapshot_id = native_shard.snapshot_id;
-    shard.manifest_path = std::string(native_shard.manifest_path);
-    shard.timestamp_seconds = native_shard.timestamp_seconds;
-    shard.data_size_bytes = native_shard.data_size_bytes;
-    shard.incremental_data_size_bytes =
-        native_shard.incremental_data_size_bytes;
-    shard.ranges.reserve(native_shard.ranges.size());
-    for (const auto& range : native_shard.ranges) {
-      shard.ranges.push_back({range.first, range.last});
-    }
-    shard.column_families.reserve(native_shard.families.size());
-    for (const auto& family : native_shard.families) {
-      shard.column_families.push_back(
-          {std::string(family.name), family.id});
-    }
-    result.shards.push_back(std::move(shard));
+    result.shards.push_back(detail::ToShardSnapshot(native_shard));
   }
   return result;
 }
@@ -54,12 +60,27 @@ struct PendingSnapshot::Impl {
   rust::Box<ffi::NativePendingSnapshot> native;
 };
 
+struct PendingShardSnapshot::Impl {
+  explicit Impl(rust::Box<ffi::NativePendingShardSnapshot> native_snapshot)
+      : native(std::move(native_snapshot)) {}
+
+  rust::Box<ffi::NativePendingShardSnapshot> native;
+};
+
 PendingSnapshot::PendingSnapshot(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 PendingSnapshot::PendingSnapshot(PendingSnapshot&&) noexcept = default;
 PendingSnapshot& PendingSnapshot::operator=(PendingSnapshot&&) noexcept =
     default;
 PendingSnapshot::~PendingSnapshot() = default;
+
+PendingShardSnapshot::PendingShardSnapshot(std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+PendingShardSnapshot::PendingShardSnapshot(PendingShardSnapshot&&) noexcept =
+    default;
+PendingShardSnapshot& PendingShardSnapshot::operator=(
+    PendingShardSnapshot&&) noexcept = default;
+PendingShardSnapshot::~PendingShardSnapshot() = default;
 
 SnapshotId PendingSnapshot::id() const noexcept {
   return impl_ ? ffi::native_pending_snapshot_id(*impl_->native) : 0;
@@ -73,6 +94,21 @@ GlobalSnapshot PendingSnapshot::Wait() {
   auto impl = std::move(impl_);
   return ToSnapshot(detail::Translate(
       [&] { return ffi::native_pending_snapshot_wait(*impl->native); }));
+}
+
+SnapshotId PendingShardSnapshot::id() const noexcept {
+  return impl_ ? ffi::native_pending_shard_snapshot_id(*impl_->native) : 0;
+}
+
+ShardSnapshot PendingShardSnapshot::Wait() {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState,
+                "PendingShardSnapshot has been moved from");
+  }
+  auto impl = std::move(impl_);
+  return detail::ToShardSnapshot(detail::Translate([&] {
+    return ffi::native_pending_shard_snapshot_wait(*impl->native);
+  }));
 }
 
 GlobalSnapshot Database::TakeSnapshot() const {
@@ -114,6 +150,72 @@ std::vector<GlobalSnapshot> Database::ListGlobalSnapshots() const {
     result.push_back(ToSnapshot(snapshot));
   }
   return result;
+}
+
+SnapshotId Db::Snapshot() const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  return detail::Translate(
+      [&] { return ffi::native_sharded_database_snapshot(*impl_->native); });
+}
+
+PendingShardSnapshot Db::StartSnapshot() const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  auto native = detail::Translate([&] {
+    return ffi::native_sharded_database_start_snapshot(*impl_->native);
+  });
+  return PendingShardSnapshot(
+      std::make_unique<PendingShardSnapshot::Impl>(std::move(native)));
+}
+
+ShardSnapshot Db::TakeSnapshot() const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  return detail::ToShardSnapshot(detail::Translate([&] {
+    return ffi::native_sharded_database_take_snapshot(*impl_->native);
+  }));
+}
+
+bool Db::CancelSnapshot(SnapshotId snapshot) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  return detail::Translate([&] {
+    return ffi::native_sharded_database_cancel_snapshot(*impl_->native,
+                                                         snapshot);
+  });
+}
+
+ShardSnapshot Db::GetShardSnapshot(SnapshotId snapshot) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  return detail::ToShardSnapshot(detail::Translate([&] {
+    return ffi::native_sharded_database_get_shard_snapshot(*impl_->native,
+                                                            snapshot);
+  }));
+}
+
+bool Db::RetainSnapshot(SnapshotId snapshot) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  return ffi::native_sharded_database_retain_snapshot(*impl_->native,
+                                                       snapshot);
+}
+
+bool Db::ExpireSnapshot(SnapshotId snapshot) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  return detail::Translate([&] {
+    return ffi::native_sharded_database_expire_snapshot(*impl_->native,
+                                                         snapshot);
+  });
 }
 
 }  // namespace cobble

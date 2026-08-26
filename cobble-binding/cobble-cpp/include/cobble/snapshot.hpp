@@ -56,4 +56,26 @@ class COBBLE_CPP_API PendingSnapshot final {
   std::unique_ptr<Impl> impl_;
   friend class Database;
 };
+
+class COBBLE_CPP_API PendingShardSnapshot final {
+ public:
+  PendingShardSnapshot(PendingShardSnapshot&&) noexcept;
+  PendingShardSnapshot& operator=(PendingShardSnapshot&&) noexcept;
+  ~PendingShardSnapshot();
+
+  PendingShardSnapshot(const PendingShardSnapshot&) = delete;
+  PendingShardSnapshot& operator=(const PendingShardSnapshot&) = delete;
+
+  [[nodiscard]] SnapshotId id() const noexcept;
+  // Single-consumer blocking wait. Destruction does not cancel the snapshot.
+  [[nodiscard]] ShardSnapshot Wait();
+
+ private:
+  struct Impl;
+  explicit PendingShardSnapshot(std::unique_ptr<Impl>) noexcept;
+  std::unique_ptr<Impl> impl_;
+
+  friend class Db;
+};
+
 }  // namespace cobble

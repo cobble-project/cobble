@@ -41,6 +41,7 @@ class COBBLE_CPP_API OwnedRow final {
   std::unique_ptr<Impl> impl_;
 
   friend class Database;
+  friend class Db;
 };
 
 class COBBLE_CPP_API Database final {

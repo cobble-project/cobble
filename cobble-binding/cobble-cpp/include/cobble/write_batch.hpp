@@ -31,6 +31,7 @@ class COBBLE_CPP_API WriteBatch final {
   std::unique_ptr<Impl> impl_;
 
   friend class Database;
+  friend class Db;
 };
 
 }  // namespace cobble
