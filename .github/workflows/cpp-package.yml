@@ -10,46 +10,96 @@ permissions:
 
 jobs:
   package:
+    name: ${{ matrix.platform.name }} / ${{ matrix.profile.cmake }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-26
-            artifact: cobble-cpp-macos-arm64
+        platform:
+          - runner: macos-26
+            name: macos-arm64
             features: storage-all
-          - os: macos-26-intel
-            artifact: cobble-cpp-macos-x64
+          - runner: macos-26-intel
+            name: macos-x64
             features: storage-all
-          - os: ubuntu-24.04
-            artifact: cobble-cpp-linux-x64
+          - runner: ubuntu-24.04
+            name: linux-x64
             features: storage-all
-          - os: ubuntu-24.04-arm
-            artifact: cobble-cpp-linux-arm64
+          - runner: ubuntu-24.04-arm
+            name: linux-arm64
             features: storage-all
-          - os: windows-2025-vs2026
-            artifact: cobble-cpp-windows-x64
+          - runner: windows-2025-vs2026
+            name: windows-x64
             features: storage-alluxio,storage-cos,storage-ftp,storage-goosefs,storage-oss,storage-s3
-    runs-on: ${{ matrix.os }}
+        profile:
+          - cmake: Release
+            name: release
+          - cmake: Debug
+            name: debug
+    runs-on: ${{ matrix.platform.runner }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Configure
         run: >-
           cmake -S cobble-cpp -B build/cobble-cpp
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=${{ matrix.profile.cmake }}
           -DCOBBLE_CPP_BUILD_TESTS=ON
-          -DCOBBLE_CPP_CARGO_FEATURES=${{ matrix.features }}
+          -DCOBBLE_CPP_CARGO_FEATURES=${{ matrix.platform.features }}
       - name: Build
-        run: cmake --build build/cobble-cpp --config Release --parallel
+        run: cmake --build build/cobble-cpp --config ${{ matrix.profile.cmake }} --parallel
       - name: Test
-        run: ctest --test-dir build/cobble-cpp -C Release --output-on-failure
+        run: >-
+          ctest --test-dir build/cobble-cpp
+          -C ${{ matrix.profile.cmake }} --output-on-failure
       - name: Install package tree
         run: >-
-          cmake --install build/cobble-cpp --config Release
+          cmake --install build/cobble-cpp --config ${{ matrix.profile.cmake }}
           --prefix build/package
-      - name: Upload package tree
+      - name: Archive package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          package_name="cobble-cpp-${{ matrix.platform.name }}-${{ matrix.profile.name }}"
+          mv build/package "build/${package_name}"
+          tar -C build -czf "build/${package_name}.tar.gz" "${package_name}"
+      - name: Archive package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $packageName = "cobble-cpp-${{ matrix.platform.name }}-${{ matrix.profile.name }}"
+          Move-Item build/package "build/$packageName"
+          Compress-Archive -Path "build/$packageName" -DestinationPath "build/$packageName.zip"
+      - name: Upload package archive
         uses: actions/upload-artifact@v5
         with:
-          name: ${{ matrix.artifact }}
-          path: build/package
+          name: cobble-cpp-${{ matrix.platform.name }}-${{ matrix.profile.name }}
+          path: |
+            build/cobble-cpp-${{ matrix.platform.name }}-${{ matrix.profile.name }}.tar.gz
+            build/cobble-cpp-${{ matrix.platform.name }}-${{ matrix.profile.name }}.zip
           if-no-files-found: error
+          compression-level: 0
+
+  publish-release:
+    name: Publish release assets
+    if: github.event_name == 'release'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download package archives
+        uses: actions/download-artifact@v5
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum cobble-cpp-* > SHA256SUMS
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release upload "${{ github.event.release.tag_name }}"
+          release-assets/*
