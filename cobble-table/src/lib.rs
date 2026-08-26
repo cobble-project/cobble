@@ -13,6 +13,7 @@ mod layout;
 mod logical_type;
 mod metadata;
 mod schema;
+pub mod snapshot;
 mod table;
 
 #[cfg(test)]
