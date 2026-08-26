@@ -23,7 +23,13 @@ The raw API includes:
 - typed raw schema inspection/evolution, lifecycle controls, and labeled
   metrics.
 
-Table codecs and structured Table rows are not part of this binding.
+The separate `<cobble/structured.hpp>` entry point adds typed BYTES/LIST
+`structured::Db` and `structured::SingleDb` APIs without changing the raw
+umbrella or ABI. This surface includes point CRUD, reusable projected reads,
+detached staged schema evolution, typed snapshot/lifecycle controls, recovery,
+and sharded rescaling. Batch, multi-get, scan/split, and priority-queue APIs are
+kept out of this initial structured surface and will be added as dedicated
+modules.
 
 ## Requirements
 
@@ -108,6 +114,10 @@ compatibility umbrella; consumers that prefer narrower dependencies can include
 `single_db.hpp`, `database.hpp`, `db.hpp`, `read_only_db.hpp`, `reader.hpp`,
 `coordinator.hpp`, or `scan_plan.hpp` directly.
 
+Structured consumers include `<cobble/structured.hpp>` explicitly. It is not
+included by `<cobble/cobble.hpp>`, so existing raw-only translation units do
+not acquire new declarations or dependencies.
+
 ## Data ownership and zero-copy paths
 
 Input `BytesView` values are borrowed for the synchronous call and cross the
@@ -129,6 +139,14 @@ For reusable C++ memory, every raw read handle provides `GetColumnInto`, and
 `ScanCursor::NextBatchInto` writes scans into a caller-owned span. A too-small
 scan buffer reports the required size and retains the pending rows so retrying
 does not skip data.
+
+Structured BYTES inputs are borrowed at the bridge and copied once when Cobble
+takes ownership. LIST inputs cross as one descriptor vector and are encoded
+directly into the final Cobble wire buffer; the binding does not first copy
+each element into an intermediate `Bytes`. `structured::OwnedRow` keeps the
+returned Rust `Bytes` and decoded LIST element slices alive, and its accessors
+return zero-copy spans. Reusing `structured::ReadOptions` also reuses the native
+schema projection cache.
 
 `ScanPlan` and typed split DTOs own their binary boundary keys. Constructing a
 plan from `BytesView` copies those cold-path metadata bytes once; split JSON is

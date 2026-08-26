@@ -1,3 +1,5 @@
+#[cfg(feature = "ffi")]
+use crate::list::encode_borrowed_list_for_write;
 use crate::list::{
     LIST_OPERATOR_ID, ListConfig, decode_list_for_read, encode_list_for_write, list_operator,
     list_operator_from_metadata,
@@ -239,6 +241,48 @@ fn ensure_list_column(
         .unwrap_or(&StructuredColumnType::Bytes)
     {
         StructuredColumnType::List(_) => Ok(()),
+        StructuredColumnType::Bytes => Err(Error::InputError(format!(
+            "column {} is not a LIST column",
+            column,
+        ))),
+    }
+}
+
+#[cfg(feature = "ffi")]
+pub(crate) fn ensure_bytes_column(
+    schema: &StructuredSchema,
+    column_family: Option<&str>,
+    column: u16,
+) -> Result<()> {
+    let column_family_id = schema.resolve_column_family_id(column_family)?;
+    match schema
+        .column_families
+        .get(&column_family_id)
+        .map(|family| family.structured_column_type(column))
+        .unwrap_or(&StructuredColumnType::Bytes)
+    {
+        StructuredColumnType::Bytes => Ok(()),
+        StructuredColumnType::List(_) => Err(Error::InputError(format!(
+            "column {} is not a BYTES column",
+            column,
+        ))),
+    }
+}
+
+#[cfg(feature = "ffi")]
+pub(crate) fn list_column_config(
+    schema: &StructuredSchema,
+    column_family: Option<&str>,
+    column: u16,
+) -> Result<ListConfig> {
+    let column_family_id = schema.resolve_column_family_id(column_family)?;
+    match schema
+        .column_families
+        .get(&column_family_id)
+        .map(|family| family.structured_column_type(column))
+        .unwrap_or(&StructuredColumnType::Bytes)
+    {
+        StructuredColumnType::List(config) => Ok(config.clone()),
         StructuredColumnType::Bytes => Err(Error::InputError(format!(
             "column {} is not a LIST column",
             column,
@@ -1359,6 +1403,23 @@ impl StructuredDb {
             .put_with_options(bucket, key, column, encoded, options.as_cobble())
     }
 
+    #[cfg(feature = "ffi")]
+    pub(crate) fn put_borrowed_bytes_with_options<K>(
+        &self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        value: &[u8],
+        options: &StructuredWriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        ensure_bytes_column(&self.structured_schema, options.column_family(), column)?;
+        self.db
+            .put_with_options(bucket, key, column, value, options.as_cobble())
+    }
+
     /// Writes byte-column entries through the core put-batch fast path.
     #[cfg(feature = "ffi")]
     pub(crate) fn put_bytes_batch_with_options<'a, I>(
@@ -1430,6 +1491,29 @@ impl StructuredDb {
             .put_with_options(bucket, key, column, encoded.into(), options.as_cobble())
     }
 
+    #[cfg(feature = "ffi")]
+    pub(crate) fn put_borrowed_list_with_options<K>(
+        &self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        elements: &[&[u8]],
+        options: &StructuredWriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        let config = list_column_config(&self.structured_schema, options.column_family(), column)?;
+        let encoded = encode_borrowed_list_for_write(
+            elements,
+            &config,
+            options.ttl_seconds(),
+            self.db.now_seconds(),
+        )?;
+        self.db
+            .put_with_options(bucket, key, column, encoded, options.as_cobble())
+    }
+
     pub fn merge<K, V>(&self, bucket: u16, key: K, column: u16, value: V) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -1460,6 +1544,23 @@ impl StructuredDb {
         )?;
         self.db
             .merge_with_options(bucket, key, column, encoded, options.as_cobble())
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn merge_borrowed_bytes_with_options<K>(
+        &self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        value: &[u8],
+        options: &StructuredWriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        ensure_bytes_column(&self.structured_schema, options.column_family(), column)?;
+        self.db
+            .merge_with_options(bucket, key, column, value, options.as_cobble())
     }
 
     #[cfg(feature = "ffi")]
@@ -1499,6 +1600,29 @@ impl StructuredDb {
         ensure_list_column(&self.structured_schema, options.column_family(), column)?;
         self.db
             .merge_with_options(bucket, key, column, encoded.into(), options.as_cobble())
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn merge_borrowed_list_with_options<K>(
+        &self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        elements: &[&[u8]],
+        options: &StructuredWriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        let config = list_column_config(&self.structured_schema, options.column_family(), column)?;
+        let encoded = encode_borrowed_list_for_write(
+            elements,
+            &config,
+            options.ttl_seconds(),
+            self.db.now_seconds(),
+        )?;
+        self.db
+            .merge_with_options(bucket, key, column, encoded, options.as_cobble())
     }
 
     pub fn delete<K>(&self, bucket: u16, key: K, column: u16) -> Result<()>

@@ -21,6 +21,9 @@ mod sharded_db;
 mod snapshot;
 mod write_batch;
 
+mod structured;
+mod structured_bridge;
+
 use coordinator::*;
 use database::{
     NativeDatabase, NativeRow, native_database_close, native_database_delete,

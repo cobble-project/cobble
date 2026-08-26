@@ -168,6 +168,24 @@ pub(crate) fn encode_list_for_write(
     encode_list_payload(&decoded, config)
 }
 
+#[cfg(feature = "ffi")]
+pub(crate) fn encode_borrowed_list_for_write(
+    elements: &[&[u8]],
+    config: &ListConfig,
+    ttl_seconds: Option<u32>,
+    now_seconds: u32,
+) -> Result<Bytes> {
+    let expires_at_secs = if config.preserve_element_ttl {
+        ttl_seconds.map(|ttl| now_seconds.saturating_add(ttl))
+    } else {
+        None
+    };
+    encode_list_parts(
+        elements.iter().map(|value| (*value, expires_at_secs)),
+        config,
+    )
+}
+
 pub(crate) fn decode_list_for_read(
     raw: &Bytes,
     config: &ListConfig,
@@ -358,6 +376,18 @@ impl ListAccumulator {
 }
 
 fn encode_list_payload(elements: &[DecodedListElement], config: &ListConfig) -> Result<Bytes> {
+    encode_list_parts(
+        elements
+            .iter()
+            .map(|element| (element.value.as_ref(), element.expires_at_secs)),
+        config,
+    )
+}
+
+fn encode_list_parts<'a, I>(elements: I, config: &ListConfig) -> Result<Bytes>
+where
+    I: Clone + ExactSizeIterator<Item = (&'a [u8], Option<u32>)>,
+{
     if elements.len() > u32::MAX as usize {
         return Err(Error::InputError(format!(
             "too many list elements to encode: {}",
@@ -369,19 +399,30 @@ fn encode_list_payload(elements: &[DecodedListElement], config: &ListConfig) -> 
     } else {
         0
     };
+    let body_size = elements.clone().try_fold(0usize, |total, (value, _)| {
+        if value.len() > u32::MAX as usize {
+            return Err(Error::InputError(format!(
+                "list element is too large to encode: {} bytes",
+                value.len()
+            )));
+        }
+        total
+            .checked_add(ttl_bytes)
+            .and_then(|size| size.checked_add(size_of::<u32>()))
+            .and_then(|size| size.checked_add(value.len()))
+            .ok_or_else(|| Error::InputError("encoded list size overflows usize".to_string()))
+    })?;
     let total_size = size_of::<u32>()
-        + elements
-            .iter()
-            .map(|item| ttl_bytes + size_of::<u32>() + item.value.len())
-            .sum::<usize>();
+        .checked_add(body_size)
+        .ok_or_else(|| Error::InputError("encoded list size overflows usize".to_string()))?;
     let mut out = BytesMut::with_capacity(total_size);
     out.put_u32_le(elements.len() as u32);
-    for element in elements {
+    for (value, expires_at_secs) in elements {
         if config.preserve_element_ttl {
-            out.put_u32_le(element.expires_at_secs.unwrap_or(0));
+            out.put_u32_le(expires_at_secs.unwrap_or(0));
         }
-        out.put_u32_le(element.value.len() as u32);
-        out.extend_from_slice(element.value.as_ref());
+        out.put_u32_le(value.len() as u32);
+        out.extend_from_slice(value);
     }
     Ok(out.freeze())
 }
