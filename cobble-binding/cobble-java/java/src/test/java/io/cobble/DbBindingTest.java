@@ -12,6 +12,7 @@ import io.cobble.table.TableKey;
 import io.cobble.table.TableProjection;
 import io.cobble.table.TableScanCursor;
 import io.cobble.table.TableSchema;
+import io.cobble.table.TableSnapshotCommitter;
 import io.cobble.table.Value;
 
 import org.junit.jupiter.api.Test;
@@ -34,6 +35,40 @@ import java.util.concurrent.ExecutionException;
 import static org.junit.jupiter.api.Assertions.*;
 
 class DbBindingTest {
+
+    @Test
+    void tableSnapshotCommitterCoordinatesInterleavedAndBatchSnapshots() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-java-table-snapshot-committer-");
+        Config config = new Config().addVolume(dataDir.toString()).totalBuckets(4);
+        Path configPath = writeConfigFile(dataDir, config);
+        ShardSnapshot shardA = tableShardSnapshot("table-shard-a", 1L, 0, 1);
+        ShardSnapshot shardB = tableShardSnapshot("table-shard-b", 2L, 2, 3);
+
+        TableSnapshotCommitter committer = TableSnapshotCommitter.open(config, 4, 2);
+        assertNull(committer.submit(10L, shardA));
+        assertNull(committer.submit(11L, shardA));
+        GlobalSnapshot interleaved = committer.submit(11L, shardB);
+        assertNotNull(interleaved);
+        assertNotEquals(11L, interleaved.id);
+        assertNull(committer.submit(10L, shardB));
+        assertNull(committer.submit(11L, shardA));
+
+        GlobalSnapshot batch = committer.commitBatch(20L, Arrays.asList(shardB, shardA));
+        assertNotNull(batch);
+        assertTrue(batch.id > interleaved.id);
+        assertNull(committer.commitBatch(20L, Arrays.asList(shardA, shardB)));
+        committer.close();
+        assertTrue(committer.isDisposed());
+        assertThrows(IllegalStateException.class, () -> committer.submit(21L, shardA));
+
+        try (TableSnapshotCommitter reopened =
+                TableSnapshotCommitter.open(configPath.toString(), 4, 2)) {
+            GlobalSnapshot nextSession = reopened.commitBatch(1L, Arrays.asList(shardA, shardB));
+            assertNotNull(nextSession);
+            assertTrue(nextSession.id > batch.id);
+            assertNotEquals(1L, nextSession.id);
+        }
+    }
 
     @Test
     void tableApiUsesLocalCodecsAndRawJniRows() throws IOException {
@@ -2464,5 +2499,22 @@ class DbBindingTest {
         assertArrayEquals(new byte[] {(byte) 0xFF, 0x05}, rebound.startKeyExclusive);
         assertEquals(Integer.valueOf(4), rebound.endBucket);
         assertArrayEquals(new byte[] {(byte) 0xF8, 0x07}, rebound.endKeyInclusive);
+    }
+
+    private static ShardSnapshot tableShardSnapshot(
+            String dbId, long snapshotId, int rangeStart, int rangeEnd) {
+        ShardSnapshot snapshot = new ShardSnapshot();
+        snapshot.dbId = dbId;
+        snapshot.snapshotId = snapshotId;
+        snapshot.manifestPath = "file:///snapshots/" + dbId + "/" + snapshotId;
+        snapshot.columnFamilyIds.put("default", Integer.valueOf(0));
+        ShardSnapshot.Range range = new ShardSnapshot.Range();
+        range.start = rangeStart;
+        range.end = rangeEnd;
+        snapshot.ranges = Collections.singletonList(range);
+        snapshot.timestampSeconds = snapshotId;
+        snapshot.dataSizeBytes = 10L;
+        snapshot.incrementalDataSizeBytes = 1L;
+        return snapshot;
     }
 }

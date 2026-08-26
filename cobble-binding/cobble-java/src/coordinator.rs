@@ -8,7 +8,6 @@ use jni::objects::{JClass, JObject, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jstring};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::ops::RangeInclusive;
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_DbCoordinator_openHandle(
@@ -136,45 +135,18 @@ pub extern "system" fn Java_io_cobble_DbCoordinator_materializeGlobalSnapshot(
             return std::ptr::null_mut();
         }
     };
-    let parsed = match serde_json::from_str::<Vec<JavaShardSnapshot>>(&json) {
-        Ok(v) => v,
+    let shard_snapshots = match parse_shard_snapshot_inputs(&json) {
+        Ok(inputs) => inputs,
         Err(err) => {
-            throw_illegal_argument(&mut env, format!("invalid shard inputs json: {}", err));
+            throw_illegal_argument(&mut env, err);
             return std::ptr::null_mut();
         }
     };
-    if parsed.is_empty() {
+    if shard_snapshots.is_empty() {
         throw_illegal_argument(&mut env, "shard inputs must not be empty".to_string());
         return std::ptr::null_mut();
     }
-    let mut shard_snapshots: Vec<ShardSnapshotInput> = Vec::with_capacity(parsed.len());
-    for input in parsed {
-        if input.ranges.is_empty() {
-            throw_illegal_argument(&mut env, "shard input ranges must not be empty".to_string());
-            return std::ptr::null_mut();
-        }
-        let mut ranges: Vec<RangeInclusive<u16>> = Vec::with_capacity(input.ranges.len());
-        for range in input.ranges {
-            if range.start > range.end {
-                throw_illegal_argument(
-                    &mut env,
-                    format!("invalid range: start {} > end {}", range.start, range.end),
-                );
-                return std::ptr::null_mut();
-            }
-            ranges.push(range.start..=range.end);
-        }
-        shard_snapshots.push(ShardSnapshotInput {
-            ranges,
-            column_family_ids: input.column_family_ids,
-            db_id: input.db_id,
-            snapshot_id: input.snapshot_id,
-            manifest_path: input.manifest_path,
-            timestamp_seconds: input.timestamp_seconds,
-            data_size_bytes: input.data_size_bytes,
-            incremental_data_size_bytes: input.incremental_data_size_bytes,
-        });
-    }
+
     let global =
         match coordinator.take_global_snapshot_with_id(total_buckets, shard_snapshots, snapshot_id)
         {
@@ -196,6 +168,38 @@ pub extern "system" fn Java_io_cobble_DbCoordinator_materializeGlobalSnapshot(
         }
     };
     to_java_string_or_throw(&mut env, json)
+}
+
+pub(crate) fn parse_shard_snapshot_inputs(json: &str) -> Result<Vec<ShardSnapshotInput>, String> {
+    let parsed = serde_json::from_str::<Vec<JavaShardSnapshot>>(json)
+        .map_err(|err| format!("invalid shard inputs json: {err}"))?;
+    let mut shard_snapshots = Vec::with_capacity(parsed.len());
+    for input in parsed {
+        if input.ranges.is_empty() {
+            return Err("shard input ranges must not be empty".to_string());
+        }
+        let mut ranges = Vec::with_capacity(input.ranges.len());
+        for range in input.ranges {
+            if range.start > range.end {
+                return Err(format!(
+                    "invalid range: start {} > end {}",
+                    range.start, range.end
+                ));
+            }
+            ranges.push(range.start..=range.end);
+        }
+        shard_snapshots.push(ShardSnapshotInput {
+            ranges,
+            column_family_ids: input.column_family_ids,
+            db_id: input.db_id,
+            snapshot_id: input.snapshot_id,
+            manifest_path: input.manifest_path,
+            timestamp_seconds: input.timestamp_seconds,
+            data_size_bytes: input.data_size_bytes,
+            incremental_data_size_bytes: input.incremental_data_size_bytes,
+        });
+    }
+    Ok(shard_snapshots)
 }
 
 #[unsafe(no_mangle)]
