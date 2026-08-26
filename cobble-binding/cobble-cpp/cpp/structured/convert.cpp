@@ -4,6 +4,24 @@
 
 namespace cobble::structured::detail {
 
+namespace {
+
+std::size_t ToSize(std::uint64_t value, const char *name) {
+  if (value > std::numeric_limits<std::size_t>::max()) {
+    throw Error(ErrorCode::kFileFormat, std::string(name) + " exceeds size_t");
+  }
+  return static_cast<std::size_t>(value);
+}
+
+BufferStatus ToStatus(std::uint8_t value) {
+  if (value > static_cast<std::uint8_t>(BufferStatus::kBlockBoundary)) {
+    throw Error(ErrorCode::kFileFormat, "unknown structured buffer status");
+  }
+  return static_cast<BufferStatus>(value);
+}
+
+} // namespace
+
 structured_ffi::NativeWriteOptions
 ToNative(const cobble::WriteOptions &options) {
   structured_ffi::NativeWriteOptions native;
@@ -153,6 +171,13 @@ ToMetrics(rust::Vec<structured_ffi::NativeMetric> native) {
     result.push_back(std::move(sample));
   }
   return result;
+}
+
+BufferResult ToBufferResult(const structured_ffi::NativeBufferResult &native) {
+  return {ToStatus(native.status),
+          ToSize(native.bytes_written, "bytes_written"),
+          ToSize(native.bytes_required, "bytes_required"),
+          ToSize(native.row_count, "row_count")};
 }
 
 } // namespace cobble::structured::detail

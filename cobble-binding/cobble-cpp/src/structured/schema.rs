@@ -10,6 +10,7 @@ use super::{
     BridgeResult, NativeStructuredDb, NativeStructuredSchemaEdit, NativeStructuredSingleDb,
     SchemaOperation,
 };
+use std::sync::Arc;
 
 pub(crate) fn native_structured_db_current_schema(
     db: &NativeStructuredDb,
@@ -89,24 +90,31 @@ fn apply_schema_operations(
     builder.commit().map_err(format_error)
 }
 
-#[allow(clippy::boxed_local)]
 pub(crate) fn native_structured_db_commit_schema(
     db: &mut NativeStructuredDb,
-    edit: Box<NativeStructuredSchemaEdit>,
+    edit: &mut NativeStructuredSchemaEdit,
 ) -> BridgeResult<ffi::NativeStructuredSchema> {
-    let operations = edit.operations;
-    apply_schema_operations(SchemaBuilderDispatch::Db(db.db.update_schema()), operations)
-        .map(native_schema)
+    let owner = Arc::get_mut(&mut db.db).ok_or_else(|| {
+        "CB_INVALID_STATE: schema commit requires releasing every structured scan cursor first"
+            .to_owned()
+    })?;
+    apply_schema_operations(
+        SchemaBuilderDispatch::Db(owner.update_schema()),
+        edit.operations.clone(),
+    )
+    .map(native_schema)
 }
-#[allow(clippy::boxed_local)]
 pub(crate) fn native_structured_single_db_commit_schema(
     db: &mut NativeStructuredSingleDb,
-    edit: Box<NativeStructuredSchemaEdit>,
+    edit: &mut NativeStructuredSchemaEdit,
 ) -> BridgeResult<ffi::NativeStructuredSchema> {
-    let operations = edit.operations;
+    let owner = Arc::get_mut(&mut db.db).ok_or_else(|| {
+        "CB_INVALID_STATE: schema commit requires releasing every structured scan cursor first"
+            .to_owned()
+    })?;
     apply_schema_operations(
-        SchemaBuilderDispatch::SingleDb(db.db.update_schema()),
-        operations,
+        SchemaBuilderDispatch::SingleDb(owner.update_schema()),
+        edit.operations.clone(),
     )
     .map(native_schema)
 }

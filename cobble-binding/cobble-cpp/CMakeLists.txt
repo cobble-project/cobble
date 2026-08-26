@@ -94,6 +94,10 @@ add_library(cobble_cpp SHARED cpp/convert.cpp cpp/error.cpp cpp/options.cpp
                               cpp/coordinator.cpp cpp/scan_plan.cpp cpp/version.cpp
                               cpp/structured/convert.cpp
                               cpp/structured/options.cpp cpp/structured/row.cpp
+                              cpp/structured/write_batch.cpp
+                              cpp/structured/multi_get.cpp
+                              cpp/structured/scan.cpp
+                              cpp/structured/scan_plan.cpp
                               cpp/structured/schema.cpp cpp/structured/db.cpp
                               cpp/structured/single_db.cpp
                               cpp/structured/lifecycle.cpp)
@@ -187,6 +191,15 @@ if(COBBLE_CPP_BUILD_TESTS)
            COMMAND cobble_cpp_structured_basic_capability_test)
   set_tests_properties(cobble_cpp_structured_basic_capability
                        PROPERTIES TIMEOUT 240)
+
+  add_executable(cobble_cpp_structured_batch_scan_capability_test
+                 tests/structured_batch_scan_capability_test.cpp)
+  target_link_libraries(cobble_cpp_structured_batch_scan_capability_test
+                        PRIVATE cobble::cobble)
+  add_test(NAME cobble_cpp_structured_batch_scan_capability
+           COMMAND cobble_cpp_structured_batch_scan_capability_test)
+  set_tests_properties(cobble_cpp_structured_batch_scan_capability
+                       PROPERTIES TIMEOUT 300)
 
   if(COBBLE_CPP_BUILD_S3_E2E_TEST)
     add_executable(cobble_cpp_s3_e2e_test tests/s3_e2e_test.cpp)

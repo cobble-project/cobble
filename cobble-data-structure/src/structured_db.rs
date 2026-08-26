@@ -449,6 +449,48 @@ impl StructuredWriteBatch {
         Ok(())
     }
 
+    #[cfg(feature = "ffi")]
+    pub(crate) fn put_borrowed_bytes_with_options<K>(
+        &mut self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        value: &[u8],
+        options: &StructuredWriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        ensure_bytes_column(&self.structured_schema, options.column_family(), column)?;
+        self.inner
+            .put_with_options(bucket, key, column, value, options.as_cobble());
+        Ok(())
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn put_borrowed_list_with_options<K>(
+        &mut self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        elements: &[&[u8]],
+        options: &StructuredWriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        let config = list_column_config(&self.structured_schema, options.column_family(), column)?;
+        let encoded = encode_borrowed_list_for_write(
+            elements,
+            &config,
+            options.ttl_seconds(),
+            self.now_seconds,
+        )?;
+        self.inner
+            .put_with_options(bucket, key, column, encoded, options.as_cobble());
+        Ok(())
+    }
+
     pub fn delete<K>(&mut self, bucket: u16, key: K, column: u16)
     where
         K: AsRef<[u8]>,
@@ -502,6 +544,48 @@ impl StructuredWriteBatch {
             column,
             value.into(),
             options.ttl_seconds(),
+        )?;
+        self.inner
+            .merge_with_options(bucket, key, column, encoded, options.as_cobble());
+        Ok(())
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn merge_borrowed_bytes_with_options<K>(
+        &mut self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        value: &[u8],
+        options: &StructuredWriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        ensure_bytes_column(&self.structured_schema, options.column_family(), column)?;
+        self.inner
+            .merge_with_options(bucket, key, column, value, options.as_cobble());
+        Ok(())
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn merge_borrowed_list_with_options<K>(
+        &mut self,
+        bucket: u16,
+        key: K,
+        column: u16,
+        elements: &[&[u8]],
+        options: &StructuredWriteOptions,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        let config = list_column_config(&self.structured_schema, options.column_family(), column)?;
+        let encoded = encode_borrowed_list_for_write(
+            elements,
+            &config,
+            options.ttl_seconds(),
+            self.now_seconds,
         )?;
         self.inner
             .merge_with_options(bucket, key, column, encoded, options.as_cobble());
@@ -1943,6 +2027,16 @@ impl StructuredDbIterator {
                 let decoded = decode_row(&structured_schema, now_seconds, columns.to_vec())?;
                 consumer(bucket, key, &decoded)
             })
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn stopped_at_block_boundary(&self) -> bool {
+        self.inner.stopped_at_block_boundary()
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn clear_stop_at_block_boundary(&mut self) {
+        self.inner.clear_stop_at_block_boundary();
     }
 }
 

@@ -23,6 +23,13 @@ pub(crate) mod ffi {
         length: usize,
     }
 
+    struct NativeBufferResult {
+        status: u8,
+        bytes_written: u64,
+        bytes_required: u64,
+        row_count: u64,
+    }
+
     struct NativeListConfig {
         has_max_elements: bool,
         max_elements: u64,
@@ -71,6 +78,20 @@ pub(crate) mod ffi {
         watermark_seconds: u32,
     }
 
+    struct NativeStructuredScanSplit {
+        shard: NativeShardSnapshot,
+        has_start: bool,
+        start: Vec<u8>,
+        has_end: bool,
+        end: Vec<u8>,
+        has_start_after: bool,
+        start_after_bucket: u16,
+        start_after_key: Vec<u8>,
+        has_end_at: bool,
+        end_at_bucket: u16,
+        end_at_key: Vec<u8>,
+    }
+
     struct NativeMetricLabel {
         key: String,
         value: String,
@@ -92,7 +113,11 @@ pub(crate) mod ffi {
         type NativeStructuredDb;
         type NativeStructuredSingleDb;
         type NativeStructuredReadOptions;
+        type NativeStructuredScanOptions;
         type NativeStructuredRow;
+        type NativeStructuredMultiGetResult;
+        type NativeStructuredScanCursor;
+        type NativeStructuredBatch;
         type NativeStructuredSchemaEdit;
         type NativePendingShardSnapshot;
         type NativePendingSnapshot;
@@ -180,6 +205,27 @@ pub(crate) mod ffi {
             options: &mut NativeStructuredReadOptions,
             columns: Vec<u64>,
         ) -> Result<()>;
+        fn native_structured_scan_options_new() -> Box<NativeStructuredScanOptions>;
+        fn native_structured_scan_options_clone(
+            options: &NativeStructuredScanOptions,
+        ) -> Box<NativeStructuredScanOptions>;
+        fn native_structured_scan_options_set_family(
+            options: &mut NativeStructuredScanOptions,
+            has_family: bool,
+            family: &str,
+        ) -> Result<()>;
+        fn native_structured_scan_options_set_columns(
+            options: &mut NativeStructuredScanOptions,
+            columns: Vec<u64>,
+        ) -> Result<()>;
+        fn native_structured_scan_options_set_preload(
+            options: &mut NativeStructuredScanOptions,
+            enabled: bool,
+        );
+        fn native_structured_scan_options_set_stop_at_block_boundary(
+            options: &mut NativeStructuredScanOptions,
+            enabled: bool,
+        );
 
         fn native_structured_db_id(db: &NativeStructuredDb) -> &str;
         fn native_structured_db_put_bytes(
@@ -227,10 +273,44 @@ pub(crate) mod ffi {
             key: &[u8],
             options: &NativeStructuredReadOptions,
         ) -> Result<Box<NativeStructuredRow>>;
+        fn native_structured_db_get_into(
+            db: &NativeStructuredDb,
+            bucket: u16,
+            key: &[u8],
+            options: &NativeStructuredReadOptions,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_db_multi_get(
+            db: &NativeStructuredDb,
+            descriptor_address: usize,
+            count: u64,
+            options: &NativeStructuredReadOptions,
+        ) -> Result<Box<NativeStructuredMultiGetResult>>;
+        fn native_structured_db_multi_get_into(
+            db: &NativeStructuredDb,
+            descriptor_address: usize,
+            count: u64,
+            options: &NativeStructuredReadOptions,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_db_write(
+            db: &NativeStructuredDb,
+            descriptor_address: usize,
+            count: u64,
+        ) -> Result<()>;
+        fn native_structured_db_scan(
+            db: &NativeStructuredDb,
+            bucket: u16,
+            start: &[u8],
+            has_start: bool,
+            end: &[u8],
+            has_end: bool,
+            options: &NativeStructuredScanOptions,
+        ) -> Result<Box<NativeStructuredScanCursor>>;
         fn native_structured_db_current_schema(db: &NativeStructuredDb) -> NativeStructuredSchema;
         fn native_structured_db_commit_schema(
             db: &mut NativeStructuredDb,
-            edit: Box<NativeStructuredSchemaEdit>,
+            edit: &mut NativeStructuredSchemaEdit,
         ) -> Result<NativeStructuredSchema>;
         fn native_structured_db_set_time(db: &NativeStructuredDb, unix_seconds: u32);
         fn native_structured_db_now_seconds(db: &NativeStructuredDb) -> u32;
@@ -335,12 +415,46 @@ pub(crate) mod ffi {
             key: &[u8],
             options: &NativeStructuredReadOptions,
         ) -> Result<Box<NativeStructuredRow>>;
+        fn native_structured_single_db_get_into(
+            db: &NativeStructuredSingleDb,
+            bucket: u16,
+            key: &[u8],
+            options: &NativeStructuredReadOptions,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_single_db_multi_get(
+            db: &NativeStructuredSingleDb,
+            descriptor_address: usize,
+            count: u64,
+            options: &NativeStructuredReadOptions,
+        ) -> Result<Box<NativeStructuredMultiGetResult>>;
+        fn native_structured_single_db_multi_get_into(
+            db: &NativeStructuredSingleDb,
+            descriptor_address: usize,
+            count: u64,
+            options: &NativeStructuredReadOptions,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_single_db_write(
+            db: &NativeStructuredSingleDb,
+            descriptor_address: usize,
+            count: u64,
+        ) -> Result<()>;
+        fn native_structured_single_db_scan(
+            db: &NativeStructuredSingleDb,
+            bucket: u16,
+            start: &[u8],
+            has_start: bool,
+            end: &[u8],
+            has_end: bool,
+            options: &NativeStructuredScanOptions,
+        ) -> Result<Box<NativeStructuredScanCursor>>;
         fn native_structured_single_db_current_schema(
             db: &NativeStructuredSingleDb,
         ) -> NativeStructuredSchema;
         fn native_structured_single_db_commit_schema(
             db: &mut NativeStructuredSingleDb,
-            edit: Box<NativeStructuredSchemaEdit>,
+            edit: &mut NativeStructuredSchemaEdit,
         ) -> Result<NativeStructuredSchema>;
         fn native_structured_single_db_set_time(db: &NativeStructuredSingleDb, unix_seconds: u32);
         fn native_structured_single_db_now_seconds(db: &NativeStructuredSingleDb) -> u32;
@@ -390,6 +504,111 @@ pub(crate) mod ffi {
             column: usize,
             element: usize,
         ) -> Result<&[u8]>;
+
+        fn native_structured_multi_get_row_count(result: &NativeStructuredMultiGetResult) -> usize;
+        fn native_structured_multi_get_found(
+            result: &NativeStructuredMultiGetResult,
+            row: usize,
+        ) -> bool;
+        fn native_structured_multi_get_column_count(
+            result: &NativeStructuredMultiGetResult,
+            row: usize,
+        ) -> Result<usize>;
+        fn native_structured_multi_get_has_column(
+            result: &NativeStructuredMultiGetResult,
+            row: usize,
+            column: usize,
+        ) -> bool;
+        fn native_structured_multi_get_kind(
+            result: &NativeStructuredMultiGetResult,
+            row: usize,
+            column: usize,
+        ) -> Result<u8>;
+        fn native_structured_multi_get_bytes(
+            result: &NativeStructuredMultiGetResult,
+            row: usize,
+            column: usize,
+        ) -> Result<&[u8]>;
+        fn native_structured_multi_get_list_size(
+            result: &NativeStructuredMultiGetResult,
+            row: usize,
+            column: usize,
+        ) -> Result<usize>;
+        fn native_structured_multi_get_list_element(
+            result: &NativeStructuredMultiGetResult,
+            row: usize,
+            column: usize,
+            element: usize,
+        ) -> Result<&[u8]>;
+
+        fn native_structured_scan_cursor_next_owned(
+            cursor: &mut NativeStructuredScanCursor,
+            max_rows: u64,
+        ) -> Result<Box<NativeStructuredBatch>>;
+        fn native_structured_scan_cursor_next_batch_into(
+            cursor: &mut NativeStructuredScanCursor,
+            max_rows: u64,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_scan_cursor_resume_after_block_boundary(
+            cursor: &mut NativeStructuredScanCursor,
+        ) -> Result<()>;
+        fn native_structured_batch_row_count(batch: &NativeStructuredBatch) -> usize;
+        fn native_structured_batch_end(batch: &NativeStructuredBatch) -> bool;
+        fn native_structured_batch_stopped_at_block_boundary(batch: &NativeStructuredBatch)
+        -> bool;
+        fn native_structured_batch_bucket(batch: &NativeStructuredBatch, row: usize)
+        -> Result<u16>;
+        fn native_structured_batch_key(batch: &NativeStructuredBatch, row: usize) -> Result<&[u8]>;
+        fn native_structured_batch_column_count(
+            batch: &NativeStructuredBatch,
+            row: usize,
+        ) -> Result<usize>;
+        fn native_structured_batch_has_column(
+            batch: &NativeStructuredBatch,
+            row: usize,
+            column: usize,
+        ) -> bool;
+        fn native_structured_batch_kind(
+            batch: &NativeStructuredBatch,
+            row: usize,
+            column: usize,
+        ) -> Result<u8>;
+        fn native_structured_batch_bytes(
+            batch: &NativeStructuredBatch,
+            row: usize,
+            column: usize,
+        ) -> Result<&[u8]>;
+        fn native_structured_batch_list_size(
+            batch: &NativeStructuredBatch,
+            row: usize,
+            column: usize,
+        ) -> Result<usize>;
+        fn native_structured_batch_list_element(
+            batch: &NativeStructuredBatch,
+            row: usize,
+            column: usize,
+            element: usize,
+        ) -> Result<&[u8]>;
+
+        fn native_structured_scan_split_split_after(
+            split: NativeStructuredScanSplit,
+            bucket: u16,
+            key: &[u8],
+        ) -> Result<Vec<NativeStructuredScanSplit>>;
+        fn native_structured_scan_split_to_json(split: NativeStructuredScanSplit)
+        -> Result<String>;
+        fn native_structured_scan_split_from_json(json: &str) -> Result<NativeStructuredScanSplit>;
+        fn native_structured_scan_split_open_scanner(
+            config_json: &str,
+            split: NativeStructuredScanSplit,
+            options: &NativeStructuredScanOptions,
+        ) -> Result<Box<NativeStructuredScanCursor>>;
+        fn native_structured_scan_split_open_scanner_file(
+            config_path: &str,
+            split: NativeStructuredScanSplit,
+            options: &NativeStructuredScanOptions,
+        ) -> Result<Box<NativeStructuredScanCursor>>;
 
         fn native_structured_schema_edit_new() -> Box<NativeStructuredSchemaEdit>;
         fn native_structured_schema_edit_add_bytes(

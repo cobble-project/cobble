@@ -462,6 +462,20 @@ impl StructuredSingleDb {
         )
     }
 
+    #[cfg(feature = "ffi")]
+    pub(crate) fn scan_with_options_bounds_for_ffi(
+        &self,
+        bucket: u16,
+        start_key_inclusive: Option<&[u8]>,
+        end_key_exclusive: Option<&[u8]>,
+        options: &StructuredScanOptions,
+    ) -> Result<StructuredDbIterator> {
+        let inner =
+            self.scan_raw_bounds(bucket, start_key_inclusive, end_key_exclusive, options)?;
+        let projected_schema = options.resolve_projected_schema_cached(&self.structured_schema)?;
+        Ok(StructuredDbIterator::new(inner, projected_schema, 0))
+    }
+
     // ── Snapshot lifecycle ───────────────────────────────────────────────
 
     pub fn snapshot(&self) -> Result<u64> {

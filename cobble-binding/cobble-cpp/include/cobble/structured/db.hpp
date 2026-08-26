@@ -12,9 +12,12 @@
 #include <cobble/rescale.hpp>
 #include <cobble/snapshot.hpp>
 #include <cobble/structured/lifecycle.hpp>
+#include <cobble/structured/multi_get.hpp>
 #include <cobble/structured/options.hpp>
 #include <cobble/structured/row.hpp>
+#include <cobble/structured/scan.hpp>
 #include <cobble/structured/schema.hpp>
+#include <cobble/structured/write_batch.hpp>
 
 namespace cobble::structured {
 
@@ -85,6 +88,26 @@ public:
   [[nodiscard]] OwnedRow Get(BucketId bucket, BytesView key,
                              const ReadOptions &options) const;
   [[nodiscard]] OwnedRow Get(BucketId bucket, BytesView key) const;
+  [[nodiscard]] BufferResult GetInto(BucketId bucket, BytesView key,
+                                     MutableBytesView output,
+                                     const ReadOptions &options) const;
+  [[nodiscard]] BufferResult GetInto(BucketId bucket, BytesView key,
+                                     MutableBytesView output) const;
+  void Write(std::span<const WriteOperation> operations) const;
+  void Write(WriteBatch &batch) const;
+  [[nodiscard]] OwnedMultiGetResult MultiGet(std::span<const MultiGetKey> keys,
+                                             const ReadOptions &options) const;
+  [[nodiscard]] OwnedMultiGetResult
+  MultiGet(std::span<const MultiGetKey> keys) const;
+  [[nodiscard]] BufferResult MultiGetInto(std::span<const MultiGetKey> keys,
+                                          MutableBytesView output,
+                                          const ReadOptions &options) const;
+  [[nodiscard]] BufferResult MultiGetInto(std::span<const MultiGetKey> keys,
+                                          MutableBytesView output) const;
+  [[nodiscard]] ScanCursor
+  Scan(BucketId bucket, std::optional<BytesView> start_inclusive = std::nullopt,
+       std::optional<BytesView> end_exclusive = std::nullopt,
+       const ScanOptions &options = {}) const;
 
   [[nodiscard]] Schema CurrentSchema() const;
   [[nodiscard]] SchemaBuilder UpdateSchema() const;
@@ -117,6 +140,7 @@ private:
   std::shared_ptr<Impl> impl_;
 
   friend class SchemaBuilder;
+  friend class ScanCursor;
 };
 
 } // namespace cobble::structured

@@ -3,7 +3,10 @@
 //! Only connector-specific raw or pre-encoded operations belong here. The
 //! structured semantic API remains available from the crate root.
 
-use crate::{StructuredDb, StructuredSingleDb, StructuredWriteOptions};
+use crate::{
+    StructuredDb, StructuredDbIterator, StructuredScanOptions, StructuredSingleDb,
+    StructuredWriteBatch, StructuredWriteOptions,
+};
 use bytes::Bytes;
 use cobble::Result;
 
@@ -89,6 +92,87 @@ where
     K: AsRef<[u8]>,
 {
     db.merge_borrowed_bytes_with_options(bucket, key, column, value, options)
+}
+
+#[inline]
+pub fn write_batch_put_borrowed_bytes_with_options<K>(
+    batch: &mut StructuredWriteBatch,
+    bucket: u16,
+    key: K,
+    column: u16,
+    value: &[u8],
+    options: &StructuredWriteOptions,
+) -> Result<()>
+where
+    K: AsRef<[u8]>,
+{
+    batch.put_borrowed_bytes_with_options(bucket, key, column, value, options)
+}
+
+#[inline]
+pub fn write_batch_merge_borrowed_bytes_with_options<K>(
+    batch: &mut StructuredWriteBatch,
+    bucket: u16,
+    key: K,
+    column: u16,
+    value: &[u8],
+    options: &StructuredWriteOptions,
+) -> Result<()>
+where
+    K: AsRef<[u8]>,
+{
+    batch.merge_borrowed_bytes_with_options(bucket, key, column, value, options)
+}
+
+#[inline]
+pub fn write_batch_put_borrowed_list_with_options<K>(
+    batch: &mut StructuredWriteBatch,
+    bucket: u16,
+    key: K,
+    column: u16,
+    elements: &[&[u8]],
+    options: &StructuredWriteOptions,
+) -> Result<()>
+where
+    K: AsRef<[u8]>,
+{
+    batch.put_borrowed_list_with_options(bucket, key, column, elements, options)
+}
+
+#[inline]
+pub fn write_batch_merge_borrowed_list_with_options<K>(
+    batch: &mut StructuredWriteBatch,
+    bucket: u16,
+    key: K,
+    column: u16,
+    elements: &[&[u8]],
+    options: &StructuredWriteOptions,
+) -> Result<()>
+where
+    K: AsRef<[u8]>,
+{
+    batch.merge_borrowed_list_with_options(bucket, key, column, elements, options)
+}
+
+#[inline]
+pub fn single_db_scan_with_options_bounds(
+    db: &StructuredSingleDb,
+    bucket: u16,
+    start_key_inclusive: Option<&[u8]>,
+    end_key_exclusive: Option<&[u8]>,
+    options: &StructuredScanOptions,
+) -> Result<StructuredDbIterator> {
+    db.scan_with_options_bounds_for_ffi(bucket, start_key_inclusive, end_key_exclusive, options)
+}
+
+#[inline]
+pub fn iterator_stopped_at_block_boundary(iterator: &StructuredDbIterator) -> bool {
+    iterator.stopped_at_block_boundary()
+}
+
+#[inline]
+pub fn iterator_clear_stop_at_block_boundary(iterator: &mut StructuredDbIterator) {
+    iterator.clear_stop_at_block_boundary();
 }
 
 #[inline]

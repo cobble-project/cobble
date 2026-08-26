@@ -1,4 +1,5 @@
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -185,7 +186,12 @@ pub(crate) fn native_structured_db_switch_to_snapshot(
     db: &mut NativeStructuredDb,
     snapshot_id: u64,
 ) -> BridgeResult<()> {
-    db.db.switch_to_snapshot(snapshot_id).map_err(format_error)
+    Arc::get_mut(&mut db.db)
+        .ok_or_else(|| {
+            "CB_INVALID_STATE: SwitchToSnapshot requires exclusive ownership; release every structured scan cursor and schema builder first".to_owned()
+        })?
+        .switch_to_snapshot(snapshot_id)
+        .map_err(format_error)
 }
 
 pub(crate) fn native_structured_single_db_start_snapshot(

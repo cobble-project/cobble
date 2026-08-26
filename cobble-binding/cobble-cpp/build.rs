@@ -8,12 +8,17 @@ fn main() {
     for source in [
         "src/structured/conversion.rs",
         "src/structured/database.rs",
+        "src/structured/encoding.rs",
         "src/structured/lifecycle.rs",
+        "src/structured/multi_get.rs",
         "src/structured/options.rs",
         "src/structured/row.rs",
+        "src/structured/scan.rs",
+        "src/structured/scan_plan.rs",
         "src/structured/schema.rs",
         "src/structured/single_db.rs",
         "src/structured/types.rs",
+        "src/structured/write_batch.rs",
     ] {
         println!("cargo:rerun-if-changed={source}");
     }

@@ -44,7 +44,7 @@ std::string_view FamilyValue(std::optional<std::string_view> family) {
 }
 
 void CheckBuilder(const auto *impl) {
-  if (impl == nullptr || impl->committed) {
+  if (impl == nullptr || impl->committed || !impl->native.has_value()) {
     throw Error(ErrorCode::kInvalidState,
                 "SchemaBuilder has been moved from or committed");
   }
@@ -58,7 +58,7 @@ SchemaBuilder::AddBytesColumn(std::optional<std::string_view> family,
   CheckBuilder(impl_.get());
   detail::Translate([&] {
     structured_ffi::native_structured_schema_edit_add_bytes(
-        *impl_->native, family.has_value(),
+        **impl_->native, family.has_value(),
         detail::RustStr(FamilyValue(family)), column);
   });
   return *this;
@@ -71,7 +71,7 @@ SchemaBuilder::AddListColumn(std::optional<std::string_view> family,
   const auto native = detail::ToNative(config);
   detail::Translate([&] {
     structured_ffi::native_structured_schema_edit_add_list(
-        *impl_->native, family.has_value(),
+        **impl_->native, family.has_value(),
         detail::RustStr(FamilyValue(family)), column, native);
   });
   return *this;
@@ -83,7 +83,7 @@ SchemaBuilder::DeleteColumn(std::optional<std::string_view> family,
   CheckBuilder(impl_.get());
   detail::Translate([&] {
     structured_ffi::native_structured_schema_edit_delete(
-        *impl_->native, family.has_value(),
+        **impl_->native, family.has_value(),
         detail::RustStr(FamilyValue(family)), column);
   });
   return *this;
@@ -95,7 +95,7 @@ SchemaBuilder::SetFamilyTtl(std::optional<std::string_view> family,
   CheckBuilder(impl_.get());
   detail::Translate([&] {
     structured_ffi::native_structured_schema_edit_set_family_ttl(
-        *impl_->native, family.has_value(),
+        **impl_->native, family.has_value(),
         detail::RustStr(FamilyValue(family)), value_has_ttl);
   });
   return *this;
@@ -103,22 +103,23 @@ SchemaBuilder::SetFamilyTtl(std::optional<std::string_view> family,
 
 Schema SchemaBuilder::Commit() {
   CheckBuilder(impl_.get());
-  impl_->committed = true;
-  auto edit = std::move(impl_->native);
   structured_ffi::NativeStructuredSchema native;
   if (auto *owner = std::get_if<std::shared_ptr<Db::Impl>>(&impl_->owner)) {
     native = detail::Translate([&] {
       return structured_ffi::native_structured_db_commit_schema(
-          *(*owner)->native, std::move(edit));
+          *(*owner)->native, **impl_->native);
     });
   } else {
     auto &single_owner =
         std::get<std::shared_ptr<SingleDb::Impl>>(impl_->owner);
     native = detail::Translate([&] {
       return structured_ffi::native_structured_single_db_commit_schema(
-          *single_owner->native, std::move(edit));
+          *single_owner->native, **impl_->native);
     });
   }
+  impl_->native.reset();
+  impl_->owner = std::monostate{};
+  impl_->committed = true;
   return detail::ToSchema(native);
 }
 

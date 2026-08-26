@@ -1,4 +1,5 @@
 use cobble_binding::structured::StructuredSingleDb;
+use std::sync::Arc;
 
 use crate::structured_bridge::ffi;
 
@@ -12,7 +13,7 @@ pub(crate) fn native_structured_single_db_open(
 ) -> BridgeResult<Box<NativeStructuredSingleDb>> {
     opendal::install_default();
     StructuredSingleDb::open(parse_config_json(config_json)?)
-        .map(|db| Box::new(NativeStructuredSingleDb { db }))
+        .map(|db| Box::new(NativeStructuredSingleDb { db: Arc::new(db) }))
         .map_err(format_error)
 }
 
@@ -21,7 +22,7 @@ pub(crate) fn native_structured_single_db_open_file(
 ) -> BridgeResult<Box<NativeStructuredSingleDb>> {
     opendal::install_default();
     StructuredSingleDb::open(parse_config_file(config_path)?)
-        .map(|db| Box::new(NativeStructuredSingleDb { db }))
+        .map(|db| Box::new(NativeStructuredSingleDb { db: Arc::new(db) }))
         .map_err(format_error)
 }
 

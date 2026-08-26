@@ -148,6 +148,18 @@ returned Rust `Bytes` and decoded LIST element slices alive, and its accessors
 return zero-copy spans. Reusing `structured::ReadOptions` also reuses the native
 schema projection cache.
 
+`structured::Db::Write(span)` and `structured::SingleDb::Write(span)` are the
+high-throughput synchronous batch path: operation, key, BYTES, and LIST-element
+views are borrowed only until the call returns and cross FFI once. The reusable
+`structured::WriteBatch` instead copies every appended payload and option into
+C++-owned storage, so temporary source containers may be destroyed before
+`Write(batch)`. Successful flush and `Clear` retain builder capacity.
+
+Structured `GetInto`, `MultiGetInto`, and `ScanCursor::NextBatchInto` share the
+versioned `CSRB` format documented in [ROW_BATCH_FORMAT.md](ROW_BATCH_FORMAT.md).
+Owned multi-get and scan results keep Rust `Bytes` and LIST element allocations
+alive and expose them through zero-copy spans.
+
 `ScanPlan` and typed split DTOs own their binary boundary keys. Constructing a
 plan from `BytesView` copies those cold-path metadata bytes once; split JSON is
 provided for durable compatibility and is not used on the scan data path.

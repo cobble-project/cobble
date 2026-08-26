@@ -1,4 +1,5 @@
 use cobble_binding::structured::StructuredDb;
+use std::sync::Arc;
 
 use crate::structured_bridge::ffi;
 
@@ -12,7 +13,7 @@ pub(crate) fn native_structured_db_open(
     let bucket_ranges = full_range(&config)?;
     opendal::install_default();
     StructuredDb::open(config, bucket_ranges)
-        .map(|db| Box::new(NativeStructuredDb { db }))
+        .map(|db| Box::new(NativeStructuredDb { db: Arc::new(db) }))
         .map_err(format_error)
 }
 
@@ -24,7 +25,7 @@ pub(crate) fn native_structured_db_open_ranges(
     let bucket_ranges = ranges(&config, values)?;
     opendal::install_default();
     StructuredDb::open(config, bucket_ranges)
-        .map(|db| Box::new(NativeStructuredDb { db }))
+        .map(|db| Box::new(NativeStructuredDb { db: Arc::new(db) }))
         .map_err(format_error)
 }
 
@@ -35,7 +36,7 @@ pub(crate) fn native_structured_db_open_file(
     let bucket_ranges = full_range(&config)?;
     opendal::install_default();
     StructuredDb::open(config, bucket_ranges)
-        .map(|db| Box::new(NativeStructuredDb { db }))
+        .map(|db| Box::new(NativeStructuredDb { db: Arc::new(db) }))
         .map_err(format_error)
 }
 
@@ -47,13 +48,13 @@ pub(crate) fn native_structured_db_open_file_ranges(
     let bucket_ranges = ranges(&config, values)?;
     opendal::install_default();
     StructuredDb::open(config, bucket_ranges)
-        .map(|db| Box::new(NativeStructuredDb { db }))
+        .map(|db| Box::new(NativeStructuredDb { db: Arc::new(db) }))
         .map_err(format_error)
 }
 
 fn boxed_db(result: cobble_binding::Result<StructuredDb>) -> BridgeResult<Box<NativeStructuredDb>> {
     result
-        .map(|db| Box::new(NativeStructuredDb { db }))
+        .map(|db| Box::new(NativeStructuredDb { db: Arc::new(db) }))
         .map_err(format_error)
 }
 

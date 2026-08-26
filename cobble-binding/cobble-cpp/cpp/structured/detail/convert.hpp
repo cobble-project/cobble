@@ -25,6 +25,7 @@ ToShardSnapshot(const structured_ffi::NativeShardSnapshot &native);
 GlobalSnapshot ToGlobalSnapshot(const structured_ffi::NativeSnapshot &native);
 std::vector<MetricSample>
 ToMetrics(rust::Vec<structured_ffi::NativeMetric> native);
+BufferResult ToBufferResult(const structured_ffi::NativeBufferResult &native);
 
 inline rust::Slice<const Byte> RustBytes(BytesView value) noexcept {
   return cobble::detail::RustBytes(value);
