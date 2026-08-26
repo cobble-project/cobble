@@ -5,7 +5,9 @@ use cobble_binding::structured::StructuredColumnValue;
 use crate::structured_bridge::ffi;
 
 use super::conversion::{format_error, input_error};
-use super::encoding::{CsrbRow, STATUS_BUFFER_TOO_SMALL, STATUS_OK, encode_into, encoded_len};
+use super::encoding::{
+    CsrbColumns, CsrbRow, STATUS_BUFFER_TOO_SMALL, STATUS_OK, encode_into, encoded_len,
+};
 use super::{
     BridgeResult, NativeStructuredDb, NativeStructuredReadOptions, NativeStructuredSingleDb,
 };
@@ -154,7 +156,10 @@ fn encode_multi_get(
         .map(|((bucket, key), columns)| CsrbRow {
             bucket: *bucket,
             key,
-            columns: columns.as_deref(),
+            columns: columns
+                .as_deref()
+                .map(CsrbColumns::Structured)
+                .unwrap_or(CsrbColumns::Missing),
         })
         .collect::<Vec<_>>();
     let required = encoded_len(&encoded_rows)?;

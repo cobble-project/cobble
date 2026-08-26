@@ -4,14 +4,15 @@ use crate::priority_queue::{
     PriorityQueue, priority_queue_column_family_name, priority_queue_column_family_options,
     validate_priority_queue_column_family,
 };
+use crate::structured_db::ensure_bytes_column;
+#[cfg(feature = "ffi")]
+use crate::structured_db::list_column_config;
 use crate::structured_db::{
     StructuredColumnValue, StructuredDbIterator, StructuredReadOptions, StructuredScanOptions,
     StructuredSchema, StructuredSchemaBuilder, StructuredSchemaOwner, StructuredWriteBatch,
     StructuredWriteOptions, decode_row, encode_for_write,
     load_structured_schema_from_cobble_schema, persist_structured_schema_on_db,
 };
-#[cfg(feature = "ffi")]
-use crate::structured_db::{ensure_bytes_column, list_column_config};
 use cobble::{Config, DbIterator, Error, MemtableType, Result, SingleDb};
 use std::ops::Range;
 use std::sync::Arc;
@@ -267,7 +268,6 @@ impl StructuredSingleDb {
             .merge_with_options(bucket, key, column, encoded, options.as_cobble())
     }
 
-    #[cfg(feature = "ffi")]
     pub(crate) fn merge_borrowed_bytes_with_options<K>(
         &self,
         bucket: u16,

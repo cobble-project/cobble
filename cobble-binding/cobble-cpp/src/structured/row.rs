@@ -4,7 +4,8 @@ use cobble_binding::structured::StructuredColumnValue;
 use super::conversion::format_error;
 use super::conversion::input_error;
 use super::encoding::{
-    CsrbRow, STATUS_BUFFER_TOO_SMALL, STATUS_NOT_FOUND, STATUS_OK, encode_into, encoded_len,
+    CsrbColumns, CsrbRow, STATUS_BUFFER_TOO_SMALL, STATUS_NOT_FOUND, STATUS_OK, encode_into,
+    encoded_len,
 };
 use super::multi_get::buffer_result;
 use super::{
@@ -60,7 +61,9 @@ fn encode_get(
     let rows = [CsrbRow {
         bucket,
         key,
-        columns,
+        columns: columns
+            .map(CsrbColumns::Structured)
+            .unwrap_or(CsrbColumns::Missing),
     }];
     let required = encoded_len(&rows)?;
     if output.len() < required {

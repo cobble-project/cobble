@@ -5,6 +5,8 @@ use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
+use super::decode_priority_queue_row;
+
 fn open_test_db(root: &str) -> Result<StructuredDb> {
     StructuredDb::open(
         Config {
@@ -33,7 +35,13 @@ fn test_priority_queue_offer_merge_and_poll_order() {
     let mut db = open_test_db(&root).unwrap();
     db.new_priority_queue("jobs").unwrap();
     let queue = db.get_priority_queue("jobs").unwrap();
-    assert!(queue.scan_options.as_cobble().preload_scan_cursor_block());
+    assert!(
+        queue
+            .descriptor
+            .fixed_scan_options
+            .as_cobble()
+            .preload_scan_cursor_block()
+    );
 
     queue.offer(0, b"k2", b"v2").unwrap();
     queue.offer(0, b"k1", b"left").unwrap();
@@ -50,6 +58,23 @@ fn test_priority_queue_offer_merge_and_poll_order() {
     assert!(queue.poll(0).unwrap().is_none());
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn test_priority_queue_value_preserves_bytes_allocation() {
+    let key = Bytes::from_static(b"key");
+    let value = Bytes::from(vec![7; 128]);
+    let pointer = value.as_ptr();
+    let (decoded_key, decoded_value) =
+        decode_priority_queue_row((key.clone(), vec![Some(value)])).unwrap();
+    assert_eq!(decoded_key, key);
+    assert_eq!(decoded_value.as_ptr(), pointer);
+
+    assert!(decode_priority_queue_row((key.clone(), Vec::new())).is_err());
+    assert!(decode_priority_queue_row((key.clone(), vec![None])).is_err());
+    assert!(
+        decode_priority_queue_row((key, vec![Some(Bytes::from_static(b"value")), None],)).is_err()
+    );
 }
 
 #[test]

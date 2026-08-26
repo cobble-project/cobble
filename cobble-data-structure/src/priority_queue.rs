@@ -1,6 +1,4 @@
-use crate::structured_db::{
-    StructuredColumnValue, StructuredDb, StructuredScanOptions, StructuredWriteOptions,
-};
+use crate::structured_db::{StructuredDb, StructuredScanOptions, StructuredWriteOptions};
 use crate::structured_single_db::StructuredSingleDb;
 use bytes::Bytes;
 use cobble::{ColumnFamilyOptions, DbIterator, Error, Result, Schema};
@@ -15,17 +13,29 @@ const DEFAULT_COLUMN_FAMILY_NAME: &str = "default";
 /// merge/delete/scan calls in that family. This type is the abstraction boundary for the embedded
 /// and sharded structured backends: callers above `cobble-data-structure` get one queue API, while
 /// this layer chooses the appropriate `StructuredDb` or `StructuredSingleDb` implementation.
-enum PriorityQueueBackend<'a> {
+#[derive(Clone, Copy)]
+pub(crate) enum PriorityQueueBackend<'a> {
     StructuredDb(&'a StructuredDb),
     StructuredSingleDb(&'a StructuredSingleDb),
 }
 
 pub struct PriorityQueue<'a> {
     backend: PriorityQueueBackend<'a>,
+    descriptor: DetachedPriorityQueueDescriptor,
+}
+
+/// Owned, backend-independent queue metadata used by language bindings.
+///
+/// This deliberately contains no borrow of a database. Schema validation and
+/// option construction happen once when the descriptor is created; callers
+/// supply a concrete backend only for the duration of an operation.
+#[derive(Clone)]
+pub(crate) struct DetachedPriorityQueueDescriptor {
     column_family: String,
     column_family_id: u8,
     write_options: StructuredWriteOptions,
-    scan_options: StructuredScanOptions,
+    fixed_scan_options: StructuredScanOptions,
+    boundary_scan_options: StructuredScanOptions,
 }
 
 impl<'a> PriorityQueue<'a> {
@@ -60,17 +70,12 @@ impl<'a> PriorityQueue<'a> {
     ) -> Self {
         Self {
             backend,
-            column_family_id,
-            write_options: StructuredWriteOptions::with_column_family(column_family.clone()),
-            scan_options: StructuredScanOptions::for_column(0)
-                .with_column_family(column_family.clone())
-                .with_preload_scan_cursor_block(true),
-            column_family,
+            descriptor: DetachedPriorityQueueDescriptor::new(column_family, column_family_id),
         }
     }
 
     pub fn column_family(&self) -> &str {
-        &self.column_family
+        self.descriptor.column_family()
     }
 
     /// Upserts one queue key with merge semantics.
@@ -79,22 +84,8 @@ impl<'a> PriorityQueue<'a> {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        match self.backend {
-            PriorityQueueBackend::StructuredDb(db) => db.merge_with_options(
-                bucket,
-                key.as_ref(),
-                0,
-                StructuredColumnValue::Bytes(Bytes::copy_from_slice(value.as_ref())),
-                &self.write_options,
-            ),
-            PriorityQueueBackend::StructuredSingleDb(db) => db.merge_with_options(
-                bucket,
-                key.as_ref(),
-                0,
-                StructuredColumnValue::Bytes(Bytes::copy_from_slice(value.as_ref())),
-                &self.write_options,
-            ),
-        }
+        self.descriptor
+            .offer(self.backend, bucket, key.as_ref(), value.as_ref())
     }
 
     /// Deletes one queue key if it exists.
@@ -102,24 +93,25 @@ impl<'a> PriorityQueue<'a> {
     where
         K: AsRef<[u8]>,
     {
-        match self.backend {
-            PriorityQueueBackend::StructuredDb(db) => {
-                db.delete_with_options(bucket, key.as_ref(), 0, &self.write_options)
-            }
-            PriorityQueueBackend::StructuredSingleDb(db) => {
-                db.delete_with_options(bucket, key.as_ref(), 0, &self.write_options)
-            }
-        }
+        self.descriptor.delete(self.backend, bucket, key.as_ref())
     }
 
     /// Returns and removes the smallest key in the queue.
     pub fn poll(&self, bucket: u16) -> Result<Option<(Bytes, Bytes)>> {
-        Ok(self.scan_batch(bucket, Some(1), true)?.into_iter().next())
+        Ok(self
+            .descriptor
+            .scan_batch(self.backend, bucket, Some(1), true)?
+            .into_iter()
+            .next())
     }
 
     /// Returns the smallest key in the queue without advancing the queue cursor.
     pub fn peek(&self, bucket: u16) -> Result<Option<(Bytes, Bytes)>> {
-        Ok(self.scan_batch(bucket, Some(1), false)?.into_iter().next())
+        Ok(self
+            .descriptor
+            .scan_batch(self.backend, bucket, Some(1), false)?
+            .into_iter()
+            .next())
     }
 
     /// Returns and removes a batch of the smallest keys in the queue.
@@ -135,7 +127,8 @@ impl<'a> PriorityQueue<'a> {
         bucket: u16,
         batch_size: Option<usize>,
     ) -> Result<Vec<(Bytes, Bytes)>> {
-        self.scan_batch(bucket, batch_size, true)
+        self.descriptor
+            .scan_batch(self.backend, bucket, batch_size, true)
     }
 
     /// Returns a batch of the smallest keys in the queue without advancing the queue cursor.
@@ -149,7 +142,8 @@ impl<'a> PriorityQueue<'a> {
         bucket: u16,
         batch_size: Option<usize>,
     ) -> Result<Vec<(Bytes, Bytes)>> {
-        self.scan_batch(bucket, batch_size, false)
+        self.descriptor
+            .scan_batch(self.backend, bucket, batch_size, false)
     }
 
     /// Advances the queue cursor to `key`, making `key` and earlier items invisible.
@@ -160,23 +154,76 @@ impl<'a> PriorityQueue<'a> {
     where
         K: AsRef<[u8]>,
     {
-        self.advance_cursor_by_id(bucket, key.as_ref())
+        self.descriptor
+            .advance_cursor(self.backend, bucket, key.as_ref())
     }
 
     /// Returns the current queue cursor, if this bucket has consumed any items.
     pub fn cursor(&self, bucket: u16) -> Result<Option<Vec<u8>>> {
-        match self.backend {
+        self.descriptor.cursor(self.backend, bucket)
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn detached_descriptor(&self) -> DetachedPriorityQueueDescriptor {
+        self.descriptor.clone()
+    }
+}
+
+impl DetachedPriorityQueueDescriptor {
+    fn new(column_family: String, column_family_id: u8) -> Self {
+        let fixed_scan_options = StructuredScanOptions::for_column(0)
+            .with_column_family(column_family.clone())
+            .with_preload_scan_cursor_block(true);
+        let boundary_scan_options = fixed_scan_options.clone().with_stop_at_block_boundary(true);
+        Self {
+            write_options: StructuredWriteOptions::with_column_family(column_family.clone()),
+            fixed_scan_options,
+            boundary_scan_options,
+            column_family,
+            column_family_id,
+        }
+    }
+
+    pub(crate) fn column_family(&self) -> &str {
+        &self.column_family
+    }
+
+    pub(crate) fn offer(
+        &self,
+        backend: PriorityQueueBackend<'_>,
+        bucket: u16,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        match backend {
             PriorityQueueBackend::StructuredDb(db) => {
-                db.column_family_truncation_cursor_by_id(bucket, self.column_family_id)
+                db.merge_borrowed_bytes_with_options(bucket, key, 0, value, &self.write_options)
             }
             PriorityQueueBackend::StructuredSingleDb(db) => {
-                db.column_family_truncation_cursor_by_id(bucket, self.column_family_id)
+                db.merge_borrowed_bytes_with_options(bucket, key, 0, value, &self.write_options)
             }
         }
     }
 
-    fn scan_batch(
+    pub(crate) fn delete(
         &self,
+        backend: PriorityQueueBackend<'_>,
+        bucket: u16,
+        key: &[u8],
+    ) -> Result<()> {
+        match backend {
+            PriorityQueueBackend::StructuredDb(db) => {
+                db.delete_with_options(bucket, key, 0, &self.write_options)
+            }
+            PriorityQueueBackend::StructuredSingleDb(db) => {
+                db.delete_with_options(bucket, key, 0, &self.write_options)
+            }
+        }
+    }
+
+    pub(crate) fn scan_batch(
+        &self,
+        backend: PriorityQueueBackend<'_>,
         bucket: u16,
         batch_size: Option<usize>,
         advance_cursor: bool,
@@ -185,11 +232,11 @@ impl<'a> PriorityQueue<'a> {
             return Ok(Vec::new());
         }
         let scan_options = if batch_size.is_none() {
-            self.scan_options.clone().with_stop_at_block_boundary(true)
+            &self.boundary_scan_options
         } else {
-            self.scan_options.clone()
+            &self.fixed_scan_options
         };
-        let mut iter = self.scan_raw_bounds(bucket, &scan_options)?;
+        let mut iter = self.scan_raw_bounds(backend, bucket, scan_options)?;
         let mut rows = Vec::with_capacity(batch_size.unwrap_or(1));
         let mut last_key = None;
         while batch_size.is_none_or(|limit| rows.len() < limit) {
@@ -200,13 +247,7 @@ impl<'a> PriorityQueue<'a> {
                 }
                 break;
             };
-            let (key, columns) = row?;
-            let value = columns.into_iter().next().flatten().ok_or_else(|| {
-                Error::IoError(
-                    "priority queue scan returned no value for projected column".to_string(),
-                )
-            })?;
-            let value = Bytes::copy_from_slice(value.as_ref());
+            let (key, value) = decode_priority_queue_row(row?)?;
             last_key = Some(key.clone());
             rows.push((key, value));
         }
@@ -214,17 +255,18 @@ impl<'a> PriorityQueue<'a> {
             return Ok(rows);
         };
         if advance_cursor {
-            self.advance_cursor_by_id(bucket, last_key.as_ref())?;
+            self.advance_cursor(backend, bucket, last_key.as_ref())?;
         }
         Ok(rows)
     }
 
     fn scan_raw_bounds(
         &self,
+        backend: PriorityQueueBackend<'_>,
         bucket: u16,
         scan_options: &StructuredScanOptions,
     ) -> Result<DbIterator> {
-        match self.backend {
+        match backend {
             PriorityQueueBackend::StructuredDb(db) => {
                 db.scan_raw_bounds(bucket, None, None, scan_options)
             }
@@ -234,8 +276,13 @@ impl<'a> PriorityQueue<'a> {
         }
     }
 
-    fn advance_cursor_by_id(&self, bucket: u16, key: &[u8]) -> Result<()> {
-        match self.backend {
+    pub(crate) fn advance_cursor(
+        &self,
+        backend: PriorityQueueBackend<'_>,
+        bucket: u16,
+        key: &[u8],
+    ) -> Result<()> {
+        match backend {
             PriorityQueueBackend::StructuredDb(db) => {
                 db.advance_column_family_truncation_cursor_by_id(bucket, self.column_family_id, key)
             }
@@ -244,6 +291,38 @@ impl<'a> PriorityQueue<'a> {
             }
         }
     }
+
+    pub(crate) fn cursor(
+        &self,
+        backend: PriorityQueueBackend<'_>,
+        bucket: u16,
+    ) -> Result<Option<Vec<u8>>> {
+        match backend {
+            PriorityQueueBackend::StructuredDb(db) => {
+                db.column_family_truncation_cursor_by_id(bucket, self.column_family_id)
+            }
+            PriorityQueueBackend::StructuredSingleDb(db) => {
+                db.column_family_truncation_cursor_by_id(bucket, self.column_family_id)
+            }
+        }
+    }
+}
+
+fn decode_priority_queue_row(
+    (key, columns): (Bytes, Vec<Option<Bytes>>),
+) -> Result<(Bytes, Bytes)> {
+    let mut columns = columns.into_iter();
+    let value = columns.next().flatten().ok_or_else(|| {
+        Error::IoError(
+            "priority queue scan returned no value for projected BYTES column".to_string(),
+        )
+    })?;
+    if columns.next().is_some() {
+        return Err(Error::IoError(
+            "priority queue scan returned an unexpected projected column layout".to_string(),
+        ));
+    }
+    Ok((key, value))
 }
 
 pub(crate) fn priority_queue_column_family_options() -> ColumnFamilyOptions {

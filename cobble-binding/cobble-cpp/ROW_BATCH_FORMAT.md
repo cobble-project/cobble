@@ -62,3 +62,13 @@ null versus empty BYTES versus empty LIST without sentinel values.
 All sizes and additions are checked. A too-small caller buffer remains entirely
 unchanged. Structured scan cursors retain that exact pending batch until a
 successful retry, so no row is skipped or repeated.
+
+Structured priority-queue point and batch caller-buffer reads encode the queue
+key plus one BYTES column in this same `CSRB` format. Peek retries do not change
+the queue cursor. Poll performs complete metadata and capacity preflight first;
+if the buffer is too small, the output and queue are unchanged. A retry must
+match the operation, bucket, and optional limit. With sufficient capacity,
+poll advances the truncation cursor before writing the already-validated
+encoding, so an advance failure cannot expose a successfully polled result.
+`limit = 0` returns an empty batch and never advances the cursor, while an
+absent limit requests one physical-boundary batch.

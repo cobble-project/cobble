@@ -119,8 +119,114 @@ pub(crate) mod ffi {
         type NativeStructuredScanCursor;
         type NativeStructuredBatch;
         type NativeStructuredSchemaEdit;
+        type NativeStructuredPriorityQueue;
+        type NativePriorityQueueBatch;
+        type NativePriorityQueueCursor;
         type NativePendingShardSnapshot;
         type NativePendingSnapshot;
+
+        fn native_structured_db_new_priority_queue(
+            db: &mut NativeStructuredDb,
+            name: &str,
+        ) -> Result<Box<NativeStructuredPriorityQueue>>;
+        fn native_structured_db_get_priority_queue(
+            db: &NativeStructuredDb,
+            name: &str,
+        ) -> Result<Box<NativeStructuredPriorityQueue>>;
+        fn native_structured_db_get_or_new_priority_queue(
+            db: &mut NativeStructuredDb,
+            name: &str,
+        ) -> Result<Box<NativeStructuredPriorityQueue>>;
+        fn native_structured_single_db_new_priority_queue(
+            db: &mut NativeStructuredSingleDb,
+            name: &str,
+        ) -> Result<Box<NativeStructuredPriorityQueue>>;
+        fn native_structured_single_db_get_priority_queue(
+            db: &NativeStructuredSingleDb,
+            name: &str,
+        ) -> Result<Box<NativeStructuredPriorityQueue>>;
+        fn native_structured_single_db_get_or_new_priority_queue(
+            db: &mut NativeStructuredSingleDb,
+            name: &str,
+        ) -> Result<Box<NativeStructuredPriorityQueue>>;
+        fn native_structured_priority_queue_column_family(
+            queue: &NativeStructuredPriorityQueue,
+        ) -> &str;
+        fn native_structured_priority_queue_offer(
+            queue: &NativeStructuredPriorityQueue,
+            bucket: u16,
+            key: &[u8],
+            value: &[u8],
+        ) -> Result<()>;
+        fn native_structured_priority_queue_delete(
+            queue: &NativeStructuredPriorityQueue,
+            bucket: u16,
+            key: &[u8],
+        ) -> Result<()>;
+        fn native_structured_priority_queue_peek(
+            queue: &NativeStructuredPriorityQueue,
+            bucket: u16,
+        ) -> Result<Box<NativePriorityQueueBatch>>;
+        fn native_structured_priority_queue_poll(
+            queue: &NativeStructuredPriorityQueue,
+            bucket: u16,
+        ) -> Result<Box<NativePriorityQueueBatch>>;
+        fn native_structured_priority_queue_peek_batch(
+            queue: &NativeStructuredPriorityQueue,
+            bucket: u16,
+            has_limit: bool,
+            limit: usize,
+        ) -> Result<Box<NativePriorityQueueBatch>>;
+        fn native_structured_priority_queue_poll_batch(
+            queue: &NativeStructuredPriorityQueue,
+            bucket: u16,
+            has_limit: bool,
+            limit: usize,
+        ) -> Result<Box<NativePriorityQueueBatch>>;
+        fn native_structured_priority_queue_peek_into(
+            queue: &mut NativeStructuredPriorityQueue,
+            bucket: u16,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_priority_queue_poll_into(
+            queue: &mut NativeStructuredPriorityQueue,
+            bucket: u16,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_priority_queue_peek_batch_into(
+            queue: &mut NativeStructuredPriorityQueue,
+            bucket: u16,
+            has_limit: bool,
+            limit: usize,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_priority_queue_poll_batch_into(
+            queue: &mut NativeStructuredPriorityQueue,
+            bucket: u16,
+            has_limit: bool,
+            limit: usize,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_priority_queue_advance(
+            queue: &NativeStructuredPriorityQueue,
+            bucket: u16,
+            key: &[u8],
+        ) -> Result<()>;
+        fn native_structured_priority_queue_cursor(
+            queue: &NativeStructuredPriorityQueue,
+            bucket: u16,
+        ) -> Result<Box<NativePriorityQueueCursor>>;
+        fn native_priority_queue_batch_size(batch: &NativePriorityQueueBatch) -> usize;
+        fn native_priority_queue_batch_key(
+            batch: &NativePriorityQueueBatch,
+            index: usize,
+        ) -> Result<&[u8]>;
+        fn native_priority_queue_batch_value(
+            batch: &NativePriorityQueueBatch,
+            index: usize,
+        ) -> Result<&[u8]>;
+        fn native_priority_queue_cursor_has_value(cursor: &NativePriorityQueueCursor) -> bool;
+        fn native_priority_queue_cursor_value(cursor: &NativePriorityQueueCursor) -> Result<&[u8]>;
 
         fn native_structured_db_open(config_json: &str) -> Result<Box<NativeStructuredDb>>;
         fn native_structured_db_open_ranges(

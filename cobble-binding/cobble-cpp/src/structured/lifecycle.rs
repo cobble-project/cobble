@@ -188,7 +188,7 @@ pub(crate) fn native_structured_db_switch_to_snapshot(
 ) -> BridgeResult<()> {
     Arc::get_mut(&mut db.db)
         .ok_or_else(|| {
-            "CB_INVALID_STATE: SwitchToSnapshot requires exclusive ownership; release every structured scan cursor and schema builder first".to_owned()
+            "CB_INVALID_STATE: SwitchToSnapshot requires exclusive ownership; release every structured scan cursor, schema builder, and priority queue first".to_owned()
         })?
         .switch_to_snapshot(snapshot_id)
         .map_err(format_error)

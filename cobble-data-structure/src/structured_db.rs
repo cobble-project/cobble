@@ -248,7 +248,6 @@ fn ensure_list_column(
     }
 }
 
-#[cfg(feature = "ffi")]
 pub(crate) fn ensure_bytes_column(
     schema: &StructuredSchema,
     column_family: Option<&str>,
@@ -1630,7 +1629,6 @@ impl StructuredDb {
             .merge_with_options(bucket, key, column, encoded, options.as_cobble())
     }
 
-    #[cfg(feature = "ffi")]
     pub(crate) fn merge_borrowed_bytes_with_options<K>(
         &self,
         bucket: u16,

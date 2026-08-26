@@ -3,12 +3,173 @@
 //! Only connector-specific raw or pre-encoded operations belong here. The
 //! structured semantic API remains available from the crate root.
 
+use crate::priority_queue::{DetachedPriorityQueueDescriptor, PriorityQueueBackend};
 use crate::{
     StructuredDb, StructuredDbIterator, StructuredScanOptions, StructuredSingleDb,
     StructuredWriteBatch, StructuredWriteOptions,
 };
 use bytes::Bytes;
 use cobble::Result;
+
+/// Backend-independent priority-queue metadata for language bindings.
+///
+/// The descriptor owns normalized schema metadata and cached options, but no
+/// database borrow. Operations receive their concrete database synchronously.
+pub struct PriorityQueueDescriptor {
+    inner: DetachedPriorityQueueDescriptor,
+}
+
+impl PriorityQueueDescriptor {
+    #[inline]
+    pub fn column_family(&self) -> &str {
+        self.inner.column_family()
+    }
+}
+
+#[inline]
+pub fn db_new_priority_queue_descriptor(
+    db: &mut StructuredDb,
+    name: String,
+) -> Result<PriorityQueueDescriptor> {
+    Ok(PriorityQueueDescriptor {
+        inner: db.new_priority_queue(name)?.detached_descriptor(),
+    })
+}
+
+#[inline]
+pub fn db_get_priority_queue_descriptor(
+    db: &StructuredDb,
+    name: String,
+) -> Result<PriorityQueueDescriptor> {
+    Ok(PriorityQueueDescriptor {
+        inner: db.get_priority_queue(name)?.detached_descriptor(),
+    })
+}
+
+#[inline]
+pub fn db_get_or_new_priority_queue_descriptor(
+    db: &mut StructuredDb,
+    name: String,
+) -> Result<PriorityQueueDescriptor> {
+    Ok(PriorityQueueDescriptor {
+        inner: db.get_or_new_priority_queue(name)?.detached_descriptor(),
+    })
+}
+
+#[inline]
+pub fn single_db_new_priority_queue_descriptor(
+    db: &mut StructuredSingleDb,
+    name: String,
+) -> Result<PriorityQueueDescriptor> {
+    Ok(PriorityQueueDescriptor {
+        inner: db.new_priority_queue(name)?.detached_descriptor(),
+    })
+}
+
+#[inline]
+pub fn single_db_get_priority_queue_descriptor(
+    db: &StructuredSingleDb,
+    name: String,
+) -> Result<PriorityQueueDescriptor> {
+    Ok(PriorityQueueDescriptor {
+        inner: db.get_priority_queue(name)?.detached_descriptor(),
+    })
+}
+
+#[inline]
+pub fn single_db_get_or_new_priority_queue_descriptor(
+    db: &mut StructuredSingleDb,
+    name: String,
+) -> Result<PriorityQueueDescriptor> {
+    Ok(PriorityQueueDescriptor {
+        inner: db.get_or_new_priority_queue(name)?.detached_descriptor(),
+    })
+}
+
+macro_rules! priority_queue_backend_functions {
+    ($offer:ident, $delete:ident, $peek_batch:ident, $advance:ident, $cursor:ident,
+     $db:ty, $variant:ident) => {
+        #[inline]
+        pub fn $offer(
+            db: &$db,
+            descriptor: &PriorityQueueDescriptor,
+            bucket: u16,
+            key: &[u8],
+            value: &[u8],
+        ) -> Result<()> {
+            descriptor
+                .inner
+                .offer(PriorityQueueBackend::$variant(db), bucket, key, value)
+        }
+
+        #[inline]
+        pub fn $delete(
+            db: &$db,
+            descriptor: &PriorityQueueDescriptor,
+            bucket: u16,
+            key: &[u8],
+        ) -> Result<()> {
+            descriptor
+                .inner
+                .delete(PriorityQueueBackend::$variant(db), bucket, key)
+        }
+
+        #[inline]
+        pub fn $peek_batch(
+            db: &$db,
+            descriptor: &PriorityQueueDescriptor,
+            bucket: u16,
+            limit: Option<usize>,
+        ) -> Result<Vec<(Bytes, Bytes)>> {
+            descriptor
+                .inner
+                .scan_batch(PriorityQueueBackend::$variant(db), bucket, limit, false)
+        }
+
+        #[inline]
+        pub fn $advance(
+            db: &$db,
+            descriptor: &PriorityQueueDescriptor,
+            bucket: u16,
+            key: &[u8],
+        ) -> Result<()> {
+            descriptor
+                .inner
+                .advance_cursor(PriorityQueueBackend::$variant(db), bucket, key)
+        }
+
+        #[inline]
+        pub fn $cursor(
+            db: &$db,
+            descriptor: &PriorityQueueDescriptor,
+            bucket: u16,
+        ) -> Result<Option<Vec<u8>>> {
+            descriptor
+                .inner
+                .cursor(PriorityQueueBackend::$variant(db), bucket)
+        }
+    };
+}
+
+priority_queue_backend_functions!(
+    db_priority_queue_offer,
+    db_priority_queue_delete,
+    db_priority_queue_peek_batch,
+    db_priority_queue_advance,
+    db_priority_queue_cursor,
+    StructuredDb,
+    StructuredDb
+);
+
+priority_queue_backend_functions!(
+    single_db_priority_queue_offer,
+    single_db_priority_queue_delete,
+    single_db_priority_queue_peek_batch,
+    single_db_priority_queue_advance,
+    single_db_priority_queue_cursor,
+    StructuredSingleDb,
+    StructuredSingleDb
+);
 
 #[inline]
 pub fn db_direct_buffer_pool_config(db: &StructuredDb) -> Result<(usize, usize)> {
@@ -372,5 +533,31 @@ mod tests {
         single.close().unwrap();
         drop(single);
         let _ = std::fs::remove_dir_all(single_root);
+    }
+
+    #[test]
+    fn detached_priority_queue_descriptor_reuses_validated_metadata() {
+        let (root, config) = config("ds_ffi_priority_queue_descriptor");
+        let mut db = StructuredSingleDb::open(config).unwrap();
+        let descriptor =
+            single_db_new_priority_queue_descriptor(&mut db, " jobs ".to_string()).unwrap();
+        assert_eq!(descriptor.column_family(), "jobs");
+
+        single_db_priority_queue_offer(&db, &descriptor, 0, b"k", b"left").unwrap();
+        single_db_priority_queue_offer(&db, &descriptor, 0, b"k", b"-right").unwrap();
+        let first = single_db_priority_queue_peek_batch(&db, &descriptor, 0, Some(1)).unwrap();
+        let second = single_db_priority_queue_peek_batch(&db, &descriptor, 0, Some(1)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first[0].0.as_ref(), b"k");
+        assert_eq!(first[0].1.as_ref(), b"left-right");
+
+        db.update_schema()
+            .add_bytes_column(Some("plain".to_string()), 0)
+            .commit()
+            .unwrap();
+        assert!(single_db_get_priority_queue_descriptor(&db, "plain".to_string()).is_err());
+        db.close().unwrap();
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

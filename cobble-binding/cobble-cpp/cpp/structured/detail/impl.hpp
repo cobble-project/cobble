@@ -52,6 +52,31 @@ struct OwnedBatch::Impl {
   rust::Box<structured_ffi::NativeStructuredBatch> native;
 };
 
+struct OwnedPriorityQueueEntry::Impl {
+  explicit Impl(rust::Box<structured_ffi::NativePriorityQueueBatch> value)
+      : native(std::move(value)) {}
+  rust::Box<structured_ffi::NativePriorityQueueBatch> native;
+};
+
+struct OwnedPriorityQueueBatch::Impl {
+  explicit Impl(rust::Box<structured_ffi::NativePriorityQueueBatch> value)
+      : native(std::move(value)) {}
+  rust::Box<structured_ffi::NativePriorityQueueBatch> native;
+};
+
+struct PriorityQueue::Impl {
+  using Owner = std::variant<std::shared_ptr<Db::Impl>,
+                             std::shared_ptr<SingleDb::Impl>>;
+
+  Impl(Owner value,
+       rust::Box<structured_ffi::NativeStructuredPriorityQueue> queue)
+      : owner(std::move(value)), native(std::move(queue)) {}
+
+  // Rust native must be destroyed first, before the last C++ database owner.
+  Owner owner;
+  rust::Box<structured_ffi::NativeStructuredPriorityQueue> native;
+};
+
 struct ScanCursor::Impl {
   explicit Impl(rust::Box<structured_ffi::NativeStructuredScanCursor> value)
       : native(std::move(value)) {}

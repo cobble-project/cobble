@@ -5,11 +5,11 @@
 The C++ API wraps both `SingleDb` and the sharded `Db` raw bucket/key/column
 data model. It includes database open/resume/restore, point and multi-key
 reads, writes, write batches, range scans, raw schema evolution, metrics,
-runtime lifecycle controls, typed global and shard snapshot operations, active
+runtime lifecycle controls, structured BYTES/LIST data, structured priority
+queues, typed global and shard snapshot operations, active
 snapshot switching, bucket rescaling, current and pinned multi-shard readers,
 exact-snapshot read-only databases, coordinator operations, and distributed
-scan planning. Table codecs and structured Table schema APIs are intentionally
-outside this binding.
+scan planning. Table codecs are intentionally outside this binding.
 
 The public C++ header does not expose generated `cxx` types or Rust storage
 layout. This leaves room to evolve the Rust bridge without changing every C++
@@ -32,6 +32,11 @@ focused private modules.
 
 This is a source-organization boundary only: neither the C++ public ABI nor
 the CBRB caller-buffer format changes.
+
+Structured headers and implementations follow the same domain layout under
+`include/cobble/structured`, `cpp/structured`, and `src/structured`, including
+dedicated priority-queue modules. The raw umbrella and raw class layouts do not
+depend on this structured surface.
 
 ## Ownership and data movement
 
@@ -114,6 +119,21 @@ the C++ reader handle is destroyed. Current readers may refresh to the latest
 global snapshot; pinned readers reject refresh with
 `ErrorCode::kInvalidState`. Reader methods are synchronous and mutable, and
 callers provide external synchronization.
+
+Priority queues hold an owned, detached descriptor plus a concrete shared
+`StructuredDb` or `StructuredSingleDb` owner. The descriptor caches normalized
+family metadata and scan/write options; it never stores or extends a borrowed
+Rust `PriorityQueue` lifetime. The native queue child is destroyed before its
+last database owner. Queue operations are synchronous and require external
+synchronization. A live queue prevents exclusive schema commit and active
+snapshot switching, while normal parent-wrapper destruction remains safe.
+
+Caller-buffer polls preflight every CSRB size and metadata field before any
+state change. A too-small buffer is untouched and retains a request keyed by
+operation, bucket, and optional limit. On a sufficient retry the truncation
+cursor advances before output is written; encoding then uses the validated,
+infallible prepared representation. Thus an advance error cannot expose rows
+as consumed, and a successful poll advances exactly once.
 
 `DbCoordinator::MaterializeGlobalSnapshot` accepts typed shard snapshots. The
 binding verifies that every inclusive range is within `total_buckets` and that

@@ -95,8 +95,7 @@ pub(crate) fn native_structured_db_commit_schema(
     edit: &mut NativeStructuredSchemaEdit,
 ) -> BridgeResult<ffi::NativeStructuredSchema> {
     let owner = Arc::get_mut(&mut db.db).ok_or_else(|| {
-        "CB_INVALID_STATE: schema commit requires releasing every structured scan cursor first"
-            .to_owned()
+        "CB_INVALID_STATE: schema commit requires releasing every structured scan cursor and priority queue first".to_owned()
     })?;
     apply_schema_operations(
         SchemaBuilderDispatch::Db(owner.update_schema()),
@@ -109,8 +108,7 @@ pub(crate) fn native_structured_single_db_commit_schema(
     edit: &mut NativeStructuredSchemaEdit,
 ) -> BridgeResult<ffi::NativeStructuredSchema> {
     let owner = Arc::get_mut(&mut db.db).ok_or_else(|| {
-        "CB_INVALID_STATE: schema commit requires releasing every structured scan cursor first"
-            .to_owned()
+        "CB_INVALID_STATE: schema commit requires releasing every structured scan cursor and priority queue first".to_owned()
     })?;
     apply_schema_operations(
         SchemaBuilderDispatch::SingleDb(owner.update_schema()),

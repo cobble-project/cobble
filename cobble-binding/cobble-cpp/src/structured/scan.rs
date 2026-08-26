@@ -10,8 +10,8 @@ use crate::structured_bridge::ffi;
 
 use super::conversion::{format_error, input_error};
 use super::encoding::{
-    CsrbRow, STATUS_BLOCK_BOUNDARY, STATUS_BUFFER_TOO_SMALL, STATUS_END, STATUS_OK, encode_into,
-    encoded_len,
+    CsrbColumns, CsrbRow, STATUS_BLOCK_BOUNDARY, STATUS_BUFFER_TOO_SMALL, STATUS_END, STATUS_OK,
+    encode_into, encoded_len,
 };
 use super::multi_get::buffer_result;
 use super::{
@@ -270,7 +270,7 @@ fn csrb_rows(rows: &[NativeStructuredBatchRow]) -> Vec<CsrbRow<'_>> {
         .map(|row| CsrbRow {
             bucket: row.bucket,
             key: &row.key,
-            columns: Some(&row.columns),
+            columns: CsrbColumns::Structured(&row.columns),
         })
         .collect()
 }

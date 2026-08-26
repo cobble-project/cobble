@@ -12,6 +12,7 @@ fn main() {
         "src/structured/lifecycle.rs",
         "src/structured/multi_get.rs",
         "src/structured/options.rs",
+        "src/structured/priority_queue.rs",
         "src/structured/row.rs",
         "src/structured/scan.rs",
         "src/structured/scan_plan.rs",

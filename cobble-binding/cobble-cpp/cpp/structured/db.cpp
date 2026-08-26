@@ -321,8 +321,8 @@ void Db::SwitchToSnapshot(SnapshotId snapshot) {
     throw Error(ErrorCode::kInvalidState, "structured Db has been moved from");
   if (impl_.use_count() != 1) {
     throw Error(ErrorCode::kInvalidState,
-                "SwitchToSnapshot requires releasing every scan cursor and "
-                "schema builder first");
+                "SwitchToSnapshot requires releasing every scan cursor, "
+                "schema builder, and priority queue first");
   }
   detail::Translate([&] {
     structured_ffi::native_structured_db_switch_to_snapshot(*impl_->native,

@@ -160,6 +160,13 @@ versioned `CSRB` format documented in [ROW_BATCH_FORMAT.md](ROW_BATCH_FORMAT.md)
 Owned multi-get and scan results keep Rust `Bytes` and LIST element allocations
 alive and expose them through zero-copy spans.
 
+`structured::PriorityQueue` caches its validated family descriptor and native
+read/write options. Offer inputs are borrowed synchronously; owned entries and
+batches expose the returned Rust `Bytes` without a payload copy. Point and
+batch caller-buffer operations also use `CSRB`. A too-small poll keeps both the
+output and queue cursor unchanged; retry must use the same operation, bucket,
+and optional limit.
+
 `ScanPlan` and typed split DTOs own their binary boundary keys. Constructing a
 plan from `BytesView` copies those cold-path metadata bytes once; split JSON is
 provided for durable compatibility and is not used on the scan data path.
@@ -173,12 +180,12 @@ and the Cobble error message. Database methods that take a const handle may be
 called concurrently. A scan cursor is mutable and requires external
 synchronization.
 
-Release all scan cursors and schema builders before an explicit
+Release all scan cursors, schema builders, and priority queues before an explicit
 `Database::Close` or `Db::Close`. Normal RAII destruction is safe because these
 dependent objects retain their database owner.
 
 `Db::SwitchToSnapshot` is an exclusive operation on the same handle. It fails
-with `ErrorCode::kInvalidState` while a scan cursor or schema builder retains
+with `ErrorCode::kInvalidState` while a scan cursor, schema builder, or priority queue retains
 that database; release those children and externally serialize the switch with
 other operations. `Db::Resume` selects the latest snapshot and replays the WAL
 by default, while `Db::ResumeFromSnapshot` selects the exact snapshot boundary

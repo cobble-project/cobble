@@ -10,6 +10,7 @@
 #include <cobble/structured/lifecycle.hpp>
 #include <cobble/structured/multi_get.hpp>
 #include <cobble/structured/options.hpp>
+#include <cobble/structured/priority_queue.hpp>
 #include <cobble/structured/row.hpp>
 #include <cobble/structured/scan.hpp>
 #include <cobble/structured/schema.hpp>
@@ -65,6 +66,9 @@ public:
   Scan(BucketId bucket, std::optional<BytesView> start_inclusive = std::nullopt,
        std::optional<BytesView> end_exclusive = std::nullopt,
        const ScanOptions &options = {}) const;
+  [[nodiscard]] PriorityQueue NewPriorityQueue(std::string_view name);
+  [[nodiscard]] PriorityQueue GetPriorityQueue(std::string_view name) const;
+  [[nodiscard]] PriorityQueue GetOrNewPriorityQueue(std::string_view name);
 
   [[nodiscard]] Schema CurrentSchema() const;
   [[nodiscard]] SchemaBuilder UpdateSchema() const;
@@ -87,6 +91,7 @@ private:
 
   friend class SchemaBuilder;
   friend class ScanCursor;
+  friend class PriorityQueue;
 };
 
 } // namespace cobble::structured
