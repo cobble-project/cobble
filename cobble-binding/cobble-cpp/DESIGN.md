@@ -11,6 +11,19 @@ The public C++ header does not expose generated `cxx` types or Rust storage
 layout. This leaves room to evolve the Rust bridge without changing every C++
 consumer and keeps the public API usable from ordinary CMake projects.
 
+## Source layout
+
+`cobble.hpp` is a compatibility umbrella over the standalone public headers:
+`types.hpp`, `options.hpp`, `write_batch.hpp`, `scan.hpp`, and `database.hpp`.
+The C++ implementation is split by the same responsibilities, with private
+bridge, conversion, error-translation, and PImpl declarations under
+`cpp/detail`. Rust keeps the `cxx` declaration in `src/lib.rs` so the generated
+header and `cobble::ffi` namespace stay stable; database, write-batch, scan,
+options, encoding, and error behavior live in focused private modules.
+
+This is a source-organization boundary only: neither the C++ public ABI nor
+the CBRB caller-buffer format changes.
+
 ## Ownership and data movement
 
 The binding provides two complementary read paths:

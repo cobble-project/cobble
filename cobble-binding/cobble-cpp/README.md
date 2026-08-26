@@ -85,7 +85,10 @@ target_compile_features(my_app PRIVATE cxx_std_20)
 ```
 
 The package installs `cobble/cobble.hpp` and the shared library. Consumers do
-not need to include a generated `cxx` header.
+not need to include a generated `cxx` header. `cobble.hpp` remains the complete
+compatibility umbrella; consumers that prefer narrower dependencies can include
+`types.hpp`, `options.hpp`, `write_batch.hpp`, `scan.hpp`, or `database.hpp`
+directly.
 
 ## Data ownership and zero-copy paths
 

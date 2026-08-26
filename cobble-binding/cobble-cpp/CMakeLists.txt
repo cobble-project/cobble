@@ -85,7 +85,9 @@ set_target_properties(
              IMPORTED_LOCATION_MINSIZEREL "${COBBLE_RUST_LIBRARY_RELEASE}")
 add_dependencies(cobble_cpp_rust cobble_cpp_cargo)
 
-add_library(cobble_cpp SHARED cpp/cobble.cpp)
+add_library(cobble_cpp SHARED cpp/convert.cpp cpp/error.cpp cpp/options.cpp
+                              cpp/write_batch.cpp cpp/scan.cpp cpp/database.cpp
+                              cpp/version.cpp)
 add_library(cobble::cobble ALIAS cobble_cpp)
 add_dependencies(cobble_cpp cobble_cpp_cargo)
 
