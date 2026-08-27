@@ -1,6 +1,8 @@
 package io.cobble.table;
 
 public final class BinaryType extends PrimitiveType {
+    private static final long serialVersionUID = 1L;
+
     BinaryType(boolean nullable) {
         super(Kind.BINARY, nullable);
     }

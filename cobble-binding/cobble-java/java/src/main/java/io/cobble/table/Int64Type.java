@@ -1,6 +1,8 @@
 package io.cobble.table;
 
 public final class Int64Type extends PrimitiveType {
+    private static final long serialVersionUID = 1L;
+
     Int64Type(boolean nullable) {
         super(Kind.INT64, nullable);
     }

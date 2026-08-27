@@ -1,5 +1,6 @@
 package io.cobble.table;
 
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -8,7 +9,9 @@ import java.util.Objects;
 import java.util.Set;
 
 /** Ordered fields of a nested struct. */
-public final class RecordType {
+public final class RecordType implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final List<DataField> fields;
 
     public RecordType(List<DataField> fields) {

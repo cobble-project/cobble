@@ -3,6 +3,8 @@ package io.cobble.table;
 import java.util.Objects;
 
 public final class TimeType extends LogicalType {
+    private static final long serialVersionUID = 1L;
+
     private final int precision;
 
     TimeType(int precision, boolean nullable) {

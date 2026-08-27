@@ -1,6 +1,8 @@
 package io.cobble.table;
 
 public final class Float32Type extends PrimitiveType {
+    private static final long serialVersionUID = 1L;
+
     Float32Type(boolean nullable) {
         super(Kind.FLOAT32, nullable);
     }

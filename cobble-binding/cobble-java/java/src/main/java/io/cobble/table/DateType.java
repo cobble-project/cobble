@@ -1,6 +1,8 @@
 package io.cobble.table;
 
 public final class DateType extends PrimitiveType {
+    private static final long serialVersionUID = 1L;
+
     DateType(boolean nullable) {
         super(Kind.DATE, nullable);
     }

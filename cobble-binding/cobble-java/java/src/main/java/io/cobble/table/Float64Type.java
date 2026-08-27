@@ -1,6 +1,8 @@
 package io.cobble.table;
 
 public final class Float64Type extends PrimitiveType {
+    private static final long serialVersionUID = 1L;
+
     Float64Type(boolean nullable) {
         super(Kind.FLOAT64, nullable);
     }

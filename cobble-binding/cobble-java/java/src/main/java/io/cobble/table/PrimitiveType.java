@@ -1,6 +1,8 @@
 package io.cobble.table;
 
 abstract class PrimitiveType extends LogicalType {
+    private static final long serialVersionUID = 1L;
+
     PrimitiveType(Kind kind, boolean nullable) {
         super(kind, nullable);
     }

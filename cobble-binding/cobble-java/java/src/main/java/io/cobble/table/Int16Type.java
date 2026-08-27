@@ -1,6 +1,8 @@
 package io.cobble.table;
 
 public final class Int16Type extends PrimitiveType {
+    private static final long serialVersionUID = 1L;
+
     Int16Type(boolean nullable) {
         super(Kind.INT16, nullable);
     }

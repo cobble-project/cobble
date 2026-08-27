@@ -1,5 +1,8 @@
 package io.cobble.table;
 
+import java.io.InvalidObjectException;
+import java.io.ObjectStreamException;
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -10,7 +13,9 @@ import java.util.Objects;
 import java.util.Set;
 
 /** User-visible semantic schema of a table. */
-public final class TableSchema {
+public final class TableSchema implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final List<DataField> fields;
     private final List<Long> primaryKey;
     private final List<Long> bucketKey;
@@ -78,6 +83,16 @@ public final class TableSchema {
     @Override
     public int hashCode() {
         return Objects.hash(fields, primaryKey, bucketKey);
+    }
+
+    private Object readResolve() throws ObjectStreamException {
+        try {
+            return new TableSchema(fields, primaryKey, bucketKey);
+        } catch (RuntimeException e) {
+            InvalidObjectException invalid = new InvalidObjectException("invalid table schema");
+            invalid.initCause(e);
+            throw invalid;
+        }
     }
 
     private static List<Long> immutableFieldIds(List<Long> ids, String name) {

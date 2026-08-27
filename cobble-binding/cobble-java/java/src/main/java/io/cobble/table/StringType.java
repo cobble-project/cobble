@@ -1,6 +1,8 @@
 package io.cobble.table;
 
 public final class StringType extends PrimitiveType {
+    private static final long serialVersionUID = 1L;
+
     StringType(boolean nullable) {
         super(Kind.STRING, nullable);
     }

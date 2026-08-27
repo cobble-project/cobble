@@ -1,9 +1,12 @@
 package io.cobble.table;
 
+import java.io.Serializable;
 import java.util.Objects;
 
 /** Base class for Cobble's immutable cross-language logical types. */
-public abstract class LogicalType {
+public abstract class LogicalType implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     public enum Kind {
         BOOLEAN,
         INT8,

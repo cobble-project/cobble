@@ -1,9 +1,12 @@
 package io.cobble.table;
 
+import java.io.Serializable;
 import java.util.Objects;
 
 /** Named logical field with a stable field id. */
-public final class DataField {
+public final class DataField implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final long id;
     private final String name;
     private final LogicalType logicalType;

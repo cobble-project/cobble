@@ -3,6 +3,8 @@ package io.cobble.table;
 import java.util.Objects;
 
 public final class DecimalType extends LogicalType {
+    private static final long serialVersionUID = 1L;
+
     private final int precision, scale;
 
     DecimalType(int precision, int scale, boolean nullable) {

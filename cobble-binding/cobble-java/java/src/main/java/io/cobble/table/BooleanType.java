@@ -1,6 +1,8 @@
 package io.cobble.table;
 
 public final class BooleanType extends PrimitiveType {
+    private static final long serialVersionUID = 1L;
+
     BooleanType(boolean nullable) {
         super(Kind.BOOLEAN, nullable);
     }
