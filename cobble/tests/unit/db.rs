@@ -47,6 +47,38 @@ fn runtime_manifest_store(db: &Db) -> crate::runtime_manifest::RuntimeManifestSt
 
 #[test]
 #[serial(file)]
+fn snapshot_schema_is_fixed_when_snapshot_starts() {
+    let root = "/tmp/db_snapshot_schema_cut";
+    cleanup_test_root(root);
+    let db = open_db(config_with_small_memtable(root));
+    let schema_at_start = db.current_schema().version();
+
+    let snapshot_id = db
+        .create_snapshot_and_wait_with_before_flush("schema cut test", |_| {
+            let mut builder = db.update_schema();
+            builder.add_column(1, None, None, None)?;
+            let committed = builder.commit();
+            assert!(committed.version() > schema_at_start);
+            Ok(())
+        })
+        .unwrap();
+
+    let manifest = load_manifest_for_snapshot(&db.file_manager, snapshot_id).unwrap();
+    assert_eq!(manifest.latest_schema_id, schema_at_start);
+
+    let next_snapshot_id = db.create_snapshot_and_wait("schema cut follow-up").unwrap();
+    let next_manifest = load_manifest_for_snapshot(&db.file_manager, next_snapshot_id).unwrap();
+    assert_eq!(
+        next_manifest.latest_schema_id,
+        db.current_schema().version()
+    );
+
+    db.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
 fn writer_persists_plain_db_properties_without_volume_credentials() {
     let root = "/tmp/db_writer_properties";
     cleanup_test_root(root);

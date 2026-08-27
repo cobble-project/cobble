@@ -285,6 +285,42 @@ fn table_runtime_create_open_and_typed_rows() {
     reopened.close().unwrap();
 }
 
+#[test]
+fn schema_only_snapshot_preserves_empty_table() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root.path().display())),
+        total_buckets: 8,
+        ..Config::default()
+    };
+    let schema = TableSchema::new(
+        vec![
+            DataField::new(0, "id", LogicalType::int64()).unwrap(),
+            DataField::new(1, "name", LogicalType::string().nullable()).unwrap(),
+        ],
+        vec![0.into()],
+        vec![0.into()],
+    )
+    .unwrap();
+    let db = DbBuilder::new(config.clone())
+        .bucket_ranges(vec![0..=7])
+        .db_id("empty-table")
+        .open()
+        .unwrap();
+    Table::create(&db, "events", schema.clone()).unwrap();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let snapshot_id = db
+        .snapshot_with_callback(move |result| sender.send(result).unwrap())
+        .unwrap();
+    receiver.recv().unwrap().unwrap();
+    db.close().unwrap();
+
+    let read_only =
+        cobble::ReadOnlyDb::open_with_db_id(config, snapshot_id, "empty-table").unwrap();
+    let table = ReadOnlyTable::open(&read_only, "events").unwrap();
+    assert_eq!(table.schema(), &schema);
+}
+
 fn build_key(table: &Table<'_>, values: &[Value]) -> TableKey {
     let mut builder = table.key_builder();
     for value in values {

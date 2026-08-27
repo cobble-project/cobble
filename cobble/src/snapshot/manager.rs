@@ -364,6 +364,10 @@ impl SnapshotManager {
         let mut snapshot = DbSnapshot::new(id, &manifest_path, callback);
         snapshot.timestamp_seconds = self.time_provider.now_seconds();
         snapshot.bucket_ranges = self.bucket_ranges.read().unwrap().clone();
+        // Schema is snapshot metadata, so capture its version at the same cut as the snapshot id
+        // and timestamp. Materialization may finish after a later schema commit and must not pull
+        // that commit backwards into an already-started snapshot.
+        snapshot.latest_schema_id = self.schema_manager.latest_schema().version();
         let snapshot = Arc::new(snapshot);
         state.snapshots.insert(id, Arc::clone(&snapshot));
         // initialize incremental references with self-reference
@@ -466,15 +470,6 @@ impl SnapshotManager {
         snapshot.truncation_cursors = truncation_cursors
             .map(TruncationCursorSnapshot::to_map)
             .unwrap_or_else(|| db_state.truncation_cursors_snapshot());
-        snapshot.latest_schema_id = db_state
-            .multi_lsm_version
-            .tree_versions_cloned()
-            .iter()
-            .flat_map(|version| version.levels.iter())
-            .flat_map(|level| level.files.iter())
-            .map(|file| file.schema_id)
-            .max()
-            .unwrap_or(0);
         snapshot.referenced_schema_ids =
             collect_schema_ids_from_lsm_versions(&snapshot.lsm_versions, snapshot.latest_schema_id);
         let retained_files = tracked_file_ids
