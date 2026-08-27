@@ -39,7 +39,7 @@ fn total_bucket_range(config: &Config) -> BridgeResult<Vec<RangeInclusive<u16>>>
     }
     let last = u16::try_from(config.total_buckets - 1)
         .map_err(|_| input_error("total_buckets does not fit the bucket id range"))?;
-    Ok(vec![0..=last])
+    Ok(std::iter::once(0..=last).collect())
 }
 
 fn bucket_ranges(

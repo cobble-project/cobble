@@ -41,7 +41,8 @@ ErrorCode ParseErrorCode(std::string_view message) noexcept {
 
 [[noreturn]] void ThrowTranslated(const rust::Error& error) {
   std::string message(error.what());
-  throw Error(ParseErrorCode(message), std::move(message));
+  const auto code = ParseErrorCode(message);
+  throw Error(code, std::move(message));
 }
 
 }  // namespace detail

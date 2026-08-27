@@ -37,10 +37,9 @@ pub(crate) fn full_range(config: &Config) -> BridgeResult<Vec<RangeInclusive<u16
     if config.total_buckets == 0 || config.total_buckets > u32::from(u16::MAX) + 1 {
         return Err(input_error("total_buckets must be in range 1..=65536"));
     }
-    Ok(vec![
-        0..=u16::try_from(config.total_buckets - 1)
-            .map_err(|_| input_error("total_buckets exceeds the bucket id range"))?,
-    ])
+    let last = u16::try_from(config.total_buckets - 1)
+        .map_err(|_| input_error("total_buckets exceeds the bucket id range"))?;
+    Ok(std::iter::once(0..=last).collect())
 }
 
 pub(crate) fn ranges(

@@ -8,6 +8,9 @@
 
 namespace cobble::structured {
 
+class Db;
+class SingleDb;
+
 enum class ColumnKind : std::uint8_t {
   kBytes = 0,
   kList = 1,

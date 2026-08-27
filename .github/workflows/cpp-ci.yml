@@ -87,13 +87,14 @@ jobs:
       - name: Create test bucket
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y awscli
-          export AWS_ACCESS_KEY_ID=rustfsadmin
-          export AWS_SECRET_ACCESS_KEY=rustfsadmin
-          export AWS_DEFAULT_REGION=us-east-1
-          aws --endpoint-url http://127.0.0.1:9000 s3api head-bucket --bucket cobble-cpp-test || \
-            aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket cobble-cpp-test
+          aws_cli=(docker run --rm --network container:cobble-cpp-s3
+            -e AWS_ACCESS_KEY_ID=rustfsadmin
+            -e AWS_SECRET_ACCESS_KEY=rustfsadmin
+            -e AWS_DEFAULT_REGION=us-east-1
+            amazon/aws-cli:2.31.18
+            --endpoint-url http://127.0.0.1:9000)
+          "${aws_cli[@]}" s3api head-bucket --bucket cobble-cpp-test ||
+            "${aws_cli[@]}" s3api create-bucket --bucket cobble-cpp-test
       - name: Configure
         run: >-
           cmake -S cobble-binding/cobble-cpp -B build/cobble-cpp

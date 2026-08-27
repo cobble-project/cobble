@@ -7,7 +7,7 @@
 #include <string>
 #include <string_view>
 
-#include <cobble/types.hpp>
+#include <cobble/structured/types.hpp>
 
 namespace cobble::structured {
 

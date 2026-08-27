@@ -3,6 +3,7 @@
 #include <memory>
 
 #include <cobble/snapshot.hpp>
+#include <cobble/structured/types.hpp>
 
 namespace cobble::structured {
 
