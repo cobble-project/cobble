@@ -58,6 +58,18 @@ fn normalize_root(path: &str) -> String {
     }
 }
 
+fn local_fs_root(url: &Url) -> Result<String> {
+    let path = url
+        .to_file_path()
+        .map_err(|_| Error::ConfigError(format!("Invalid local file URL path: {url}")))?;
+    path.into_os_string().into_string().map_err(|path| {
+        Error::ConfigError(format!(
+            "Local file URL path is not valid UTF-8: {}",
+            path.to_string_lossy()
+        ))
+    })
+}
+
 fn split_bucket_and_root_from_path(path: &str) -> Option<(String, String)> {
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
@@ -168,8 +180,14 @@ impl FileSystem for OpendalFileSystem {
         let mut options: HashMap<String, String> = HashMap::new();
         match scheme.as_str() {
             "fs" => {
-                // For local fs, we only need to set the root path
-                options.insert("root".to_string(), url.path().to_string());
+                // URL paths are not native filesystem paths on Windows: for example,
+                // `file:///D:/data` has a URL path of `/D:/data` but an fs root of `D:\data`.
+                let root = if url.scheme().eq_ignore_ascii_case("file") {
+                    local_fs_root(url)?
+                } else {
+                    url.path().to_string()
+                };
+                options.insert("root".to_string(), root);
             }
             "s3" => {
                 let (bucket, root, endpoint) =

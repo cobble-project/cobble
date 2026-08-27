@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -90,7 +91,7 @@ void VerifyEncodedBatch(const std::vector<std::uint8_t>& encoded,
 
 }  // namespace
 
-int main() {
+int RunBindingTest() {
   const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
   const auto root = std::filesystem::temp_directory_path() /
                     ("cobble-cpp-binding-" + std::to_string(nonce));
@@ -186,4 +187,14 @@ int main() {
   CHECK(saw_config_error);
 
   std::filesystem::remove_all(root);
+  return 0;
+}
+
+int main() {
+  try {
+    return RunBindingTest();
+  } catch (const std::exception& error) {
+    std::cerr << "C++ binding test failed: " << error.what() << '\n';
+    return 1;
+  }
 }

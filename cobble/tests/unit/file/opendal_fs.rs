@@ -15,6 +15,14 @@ fn cleanup_test_root() {
 }
 
 #[test]
+fn test_local_fs_root_uses_native_platform_path() {
+    let path = std::env::temp_dir().join("cobble local fs root");
+    let url = Url::from_file_path(&path).expect("temporary directory must form a file URL");
+    let root = local_fs_root(&url).expect("file URL must convert back to a local root");
+    assert_eq!(std::path::PathBuf::from(root), path);
+}
+
+#[test]
 #[serial_test::serial(file)]
 fn test_opendal_fs_basic() {
     cleanup_test_root();
