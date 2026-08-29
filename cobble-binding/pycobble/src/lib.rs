@@ -14,6 +14,7 @@ mod scan;
 mod schema;
 mod sharded_db;
 mod snapshot;
+mod structured;
 mod types;
 mod write_batch;
 
@@ -39,5 +40,6 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     snapshot::register(module)?;
     database::register(module)?;
     sharded_db::register(module)?;
+    structured::register(module)?;
     Ok(())
 }
