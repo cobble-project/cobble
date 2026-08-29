@@ -1,0 +1,33 @@
+[package]
+name = "pycobble"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+description = "High-performance Python bindings for Cobble."
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+storage-all = ["cobble-binding/storage-all"]
+storage-alluxio = ["cobble-binding/storage-alluxio"]
+storage-cos = ["cobble-binding/storage-cos"]
+storage-ftp = ["cobble-binding/storage-ftp"]
+storage-goosefs = ["cobble-binding/storage-goosefs"]
+storage-hdfs = ["cobble-binding/storage-hdfs"]
+storage-oss = ["cobble-binding/storage-oss"]
+storage-s3 = ["cobble-binding/storage-s3"]
+storage-sftp = ["cobble-binding/storage-sftp"]
+
+[dependencies]
+bytes = { workspace = true }
+cobble-binding = { workspace = true }
+opendal = { version = "0.58.1", default-features = false }
+pyo3 = { version = "0.29.2", features = ["abi3-py311"] }
+size = { workspace = true }

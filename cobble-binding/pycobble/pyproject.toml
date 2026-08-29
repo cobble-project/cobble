@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "pycobble"
+dynamic = ["version"]
+description = "High-performance Python bindings for Cobble."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Cobble contributors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Typing :: Typed",
+]
+
+[tool.maturin]
+bindings = "pyo3"
+features = ["extension-module", "storage-s3"]
+module-name = "pycobble._native"
+python-source = "python"
+strip = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
