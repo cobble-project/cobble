@@ -1,5 +1,5 @@
 use crate::error::{invalid_state, map_error};
-use cobble_binding::{GlobalSnapshotManifest, ShardSnapshotRef, SingleDb};
+use cobble_binding::{Db, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef, SingleDb};
 use pyo3::prelude::*;
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, mpsc};
     name = "BucketRange",
     module = "pycobble._native",
     frozen,
-    skip_from_py_object
+    from_py_object
 )]
 #[derive(Clone)]
 pub(crate) struct PyBucketRange {
@@ -17,11 +17,25 @@ pub(crate) struct PyBucketRange {
     pub(crate) end_inclusive: u16,
 }
 
+#[pymethods]
+impl PyBucketRange {
+    #[new]
+    fn new(start_inclusive: u16, end_inclusive: u16) -> PyResult<Self> {
+        if start_inclusive > end_inclusive {
+            return Err(crate::error::input_error("bucket range is reversed"));
+        }
+        Ok(Self {
+            start_inclusive,
+            end_inclusive,
+        })
+    }
+}
+
 #[pyclass(
     name = "ColumnFamilyId",
     module = "pycobble._native",
     frozen,
-    skip_from_py_object
+    from_py_object
 )]
 #[derive(Clone)]
 pub(crate) struct PyColumnFamilyId {
@@ -35,7 +49,7 @@ pub(crate) struct PyColumnFamilyId {
     name = "ShardSnapshot",
     module = "pycobble._native",
     frozen,
-    skip_from_py_object
+    from_py_object
 )]
 #[derive(Clone)]
 pub(crate) struct PyShardSnapshot {
@@ -72,7 +86,7 @@ impl PyShardSnapshot {
     name = "GlobalSnapshot",
     module = "pycobble._native",
     frozen,
-    skip_from_py_object
+    from_py_object
 )]
 #[derive(Clone)]
 pub(crate) struct PyGlobalSnapshot {
@@ -125,6 +139,26 @@ fn shard(value: ShardSnapshotRef) -> PyShardSnapshot {
     }
 }
 
+pub(crate) fn shard_input(value: ShardSnapshotInput) -> PyShardSnapshot {
+    PyShardSnapshot {
+        ranges: value
+            .ranges
+            .into_iter()
+            .map(|range| PyBucketRange {
+                start_inclusive: *range.start(),
+                end_inclusive: *range.end(),
+            })
+            .collect(),
+        column_families: value.column_family_ids.into_iter().map(family).collect(),
+        db_id: value.db_id,
+        snapshot_id: value.snapshot_id,
+        manifest_path: value.manifest_path,
+        timestamp_seconds: value.timestamp_seconds,
+        data_size_bytes: value.data_size_bytes,
+        incremental_data_size_bytes: value.incremental_data_size_bytes,
+    }
+}
+
 pub(crate) fn snapshot(value: GlobalSnapshotManifest) -> PyGlobalSnapshot {
     PyGlobalSnapshot {
         version: value.version,
@@ -142,6 +176,57 @@ type SnapshotResult = cobble_binding::Result<GlobalSnapshotManifest>;
 pub(crate) struct PyPendingSnapshot {
     id: u64,
     receiver: Mutex<Option<mpsc::Receiver<SnapshotResult>>>,
+}
+
+type ShardSnapshotResult = cobble_binding::Result<ShardSnapshotInput>;
+
+#[pyclass(name = "PendingShardSnapshot", module = "pycobble._native")]
+pub(crate) struct PyPendingShardSnapshot {
+    id: u64,
+    receiver: Mutex<Option<mpsc::Receiver<ShardSnapshotResult>>>,
+}
+
+impl PyPendingShardSnapshot {
+    pub(crate) fn start(db: &Arc<Db>) -> PyResult<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let id = db
+            .snapshot_with_callback(move |result| {
+                let _ = sender.send(result);
+            })
+            .map_err(map_error)?;
+        Ok(Self {
+            id,
+            receiver: Mutex::new(Some(receiver)),
+        })
+    }
+
+    pub(crate) fn wait_result(&self, py: Python<'_>) -> PyResult<PyShardSnapshot> {
+        let receiver = self
+            .receiver
+            .lock()
+            .expect("pending shard snapshot receiver mutex poisoned")
+            .take()
+            .ok_or_else(|| invalid_state("pending shard snapshot was already waited"))?;
+        py.detach(move || {
+            receiver
+                .recv()
+                .map_err(|_| invalid_state("shard snapshot completion channel closed"))?
+                .map(shard_input)
+                .map_err(map_error)
+        })
+    }
+}
+
+#[pymethods]
+impl PyPendingShardSnapshot {
+    #[getter]
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn wait(&self, py: Python<'_>) -> PyResult<PyShardSnapshot> {
+        self.wait_result(py)
+    }
 }
 
 impl PyPendingSnapshot {
@@ -192,5 +277,6 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyColumnFamilyId>()?;
     module.add_class::<PyShardSnapshot>()?;
     module.add_class::<PyGlobalSnapshot>()?;
-    module.add_class::<PyPendingSnapshot>()
+    module.add_class::<PyPendingSnapshot>()?;
+    module.add_class::<PyPendingShardSnapshot>()
 }

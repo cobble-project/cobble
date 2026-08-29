@@ -1,4 +1,4 @@
-use cobble_binding::{MemtableType, RecoveryMode};
+use cobble_binding::{ExpandStorageMode, MemtableType, RecoveryMode};
 use pyo3::prelude::*;
 
 #[pyclass(
@@ -27,6 +27,20 @@ pub(crate) enum PyMemtableType {
     Skiplist = 1,
     Vec = 2,
     Adaptive = 3,
+}
+
+#[pyclass(
+    name = "ExpandStorageMode",
+    module = "pycobble._native",
+    eq,
+    eq_int,
+    from_py_object
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PyExpandStorageMode {
+    AdoptAsync = 0,
+    ReferencePersistent = 1,
+    ReferencePersistentWithCache = 2,
 }
 
 #[pyclass(
@@ -93,9 +107,20 @@ impl From<PyMemtableType> for MemtableType {
     }
 }
 
+impl From<PyExpandStorageMode> for ExpandStorageMode {
+    fn from(value: PyExpandStorageMode) -> Self {
+        match value {
+            PyExpandStorageMode::AdoptAsync => Self::AdoptAsync,
+            PyExpandStorageMode::ReferencePersistent => Self::ReferencePersistent,
+            PyExpandStorageMode::ReferencePersistentWithCache => Self::ReferencePersistentWithCache,
+        }
+    }
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRecoveryMode>()?;
     module.add_class::<PyMemtableType>()?;
+    module.add_class::<PyExpandStorageMode>()?;
     module.add_class::<PyBufferStatus>()?;
     module.add_class::<PyBufferResult>()
 }

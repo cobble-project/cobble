@@ -3,7 +3,7 @@ use crate::encoding::{batch_encoded_len, encode_batch_into};
 use crate::error::{input_error, invalid_state, map_error};
 use crate::types::{PyBufferResult, PyBufferStatus};
 use bytes::Bytes;
-use cobble_binding::{DbIterator, SingleDb};
+use cobble_binding::{Db, DbIterator, SingleDb};
 use pyo3::prelude::*;
 use std::sync::Arc;
 
@@ -150,11 +150,16 @@ impl ScanState {
 pub(crate) struct PyScanCursor {
     // Drop the iterator/access guard before the final database owner.
     state: Option<ScanState>,
-    owner: Option<Arc<SingleDb>>,
+    owner: Option<ScanOwner>,
+}
+
+enum ScanOwner {
+    Single { _db: Arc<SingleDb> },
+    Sharded { _db: Arc<Db> },
 }
 
 impl PyScanCursor {
-    pub(crate) fn new(bucket: u16, iterator: DbIterator, owner: Arc<SingleDb>) -> Self {
+    pub(crate) fn new_single(bucket: u16, iterator: DbIterator, owner: Arc<SingleDb>) -> Self {
         Self {
             state: Some(ScanState {
                 bucket,
@@ -162,7 +167,19 @@ impl PyScanCursor {
                 pending_row: None,
                 pending_batch: None,
             }),
-            owner: Some(owner),
+            owner: Some(ScanOwner::Single { _db: owner }),
+        }
+    }
+
+    pub(crate) fn new_sharded(bucket: u16, iterator: DbIterator, owner: Arc<Db>) -> Self {
+        Self {
+            state: Some(ScanState {
+                bucket,
+                iterator,
+                pending_row: None,
+                pending_batch: None,
+            }),
+            owner: Some(ScanOwner::Sharded { _db: owner }),
         }
     }
 

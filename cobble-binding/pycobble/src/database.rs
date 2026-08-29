@@ -288,7 +288,7 @@ impl PySingleDb {
                 &options,
             )
             .map_err(map_error)?;
-        Ok(PyScanCursor::new(bucket, iterator, db))
+        Ok(PyScanCursor::new_single(bucket, iterator, db))
     }
 
     fn snapshot(&self, py: Python<'_>) -> PyResult<u64> {

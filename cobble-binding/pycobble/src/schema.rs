@@ -1,7 +1,7 @@
 use crate::buffer::InputBytes;
 use crate::error::{input_error, invalid_state, map_error};
 use bytes::Bytes;
-use cobble_binding::{MergeOperator, Schema, SchemaBuilder, SingleDb, merge_operator_by_id};
+use cobble_binding::{Db, MergeOperator, Schema, SchemaBuilder, SingleDb, merge_operator_by_id};
 use pyo3::prelude::*;
 use serde_json::Value;
 use std::sync::Arc;
@@ -115,14 +115,26 @@ fn resolve_operator(
 pub(crate) struct PySchemaBuilder {
     // Drop the core builder/access guard before the final database owner.
     builder: Option<SchemaBuilder>,
-    owner: Option<Arc<SingleDb>>,
+    owner: Option<SchemaOwner>,
+}
+
+enum SchemaOwner {
+    Single { _db: Arc<SingleDb> },
+    Sharded { _db: Arc<Db> },
 }
 
 impl PySchemaBuilder {
     pub(crate) fn new(owner: Arc<SingleDb>) -> Self {
         Self {
             builder: Some(owner.db().update_schema()),
-            owner: Some(owner),
+            owner: Some(SchemaOwner::Single { _db: owner }),
+        }
+    }
+
+    pub(crate) fn new_sharded(owner: Arc<Db>) -> Self {
+        Self {
+            builder: Some(owner.update_schema()),
+            owner: Some(SchemaOwner::Sharded { _db: owner }),
         }
     }
 
