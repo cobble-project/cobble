@@ -5,8 +5,13 @@ use super::types::{
 };
 use crate::buffer::InputBytes;
 use crate::error::{input_error, invalid_state, map_error};
+use crate::metrics::{PyMetricSample, metrics};
 use crate::multi_get::extract_keys;
-use crate::snapshot::{PyBucketRange, PyGlobalSnapshot, PyShardSnapshot, shard_input, snapshot};
+use crate::snapshot::{
+    PyBucketRange, PyGlobalSnapshot, PyPendingShardSnapshot, PyPendingSnapshot, PyShardSnapshot,
+    shard_input, snapshot,
+};
+use crate::types::{PyExpandStorageMode, PyMemtableType, PyRecoveryMode};
 use cobble_binding::Config;
 use cobble_binding::structured::ffi as ds_ffi;
 use cobble_binding::structured::{
@@ -16,8 +21,9 @@ use cobble_binding::structured::{
 use pyo3::prelude::*;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 fn write_options(
     options: Option<PyRef<'_, crate::options::PyWriteOptions>>,
@@ -199,6 +205,15 @@ pub(crate) struct PyStructuredSingleDb {
     pub(crate) active_builders: Arc<AtomicUsize>,
 }
 
+impl PyStructuredSingleDb {
+    fn from_db(db: StructuredSingleDb) -> Self {
+        Self {
+            db: Arc::new(db),
+            active_builders: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 #[pymethods]
 impl PyStructuredSingleDb {
     #[staticmethod]
@@ -206,10 +221,7 @@ impl PyStructuredSingleDb {
         py.detach(move || {
             opendal::install_default();
             StructuredSingleDb::open(Config::from_json_str(&config_json).map_err(map_error)?)
-                .map(|db| Self {
-                    db: Arc::new(db),
-                    active_builders: Arc::new(AtomicUsize::new(0)),
-                })
+                .map(Self::from_db)
                 .map_err(map_error)
         })
     }
@@ -219,10 +231,7 @@ impl PyStructuredSingleDb {
         py.detach(move || {
             opendal::install_default();
             StructuredSingleDb::open(Config::from_path(config_path).map_err(map_error)?)
-                .map(|db| Self {
-                    db: Arc::new(db),
-                    active_builders: Arc::new(AtomicUsize::new(0)),
-                })
+                .map(Self::from_db)
                 .map_err(map_error)
         })
     }
@@ -276,7 +285,6 @@ impl PyStructuredSingleDb {
         )
         .map_err(map_error)
     }
-
     #[pyo3(signature = (bucket, key, column, value, options=None))]
     fn merge_bytes(
         &self,
@@ -443,19 +451,59 @@ impl PyStructuredSingleDb {
         let db = Arc::clone(&self.db);
         py.detach(move || db.snapshot().map_err(map_error))
     }
+    fn start_snapshot(&self) -> PyResult<PyPendingSnapshot> {
+        PyPendingSnapshot::start_structured(&self.db)
+    }
     fn take_snapshot(&self, py: Python<'_>) -> PyResult<PyGlobalSnapshot> {
-        let (tx, rx) = mpsc::channel();
-        self.db
-            .snapshot_with_callback(move |result| {
-                let _ = tx.send(result);
-            })
-            .map_err(map_error)?;
+        PyPendingSnapshot::start_structured(&self.db)?.wait_result(py)
+    }
+    fn get_snapshot(&self, py: Python<'_>, snapshot_id: u64) -> PyResult<PyGlobalSnapshot> {
+        let db = Arc::clone(&self.db);
         py.detach(move || {
-            rx.recv()
-                .map_err(|_| invalid_state("snapshot completion channel closed"))?
+            db.db()
+                .get_snapshot(snapshot_id)
                 .map(snapshot)
                 .map_err(map_error)
         })
+    }
+    fn list_snapshots(&self, py: Python<'_>) -> PyResult<Vec<PyGlobalSnapshot>> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || {
+            db.list_snapshots()
+                .map(|values| values.into_iter().map(snapshot).collect())
+                .map_err(map_error)
+        })
+    }
+    fn retain_snapshot(&self, py: Python<'_>, snapshot_id: u64) -> PyResult<bool> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.retain_snapshot(snapshot_id).map_err(map_error))
+    }
+    fn expire_snapshot(&self, py: Python<'_>, snapshot_id: u64) -> PyResult<bool> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.expire_snapshot(snapshot_id).map_err(map_error))
+    }
+    fn set_time(&self, unix_seconds: u32) {
+        self.db.set_time(unix_seconds);
+    }
+    fn now_seconds(&self) -> u32 {
+        self.db.db().now_seconds()
+    }
+    #[pyo3(signature = (memtable_type, *, flush_current=false))]
+    fn switch_memtable_type(
+        &self,
+        py: Python<'_>,
+        memtable_type: PyMemtableType,
+        flush_current: bool,
+    ) -> PyResult<()> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || {
+            db.switch_memtable_type(memtable_type.into(), flush_current)
+                .map_err(map_error)
+        })
+    }
+    fn load_readonly_files_to_primary(&self, py: Python<'_>) -> PyResult<usize> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.load_readonly_files_to_primary().map_err(map_error))
     }
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         if Arc::strong_count(&self.db) != 1 || self.active_builders.load(Ordering::Acquire) != 0 {
@@ -474,10 +522,43 @@ pub(crate) struct PyStructuredDb {
     pub(crate) active_builders: Arc<AtomicUsize>,
 }
 
+impl PyStructuredDb {
+    fn from_db(db: StructuredDb) -> Self {
+        Self {
+            db: Arc::new(db),
+            active_builders: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn parse_json(config_json: &str) -> PyResult<Config> {
+        Config::from_json_str(config_json).map_err(map_error)
+    }
+
+    fn parse_file(config_path: PathBuf) -> PyResult<Config> {
+        Config::from_path(config_path).map_err(map_error)
+    }
+
+    fn unchecked_ranges(
+        ranges: Vec<PyBucketRange>,
+        operation: &str,
+    ) -> PyResult<Vec<RangeInclusive<u16>>> {
+        if ranges.is_empty() {
+            return Err(input_error(format!("{operation} ranges must not be empty")));
+        }
+        Ok(ranges
+            .into_iter()
+            .map(|range| range.start_inclusive..=range.end_inclusive)
+            .collect())
+    }
+}
+
 fn full_ranges(
     config: &Config,
     ranges: Option<Vec<PyBucketRange>>,
 ) -> PyResult<Vec<RangeInclusive<u16>>> {
+    if config.total_buckets == 0 || config.total_buckets > u32::from(u16::MAX) + 1 {
+        return Err(input_error("total_buckets must be in range 1..=65536"));
+    }
     let values = if let Some(values) = ranges {
         values
     } else {
@@ -495,10 +576,18 @@ fn full_ranges(
     if values.is_empty() {
         return Err(input_error("ranges must not be empty"));
     }
-    Ok(values
+    values
         .into_iter()
-        .map(|value| value.start_inclusive..=value.end_inclusive)
-        .collect())
+        .map(|value| {
+            if u32::from(value.end_inclusive) >= config.total_buckets {
+                return Err(input_error(format!(
+                    "range {}..={} exceeds total_buckets {}",
+                    value.start_inclusive, value.end_inclusive, config.total_buckets
+                )));
+            }
+            Ok(value.start_inclusive..=value.end_inclusive)
+        })
+        .collect()
 }
 
 #[pymethods]
@@ -515,11 +604,211 @@ impl PyStructuredDb {
             let config = Config::from_json_str(&config_json).map_err(map_error)?;
             let ranges = full_ranges(&config, ranges)?;
             StructuredDb::open(config, ranges)
-                .map(|db| Self {
-                    db: Arc::new(db),
-                    active_builders: Arc::new(AtomicUsize::new(0)),
-                })
+                .map(Self::from_db)
                 .map_err(map_error)
+        })
+    }
+    #[staticmethod]
+    #[pyo3(signature = (config_path, ranges=None))]
+    fn open_file(
+        py: Python<'_>,
+        config_path: PathBuf,
+        ranges: Option<Vec<PyBucketRange>>,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            opendal::install_default();
+            let config = Self::parse_file(config_path)?;
+            let ranges = full_ranges(&config, ranges)?;
+            StructuredDb::open(config, ranges)
+                .map(Self::from_db)
+                .map_err(map_error)
+        })
+    }
+    #[staticmethod]
+    #[pyo3(signature = (config_json, snapshot_id, db_id, recovery_mode=PyRecoveryMode::SnapshotOnly))]
+    fn open_from_snapshot(
+        py: Python<'_>,
+        config_json: String,
+        snapshot_id: u64,
+        db_id: String,
+        recovery_mode: PyRecoveryMode,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            opendal::install_default();
+            StructuredDb::open_from_snapshot_with_recovery_mode(
+                Self::parse_json(&config_json)?,
+                snapshot_id,
+                db_id,
+                recovery_mode.into(),
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
+        })
+    }
+    #[staticmethod]
+    #[pyo3(signature = (config_path, snapshot_id, db_id, recovery_mode=PyRecoveryMode::SnapshotOnly))]
+    fn open_from_snapshot_file(
+        py: Python<'_>,
+        config_path: PathBuf,
+        snapshot_id: u64,
+        db_id: String,
+        recovery_mode: PyRecoveryMode,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            opendal::install_default();
+            StructuredDb::open_from_snapshot_with_recovery_mode(
+                Self::parse_file(config_path)?,
+                snapshot_id,
+                db_id,
+                recovery_mode.into(),
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
+        })
+    }
+    #[staticmethod]
+    fn restore_new(
+        py: Python<'_>,
+        config_json: String,
+        snapshot_id: u64,
+        source_db_id: String,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            opendal::install_default();
+            StructuredDb::open_new_with_snapshot(
+                Self::parse_json(&config_json)?,
+                snapshot_id,
+                source_db_id,
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
+        })
+    }
+    #[staticmethod]
+    fn restore_new_file(
+        py: Python<'_>,
+        config_path: PathBuf,
+        snapshot_id: u64,
+        source_db_id: String,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            opendal::install_default();
+            StructuredDb::open_new_with_snapshot(
+                Self::parse_file(config_path)?,
+                snapshot_id,
+                source_db_id,
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
+        })
+    }
+    #[staticmethod]
+    fn restore_new_from_manifest(
+        py: Python<'_>,
+        config_json: String,
+        manifest_path: String,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            opendal::install_default();
+            StructuredDb::open_new_with_manifest_path(
+                Self::parse_json(&config_json)?,
+                manifest_path,
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
+        })
+    }
+    #[staticmethod]
+    fn restore_new_from_manifest_file(
+        py: Python<'_>,
+        config_path: PathBuf,
+        manifest_path: String,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            opendal::install_default();
+            StructuredDb::open_new_with_manifest_path(Self::parse_file(config_path)?, manifest_path)
+                .map(Self::from_db)
+                .map_err(map_error)
+        })
+    }
+    #[staticmethod]
+    #[pyo3(signature = (config_json, db_id, recovery_mode=PyRecoveryMode::LatestWithWal))]
+    fn resume(
+        py: Python<'_>,
+        config_json: String,
+        db_id: String,
+        recovery_mode: PyRecoveryMode,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            opendal::install_default();
+            StructuredDb::resume_with_recovery_mode(
+                Self::parse_json(&config_json)?,
+                db_id,
+                recovery_mode.into(),
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
+        })
+    }
+    #[staticmethod]
+    #[pyo3(signature = (config_path, db_id, recovery_mode=PyRecoveryMode::LatestWithWal))]
+    fn resume_file(
+        py: Python<'_>,
+        config_path: PathBuf,
+        db_id: String,
+        recovery_mode: PyRecoveryMode,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            opendal::install_default();
+            StructuredDb::resume_with_recovery_mode(
+                Self::parse_file(config_path)?,
+                db_id,
+                recovery_mode.into(),
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
+        })
+    }
+    #[staticmethod]
+    #[pyo3(signature = (config_json, snapshot_id, db_id, recovery_mode=PyRecoveryMode::SnapshotOnly))]
+    fn resume_from_snapshot(
+        py: Python<'_>,
+        config_json: String,
+        snapshot_id: u64,
+        db_id: String,
+        recovery_mode: PyRecoveryMode,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            opendal::install_default();
+            StructuredDb::resume_from_snapshot_with_recovery_mode(
+                Self::parse_json(&config_json)?,
+                snapshot_id,
+                db_id,
+                recovery_mode.into(),
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
+        })
+    }
+    #[staticmethod]
+    #[pyo3(signature = (config_path, snapshot_id, db_id, recovery_mode=PyRecoveryMode::SnapshotOnly))]
+    fn resume_from_snapshot_file(
+        py: Python<'_>,
+        config_path: PathBuf,
+        snapshot_id: u64,
+        db_id: String,
+        recovery_mode: PyRecoveryMode,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            opendal::install_default();
+            StructuredDb::resume_from_snapshot_with_recovery_mode(
+                Self::parse_file(config_path)?,
+                snapshot_id,
+                db_id,
+                recovery_mode.into(),
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
         })
     }
     #[getter]
@@ -573,6 +862,71 @@ impl PyStructuredDb {
             &write_options(options),
         )
         .map_err(map_error)
+    }
+    #[pyo3(signature = (bucket,key,column,value,options=None))]
+    fn merge_bytes(
+        &self,
+        py: Python<'_>,
+        bucket: u16,
+        key: &Bound<'_, PyAny>,
+        column: u16,
+        value: &Bound<'_, PyAny>,
+        options: Option<PyRef<'_, crate::options::PyWriteOptions>>,
+    ) -> PyResult<()> {
+        let key = InputBytes::extract(key)?;
+        let value = InputBytes::extract(value)?;
+        let db = Arc::clone(&self.db);
+        let options = write_options(options);
+        py.detach(move || {
+            ds_ffi::db_merge_borrowed_bytes_with_options(
+                &db,
+                bucket,
+                key.as_ref(),
+                column,
+                value.as_ref(),
+                &options,
+            )
+            .map_err(map_error)
+        })
+    }
+    #[pyo3(signature = (bucket,key,column,elements,options=None))]
+    fn merge_list(
+        &self,
+        bucket: u16,
+        key: &Bound<'_, PyAny>,
+        column: u16,
+        elements: &Bound<'_, PyAny>,
+        options: Option<PyRef<'_, crate::options::PyWriteOptions>>,
+    ) -> PyResult<()> {
+        let key = InputBytes::extract(key)?;
+        let elements = extract_elements(elements)?;
+        let refs = elements.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+        ds_ffi::db_merge_borrowed_list_with_options(
+            &self.db,
+            bucket,
+            key.as_ref(),
+            column,
+            &refs,
+            &write_options(options),
+        )
+        .map_err(map_error)
+    }
+    #[pyo3(signature = (bucket,key,column,options=None))]
+    fn delete(
+        &self,
+        py: Python<'_>,
+        bucket: u16,
+        key: &Bound<'_, PyAny>,
+        column: u16,
+        options: Option<PyRef<'_, crate::options::PyWriteOptions>>,
+    ) -> PyResult<()> {
+        let key = InputBytes::extract(key)?;
+        let db = Arc::clone(&self.db);
+        let options = write_options(options);
+        py.detach(move || {
+            db.delete_with_options(bucket, key.as_ref(), column, &options)
+                .map_err(map_error)
+        })
     }
     #[pyo3(signature = (bucket,key,options=None))]
     fn get(
@@ -666,19 +1020,113 @@ impl PyStructuredDb {
     ) -> PyResult<super::priority_queue::PyPriorityQueue> {
         super::priority_queue::new_db(self, name, true)
     }
+    fn snapshot(&self, py: Python<'_>) -> PyResult<u64> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.snapshot().map_err(map_error))
+    }
+    fn start_snapshot(&self) -> PyResult<PyPendingShardSnapshot> {
+        PyPendingShardSnapshot::start_structured(&self.db)
+    }
     fn take_snapshot(&self, py: Python<'_>) -> PyResult<PyShardSnapshot> {
-        let (tx, rx) = mpsc::channel();
-        self.db
-            .snapshot_with_callback(move |result| {
-                let _ = tx.send(result);
-            })
-            .map_err(map_error)?;
+        PyPendingShardSnapshot::start_structured(&self.db)?.wait_result(py)
+    }
+    fn cancel_snapshot(&self, py: Python<'_>, snapshot_id: u64) -> PyResult<bool> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.cancel_snapshot(snapshot_id).map_err(map_error))
+    }
+    fn get_shard_snapshot(&self, py: Python<'_>, snapshot_id: u64) -> PyResult<PyShardSnapshot> {
+        let db = Arc::clone(&self.db);
         py.detach(move || {
-            rx.recv()
-                .map_err(|_| invalid_state("snapshot completion channel closed"))?
+            db.shard_snapshot_input(snapshot_id)
                 .map(shard_input)
                 .map_err(map_error)
         })
+    }
+    fn retain_snapshot(&self, snapshot_id: u64) -> bool {
+        self.db.retain_snapshot(snapshot_id)
+    }
+    fn expire_snapshot(&self, py: Python<'_>, snapshot_id: u64) -> PyResult<bool> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.expire_snapshot(snapshot_id).map_err(map_error))
+    }
+    fn switch_to_snapshot(&mut self, py: Python<'_>, snapshot_id: u64) -> PyResult<()> {
+        if self.active_builders.load(Ordering::Acquire) != 0 {
+            return Err(invalid_state(
+                "switch_to_snapshot requires all structured schema builders to be released",
+            ));
+        }
+        let db = Arc::get_mut(&mut self.db).ok_or_else(|| {
+            invalid_state(
+                "switch_to_snapshot requires all structured cursors and priority queues to be released",
+            )
+        })?;
+        py.detach(move || db.switch_to_snapshot(snapshot_id).map_err(map_error))
+    }
+    #[pyo3(signature = (source_db_id, *, source_snapshot=None, ranges=None, storage_mode=PyExpandStorageMode::AdoptAsync))]
+    fn expand_bucket(
+        &self,
+        py: Python<'_>,
+        source_db_id: String,
+        source_snapshot: Option<u64>,
+        ranges: Option<Vec<PyBucketRange>>,
+        storage_mode: PyExpandStorageMode,
+    ) -> PyResult<u64> {
+        let ranges = ranges
+            .map(|ranges| Self::unchecked_ranges(ranges, "expand"))
+            .transpose()?;
+        let db = Arc::clone(&self.db);
+        py.detach(move || {
+            db.expand_bucket_with_storage_mode(
+                source_db_id,
+                source_snapshot,
+                ranges,
+                storage_mode.into(),
+            )
+            .map_err(map_error)
+        })
+    }
+    fn wait_for_expand_adoption(&self, py: Python<'_>, timeout_seconds: f64) -> PyResult<()> {
+        if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
+            return Err(input_error(
+                "expand adoption timeout must be finite and non-negative",
+            ));
+        }
+        let timeout = Duration::try_from_secs_f64(timeout_seconds)
+            .map_err(|_| input_error("expand adoption timeout is too large"))?;
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.wait_for_expand_adoption(timeout).map_err(map_error))
+    }
+    fn shrink_bucket(&self, py: Python<'_>, ranges: Vec<PyBucketRange>) -> PyResult<u64> {
+        let ranges = Self::unchecked_ranges(ranges, "shrink")?;
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.shrink_bucket(ranges).map_err(map_error))
+    }
+    fn metrics(&self, py: Python<'_>) -> Vec<PyMetricSample> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || metrics(db.metrics()))
+    }
+    fn set_time(&self, unix_seconds: u32) {
+        self.db.set_time(unix_seconds);
+    }
+    fn now_seconds(&self) -> u32 {
+        self.db.now_seconds()
+    }
+    #[pyo3(signature = (memtable_type, *, flush_current=false))]
+    fn switch_memtable_type(
+        &self,
+        py: Python<'_>,
+        memtable_type: PyMemtableType,
+        flush_current: bool,
+    ) -> PyResult<()> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || {
+            db.switch_memtable_type(memtable_type.into(), flush_current)
+                .map_err(map_error)
+        })
+    }
+    fn load_readonly_files_to_primary(&self, py: Python<'_>) -> PyResult<usize> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.load_readonly_files_to_primary().map_err(map_error))
     }
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         if Arc::strong_count(&self.db) != 1 || self.active_builders.load(Ordering::Acquire) != 0 {

@@ -1,5 +1,6 @@
 use crate::error::input_error;
 use crate::error::{invalid_state, map_error};
+use cobble_binding::structured::{StructuredDb, StructuredSingleDb};
 use cobble_binding::{Db, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef, SingleDb};
 use pyo3::prelude::*;
 use std::collections::BTreeMap;
@@ -326,6 +327,19 @@ impl PyPendingShardSnapshot {
         })
     }
 
+    pub(crate) fn start_structured(db: &Arc<StructuredDb>) -> PyResult<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let id = db
+            .snapshot_with_callback(move |result| {
+                let _ = sender.send(result);
+            })
+            .map_err(map_error)?;
+        Ok(Self {
+            id,
+            receiver: Mutex::new(Some(receiver)),
+        })
+    }
+
     pub(crate) fn wait_result(&self, py: Python<'_>) -> PyResult<PyShardSnapshot> {
         let receiver = self
             .receiver
@@ -357,6 +371,19 @@ impl PyPendingShardSnapshot {
 
 impl PyPendingSnapshot {
     pub(crate) fn start(db: &Arc<SingleDb>) -> PyResult<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let id = db
+            .snapshot_with_callback(move |result| {
+                let _ = sender.send(result);
+            })
+            .map_err(map_error)?;
+        Ok(Self {
+            id,
+            receiver: Mutex::new(Some(receiver)),
+        })
+    }
+
+    pub(crate) fn start_structured(db: &Arc<StructuredSingleDb>) -> PyResult<Self> {
         let (sender, receiver) = mpsc::channel();
         let id = db
             .snapshot_with_callback(move |result| {

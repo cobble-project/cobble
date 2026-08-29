@@ -20,6 +20,7 @@ def config(root: Path) -> str:
             "num_columns": 1,
             "total_buckets": 4,
             "block_cache_size": 0,
+            "time_provider": "manual",
             "wal_enabled": False,
         }
     )
@@ -158,4 +159,78 @@ def test_structured_batch_and_multi_get(tmp_path: Path, sharded: bool) -> None:
     assert not db.get(1, b"atomic")
     invalid.clear()
     assert not invalid
+    db.close()
+
+
+def test_structured_snapshot_recovery_and_lifecycle(tmp_path: Path) -> None:
+    config_json = config(tmp_path / "structured-recovery")
+    config_path = tmp_path / "structured-config.json"
+    config_path.write_text(config_json)
+
+    db = pycobble.StructuredDb.open_file(config_path)
+    db_id = db.id
+    db.put_bytes(0, b"versioned", 0, b"v1")
+    first = db.start_snapshot()
+    assert first.id >= 0
+    first_snapshot = first.wait()
+    with pytest.raises(pycobble.InternalStateError):
+        first.wait()
+    assert db.get_shard_snapshot(first_snapshot.snapshot_id).db_id == db_id
+
+    db.put_bytes(0, b"versioned", 0, b"v2")
+    second_snapshot = db.take_snapshot()
+    assert second_snapshot.snapshot_id > first_snapshot.snapshot_id
+    assert db.retain_snapshot(first_snapshot.snapshot_id)
+    assert db.retain_snapshot(first_snapshot.snapshot_id)
+    next_time = db.now_seconds() + 1234
+    db.set_time(next_time)
+    assert db.now_seconds() == next_time
+    db.switch_memtable_type(pycobble.MemtableType.Skiplist)
+    assert isinstance(db.load_readonly_files_to_primary(), int)
+    assert isinstance(db.metrics(), list)
+    db.close()
+
+    exact = pycobble.StructuredDb.resume_from_snapshot_file(
+        config_path,
+        first_snapshot.snapshot_id,
+        db_id,
+        pycobble.RecoveryMode.SnapshotOnly,
+    )
+    assert bytes(exact.get(0, b"versioned").bytes(0)) == b"v1"
+    exact.close()
+
+    latest = pycobble.StructuredDb.resume(
+        config_json, db_id, pycobble.RecoveryMode.SnapshotOnly
+    )
+    assert bytes(latest.get(0, b"versioned").bytes(0)) == b"v2"
+    cursor = latest.scan(0)
+    with pytest.raises(pycobble.InternalStateError):
+        latest.switch_to_snapshot(first_snapshot.snapshot_id)
+    cursor.close()
+    latest.switch_to_snapshot(first_snapshot.snapshot_id)
+    assert bytes(latest.get(0, b"versioned").bytes(0)) == b"v1"
+    latest.close()
+
+    restored = pycobble.StructuredDb.restore_new(
+        config_json, first_snapshot.snapshot_id, db_id
+    )
+    assert restored.id != db_id
+    assert bytes(restored.get(0, b"versioned").bytes(0)) == b"v1"
+    restored.close()
+
+
+def test_structured_single_snapshot_management(tmp_path: Path) -> None:
+    db = pycobble.StructuredSingleDb.open(config(tmp_path / "single-snapshots"))
+    db.put_bytes(0, b"key", 0, b"value")
+    pending = db.start_snapshot()
+    manifest = pending.wait()
+    assert db.get_snapshot(manifest.id).id == manifest.id
+    assert [item.id for item in db.list_snapshots()] == [manifest.id]
+    assert db.retain_snapshot(manifest.id)
+    assert db.retain_snapshot(manifest.id)
+    next_time = db.now_seconds() + 4321
+    db.set_time(next_time)
+    assert db.now_seconds() == next_time
+    db.switch_memtable_type(pycobble.MemtableType.Hash)
+    assert isinstance(db.load_readonly_files_to_primary(), int)
     db.close()
