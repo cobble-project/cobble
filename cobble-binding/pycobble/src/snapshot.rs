@@ -1,6 +1,9 @@
+use crate::error::input_error;
 use crate::error::{invalid_state, map_error};
 use cobble_binding::{Db, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef, SingleDb};
 use pyo3::prelude::*;
+use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, mpsc};
 
 #[pyclass(
@@ -45,6 +48,17 @@ pub(crate) struct PyColumnFamilyId {
     pub(crate) id: u8,
 }
 
+#[pymethods]
+impl PyColumnFamilyId {
+    #[new]
+    fn new(name: String, id: u8) -> PyResult<Self> {
+        if name.is_empty() {
+            return Err(input_error("column family name must not be empty"));
+        }
+        Ok(Self { name, id })
+    }
+}
+
 #[pyclass(
     name = "ShardSnapshot",
     module = "pycobble._native",
@@ -71,6 +85,33 @@ pub(crate) struct PyShardSnapshot {
 
 #[pymethods]
 impl PyShardSnapshot {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (ranges, column_families, db_id, snapshot_id, manifest_path, timestamp_seconds, data_size_bytes, incremental_data_size_bytes))]
+    fn new(
+        ranges: Vec<PyBucketRange>,
+        column_families: Vec<PyColumnFamilyId>,
+        db_id: String,
+        snapshot_id: u64,
+        manifest_path: String,
+        timestamp_seconds: u32,
+        data_size_bytes: u64,
+        incremental_data_size_bytes: u64,
+    ) -> PyResult<Self> {
+        let value = Self {
+            ranges,
+            column_families,
+            db_id,
+            snapshot_id,
+            manifest_path,
+            timestamp_seconds,
+            data_size_bytes,
+            incremental_data_size_bytes,
+        };
+        shard_snapshot_input(value.clone())?;
+        Ok(value)
+    }
+
     #[getter]
     fn ranges(&self) -> Vec<PyBucketRange> {
         self.ranges.clone()
@@ -119,7 +160,7 @@ fn family((name, id): (String, u8)) -> PyColumnFamilyId {
     PyColumnFamilyId { name, id }
 }
 
-fn shard(value: ShardSnapshotRef) -> PyShardSnapshot {
+pub(crate) fn shard(value: ShardSnapshotRef) -> PyShardSnapshot {
     PyShardSnapshot {
         ranges: value
             .ranges
@@ -168,6 +209,91 @@ pub(crate) fn snapshot(value: GlobalSnapshotManifest) -> PyGlobalSnapshot {
         shards: value.shard_snapshots.into_iter().map(shard).collect(),
         watermark_seconds: value.watermark_seconds,
     }
+}
+
+fn native_ranges(values: Vec<PyBucketRange>) -> PyResult<Vec<RangeInclusive<u16>>> {
+    if values.is_empty() {
+        return Err(input_error("shard snapshot ranges must not be empty"));
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            if value.start_inclusive > value.end_inclusive {
+                return Err(input_error("shard snapshot range is reversed"));
+            }
+            Ok(value.start_inclusive..=value.end_inclusive)
+        })
+        .collect()
+}
+
+fn native_families(values: Vec<PyColumnFamilyId>) -> PyResult<BTreeMap<String, u8>> {
+    let mut by_name = BTreeMap::new();
+    let mut by_id = BTreeMap::new();
+    for value in values {
+        if value.name.is_empty() {
+            return Err(input_error("column family name must not be empty"));
+        }
+        if by_name.insert(value.name.clone(), value.id).is_some() {
+            return Err(input_error("duplicate column family name"));
+        }
+        if by_id.insert(value.id, value.name).is_some() {
+            return Err(input_error("duplicate column family id"));
+        }
+    }
+    Ok(by_name)
+}
+
+pub(crate) fn shard_snapshot_input(value: PyShardSnapshot) -> PyResult<ShardSnapshotInput> {
+    if value.db_id.is_empty() || value.manifest_path.is_empty() {
+        return Err(input_error(
+            "shard snapshot db_id and manifest_path must not be empty",
+        ));
+    }
+    Ok(ShardSnapshotInput {
+        ranges: native_ranges(value.ranges)?,
+        column_family_ids: native_families(value.column_families)?,
+        db_id: value.db_id,
+        snapshot_id: value.snapshot_id,
+        manifest_path: value.manifest_path,
+        timestamp_seconds: value.timestamp_seconds,
+        data_size_bytes: value.data_size_bytes,
+        incremental_data_size_bytes: value.incremental_data_size_bytes,
+    })
+}
+
+pub(crate) fn shard_snapshot_reference(value: PyShardSnapshot) -> PyResult<ShardSnapshotRef> {
+    let value = shard_snapshot_input(value)?;
+    Ok(ShardSnapshotRef {
+        ranges: value.ranges,
+        column_family_ids: value.column_family_ids,
+        db_id: value.db_id,
+        snapshot_id: value.snapshot_id,
+        manifest_path: value.manifest_path,
+        timestamp_seconds: value.timestamp_seconds,
+        data_size_bytes: value.data_size_bytes,
+        incremental_data_size_bytes: value.incremental_data_size_bytes,
+    })
+}
+
+pub(crate) fn global_snapshot(value: PyGlobalSnapshot) -> PyResult<GlobalSnapshotManifest> {
+    let mut column_family_ids = BTreeMap::new();
+    for family in value.column_families {
+        if column_family_ids.insert(family.name, family.id).is_some() {
+            return Err(input_error("duplicate global column family name"));
+        }
+    }
+    Ok(GlobalSnapshotManifest {
+        version: value.version,
+        id: value.id,
+        total_buckets: value.total_buckets,
+        column_family_ids,
+        shard_snapshots: value
+            .shards
+            .into_iter()
+            .map(shard_snapshot_reference)
+            .collect::<PyResult<_>>()?,
+        watermark_seconds: value.watermark_seconds,
+    })
 }
 
 type SnapshotResult = cobble_binding::Result<GlobalSnapshotManifest>;

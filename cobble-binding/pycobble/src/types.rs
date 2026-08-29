@@ -44,6 +44,19 @@ pub(crate) enum PyExpandStorageMode {
 }
 
 #[pyclass(
+    name = "ReaderMode",
+    module = "pycobble._native",
+    eq,
+    eq_int,
+    skip_from_py_object
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PyReaderMode {
+    Current = 0,
+    Snapshot = 1,
+}
+
+#[pyclass(
     name = "BufferStatus",
     module = "pycobble._native",
     eq,
@@ -121,6 +134,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRecoveryMode>()?;
     module.add_class::<PyMemtableType>()?;
     module.add_class::<PyExpandStorageMode>()?;
+    module.add_class::<PyReaderMode>()?;
     module.add_class::<PyBufferStatus>()?;
     module.add_class::<PyBufferResult>()
 }

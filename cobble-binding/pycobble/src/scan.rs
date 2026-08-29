@@ -3,7 +3,7 @@ use crate::encoding::{batch_encoded_len, encode_batch_into};
 use crate::error::{input_error, invalid_state, map_error};
 use crate::types::{PyBufferResult, PyBufferStatus};
 use bytes::Bytes;
-use cobble_binding::{Db, DbIterator, SingleDb};
+use cobble_binding::{Db, DbIterator, ReadOnlyDb, ScanSplitScanner, SingleDb};
 use pyo3::prelude::*;
 use std::sync::Arc;
 
@@ -93,24 +93,51 @@ impl PyOwnedBatch {
 
 struct ScanState {
     bucket: u16,
-    iterator: DbIterator,
+    iterator: ScanIterator,
     pending_row: Option<BatchRow>,
     pending_batch: Option<PyOwnedBatch>,
 }
 
+enum ScanIterator {
+    Db(Box<DbIterator>),
+    Split(Box<ScanSplitScanner>),
+}
+
 impl ScanState {
     fn next_row(&mut self) -> PyResult<Option<BatchRow>> {
-        self.iterator
-            .next()
-            .transpose()
-            .map_err(map_error)
-            .map(|row| {
-                row.map(|(key, columns)| BatchRow {
-                    bucket: self.bucket,
-                    key,
-                    columns,
+        match &mut self.iterator {
+            ScanIterator::Db(iterator) => {
+                iterator.next().transpose().map_err(map_error).map(|row| {
+                    row.map(|(key, columns)| BatchRow {
+                        bucket: self.bucket,
+                        key,
+                        columns,
+                    })
                 })
-            })
+            }
+            ScanIterator::Split(scanner) => {
+                scanner.next().transpose().map_err(map_error).map(|row| {
+                    row.map(|(bucket, key, columns)| BatchRow {
+                        bucket,
+                        key,
+                        columns,
+                    })
+                })
+            }
+        }
+    }
+
+    fn stopped_at_block_boundary(&self) -> bool {
+        match &self.iterator {
+            ScanIterator::Db(iterator) => iterator.stopped_at_block_boundary(),
+            ScanIterator::Split(_) => false,
+        }
+    }
+
+    fn clear_stop_at_block_boundary(&mut self) {
+        if let ScanIterator::Db(iterator) = &mut self.iterator {
+            iterator.clear_stop_at_block_boundary();
+        }
     }
 
     fn read_batch(&mut self, max_rows: usize) -> PyResult<PyOwnedBatch> {
@@ -120,7 +147,7 @@ impl ScanState {
         }
         while rows.len() < max_rows {
             let Some(row) = self.next_row()? else {
-                let stopped = self.iterator.stopped_at_block_boundary();
+                let stopped = self.stopped_at_block_boundary();
                 return Ok(PyOwnedBatch {
                     rows,
                     end: !stopped,
@@ -130,7 +157,7 @@ impl ScanState {
             rows.push(row);
         }
         self.pending_row = self.next_row()?;
-        let stopped = self.iterator.stopped_at_block_boundary();
+        let stopped = self.stopped_at_block_boundary();
         Ok(PyOwnedBatch {
             rows,
             end: self.pending_row.is_none() && !stopped,
@@ -156,6 +183,7 @@ pub(crate) struct PyScanCursor {
 enum ScanOwner {
     Single { _db: Arc<SingleDb> },
     Sharded { _db: Arc<Db> },
+    ReadOnly { _db: Arc<ReadOnlyDb> },
 }
 
 impl PyScanCursor {
@@ -163,7 +191,7 @@ impl PyScanCursor {
         Self {
             state: Some(ScanState {
                 bucket,
-                iterator,
+                iterator: ScanIterator::Db(Box::new(iterator)),
                 pending_row: None,
                 pending_batch: None,
             }),
@@ -175,11 +203,47 @@ impl PyScanCursor {
         Self {
             state: Some(ScanState {
                 bucket,
-                iterator,
+                iterator: ScanIterator::Db(Box::new(iterator)),
                 pending_row: None,
                 pending_batch: None,
             }),
             owner: Some(ScanOwner::Sharded { _db: owner }),
+        }
+    }
+
+    pub(crate) fn new_reader(bucket: u16, iterator: DbIterator) -> Self {
+        Self {
+            state: Some(ScanState {
+                bucket,
+                iterator: ScanIterator::Db(Box::new(iterator)),
+                pending_row: None,
+                pending_batch: None,
+            }),
+            owner: None,
+        }
+    }
+
+    pub(crate) fn new_read_only(bucket: u16, iterator: DbIterator, owner: Arc<ReadOnlyDb>) -> Self {
+        Self {
+            state: Some(ScanState {
+                bucket,
+                iterator: ScanIterator::Db(Box::new(iterator)),
+                pending_row: None,
+                pending_batch: None,
+            }),
+            owner: Some(ScanOwner::ReadOnly { _db: owner }),
+        }
+    }
+
+    pub(crate) fn new_split(scanner: ScanSplitScanner) -> Self {
+        Self {
+            state: Some(ScanState {
+                bucket: 0,
+                iterator: ScanIterator::Split(Box::new(scanner)),
+                pending_row: None,
+                pending_batch: None,
+            }),
+            owner: None,
         }
     }
 
@@ -254,7 +318,7 @@ impl PyScanCursor {
         {
             self.state_mut()?.pending_batch = None;
         }
-        self.state_mut()?.iterator.clear_stop_at_block_boundary();
+        self.state_mut()?.clear_stop_at_block_boundary();
         Ok(())
     }
 
