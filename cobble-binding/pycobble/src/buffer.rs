@@ -1,10 +1,82 @@
 use bytes::Bytes;
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyBufferError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyMemoryView};
 use std::ffi::{c_int, c_void};
 use std::ptr;
+use std::slice;
+
+pub(crate) enum InputBytes {
+    ReadOnly(PyBuffer<u8>),
+    Owned(Vec<u8>),
+}
+
+pub(crate) struct WritableBuffer {
+    buffer: PyBuffer<u8>,
+}
+
+impl WritableBuffer {
+    pub(crate) fn extract(value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let buffer = PyBuffer::<u8>::get(value)?;
+        if buffer.readonly() {
+            return Err(PyBufferError::new_err("output buffer is read-only"));
+        }
+        if !buffer.is_c_contiguous() {
+            return Err(crate::error::input_error(
+                "output buffer must be C-contiguous",
+            ));
+        }
+        Ok(Self { buffer })
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        if self.buffer.len_bytes() == 0 {
+            return &mut [];
+        }
+        // SAFETY: extraction accepts only writable, C-contiguous u8 buffers.
+        // Into-buffer calls stay attached to the GIL for the whole write.
+        unsafe {
+            slice::from_raw_parts_mut(self.buffer.buf_ptr().cast::<u8>(), self.buffer.len_bytes())
+        }
+    }
+}
+
+impl InputBytes {
+    pub(crate) fn extract(value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let buffer = PyBuffer::<u8>::get(value)?;
+        if !buffer.is_c_contiguous() {
+            return Err(crate::error::input_error(
+                "byte buffer must be C-contiguous",
+            ));
+        }
+        // Only Python `bytes` has an immutable backing allocation. A read-only
+        // memoryview can still reference a mutable bytearray which another
+        // Python thread may modify while a native operation has detached.
+        if value.cast::<PyBytes>().is_ok() {
+            Ok(Self::ReadOnly(buffer))
+        } else {
+            Ok(Self::Owned(buffer.to_vec(value.py())?))
+        }
+    }
+}
+
+impl AsRef<[u8]> for InputBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::ReadOnly(buffer) => {
+                if buffer.len_bytes() == 0 {
+                    return &[];
+                }
+                // SAFETY: extraction accepts only C-contiguous u8 buffers. A
+                // read-only PyBuffer pins its exporter until this owner drops.
+                unsafe { slice::from_raw_parts(buffer.buf_ptr().cast::<u8>(), buffer.len_bytes()) }
+            }
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
 
 #[pyclass(module = "pycobble._native", frozen)]
 pub(crate) struct OwnedBytes {
@@ -112,5 +184,21 @@ mod tests {
         let owner = OwnedBytes::new(bytes);
         assert_eq!(owner.as_slice(), b"cobble");
         assert_eq!(owner.as_slice().as_ptr(), pointer);
+    }
+
+    #[test]
+    fn immutable_python_input_is_borrowed_and_mutable_input_is_copied() {
+        Python::initialize();
+        Python::attach(|py| {
+            let immutable = PyBytes::new(py, b"immutable").into_any();
+            let input = InputBytes::extract(&immutable).expect("bytes input");
+            assert!(matches!(input, InputBytes::ReadOnly(_)));
+            assert_eq!(input.as_ref(), b"immutable");
+
+            let mutable = pyo3::types::PyByteArray::new(py, b"mutable").into_any();
+            let input = InputBytes::extract(&mutable).expect("bytearray input");
+            assert!(matches!(input, InputBytes::Owned(_)));
+            assert_eq!(input.as_ref(), b"mutable");
+        });
     }
 }

@@ -1,10 +1,13 @@
 mod buffer;
 mod database;
+mod encoding;
 mod error;
+mod multi_get;
 mod options;
 mod row;
 mod scan;
 mod types;
+mod write_batch;
 
 use pyo3::prelude::*;
 
@@ -14,9 +17,11 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register(module)?;
     types::register(module)?;
     buffer::register(module)?;
+    multi_get::register(module)?;
     row::register(module)?;
     options::register(module)?;
     scan::register(module)?;
+    write_batch::register(module)?;
     database::register(module)?;
     Ok(())
 }

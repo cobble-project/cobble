@@ -2,6 +2,8 @@
 
 from ._native import (
     CancelledError,
+    BufferResult,
+    BufferStatus,
     ChecksumError,
     CobbleError,
     ConfigurationError,
@@ -16,6 +18,7 @@ from ._native import (
     OwnedBytes,
     OwnedBatch,
     OwnedRow,
+    OwnedMultiGetResult,
     ReadOptions,
     RecoveryMode,
     ScanOptions,
@@ -24,11 +27,14 @@ from ._native import (
     SingleDb,
     UrlError,
     WriteOptions,
+    WriteBatch,
     __version__,
 )
 
 __all__ = [
     "CancelledError",
+    "BufferResult",
+    "BufferStatus",
     "ChecksumError",
     "CobbleError",
     "ConfigurationError",
@@ -43,6 +49,7 @@ __all__ = [
     "OwnedBytes",
     "OwnedBatch",
     "OwnedRow",
+    "OwnedMultiGetResult",
     "ReadOptions",
     "RecoveryMode",
     "ScanOptions",
@@ -51,5 +58,6 @@ __all__ = [
     "SingleDb",
     "UrlError",
     "WriteOptions",
+    "WriteBatch",
     "__version__",
 ]

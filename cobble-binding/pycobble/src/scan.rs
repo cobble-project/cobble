@@ -1,14 +1,16 @@
-use crate::buffer::OwnedBytes;
+use crate::buffer::{OwnedBytes, WritableBuffer};
+use crate::encoding::{batch_encoded_len, encode_batch_into};
 use crate::error::{input_error, invalid_state, map_error};
+use crate::types::{PyBufferResult, PyBufferStatus};
 use bytes::Bytes;
 use cobble_binding::{DbIterator, SingleDb};
 use pyo3::prelude::*;
 use std::sync::Arc;
 
-struct BatchRow {
-    bucket: u16,
-    key: Bytes,
-    columns: Vec<Option<Bytes>>,
+pub(crate) struct BatchRow {
+    pub(crate) bucket: u16,
+    pub(crate) key: Bytes,
+    pub(crate) columns: Vec<Option<Bytes>>,
 }
 
 #[pyclass(name = "ScanRow", module = "pycobble._native", frozen)]
@@ -60,9 +62,9 @@ impl PyScanRow {
 
 #[pyclass(name = "OwnedBatch", module = "pycobble._native", frozen)]
 pub(crate) struct PyOwnedBatch {
-    rows: Vec<BatchRow>,
-    end: bool,
-    stopped_at_block_boundary: bool,
+    pub(crate) rows: Vec<BatchRow>,
+    pub(crate) end: bool,
+    pub(crate) stopped_at_block_boundary: bool,
 }
 
 #[pymethods]
@@ -93,6 +95,7 @@ struct ScanState {
     bucket: u16,
     iterator: DbIterator,
     pending_row: Option<BatchRow>,
+    pending_batch: Option<PyOwnedBatch>,
 }
 
 impl ScanState {
@@ -134,6 +137,13 @@ impl ScanState {
             stopped_at_block_boundary: stopped,
         })
     }
+
+    fn take_or_read_batch(&mut self, max_rows: usize) -> PyResult<PyOwnedBatch> {
+        if let Some(batch) = self.pending_batch.take() {
+            return Ok(batch);
+        }
+        self.read_batch(max_rows)
+    }
 }
 
 #[pyclass(name = "ScanCursor", module = "pycobble._native", unsendable)]
@@ -150,6 +160,7 @@ impl PyScanCursor {
                 bucket,
                 iterator,
                 pending_row: None,
+                pending_batch: None,
             }),
             owner: Some(owner),
         }
@@ -168,10 +179,64 @@ impl PyScanCursor {
         if max_rows == 0 {
             return Err(input_error("max_rows must be greater than zero"));
         }
-        self.state_mut()?.read_batch(max_rows)
+        self.state_mut()?.take_or_read_batch(max_rows)
+    }
+
+    fn next_batch_into(
+        &mut self,
+        max_rows: usize,
+        output: &Bound<'_, PyAny>,
+    ) -> PyResult<PyBufferResult> {
+        if max_rows == 0 {
+            return Err(input_error("max_rows must be greater than zero"));
+        }
+        let mut output = WritableBuffer::extract(output)?;
+        let state = self.state_mut()?;
+        if state.pending_batch.is_none() {
+            state.pending_batch = Some(state.read_batch(max_rows)?);
+        }
+        let batch = state
+            .pending_batch
+            .as_ref()
+            .ok_or_else(|| invalid_state("pending scan batch was not initialized"))?;
+        if batch.rows.is_empty() {
+            let status = if batch.stopped_at_block_boundary {
+                PyBufferStatus::BlockBoundary
+            } else {
+                PyBufferStatus::End
+            };
+            state.pending_batch = None;
+            return Ok(PyBufferResult::new(status, 0, 0, 0));
+        }
+        let required = batch_encoded_len(batch)?;
+        if output.as_mut_slice().len() < required {
+            return Ok(PyBufferResult::new(
+                PyBufferStatus::BufferTooSmall,
+                0,
+                required,
+                batch.rows.len(),
+            ));
+        }
+        encode_batch_into(batch, &mut output.as_mut_slice()[..required])?;
+        let row_count = batch.rows.len();
+        state.pending_batch = None;
+        Ok(PyBufferResult::new(
+            PyBufferStatus::Ok,
+            required,
+            required,
+            row_count,
+        ))
     }
 
     fn resume_after_block_boundary(&mut self) -> PyResult<()> {
+        if self
+            .state
+            .as_ref()
+            .and_then(|state| state.pending_batch.as_ref())
+            .is_some_and(|batch| batch.rows.is_empty() && batch.stopped_at_block_boundary)
+        {
+            self.state_mut()?.pending_batch = None;
+        }
         self.state_mut()?.iterator.clear_stop_at_block_boundary();
         Ok(())
     }

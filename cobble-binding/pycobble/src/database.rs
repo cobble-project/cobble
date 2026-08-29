@@ -1,11 +1,14 @@
+use crate::buffer::{InputBytes, WritableBuffer};
 use crate::error::{invalid_state, map_error};
+use crate::multi_get::{PyMultiGetResult, extract_keys};
 use crate::options::{PyReadOptions, PyWriteOptions};
 use crate::row::PyOwnedRow;
 use crate::scan::PyScanCursor;
 use crate::types::PyRecoveryMode;
+use crate::types::{PyBufferResult, PyBufferStatus};
+use crate::write_batch::PyWriteBatch;
 use cobble_binding::{Config, ReadOptions, SingleDb, WriteOptions};
 use pyo3::prelude::*;
-use pyo3::pybacked::PyBackedBytes;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -105,16 +108,18 @@ impl PySingleDb {
         &self,
         py: Python<'_>,
         bucket: u16,
-        key: PyBackedBytes,
+        key: &Bound<'_, PyAny>,
         column: u16,
-        value: PyBackedBytes,
+        value: &Bound<'_, PyAny>,
         options: Option<PyRef<'_, PyWriteOptions>>,
     ) -> PyResult<()> {
         self.ensure_open()?;
+        let key = InputBytes::extract(key)?;
+        let value = InputBytes::extract(value)?;
         let db = Arc::clone(&self.db);
         let options = Self::write_options(options);
         py.detach(move || {
-            db.put_with_options(bucket, &key, column, &value, &options)
+            db.put_with_options(bucket, key.as_ref(), column, value.as_ref(), &options)
                 .map_err(map_error)
         })
     }
@@ -124,16 +129,18 @@ impl PySingleDb {
         &self,
         py: Python<'_>,
         bucket: u16,
-        key: PyBackedBytes,
+        key: &Bound<'_, PyAny>,
         column: u16,
-        value: PyBackedBytes,
+        value: &Bound<'_, PyAny>,
         options: Option<PyRef<'_, PyWriteOptions>>,
     ) -> PyResult<()> {
         self.ensure_open()?;
+        let key = InputBytes::extract(key)?;
+        let value = InputBytes::extract(value)?;
         let db = Arc::clone(&self.db);
         let options = Self::write_options(options);
         py.detach(move || {
-            db.merge_with_options(bucket, &key, column, &value, &options)
+            db.merge_with_options(bucket, key.as_ref(), column, value.as_ref(), &options)
                 .map_err(map_error)
         })
     }
@@ -143,15 +150,16 @@ impl PySingleDb {
         &self,
         py: Python<'_>,
         bucket: u16,
-        key: PyBackedBytes,
+        key: &Bound<'_, PyAny>,
         column: u16,
         options: Option<PyRef<'_, PyWriteOptions>>,
     ) -> PyResult<()> {
         self.ensure_open()?;
+        let key = InputBytes::extract(key)?;
         let db = Arc::clone(&self.db);
         let options = Self::write_options(options);
         py.detach(move || {
-            db.delete_with_options(bucket, &key, column, &options)
+            db.delete_with_options(bucket, key.as_ref(), column, &options)
                 .map_err(map_error)
         })
     }
@@ -161,17 +169,95 @@ impl PySingleDb {
         &self,
         py: Python<'_>,
         bucket: u16,
-        key: PyBackedBytes,
+        key: &Bound<'_, PyAny>,
         options: Option<PyRef<'_, PyReadOptions>>,
     ) -> PyResult<PyOwnedRow> {
         self.ensure_open()?;
+        let key = InputBytes::extract(key)?;
         let db = Arc::clone(&self.db);
         let options = Self::read_options(options);
         py.detach(move || {
-            db.get_with_options(bucket, &key, &options)
+            db.get_with_options(bucket, key.as_ref(), &options)
                 .map(PyOwnedRow::new)
                 .map_err(map_error)
         })
+    }
+
+    #[pyo3(signature = (keys, options=None))]
+    fn multi_get(
+        &self,
+        py: Python<'_>,
+        keys: &Bound<'_, PyAny>,
+        options: Option<PyRef<'_, PyReadOptions>>,
+    ) -> PyResult<PyMultiGetResult> {
+        self.ensure_open()?;
+        let keys = extract_keys(keys)?;
+        let db = Arc::clone(&self.db);
+        let options = Self::read_options(options);
+        py.detach(move || {
+            db.multi_get_with_options(&keys, &options)
+                .map(PyMultiGetResult::new)
+                .map_err(map_error)
+        })
+    }
+
+    #[pyo3(signature = (bucket, key, output, options))]
+    fn get_column_into(
+        &self,
+        _py: Python<'_>,
+        bucket: u16,
+        key: &Bound<'_, PyAny>,
+        output: &Bound<'_, PyAny>,
+        options: PyRef<'_, PyReadOptions>,
+    ) -> PyResult<PyBufferResult> {
+        self.ensure_open()?;
+        let key = InputBytes::extract(key)?;
+        let mut output = WritableBuffer::extract(output)?;
+        if options.inner.column_indices.as_ref().map(Vec::len) != Some(1) {
+            return Err(crate::error::input_error(
+                "get_column_into requires ReadOptions with exactly one column",
+            ));
+        }
+        let Some(columns) = self
+            .db
+            .get_with_options(bucket, key.as_ref(), &options.inner)
+            .map_err(map_error)?
+        else {
+            return Ok(PyBufferResult::new(PyBufferStatus::NotFound, 0, 0, 0));
+        };
+        let Some(Some(column)) = columns.into_iter().next() else {
+            return Ok(PyBufferResult::new(PyBufferStatus::NotFound, 0, 0, 0));
+        };
+        let required = column.len();
+        if output.as_mut_slice().len() < required {
+            return Ok(PyBufferResult::new(
+                PyBufferStatus::BufferTooSmall,
+                0,
+                required,
+                1,
+            ));
+        }
+        output.as_mut_slice()[..required].copy_from_slice(&column);
+        Ok(PyBufferResult::new(
+            PyBufferStatus::Ok,
+            required,
+            required,
+            1,
+        ))
+    }
+
+    #[pyo3(signature = (batch, *, await_durable=true))]
+    fn write(&self, py: Python<'_>, batch: &PyWriteBatch, await_durable: bool) -> PyResult<()> {
+        self.ensure_open()?;
+        let native_batch = batch.begin_write()?;
+        let db = Arc::clone(&self.db);
+        let options = WriteOptions::default().with_await_durable(await_durable);
+        let result = py.detach(move || {
+            db.write_batch_with_options(native_batch, &options)
+                .map_err(map_error)
+        });
+        batch.finish_write(result.is_ok());
+        result
     }
 
     #[pyo3(signature = (bucket, start=None, end=None, options=None))]
@@ -179,18 +265,25 @@ impl PySingleDb {
         &self,
         _py: Python<'_>,
         bucket: u16,
-        start: Option<PyBackedBytes>,
-        end: Option<PyBackedBytes>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
         options: Option<PyRef<'_, crate::options::PyScanOptions>>,
     ) -> PyResult<PyScanCursor> {
         self.ensure_open()?;
+        let start = start.map(InputBytes::extract).transpose()?;
+        let end = end.map(InputBytes::extract).transpose()?;
         let db = Arc::clone(&self.db);
         let options = options.map_or_else(Default::default, |options| options.inner.clone());
         // DbIterator is thread-affine in the core today, so cursor creation and
         // advancement stay attached to the originating Python thread.
         let iterator = db
             .db()
-            .scan_with_options_bounds(bucket, start.as_deref(), end.as_deref(), &options)
+            .scan_with_options_bounds(
+                bucket,
+                start.as_ref().map(AsRef::as_ref),
+                end.as_ref().map(AsRef::as_ref),
+                &options,
+            )
             .map_err(map_error)?;
         Ok(PyScanCursor::new(bucket, iterator, db))
     }
