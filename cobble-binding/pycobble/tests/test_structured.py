@@ -104,3 +104,58 @@ def test_structured_sharded_db_typed_snapshot(tmp_path: Path) -> None:
     assert snapshot.ranges[0].start_inclusive == 1
     assert snapshot.ranges[0].end_inclusive == 2
     db.close()
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_structured_batch_and_multi_get(tmp_path: Path, sharded: bool) -> None:
+    root = tmp_path / ("sharded-batch" if sharded else "single-batch")
+    if sharded:
+        db = pycobble.StructuredDb.open(
+            config(root), [pycobble.BucketRange(0, 3)]
+        )
+    else:
+        db = pycobble.StructuredSingleDb.open(config(root))
+
+    builder = db.update_schema()
+    builder.add_list_column(1, pycobble.ListConfig())
+    builder.commit()
+
+    mutable_key = bytearray(b"alpha")
+    mutable_value = bytearray(b"value-a")
+    mutable_element = bytearray(b"list-a")
+    batch = pycobble.StructuredWriteBatch()
+    batch.put_bytes(0, mutable_key, 0, mutable_value)
+    batch.put_list(0, mutable_key, 1, [mutable_element, b"list-b"])
+    batch.put_bytes(3, b"omega", 0, b"value-z")
+    mutable_key[:] = b"xxxxx"
+    mutable_value[:] = b"changed"
+    mutable_element[:] = b"xxxxxx"
+
+    assert len(batch) == 3
+    db.write(batch)
+    assert not batch
+
+    result = db.multi_get(
+        [(0, b"alpha"), (0, b"missing"), (3, b"omega"), (0, b"alpha")]
+    )
+    assert len(result) == 4
+    assert bytes(result.row(0).bytes(0)) == b"value-a"
+    assert not result.row(1)
+    assert bytes(result.row(2).bytes(0)) == b"value-z"
+    assert bytes(result.row(3).list_element(1, 0)) == b"list-a"
+
+    batch.merge_bytes(0, b"alpha", 0, b"-tail")
+    db.write(batch)
+    assert not batch
+    assert bytes(db.get(0, b"alpha").bytes(0)) == b"value-a-tail"
+
+    invalid = pycobble.StructuredWriteBatch()
+    invalid.put_bytes(1, b"atomic", 0, b"must-not-land")
+    invalid.put_list(1, b"atomic", 0, [b"wrong-column-kind"])
+    with pytest.raises(pycobble.CobbleError):
+        db.write(invalid)
+    assert len(invalid) == 2
+    assert not db.get(1, b"atomic")
+    invalid.clear()
+    assert not invalid
+    db.close()

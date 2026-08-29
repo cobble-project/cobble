@@ -145,6 +145,25 @@ pub(crate) struct PyStructuredRow {
     pub(crate) columns: Option<Vec<Option<StructuredColumnValue>>>,
 }
 
+#[pyclass(name = "StructuredMultiGetResult", module = "pycobble._native", frozen)]
+pub(crate) struct PyStructuredMultiGetResult {
+    pub(crate) rows: Vec<Option<Vec<Option<StructuredColumnValue>>>>,
+}
+
+#[pymethods]
+impl PyStructuredMultiGetResult {
+    fn __len__(&self) -> usize {
+        self.rows.len()
+    }
+    fn row(&self, index: usize) -> PyResult<PyStructuredRow> {
+        self.rows
+            .get(index)
+            .cloned()
+            .map(PyStructuredRow::new)
+            .ok_or_else(|| input_error("multi_get row index is out of bounds"))
+    }
+}
+
 impl PyStructuredRow {
     pub(crate) fn new(columns: Option<Vec<Option<StructuredColumnValue>>>) -> Self {
         Self { columns }
@@ -501,6 +520,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyStructuredReadOptions>()?;
     module.add_class::<PyStructuredScanOptions>()?;
     module.add_class::<PyStructuredRow>()?;
+    module.add_class::<PyStructuredMultiGetResult>()?;
     module.add_class::<PyStructuredColumn>()?;
     module.add_class::<PyStructuredFamily>()?;
     module.add_class::<PyStructuredSchema>()?;

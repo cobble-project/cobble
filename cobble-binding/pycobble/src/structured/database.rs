@@ -1,9 +1,11 @@
+use super::batch::PyStructuredWriteBatch;
 use super::types::{
-    PyStructuredReadOptions, PyStructuredRow, PyStructuredScanOptions, PyStructuredSchema,
-    PyStructuredSchemaBuilder, StructuredOwner, schema,
+    PyStructuredMultiGetResult, PyStructuredReadOptions, PyStructuredRow, PyStructuredScanOptions,
+    PyStructuredSchema, PyStructuredSchemaBuilder, StructuredOwner, schema,
 };
 use crate::buffer::InputBytes;
 use crate::error::{input_error, invalid_state, map_error};
+use crate::multi_get::extract_keys;
 use crate::snapshot::{PyBucketRange, PyGlobalSnapshot, PyShardSnapshot, shard_input, snapshot};
 use cobble_binding::Config;
 use cobble_binding::structured::ffi as ds_ffi;
@@ -361,6 +363,37 @@ impl PyStructuredSingleDb {
         })
     }
 
+    #[pyo3(signature = (keys, options=None))]
+    fn multi_get(
+        &self,
+        py: Python<'_>,
+        keys: &Bound<'_, PyAny>,
+        options: Option<PyRef<'_, PyStructuredReadOptions>>,
+    ) -> PyResult<PyStructuredMultiGetResult> {
+        let keys = extract_keys(keys)?;
+        let db = Arc::clone(&self.db);
+        let options = options.map_or_else(Default::default, |value| value.inner.clone());
+        py.detach(move || {
+            db.multi_get_with_options(&keys, &options)
+                .map(|rows| PyStructuredMultiGetResult { rows })
+                .map_err(map_error)
+        })
+    }
+
+    fn write(&self, py: Python<'_>, batch: &PyStructuredWriteBatch) -> PyResult<()> {
+        let operations = batch.begin()?;
+        let native = PyStructuredWriteBatch::for_single(&self.db, operations);
+        let result = match native {
+            Ok(native) => {
+                let db = Arc::clone(&self.db);
+                py.detach(move || db.write_batch(native).map_err(map_error))
+            }
+            Err(error) => Err(error),
+        };
+        batch.finish(result.is_ok());
+        result
+    }
+
     #[pyo3(signature = (bucket, start=None, end=None, options=None))]
     fn scan(
         &self,
@@ -557,6 +590,37 @@ impl PyStructuredDb {
                 .map(PyStructuredRow::new)
                 .map_err(map_error)
         })
+    }
+
+    #[pyo3(signature = (keys, options=None))]
+    fn multi_get(
+        &self,
+        py: Python<'_>,
+        keys: &Bound<'_, PyAny>,
+        options: Option<PyRef<'_, PyStructuredReadOptions>>,
+    ) -> PyResult<PyStructuredMultiGetResult> {
+        let keys = extract_keys(keys)?;
+        let db = Arc::clone(&self.db);
+        let options = options.map_or_else(Default::default, |value| value.inner.clone());
+        py.detach(move || {
+            db.multi_get_with_options(&keys, &options)
+                .map(|rows| PyStructuredMultiGetResult { rows })
+                .map_err(map_error)
+        })
+    }
+
+    fn write(&self, py: Python<'_>, batch: &PyStructuredWriteBatch) -> PyResult<()> {
+        let operations = batch.begin()?;
+        let native = PyStructuredWriteBatch::for_db(&self.db, operations);
+        let result = match native {
+            Ok(native) => {
+                let db = Arc::clone(&self.db);
+                py.detach(move || db.write_batch(native).map_err(map_error))
+            }
+            Err(error) => Err(error),
+        };
+        batch.finish(result.is_ok());
+        result
     }
     #[pyo3(signature = (bucket,start=None,end=None,options=None))]
     fn scan(
