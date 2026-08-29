@@ -1,9 +1,10 @@
 use super::batch::PyStructuredWriteBatch;
+use super::encoding::{CsrbColumns, CsrbRow, buffer_result, encode_into, encoded_len};
 use super::types::{
     PyStructuredMultiGetResult, PyStructuredReadOptions, PyStructuredRow, PyStructuredScanOptions,
     PyStructuredSchema, PyStructuredSchemaBuilder, StructuredOwner, schema,
 };
-use crate::buffer::InputBytes;
+use crate::buffer::{InputBytes, WritableBuffer};
 use crate::error::{input_error, invalid_state, map_error};
 use crate::metrics::{PyMetricSample, metrics};
 use crate::multi_get::extract_keys;
@@ -11,7 +12,9 @@ use crate::snapshot::{
     PyBucketRange, PyGlobalSnapshot, PyPendingShardSnapshot, PyPendingSnapshot, PyShardSnapshot,
     shard_input, snapshot,
 };
-use crate::types::{PyExpandStorageMode, PyMemtableType, PyRecoveryMode};
+use crate::types::{
+    PyBufferResult, PyBufferStatus, PyExpandStorageMode, PyMemtableType, PyRecoveryMode,
+};
 use cobble_binding::Config;
 use cobble_binding::structured::ffi as ds_ffi;
 use cobble_binding::structured::{
@@ -38,6 +41,79 @@ fn extract_elements(values: &Bound<'_, PyAny>) -> PyResult<Vec<InputBytes>> {
         .try_iter()?
         .map(|value| InputBytes::extract(&value?))
         .collect()
+}
+
+fn encode_get_into(
+    bucket: u16,
+    key: &[u8],
+    columns: Option<&[Option<StructuredColumnValue>]>,
+    output: &mut [u8],
+) -> PyResult<PyBufferResult> {
+    let rows = [CsrbRow {
+        bucket,
+        key,
+        columns: columns
+            .map(CsrbColumns::Structured)
+            .unwrap_or(CsrbColumns::Missing),
+    }];
+    let required = encoded_len(&rows)?;
+    if output.len() < required {
+        return Ok(buffer_result(
+            PyBufferStatus::BufferTooSmall,
+            0,
+            required,
+            1,
+        ));
+    }
+    let written = encode_into(&rows, false, false, output)?;
+    Ok(buffer_result(
+        if columns.is_some() {
+            PyBufferStatus::Ok
+        } else {
+            PyBufferStatus::NotFound
+        },
+        written,
+        written,
+        1,
+    ))
+}
+
+fn encode_multi_get_into(
+    keys: &[(u16, InputBytes)],
+    values: &[Option<Vec<Option<StructuredColumnValue>>>],
+    output: &mut [u8],
+) -> PyResult<PyBufferResult> {
+    if keys.len() != values.len() {
+        return Err(invalid_state("structured multi_get result count mismatch"));
+    }
+    let rows = keys
+        .iter()
+        .zip(values)
+        .map(|((bucket, key), columns)| CsrbRow {
+            bucket: *bucket,
+            key: key.as_ref(),
+            columns: columns
+                .as_deref()
+                .map(CsrbColumns::Structured)
+                .unwrap_or(CsrbColumns::Missing),
+        })
+        .collect::<Vec<_>>();
+    let required = encoded_len(&rows)?;
+    if output.len() < required {
+        return Ok(buffer_result(
+            PyBufferStatus::BufferTooSmall,
+            0,
+            required,
+            rows.len(),
+        ));
+    }
+    let written = encode_into(&rows, false, false, output)?;
+    Ok(buffer_result(
+        PyBufferStatus::Ok,
+        written,
+        written,
+        rows.len(),
+    ))
 }
 
 enum IteratorOwner {
@@ -117,6 +193,7 @@ pub(crate) struct PyStructuredScanCursor {
     iterator: Option<StructuredIterator>,
     bucket: u16,
     pending: Option<StructuredBatchRow>,
+    pending_batch: Option<PyStructuredBatch>,
     owner: Option<IteratorOwner>,
 }
 
@@ -126,6 +203,7 @@ impl PyStructuredScanCursor {
             iterator: Some(StructuredIterator::Db(iterator)),
             bucket,
             pending: None,
+            pending_batch: None,
             owner: Some(IteratorOwner::Db { _db: db }),
         }
     }
@@ -139,6 +217,7 @@ impl PyStructuredScanCursor {
             iterator: Some(StructuredIterator::Db(iterator)),
             bucket,
             pending: None,
+            pending_batch: None,
             owner: Some(IteratorOwner::Single { _db: db }),
         }
     }
@@ -148,6 +227,7 @@ impl PyStructuredScanCursor {
             iterator: Some(StructuredIterator::Split(Box::new(iterator))),
             bucket: 0,
             pending: None,
+            pending_batch: None,
             owner: None,
         }
     }
@@ -178,11 +258,8 @@ impl PyStructuredScanCursor {
             }
         }
     }
-}
 
-#[pymethods]
-impl PyStructuredScanCursor {
-    fn next(&mut self, max_rows: usize) -> PyResult<PyStructuredBatch> {
+    fn read_batch(&mut self, max_rows: usize) -> PyResult<PyStructuredBatch> {
         if max_rows == 0 {
             return Err(input_error("max_rows must be greater than zero"));
         }
@@ -215,8 +292,74 @@ impl PyStructuredScanCursor {
             rows,
         })
     }
+}
+
+#[pymethods]
+impl PyStructuredScanCursor {
+    fn next(&mut self, max_rows: usize) -> PyResult<PyStructuredBatch> {
+        if let Some(batch) = self.pending_batch.take() {
+            return Ok(batch);
+        }
+        self.read_batch(max_rows)
+    }
+
+    fn next_into(
+        &mut self,
+        max_rows: usize,
+        output: &Bound<'_, PyAny>,
+    ) -> PyResult<PyBufferResult> {
+        if self.pending_batch.is_none() {
+            self.pending_batch = Some(self.read_batch(max_rows)?);
+        }
+        let batch = self
+            .pending_batch
+            .as_ref()
+            .ok_or_else(|| invalid_state("pending structured scan batch is unavailable"))?;
+        let rows = batch
+            .rows
+            .iter()
+            .map(|row| CsrbRow {
+                bucket: row.bucket,
+                key: row.key.as_ref(),
+                columns: CsrbColumns::Structured(&row.columns),
+            })
+            .collect::<Vec<_>>();
+        let required = encoded_len(&rows)?;
+        let mut output = WritableBuffer::extract(output)?;
+        if output.as_mut_slice().len() < required {
+            return Ok(buffer_result(
+                PyBufferStatus::BufferTooSmall,
+                0,
+                required,
+                rows.len(),
+            ));
+        }
+        let written = encode_into(
+            &rows,
+            batch.end,
+            batch.stopped_at_block_boundary,
+            output.as_mut_slice(),
+        )?;
+        let status = if rows.is_empty() && batch.end {
+            PyBufferStatus::End
+        } else if rows.is_empty() && batch.stopped_at_block_boundary {
+            PyBufferStatus::BlockBoundary
+        } else {
+            PyBufferStatus::Ok
+        };
+        let row_count = rows.len();
+        self.pending_batch = None;
+        Ok(buffer_result(status, written, written, row_count))
+    }
 
     fn resume_after_block_boundary(&mut self) -> PyResult<()> {
+        if self
+            .pending_batch
+            .as_ref()
+            .is_some_and(|batch| batch.rows.is_empty() && batch.stopped_at_block_boundary)
+        {
+            self.pending_batch = None;
+        }
         let iterator = self
             .iterator
             .as_mut()
@@ -235,6 +378,7 @@ impl PyStructuredScanCursor {
     fn close(&mut self) {
         self.iterator.take();
         self.pending.take();
+        self.pending_batch.take();
         self.owner.take();
     }
 }
@@ -411,6 +555,31 @@ impl PyStructuredSingleDb {
         })
     }
 
+    #[pyo3(signature = (bucket, key, output, options=None))]
+    fn get_into(
+        &self,
+        py: Python<'_>,
+        bucket: u16,
+        key: &Bound<'_, PyAny>,
+        output: &Bound<'_, PyAny>,
+        options: Option<PyRef<'_, PyStructuredReadOptions>>,
+    ) -> PyResult<PyBufferResult> {
+        let key = InputBytes::extract(key)?;
+        let mut output = WritableBuffer::extract(output)?;
+        let db = Arc::clone(&self.db);
+        let options = options.map_or_else(Default::default, |value| value.inner.clone());
+        let columns = py.detach(|| {
+            db.get_with_options(bucket, key.as_ref(), &options)
+                .map_err(map_error)
+        })?;
+        encode_get_into(
+            bucket,
+            key.as_ref(),
+            columns.as_deref(),
+            output.as_mut_slice(),
+        )
+    }
+
     #[pyo3(signature = (keys, options=None))]
     fn multi_get(
         &self,
@@ -426,6 +595,25 @@ impl PyStructuredSingleDb {
                 .map(|rows| PyStructuredMultiGetResult { rows })
                 .map_err(map_error)
         })
+    }
+
+    #[pyo3(signature = (keys, output, options=None))]
+    fn multi_get_into(
+        &self,
+        py: Python<'_>,
+        keys: &Bound<'_, PyAny>,
+        output: &Bound<'_, PyAny>,
+        options: Option<PyRef<'_, PyStructuredReadOptions>>,
+    ) -> PyResult<PyBufferResult> {
+        let keys = extract_keys(keys)?;
+        let mut output = WritableBuffer::extract(output)?;
+        let db = Arc::clone(&self.db);
+        let options = options.map_or_else(Default::default, |value| value.inner.clone());
+        let values = py.detach(|| {
+            db.multi_get_with_options(&keys, &options)
+                .map_err(map_error)
+        })?;
+        encode_multi_get_into(&keys, &values, output.as_mut_slice())
     }
 
     fn write(&self, py: Python<'_>, batch: &PyStructuredWriteBatch) -> PyResult<()> {
@@ -986,6 +1174,31 @@ impl PyStructuredDb {
         })
     }
 
+    #[pyo3(signature = (bucket, key, output, options=None))]
+    fn get_into(
+        &self,
+        py: Python<'_>,
+        bucket: u16,
+        key: &Bound<'_, PyAny>,
+        output: &Bound<'_, PyAny>,
+        options: Option<PyRef<'_, PyStructuredReadOptions>>,
+    ) -> PyResult<PyBufferResult> {
+        let key = InputBytes::extract(key)?;
+        let mut output = WritableBuffer::extract(output)?;
+        let db = Arc::clone(&self.db);
+        let options = options.map_or_else(Default::default, |value| value.inner.clone());
+        let columns = py.detach(|| {
+            db.get_with_options(bucket, key.as_ref(), &options)
+                .map_err(map_error)
+        })?;
+        encode_get_into(
+            bucket,
+            key.as_ref(),
+            columns.as_deref(),
+            output.as_mut_slice(),
+        )
+    }
+
     #[pyo3(signature = (keys, options=None))]
     fn multi_get(
         &self,
@@ -1001,6 +1214,25 @@ impl PyStructuredDb {
                 .map(|rows| PyStructuredMultiGetResult { rows })
                 .map_err(map_error)
         })
+    }
+
+    #[pyo3(signature = (keys, output, options=None))]
+    fn multi_get_into(
+        &self,
+        py: Python<'_>,
+        keys: &Bound<'_, PyAny>,
+        output: &Bound<'_, PyAny>,
+        options: Option<PyRef<'_, PyStructuredReadOptions>>,
+    ) -> PyResult<PyBufferResult> {
+        let keys = extract_keys(keys)?;
+        let mut output = WritableBuffer::extract(output)?;
+        let db = Arc::clone(&self.db);
+        let options = options.map_or_else(Default::default, |value| value.inner.clone());
+        let values = py.detach(|| {
+            db.multi_get_with_options(&keys, &options)
+                .map_err(map_error)
+        })?;
+        encode_multi_get_into(&keys, &values, output.as_mut_slice())
     }
 
     fn write(&self, py: Python<'_>, batch: &PyStructuredWriteBatch) -> PyResult<()> {

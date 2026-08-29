@@ -1,6 +1,8 @@
 use super::database::{PyStructuredDb, PyStructuredSingleDb};
-use crate::buffer::{InputBytes, OwnedBytes};
+use super::encoding::{CsrbColumns, CsrbRow, buffer_result, encode_into, encoded_len};
+use crate::buffer::{InputBytes, OwnedBytes, WritableBuffer};
 use crate::error::{input_error, invalid_state, map_error};
+use crate::types::{PyBufferResult, PyBufferStatus};
 use cobble_binding::structured::ffi as ds_ffi;
 use cobble_binding::structured::{StructuredDb, StructuredSingleDb};
 use pyo3::prelude::*;
@@ -11,6 +13,25 @@ use std::sync::atomic::Ordering;
 enum PriorityQueueOwner {
     Db(Arc<StructuredDb>),
     Single(Arc<StructuredSingleDb>),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CallerOperation {
+    Peek,
+    Poll,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct CallerRequest {
+    operation: CallerOperation,
+    bucket: u16,
+    limit: Option<usize>,
+    single: bool,
+}
+
+struct PendingCallerBatch {
+    request: CallerRequest,
+    rows: Vec<(bytes::Bytes, bytes::Bytes)>,
 }
 
 #[pyclass(name = "PriorityQueueEntry", module = "pycobble._native", frozen)]
@@ -58,6 +79,7 @@ impl PyPriorityQueueBatch {
 pub(crate) struct PyPriorityQueue {
     descriptor: ds_ffi::PriorityQueueDescriptor,
     owner: PriorityQueueOwner,
+    pending: Option<PendingCallerBatch>,
 }
 
 impl PyPriorityQueue {
@@ -68,6 +90,7 @@ impl PyPriorityQueue {
         Self {
             descriptor,
             owner: PriorityQueueOwner::Db(owner),
+            pending: None,
         }
     }
 
@@ -78,6 +101,7 @@ impl PyPriorityQueue {
         Self {
             descriptor,
             owner: PriorityQueueOwner::Single(owner),
+            pending: None,
         }
     }
 
@@ -108,6 +132,80 @@ impl PyPriorityQueue {
         }
         .map_err(map_error)
     }
+
+    fn ensure_idle(&self) -> PyResult<()> {
+        if self.pending.is_some() {
+            Err(invalid_state(
+                "priority queue has a pending caller-buffer result; retry the same operation",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn batch_into(
+        &mut self,
+        request: CallerRequest,
+        output: &Bound<'_, PyAny>,
+    ) -> PyResult<PyBufferResult> {
+        match self.pending.as_ref() {
+            Some(pending) if pending.request != request => {
+                return Err(invalid_state(
+                    "priority queue caller-buffer retry must use the same operation, bucket, and limit",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                self.pending = Some(PendingCallerBatch {
+                    request,
+                    rows: self.peek_rows(request.bucket, request.limit)?,
+                });
+            }
+        }
+
+        let pending = self.pending.as_ref().expect("pending caller batch");
+        let rows = pending
+            .rows
+            .iter()
+            .map(|(key, value)| CsrbRow {
+                bucket: request.bucket,
+                key,
+                columns: CsrbColumns::PriorityQueue(value),
+            })
+            .collect::<Vec<_>>();
+        let required = encoded_len(&rows)?;
+        let mut output = WritableBuffer::extract(output)?;
+        if output.as_mut_slice().len() < required {
+            return Ok(buffer_result(
+                PyBufferStatus::BufferTooSmall,
+                0,
+                required,
+                rows.len(),
+            ));
+        }
+        if request.operation == CallerOperation::Poll
+            && let Some((key, _)) = pending.rows.last()
+        {
+            self.advance_inner(request.bucket, key.as_ref())?;
+        }
+        let written = encode_into(&rows, pending.rows.is_empty(), false, output.as_mut_slice())?;
+        let row_count = rows.len();
+        self.pending = None;
+        Ok(buffer_result(
+            if row_count == 0 {
+                if request.single {
+                    PyBufferStatus::NotFound
+                } else {
+                    PyBufferStatus::End
+                }
+            } else {
+                PyBufferStatus::Ok
+            },
+            written,
+            written,
+            row_count,
+        ))
+    }
 }
 
 #[pymethods]
@@ -117,7 +215,13 @@ impl PyPriorityQueue {
         self.descriptor.column_family()
     }
 
-    fn offer(&self, bucket: u16, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn offer(
+        &mut self,
+        bucket: u16,
+        key: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        self.ensure_idle()?;
         let key = InputBytes::extract(key)?;
         let value = InputBytes::extract(value)?;
         match &self.owner {
@@ -139,7 +243,8 @@ impl PyPriorityQueue {
         .map_err(map_error)
     }
 
-    fn delete(&self, bucket: u16, key: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn delete(&mut self, bucket: u16, key: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.ensure_idle()?;
         let key = InputBytes::extract(key)?;
         match &self.owner {
             PriorityQueueOwner::Db(db) => {
@@ -152,7 +257,8 @@ impl PyPriorityQueue {
         .map_err(map_error)
     }
 
-    fn peek(&self, bucket: u16) -> PyResult<Option<PyPriorityQueueEntry>> {
+    fn peek(&mut self, bucket: u16) -> PyResult<Option<PyPriorityQueueEntry>> {
+        self.ensure_idle()?;
         Ok(self
             .peek_rows(bucket, Some(1))?
             .into_iter()
@@ -160,7 +266,8 @@ impl PyPriorityQueue {
             .map(|(key, value)| PyPriorityQueueEntry { key, value }))
     }
 
-    fn poll(&self, bucket: u16) -> PyResult<Option<PyPriorityQueueEntry>> {
+    fn poll(&mut self, bucket: u16) -> PyResult<Option<PyPriorityQueueEntry>> {
+        self.ensure_idle()?;
         let Some((key, value)) = self.peek_rows(bucket, Some(1))?.into_iter().next() else {
             return Ok(None);
         };
@@ -169,14 +276,16 @@ impl PyPriorityQueue {
     }
 
     #[pyo3(signature = (bucket, limit=None))]
-    fn peek_batch(&self, bucket: u16, limit: Option<usize>) -> PyResult<PyPriorityQueueBatch> {
+    fn peek_batch(&mut self, bucket: u16, limit: Option<usize>) -> PyResult<PyPriorityQueueBatch> {
+        self.ensure_idle()?;
         Ok(PyPriorityQueueBatch {
             rows: self.peek_rows(bucket, limit)?,
         })
     }
 
     #[pyo3(signature = (bucket, limit=None))]
-    fn poll_batch(&self, bucket: u16, limit: Option<usize>) -> PyResult<PyPriorityQueueBatch> {
+    fn poll_batch(&mut self, bucket: u16, limit: Option<usize>) -> PyResult<PyPriorityQueueBatch> {
+        self.ensure_idle()?;
         let rows = self.peek_rows(bucket, limit)?;
         if let Some((key, _)) = rows.last() {
             self.advance_inner(bucket, key.as_ref())?;
@@ -184,12 +293,14 @@ impl PyPriorityQueue {
         Ok(PyPriorityQueueBatch { rows })
     }
 
-    fn advance(&self, bucket: u16, key: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn advance(&mut self, bucket: u16, key: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.ensure_idle()?;
         let key = InputBytes::extract(key)?;
         self.advance_inner(bucket, key.as_ref())
     }
 
-    fn cursor(&self, py: Python<'_>, bucket: u16) -> PyResult<Option<Py<PyBytes>>> {
+    fn cursor(&mut self, py: Python<'_>, bucket: u16) -> PyResult<Option<Py<PyBytes>>> {
+        self.ensure_idle()?;
         let value = match &self.owner {
             PriorityQueueOwner::Db(db) => {
                 ds_ffi::db_priority_queue_cursor(db, &self.descriptor, bucket)
@@ -200,6 +311,66 @@ impl PyPriorityQueue {
         }
         .map_err(map_error)?;
         Ok(value.map(|value| PyBytes::new(py, &value).unbind()))
+    }
+
+    fn peek_into(&mut self, bucket: u16, output: &Bound<'_, PyAny>) -> PyResult<PyBufferResult> {
+        self.batch_into(
+            CallerRequest {
+                operation: CallerOperation::Peek,
+                bucket,
+                limit: Some(1),
+                single: true,
+            },
+            output,
+        )
+    }
+
+    fn poll_into(&mut self, bucket: u16, output: &Bound<'_, PyAny>) -> PyResult<PyBufferResult> {
+        self.batch_into(
+            CallerRequest {
+                operation: CallerOperation::Poll,
+                bucket,
+                limit: Some(1),
+                single: true,
+            },
+            output,
+        )
+    }
+
+    #[pyo3(signature = (bucket, output, limit=None))]
+    fn peek_batch_into(
+        &mut self,
+        bucket: u16,
+        output: &Bound<'_, PyAny>,
+        limit: Option<usize>,
+    ) -> PyResult<PyBufferResult> {
+        self.batch_into(
+            CallerRequest {
+                operation: CallerOperation::Peek,
+                bucket,
+                limit,
+                single: false,
+            },
+            output,
+        )
+    }
+
+    #[pyo3(signature = (bucket, output, limit=None))]
+    fn poll_batch_into(
+        &mut self,
+        bucket: u16,
+        output: &Bound<'_, PyAny>,
+        limit: Option<usize>,
+    ) -> PyResult<PyBufferResult> {
+        self.batch_into(
+            CallerRequest {
+                operation: CallerOperation::Poll,
+                bucket,
+                limit,
+                single: false,
+            },
+            output,
+        )
     }
 }
 

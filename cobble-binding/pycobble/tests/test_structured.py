@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import struct
 from pathlib import Path
 
 import pycobble
@@ -24,6 +25,55 @@ def config(root: Path) -> str:
             "wal_enabled": False,
         }
     )
+
+
+def decode_csrb(value: bytearray, length: int) -> list[tuple[int, bytes, bool, list[object]]]:
+    data = memoryview(value)[:length]
+    assert data[:4] == b"CSRB"
+    version, header_size, _flags, row_count, required = struct.unpack_from(
+        "<HHIIQ", data, 4
+    )
+    assert version == 1
+    assert header_size == 24
+    assert required == length
+    offset = header_size
+    rows: list[tuple[int, bytes, bool, list[object]]] = []
+    for _ in range(row_count):
+        bucket, row_flags, key_len, column_count, reserved = struct.unpack_from(
+            "<HHIII", data, offset
+        )
+        assert reserved == 0
+        offset += 16
+        key = bytes(data[offset : offset + key_len])
+        offset += key_len
+        columns: list[object] = []
+        for _ in range(column_count):
+            tag, flags, reserved, element_count, payload_size = struct.unpack_from(
+                "<BBHIQ", data, offset
+            )
+            assert flags == 0 and reserved == 0
+            offset += 16
+            payload_end = offset + payload_size
+            if tag == 0:
+                assert element_count == 0 and payload_size == 0
+                columns.append(None)
+            elif tag == 1:
+                assert element_count == 1
+                columns.append(bytes(data[offset:payload_end]))
+                offset = payload_end
+            else:
+                assert tag == 2
+                elements: list[bytes] = []
+                for _ in range(element_count):
+                    element_len = struct.unpack_from("<Q", data, offset)[0]
+                    offset += 8
+                    elements.append(bytes(data[offset : offset + element_len]))
+                    offset += element_len
+                assert offset == payload_end
+                columns.append(elements)
+        rows.append((bucket, key, bool(row_flags & 1), columns))
+    assert offset == length
+    return rows
 
 
 def test_structured_bytes_lists_schema_scan_and_priority_queue(tmp_path: Path) -> None:
@@ -299,3 +349,81 @@ def test_structured_distributed_scan_plan(tmp_path: Path) -> None:
             config_json,
             pycobble.StructuredScanOptions(stop_at_block_boundary=True),
         )
+
+
+def test_structured_caller_owned_buffers_and_retry(tmp_path: Path) -> None:
+    db = pycobble.StructuredSingleDb.open(config(tmp_path / "structured-csrb"))
+    builder = db.update_schema()
+    builder.add_list_column(1, pycobble.ListConfig())
+    builder.commit()
+    db.put_bytes(0, b"a", 0, b"value-a")
+    db.put_list(0, b"a", 1, [b"x", b"y"])
+    db.put_bytes(0, b"b", 0, b"value-b")
+
+    too_small = bytearray(b"\xa5" * 8)
+    before = too_small[:]
+    result = db.get_into(0, b"a", too_small)
+    assert result.status == pycobble.BufferStatus.BufferTooSmall
+    assert result.bytes_written == 0
+    assert too_small == before
+    output = bytearray(result.bytes_required)
+    result = db.get_into(0, b"a", output)
+    assert result.status == pycobble.BufferStatus.Ok
+    assert decode_csrb(output, result.bytes_written) == [
+        (0, b"a", True, [b"value-a", [b"x", b"y"]])
+    ]
+
+    keys = [(0, b"a"), (0, b"missing"), (0, b"b"), (0, b"a")]
+    probe = bytearray()
+    result = db.multi_get_into(keys, probe)
+    assert result.status == pycobble.BufferStatus.BufferTooSmall
+    output = bytearray(result.bytes_required)
+    result = db.multi_get_into(keys, output)
+    rows = decode_csrb(output, result.bytes_written)
+    assert [row[1] for row in rows] == [b"a", b"missing", b"b", b"a"]
+    assert [row[2] for row in rows] == [True, False, True, True]
+
+    cursor = db.scan(0)
+    probe = bytearray(b"\x5a" * 12)
+    before = probe[:]
+    result = cursor.next_into(1, probe)
+    assert result.status == pycobble.BufferStatus.BufferTooSmall
+    assert probe == before
+    output = bytearray(result.bytes_required)
+    result = cursor.next_into(1, output)
+    assert decode_csrb(output, result.bytes_written)[0][1] == b"a"
+    output = bytearray(256)
+    result = cursor.next_into(1, output)
+    assert decode_csrb(output, result.bytes_written)[0][1] == b"b"
+    cursor.close()
+
+    queue = db.new_priority_queue("caller-buffer")
+    queue.offer(0, b"001", b"one")
+    queue.offer(0, b"002", b"two")
+    probe = bytearray(b"\x33" * 4)
+    before = probe[:]
+    result = queue.poll_into(0, probe)
+    assert result.status == pycobble.BufferStatus.BufferTooSmall
+    assert probe == before
+    with pytest.raises(pycobble.InternalStateError):
+        queue.peek(0)
+    with pytest.raises(pycobble.InternalStateError):
+        queue.peek_into(0, bytearray(result.bytes_required))
+    output = bytearray(result.bytes_required)
+    result = queue.poll_into(0, output)
+    assert decode_csrb(output, result.bytes_written) == [
+        (0, b"001", True, [b"one"])
+    ]
+    assert bytes(queue.peek(0).key) == b"002"
+    output = bytearray(256)
+    result = queue.poll_batch_into(0, output)
+    assert decode_csrb(output, result.bytes_written) == [
+        (0, b"002", True, [b"two"])
+    ]
+    result = queue.peek_batch_into(0, output)
+    assert result.status == pycobble.BufferStatus.End
+    assert result.row_count == 0
+    assert decode_csrb(output, result.bytes_written) == []
+    del queue
+    gc.collect()
+    db.close()

@@ -1,5 +1,6 @@
 mod batch;
 mod database;
+mod encoding;
 mod priority_queue;
 mod scan_plan;
 mod types;
