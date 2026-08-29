@@ -11,6 +11,24 @@ public interface CustomFileSystem extends AutoCloseable {
     /** Returns the regular-file size in bytes, or {@code null} for a non-file path. */
     Long fileSize(String path);
 
+    /**
+     * Returns whether this filesystem can fast-copy {@code sourcePath} to the supplied filesystem
+     * and path.
+     */
+    default boolean canFastCopyTo(
+            String sourcePath, CustomFileSystem destinationFileSystem, String destinationPath) {
+        return false;
+    }
+
+    /**
+     * Fast-copies {@code sourcePath} to the supplied filesystem and path. Implementations must
+     * leave the destination absent when throwing an exception.
+     */
+    default void fastCopyTo(
+            String sourcePath, CustomFileSystem destinationFileSystem, String destinationPath) {
+        throw new UnsupportedOperationException("Fast copy is not supported");
+    }
+
     /** Deletes a file or directory path recursively. */
     void delete(String path);
 

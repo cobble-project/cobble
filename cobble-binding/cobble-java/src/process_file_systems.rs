@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use cobble_binding::{
-    Error, File, FileSystem, ProcessFileSystemRegistry, ProcessFileSystemRequest, RandomAccessFile,
-    Result, SequentialWriteFile, Url, clear_process_custom_file_system_registry,
-    register_process_custom_file_system_registry,
+    Error, FastCopyDestination, File, FileSystem, ProcessFileSystemRegistry,
+    ProcessFileSystemRequest, RandomAccessFile, Result, SequentialWriteFile, Url,
+    clear_process_custom_file_system_registry, register_process_custom_file_system_registry,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -149,6 +149,81 @@ impl FileSystem for JniCustomFileSystem {
 
     fn file_size(&self, path: &str) -> Result<Option<u64>> {
         call_optional_u64_with_string_arg(self.vm.as_ref(), self.object.as_obj(), "fileSize", path)
+    }
+
+    fn can_fast_copy_to(&self, source_path: &str, destination: &FastCopyDestination<'_>) -> bool {
+        let Some(destination_fs) = destination
+            .file_system()
+            .as_any()
+            .downcast_ref::<JniCustomFileSystem>()
+        else {
+            return false;
+        };
+        let Ok(mut env) = self.vm.attach_current_thread() else {
+            return false;
+        };
+        let result = (|| -> jni::errors::Result<bool> {
+            let source_path = JObject::from(env.new_string(source_path)?);
+            let destination_path = JObject::from(env.new_string(destination.path())?);
+            env.call_method(
+                self.object.as_obj(),
+                "canFastCopyTo",
+                "(Ljava/lang/String;Lio/cobble/CustomFileSystem;Ljava/lang/String;)Z",
+                &[
+                    JValue::Object(&source_path),
+                    JValue::Object(destination_fs.object.as_obj()),
+                    JValue::Object(&destination_path),
+                ],
+            )?
+            .z()
+        })();
+        match result {
+            Ok(can_copy) => can_copy,
+            Err(_) => {
+                clear_pending_java_exception(&mut env);
+                false
+            }
+        }
+    }
+
+    fn fast_copy_to(&self, source_path: &str, destination: &FastCopyDestination<'_>) -> Result<()> {
+        let destination_fs = destination
+            .file_system()
+            .as_any()
+            .downcast_ref::<JniCustomFileSystem>()
+            .ok_or_else(|| {
+                Error::FileSystemError(
+                    "custom JNI filesystem cannot fast-copy to a non-JNI filesystem".to_string(),
+                )
+            })?;
+        let mut env = self
+            .vm
+            .attach_current_thread()
+            .map_err(|err| Error::IoError(format!("failed to attach JVM thread: {err}")))?;
+        let result = (|| -> jni::errors::Result<()> {
+            let source_path = JObject::from(env.new_string(source_path)?);
+            let destination_path = JObject::from(env.new_string(destination.path())?);
+            env.call_method(
+                self.object.as_obj(),
+                "fastCopyTo",
+                "(Ljava/lang/String;Lio/cobble/CustomFileSystem;Ljava/lang/String;)V",
+                &[
+                    JValue::Object(&source_path),
+                    JValue::Object(destination_fs.object.as_obj()),
+                    JValue::Object(&destination_path),
+                ],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                clear_pending_java_exception(&mut env);
+                Err(Error::IoError(format!(
+                    "custom filesystem fastCopyTo failed: {err}"
+                )))
+            }
+        }
     }
 
     fn delete(&self, path: &str) -> Result<()> {
@@ -718,4 +793,10 @@ fn query_support_direct(vm: &JavaVM, target: &GlobalRef) -> Result<bool> {
         .map_err(|err| Error::IoError(format!("custom file supportDirect failed: {err}")))?
         .z()
         .map_err(|err| Error::IoError(format!("custom file supportDirect decode failed: {err}")))
+}
+
+fn clear_pending_java_exception(env: &mut JNIEnv<'_>) {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
 }
