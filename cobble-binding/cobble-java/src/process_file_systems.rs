@@ -143,6 +143,10 @@ impl FileSystem for JniCustomFileSystem {
         .map_err(|err| Error::IoError(format!("custom filesystem exists decode failed: {err}")))
     }
 
+    fn file_size(&self, path: &str) -> Result<Option<u64>> {
+        call_optional_u64_with_string_arg(self.vm.as_ref(), self.object.as_obj(), "fileSize", path)
+    }
+
     fn delete(&self, path: &str) -> Result<()> {
         call_void_with_string_arg(self.vm.as_ref(), self.object.as_obj(), "delete", path)
     }
@@ -297,43 +301,12 @@ impl FileSystem for JniCustomFileSystem {
     }
 
     fn last_modified(&self, path: &str) -> Result<Option<u64>> {
-        let mut env = self
-            .vm
-            .attach_current_thread()
-            .map_err(|err| Error::IoError(format!("failed to attach JVM thread: {err}")))?;
-        let jpath = env
-            .new_string(path)
-            .map_err(|err| Error::IoError(format!("failed to encode path string: {err}")))?;
-        let value = env
-            .call_method(
-                self.object.as_obj(),
-                "lastModified",
-                "(Ljava/lang/String;)Ljava/lang/Long;",
-                &[JValue::Object(&JObject::from(jpath))],
-            )
-            .map_err(|err| Error::IoError(format!("custom filesystem lastModified failed: {err}")))?
-            .l()
-            .map_err(|err| {
-                Error::IoError(format!(
-                    "custom filesystem lastModified decode failed: {err}"
-                ))
-            })?;
-        if value.is_null() {
-            return Ok(None);
-        }
-        let raw = env
-            .call_method(value, "longValue", "()J", &[])
-            .map_err(|err| Error::IoError(format!("custom filesystem longValue failed: {err}")))?
-            .j()
-            .map_err(|err| {
-                Error::IoError(format!("custom filesystem longValue decode failed: {err}"))
-            })?;
-        if raw < 0 {
-            return Err(Error::IoError(format!(
-                "invalid negative lastModified: {raw}"
-            )));
-        }
-        Ok(Some(raw as u64))
+        call_optional_u64_with_string_arg(
+            self.vm.as_ref(),
+            self.object.as_obj(),
+            "lastModified",
+            path,
+        )
     }
 }
 
@@ -686,6 +659,51 @@ fn call_void_no_args(vm: &JavaVM, target: &JObject, method: &str) -> Result<()> 
     env.call_method(target, method, "()V", &[])
         .map_err(|err| Error::IoError(format!("custom filesystem {method} failed: {err}")))?;
     Ok(())
+}
+
+fn call_optional_u64_with_string_arg(
+    vm: &JavaVM,
+    target: &JObject,
+    method: &str,
+    arg: &str,
+) -> Result<Option<u64>> {
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|err| Error::IoError(format!("failed to attach JVM thread: {err}")))?;
+    let value = JObject::from(
+        env.new_string(arg)
+            .map_err(|err| Error::IoError(format!("failed to encode argument string: {err}")))?,
+    );
+    let result = env
+        .call_method(
+            target,
+            method,
+            "(Ljava/lang/String;)Ljava/lang/Long;",
+            &[JValue::Object(&value)],
+        )
+        .map_err(|err| Error::IoError(format!("custom filesystem {method} failed: {err}")))?
+        .l()
+        .map_err(|err| {
+            Error::IoError(format!("custom filesystem {method} decode failed: {err}"))
+        })?;
+    if result.is_null() {
+        return Ok(None);
+    }
+    let raw = env
+        .call_method(result, "longValue", "()J", &[])
+        .map_err(|err| Error::IoError(format!("custom filesystem {method} value failed: {err}")))?
+        .j()
+        .map_err(|err| {
+            Error::IoError(format!(
+                "custom filesystem {method} value decode failed: {err}"
+            ))
+        })?;
+    if raw < 0 {
+        return Err(Error::IoError(format!(
+            "custom filesystem {method} returned a negative value: {raw}"
+        )));
+    }
+    Ok(Some(raw as u64))
 }
 
 fn query_support_direct(vm: &JavaVM, target: &GlobalRef) -> Result<bool> {

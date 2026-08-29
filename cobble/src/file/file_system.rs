@@ -11,6 +11,16 @@ use std::sync::{Arc, OnceLock, RwLock};
 use url::Url;
 
 pub trait FileSystem: Send + Sync {
+    /// Whether this filesystem is the built-in local POSIX implementation.
+    fn is_posix(&self) -> bool {
+        false
+    }
+
+    /// Returns the size of a regular file without opening it for reads.
+    fn file_size(&self, _path: &str) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
     fn init(
         url: &Url,
         access_id: Option<String>,

@@ -23,6 +23,17 @@ impl PosixFileSystem {
 }
 
 impl FileSystem for PosixFileSystem {
+    fn is_posix(&self) -> bool {
+        true
+    }
+
+    fn file_size(&self, path: &str) -> Result<Option<u64>> {
+        let resolved = self.resolve_path(path);
+        let metadata = std::fs::metadata(&resolved)
+            .map_err(|e| Error::IoError(format!("Failed to stat {}: {}", resolved.display(), e)))?;
+        Ok(metadata.is_file().then_some(metadata.len()))
+    }
+
     fn init(
         _url: &Url,
         _access_id: Option<String>,

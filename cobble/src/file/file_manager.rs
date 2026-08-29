@@ -146,6 +146,13 @@ pub(crate) struct DataVolume {
     pub(crate) readonly_source: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PrimaryResidualFile {
+    pub(crate) file_name: String,
+    pub(crate) absolute_path: String,
+    pub(crate) size_bytes: u64,
+}
+
 impl Clone for DataVolume {
     fn clone(&self) -> Self {
         Self {
@@ -1254,6 +1261,52 @@ impl FileManager {
         )
     }
 
+    pub(crate) fn data_file_path_with_name(&self, name: &str) -> String {
+        format!("{}/{}/{}", self.options.base_dir, DATA_DIR, name)
+    }
+
+    /// Best-effort shallow scan of built-in POSIX primary data directories.
+    pub(crate) fn scan_primary_residual_files(&self) -> Vec<PrimaryResidualFile> {
+        let mut files = Vec::new();
+        let data_dir = if self.options.base_dir.is_empty() {
+            DATA_DIR.to_string()
+        } else {
+            format!("{}/{}", self.options.base_dir, DATA_DIR)
+        };
+        for volume in &self.data_volumes {
+            if !volume.supports_primary_data || !volume.fs().is_posix() {
+                continue;
+            }
+            let names = match volume.fs().list(&data_dir) {
+                Ok(names) => names,
+                Err(err) => {
+                    log::warn!(
+                        "failed to scan primary residual directory {}: {}",
+                        data_dir,
+                        err
+                    );
+                    continue;
+                }
+            };
+            for file_name in names {
+                let relative_path = self.data_file_path_with_name(&file_name);
+                let Some(size_bytes) = volume.fs().file_size(&relative_path).ok().flatten() else {
+                    continue;
+                };
+                let absolute_path = volume
+                    .base_dir()
+                    .map(|base_dir| format!("{}/{}", base_dir.trim_end_matches('/'), relative_path))
+                    .unwrap_or_else(|| relative_path.clone());
+                files.push(PrimaryResidualFile {
+                    file_name,
+                    absolute_path,
+                    size_bytes,
+                });
+            }
+        }
+        files
+    }
+
     /// Generates the path for a metadata file with the given name.
     fn metadata_file_path(&self, name: &str) -> String {
         if self.options.base_dir.is_empty() {
@@ -1589,8 +1642,11 @@ impl FileManager {
 
     /// Registers an existing data file for restore operations.
     ///
-    /// Existing primary replicas are retained. Files copied from a non-primary source use the
-    /// requested primary placement.
+    /// A primary residual registered by the resume scan is preferred without copying. Otherwise,
+    /// the requested placement is resolved before deciding whether the manifest source can be
+    /// retained or must be copied.
+    ///
+    /// Returns `true` when the selected replica is pending adoption by the restore caller.
     pub(crate) fn register_data_file_for_restore(
         &self,
         file_id: FileId,
@@ -1599,23 +1655,39 @@ impl FileManager {
         placement: PrimaryDataPlacement,
         estimated_size_bytes: Option<u64>,
         resource_registry: Option<Arc<dyn RestoreCopyResourceRegistry + Send + Sync>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if self.select_primary_residual_replica(file_id, placement) {
+            return Ok(true);
+        }
         let (source_volume, source_relative_path) = self.resolve_volume_path(path)?;
-        if source_volume.supports_primary_data {
+        let mut source_reader = None;
+        let expected_write_bytes = if let Some(size) = estimated_size_bytes {
+            size
+        } else {
+            let reader = source_volume.fs().open_read(&source_relative_path)?;
+            let size = reader.size() as u64;
+            source_reader = Some(reader);
+            size
+        };
+        let target_volume =
+            self.select_primary_data_volume_for_placement(placement, Some(expected_write_bytes))?;
+        let selected_target_rank = target_volume.priority.rank();
+        if source_volume.supports_primary_data
+            && source_volume.priority.rank() == selected_target_rank
+        {
             self.register_restore_source_replica(file_id, path, source_origin)?;
-            return Ok(());
+            return Ok(false);
         }
 
-        let source_reader = source_volume.fs().open_read(&source_relative_path)?;
-        let expected_write_bytes =
-            estimated_size_bytes.or_else(|| Some(source_reader.size() as u64));
+        let source_reader = match source_reader {
+            Some(reader) => reader,
+            None => source_volume.fs().open_read(&source_relative_path)?,
+        };
         if source_volume.snapshot_persistable {
             self.register_data_file_readonly_with_origin(file_id, path, source_origin)?;
         }
-        let target_volume =
-            self.select_primary_data_volume_for_placement(placement, expected_write_bytes)?;
         let (mut writer, target_tracked) =
-            self.create_untracked_data_file_writer_on_volume(target_volume)?;
+            self.create_transfer_data_file_writer_on_volume(target_volume, path)?;
         if let Err(err) = self.copy_reader_to_tracked_writer(source_reader.as_ref(), &mut writer) {
             if source_volume.snapshot_persistable {
                 let _ = self.remove_data_file(file_id);
@@ -1657,7 +1729,7 @@ impl FileManager {
         if let Some(registry) = resource_registry {
             registry.register_temp_restored_copy(file_id);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn register_restore_source_replica(
@@ -2080,7 +2152,7 @@ impl FileManager {
         let source_reader = source_tracked.fs().open_read(source_tracked.path())?;
         let source_priority = source_tracked.priority();
         let (mut writer, target) =
-            self.create_untracked_data_file_writer_on_volume(snapshot_volume)?;
+            self.create_snapshot_replica_writer_on_volume(snapshot_volume, source_tracked)?;
 
         let copy_result = self.copy_reader_to_tracked_writer_with_cancel(
             source_reader.as_ref(),
@@ -2397,6 +2469,11 @@ impl FileManager {
         volume.fs().open_read(&relative_path)
     }
 
+    pub(crate) fn data_file_size_at_path(&self, path: &str) -> Result<u64> {
+        let (volume, relative_path) = self.resolve_volume_path(path)?;
+        Ok(volume.fs().open_read(&relative_path)?.size() as u64)
+    }
+
     /// Registers an existing data file without deleting it on drop.
     pub fn register_data_file_readonly(&self, file_id: FileId, path: &str) -> Result<()> {
         self.register_data_file_readonly_with_origin(
@@ -2439,6 +2516,98 @@ impl FileManager {
             PhysicalDeletePolicy::Retained,
             ReplicaOrigin::Owned,
         )
+    }
+
+    /// Registers one scanned primary residual as a non-owning replica until resume succeeds.
+    pub(crate) fn register_primary_residual_replica(
+        &self,
+        file_id: FileId,
+        path: &str,
+        size_bytes: u64,
+    ) -> Result<()> {
+        let (volume, relative_path) = self.resolve_volume_path(path)?;
+        if let Some(logical) = self.get_logical_file(file_id) {
+            if logical.replica_at_absolute_path(path).is_some() {
+                return Ok(());
+            }
+            let tracked = Arc::new(TrackedFile::retained(
+                relative_path,
+                Arc::clone(volume.fs()),
+                Some(volume),
+            ));
+            tracked.update_size_bytes(size_bytes);
+            logical.add_replica(tracked, ReplicaLifecycle::PendingAdoption);
+            return Ok(());
+        }
+
+        let tracked = Arc::new(TrackedFile::retained(
+            relative_path,
+            Arc::clone(volume.fs()),
+            Some(volume),
+        ));
+        tracked.update_size_bytes(size_bytes);
+        self.register_logical_file(
+            file_id,
+            tracked,
+            ReplicaLifecycle::PendingAdoption,
+            FileCommitState::Uncommitted,
+            ReplicaOrigin::Owned,
+        );
+        self.report_data_files_gauge();
+        Ok(())
+    }
+
+    fn select_primary_residual_replica(
+        &self,
+        file_id: FileId,
+        placement: PrimaryDataPlacement,
+    ) -> bool {
+        let Some(logical) = self.get_logical_file(file_id) else {
+            return false;
+        };
+        let mut candidates = logical
+            .replica_state_snapshot()
+            .replicas
+            .into_iter()
+            .filter(|replica| {
+                replica.lifecycle() == ReplicaLifecycle::PendingAdoption
+                    && replica
+                        .tracked
+                        .volume
+                        .as_ref()
+                        .is_some_and(|volume| volume.supports_primary_data)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|replica| {
+            replica
+                .tracked
+                .volume
+                .as_ref()
+                .map(|volume| volume.priority.rank())
+                .unwrap_or(0)
+        });
+        let selected = if self.uses_lowest_primary_tier(placement) {
+            candidates.first()
+        } else {
+            candidates.last()
+        };
+        selected.is_some_and(|replica| logical.select_durable_and_preferred(replica.replica_id))
+    }
+
+    /// Completes ownership transfer for every scanned replica of one restored logical file.
+    pub(crate) fn adopt_primary_residual_replicas(&self, file_id: FileId) {
+        let Some(logical) = self.get_logical_file(file_id) else {
+            return;
+        };
+        for replica in logical.replica_state_snapshot().replicas {
+            if replica.lifecycle() != ReplicaLifecycle::PendingAdoption {
+                continue;
+            }
+            replica
+                .tracked
+                .set_physical_delete_policy(PhysicalDeletePolicy::ManagedDelete);
+            logical.set_replica_lifecycle(replica.replica_id, ReplicaLifecycle::OwnedReady);
+        }
     }
 
     fn register_existing_data_file(

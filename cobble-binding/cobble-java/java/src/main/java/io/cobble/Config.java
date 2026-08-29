@@ -143,6 +143,9 @@ public final class Config {
      */
     public Boolean vlogLowPriorityPrimaryEnabled;
 
+    /** Whether resume adopts matching files found by a shallow scan of POSIX primary volumes. */
+    public Boolean resumePrimaryResidualScanEnabled;
+
     /** Time provider implementation used by TTL. */
     public TimeProviderKind timeProvider;
 

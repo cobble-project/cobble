@@ -211,6 +211,7 @@ Named column families are added later through schema evolution. Reopen, restore,
 | `primary_volume_backfill_trigger_watermark` | `f64` | 0.40 | Backfill trigger ratio (maximum 0.80 and kept below the offload watermark) |
 | `file_transfer_concurrency` | `usize` | 4 | Maximum concurrent background file transfers per database |
 | `primary_volume_offload_policy` | `PrimaryVolumeOffloadPolicyKind` | `Priority` | Policy: `LargestFile` or `Priority` |
+| `resume_primary_residual_scan_enabled` | `bool` | `true` | On resume, shallow-scan built-in POSIX primary data directories and adopt basename-and-size matches from the selected snapshot |
 
 ### LSM Splitting
 

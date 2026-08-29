@@ -204,6 +204,7 @@ Named column families are created later through schema evolution. Reopen, restor
 | `primary_volume_backfill_trigger_watermark` | 0.40 | Backfill trigger ratio, up to 0.80 and kept below the offload watermark |
 | `file_transfer_concurrency` | 4 | Maximum concurrent background file transfers per database |
 | `primary_volume_offload_policy` | `Priority` | Offload policy: `LargestFile` or `Priority` |
+| `resume_primary_residual_scan_enabled` | `true` | On resume, shallow-scan POSIX primary data directories and adopt matching snapshot files |
 
 ### Logging
 

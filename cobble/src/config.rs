@@ -951,6 +951,9 @@ pub struct Config {
     /// Whether VLog files newly created or copied into primary use the lowest-priority primary
     /// tier instead of the normal highest-priority tier.
     pub vlog_low_priority_primary_enabled: bool,
+    /// During resume, scan shallow POSIX primary data directories and adopt matching residual
+    /// replicas referenced by the selected snapshot manifest.
+    pub resume_primary_residual_scan_enabled: bool,
     /// Time provider to use for TTL.
     pub time_provider: TimeProviderKind,
     /// Optional log file path. If None, logs go to console only. Must be a local path.
@@ -1058,6 +1061,7 @@ impl Default for Config {
             default_ttl_seconds: None,
             value_separation_threshold: None,
             vlog_low_priority_primary_enabled: false,
+            resume_primary_residual_scan_enabled: true,
             time_provider: TimeProviderKind::default(),
             log_path: None,
             log_max_file_size: Size::from_mib(10),

@@ -59,8 +59,10 @@ class DbBindingTest {
     void configSerializesVlogLowPriorityPrimaryPlacement() {
         Config config = new Config();
         config.vlogLowPriorityPrimaryEnabled = true;
+        config.resumePrimaryResidualScanEnabled = false;
 
         assertTrue(config.toJson().contains("\"vlog_low_priority_primary_enabled\":true"));
+        assertTrue(config.toJson().contains("\"resume_primary_residual_scan_enabled\":false"));
     }
 
     @Test

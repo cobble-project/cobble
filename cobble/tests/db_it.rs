@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use cobble::paths::bucket_snapshot_manifest_path;
 use cobble::test_utils::read_metadata_payload_from_path_for_test;
@@ -1828,6 +1828,236 @@ fn test_db_snapshot_volume_uploads_files_and_keeps_incremental_manifest() {
     );
     assert!(Path::new(&format!("{}/{}/data", primary_root, db.id())).exists());
     db.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_resume_reuses_residual_primary_files_from_snapshot_volume() {
+    let root = "/tmp/db_resume_reuse_residual_primary";
+    let primary_root = format!("{root}/primary");
+    let snapshot_root = format!("{root}/snapshot");
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: vec![
+            VolumeDescriptor::new(
+                format!("file://{primary_root}"),
+                vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{snapshot_root}"),
+                vec![
+                    VolumeUsageKind::PrimaryDataPriorityLow,
+                    VolumeUsageKind::Snapshot,
+                    VolumeUsageKind::Meta,
+                ],
+            ),
+        ],
+        memtable_capacity: Size::from_const(128),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: Size::from_const(0),
+        value_separation_threshold: Some(Size::from_const(16)),
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config.clone());
+    db.put(0, b"key", 0, vec![b'v'; 128]).unwrap();
+    let snapshot_id = db.snapshot().unwrap();
+    let db_id = db.id().to_string();
+    let manifest = wait_for_manifest_in_db(&snapshot_root, &db_id, snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&manifest).unwrap();
+    let snapshot_file_names: BTreeSet<_> = snapshot_tree_file_paths(&manifest_json)
+        .into_iter()
+        .chain(snapshot_vlog_file_paths(&manifest_json))
+        .map(|path| path.rsplit('/').next().unwrap().to_string())
+        .collect();
+    assert!(!snapshot_file_names.is_empty());
+
+    // Simulate a stopped process whose high-primary directory has been retained by its caller.
+    // The manifest and its source replicas remain on the snapshot-capable low-primary volume;
+    // only immutable data-file replicas are placed back into the high-primary directory.
+    db.close().unwrap();
+    drop(db);
+    let primary_data_dir = format!("{primary_root}/{db_id}/data");
+    let deadline = Instant::now() + ASYNC_TEST_TIMEOUT;
+    loop {
+        let is_empty = !Path::new(&primary_data_dir).exists()
+            || std::fs::read_dir(&primary_data_dir)
+                .unwrap()
+                .next()
+                .is_none();
+        if is_empty {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "old primary files were not released before residual handoff simulation"
+        );
+        std::thread::sleep(ASYNC_TEST_POLL_INTERVAL);
+    }
+    std::fs::create_dir_all(&primary_data_dir).unwrap();
+    for file_name in &snapshot_file_names {
+        let snapshot_file = format!("{snapshot_root}/{db_id}/data/{file_name}");
+        let primary_file = format!("{primary_data_dir}/{file_name}");
+        if !Path::new(&primary_file).exists() {
+            std::fs::copy(&snapshot_file, &primary_file).unwrap();
+        }
+    }
+
+    let resumed = Db::resume_from_snapshot(config.clone(), snapshot_id, db_id.clone()).unwrap();
+    assert!(resumed.get(0, b"key").unwrap().is_some());
+    let primary_file_names: BTreeSet<_> = std::fs::read_dir(&primary_data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(primary_file_names, snapshot_file_names);
+    resumed.close().unwrap();
+    drop(resumed);
+    let deadline = Instant::now() + ASYNC_TEST_TIMEOUT;
+    while snapshot_file_names
+        .iter()
+        .any(|file_name| Path::new(&format!("{primary_data_dir}/{file_name}")).exists())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "adopted residual primary files were not released after close"
+        );
+        std::thread::sleep(ASYNC_TEST_POLL_INTERVAL);
+    }
+    for file_name in &snapshot_file_names {
+        assert!(
+            Path::new(&format!("{snapshot_root}/{db_id}/data/{file_name}")).exists(),
+            "snapshot replica must outlive the adopted primary replica"
+        );
+    }
+
+    // Disabling the scan leaves same-name residuals unowned and falls back to fresh-UUID copies.
+    for file_name in &snapshot_file_names {
+        std::fs::copy(
+            format!("{snapshot_root}/{db_id}/data/{file_name}"),
+            format!("{primary_data_dir}/{file_name}"),
+        )
+        .unwrap();
+    }
+    let mut scan_disabled = config;
+    scan_disabled.resume_primary_residual_scan_enabled = false;
+    let resumed = Db::resume_from_snapshot(scan_disabled, snapshot_id, db_id.clone()).unwrap();
+    assert!(resumed.get(0, b"key").unwrap().is_some());
+    let disabled_names: BTreeSet<_> = std::fs::read_dir(&primary_data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(snapshot_file_names.is_subset(&disabled_names));
+    assert!(disabled_names.len() > snapshot_file_names.len());
+    resumed.close().unwrap();
+    drop(resumed);
+    for file_name in &snapshot_file_names {
+        assert!(Path::new(&format!("{primary_data_dir}/{file_name}")).exists());
+    }
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_db_resume_falls_back_without_touching_size_mismatched_residual_primary_file() {
+    let root = "/tmp/db_resume_fallback_mismatched_residual_primary";
+    let primary_root = format!("{root}/primary");
+    let snapshot_root = format!("{root}/snapshot");
+    cleanup_test_root(root);
+    let config = Config {
+        volumes: vec![
+            VolumeDescriptor::new(
+                format!("file://{primary_root}"),
+                vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{snapshot_root}"),
+                vec![VolumeUsageKind::Snapshot, VolumeUsageKind::Meta],
+            ),
+        ],
+        memtable_capacity: Size::from_const(128),
+        memtable_buffer_count: 2,
+        num_columns: 1,
+        block_cache_size: Size::from_const(0),
+        value_separation_threshold: Some(Size::from_const(16)),
+        sst_bloom_filter_enabled: true,
+        ..Config::default()
+    };
+    let db = open_db(config.clone());
+    db.put(0, b"key", 0, vec![b'v'; 128]).unwrap();
+    let snapshot_id = db.snapshot().unwrap();
+    let db_id = db.id().to_string();
+    let manifest = wait_for_manifest_in_db(&snapshot_root, &db_id, snapshot_id);
+    let manifest_json: JsonValue = serde_json::from_str(&manifest).unwrap();
+    let tree_file_names: BTreeSet<_> = snapshot_tree_file_paths(&manifest_json)
+        .into_iter()
+        .map(|path| path.rsplit('/').next().unwrap().to_string())
+        .collect();
+    let bad_file_name = tree_file_names.iter().next().unwrap().clone();
+
+    db.close().unwrap();
+    drop(db);
+    let primary_data_dir = format!("{primary_root}/{db_id}/data");
+    let deadline = Instant::now() + ASYNC_TEST_TIMEOUT;
+    loop {
+        let is_empty = !Path::new(&primary_data_dir).exists()
+            || std::fs::read_dir(&primary_data_dir)
+                .unwrap()
+                .next()
+                .is_none();
+        if is_empty {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "old primary files were not released before residual handoff simulation"
+        );
+        std::thread::sleep(ASYNC_TEST_POLL_INTERVAL);
+    }
+    std::fs::create_dir_all(&primary_data_dir).unwrap();
+    for file_name in &tree_file_names {
+        std::fs::copy(
+            format!("{snapshot_root}/{db_id}/data/{file_name}"),
+            format!("{primary_data_dir}/{file_name}"),
+        )
+        .unwrap();
+    }
+    let bad_primary_file = format!("{primary_data_dir}/{bad_file_name}");
+    let expected_restored_bytes =
+        std::fs::read(format!("{snapshot_root}/{db_id}/data/{bad_file_name}")).unwrap();
+    std::fs::write(&bad_primary_file, b"bad residual").unwrap();
+
+    let resumed = Db::resume_from_snapshot(config, snapshot_id, db_id).unwrap();
+    assert!(resumed.get(0, b"key").unwrap().is_some());
+    assert_eq!(std::fs::read(&bad_primary_file).unwrap(), b"bad residual");
+
+    let restored_names: Vec<_> = std::fs::read_dir(&primary_data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !tree_file_names.contains(name))
+        .filter(|name| {
+            std::fs::read(format!("{primary_data_dir}/{name}"))
+                .is_ok_and(|bytes| bytes == expected_restored_bytes)
+        })
+        .collect();
+    assert_eq!(restored_names.len(), 1);
+    let restored_file_name = restored_names[0].clone();
+    assert_ne!(restored_file_name, bad_file_name);
+    let restored_primary_file = format!("{primary_data_dir}/{restored_file_name}");
+    assert!(Path::new(&restored_primary_file).exists());
+
+    resumed.close().unwrap();
+    drop(resumed);
+    let deadline = Instant::now() + ASYNC_TEST_TIMEOUT;
+    while Path::new(&restored_primary_file).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "managed fallback replica was not released after close"
+        );
+        std::thread::sleep(ASYNC_TEST_POLL_INTERVAL);
+    }
+    assert_eq!(std::fs::read(&bad_primary_file).unwrap(), b"bad residual");
     cleanup_test_root(root);
 }
 

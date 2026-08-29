@@ -38,6 +38,7 @@ fn test_posix_fs_read_write_and_mtime() {
         assert_eq!(written, data.len());
         writer.close().unwrap();
     }
+    assert_eq!(fs.file_size("example").unwrap(), Some(data.len() as u64));
     assert!(fs.last_modified("example").unwrap().is_some());
     {
         let reader = fs.open_read("example").unwrap();
@@ -55,6 +56,7 @@ fn test_posix_fs_list() {
     cleanup_test_root();
     let fs = PosixFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None).unwrap();
     fs.create_dir("list/subdir").unwrap();
+    assert_eq!(fs.file_size("list/subdir").unwrap(), None);
     {
         let mut writer = fs.open_write("list/a.txt").unwrap();
         writer.write(b"a").unwrap();

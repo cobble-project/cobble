@@ -61,6 +61,20 @@ fn snapshot_retention_must_be_positive_when_configured() {
 }
 
 #[test]
+fn resume_primary_residual_scan_defaults_on_and_can_be_disabled() {
+    assert!(
+        Config::from_json_str("{}")
+            .unwrap()
+            .resume_primary_residual_scan_enabled
+    );
+    assert!(
+        !Config::from_json_str(r#"{"resume_primary_residual_scan_enabled":false}"#)
+            .unwrap()
+            .resume_primary_residual_scan_enabled
+    );
+}
+
+#[test]
 fn test_resolved_write_stall_limit() {
     let mut config = Config::default();
     assert_eq!(config.resolved_write_stall_limit(), 32);
@@ -165,6 +179,7 @@ fn test_config_from_file_round_trip() {
         default_ttl_seconds: Some(120),
         value_separation_threshold: Some(Size::from_kib(4)),
         vlog_low_priority_primary_enabled: true,
+        resume_primary_residual_scan_enabled: false,
         time_provider: crate::time::TimeProviderKind::Manual,
         log_path: Some("/tmp/cobble.log".to_string()),
         log_max_file_size: Size::from_mib(16),
@@ -255,6 +270,7 @@ fn test_config_from_file_round_trip() {
     );
     assert_eq!(decoded.value_separation_threshold, Some(Size::from_kib(4)));
     assert!(decoded.vlog_low_priority_primary_enabled);
+    assert!(!decoded.resume_primary_residual_scan_enabled);
     assert_eq!(decoded.compaction_server_max_concurrent, 8);
     assert_eq!(decoded.compaction_server_max_queued, 32);
     assert_eq!(

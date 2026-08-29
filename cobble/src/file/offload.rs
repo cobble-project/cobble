@@ -607,6 +607,48 @@ impl FileManager {
         Ok((TrackedWriter::new(writer, Arc::clone(&tracked)), tracked))
     }
 
+    /// Creates a transfer destination that preserves the source basename when it is unused on
+    /// the target volume. A pre-existing path is never overwritten or adopted here; collisions
+    /// and existence-check errors fall back to a fresh UUID.
+    pub(crate) fn create_transfer_data_file_writer_on_volume(
+        &self,
+        volume: &Arc<DataVolume>,
+        source_path: &str,
+    ) -> crate::Result<(TrackedWriter, Arc<TrackedFile>)> {
+        let file_name = source_path
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                Error::InvalidState(format!(
+                    "Transfer source has no data-file basename: {source_path}"
+                ))
+            })?;
+        let preserved_path = self.data_file_path_with_name(file_name);
+        if volume.fs().exists(&preserved_path).unwrap_or(true) {
+            return self.create_untracked_data_file_writer_on_volume(volume);
+        }
+        let tracked = Arc::new(TrackedFile::managed(
+            preserved_path,
+            Arc::clone(volume.fs()),
+            Some(Arc::clone(volume)),
+        ));
+        let writer = volume.fs().open_write(tracked.path())?;
+        Ok((TrackedWriter::new(writer, Arc::clone(&tracked)), tracked))
+    }
+
+    /// Creates a snapshot-only replica under the source's data-file basename when that path is
+    /// available. Keeping this name makes the snapshot manifest path directly usable as a
+    /// residual-primary lookup key during resume. A collision uses a fresh UUID rather than
+    /// overwriting an existing snapshot file.
+    pub(crate) fn create_snapshot_replica_writer_on_volume(
+        &self,
+        volume: &Arc<DataVolume>,
+        source: &Arc<TrackedFile>,
+    ) -> crate::Result<(TrackedWriter, Arc<TrackedFile>)> {
+        self.create_transfer_data_file_writer_on_volume(volume, source.path())
+    }
+
     pub(crate) fn stop_offload_worker(&self) {
         self.offload_runtime.stop();
     }
@@ -1475,7 +1517,7 @@ impl FileManager {
         }
         let source_reader = source.fs().open_read(source.path())?;
         let (mut writer, owned) =
-            self.create_untracked_data_file_writer_on_volume(target_volume)?;
+            self.create_transfer_data_file_writer_on_volume(target_volume, source.path())?;
         self.copy_reader_to_tracked_writer_with_progress(
             source_reader.as_ref(),
             &mut writer,
@@ -1618,7 +1660,7 @@ impl FileManager {
         }
         let reader = source.fs().open_read(source.path())?;
         let (mut writer, owned) =
-            self.create_untracked_data_file_writer_on_volume(target_volume)?;
+            self.create_transfer_data_file_writer_on_volume(target_volume, source.path())?;
         self.copy_reader_to_tracked_writer_with_progress(reader.as_ref(), &mut writer, progress)?;
         owned.set_priority(source.priority());
         if logical
@@ -1671,7 +1713,7 @@ impl FileManager {
         } else {
             let reader = source.fs().open_read(source.path())?;
             let (mut writer, owned) =
-                self.create_untracked_data_file_writer_on_volume(target_volume)?;
+                self.create_transfer_data_file_writer_on_volume(target_volume, source.path())?;
             if let Err(err) = self.copy_reader_to_tracked_writer_with_progress(
                 reader.as_ref(),
                 &mut writer,
@@ -2061,7 +2103,7 @@ impl FileManager {
             .load(std::sync::atomic::Ordering::SeqCst);
         let source_reader = source_tracked.fs().open_read(source_tracked.path())?;
         let (mut writer, new_tracked) =
-            self.create_untracked_data_file_writer_on_volume(target_volume)?;
+            self.create_transfer_data_file_writer_on_volume(target_volume, source_tracked.path())?;
         if let Err(err) = self.copy_reader_to_tracked_writer_with_progress(
             source_reader.as_ref(),
             &mut writer,

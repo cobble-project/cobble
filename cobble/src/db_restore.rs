@@ -99,14 +99,14 @@ fn prepare_manifest_data_files_for_restore(
     file_manager: &Arc<FileManager>,
     manifest: &ManifestSnapshot,
     retained_owned_source_id: Option<&str>,
-) -> Result<()> {
+) -> Result<Vec<u64>> {
     let refs = ordered_manifest_data_file_refs_for_restore(
         manifest,
         file_manager.options.primary_volume_offload_policy,
         retained_owned_source_id,
     );
     if refs.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if let Some(max_file_id) = refs.iter().map(|item| item.file_id).max() {
         let min_next_file_id = max_file_id.saturating_add(1);
@@ -118,7 +118,7 @@ fn prepare_manifest_data_files_for_restore(
     let registry: Arc<dyn RestoreCopyResourceRegistry + Send + Sync> = resources.clone();
     let file_manager = Arc::clone(file_manager);
     let registry = Arc::clone(&registry);
-    std::thread::spawn(move || {
+    let residual_file_ids = std::thread::spawn(move || {
         let worker_threads = std::thread::available_parallelism()
             .map(|parallelism| parallelism.get())
             .unwrap_or(1)
@@ -138,7 +138,53 @@ fn prepare_manifest_data_files_for_restore(
     .join()
     .map_err(|_| Error::IoError("Restore worker thread panicked".to_string()))??;
     resources.finalize();
-    Ok(())
+    Ok(residual_file_ids)
+}
+
+fn register_scanned_primary_residuals(
+    file_manager: &Arc<FileManager>,
+    manifest: &ManifestSnapshot,
+) {
+    let mut candidates_by_name = HashMap::new();
+    for candidate in file_manager.scan_primary_residual_files() {
+        candidates_by_name
+            .entry(candidate.file_name.clone())
+            .or_insert_with(Vec::new)
+            .push(candidate);
+    }
+    if candidates_by_name.is_empty() {
+        return;
+    }
+
+    let refs = ordered_manifest_data_file_refs_for_restore(
+        manifest,
+        file_manager.options.primary_volume_offload_policy,
+        None,
+    );
+    for file in refs {
+        let Some(file_name) = file.path.rsplit('/').next() else {
+            continue;
+        };
+        let Some(candidates) = candidates_by_name.get(file_name) else {
+            continue;
+        };
+        let expected_size = file
+            .expected_size_bytes
+            .or_else(|| file_manager.data_file_size_at_path(&file.path).ok());
+        let Some(expected_size) = expected_size else {
+            continue;
+        };
+        for candidate in candidates {
+            if candidate.size_bytes != expected_size {
+                continue;
+            }
+            let _ = file_manager.register_primary_residual_replica(
+                file.file_id,
+                &candidate.absolute_path,
+                candidate.size_bytes,
+            );
+        }
+    }
 }
 
 async fn run_restore_prepare_jobs(
@@ -146,7 +192,7 @@ async fn run_restore_prepare_jobs(
     refs: Vec<RestoreFileRef>,
     registry: Arc<dyn RestoreCopyResourceRegistry + Send + Sync>,
     worker_count: usize,
-) -> Result<()> {
+) -> Result<Vec<u64>> {
     let worker_count = worker_count.max(1);
     let queue = Arc::new(Mutex::new(VecDeque::from(refs)));
     let mut join_set = JoinSet::new();
@@ -154,7 +200,8 @@ async fn run_restore_prepare_jobs(
         let file_manager = Arc::clone(&file_manager);
         let queue = Arc::clone(&queue);
         let registry = Arc::clone(&registry);
-        join_set.spawn_blocking(move || -> Result<()> {
+        join_set.spawn_blocking(move || -> Result<Vec<u64>> {
+            let mut residual_file_ids = Vec::new();
             loop {
                 let next = {
                     let mut guard = queue.lock().unwrap();
@@ -163,22 +210,28 @@ async fn run_restore_prepare_jobs(
                 let Some(file) = next else {
                     break;
                 };
-                file_manager.register_data_file_for_restore(
+                if file_manager.register_data_file_for_restore(
                     file.file_id,
                     &file.path,
                     file.origin,
                     file.placement,
-                    Some(file.size_bytes),
+                    file.expected_size_bytes,
                     Some(Arc::clone(&registry)),
-                )?;
+                )? {
+                    residual_file_ids.push(file.file_id);
+                }
             }
-            Ok(())
+            Ok(residual_file_ids)
         });
     }
+    let mut residual_file_ids = Vec::new();
     while let Some(joined) = join_set.join_next().await {
-        joined.map_err(|err| Error::IoError(format!("Restore worker join failed: {}", err)))??;
+        residual_file_ids.extend(
+            joined
+                .map_err(|err| Error::IoError(format!("Restore worker join failed: {}", err)))??,
+        );
     }
-    Ok(())
+    Ok(residual_file_ids)
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +240,7 @@ struct RestoreFileRef {
     path: String,
     origin: ReplicaOrigin,
     size_bytes: u64,
+    expected_size_bytes: Option<u64>,
     priority: u8,
     placement: PrimaryDataPlacement,
 }
@@ -206,11 +260,18 @@ fn ordered_manifest_data_file_refs_for_restore(
                     path: file.path.clone(),
                     origin: restore_source_origin(&file.origin, retained_owned_source_id),
                     size_bytes: file.size as u64,
+                    expected_size_bytes: Some(file.size as u64),
                     priority: level_priority,
                     placement: PrimaryDataPlacement::Standard,
                 });
                 if file.size as u64 > entry.size_bytes {
                     entry.size_bytes = file.size as u64;
+                }
+                if entry
+                    .expected_size_bytes
+                    .is_none_or(|size| file.size as u64 > size)
+                {
+                    entry.expected_size_bytes = Some(file.size as u64);
                 }
                 if level_priority < entry.priority {
                     entry.priority = level_priority;
@@ -224,6 +285,7 @@ fn ordered_manifest_data_file_refs_for_restore(
             path: file.path.clone(),
             origin: restore_source_origin(&file.origin, retained_owned_source_id),
             size_bytes: 0,
+            expected_size_bytes: None,
             priority: VLOG_FILE_PRIORITY,
             placement: PrimaryDataPlacement::Vlog,
         });
@@ -284,7 +346,7 @@ fn open_restored_db_from_manifest(
     retained_owned_source_id: Option<String>,
     recovery_wal_volume: Option<VolumeDescriptor>,
 ) -> Result<Db> {
-    prepare_manifest_data_files_for_restore(
+    let residual_primary_file_ids = prepare_manifest_data_files_for_restore(
         &file_manager,
         &manifest,
         retained_owned_source_id.as_deref(),
@@ -352,6 +414,10 @@ fn open_restored_db_from_manifest(
     db.memtable_manager.open()?;
     if let Some(recovery_wal_volume) = recovery_wal_volume.as_ref() {
         db.replay_wal_after_checkpoint(manifest.wal_checkpoint_id, recovery_wal_volume)?;
+    }
+    file_manager.commit_logical_files(residual_primary_file_ids.iter().copied());
+    for file_id in residual_primary_file_ids {
+        file_manager.adopt_primary_residual_replicas(file_id);
     }
     db.db_lifecycle.mark_open()?;
     db.start_dedicated_poller();
@@ -897,7 +963,11 @@ impl Db {
                 selected_snapshot_id
             )));
         }
-        prepare_manifest_data_files_for_restore(&file_manager, &manifest, None)?;
+        if config.resume_primary_residual_scan_enabled {
+            register_scanned_primary_residuals(&file_manager, &manifest);
+        }
+        let residual_primary_file_ids =
+            prepare_manifest_data_files_for_restore(&file_manager, &manifest, None)?;
         let bucket_ranges = manifest.bucket_ranges.clone();
         let _lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
             manifest.bucket_ranges.clone()
@@ -992,6 +1062,11 @@ impl Db {
         db.memtable_manager.open()?;
         if let Some(recovery_wal_volume) = recovery_wal_volume.as_ref() {
             db.replay_wal_after_checkpoint(manifest.wal_checkpoint_id, recovery_wal_volume)?;
+        }
+        db.file_manager
+            .commit_logical_files(residual_primary_file_ids.iter().copied());
+        for file_id in residual_primary_file_ids {
+            db.file_manager.adopt_primary_residual_replicas(file_id);
         }
         db.db_lifecycle.mark_open()?;
         db.start_dedicated_poller();

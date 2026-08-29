@@ -8,6 +8,9 @@ public interface CustomFileSystem extends AutoCloseable {
     /** Returns whether the provided path exists. */
     boolean exists(String path);
 
+    /** Returns the regular-file size in bytes, or {@code null} for a non-file path. */
+    Long fileSize(String path);
+
     /** Deletes a file or directory path recursively. */
     void delete(String path);
 

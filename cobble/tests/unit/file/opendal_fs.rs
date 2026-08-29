@@ -52,6 +52,7 @@ fn test_opendal_read_write() {
         assert_eq!(written, data.len());
         writer.close().unwrap();
     }
+    assert_eq!(fs.file_size("example").unwrap(), Some(data.len() as u64));
     {
         let reader = fs.open_read("example").unwrap();
         let read = reader.read_at(0, data.len()).unwrap();
@@ -66,6 +67,7 @@ fn test_opendal_fs_list() {
     cleanup_test_root();
     let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None).unwrap();
     fs.create_dir("list/subdir").unwrap();
+    assert_eq!(fs.file_size("list/subdir").unwrap(), None);
     {
         let mut writer = fs.open_write("list/a.txt").unwrap();
         writer.write(b"a").unwrap();

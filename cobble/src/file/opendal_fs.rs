@@ -166,6 +166,13 @@ fn resolve_goosefs_master_addr_root(
 }
 
 impl FileSystem for OpendalFileSystem {
+    fn file_size(&self, path: &str) -> Result<Option<u64>> {
+        self.runtime
+            .block_on(self.op.stat(path))
+            .map(|metadata| metadata.is_file().then_some(metadata.content_length()))
+            .map_err(|e| Error::IoError(format!("Failed to stat {}: {}", path, e)))
+    }
+
     fn init(
         url: &Url,
         access_id: Option<String>,

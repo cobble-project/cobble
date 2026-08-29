@@ -147,6 +147,9 @@ own filesystem stack for Cobble volume access.
 - `CustomFileSystem`: filesystem operations used by Cobble native runtime.
 - `CustomRandomAccessFile` / `CustomSequentialWriteFile`: file handles for read/write operations.
 
+`CustomFileSystem.fileSize(path)` should return regular-file size metadata without opening a read
+handle, or `null` when the path is not a regular file.
+
 ### Direct I/O Capability Contract
 
 - `supportDirect()` declares whether the file handle supports direct `ByteBuffer` paths.

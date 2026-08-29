@@ -46,6 +46,84 @@ fn create_test_file_manager() -> (Arc<dyn FileSystem>, FileManager) {
 
 #[test]
 #[serial_test::serial(file)]
+fn resume_residual_scan_registers_all_matching_primary_tiers() {
+    let root = "/tmp/file_manager_resume_residual_scan";
+    let _ = std::fs::remove_dir_all(root);
+    let high_root = format!("{root}/high");
+    let low_root = format!("{root}/low");
+    let config = Config {
+        volumes: vec![
+            crate::VolumeDescriptor::new(
+                format!("file://{high_root}"),
+                vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+            ),
+            crate::VolumeDescriptor::new(
+                format!("file://{low_root}"),
+                vec![VolumeUsageKind::PrimaryDataPriorityLow],
+            ),
+        ],
+        ..Config::default()
+    };
+    for volume_root in [&high_root, &low_root] {
+        std::fs::create_dir_all(format!("{volume_root}/db/data/nested")).unwrap();
+        std::fs::write(format!("{volume_root}/db/data/shared.sst"), b"shared").unwrap();
+        std::fs::write(
+            format!("{volume_root}/db/data/nested/ignored.sst"),
+            b"ignored",
+        )
+        .unwrap();
+    }
+    let fm = FileManager::from_config(
+        &config,
+        "db",
+        Arc::new(MetricsManager::new("resume-residual-scan")),
+    )
+    .unwrap();
+
+    let candidates = fm.scan_primary_residual_files();
+    assert_eq!(candidates.len(), 2);
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.file_name == "shared.sst")
+    );
+    for candidate in candidates {
+        fm.register_primary_residual_replica(7, &candidate.absolute_path, candidate.size_bytes)
+            .unwrap();
+    }
+    let logical = fm.get_logical_file(7).unwrap();
+    assert_eq!(logical.replica_ids().len(), 2);
+    assert!(fm.select_primary_residual_replica(7, PrimaryDataPlacement::Standard));
+    assert_eq!(
+        logical
+            .preferred_replica_any()
+            .unwrap()
+            .tracked
+            .volume
+            .as_ref()
+            .unwrap()
+            .priority
+            .rank(),
+        3
+    );
+    fm.commit_logical_files([7]);
+    fm.adopt_primary_residual_replicas(7);
+    assert!(
+        logical
+            .replica_state_snapshot()
+            .replicas
+            .iter()
+            .all(|replica| {
+                replica.lifecycle() == ReplicaLifecycle::OwnedReady
+                    && replica.tracked.physical_delete_policy()
+                        == PhysicalDeletePolicy::ManagedDelete
+            })
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_logical_file_attachment_metadata_and_replica_replacement() {
     let (fs, fm) = create_test_file_manager();
     let fm = Arc::new(fm);
@@ -207,6 +285,19 @@ fn test_logical_file_attachment_metadata_and_replica_replacement() {
             .unwrap()
             .physical_delete_policy(),
         PhysicalDeletePolicy::Retained
+    );
+    fm.commit_logical_files([file_id + 2]);
+    fm.adopt_data_file(file_id + 2).unwrap();
+    assert_eq!(pending.commit_state(), FileCommitState::Committed);
+    assert_eq!(
+        pending.preferred_replica_lifecycle(),
+        Some(ReplicaLifecycle::OwnedReady)
+    );
+    assert_eq!(
+        fm.data_file_ref(file_id + 2)
+            .unwrap()
+            .physical_delete_policy(),
+        PhysicalDeletePolicy::ManagedDelete
     );
     fm.register_uncommitted_data_file(file_id + 3, &path)
         .unwrap();
@@ -1032,6 +1123,10 @@ fn test_register_data_file_for_restore_copies_from_readonly_source() {
     .unwrap();
     assert!(fm.is_data_file_on_primary_volume(42));
     assert_eq!(fm.preferred_replica_origin(42), Some(ReplicaOrigin::Owned));
+    assert_eq!(
+        fm.get_data_file_path(42).as_deref(),
+        Some("db/data/source.sst")
+    );
     let restored_reader = fm.open_data_file_reader(42).unwrap();
     assert_eq!(
         &restored_reader.read_at(0, "restore-source".len()).unwrap()[..],
@@ -1225,12 +1320,16 @@ fn test_register_data_file_for_restore_copies_from_readonly_data_dir() {
     )
     .unwrap();
     assert!(fm.is_data_file_on_primary_volume(77));
+    assert_eq!(
+        fm.get_data_file_path(77).as_deref(),
+        Some("db/data/source.sst")
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 #[serial_test::serial(file)]
-fn test_register_data_file_for_restore_keeps_existing_primary_vlog() {
+fn test_register_data_file_for_restore_moves_primary_vlog_to_requested_tier() {
     let root = "/tmp/file_manager_restore_primary_source_owned";
     let primary_root = format!("{}/primary", root);
     let low_primary_root = format!("{}/low-primary", root);
@@ -1268,8 +1367,8 @@ fn test_register_data_file_for_restore_keeps_existing_primary_vlog() {
     let tracked = fm.preferred_tracked_file(120).unwrap();
     assert_eq!(
         tracked.volume.as_ref().map(|volume| volume.priority.rank()),
-        Some(3),
-        "an existing primary VLOG replica is not rebalanced"
+        Some(1),
+        "restore placement moves a VLOG source into the configured low tier"
     );
     assert_eq!(
         tracked.physical_delete_policy(),
@@ -1280,6 +1379,9 @@ fn test_register_data_file_for_restore_keeps_existing_primary_vlog() {
     drop(tracked);
     fm.remove_data_file(120).unwrap();
     test_utils::wait_for_file_deletion(&tracked_fs, &tracked_path);
-    assert!(!std::path::Path::new(&source_local_path).exists());
+    assert!(
+        std::path::Path::new(&source_local_path).exists(),
+        "the copied source remains outside the restored logical-file lifecycle"
+    );
     let _ = std::fs::remove_dir_all(root);
 }

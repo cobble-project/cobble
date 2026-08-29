@@ -533,6 +533,9 @@ fn test_offload_move_is_async_and_keeps_reads_available() {
 
     let old_path = fm.get_data_file_path(file_id).unwrap();
     assert!(high_fs.exists(&old_path).unwrap());
+    let mut residual_writer = low_fs.open_write(&old_path).unwrap();
+    residual_writer.write(&payload).unwrap();
+    residual_writer.close().unwrap();
     let old_reader = fm.open_data_file_reader(file_id).unwrap();
     let target_volume = fm.primary_volume_by_rank(1).unwrap();
 
@@ -547,6 +550,10 @@ fn test_offload_move_is_async_and_keeps_reads_available() {
     let new_path = fm.get_data_file_path(file_id).unwrap();
     assert_ne!(old_path, new_path);
     assert!(low_fs.exists(&new_path).unwrap());
+    assert!(
+        low_fs.exists(&old_path).unwrap(),
+        "normal offload must not adopt an unregistered same-name residual"
+    );
     let new_reader = fm.open_data_file_reader(file_id).unwrap();
     assert_eq!(
         new_reader.read_at(payload.len() - 16, 16).unwrap().as_ref(),
@@ -617,6 +624,8 @@ fn persistent_cache_moves_without_changing_durable_route_and_evicts_when_low_is_
         fm.cache_external_persistent_file(file_id, &high_volume, &mut |_| {})
             .unwrap()
     );
+    let high_cache_path = fm.get_data_file_path(file_id).unwrap();
+    assert_eq!(high_cache_path, "db/data/external.sst");
     assert!(
         fm.move_persistent_cache_to_volume_with_progress(
             file_id,
@@ -626,6 +635,7 @@ fn persistent_cache_moves_without_changing_durable_route_and_evicts_when_low_is_
         )
         .unwrap()
     );
+    assert_eq!(fm.get_data_file_path(file_id).unwrap(), high_cache_path);
     assert_eq!(
         fm.preferred_tracked_file(file_id)
             .unwrap()
@@ -767,6 +777,8 @@ fn test_offload_promotes_existing_snapshot_replica_on_target_volume() {
     let source_path = fm.get_data_file_path(source_file_id).unwrap();
 
     let source = fm.data_file_ref(source_file_id).unwrap();
+    let source_absolute_path = source.absolute_path();
+    let source_volume = Arc::clone(source.volume.as_ref().unwrap());
     let logical = fm.get_logical_file(source_file_id).unwrap();
     let snapshot_replica = fm
         .snapshot_replica_for_tracked_file(source_file_id, &source, Some(&logical), None, None)
@@ -779,6 +791,11 @@ fn test_offload_promotes_existing_snapshot_replica_on_target_volume() {
         .unwrap();
     logical.set_replica_lifecycle(replica_id, ReplicaLifecycle::OwnedReady);
     let snapshot_replica_path = snapshot_replica.path().to_string();
+    let snapshot_replica_absolute_path = snapshot_replica.absolute_path();
+    let snapshot_volume = Arc::clone(snapshot_replica.volume.as_ref().unwrap());
+    assert_eq!(source_path, snapshot_replica_path);
+    assert_ne!(source_absolute_path, snapshot_replica_absolute_path);
+    assert!(!Arc::ptr_eq(&source_volume, &snapshot_volume));
 
     let target_volume = fm.primary_volume_by_rank(1).unwrap();
     let promoted = fm
@@ -789,8 +806,17 @@ fn test_offload_promotes_existing_snapshot_replica_on_target_volume() {
         fm.get_data_file_path(source_file_id).unwrap(),
         snapshot_replica_path
     );
-    assert_ne!(source_path, snapshot_replica_path);
     assert_eq!(logical.replica_ids().len(), 1);
+    assert!(Arc::ptr_eq(
+        logical
+            .preferred_replica_any()
+            .unwrap()
+            .tracked
+            .volume
+            .as_ref()
+            .unwrap(),
+        &target_volume
+    ));
     assert!(
         !Arc::ptr_eq(&logical.preferred_replica_any().unwrap().tracked, &source),
         "promotion must remove the old preferred source replica"
@@ -1156,6 +1182,9 @@ fn readonly_load_pins_eligible_sst_after_promotion_and_reuses_it() {
         .unwrap(),
     );
     let data_file = register_readonly_sst(&fm, &readonly_root, 301, true);
+    let readonly_source = readonly_root.join("db/data/301.sst");
+    let residual_target = primary_root.join("readonly-load-pin/data/301.sst");
+    std::fs::copy(&readonly_source, &residual_target).unwrap();
     let db_state = Arc::new(DbStateHandle::new());
     store_readonly_sst_state(&db_state, 0, Arc::clone(&data_file));
 
@@ -1170,6 +1199,17 @@ fn readonly_load_pins_eligible_sst_after_promotion_and_reuses_it() {
     assert_eq!(fm.trigger_primary_tiering_if_needed(&db_state).unwrap(), 1);
     assert!(fm.wait_for_offload_idle(Duration::from_secs(5)));
     assert!(fm.is_data_file_on_primary_volume(data_file.file_id));
+    assert_ne!(
+        fm.get_data_file_path(data_file.file_id).as_deref(),
+        Some("readonly-load-pin/data/301.sst"),
+        "runtime readonly loading must not adopt an unregistered residual"
+    );
+    assert_eq!(
+        std::fs::read_dir(residual_target.parent().unwrap())
+            .unwrap()
+            .count(),
+        2
+    );
 
     let pin = data_file
         .pinned_sst_read_metadata()
@@ -1598,6 +1638,12 @@ fn test_primary_tiering_worker_backfills_only_current_lsm_files() {
     let l0_file_id = create_on_low(256);
     let vlog_file_id = create_on_low(256);
     let unreferenced_file_id = create_on_low(256);
+    let l0_low_path = fm.get_data_file_path(l0_file_id).unwrap();
+    std::fs::copy(
+        format!("{root}/low/{l0_low_path}"),
+        format!("{root}/high/{l0_low_path}"),
+    )
+    .unwrap();
 
     let data_file = Arc::new(crate::data_file::DataFile::new(
         crate::data_file::DataFileType::SSTable,
@@ -1668,6 +1714,11 @@ fn test_primary_tiering_worker_backfills_only_current_lsm_files() {
     assert!(fm.wait_for_offload_idle(Duration::from_secs(20)));
 
     assert!(moved, "the current L0 file should be backfilled");
+    assert_ne!(
+        fm.get_data_file_path(l0_file_id).as_deref(),
+        Some(l0_low_path.as_str()),
+        "runtime backfill must not adopt an unregistered residual"
+    );
     assert_eq!(
         fm.preferred_tracked_file(vlog_file_id)
             .and_then(|tracked| { tracked.volume.as_ref().map(|volume| volume.priority.rank()) }),
@@ -1696,7 +1747,13 @@ fn test_create_data_file_with_offload_triggers_background_offload() {
     let mut high =
         crate::VolumeDescriptor::new(high_url, vec![VolumeUsageKind::PrimaryDataPriorityHigh]);
     high.size_limit = Some(Size::from_kib(1));
-    let low = crate::VolumeDescriptor::new(low_url, vec![VolumeUsageKind::PrimaryDataPriorityLow]);
+    let low = crate::VolumeDescriptor::new(
+        low_url,
+        vec![
+            VolumeUsageKind::PrimaryDataPriorityLow,
+            VolumeUsageKind::Snapshot,
+        ],
+    );
     let config = Config {
         volumes: vec![high, low],
         base_file_size: Size::from_const(64),
@@ -1719,8 +1776,18 @@ fn test_create_data_file_with_offload_triggers_background_offload() {
 
     assert!(fm.wait_for_offload_idle(Duration::from_secs(20)));
     let new_path = fm.get_data_file_path(file_id).unwrap();
-    assert_ne!(new_path, old_path);
+    assert_eq!(new_path, old_path);
     assert!(low_fs.exists(&new_path).unwrap());
+
+    let current = fm.data_file_ref(file_id).unwrap();
+    assert!(current.absolute_path().contains("/low/"));
+    let logical = fm.get_logical_file(file_id).unwrap();
+    let snapshot_replica = fm
+        .snapshot_replica_for_tracked_file(file_id, &current, Some(&logical), None, None)
+        .unwrap();
+    assert!(Arc::ptr_eq(&current, &snapshot_replica));
+    assert_eq!(snapshot_replica.path(), old_path);
+    current.dereference();
     let _ = std::fs::remove_dir_all(root);
 }
 

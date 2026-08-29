@@ -41,6 +41,13 @@ exactly or replay the durable WAL tail after the latest snapshot.
 
 For distributed deployments, the restore order matters: restore the coordinator first to load the global manifest, then restore each shard using its referenced shard snapshot.
 
+By default, resume also performs a shallow, best-effort scan of each built-in POSIX primary data
+directory. If a first-level file has the same UUID filename and size as a file referenced by the
+selected snapshot, Cobble registers that file as an existing primary replica instead of copying it
+again. Matching replicas across primary tiers are all adopted only after snapshot-chain, memtable,
+and WAL recovery succeeds. A missing or mismatched file simply uses the normal restore copy path.
+Set `resume_primary_residual_scan_enabled` to `false` to disable this optimization.
+
 ## Snapshot Retention
 
 By default, Cobble keeps all snapshots. In long-running systems, old snapshots accumulate and prevent [compaction](compaction) from reclaiming space (since old file versions are still referenced). The `snapshot_retention` parameter limits how many snapshots are kept — older ones are automatically expired and their exclusively-referenced files become eligible for cleanup.
