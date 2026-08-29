@@ -742,6 +742,21 @@ impl PyStructuredSingleDb {
         let db = Arc::clone(&self.db);
         py.detach(move || db.close().map_err(map_error))
     }
+
+    fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exception_type: &Bound<'_, PyAny>,
+        _exception: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
+    }
 }
 
 #[pyclass(name = "StructuredDb", module = "pycobble._native")]
@@ -1408,6 +1423,21 @@ impl PyStructuredDb {
         }
         let db = Arc::clone(&self.db);
         py.detach(move || db.close().map_err(map_error))
+    }
+
+    fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exception_type: &Bound<'_, PyAny>,
+        _exception: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
     }
 }
 

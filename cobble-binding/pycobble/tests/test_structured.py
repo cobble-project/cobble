@@ -270,19 +270,19 @@ def test_structured_snapshot_recovery_and_lifecycle(tmp_path: Path) -> None:
 
 
 def test_structured_single_snapshot_management(tmp_path: Path) -> None:
-    db = pycobble.StructuredSingleDb.open(config(tmp_path / "single-snapshots"))
-    db.put_bytes(0, b"key", 0, b"value")
-    pending = db.start_snapshot()
-    manifest = pending.wait()
-    assert db.get_snapshot(manifest.id).id == manifest.id
-    assert [item.id for item in db.list_snapshots()] == [manifest.id]
-    assert db.retain_snapshot(manifest.id)
-    assert db.retain_snapshot(manifest.id)
-    next_time = db.now_seconds() + 4321
-    db.set_time(next_time)
-    assert db.now_seconds() == next_time
-    db.switch_memtable_type(pycobble.MemtableType.Hash)
-    assert isinstance(db.load_readonly_files_to_primary(), int)
+    with pycobble.StructuredSingleDb.open(config(tmp_path / "single-snapshots")) as db:
+        db.put_bytes(0, b"key", 0, b"value")
+        pending = db.start_snapshot()
+        manifest = pending.wait()
+        assert db.get_snapshot(manifest.id).id == manifest.id
+        assert [item.id for item in db.list_snapshots()] == [manifest.id]
+        assert db.retain_snapshot(manifest.id)
+        assert db.retain_snapshot(manifest.id)
+        next_time = db.now_seconds() + 4321
+        db.set_time(next_time)
+        assert db.now_seconds() == next_time
+        db.switch_memtable_type(pycobble.MemtableType.Hash)
+        assert isinstance(db.load_readonly_files_to_primary(), int)
     db.close()
 
 
