@@ -2,10 +2,14 @@ use crate::error::{Error, Result};
 use crate::file::file_system::FileSystem;
 use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::file::opendal_file::{OpendalRandomAccessFile, OpendalSequentialWriteFile};
+#[cfg(windows)]
+use crate::file::windows_fs::same_volume;
 use ::opendal::layers::{RetryLayer, TimeoutLayer};
 use ::opendal::{Entry, ErrorKind, Metadata, Operator};
 use std::collections::HashMap;
 use std::net::IpAddr;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
@@ -13,6 +17,17 @@ use url::Url;
 pub struct OpendalFileSystem {
     pub(crate) op: Operator,
     runtime: Arc<tokio::runtime::Runtime>,
+    #[cfg(windows)]
+    local_root: Option<PathBuf>,
+}
+
+impl OpendalFileSystem {
+    #[cfg(windows)]
+    fn local_path(&self, path: &str) -> Option<PathBuf> {
+        self.local_root
+            .as_ref()
+            .map(|root| root.join(path.trim_start_matches('/')))
+    }
 }
 
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -177,6 +192,74 @@ impl FileSystem for OpendalFileSystem {
             .map_err(|e| Error::IoError(format!("Failed to stat {}: {}", path, e)))
     }
 
+    #[cfg(windows)]
+    fn can_fast_copy_to(
+        &self,
+        source_path: &str,
+        destination: &crate::file::FastCopyDestination<'_>,
+    ) -> bool {
+        let Some(source_path) = self.local_path(source_path) else {
+            return false;
+        };
+        let Some(destination_fs) = destination
+            .file_system()
+            .as_any()
+            .downcast_ref::<OpendalFileSystem>()
+        else {
+            return false;
+        };
+        let Some(destination_path) = destination_fs.local_path(destination.path()) else {
+            return false;
+        };
+        let Some(destination_parent) = destination_path.parent() else {
+            return false;
+        };
+        let Ok(source_metadata) = std::fs::metadata(&source_path) else {
+            return false;
+        };
+        let Ok(destination_metadata) = std::fs::metadata(destination_parent) else {
+            return false;
+        };
+        source_metadata.is_file()
+            && destination_metadata.is_dir()
+            && same_volume(&source_path, destination_parent)
+    }
+
+    #[cfg(windows)]
+    fn fast_copy_to(
+        &self,
+        source_path: &str,
+        destination: &crate::file::FastCopyDestination<'_>,
+    ) -> Result<()> {
+        let source_path = self.local_path(source_path).ok_or_else(|| {
+            Error::FileSystemError("Fast copy source is not a local filesystem".to_string())
+        })?;
+        let destination_fs = destination
+            .file_system()
+            .as_any()
+            .downcast_ref::<OpendalFileSystem>()
+            .ok_or_else(|| {
+                Error::FileSystemError(
+                    "Fast copy destination is not a local filesystem".to_string(),
+                )
+            })?;
+        let destination_path = destination_fs
+            .local_path(destination.path())
+            .ok_or_else(|| {
+                Error::FileSystemError(
+                    "Fast copy destination is not a local filesystem".to_string(),
+                )
+            })?;
+        std::fs::hard_link(&source_path, &destination_path).map_err(|error| {
+            Error::IoError(format!(
+                "Failed to hard link {} to {}: {}",
+                source_path.display(),
+                destination_path.display(),
+                error
+            ))
+        })
+    }
+
     fn init(
         url: &Url,
         access_id: Option<String>,
@@ -265,6 +348,12 @@ impl FileSystem for OpendalFileSystem {
         if let Some(custom_options) = custom_options {
             options.extend(custom_options);
         }
+        #[cfg(windows)]
+        let local_root = if scheme == "fs" {
+            options.get("root").map(PathBuf::from)
+        } else {
+            None
+        };
         let op = Operator::via_iter(&scheme, options).map_err(|e| {
             Error::FileSystemError(format!(
                 "Failed to create opendal operator for scheme '{}': {}. Enable the matching cobble storage feature (for example: storage-s3, storage-oss, storage-cos, storage-alluxio, storage-goosefs).",
@@ -287,6 +376,8 @@ impl FileSystem for OpendalFileSystem {
                     Error::FileSystemError(format!("Failed to create tokio runtime: {}", e))
                 })?
                 .into(),
+            #[cfg(windows)]
+            local_root,
         })
     }
 

@@ -8,6 +8,8 @@ mod opendal_file;
 mod opendal_fs;
 #[cfg(unix)]
 mod posix_fs;
+#[cfg(windows)]
+mod windows_fs;
 
 pub(crate) use self::file_manager::DataVolume;
 pub(crate) use self::file_manager::FileManagerMetrics;

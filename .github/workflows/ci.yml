@@ -230,3 +230,6 @@ jobs:
 
       - name: cargo check (storage-all except hdfs and sftp)
         run: cargo check -p cobble --features storage-alluxio,storage-cos,storage-ftp,storage-goosefs,storage-oss,storage-s3
+
+      - name: Test Windows local fast copy
+        run: cargo test -p cobble --lib test_windows_local_fs_fast_copy_uses_hard_link_on_the_same_volume -- --nocapture

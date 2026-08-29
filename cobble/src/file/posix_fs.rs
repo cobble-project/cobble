@@ -45,34 +45,25 @@ impl FileSystem for PosixFileSystem {
         source_path: &str,
         destination: &crate::file::FastCopyDestination<'_>,
     ) -> bool {
-        #[cfg(not(unix))]
-        {
-            let _ = (source_path, destination);
+        let source_path = self.resolve_path(source_path);
+        let Some(destination_fs) = destination
+            .file_system()
+            .as_any()
+            .downcast_ref::<PosixFileSystem>()
+        else {
             return false;
-        }
-
-        #[cfg(unix)]
-        {
-            let source_path = self.resolve_path(source_path);
-            let Some(destination_fs) = destination
-                .file_system()
-                .as_any()
-                .downcast_ref::<PosixFileSystem>()
-            else {
-                return false;
-            };
-            let destination_path = destination_fs.resolve_path(destination.path());
-            let Some(destination_parent) = destination_path.parent() else {
-                return false;
-            };
-            let Ok(source_metadata) = std::fs::metadata(source_path) else {
-                return false;
-            };
-            let Ok(destination_metadata) = std::fs::metadata(destination_parent) else {
-                return false;
-            };
-            source_metadata.is_file() && source_metadata.dev() == destination_metadata.dev()
-        }
+        };
+        let destination_path = destination_fs.resolve_path(destination.path());
+        let Some(destination_parent) = destination_path.parent() else {
+            return false;
+        };
+        let Ok(source_metadata) = std::fs::metadata(source_path) else {
+            return false;
+        };
+        let Ok(destination_metadata) = std::fs::metadata(destination_parent) else {
+            return false;
+        };
+        source_metadata.is_file() && source_metadata.dev() == destination_metadata.dev()
     }
 
     fn fast_copy_to(

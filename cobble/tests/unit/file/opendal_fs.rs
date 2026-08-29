@@ -24,6 +24,40 @@ fn test_local_fs_root_uses_native_platform_path() {
 
 #[test]
 #[serial_test::serial(file)]
+#[cfg(windows)]
+fn test_windows_local_fs_fast_copy_uses_hard_link_on_the_same_volume() {
+    let root = tempfile::tempdir().unwrap();
+    let source_root = root.path().join("source");
+    let destination_root = root.path().join("destination");
+    std::fs::create_dir_all(&source_root).unwrap();
+    std::fs::create_dir_all(&destination_root).unwrap();
+    let source_url = Url::from_directory_path(&source_root).unwrap();
+    let destination_url = Url::from_directory_path(&destination_root).unwrap();
+    let source_fs =
+        OpendalFileSystem::init(&source_url, None, None, None).expect("source filesystem");
+    let destination_fs = OpendalFileSystem::init(&destination_url, None, None, None)
+        .expect("destination filesystem");
+    source_fs.create_dir("data").unwrap();
+    destination_fs.create_dir("data").unwrap();
+    let mut writer = source_fs.open_write("data/file.sst").unwrap();
+    writer.write(b"fast-copy").unwrap();
+    writer.close().unwrap();
+
+    let destination = crate::file::FastCopyDestination::new(&destination_fs, "data/file.sst");
+    assert!(source_fs.can_fast_copy_to("data/file.sst", &destination));
+    source_fs
+        .fast_copy_to("data/file.sst", &destination)
+        .unwrap();
+
+    std::fs::write(source_root.join("data/file.sst"), b"updated").unwrap();
+    assert_eq!(
+        std::fs::read(destination_root.join("data/file.sst")).unwrap(),
+        b"updated"
+    );
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_opendal_fs_basic() {
     cleanup_test_root();
     let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None);
