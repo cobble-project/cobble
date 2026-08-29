@@ -166,6 +166,10 @@ fn resolve_goosefs_master_addr_root(
 }
 
 impl FileSystem for OpendalFileSystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn file_size(&self, path: &str) -> Result<Option<u64>> {
         self.runtime
             .block_on(self.op.stat(path))

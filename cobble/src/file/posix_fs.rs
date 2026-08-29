@@ -6,6 +6,8 @@ use positioned_io::ReadAt;
 use std::collections::HashMap;
 use std::fs::{File as StdFile, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::UNIX_EPOCH;
@@ -23,6 +25,10 @@ impl PosixFileSystem {
 }
 
 impl FileSystem for PosixFileSystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn is_posix(&self) -> bool {
         true
     }
@@ -32,6 +38,67 @@ impl FileSystem for PosixFileSystem {
         let metadata = std::fs::metadata(&resolved)
             .map_err(|e| Error::IoError(format!("Failed to stat {}: {}", resolved.display(), e)))?;
         Ok(metadata.is_file().then_some(metadata.len()))
+    }
+
+    fn can_fast_copy_to(
+        &self,
+        source_path: &str,
+        destination: &crate::file::FastCopyDestination<'_>,
+    ) -> bool {
+        #[cfg(not(unix))]
+        {
+            let _ = (source_path, destination);
+            return false;
+        }
+
+        #[cfg(unix)]
+        {
+            let source_path = self.resolve_path(source_path);
+            let Some(destination_fs) = destination
+                .file_system()
+                .as_any()
+                .downcast_ref::<PosixFileSystem>()
+            else {
+                return false;
+            };
+            let destination_path = destination_fs.resolve_path(destination.path());
+            let Some(destination_parent) = destination_path.parent() else {
+                return false;
+            };
+            let Ok(source_metadata) = std::fs::metadata(source_path) else {
+                return false;
+            };
+            let Ok(destination_metadata) = std::fs::metadata(destination_parent) else {
+                return false;
+            };
+            source_metadata.is_file() && source_metadata.dev() == destination_metadata.dev()
+        }
+    }
+
+    fn fast_copy_to(
+        &self,
+        source_path: &str,
+        destination: &crate::file::FastCopyDestination<'_>,
+    ) -> Result<()> {
+        let source_path = self.resolve_path(source_path);
+        let destination_fs = destination
+            .file_system()
+            .as_any()
+            .downcast_ref::<PosixFileSystem>()
+            .ok_or_else(|| {
+                Error::FileSystemError(
+                    "POSIX hard-link destination is not a local filesystem".to_string(),
+                )
+            })?;
+        let destination_path = destination_fs.resolve_path(destination.path());
+        std::fs::hard_link(&source_path, &destination_path).map_err(|e| {
+            Error::IoError(format!(
+                "Failed to hard link {} to {}: {}",
+                source_path.display(),
+                destination_path.display(),
+                e
+            ))
+        })
     }
 
     fn init(

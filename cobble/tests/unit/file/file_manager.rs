@@ -3,6 +3,8 @@ use crate::data_file::{DataFile, DataFileType};
 use crate::file::FileSystemRegistry;
 use crate::file::files::File;
 use crate::metrics_manager::MetricsManager;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::AtomicBool;
 
 pub(crate) mod test_utils {
@@ -30,6 +32,78 @@ impl FileManager {
 }
 
 static TEST_ROOT: &str = "file:///tmp/file_manager_test";
+
+struct FailingFastCopyFileSystem {
+    inner: Arc<dyn FileSystem>,
+}
+
+impl FileSystem for FailingFastCopyFileSystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn can_fast_copy_to(&self, _source_path: &str, _destination: &FastCopyDestination<'_>) -> bool {
+        true
+    }
+
+    fn fast_copy_to(
+        &self,
+        _source_path: &str,
+        _destination: &FastCopyDestination<'_>,
+    ) -> Result<()> {
+        Err(Error::IoError("injected fast-copy failure".to_string()))
+    }
+
+    fn init(
+        _url: &url::Url,
+        _access_id: Option<String>,
+        _access_key: Option<String>,
+        _custom_options: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Err(Error::InvalidState(
+            "test wrapper requires an existing filesystem".to_string(),
+        ))
+    }
+
+    fn create_dir(&self, path: &str) -> Result<()> {
+        self.inner.create_dir(path)
+    }
+
+    fn exists(&self, path: &str) -> Result<bool> {
+        self.inner.exists(path)
+    }
+
+    fn delete(&self, path: &str) -> Result<()> {
+        self.inner.delete(path)
+    }
+
+    fn delete_async(&self, path: &str) -> Result<()> {
+        self.inner.delete_async(path)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<()> {
+        self.inner.rename(from, to)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<String>> {
+        self.inner.list(path)
+    }
+
+    fn open_read(&self, path: &str) -> Result<Box<dyn RandomAccessFile>> {
+        self.inner.open_read(path)
+    }
+
+    fn open_write(&self, path: &str) -> Result<Box<dyn SequentialWriteFile>> {
+        self.inner.open_write(path)
+    }
+
+    fn last_modified(&self, path: &str) -> Result<Option<u64>> {
+        self.inner.last_modified(path)
+    }
+}
 
 fn cleanup_test_root() {
     let _ = std::fs::remove_dir_all("/tmp/file_manager_test");
@@ -118,6 +192,152 @@ fn resume_residual_scan_registers_all_matching_primary_tiers() {
                     && replica.tracked.physical_delete_policy()
                         == PhysicalDeletePolicy::ManagedDelete
             })
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+#[cfg(unix)]
+fn transfer_data_file_uses_posix_hard_link_and_manages_only_the_target_name() {
+    let root = "/tmp/file_manager_fast_copy";
+    let source_root = format!("{root}/source");
+    let target_root = format!("{root}/target");
+    let _ = std::fs::remove_dir_all(root);
+    let registry = FileSystemRegistry::new();
+    let source_fs = registry
+        .get_or_register(format!("file://{source_root}"))
+        .unwrap();
+    source_fs.create_dir("db/data").unwrap();
+    let source_path = "db/data/shared.sst";
+    let mut source_writer = source_fs.open_write(source_path).unwrap();
+    source_writer.write(b"fast-copy-data").unwrap();
+    source_writer.close().unwrap();
+
+    let config = Config {
+        volumes: vec![crate::VolumeDescriptor::new(
+            format!("file://{target_root}"),
+            vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+        )],
+        ..Config::default()
+    };
+    let fm = FileManager::from_config(
+        &config,
+        "db",
+        Arc::new(MetricsManager::new("file-manager-fast-copy")),
+    )
+    .unwrap();
+    let target_volume = Arc::clone(&fm.data_volumes[0]);
+    let target = fm
+        .transfer_data_file_to_volume(&source_fs, source_path, &target_volume, None, &mut |_| {})
+        .unwrap();
+    let source_metadata = std::fs::metadata(format!("{source_root}/{source_path}")).unwrap();
+    let target_local_path = format!("{target_root}/{}", target.path());
+    let target_metadata = std::fs::metadata(&target_local_path).unwrap();
+    assert_eq!(source_metadata.dev(), target_metadata.dev());
+    assert_eq!(source_metadata.ino(), target_metadata.ino());
+
+    drop(target);
+    test_utils::wait_for_file_deletion(target_volume.fs(), "db/data/shared.sst");
+    assert!(std::path::Path::new(&format!("{source_root}/{source_path}")).exists());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+#[cfg(unix)]
+fn transfer_data_file_streams_when_source_does_not_support_fast_copy() {
+    let root = "/tmp/file_manager_fast_copy_fallback";
+    let source_root = format!("{root}/source");
+    let target_root = format!("{root}/target");
+    let _ = std::fs::remove_dir_all(root);
+    let registry = FileSystemRegistry::new();
+    let source_fs = registry
+        .get_or_register(format!("fs://{source_root}"))
+        .unwrap();
+    source_fs.create_dir("db/data").unwrap();
+    let source_path = "db/data/streamed.sst";
+    let mut source_writer = source_fs.open_write(source_path).unwrap();
+    source_writer.write(b"stream-copy-data").unwrap();
+    source_writer.close().unwrap();
+
+    let config = Config {
+        volumes: vec![crate::VolumeDescriptor::new(
+            format!("file://{target_root}"),
+            vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+        )],
+        ..Config::default()
+    };
+    let fm = FileManager::from_config(
+        &config,
+        "db",
+        Arc::new(MetricsManager::new("file-manager-fast-copy-fallback")),
+    )
+    .unwrap();
+    let target_volume = Arc::clone(&fm.data_volumes[0]);
+    let target = fm
+        .transfer_data_file_to_volume(&source_fs, source_path, &target_volume, None, &mut |_| {})
+        .unwrap();
+    let source_metadata = std::fs::metadata(format!("{source_root}/{source_path}")).unwrap();
+    let target_local_path = format!("{target_root}/{}", target.path());
+    let target_metadata = std::fs::metadata(&target_local_path).unwrap();
+    assert_ne!(source_metadata.ino(), target_metadata.ino());
+    assert_eq!(
+        std::fs::read(target_local_path).unwrap(),
+        b"stream-copy-data"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn transfer_data_file_uses_fresh_uuid_after_fast_copy_failure() {
+    let root = "/tmp/file_manager_fast_copy_failure";
+    let source_root = format!("{root}/source");
+    let target_root = format!("{root}/target");
+    let _ = std::fs::remove_dir_all(root);
+    let registry = FileSystemRegistry::new();
+    let source_fs = registry
+        .get_or_register(format!("file://{source_root}"))
+        .unwrap();
+    source_fs.create_dir("db/data").unwrap();
+    let source_path = "db/data/colliding.sst";
+    let mut source_writer = source_fs.open_write(source_path).unwrap();
+    source_writer.write(b"fallback-data").unwrap();
+    source_writer.close().unwrap();
+    let failing_source_fs: Arc<dyn FileSystem> = Arc::new(FailingFastCopyFileSystem {
+        inner: Arc::clone(&source_fs),
+    });
+
+    let config = Config {
+        volumes: vec![crate::VolumeDescriptor::new(
+            format!("file://{target_root}"),
+            vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+        )],
+        ..Config::default()
+    };
+    let fm = FileManager::from_config(
+        &config,
+        "db",
+        Arc::new(MetricsManager::new("file-manager-fast-copy-failure")),
+    )
+    .unwrap();
+    let target_volume = Arc::clone(&fm.data_volumes[0]);
+    let target = fm
+        .transfer_data_file_to_volume(
+            &failing_source_fs,
+            source_path,
+            &target_volume,
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+
+    assert_ne!(target.path(), "db/data/colliding.sst");
+    assert!(!std::path::Path::new(&format!("{target_root}/db/data/colliding.sst")).exists());
+    assert_eq!(
+        std::fs::read(format!("{target_root}/{}", target.path())).unwrap(),
+        b"fallback-data"
     );
     let _ = std::fs::remove_dir_all(root);
 }

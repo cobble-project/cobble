@@ -1,5 +1,7 @@
 use super::*;
-use crate::file::FileSystem;
+use crate::file::{FastCopyDestination, FileSystem};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 static TEST_ROOT: &str = "file:///tmp/posix_fs_test";
 
@@ -79,5 +81,33 @@ fn test_posix_fs_list() {
         ]
     );
     assert!(fs.list("missing").unwrap().is_empty());
+    cleanup_test_root();
+}
+
+#[test]
+#[serial_test::serial(file)]
+#[cfg(unix)]
+fn test_posix_fast_copy_uses_hard_link() {
+    cleanup_test_root();
+    let fs = PosixFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None).unwrap();
+    fs.create_dir("source").unwrap();
+    fs.create_dir("destination").unwrap();
+    let mut writer = fs.open_write("source/data.sst").unwrap();
+    writer.write(b"fast-copy").unwrap();
+    writer.close().unwrap();
+
+    let destination = FastCopyDestination::new(&fs, "destination/data.sst");
+    assert!(fs.can_fast_copy_to("source/data.sst", &destination));
+    fs.fast_copy_to("source/data.sst", &destination).unwrap();
+
+    let source_metadata = std::fs::metadata("/tmp/posix_fs_test/source/data.sst").unwrap();
+    let destination_metadata =
+        std::fs::metadata("/tmp/posix_fs_test/destination/data.sst").unwrap();
+    assert_eq!(source_metadata.dev(), destination_metadata.dev());
+    assert_eq!(source_metadata.ino(), destination_metadata.ino());
+    assert_eq!(
+        std::fs::read("/tmp/posix_fs_test/destination/data.sst").unwrap(),
+        b"fast-copy"
+    );
     cleanup_test_root();
 }

@@ -161,8 +161,8 @@ pub use db_builder::DbBuilder;
 pub use db_iter::DbIterator;
 pub use error::{Error, Result};
 pub use file::{
-    File, FileSystem, ProcessFileSystemRegistry, ProcessFileSystemRequest, RandomAccessFile,
-    SequentialWriteFile, clear_process_custom_file_system_registry,
+    FastCopyDestination, File, FileSystem, ProcessFileSystemRegistry, ProcessFileSystemRequest,
+    RandomAccessFile, SequentialWriteFile, clear_process_custom_file_system_registry,
     register_process_custom_file_system_registry,
 };
 pub use governance::{DbGovernance, FileSystemDbGovernance, NoopDbGovernance};

@@ -594,27 +594,13 @@ impl PrimaryOffloadPolicy for PriorityOffloadPolicy {
 // File Manager offload logic
 // ----------------------------
 impl FileManager {
-    pub(crate) fn create_untracked_data_file_writer_on_volume(
-        &self,
-        volume: &Arc<DataVolume>,
-    ) -> crate::Result<(TrackedWriter, Arc<TrackedFile>)> {
-        let tracked = Arc::new(TrackedFile::managed(
-            self.data_file_path(0),
-            Arc::clone(volume.fs()),
-            Some(Arc::clone(volume)),
-        ));
-        let writer = volume.fs().open_write(tracked.path())?;
-        Ok((TrackedWriter::new(writer, Arc::clone(&tracked)), tracked))
-    }
-
-    /// Creates a transfer destination that preserves the source basename when it is unused on
-    /// the target volume. A pre-existing path is never overwritten or adopted here; collisions
-    /// and existence-check errors fall back to a fresh UUID.
-    pub(crate) fn create_transfer_data_file_writer_on_volume(
+    /// Creates an unowned transfer target that preserves the source basename when it is unused
+    /// on the target volume. Ownership starts only after fast copy or writer creation succeeds.
+    pub(crate) fn create_transfer_data_file_target_on_volume(
         &self,
         volume: &Arc<DataVolume>,
         source_path: &str,
-    ) -> crate::Result<(TrackedWriter, Arc<TrackedFile>)> {
+    ) -> crate::Result<Arc<TrackedFile>> {
         let file_name = source_path
             .rsplit('/')
             .next()
@@ -626,27 +612,24 @@ impl FileManager {
             })?;
         let preserved_path = self.data_file_path_with_name(file_name);
         if volume.fs().exists(&preserved_path).unwrap_or(true) {
-            return self.create_untracked_data_file_writer_on_volume(volume);
+            return Ok(self.create_fresh_transfer_target_on_volume(volume));
         }
-        let tracked = Arc::new(TrackedFile::managed(
+        Ok(Arc::new(TrackedFile::retained(
             preserved_path,
             Arc::clone(volume.fs()),
             Some(Arc::clone(volume)),
-        ));
-        let writer = volume.fs().open_write(tracked.path())?;
-        Ok((TrackedWriter::new(writer, Arc::clone(&tracked)), tracked))
+        )))
     }
 
-    /// Creates a snapshot-only replica under the source's data-file basename when that path is
-    /// available. Keeping this name makes the snapshot manifest path directly usable as a
-    /// residual-primary lookup key during resume. A collision uses a fresh UUID rather than
-    /// overwriting an existing snapshot file.
-    pub(crate) fn create_snapshot_replica_writer_on_volume(
+    pub(crate) fn create_fresh_transfer_target_on_volume(
         &self,
         volume: &Arc<DataVolume>,
-        source: &Arc<TrackedFile>,
-    ) -> crate::Result<(TrackedWriter, Arc<TrackedFile>)> {
-        self.create_transfer_data_file_writer_on_volume(volume, source.path())
+    ) -> Arc<TrackedFile> {
+        Arc::new(TrackedFile::retained(
+            self.data_file_path(0),
+            Arc::clone(volume.fs()),
+            Some(Arc::clone(volume)),
+        ))
     }
 
     pub(crate) fn stop_offload_worker(&self) {
@@ -1515,12 +1498,11 @@ impl FileManager {
         ) {
             return Ok(false);
         }
-        let source_reader = source.fs().open_read(source.path())?;
-        let (mut writer, owned) =
-            self.create_transfer_data_file_writer_on_volume(target_volume, source.path())?;
-        self.copy_reader_to_tracked_writer_with_progress(
-            source_reader.as_ref(),
-            &mut writer,
+        let owned = self.transfer_data_file_to_volume(
+            source.fs(),
+            source.path(),
+            target_volume,
+            None,
             progress,
         )?;
         owned.set_priority(source.priority());
@@ -1658,10 +1640,13 @@ impl FileManager {
         ) {
             return Ok(false);
         }
-        let reader = source.fs().open_read(source.path())?;
-        let (mut writer, owned) =
-            self.create_transfer_data_file_writer_on_volume(target_volume, source.path())?;
-        self.copy_reader_to_tracked_writer_with_progress(reader.as_ref(), &mut writer, progress)?;
+        let owned = self.transfer_data_file_to_volume(
+            source.fs(),
+            source.path(),
+            target_volume,
+            None,
+            progress,
+        )?;
         owned.set_priority(source.priority());
         if logical
             .add_and_select_replica_if(&source, Arc::clone(&owned), ReplicaLifecycle::OwnedReady)
@@ -1711,17 +1696,19 @@ impl FileManager {
             }
             replica.replica_id
         } else {
-            let reader = source.fs().open_read(source.path())?;
-            let (mut writer, owned) =
-                self.create_transfer_data_file_writer_on_volume(target_volume, source.path())?;
-            if let Err(err) = self.copy_reader_to_tracked_writer_with_progress(
-                reader.as_ref(),
-                &mut writer,
+            let owned = match self.transfer_data_file_to_volume(
+                source.fs(),
+                source.path(),
+                target_volume,
+                None,
                 progress,
             ) {
-                rollback();
-                return Err(err);
-            }
+                Ok(owned) => owned,
+                Err(err) => {
+                    rollback();
+                    return Err(err);
+                }
+            };
             owned.set_priority(source.priority());
             if logical
                 .add_and_select_replica_if(&source, owned, ReplicaLifecycle::OwnedReady)
@@ -2101,17 +2088,19 @@ impl FileManager {
         let copied_bytes = source_tracked
             .size_bytes
             .load(std::sync::atomic::Ordering::SeqCst);
-        let source_reader = source_tracked.fs().open_read(source_tracked.path())?;
-        let (mut writer, new_tracked) =
-            self.create_transfer_data_file_writer_on_volume(target_volume, source_tracked.path())?;
-        if let Err(err) = self.copy_reader_to_tracked_writer_with_progress(
-            source_reader.as_ref(),
-            &mut writer,
+        let new_tracked = match self.transfer_data_file_to_volume(
+            source_tracked.fs(),
+            source_tracked.path(),
+            target_volume,
+            None,
             progress,
         ) {
-            rollback();
-            return Err(err);
-        }
+            Ok(target) => target,
+            Err(err) => {
+                rollback();
+                return Err(err);
+            }
+        };
         new_tracked.set_priority(source_tracked.priority());
         let Some(logical) = self.get_logical_file(file_id) else {
             rollback();

@@ -106,6 +106,10 @@ impl Drop for JniCustomFileSystem {
 }
 
 impl FileSystem for JniCustomFileSystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn init(
         _url: &Url,
         _access_id: Option<String>,

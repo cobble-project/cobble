@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 struct NoopFileSystem;
 
 impl FileSystem for NoopFileSystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn init(
         _url: &Url,
         _access_id: Option<String>,

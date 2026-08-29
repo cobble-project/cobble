@@ -13,7 +13,7 @@
 use crate::Config;
 use crate::config::{PrimaryVolumeOffloadPolicyKind, VolumeUsageKind};
 use crate::error::{Error, Result};
-use crate::file::file_system::{FileSystem, FileSystemRegistry};
+use crate::file::file_system::{FastCopyDestination, FileSystem, FileSystemRegistry};
 use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
 use crate::file::logical_file::{
     FileCommitState, LogicalFile, ReplicaId, ReplicaLifecycle, ReplicaOrigin,
@@ -1574,19 +1574,6 @@ impl FileManager {
         }
     }
 
-    pub(crate) fn copy_reader_to_tracked_writer(
-        &self,
-        source: &dyn RandomAccessFile,
-        writer: &mut TrackedWriter,
-    ) -> Result<()> {
-        self.copy_reader_to_tracked_writer_with_cancel_and_progress(
-            source,
-            writer,
-            None,
-            &mut |_| {},
-        )
-    }
-
     pub(crate) fn copy_reader_to_tracked_writer_with_cancel(
         &self,
         source: &dyn RandomAccessFile,
@@ -1599,15 +1586,6 @@ impl FileManager {
             lifecycle_state,
             &mut |_| {},
         )
-    }
-
-    pub(crate) fn copy_reader_to_tracked_writer_with_progress(
-        &self,
-        source: &dyn RandomAccessFile,
-        writer: &mut TrackedWriter,
-        progress: &mut dyn FnMut(u64),
-    ) -> Result<()> {
-        self.copy_reader_to_tracked_writer_with_cancel_and_progress(source, writer, None, progress)
     }
 
     fn copy_reader_to_tracked_writer_with_cancel_and_progress(
@@ -1640,6 +1618,65 @@ impl FileManager {
         Ok(())
     }
 
+    pub(crate) fn transfer_data_file_to_volume(
+        &self,
+        source_fs: &Arc<dyn FileSystem>,
+        source_path: &str,
+        target_volume: &Arc<DataVolume>,
+        lifecycle_state: Option<&AtomicU8>,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<Arc<TrackedFile>> {
+        if lifecycle_state.is_some_and(SnapshotLifecycleState::is_cancelled_raw) {
+            return Err(Error::CancelledError(
+                "Snapshot upload cancelled while copying data files".to_string(),
+            ));
+        }
+
+        let mut target =
+            self.create_transfer_data_file_target_on_volume(target_volume, source_path)?;
+        let destination = FastCopyDestination::new(target_volume.fs().as_ref(), target.path());
+        if source_fs.can_fast_copy_to(source_path, &destination) {
+            match source_fs.fast_copy_to(source_path, &destination) {
+                Ok(()) => {
+                    target.set_physical_delete_policy(PhysicalDeletePolicy::ManagedDelete);
+                    let size_bytes =
+                        target_volume
+                            .fs()
+                            .file_size(target.path())?
+                            .ok_or_else(|| {
+                                Error::IoError(format!(
+                                    "Fast-copy destination is not a regular file: {}",
+                                    target.path()
+                                ))
+                            })?;
+                    target.update_size_bytes(size_bytes);
+                    progress(size_bytes);
+                    if lifecycle_state.is_some_and(SnapshotLifecycleState::is_cancelled_raw) {
+                        return Err(Error::CancelledError(
+                            "Snapshot upload cancelled while copying data files".to_string(),
+                        ));
+                    }
+                    return Ok(target);
+                }
+                Err(_) => {
+                    target = self.create_fresh_transfer_target_on_volume(target_volume);
+                }
+            }
+        }
+
+        let source_reader = source_fs.open_read(source_path)?;
+        let writer = target_volume.fs().open_write(target.path())?;
+        target.set_physical_delete_policy(PhysicalDeletePolicy::ManagedDelete);
+        let mut writer = TrackedWriter::new(writer, Arc::clone(&target));
+        self.copy_reader_to_tracked_writer_with_cancel_and_progress(
+            source_reader.as_ref(),
+            &mut writer,
+            lifecycle_state,
+            progress,
+        )?;
+        Ok(target)
+    }
+
     /// Registers an existing data file for restore operations.
     ///
     /// A primary residual registered by the resume scan is preferred without copying. Otherwise,
@@ -1660,14 +1697,13 @@ impl FileManager {
             return Ok(true);
         }
         let (source_volume, source_relative_path) = self.resolve_volume_path(path)?;
-        let mut source_reader = None;
         let expected_write_bytes = if let Some(size) = estimated_size_bytes {
             size
         } else {
-            let reader = source_volume.fs().open_read(&source_relative_path)?;
-            let size = reader.size() as u64;
-            source_reader = Some(reader);
-            size
+            match source_volume.fs().file_size(&source_relative_path)? {
+                Some(size) => size,
+                None => source_volume.fs().open_read(&source_relative_path)?.size() as u64,
+            }
         };
         let target_volume =
             self.select_primary_data_volume_for_placement(placement, Some(expected_write_bytes))?;
@@ -1679,21 +1715,24 @@ impl FileManager {
             return Ok(false);
         }
 
-        let source_reader = match source_reader {
-            Some(reader) => reader,
-            None => source_volume.fs().open_read(&source_relative_path)?,
-        };
         if source_volume.snapshot_persistable {
             self.register_data_file_readonly_with_origin(file_id, path, source_origin)?;
         }
-        let (mut writer, target_tracked) =
-            self.create_transfer_data_file_writer_on_volume(target_volume, path)?;
-        if let Err(err) = self.copy_reader_to_tracked_writer(source_reader.as_ref(), &mut writer) {
-            if source_volume.snapshot_persistable {
-                let _ = self.remove_data_file(file_id);
+        let target_tracked = match self.transfer_data_file_to_volume(
+            source_volume.fs(),
+            &source_relative_path,
+            target_volume,
+            None,
+            &mut |_| {},
+        ) {
+            Ok(target) => target,
+            Err(err) => {
+                if source_volume.snapshot_persistable {
+                    let _ = self.remove_data_file(file_id);
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
+        };
         if let Some(logical) = self.get_logical_file(file_id) {
             let source = logical.preferred_replica_any().ok_or_else(|| {
                 Error::InvalidState(format!("Logical file {} has no replica", file_id))
@@ -2149,18 +2188,14 @@ impl FileManager {
             return Ok((Arc::clone(&replica.tracked), replica.origin()));
         }
         let snapshot_volume = self.select_snapshot_persistable_volume()?;
-        let source_reader = source_tracked.fs().open_read(source_tracked.path())?;
         let source_priority = source_tracked.priority();
-        let (mut writer, target) =
-            self.create_snapshot_replica_writer_on_volume(snapshot_volume, source_tracked)?;
-
-        let copy_result = self.copy_reader_to_tracked_writer_with_cancel(
-            source_reader.as_ref(),
-            &mut writer,
+        let target = self.transfer_data_file_to_volume(
+            source_tracked.fs(),
+            source_tracked.path(),
+            snapshot_volume,
             lifecycle_state,
-        );
-
-        copy_result?;
+            &mut |_| {},
+        )?;
         target.set_priority(source_priority);
         let replica_id = logical.add_replica(Arc::clone(&target), ReplicaLifecycle::Staging);
         if let Some(registry) = resource_registry {

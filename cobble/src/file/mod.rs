@@ -20,8 +20,9 @@ pub(crate) use self::file_manager::lsm_file_priority_for_level;
 pub(crate) use self::file_manager::test_utils;
 pub use self::file_manager::{FileId, FileManager, TrackedFile, TrackedFileId, TrackedWriter};
 pub use self::file_system::{
-    FileSystem, FileSystemRegistry, ProcessFileSystemRegistry, ProcessFileSystemRequest,
-    clear_process_custom_file_system_registry, register_process_custom_file_system_registry,
+    FastCopyDestination, FileSystem, FileSystemRegistry, ProcessFileSystemRegistry,
+    ProcessFileSystemRequest, clear_process_custom_file_system_registry,
+    register_process_custom_file_system_registry,
 };
 pub use self::files::{
     BufferedReader, BufferedWriter, File, RandomAccessFile, ReadAheadBufferedReader,

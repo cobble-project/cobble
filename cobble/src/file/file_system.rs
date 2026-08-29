@@ -6,11 +6,35 @@ use crate::file::opendal_fs::OpendalFileSystem;
 use crate::file::posix_fs::PosixFileSystem;
 use crate::util::normalize_storage_path_to_url;
 use dashmap::DashMap;
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use url::Url;
 
+/// Destination filesystem and path for a filesystem-native file copy.
+pub struct FastCopyDestination<'a> {
+    file_system: &'a dyn FileSystem,
+    path: &'a str,
+}
+
+impl<'a> FastCopyDestination<'a> {
+    pub fn new(file_system: &'a dyn FileSystem, path: &'a str) -> Self {
+        Self { file_system, path }
+    }
+
+    pub fn file_system(&self) -> &'a dyn FileSystem {
+        self.file_system
+    }
+
+    pub fn path(&self) -> &'a str {
+        self.path
+    }
+}
+
 pub trait FileSystem: Send + Sync {
+    /// Returns this concrete filesystem for compatible fast-copy implementations.
+    fn as_any(&self) -> &dyn Any;
+
     /// Whether this filesystem is the built-in local POSIX implementation.
     fn is_posix(&self) -> bool {
         false
@@ -19,6 +43,24 @@ pub trait FileSystem: Send + Sync {
     /// Returns the size of a regular file without opening it for reads.
     fn file_size(&self, _path: &str) -> Result<Option<u64>> {
         Ok(None)
+    }
+
+    /// Returns whether this filesystem can use a native fast-copy operation for these paths.
+    fn can_fast_copy_to(&self, _source_path: &str, _destination: &FastCopyDestination<'_>) -> bool {
+        false
+    }
+
+    /// Copies a file using a filesystem-native operation. Callers should use
+    /// [`FileSystem::can_fast_copy_to`] first and fall back to streamed copying on failure.
+    /// Implementations must leave the destination absent when returning an error.
+    fn fast_copy_to(
+        &self,
+        _source_path: &str,
+        _destination: &FastCopyDestination<'_>,
+    ) -> Result<()> {
+        Err(Error::FileSystemError(
+            "Fast copy is not supported by this filesystem".to_string(),
+        ))
     }
 
     fn init(
