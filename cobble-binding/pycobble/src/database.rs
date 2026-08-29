@@ -1,11 +1,14 @@
 use crate::buffer::{InputBytes, WritableBuffer};
 use crate::error::{invalid_state, map_error};
+use crate::metrics::{PyMetricSample, metrics};
 use crate::multi_get::{PyMultiGetResult, extract_keys};
 use crate::options::{PyReadOptions, PyWriteOptions};
 use crate::row::PyOwnedRow;
 use crate::scan::PyScanCursor;
-use crate::types::PyRecoveryMode;
+use crate::schema::{PySchema, PySchemaBuilder, schema};
+use crate::snapshot::{PyGlobalSnapshot, PyPendingSnapshot, snapshot};
 use crate::types::{PyBufferResult, PyBufferStatus};
+use crate::types::{PyMemtableType, PyRecoveryMode};
 use crate::write_batch::PyWriteBatch;
 use cobble_binding::{Config, ReadOptions, SingleDb, WriteOptions};
 use pyo3::prelude::*;
@@ -294,6 +297,36 @@ impl PySingleDb {
         py.detach(move || db.snapshot().map_err(map_error))
     }
 
+    fn start_snapshot(&self) -> PyResult<PyPendingSnapshot> {
+        self.ensure_open()?;
+        PyPendingSnapshot::start(&self.db)
+    }
+
+    fn take_snapshot(&self, py: Python<'_>) -> PyResult<PyGlobalSnapshot> {
+        self.ensure_open()?;
+        PyPendingSnapshot::start(&self.db)?.wait_result(py)
+    }
+
+    fn get_snapshot(&self, py: Python<'_>, snapshot_id: u64) -> PyResult<PyGlobalSnapshot> {
+        self.ensure_open()?;
+        let db = Arc::clone(&self.db);
+        py.detach(move || {
+            db.get_snapshot(snapshot_id)
+                .map(snapshot)
+                .map_err(map_error)
+        })
+    }
+
+    fn list_global_snapshots(&self, py: Python<'_>) -> PyResult<Vec<PyGlobalSnapshot>> {
+        self.ensure_open()?;
+        let db = Arc::clone(&self.db);
+        py.detach(move || {
+            db.list_snapshots()
+                .map(|snapshots| snapshots.into_iter().map(snapshot).collect())
+                .map_err(map_error)
+        })
+    }
+
     fn retain_snapshot(&self, py: Python<'_>, snapshot_id: u64) -> PyResult<bool> {
         self.ensure_open()?;
         let db = Arc::clone(&self.db);
@@ -320,6 +353,49 @@ impl PySingleDb {
         self.ensure_open()?;
         self.db.set_time(unix_seconds);
         Ok(())
+    }
+
+    fn now_seconds(&self) -> PyResult<u32> {
+        self.ensure_open()?;
+        Ok(self.db.now_seconds())
+    }
+
+    #[pyo3(signature = (memtable_type, *, flush_current=false))]
+    fn switch_memtable_type(
+        &self,
+        py: Python<'_>,
+        memtable_type: PyMemtableType,
+        flush_current: bool,
+    ) -> PyResult<()> {
+        self.ensure_open()?;
+        let db = Arc::clone(&self.db);
+        py.detach(move || {
+            db.switch_memtable_type(memtable_type.into(), flush_current)
+                .map_err(map_error)
+        })
+    }
+
+    fn load_readonly_files_to_primary(&self, py: Python<'_>) -> PyResult<usize> {
+        self.ensure_open()?;
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.load_readonly_files_to_primary().map_err(map_error))
+    }
+
+    fn current_schema(&self, py: Python<'_>) -> PyResult<PySchema> {
+        self.ensure_open()?;
+        let db = Arc::clone(&self.db);
+        py.detach(move || schema(db.current_schema().as_ref()))
+    }
+
+    fn update_schema(&self) -> PyResult<PySchemaBuilder> {
+        self.ensure_open()?;
+        Ok(PySchemaBuilder::new(Arc::clone(&self.db)))
+    }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<Vec<PyMetricSample>> {
+        self.ensure_open()?;
+        let db = Arc::clone(&self.db);
+        Ok(py.detach(move || metrics(db.metrics())))
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {

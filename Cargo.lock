@@ -3285,6 +3285,7 @@ dependencies = [
  "cobble-binding",
  "opendal",
  "pyo3",
+ "serde_json",
  "size",
 ]
 

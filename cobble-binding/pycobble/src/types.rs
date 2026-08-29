@@ -1,4 +1,4 @@
-use cobble_binding::RecoveryMode;
+use cobble_binding::{MemtableType, RecoveryMode};
 use pyo3::prelude::*;
 
 #[pyclass(
@@ -12,6 +12,21 @@ use pyo3::prelude::*;
 pub(crate) enum PyRecoveryMode {
     SnapshotOnly = 0,
     LatestWithWal = 1,
+}
+
+#[pyclass(
+    name = "MemtableType",
+    module = "pycobble._native",
+    eq,
+    eq_int,
+    from_py_object
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PyMemtableType {
+    Hash = 0,
+    Skiplist = 1,
+    Vec = 2,
+    Adaptive = 3,
 }
 
 #[pyclass(
@@ -67,8 +82,20 @@ impl From<PyRecoveryMode> for RecoveryMode {
     }
 }
 
+impl From<PyMemtableType> for MemtableType {
+    fn from(value: PyMemtableType) -> Self {
+        match value {
+            PyMemtableType::Hash => Self::Hash,
+            PyMemtableType::Skiplist => Self::Skiplist,
+            PyMemtableType::Vec => Self::Vec,
+            PyMemtableType::Adaptive => Self::Adaptive,
+        }
+    }
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRecoveryMode>()?;
+    module.add_class::<PyMemtableType>()?;
     module.add_class::<PyBufferStatus>()?;
     module.add_class::<PyBufferResult>()
 }
