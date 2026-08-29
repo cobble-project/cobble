@@ -234,3 +234,68 @@ def test_structured_single_snapshot_management(tmp_path: Path) -> None:
     db.switch_memtable_type(pycobble.MemtableType.Hash)
     assert isinstance(db.load_readonly_files_to_primary(), int)
     db.close()
+
+
+def test_structured_distributed_scan_plan(tmp_path: Path) -> None:
+    config_json = config(tmp_path / "structured-plan")
+    config_path = tmp_path / "structured-plan.json"
+    config_path.write_text(config_json)
+    left = pycobble.StructuredDb.open(
+        config_json, [pycobble.BucketRange(0, 1)]
+    )
+    right = pycobble.StructuredDb.open(
+        config_json, [pycobble.BucketRange(2, 3)]
+    )
+    for db in (left, right):
+        builder = db.update_schema()
+        builder.add_list_column(1, pycobble.ListConfig())
+        builder.commit()
+    left.put_bytes(0, b"a", 0, b"left-a")
+    left.put_list(1, b"b", 1, [b"left-b"])
+    right.put_bytes(2, b"c", 0, b"right-c")
+    right.put_list(3, b"d", 1, [b"right-d"])
+    left_snapshot = left.take_snapshot()
+    right_snapshot = right.take_snapshot()
+    left.close()
+    right.close()
+
+    coordinator = pycobble.DbCoordinator.open(config_json)
+    global_snapshot = coordinator.materialize_global_snapshot(
+        4, 77, [left_snapshot, right_snapshot]
+    )
+    plan = pycobble.StructuredScanPlan.from_global_snapshot(global_snapshot)
+    splits = plan.splits()
+    assert len(splits) == 2
+
+    rows: list[tuple[int, bytes, bytes | None]] = []
+    for split in splits:
+        restored = pycobble.StructuredScanSplit.from_json(split.to_json())
+        scanner = restored.open_scanner_file(config_path)
+        while True:
+            batch = scanner.next(2)
+            for index in range(len(batch)):
+                row = batch.row(index)
+                value = row.value
+                payload = bytes(value.bytes(0)) if value.has_column(0) else None
+                rows.append((row.bucket, bytes(row.key), payload))
+            if batch.end:
+                break
+        scanner.close()
+
+    assert rows == [
+        (0, b"a", b"left-a"),
+        (1, b"b", None),
+        (2, b"c", b"right-c"),
+        (3, b"d", None),
+    ]
+
+    partition = splits[0].split_after(0, b"a")
+    assert partition.before.end_at_inclusive.bucket == 0
+    assert partition.before.end_at_inclusive.key == b"a"
+    assert partition.after.start_after_exclusive.bucket == 0
+    assert partition.after.start_after_exclusive.key == b"a"
+    with pytest.raises(pycobble.InputError):
+        splits[0].open_scanner(
+            config_json,
+            pycobble.StructuredScanOptions(stop_at_block_boundary=True),
+        )

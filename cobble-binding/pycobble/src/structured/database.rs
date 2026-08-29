@@ -15,8 +15,8 @@ use crate::types::{PyExpandStorageMode, PyMemtableType, PyRecoveryMode};
 use cobble_binding::Config;
 use cobble_binding::structured::ffi as ds_ffi;
 use cobble_binding::structured::{
-    StructuredColumnValue, StructuredDb, StructuredDbIterator, StructuredSingleDb,
-    StructuredWriteOptions,
+    StructuredColumnValue, StructuredDb, StructuredDbIterator, StructuredScanSplitScanner,
+    StructuredSingleDb, StructuredWriteOptions,
 };
 use pyo3::prelude::*;
 use std::ops::RangeInclusive;
@@ -43,6 +43,14 @@ fn extract_elements(values: &Bound<'_, PyAny>) -> PyResult<Vec<InputBytes>> {
 enum IteratorOwner {
     Db { _db: Arc<StructuredDb> },
     Single { _db: Arc<StructuredSingleDb> },
+}
+
+// Keep the common database iterator inline so ordinary scans do not gain a
+// heap allocation; only the larger, cold-path distributed scanner is boxed.
+#[allow(clippy::large_enum_variant)]
+enum StructuredIterator {
+    Db(StructuredDbIterator),
+    Split(Box<StructuredScanSplitScanner>),
 }
 
 struct StructuredBatchRow {
@@ -106,7 +114,7 @@ impl PyStructuredBatch {
 
 #[pyclass(name = "StructuredScanCursor", module = "pycobble._native", unsendable)]
 pub(crate) struct PyStructuredScanCursor {
-    iterator: Option<StructuredDbIterator>,
+    iterator: Option<StructuredIterator>,
     bucket: u16,
     pending: Option<StructuredBatchRow>,
     owner: Option<IteratorOwner>,
@@ -115,7 +123,7 @@ pub(crate) struct PyStructuredScanCursor {
 impl PyStructuredScanCursor {
     fn new_db(bucket: u16, iterator: StructuredDbIterator, db: Arc<StructuredDb>) -> Self {
         Self {
-            iterator: Some(iterator),
+            iterator: Some(StructuredIterator::Db(iterator)),
             bucket,
             pending: None,
             owner: Some(IteratorOwner::Db { _db: db }),
@@ -128,27 +136,47 @@ impl PyStructuredScanCursor {
         db: Arc<StructuredSingleDb>,
     ) -> Self {
         Self {
-            iterator: Some(iterator),
+            iterator: Some(StructuredIterator::Db(iterator)),
             bucket,
             pending: None,
             owner: Some(IteratorOwner::Single { _db: db }),
         }
     }
 
+    pub(super) fn new_split(iterator: StructuredScanSplitScanner) -> Self {
+        Self {
+            iterator: Some(StructuredIterator::Split(Box::new(iterator))),
+            bucket: 0,
+            pending: None,
+            owner: None,
+        }
+    }
+
     fn next_row(&mut self) -> PyResult<Option<StructuredBatchRow>> {
-        self.iterator
+        let iterator = self
+            .iterator
             .as_mut()
-            .ok_or_else(|| invalid_state("StructuredScanCursor is closed"))?
-            .next()
-            .transpose()
-            .map_err(map_error)
-            .map(|row| {
-                row.map(|(key, columns)| StructuredBatchRow {
-                    bucket: self.bucket,
-                    key,
-                    columns,
+            .ok_or_else(|| invalid_state("StructuredScanCursor is closed"))?;
+        match iterator {
+            StructuredIterator::Db(iterator) => {
+                iterator.next().transpose().map_err(map_error).map(|row| {
+                    row.map(|(key, columns)| StructuredBatchRow {
+                        bucket: self.bucket,
+                        key,
+                        columns,
+                    })
                 })
-            })
+            }
+            StructuredIterator::Split(iterator) => {
+                iterator.next().transpose().map_err(map_error).map(|row| {
+                    row.map(|(bucket, key, columns)| StructuredBatchRow {
+                        bucket,
+                        key,
+                        columns,
+                    })
+                })
+            }
+        }
     }
 }
 
@@ -175,7 +203,12 @@ impl PyStructuredScanCursor {
             .iterator
             .as_ref()
             .ok_or_else(|| invalid_state("StructuredScanCursor is closed"))?;
-        let stopped = ds_ffi::iterator_stopped_at_block_boundary(iterator);
+        let stopped = match iterator {
+            StructuredIterator::Db(iterator) => {
+                ds_ffi::iterator_stopped_at_block_boundary(iterator)
+            }
+            StructuredIterator::Split(_) => false,
+        };
         Ok(PyStructuredBatch {
             end: self.pending.is_none() && !stopped,
             stopped_at_block_boundary: stopped,
@@ -188,8 +221,15 @@ impl PyStructuredScanCursor {
             .iterator
             .as_mut()
             .ok_or_else(|| invalid_state("StructuredScanCursor is closed"))?;
-        ds_ffi::iterator_clear_stop_at_block_boundary(iterator);
-        Ok(())
+        match iterator {
+            StructuredIterator::Db(iterator) => {
+                ds_ffi::iterator_clear_stop_at_block_boundary(iterator);
+                Ok(())
+            }
+            StructuredIterator::Split(_) => Err(invalid_state(
+                "split scanners do not support block-boundary resume",
+            )),
+        }
     }
 
     fn close(&mut self) {
