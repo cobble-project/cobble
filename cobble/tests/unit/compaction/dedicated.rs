@@ -214,7 +214,7 @@ fn test_orphan_sweep_preserves_active_and_committed() {
 
     // The filesystem's `last_modified` returns timestamps in seconds, so the sweep
     // compares age in seconds. Sleep 2 seconds so the crashed and committed leases are
-    // stale (>= 1s old with min_age_ms=100 -> min_age_secs=1), then refresh the active
+    // stale (> 1s old with min_age_ms=100 -> min_age_secs=1), then refresh the active
     // job's lease so it's fresh (< 1s old).
     std::thread::sleep(std::time::Duration::from_secs(2));
     write_job_lease(&fm, active_job).unwrap();

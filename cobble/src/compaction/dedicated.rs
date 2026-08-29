@@ -589,7 +589,10 @@ pub(crate) fn sweep_orphan_job_dirs(
         let last_modified = file_manager.metadata_volume_last_modified(&lease_path)?;
         match last_modified {
             Some(ts) => {
-                if now_secs.saturating_sub(ts) < min_age_secs {
+                // Timestamps have one-second resolution. At the exact threshold the
+                // lease may still be younger than `min_age_ms`, so only sweep once it
+                // is strictly older than the rounded-up threshold.
+                if now_secs.saturating_sub(ts) <= min_age_secs {
                     continue; // Lease is still fresh; skip.
                 }
             }
@@ -601,7 +604,7 @@ pub(crate) fn sweep_orphan_job_dirs(
                 let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
                 let dir_mtime = file_manager.data_volume_last_modified(&job_dir)?;
                 match dir_mtime {
-                    Some(ts) if now_secs.saturating_sub(ts) < min_age_secs => continue,
+                    Some(ts) if now_secs.saturating_sub(ts) <= min_age_secs => continue,
                     None => continue, // Can't determine age; skip.
                     _ => {}
                 }
