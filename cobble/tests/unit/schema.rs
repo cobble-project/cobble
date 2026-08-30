@@ -278,18 +278,57 @@ fn test_schema_evolution_mixes_add_delete_and_replace() {
             .contains("test-transform' requires materialized row execution")
     );
 
+    let transforms = Arc::new(SchemaTransformRegistry::default());
+    transforms
+        .register("first", |value: Option<Bytes>| {
+            let mut value = value.expect("first transform source").to_vec();
+            value.extend_from_slice(b"-first");
+            Ok(Some(value.into()))
+        })
+        .unwrap();
+    let duplicate = transforms
+        .register("first", |value: Option<Bytes>| Ok(value))
+        .unwrap_err();
+    assert!(duplicate.to_string().contains("already registered"));
+    transforms
+        .register("second", |value: Option<Bytes>| {
+            let mut value = value
+                .unwrap_or_else(|| Bytes::from_static(b"null"))
+                .to_vec();
+            value.extend_from_slice(b"-second");
+            Ok(Some(value.into()))
+        })
+        .unwrap();
+
     let source_manager = Arc::new(SchemaManager::new(1));
     let mut builder = source_manager.builder();
-    builder.add_column(1, None, None, None).unwrap();
+    builder
+        .add_column(1, None, Some(Bytes::from_static(b"default")), None)
+        .unwrap();
+    builder.add_column(2, None, None, None).unwrap();
     let schema1 = builder.commit();
     let mut builder = source_manager.builder_from(schema1.clone());
     builder
         .replace_column(None, 0, Arc::new(U32CounterMergeOperator))
         .unwrap();
     let schema2 = builder.commit();
-    let out_of_order = SchemaManager::new(1);
+    let mut schema1_file = schema_to_file(&schema1);
+    let schema1_transition = schema1_file.column_families[0].transition.as_mut().unwrap();
+    let ColumnEvolutionFile::Source { transform_id, .. } = &mut schema1_transition[0] else {
+        panic!("first schema should preserve its source column");
+    };
+    *transform_id = Some("first".to_string());
+    let mut schema2_file = schema_to_file(&schema2);
+    for evolution in schema2_file.column_families[0].transition.as_mut().unwrap() {
+        let ColumnEvolutionFile::Source { transform_id, .. } = evolution else {
+            panic!("second schema should preserve every source column");
+        };
+        *transform_id = Some("second".to_string());
+    }
+
+    let out_of_order = SchemaManager::new_with_transform_registry(1, Arc::clone(&transforms));
     out_of_order
-        .register_schema_from_def(&schema_to_file(&schema2), None)
+        .register_schema_from_def(&schema2_file, None)
         .unwrap();
     assert_eq!(
         out_of_order
@@ -300,7 +339,7 @@ fn test_schema_evolution_mixes_add_delete_and_replace() {
         TransitionCompatibility::Unknown
     );
     out_of_order
-        .register_schema_from_def(&schema_to_file(&schema1), None)
+        .register_schema_from_def(&schema1_file, None)
         .unwrap();
     assert_eq!(
         out_of_order
@@ -310,6 +349,34 @@ fn test_schema_evolution_mixes_add_delete_and_replace() {
             .unwrap(),
         TransitionCompatibility::Incompatible
     );
+    let route = out_of_order
+        .compile_projection_route(0, 2, DEFAULT_COLUMN_FAMILY_ID)
+        .unwrap();
+    assert_eq!(
+        route.apply(&[Some(Bytes::from_static(b"value"))]).unwrap(),
+        vec![
+            Some(Bytes::from_static(b"value-first-second")),
+            Some(Bytes::from_static(b"default-second")),
+            Some(Bytes::from_static(b"null-second")),
+        ]
+    );
+
+    let missing_registry = Arc::new(SchemaTransformRegistry::default());
+    missing_registry
+        .register("second", |value: Option<Bytes>| Ok(value))
+        .unwrap();
+    let missing = SchemaManager::new_with_transform_registry(1, missing_registry);
+    missing
+        .register_schema_from_def(&schema1_file, None)
+        .unwrap();
+    missing
+        .register_schema_from_def(&schema2_file, None)
+        .unwrap();
+    let error = match missing.compile_projection_route(0, 2, DEFAULT_COLUMN_FAMILY_ID) {
+        Ok(_) => panic!("missing transform must reject route compilation"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("'first' is not registered"));
 }
 
 #[test]
