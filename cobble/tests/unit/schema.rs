@@ -83,11 +83,16 @@ fn test_schema_evolution_add_column() {
     let schema = builder.commit();
     assert_eq!(schema.version(), 1);
     assert_eq!(schema.num_columns(), 2);
-    assert_eq!(
+    assert!(
         schema_to_file(&schema).column_families[0]
-            .evolution_id
-            .as_deref(),
-        Some("column_remap")
+            .transition
+            .is_some()
+    );
+    assert_eq!(
+        schema
+            .transition_compatibility_in_family(DEFAULT_COLUMN_FAMILY_ID)
+            .unwrap(),
+        TransitionCompatibility::Incompatible
     );
 
     let value = Value::new(vec![Some(Column::new(
@@ -139,15 +144,20 @@ fn test_schema_evolution_add_column_with_default() {
 fn test_schema_evolution_delete_column() {
     let manager = Arc::new(SchemaManager::new(2));
     let mut builder = manager.builder();
-    builder.delete_column(None, 1).unwrap();
+    builder.delete_column(None, 0).unwrap();
     let schema = builder.commit();
     assert_eq!(schema.version(), 1);
     assert_eq!(schema.num_columns(), 1);
-    assert_eq!(
+    assert!(
         schema_to_file(&schema).column_families[0]
-            .evolution_id
-            .as_deref(),
-        Some("column_remap")
+            .transition
+            .is_some()
+    );
+    assert_eq!(
+        schema
+            .transition_compatibility_in_family(DEFAULT_COLUMN_FAMILY_ID)
+            .unwrap(),
+        TransitionCompatibility::Compatible
     );
 
     let value = Value::new(vec![
@@ -160,7 +170,7 @@ fn test_schema_evolution_delete_column() {
     assert_eq!(evolved.columns().len(), 1);
     assert_eq!(
         evolved.columns()[0].as_ref().unwrap().data().as_ref(),
-        b"v0"
+        b"v1"
     );
 }
 
@@ -179,9 +189,12 @@ fn test_schema_evolution_mixes_add_delete_and_replace() {
     assert_eq!(schema.operator(1).id(), U32CounterMergeOperator.id());
 
     let schema_file = schema_to_file(&schema);
+    assert!(schema_file.column_families[0].transition.is_some());
     assert_eq!(
-        schema_file.column_families[0].evolution_id.as_deref(),
-        Some("column_remap")
+        schema
+            .transition_compatibility_in_family(DEFAULT_COLUMN_FAMILY_ID)
+            .unwrap(),
+        TransitionCompatibility::Incompatible
     );
     let restored = schema_from_file(&schema_file, None).unwrap();
     assert_eq!(restored.num_columns(), 3);
@@ -228,6 +241,75 @@ fn test_schema_evolution_mixes_add_delete_and_replace() {
             .as_ref()
             .is_some_and(|column| *column.value_type() == ValueType::Delete)
     }));
+
+    let mut schema_file = schema_to_file(&schema);
+    let transition = schema_file.column_families[0]
+        .transition
+        .as_mut()
+        .expect("mixed transition");
+    let ColumnEvolutionFile::Source { transform_id, .. } = &mut transition[0] else {
+        panic!("first target column should use a source");
+    };
+    *transform_id = Some("test-transform".to_string());
+    let payload = serde_json::to_vec(&schema_file).unwrap();
+    let restored_file: SchemaFile = serde_json::from_slice(&payload).unwrap();
+    let restored = schema_from_file(&restored_file, None).unwrap();
+    manager
+        .schemas
+        .write()
+        .unwrap()
+        .insert(1, Arc::new(restored));
+    let error = match manager.evolve_value_in_family(
+        Value::new(vec![
+            Some(Column::new(ValueType::Put, Bytes::from_static(b"v0"))),
+            Some(Column::new(ValueType::Put, Bytes::from_static(b"v1"))),
+            Some(Column::new(ValueType::Put, Bytes::from_static(b"v2"))),
+        ]),
+        0,
+        1,
+        DEFAULT_COLUMN_FAMILY_ID,
+    ) {
+        Ok(_) => panic!("transform transition must reject per-value execution"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("test-transform' requires materialized row execution")
+    );
+
+    let source_manager = Arc::new(SchemaManager::new(1));
+    let mut builder = source_manager.builder();
+    builder.add_column(1, None, None, None).unwrap();
+    let schema1 = builder.commit();
+    let mut builder = source_manager.builder_from(schema1.clone());
+    builder
+        .replace_column(None, 0, Arc::new(U32CounterMergeOperator))
+        .unwrap();
+    let schema2 = builder.commit();
+    let out_of_order = SchemaManager::new(1);
+    out_of_order
+        .register_schema_from_def(&schema_to_file(&schema2), None)
+        .unwrap();
+    assert_eq!(
+        out_of_order
+            .schema(2)
+            .unwrap()
+            .transition_compatibility_in_family(DEFAULT_COLUMN_FAMILY_ID)
+            .unwrap(),
+        TransitionCompatibility::Unknown
+    );
+    out_of_order
+        .register_schema_from_def(&schema_to_file(&schema1), None)
+        .unwrap();
+    assert_eq!(
+        out_of_order
+            .schema(2)
+            .unwrap()
+            .transition_compatibility_in_family(DEFAULT_COLUMN_FAMILY_ID)
+            .unwrap(),
+        TransitionCompatibility::Incompatible
+    );
 }
 
 #[test]
@@ -238,9 +320,17 @@ fn test_schema_evolution_remaps_columns_atomically() {
         .remap_columns(
             None,
             vec![
-                ColumnRemap::Source(2),
-                ColumnRemap::Default(Bytes::from_static(b"new")),
-                ColumnRemap::Source(0),
+                ColumnEvolution::Source {
+                    source_index: 2,
+                    transform_id: None,
+                },
+                ColumnEvolution::Default {
+                    value: Bytes::from_static(b"new"),
+                },
+                ColumnEvolution::Source {
+                    source_index: 0,
+                    transform_id: None,
+                },
             ],
         )
         .unwrap();
@@ -282,7 +372,19 @@ fn test_schema_evolution_remaps_columns_atomically() {
     assert!(
         Arc::new(SchemaManager::new(2))
             .builder()
-            .remap_columns(None, vec![ColumnRemap::Source(0), ColumnRemap::Source(0)])
+            .remap_columns(
+                None,
+                vec![
+                    ColumnEvolution::Source {
+                        source_index: 0,
+                        transform_id: None,
+                    },
+                    ColumnEvolution::Source {
+                        source_index: 0,
+                        transform_id: None,
+                    },
+                ],
+            )
             .is_err()
     );
 }
@@ -314,6 +416,12 @@ fn test_schema_builder_assign_new_column_to_new_column_family() {
         (DEFAULT_COLUMN_FAMILY_NAME.to_string(), 1usize)
     );
     assert_eq!(families[1], ("metrics".to_string(), 1usize));
+    assert_eq!(
+        schema
+            .transition_compatibility_in_family(1)
+            .expect("new column family compatibility"),
+        TransitionCompatibility::Compatible
+    );
 }
 
 #[test]

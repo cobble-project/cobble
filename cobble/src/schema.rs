@@ -22,7 +22,6 @@ pub(crate) const DEFAULT_COLUMN_FAMILY_ID: u8 = 0;
 pub(crate) const DEFAULT_COLUMN_FAMILY_NAME: &str = "default";
 pub(crate) const MAX_COLUMN_FAMILY_COUNT: usize = 230;
 const SCHEMA_FILE_FORMAT_VERSION: u32 = 2;
-const NULL_REMAP_INDEX: usize = u32::MAX as usize;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 /// Column-family scoped schema options.
@@ -56,7 +55,7 @@ pub(crate) struct ColumnFamily {
     operators: Vec<Arc<dyn MergeOperator>>,
     column_metadata: Vec<Option<JsonValue>>,
     options: ColumnFamilyOptions,
-    evolution: BuiltinSchemaEvolution,
+    evolution: SchemaEvolution,
     projection: Option<Vec<usize>>,
 }
 
@@ -82,7 +81,7 @@ impl ColumnFamily {
             operators,
             column_metadata,
             options,
-            evolution: BuiltinSchemaEvolution::Noop,
+            evolution: SchemaEvolution::identity(),
             projection: None,
         }
     }
@@ -136,9 +135,7 @@ pub(crate) struct ColumnFamilyFile {
     merge_operator_ids: Vec<String>,
     column_metadata: Vec<Option<JsonValue>>,
     options: ColumnFamilyOptions,
-    evolution_id: Option<String>,
-    evolution_indexes: Option<Vec<usize>>,
-    evolution_default_values: Option<Vec<Option<Vec<u8>>>>,
+    transition: Option<Vec<ColumnEvolutionFile>>,
 }
 
 fn normalize_column_family_name(name: impl Into<String>) -> Result<String> {
@@ -151,215 +148,226 @@ fn normalize_column_family_name(name: impl Into<String>) -> Result<String> {
     Ok(normalized)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum BuiltinSchemaEvolution {
-    Noop,
-    ColumnRemap { columns: Arc<Vec<ColumnRemap>> },
-}
-
-/// One target column in an atomic schema remap.
+/// One target column in a schema transition.
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ColumnRemap {
-    Source(usize),
-    Default(Bytes),
-    /// A newly added column without a default value.
-    #[doc(hidden)]
+pub enum ColumnEvolution {
+    Source {
+        source_index: usize,
+        transform_id: Option<String>,
+    },
+    Default {
+        value: Bytes,
+    },
     Null,
 }
 
-impl BuiltinSchemaEvolution {
-    fn id(&self) -> &'static str {
-        match self {
-            Self::Noop => "noop",
-            Self::ColumnRemap { .. } => "column_remap",
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ColumnEvolutionFile {
+    Source {
+        source_index: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transform_id: Option<String>,
+    },
+    Default {
+        value: Vec<u8>,
+    },
+    Null,
+}
+
+impl From<&ColumnEvolution> for ColumnEvolutionFile {
+    fn from(evolution: &ColumnEvolution) -> Self {
+        match evolution {
+            ColumnEvolution::Source {
+                source_index,
+                transform_id,
+            } => Self::Source {
+                source_index: *source_index,
+                transform_id: transform_id.clone(),
+            },
+            ColumnEvolution::Default { value } => Self::Default {
+                value: value.to_vec(),
+            },
+            ColumnEvolution::Null => Self::Null,
+        }
+    }
+}
+
+impl From<ColumnEvolutionFile> for ColumnEvolution {
+    fn from(evolution: ColumnEvolutionFile) -> Self {
+        match evolution {
+            ColumnEvolutionFile::Source {
+                source_index,
+                transform_id,
+            } => Self::Source {
+                source_index,
+                transform_id,
+            },
+            ColumnEvolutionFile::Default { value } => Self::Default {
+                value: Bytes::from(value),
+            },
+            ColumnEvolutionFile::Null => Self::Null,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitionCompatibility {
+    Compatible,
+    Incompatible,
+    Unknown,
+}
+
+/// Runtime state for one schema transition.
+///
+/// `columns == None` means the transition is an identity for this column family.
+/// Derived execution metadata belongs here rather than in the persisted schema model.
+#[derive(Clone, Debug)]
+struct SchemaEvolution {
+    columns: Option<Arc<Vec<ColumnEvolution>>>,
+    compatibility: TransitionCompatibility,
+}
+
+impl SchemaEvolution {
+    fn identity() -> Self {
+        Self {
+            columns: None,
+            compatibility: TransitionCompatibility::Compatible,
         }
     }
 
-    fn evolve(&self, value: Value) -> Result<Value> {
-        let expired_at = value.expired_at();
-        let mut columns = value.columns;
-        match self {
-            Self::Noop => {}
-            Self::ColumnRemap { columns: remap } => {
-                let mut source = columns;
-                let source_len = source.len();
-                columns = Vec::with_capacity(remap.len());
-                let mut moved_sources = 0;
-                let mut moved_sources_are_deletes = true;
-                let mut whole_row_delete = None;
-                for target in remap.iter() {
-                    columns.push(match target {
-                        ColumnRemap::Source(index) => {
-                            let column = source
-                                .get_mut(*index)
-                                .ok_or_else(|| {
-                                    Error::InvalidState(format!(
-                                        "Cannot remap source column {index} from {} columns",
-                                        source_len
-                                    ))
-                                })?
-                                .take();
-                            moved_sources += 1;
-                            moved_sources_are_deletes &= is_delete_column(column.as_ref());
-                            column
-                        }
-                        ColumnRemap::Default(bytes) => {
-                            let deleted = *whole_row_delete.get_or_insert_with(|| {
-                                source_len != 0
-                                    && moved_sources_are_deletes
-                                    && source.iter().filter(|column| column.is_none()).count()
-                                        == moved_sources
-                                    && source
-                                        .iter()
-                                        .filter_map(Option::as_ref)
-                                        .all(|column| is_delete_column(Some(column)))
-                            });
-                            if deleted {
-                                Some(Column::new(ValueType::Delete, Bytes::new()))
-                            } else {
-                                Some(Column::new(ValueType::Put, bytes.clone()))
-                            }
-                        }
-                        ColumnRemap::Null => {
-                            let deleted = *whole_row_delete.get_or_insert_with(|| {
-                                source_len != 0
-                                    && moved_sources_are_deletes
-                                    && source.iter().filter(|column| column.is_none()).count()
-                                        == moved_sources
-                                    && source
-                                        .iter()
-                                        .filter_map(Option::as_ref)
-                                        .all(|column| is_delete_column(Some(column)))
-                            });
-                            if deleted {
-                                Some(Column::new(ValueType::Delete, Bytes::new()))
-                            } else {
-                                None
-                            }
-                        }
-                    });
+    fn with_columns(columns: Vec<ColumnEvolution>, compatibility: TransitionCompatibility) -> Self {
+        Self {
+            columns: Some(Arc::new(columns)),
+            compatibility,
+        }
+    }
+}
+
+fn evolve_value_with_transition(transition: &[ColumnEvolution], value: Value) -> Result<Value> {
+    let expired_at = value.expired_at();
+    let mut source = value.columns;
+    let source_len = source.len();
+    let whole_row_delete = source_len != 0
+        && source
+            .iter()
+            .all(|column| is_delete_column(column.as_ref()));
+    let mut columns = Vec::with_capacity(transition.len());
+    for target in transition {
+        columns.push(match target {
+            ColumnEvolution::Source {
+                source_index,
+                transform_id: None,
+            } => source
+                .get_mut(*source_index)
+                .ok_or_else(|| {
+                    Error::InvalidState(format!(
+                        "Cannot evolve source column {source_index} from {} columns",
+                        source_len
+                    ))
+                })?
+                .take(),
+            ColumnEvolution::Source {
+                transform_id: Some(transform_id),
+                ..
+            } => {
+                return Err(Error::InvalidState(format!(
+                    "Schema transform '{}' requires materialized row execution",
+                    transform_id
+                )));
+            }
+            ColumnEvolution::Default { value } => {
+                if whole_row_delete {
+                    Some(Column::new(ValueType::Delete, Bytes::new()))
+                } else {
+                    Some(Column::new(ValueType::Put, value.clone()))
                 }
             }
-        }
-        Ok(Value::new_with_expired_at(columns, expired_at))
+            ColumnEvolution::Null => {
+                if whole_row_delete {
+                    Some(Column::new(ValueType::Delete, Bytes::new()))
+                } else {
+                    None
+                }
+            }
+        });
     }
+    Ok(Value::new_with_expired_at(columns, expired_at))
 }
 
 fn is_delete_column(column: Option<&Column>) -> bool {
     column.is_some_and(|column| *column.value_type() == ValueType::Delete)
 }
 
-/// Compiles the builder's final target-to-source mapping into the runtime
-/// evolution form, using `Noop` only for an unchanged identity mapping.
-fn compile_builtin_evolution(
-    source_columns: usize,
-    remap: &[ColumnRemap],
-) -> BuiltinSchemaEvolution {
-    if remap
-        .iter()
-        .enumerate()
-        .all(|(index, column)| matches!(column, ColumnRemap::Source(source) if *source == index))
-        && remap.len() == source_columns
+fn compile_evolution(
+    previous: Option<&ColumnFamily>,
+    target: &ColumnFamily,
+    columns: &[ColumnEvolution],
+) -> SchemaEvolution {
+    let Some(previous) = previous else {
+        return SchemaEvolution::identity();
+    };
+    let identity = columns.iter().enumerate().all(|(index, evolution)| {
+        matches!(
+            evolution,
+            ColumnEvolution::Source {
+                source_index,
+                transform_id: None,
+            } if *source_index == index
+        )
+    });
+    if identity
+        && columns.len() == previous.num_columns()
+        && target
+            .operators
+            .iter()
+            .map(|operator| operator.id())
+            .eq(previous.operators.iter().map(|operator| operator.id()))
+        && target.column_metadata == previous.column_metadata
+        && target.options == previous.options
     {
-        return BuiltinSchemaEvolution::Noop;
-    }
-
-    BuiltinSchemaEvolution::ColumnRemap {
-        columns: Arc::new(remap.to_vec()),
-    }
-}
-
-#[allow(clippy::type_complexity)]
-fn encode_evolution(
-    evolution: &BuiltinSchemaEvolution,
-) -> (
-    Option<String>,
-    Option<Vec<usize>>,
-    Option<Vec<Option<Vec<u8>>>>,
-) {
-    match evolution {
-        BuiltinSchemaEvolution::Noop => (Some(evolution.id().to_string()), None, None),
-        BuiltinSchemaEvolution::ColumnRemap { columns } => {
-            let indexes = columns
-                .iter()
-                .map(|column| match column {
-                    ColumnRemap::Source(index) => *index,
-                    ColumnRemap::Default(_) => 0,
-                    ColumnRemap::Null => NULL_REMAP_INDEX,
-                })
-                .collect();
-            let defaults = columns
-                .iter()
-                .map(|column| match column {
-                    ColumnRemap::Source(_) => None,
-                    ColumnRemap::Default(bytes) => Some(bytes.to_vec()),
-                    ColumnRemap::Null => None,
-                })
-                .collect();
-            (
-                Some(evolution.id().to_string()),
-                Some(indexes),
-                Some(defaults),
-            )
-        }
+        SchemaEvolution::identity()
+    } else {
+        SchemaEvolution::with_columns(
+            columns.to_vec(),
+            classify_columns(previous, target, columns),
+        )
     }
 }
 
-fn decode_evolution(
-    evolution_id: Option<&str>,
-    evolution_indexes: Option<Vec<usize>>,
-    evolution_default_values: Option<Vec<Option<Vec<u8>>>>,
-    target_columns: usize,
-) -> Result<BuiltinSchemaEvolution> {
-    match evolution_id {
-        Some("noop") | None => Ok(BuiltinSchemaEvolution::Noop),
-        Some("column_remap") => {
-            let indexes = evolution_indexes.ok_or_else(|| {
-                Error::FileFormatError(
-                    "Missing evolution_indexes for column_remap schema evolution".to_string(),
-                )
-            })?;
-            let defaults = evolution_default_values.ok_or_else(|| {
-                Error::FileFormatError(
-                    "Missing evolution_default_values for column_remap schema evolution"
-                        .to_string(),
-                )
-            })?;
-            if indexes.len() != defaults.len() {
-                return Err(Error::FileFormatError(
-                    "column_remap sources/defaults length mismatch".to_string(),
-                ));
-            }
-            let mut sources = BTreeSet::new();
-            let columns = indexes
-                .into_iter()
-                .zip(defaults)
-                .map(|(index, default)| match (index, default) {
-                    (0, Some(default)) => Ok(ColumnRemap::Default(Bytes::from(default))),
-                    (NULL_REMAP_INDEX, None) => Ok(ColumnRemap::Null),
-                    (index, None) if sources.insert(index) => Ok(ColumnRemap::Source(index)),
-                    _ => Err(Error::FileFormatError(
-                        "invalid column_remap target".to_string(),
-                    )),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if columns.len() != target_columns {
-                return Err(Error::FileFormatError(format!(
-                    "column_remap target length {} does not match schema columns {}",
-                    columns.len(),
-                    target_columns
-                )));
-            }
-            Ok(BuiltinSchemaEvolution::ColumnRemap {
-                columns: Arc::new(columns),
-            })
-        }
-        Some(id) => Err(Error::InvalidState(format!(
-            "Unknown schema evolution id '{}'",
-            id
-        ))),
+fn classify_columns(
+    previous: &ColumnFamily,
+    target: &ColumnFamily,
+    columns: &[ColumnEvolution],
+) -> TransitionCompatibility {
+    if previous.options != target.options {
+        return TransitionCompatibility::Incompatible;
     }
+    let mut source_indexes = BTreeSet::new();
+    for (target_index, evolution) in columns.iter().enumerate() {
+        let ColumnEvolution::Source {
+            source_index,
+            transform_id: None,
+        } = evolution
+        else {
+            return TransitionCompatibility::Incompatible;
+        };
+        let Some(source_operator) = previous.operators.get(*source_index) else {
+            return TransitionCompatibility::Incompatible;
+        };
+        let Some(target_operator) = target.operators.get(target_index) else {
+            return TransitionCompatibility::Incompatible;
+        };
+        if !source_indexes.insert(*source_index)
+            || source_operator.id() != target_operator.id()
+            || previous.column_metadata.get(*source_index)
+                != target.column_metadata.get(target_index)
+        {
+            return TransitionCompatibility::Incompatible;
+        }
+    }
+    TransitionCompatibility::Compatible
 }
 
 /// Runtime schema for merge semantics.
@@ -375,6 +383,29 @@ pub struct Schema {
 }
 
 impl Schema {
+    fn compile_transition_compatibility(&mut self, previous: Option<&Schema>) {
+        let previous_is_available = previous.is_some() || self.version == 0;
+        let families = Arc::make_mut(&mut self.column_families);
+        for family in families {
+            let Some(columns) = family.evolution.columns.as_ref() else {
+                continue;
+            };
+            let compatibility = if previous_is_available {
+                previous
+                    .and_then(|schema| schema.column_family_by_id(family.id))
+                    .map_or(TransitionCompatibility::Compatible, |previous| {
+                        classify_columns(previous, family, columns)
+                    })
+            } else {
+                TransitionCompatibility::Unknown
+            };
+            family.evolution = SchemaEvolution {
+                columns: Some(Arc::clone(columns)),
+                compatibility,
+            };
+        }
+    }
+
     pub(crate) fn new(
         version: u64,
         num_columns: usize,
@@ -536,7 +567,7 @@ impl Schema {
     ) -> Arc<Schema> {
         let mut column_families = self.column_families.as_ref().clone();
         for family in &mut column_families {
-            family.evolution = BuiltinSchemaEvolution::Noop;
+            family.evolution = SchemaEvolution::identity();
             family.projection = None;
         }
         if let Some(projected_family) = column_families
@@ -610,9 +641,23 @@ impl Schema {
         Arc::new(Self::new(0, 0, Vec::new()))
     }
 
-    fn evolution_in_family(&self, column_family_id: u8) -> Result<BuiltinSchemaEvolution> {
+    fn evolution_in_family(&self, column_family_id: u8) -> Result<&SchemaEvolution> {
         self.column_family_by_id(column_family_id)
-            .map(|family| family.evolution.clone())
+            .map(|family| &family.evolution)
+            .ok_or_else(|| {
+                Error::InvalidState(format!(
+                    "schema {} is missing column family {}",
+                    self.version, column_family_id
+                ))
+            })
+    }
+
+    pub(crate) fn transition_compatibility_in_family(
+        &self,
+        column_family_id: u8,
+    ) -> Result<TransitionCompatibility> {
+        self.column_family_by_id(column_family_id)
+            .map(|family| family.evolution.compatibility)
             .ok_or_else(|| {
                 Error::InvalidState(format!(
                     "schema {} is missing column family {}",
@@ -707,9 +752,17 @@ impl SchemaManager {
         default_num_columns: usize,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Self {
+        let mut pending = schemas
+            .into_iter()
+            .map(|schema| (schema.version(), schema))
+            .collect::<BTreeMap<_, _>>();
         let mut versions: BTreeMap<u64, Arc<Schema>> = BTreeMap::new();
-        for schema in schemas {
-            let version = schema.version();
+        while let Some((version, mut schema)) = pending.pop_first() {
+            let previous = version
+                .checked_sub(1)
+                .and_then(|previous_version| versions.get(&previous_version))
+                .cloned();
+            schema.compile_transition_compatibility(previous.as_deref());
             versions.insert(version, Arc::new(schema));
         }
         if versions.is_empty() {
@@ -915,9 +968,9 @@ impl SchemaManager {
             let schema = schemas.get(&schema_id).ok_or_else(|| {
                 Error::InvalidState(format!("Missing schema for version {}", schema_id))
             })?;
-            value = schema
-                .evolution_in_family(column_family_id)?
-                .evolve(value)?;
+            if let Some(columns) = &schema.evolution_in_family(column_family_id)?.columns {
+                value = evolve_value_with_transition(columns, value)?;
+            }
         }
         Ok(value)
     }
@@ -1008,7 +1061,7 @@ impl SchemaManager {
         if self.schemas.read().unwrap().contains_key(&schema_id) {
             return Ok(());
         }
-        let schema = Arc::new(load_schema(file_manager, schema_id, resolver)?);
+        let schema = load_schema(file_manager, schema_id, resolver)?;
         self.register_loaded_schema(schema);
         Ok(())
     }
@@ -1027,7 +1080,7 @@ impl SchemaManager {
         if self.schemas.read().unwrap().contains_key(&schema_file.id) {
             return Ok(());
         }
-        let schema = Arc::new(schema_from_file(schema_file, resolver)?);
+        let schema = schema_from_file(schema_file, resolver)?;
         self.register_loaded_schema(schema);
         Ok(())
     }
@@ -1036,14 +1089,35 @@ impl SchemaManager {
     /// than the current latest, and advances `next_version` past it. ArcSwap guarantees the
     /// promotion is atomic; a concurrent loader that registers an even-newer version simply wins,
     /// which is correct because both are writer-persisted schemas.
-    fn register_loaded_schema(&self, schema: Arc<Schema>) {
-        self.schemas
-            .write()
-            .unwrap()
-            .insert(schema.version(), Arc::clone(&schema));
+    fn register_loaded_schema(&self, mut schema: Schema) {
+        let mut schemas = self.schemas.write().unwrap();
+        let version = schema.version();
+        let previous = version
+            .checked_sub(1)
+            .and_then(|previous_version| schemas.get(&previous_version).cloned());
+        schema.compile_transition_compatibility(previous.as_deref());
+        let schema = Arc::new(schema);
+        schemas.insert(version, Arc::clone(&schema));
+        let successor = version
+            .checked_add(1)
+            .and_then(|successor_version| schemas.get(&successor_version).cloned())
+            .map(|successor| {
+                let mut successor = successor.as_ref().clone();
+                successor.compile_transition_compatibility(Some(schema.as_ref()));
+                let successor = Arc::new(successor);
+                schemas.insert(successor.version(), Arc::clone(&successor));
+                successor
+            });
+        drop(schemas);
+
         let current_latest_version = self.latest_schema.load().version();
         if schema.version() > current_latest_version {
             self.latest_schema.store(Arc::clone(&schema));
+        } else if successor
+            .as_ref()
+            .is_some_and(|successor| successor.version() == current_latest_version)
+        {
+            self.latest_schema.store(successor.unwrap());
         }
         let target_next = schema.version().saturating_add(1);
         let mut current_next = self.next_version.load(Ordering::SeqCst);
@@ -1108,19 +1182,17 @@ pub(crate) fn schema_to_file(schema: &Schema) -> SchemaFile {
     let column_families = schema
         .column_families
         .iter()
-        .map(|family| {
-            let (evolution_id, evolution_indexes, evolution_default_values) =
-                encode_evolution(&family.evolution);
-            ColumnFamilyFile {
-                id: family.id,
-                name: family.name.clone(),
-                merge_operator_ids: family.operator_ids(),
-                column_metadata: family.column_metadata.clone(),
-                options: family.options.clone(),
-                evolution_id,
-                evolution_indexes,
-                evolution_default_values,
-            }
+        .map(|family| ColumnFamilyFile {
+            id: family.id,
+            name: family.name.clone(),
+            merge_operator_ids: family.operator_ids(),
+            column_metadata: family.column_metadata.clone(),
+            options: family.options.clone(),
+            transition: family
+                .evolution
+                .columns
+                .as_ref()
+                .map(|columns| columns.iter().map(ColumnEvolutionFile::from).collect()),
         })
         .collect();
     SchemaFile {
@@ -1157,6 +1229,11 @@ pub(crate) fn schema_from_file(
     ))
 }
 
+fn schema_file_from_payload(payload: &[u8]) -> Result<SchemaFile> {
+    serde_json::from_slice(payload)
+        .map_err(|err| Error::FileFormatError(format!("Failed to decode schema file: {}", err)))
+}
+
 pub(crate) fn load_schema(
     file_manager: &Arc<FileManager>,
     schema_id: u64,
@@ -1165,32 +1242,14 @@ pub(crate) fn load_schema(
     let reader =
         file_manager.open_metadata_file_reader_untracked(&schema_file_relative_path(schema_id))?;
     let payload = MetadataReader::new(reader).read_all()?;
-    let schema_file: SchemaFile = serde_json::from_slice(payload.as_ref())
-        .map_err(|err| Error::FileFormatError(format!("Failed to decode schema file: {}", err)))?;
+    let schema_file = schema_file_from_payload(payload.as_ref())?;
     if schema_file.id != schema_id {
         return Err(Error::InvalidState(format!(
             "Schema file id mismatch: expected {}, got {}",
             schema_id, schema_file.id
         )));
     }
-    if schema_file.format_version != SCHEMA_FILE_FORMAT_VERSION {
-        return Err(Error::FileFormatError(format!(
-            "Unsupported schema file format version {} (expected {})",
-            schema_file.format_version, SCHEMA_FILE_FORMAT_VERSION
-        )));
-    }
-    let column_families = load_column_families(&schema_file, resolver)?;
-    if column_families.len() > MAX_COLUMN_FAMILY_COUNT {
-        return Err(Error::FileFormatError(format!(
-            "column family count {} exceeds max {}",
-            column_families.len(),
-            MAX_COLUMN_FAMILY_COUNT
-        )));
-    }
-    Ok(Schema::new_with_column_families(
-        schema_file.id,
-        column_families,
-    ))
+    schema_from_file(&schema_file, resolver)
 }
 
 pub(crate) fn load_schema_from_path(
@@ -1201,32 +1260,14 @@ pub(crate) fn load_schema_from_path(
 ) -> Result<Schema> {
     let reader = file_manager.open_metadata_file_reader_at_path(schema_path)?;
     let payload = MetadataReader::new(reader).read_all()?;
-    let schema_file: SchemaFile = serde_json::from_slice(payload.as_ref())
-        .map_err(|err| Error::FileFormatError(format!("Failed to decode schema file: {}", err)))?;
+    let schema_file = schema_file_from_payload(payload.as_ref())?;
     if schema_file.id != schema_id {
         return Err(Error::InvalidState(format!(
             "Schema file id mismatch: expected {}, got {}",
             schema_id, schema_file.id
         )));
     }
-    if schema_file.format_version != SCHEMA_FILE_FORMAT_VERSION {
-        return Err(Error::FileFormatError(format!(
-            "Unsupported schema file format version {} (expected {})",
-            schema_file.format_version, SCHEMA_FILE_FORMAT_VERSION
-        )));
-    }
-    let column_families = load_column_families(&schema_file, resolver)?;
-    if column_families.len() > MAX_COLUMN_FAMILY_COUNT {
-        return Err(Error::FileFormatError(format!(
-            "column family count {} exceeds max {}",
-            column_families.len(),
-            MAX_COLUMN_FAMILY_COUNT
-        )));
-    }
-    Ok(Schema::new_with_column_families(
-        schema_file.id,
-        column_families,
-    ))
+    schema_from_file(&schema_file, resolver)
 }
 
 fn load_column_families(
@@ -1257,12 +1298,20 @@ fn load_column_families(
             family.column_metadata.clone(),
             family.options.clone(),
         );
-        column_family.evolution = decode_evolution(
-            family.evolution_id.as_deref(),
-            family.evolution_indexes.clone(),
-            family.evolution_default_values.clone(),
-            column_family.num_columns(),
-        )?;
+        column_family.evolution =
+            family
+                .transition
+                .as_ref()
+                .map_or_else(SchemaEvolution::identity, |transition| {
+                    SchemaEvolution::with_columns(
+                        transition
+                            .iter()
+                            .cloned()
+                            .map(ColumnEvolution::from)
+                            .collect(),
+                        TransitionCompatibility::Unknown,
+                    )
+                });
         column_families.push(column_family);
     }
     for (position, family) in column_families.iter().enumerate() {
@@ -1293,7 +1342,7 @@ pub struct SchemaBuilder {
     column_families: Vec<ColumnFamily>,
     column_family_name_index: HashMap<String, u8>,
     /// The complete target-to-source mapping for each column family.
-    column_remaps: Vec<Vec<ColumnRemap>>,
+    transitions: Vec<Vec<ColumnEvolution>>,
     _access_guard: Option<OwnedDbAccessGuard>,
 }
 
@@ -1305,19 +1354,26 @@ impl SchemaBuilder {
     ) -> Self {
         let mut column_families = schema.column_families.as_ref().clone();
         for family in &mut column_families {
-            family.evolution = BuiltinSchemaEvolution::Noop;
+            family.evolution = SchemaEvolution::identity();
             family.projection = None;
         }
-        let column_remaps = column_families
+        let transitions = column_families
             .iter()
-            .map(|family| (0..family.num_columns()).map(ColumnRemap::Source).collect())
+            .map(|family| {
+                (0..family.num_columns())
+                    .map(|source_index| ColumnEvolution::Source {
+                        source_index,
+                        transform_id: None,
+                    })
+                    .collect()
+            })
             .collect::<Vec<_>>();
         Self {
             manager,
             base_schema: Arc::clone(&schema),
             column_families,
             column_family_name_index: schema.column_family_name_index.as_ref().clone(),
-            column_remaps,
+            transitions,
             _access_guard: access_guard,
         }
     }
@@ -1450,21 +1506,30 @@ impl SchemaBuilder {
     pub fn remap_columns(
         &mut self,
         column_family: Option<String>,
-        columns: Vec<ColumnRemap>,
+        columns: Vec<ColumnEvolution>,
     ) -> Result<()> {
         let family_position = self.resolve_existing_family_position(column_family)?;
-        let old_columns = self.column_remaps[family_position].len();
+        let old_columns = self.transitions[family_position].len();
         let mut used_sources = vec![false; old_columns];
         for column in &columns {
-            if let ColumnRemap::Source(index) = column {
-                if *index >= old_columns {
+            if let ColumnEvolution::Source {
+                source_index,
+                transform_id,
+            } = column
+            {
+                if transform_id.is_some() {
+                    return Err(Error::InvalidState(
+                        "schema transforms are not available through remap_columns".to_string(),
+                    ));
+                }
+                if *source_index >= old_columns {
                     return Err(Error::InvalidState(format!(
-                        "Cannot remap source column {index} from {old_columns} columns"
+                        "Cannot remap source column {source_index} from {old_columns} columns"
                     )));
                 }
-                if std::mem::replace(&mut used_sources[*index], true) {
+                if std::mem::replace(&mut used_sources[*source_index], true) {
                     return Err(Error::InvalidState(format!(
-                        "Cannot remap source column {index} more than once"
+                        "Cannot remap source column {source_index} more than once"
                     )));
                 }
             }
@@ -1473,26 +1538,30 @@ impl SchemaBuilder {
         let family = &mut self.column_families[family_position];
         let old_operators = std::mem::take(&mut family.operators);
         let old_metadata = std::mem::take(&mut family.column_metadata);
-        let old_remap = self.column_remaps[family_position].clone();
+        let old_transition = self.transitions[family_position].clone();
         family.operators = columns
             .iter()
             .map(|column| match column {
-                ColumnRemap::Source(index) => Arc::clone(&old_operators[*index]),
-                ColumnRemap::Default(_) | ColumnRemap::Null => default_merge_operator(),
+                ColumnEvolution::Source { source_index, .. } => {
+                    Arc::clone(&old_operators[*source_index])
+                }
+                ColumnEvolution::Default { .. } | ColumnEvolution::Null => default_merge_operator(),
             })
             .collect();
         family.column_metadata = columns
             .iter()
             .map(|column| match column {
-                ColumnRemap::Source(index) => old_metadata[*index].clone(),
-                ColumnRemap::Default(_) | ColumnRemap::Null => None,
+                ColumnEvolution::Source { source_index, .. } => old_metadata[*source_index].clone(),
+                ColumnEvolution::Default { .. } | ColumnEvolution::Null => None,
             })
             .collect();
-        self.column_remaps[family_position] = columns
+        self.transitions[family_position] = columns
             .into_iter()
             .map(|column| match column {
-                ColumnRemap::Source(index) => old_remap[index].clone(),
-                default => default,
+                ColumnEvolution::Source { source_index, .. } => {
+                    old_transition[source_index].clone()
+                }
+                evolution => evolution,
             })
             .collect();
         Ok(())
@@ -1501,13 +1570,8 @@ impl SchemaBuilder {
     /// Commit the schema changes and return the new schema.
     pub fn commit(mut self) -> Arc<Schema> {
         for (position, family) in self.column_families.iter_mut().enumerate() {
-            let source_columns = self
-                .base_schema
-                .column_families
-                .get(position)
-                .map_or(0, ColumnFamily::num_columns);
-            family.evolution =
-                compile_builtin_evolution(source_columns, self.column_remaps[position].as_slice());
+            let previous = self.base_schema.column_families.get(position);
+            family.evolution = compile_evolution(previous, family, &self.transitions[position]);
         }
         self.manager
             .commit_build(self.base_schema.as_ref(), self.column_families)
@@ -1538,7 +1602,7 @@ impl SchemaBuilder {
             ColumnFamilyOptions::default(),
         ));
         self.column_family_name_index.insert(normalized, next_id);
-        self.column_remaps.push(Vec::new());
+        self.transitions.push(Vec::new());
         Ok(next_id)
     }
 
@@ -1596,13 +1660,15 @@ impl SchemaBuilder {
                 default_values.len()
             )));
         }
-        let remap = &mut self.column_remaps[family_position];
+        let transition = &mut self.transitions[family_position];
         for (&index, default_value) in indexes.iter().zip(default_values.iter()) {
             let target = default_value
                 .as_ref()
                 .cloned()
-                .map_or(ColumnRemap::Null, ColumnRemap::Default);
-            remap.insert(index, target);
+                .map_or(ColumnEvolution::Null, |value| ColumnEvolution::Default {
+                    value,
+                });
+            transition.insert(index, target);
         }
         Ok(())
     }
@@ -1612,7 +1678,7 @@ impl SchemaBuilder {
         family_position: usize,
         index: usize,
     ) -> Result<()> {
-        self.column_remaps[family_position].remove(index);
+        self.transitions[family_position].remove(index);
         Ok(())
     }
 

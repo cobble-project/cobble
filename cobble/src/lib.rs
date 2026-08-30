@@ -175,7 +175,7 @@ pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
 pub use read_only_db::ReadOnlyDb;
 pub use reader::{GlobalSnapshotSummary, Reader, ReaderConfig};
 pub use scan::{ScanPlan, ScanSplit, ScanSplitScanner};
-pub use schema::{ColumnFamilyOptions, ColumnRemap, Schema, SchemaBuilder};
+pub use schema::{ColumnEvolution, ColumnFamilyOptions, Schema, SchemaBuilder};
 pub use single_db::SingleDb;
 pub use snapshot_tool::prune_shard_snapshot;
 pub use sst::SstCompressionAlgorithm;

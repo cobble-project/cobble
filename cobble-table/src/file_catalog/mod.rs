@@ -8,7 +8,7 @@ use crate::{
     DataField, FieldId, LogicalType, LogicalTypeKind, Table, TableError, TableSchema, Value,
     ValueCodec,
 };
-use cobble::{ColumnFamilyOptions, ColumnRemap, Config, Db};
+use cobble::{ColumnEvolution, ColumnFamilyOptions, Config, Db};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -864,7 +864,7 @@ fn validate_schema_mapping_key(
 fn build_column_remap(
     existing: &TableMetadata,
     target: &TableMetadata,
-) -> CatalogResult<Vec<ColumnRemap>> {
+) -> CatalogResult<Vec<ColumnEvolution>> {
     if existing.layout.key_fields != target.layout.key_fields
         || existing.layout.bucket_fields != target.layout.bucket_fields
     {
@@ -892,7 +892,9 @@ fn build_column_remap(
     }
 
     if target.layout.value_columns.is_empty() {
-        return Ok(vec![ColumnRemap::Default(Vec::new().into())]);
+        return Ok(vec![ColumnEvolution::Default {
+            value: Vec::new().into(),
+        }]);
     }
     let existing_columns = existing
         .layout
@@ -912,12 +914,15 @@ fn build_column_remap(
         .iter()
         .map(|column| {
             if let Some(source) = existing_columns.get(&column.field_id) {
-                return Ok(ColumnRemap::Source(*source));
+                return Ok(ColumnEvolution::Source {
+                    source_index: *source,
+                    transform_id: None,
+                });
             }
             let logical_type = target_fields[&column.field_id];
-            Ok(ColumnRemap::Default(
-                ValueCodec::encode_validated(logical_type, &Value::Null)?.into(),
-            ))
+            Ok(ColumnEvolution::Default {
+                value: ValueCodec::encode_validated(logical_type, &Value::Null)?.into(),
+            })
         })
         .collect()
 }
