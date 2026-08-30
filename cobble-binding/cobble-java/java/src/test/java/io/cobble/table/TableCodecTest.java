@@ -27,6 +27,7 @@ class TableCodecTest {
                                                 Paths.get(
                                                         "..",
                                                         "..",
+                                                        "..",
                                                         "spec",
                                                         "table",
                                                         "fixtures",
@@ -158,6 +159,7 @@ class TableCodecTest {
                 new String(
                         Files.readAllBytes(
                                 Paths.get(
+                                        "..",
                                         "..",
                                         "..",
                                         "spec",
