@@ -1,11 +1,11 @@
-use crate::buffer::{InputBytes, WritableBuffer};
+use crate::buffer::{InputBytes, copy_single_column};
 use crate::error::{input_error, invalid_state, map_error};
 use crate::multi_get::{PyMultiGetResult, extract_keys};
 use crate::options::{PyReadOptions, PyScanOptions};
 use crate::row::PyOwnedRow;
 use crate::scan::PyScanCursor;
 use crate::snapshot::{PyGlobalSnapshot, snapshot};
-use crate::types::{PyBufferResult, PyBufferStatus, PyReaderMode};
+use crate::types::{PyBufferResult, PyReaderMode};
 use cobble_binding::{Config, ReadOptions, Reader, ReaderConfig};
 use pyo3::prelude::*;
 use std::path::PathBuf;
@@ -117,44 +117,25 @@ impl PyReader {
 
     fn get_column_into(
         &mut self,
+        py: Python<'_>,
         bucket: u16,
         key: &Bound<'_, PyAny>,
         output: &Bound<'_, PyAny>,
         options: PyRef<'_, PyReadOptions>,
     ) -> PyResult<PyBufferResult> {
         let key = InputBytes::extract(key)?;
-        let mut output = WritableBuffer::extract(output)?;
         if options.inner.column_indices.as_ref().map(Vec::len) != Some(1) {
             return Err(input_error(
                 "get_column_into requires ReadOptions with exactly one column",
             ));
         }
-        let Some(columns) = self
-            .reader
-            .get_with_options(bucket, key.as_ref(), &options.inner)
-            .map_err(map_error)?
-        else {
-            return Ok(PyBufferResult::new(PyBufferStatus::NotFound, 0, 0, 0));
-        };
-        let Some(Some(column)) = columns.into_iter().next() else {
-            return Ok(PyBufferResult::new(PyBufferStatus::NotFound, 0, 0, 0));
-        };
-        let required = column.len();
-        if output.as_mut_slice().len() < required {
-            return Ok(PyBufferResult::new(
-                PyBufferStatus::BufferTooSmall,
-                0,
-                required,
-                1,
-            ));
-        }
-        output.as_mut_slice()[..required].copy_from_slice(&column);
-        Ok(PyBufferResult::new(
-            PyBufferStatus::Ok,
-            required,
-            required,
-            1,
-        ))
+        let options = options.inner.clone();
+        let columns = py.detach(|| {
+            self.reader
+                .get_with_options(bucket, key.as_ref(), &options)
+                .map_err(map_error)
+        })?;
+        copy_single_column(columns, output)
     }
 
     #[pyo3(signature = (bucket, start, end, options=None))]

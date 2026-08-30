@@ -1,5 +1,5 @@
 use super::batch::PyStructuredWriteBatch;
-use super::encoding::{CsrbColumns, CsrbRow, buffer_result, encode_into, encoded_len};
+use super::encoding::{CsrbColumns, CsrbRow, buffer_result, prepare};
 use super::types::{
     PyStructuredMultiGetResult, PyStructuredReadOptions, PyStructuredRow, PyStructuredScanOptions,
     PyStructuredSchema, PyStructuredSchemaBuilder, StructuredOwner, schema,
@@ -56,7 +56,8 @@ fn encode_get_into(
             .map(CsrbColumns::Structured)
             .unwrap_or(CsrbColumns::Missing),
     }];
-    let required = encoded_len(&rows)?;
+    let prepared = prepare(&rows, false, false)?;
+    let required = prepared.required_len();
     if output.len() < required {
         return Ok(buffer_result(
             PyBufferStatus::BufferTooSmall,
@@ -65,7 +66,7 @@ fn encode_get_into(
             1,
         ));
     }
-    let written = encode_into(&rows, false, false, output)?;
+    let written = prepared.encode_into(output);
     Ok(buffer_result(
         if columns.is_some() {
             PyBufferStatus::Ok
@@ -98,7 +99,8 @@ fn encode_multi_get_into(
                 .unwrap_or(CsrbColumns::Missing),
         })
         .collect::<Vec<_>>();
-    let required = encoded_len(&rows)?;
+    let prepared = prepare(&rows, false, false)?;
+    let required = prepared.required_len();
     if output.len() < required {
         return Ok(buffer_result(
             PyBufferStatus::BufferTooSmall,
@@ -107,7 +109,7 @@ fn encode_multi_get_into(
             rows.len(),
         ));
     }
-    let written = encode_into(&rows, false, false, output)?;
+    let written = prepared.encode_into(output);
     Ok(buffer_result(
         PyBufferStatus::Ok,
         written,
@@ -324,7 +326,8 @@ impl PyStructuredScanCursor {
                 columns: CsrbColumns::Structured(&row.columns),
             })
             .collect::<Vec<_>>();
-        let required = encoded_len(&rows)?;
+        let prepared = prepare(&rows, batch.end, batch.stopped_at_block_boundary)?;
+        let required = prepared.required_len();
         let mut output = WritableBuffer::extract(output)?;
         if output.as_mut_slice().len() < required {
             return Ok(buffer_result(
@@ -334,12 +337,7 @@ impl PyStructuredScanCursor {
                 rows.len(),
             ));
         }
-        let written = encode_into(
-            &rows,
-            batch.end,
-            batch.stopped_at_block_boundary,
-            output.as_mut_slice(),
-        )?;
+        let written = prepared.encode_into(output.as_mut_slice());
         let status = if rows.is_empty() && batch.end {
             PyBufferStatus::End
         } else if rows.is_empty() && batch.stopped_at_block_boundary {
@@ -450,6 +448,7 @@ impl PyStructuredSingleDb {
     #[pyo3(signature = (bucket, key, column, elements, options=None))]
     fn put_list(
         &self,
+        py: Python<'_>,
         bucket: u16,
         key: &Bound<'_, PyAny>,
         column: u16,
@@ -458,16 +457,20 @@ impl PyStructuredSingleDb {
     ) -> PyResult<()> {
         let key = InputBytes::extract(key)?;
         let elements = extract_elements(elements)?;
-        let refs = elements.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-        ds_ffi::single_db_put_borrowed_list_with_options(
-            &self.db,
-            bucket,
-            key.as_ref(),
-            column,
-            &refs,
-            &write_options(options),
-        )
-        .map_err(map_error)
+        let db = Arc::clone(&self.db);
+        let options = write_options(options);
+        py.detach(move || {
+            let refs = elements.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+            ds_ffi::single_db_put_borrowed_list_with_options(
+                &db,
+                bucket,
+                key.as_ref(),
+                column,
+                &refs,
+                &options,
+            )
+            .map_err(map_error)
+        })
     }
     #[pyo3(signature = (bucket, key, column, value, options=None))]
     fn merge_bytes(
@@ -499,6 +502,7 @@ impl PyStructuredSingleDb {
     #[pyo3(signature = (bucket, key, column, elements, options=None))]
     fn merge_list(
         &self,
+        py: Python<'_>,
         bucket: u16,
         key: &Bound<'_, PyAny>,
         column: u16,
@@ -507,16 +511,20 @@ impl PyStructuredSingleDb {
     ) -> PyResult<()> {
         let key = InputBytes::extract(key)?;
         let elements = extract_elements(elements)?;
-        let refs = elements.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-        ds_ffi::single_db_merge_borrowed_list_with_options(
-            &self.db,
-            bucket,
-            key.as_ref(),
-            column,
-            &refs,
-            &write_options(options),
-        )
-        .map_err(map_error)
+        let db = Arc::clone(&self.db);
+        let options = write_options(options);
+        py.detach(move || {
+            let refs = elements.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+            ds_ffi::single_db_merge_borrowed_list_with_options(
+                &db,
+                bucket,
+                key.as_ref(),
+                column,
+                &refs,
+                &options,
+            )
+            .map_err(map_error)
+        })
     }
 
     #[pyo3(signature = (bucket, key, column, options=None))]
@@ -618,7 +626,7 @@ impl PyStructuredSingleDb {
 
     fn write(&self, py: Python<'_>, batch: &PyStructuredWriteBatch) -> PyResult<()> {
         let operations = batch.begin()?;
-        let native = PyStructuredWriteBatch::for_single(&self.db, operations);
+        let native = PyStructuredWriteBatch::for_single(&self.db, operations.as_slice());
         let result = match native {
             Ok(native) => {
                 let db = Arc::clone(&self.db);
@@ -626,7 +634,7 @@ impl PyStructuredSingleDb {
             }
             Err(error) => Err(error),
         };
-        batch.finish(result.is_ok());
+        batch.finish(operations, result.is_ok());
         result
     }
 
@@ -1087,6 +1095,7 @@ impl PyStructuredDb {
     #[pyo3(signature = (bucket,key,column,elements,options=None))]
     fn put_list(
         &self,
+        py: Python<'_>,
         bucket: u16,
         key: &Bound<'_, PyAny>,
         column: u16,
@@ -1095,16 +1104,20 @@ impl PyStructuredDb {
     ) -> PyResult<()> {
         let key = InputBytes::extract(key)?;
         let elements = extract_elements(elements)?;
-        let refs = elements.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-        ds_ffi::db_put_borrowed_list_with_options(
-            &self.db,
-            bucket,
-            key.as_ref(),
-            column,
-            &refs,
-            &write_options(options),
-        )
-        .map_err(map_error)
+        let db = Arc::clone(&self.db);
+        let options = write_options(options);
+        py.detach(move || {
+            let refs = elements.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+            ds_ffi::db_put_borrowed_list_with_options(
+                &db,
+                bucket,
+                key.as_ref(),
+                column,
+                &refs,
+                &options,
+            )
+            .map_err(map_error)
+        })
     }
     #[pyo3(signature = (bucket,key,column,value,options=None))]
     fn merge_bytes(
@@ -1135,6 +1148,7 @@ impl PyStructuredDb {
     #[pyo3(signature = (bucket,key,column,elements,options=None))]
     fn merge_list(
         &self,
+        py: Python<'_>,
         bucket: u16,
         key: &Bound<'_, PyAny>,
         column: u16,
@@ -1143,16 +1157,20 @@ impl PyStructuredDb {
     ) -> PyResult<()> {
         let key = InputBytes::extract(key)?;
         let elements = extract_elements(elements)?;
-        let refs = elements.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-        ds_ffi::db_merge_borrowed_list_with_options(
-            &self.db,
-            bucket,
-            key.as_ref(),
-            column,
-            &refs,
-            &write_options(options),
-        )
-        .map_err(map_error)
+        let db = Arc::clone(&self.db);
+        let options = write_options(options);
+        py.detach(move || {
+            let refs = elements.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+            ds_ffi::db_merge_borrowed_list_with_options(
+                &db,
+                bucket,
+                key.as_ref(),
+                column,
+                &refs,
+                &options,
+            )
+            .map_err(map_error)
+        })
     }
     #[pyo3(signature = (bucket,key,column,options=None))]
     fn delete(
@@ -1252,7 +1270,7 @@ impl PyStructuredDb {
 
     fn write(&self, py: Python<'_>, batch: &PyStructuredWriteBatch) -> PyResult<()> {
         let operations = batch.begin()?;
-        let native = PyStructuredWriteBatch::for_db(&self.db, operations);
+        let native = PyStructuredWriteBatch::for_db(&self.db, operations.as_slice());
         let result = match native {
             Ok(native) => {
                 let db = Arc::clone(&self.db);
@@ -1260,7 +1278,7 @@ impl PyStructuredDb {
             }
             Err(error) => Err(error),
         };
-        batch.finish(result.is_ok());
+        batch.finish(operations, result.is_ok());
         result
     }
     #[pyo3(signature = (bucket,start=None,end=None,options=None))]

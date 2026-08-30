@@ -1,4 +1,4 @@
-use crate::buffer::{InputBytes, WritableBuffer};
+use crate::buffer::{InputBytes, copy_single_column};
 use crate::error::{invalid_state, map_error};
 use crate::metrics::{PyMetricSample, metrics};
 use crate::multi_get::{PyMultiGetResult, extract_keys};
@@ -7,7 +7,7 @@ use crate::row::PyOwnedRow;
 use crate::scan::PyScanCursor;
 use crate::schema::{PySchema, PySchemaBuilder, schema};
 use crate::snapshot::{PyGlobalSnapshot, PyPendingSnapshot, snapshot};
-use crate::types::{PyBufferResult, PyBufferStatus};
+use crate::types::PyBufferResult;
 use crate::types::{PyMemtableType, PyRecoveryMode};
 use crate::write_batch::PyWriteBatch;
 use cobble_binding::{Config, ReadOptions, SingleDb, WriteOptions};
@@ -207,7 +207,7 @@ impl PySingleDb {
     #[pyo3(signature = (bucket, key, output, options))]
     fn get_column_into(
         &self,
-        _py: Python<'_>,
+        py: Python<'_>,
         bucket: u16,
         key: &Bound<'_, PyAny>,
         output: &Bound<'_, PyAny>,
@@ -215,38 +215,18 @@ impl PySingleDb {
     ) -> PyResult<PyBufferResult> {
         self.ensure_open()?;
         let key = InputBytes::extract(key)?;
-        let mut output = WritableBuffer::extract(output)?;
         if options.inner.column_indices.as_ref().map(Vec::len) != Some(1) {
             return Err(crate::error::input_error(
                 "get_column_into requires ReadOptions with exactly one column",
             ));
         }
-        let Some(columns) = self
-            .db
-            .get_with_options(bucket, key.as_ref(), &options.inner)
-            .map_err(map_error)?
-        else {
-            return Ok(PyBufferResult::new(PyBufferStatus::NotFound, 0, 0, 0));
-        };
-        let Some(Some(column)) = columns.into_iter().next() else {
-            return Ok(PyBufferResult::new(PyBufferStatus::NotFound, 0, 0, 0));
-        };
-        let required = column.len();
-        if output.as_mut_slice().len() < required {
-            return Ok(PyBufferResult::new(
-                PyBufferStatus::BufferTooSmall,
-                0,
-                required,
-                1,
-            ));
-        }
-        output.as_mut_slice()[..required].copy_from_slice(&column);
-        Ok(PyBufferResult::new(
-            PyBufferStatus::Ok,
-            required,
-            required,
-            1,
-        ))
+        let db = Arc::clone(&self.db);
+        let options = options.inner.clone();
+        let columns = py.detach(move || {
+            db.get_with_options(bucket, key.as_ref(), &options)
+                .map_err(map_error)
+        })?;
+        copy_single_column(columns, output)
     }
 
     #[pyo3(signature = (batch, *, await_durable=true))]

@@ -1,5 +1,5 @@
 use crate::buffer::{OwnedBytes, WritableBuffer};
-use crate::encoding::{batch_encoded_len, encode_batch_into};
+use crate::encoding::prepare_batch;
 use crate::error::{input_error, invalid_state, map_error};
 use crate::types::{PyBufferResult, PyBufferStatus};
 use bytes::Bytes;
@@ -16,18 +16,6 @@ pub(crate) struct BatchRow {
 #[pyclass(name = "ScanRow", module = "pycobble._native", frozen)]
 pub(crate) struct PyScanRow {
     row: BatchRow,
-}
-
-impl PyScanRow {
-    fn from_row(row: &BatchRow) -> Self {
-        Self {
-            row: BatchRow {
-                bucket: row.bucket,
-                key: row.key.clone(),
-                columns: row.columns.clone(),
-            },
-        }
-    }
 }
 
 #[pymethods]
@@ -76,7 +64,13 @@ impl PyOwnedBatch {
     fn row(&self, index: usize) -> PyResult<PyScanRow> {
         self.rows
             .get(index)
-            .map(PyScanRow::from_row)
+            .map(|row| PyScanRow {
+                row: BatchRow {
+                    bucket: row.bucket,
+                    key: row.key.clone(),
+                    columns: row.columns.clone(),
+                },
+            })
             .ok_or_else(|| input_error("scan row index is out of bounds"))
     }
 
@@ -289,7 +283,8 @@ impl PyScanCursor {
             state.pending_batch = None;
             return Ok(PyBufferResult::new(status, 0, 0, 0));
         }
-        let required = batch_encoded_len(batch)?;
+        let prepared = prepare_batch(batch)?;
+        let required = prepared.required_len();
         if output.as_mut_slice().len() < required {
             return Ok(PyBufferResult::new(
                 PyBufferStatus::BufferTooSmall,
@@ -298,7 +293,7 @@ impl PyScanCursor {
                 batch.rows.len(),
             ));
         }
-        encode_batch_into(batch, &mut output.as_mut_slice()[..required])?;
+        prepared.encode_into(output.as_mut_slice());
         let row_count = batch.rows.len();
         state.pending_batch = None;
         Ok(PyBufferResult::new(

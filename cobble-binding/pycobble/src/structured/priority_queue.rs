@@ -1,5 +1,5 @@
 use super::database::{PyStructuredDb, PyStructuredSingleDb};
-use super::encoding::{CsrbColumns, CsrbRow, buffer_result, encode_into, encoded_len};
+use super::encoding::{CsrbColumns, CsrbRow, buffer_result, prepare};
 use crate::buffer::{InputBytes, OwnedBytes, WritableBuffer};
 use crate::error::{input_error, invalid_state, map_error};
 use crate::types::{PyBufferResult, PyBufferStatus};
@@ -173,7 +173,8 @@ impl PyPriorityQueue {
                 columns: CsrbColumns::PriorityQueue(value),
             })
             .collect::<Vec<_>>();
-        let required = encoded_len(&rows)?;
+        let prepared = prepare(&rows, pending.rows.is_empty(), false)?;
+        let required = prepared.required_len();
         let mut output = WritableBuffer::extract(output)?;
         if output.as_mut_slice().len() < required {
             return Ok(buffer_result(
@@ -188,7 +189,7 @@ impl PyPriorityQueue {
         {
             self.advance_inner(request.bucket, key.as_ref())?;
         }
-        let written = encode_into(&rows, pending.rows.is_empty(), false, output.as_mut_slice())?;
+        let written = prepared.encode_into(output.as_mut_slice());
         let row_count = rows.len();
         self.pending = None;
         Ok(buffer_result(

@@ -8,6 +8,8 @@ use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::slice;
 
+use crate::types::{PyBufferResult, PyBufferStatus};
+
 pub(crate) enum InputBytes {
     ReadOnly(PyBuffer<u8>),
     Owned(Vec<u8>),
@@ -41,6 +43,32 @@ impl WritableBuffer {
             slice::from_raw_parts_mut(self.buffer.buf_ptr().cast::<u8>(), self.buffer.len_bytes())
         }
     }
+}
+
+pub(crate) fn copy_single_column(
+    columns: Option<Vec<Option<Bytes>>>,
+    output: &Bound<'_, PyAny>,
+) -> PyResult<PyBufferResult> {
+    let Some(column) = columns.and_then(|columns| columns.into_iter().next().flatten()) else {
+        return Ok(PyBufferResult::new(PyBufferStatus::NotFound, 0, 0, 0));
+    };
+    let required = column.len();
+    let mut output = WritableBuffer::extract(output)?;
+    if output.as_mut_slice().len() < required {
+        return Ok(PyBufferResult::new(
+            PyBufferStatus::BufferTooSmall,
+            0,
+            required,
+            1,
+        ));
+    }
+    output.as_mut_slice()[..required].copy_from_slice(&column);
+    Ok(PyBufferResult::new(
+        PyBufferStatus::Ok,
+        required,
+        required,
+        1,
+    ))
 }
 
 impl InputBytes {

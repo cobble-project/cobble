@@ -112,8 +112,11 @@ def test_structured_bytes_lists_schema_scan_and_priority_queue(tmp_path: Path) -
         db.close()
     batch = cursor.next(10)
     assert len(batch) == 1
-    assert bytes(batch.row(0).key) == b"row"
-    assert bytes(batch.row(0).value.bytes(0)) == b"bytes"
+    retained_row = batch.row(0)
+    del batch
+    gc.collect()
+    assert bytes(retained_row.key) == b"row"
+    assert bytes(retained_row.value.bytes(0)) == b"bytes"
     cursor.close()
 
     queue = db.new_priority_queue("timers")

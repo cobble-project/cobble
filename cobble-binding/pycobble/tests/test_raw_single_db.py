@@ -72,7 +72,13 @@ def test_scan_cursor_owns_database_access_and_preserves_order(tmp_path: Path) ->
     with pytest.raises(pycobble.InternalStateError):
         db.close()
 
-    keys: list[bytes] = []
+    first_batch = cursor.next(1)
+    retained_row = first_batch.row(0)
+    del first_batch
+    gc.collect()
+    assert bytes(retained_row.key) == b"key-003"
+
+    keys: list[bytes] = [bytes(retained_row.key)]
     while True:
         batch = cursor.next(4)
         keys.extend(bytes(batch.row(index).key) for index in range(len(batch)))
