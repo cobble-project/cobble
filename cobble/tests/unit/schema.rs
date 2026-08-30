@@ -1,5 +1,5 @@
 use super::*;
-use crate::merge_operator::MergeOperator;
+use crate::merge_operator::{MergeOperator, U32CounterMergeOperator};
 use crate::r#type::{Column, ValueType};
 use bytes::Bytes;
 
@@ -83,6 +83,12 @@ fn test_schema_evolution_add_column() {
     let schema = builder.commit();
     assert_eq!(schema.version(), 1);
     assert_eq!(schema.num_columns(), 2);
+    assert_eq!(
+        schema_to_file(&schema).column_families[0]
+            .evolution_id
+            .as_deref(),
+        Some("column_remap")
+    );
 
     let value = Value::new(vec![Some(Column::new(
         ValueType::Put,
@@ -137,6 +143,12 @@ fn test_schema_evolution_delete_column() {
     let schema = builder.commit();
     assert_eq!(schema.version(), 1);
     assert_eq!(schema.num_columns(), 1);
+    assert_eq!(
+        schema_to_file(&schema).column_families[0]
+            .evolution_id
+            .as_deref(),
+        Some("column_remap")
+    );
 
     let value = Value::new(vec![
         Some(Column::new(ValueType::Put, Bytes::from_static(b"v0"))),
@@ -150,6 +162,72 @@ fn test_schema_evolution_delete_column() {
         evolved.columns()[0].as_ref().unwrap().data().as_ref(),
         b"v0"
     );
+}
+
+#[test]
+fn test_schema_evolution_mixes_add_delete_and_replace() {
+    let manager = Arc::new(SchemaManager::new(3));
+    let mut builder = manager.builder();
+    builder.add_column(1, None, None, None).unwrap();
+    builder.delete_column(None, 2).unwrap();
+    builder
+        .replace_column(None, 1, Arc::new(U32CounterMergeOperator))
+        .unwrap();
+    let schema = builder.commit();
+
+    assert_eq!(schema.num_columns(), 3);
+    assert_eq!(schema.operator(1).id(), U32CounterMergeOperator.id());
+
+    let schema_file = schema_to_file(&schema);
+    assert_eq!(
+        schema_file.column_families[0].evolution_id.as_deref(),
+        Some("column_remap")
+    );
+    let restored = schema_from_file(&schema_file, None).unwrap();
+    assert_eq!(restored.num_columns(), 3);
+    assert_eq!(
+        restored.operator(1).id(),
+        U32CounterMergeOperator.id(),
+        "replacement survives schema persistence"
+    );
+    manager
+        .schemas
+        .write()
+        .unwrap()
+        .insert(1, Arc::new(restored));
+
+    let value = Value::new(vec![
+        Some(Column::new(ValueType::Put, Bytes::from_static(b"v0"))),
+        Some(Column::new(ValueType::Put, Bytes::from_static(b"v1"))),
+        Some(Column::new(ValueType::Put, Bytes::from_static(b"v2"))),
+    ]);
+    let evolved = manager
+        .evolve_value_in_family(value, 0, 1, DEFAULT_COLUMN_FAMILY_ID)
+        .unwrap();
+    assert_eq!(evolved.columns().len(), 3);
+    assert_eq!(
+        evolved.columns()[0].as_ref().unwrap().data().as_ref(),
+        b"v0"
+    );
+    assert!(evolved.columns()[1].is_none());
+    assert_eq!(
+        evolved.columns()[2].as_ref().unwrap().data().as_ref(),
+        b"v2"
+    );
+
+    let deleted = Value::new(vec![
+        Some(Column::new(ValueType::Delete, Bytes::new())),
+        Some(Column::new(ValueType::Delete, Bytes::new())),
+        Some(Column::new(ValueType::Delete, Bytes::new())),
+    ]);
+    let evolved = manager
+        .evolve_value_in_family(deleted, 0, 1, DEFAULT_COLUMN_FAMILY_ID)
+        .unwrap();
+    assert!(evolved.columns().iter().all(|column| {
+        column
+            .as_ref()
+            .is_some_and(|column| *column.value_type() == ValueType::Delete)
+    }));
 }
 
 #[test]
