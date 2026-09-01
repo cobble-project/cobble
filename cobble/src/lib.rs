@@ -125,6 +125,7 @@ mod properties;
 mod read_only_db;
 mod reader;
 mod rescale_protocol;
+mod row_merge;
 mod runtime_manifest;
 mod scan;
 mod schema;

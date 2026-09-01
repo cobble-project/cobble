@@ -1,5 +1,4 @@
 //! This module defines the `DbIterator` struct, which provides an iterator over key-value pairs in the database.
-use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_state::DbState;
 use crate::db_status::OwnedDbAccessGuard;
 use crate::error::Result;
@@ -7,6 +6,7 @@ use crate::iterator::KvIterator;
 use crate::iterator::{DeduplicatingIterator, MergingIterator, TruncationFilterIterator};
 use crate::lsm::DynKvIterator;
 use crate::memtable::MemtableManager;
+use crate::row_merge::value_to_vec_of_columns_with_vlog;
 use crate::schema::Schema;
 use crate::sst::row_codec::decode_key;
 use crate::ttl::TTLProvider;

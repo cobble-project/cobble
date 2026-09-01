@@ -27,6 +27,7 @@ use evolution::{
     evolve_value_with_transition,
 };
 pub(crate) use evolution::{SchemaTransformRegistry, TransitionCompatibility};
+pub(crate) use projection::SchemaProjectionRoute;
 
 pub(crate) const DEFAULT_COLUMN_FAMILY_ID: u8 = 0;
 pub(crate) const DEFAULT_COLUMN_FAMILY_NAME: &str = "default";
@@ -756,6 +757,32 @@ impl SchemaManager {
             }
         }
         Ok(value)
+    }
+
+    pub(crate) fn is_builtin_compatible_transition(
+        &self,
+        from_schema_id: u64,
+        to_schema_id: u64,
+        column_family_id: u8,
+    ) -> Result<bool> {
+        if from_schema_id > to_schema_id {
+            return Err(Error::InvalidState(format!(
+                "cannot evolve schema from {} down to {}",
+                from_schema_id, to_schema_id
+            )));
+        }
+        let schemas = self.schemas.read().unwrap();
+        for schema_id in (from_schema_id + 1)..=to_schema_id {
+            let schema = schemas.get(&schema_id).ok_or_else(|| {
+                Error::InvalidState(format!("Missing schema for version {}", schema_id))
+            })?;
+            if schema.evolution_in_family(column_family_id)?.compatibility
+                != TransitionCompatibility::Compatible
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn persist_schemas_up_to(

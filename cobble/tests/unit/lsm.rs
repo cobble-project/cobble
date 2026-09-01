@@ -716,11 +716,17 @@ fn test_lsm_get_in_bucket_routes_to_bucket_tree_state() {
     assert_eq!(bucket0_values.len(), 1);
     assert_eq!(bucket1_values.len(), 1);
     assert_eq!(
-        bucket0_values[0].columns()[0].as_ref().unwrap().data(),
+        bucket0_values[0].value.columns()[0]
+            .as_ref()
+            .unwrap()
+            .data(),
         b"v0".as_slice()
     );
     assert_eq!(
-        bucket1_values[0].columns()[0].as_ref().unwrap().data(),
+        bucket1_values[0].value.columns()[0]
+            .as_ref()
+            .unwrap()
+            .data(),
         b"v1".as_slice()
     );
     let unknown_bucket_values = lsm_tree
@@ -1434,11 +1440,19 @@ fn test_lsm_get_tiered_returns_newest_first() {
         .unwrap();
     assert_eq!(value.len(), 2);
     assert_eq!(
-        value[0].columns()[0].as_ref().unwrap().data().as_ref(),
+        value[0].value.columns()[0]
+            .as_ref()
+            .unwrap()
+            .data()
+            .as_ref(),
         b"new"
     );
     assert_eq!(
-        value[1].columns()[0].as_ref().unwrap().data().as_ref(),
+        value[1].value.columns()[0]
+            .as_ref()
+            .unwrap()
+            .data()
+            .as_ref(),
         b"old"
     );
     cleanup_test_root(root);
@@ -1528,7 +1542,7 @@ fn test_lsm_many_tiered_skips_older_file_after_terminal_per_key() {
 
     assert_eq!(requests[0].values.len(), 1);
     assert_eq!(
-        requests[0].values[0].columns()[0]
+        requests[0].values[0].value.columns()[0]
             .as_ref()
             .unwrap()
             .data()
@@ -1537,7 +1551,7 @@ fn test_lsm_many_tiered_skips_older_file_after_terminal_per_key() {
     );
     assert_eq!(requests[1].values.len(), 1, "terminal key skips older file");
     assert_eq!(
-        requests[1].values[0].columns()[0]
+        requests[1].values[0].value.columns()[0]
             .as_ref()
             .unwrap()
             .data()
@@ -1623,7 +1637,7 @@ fn test_lsm_many_non_tiered_routes_unsorted_small_batch_across_gaps() {
         .unwrap();
 
     assert_eq!(
-        requests[0].values[0].columns()[0]
+        requests[0].values[0].value.columns()[0]
             .as_ref()
             .unwrap()
             .data()
@@ -1635,7 +1649,7 @@ fn test_lsm_many_non_tiered_routes_unsorted_small_batch_across_gaps() {
         "key in the file gap is absent"
     );
     assert_eq!(
-        requests[2].values[0].columns()[0]
+        requests[2].values[0].value.columns()[0]
             .as_ref()
             .unwrap()
             .data()
@@ -1643,7 +1657,7 @@ fn test_lsm_many_non_tiered_routes_unsorted_small_batch_across_gaps() {
         b"left-a"
     );
     assert_eq!(
-        requests[3].values[0].columns()[0]
+        requests[3].values[0].value.columns()[0]
             .as_ref()
             .unwrap()
             .data()

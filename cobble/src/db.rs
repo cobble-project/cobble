@@ -10,18 +10,16 @@ use crate::key_codec::{
 };
 use crate::lsm::{BatchGetRequest, LSMTree, LSMTreeVersion};
 use crate::memtable::{MemtableManager, MemtableManagerOptions};
-use crate::merge_operator::MergeOperator;
 use crate::metrics_manager::MetricsManager;
+use crate::row_merge::{SchemaMergePlan, SchemaValue, merge_schema_values_to_columns};
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaBuilder, SchemaManager};
 use crate::snapshot::{
     ActiveMemtableSnapshotData, LoadedManifest, SnapshotCallback, SnapshotManager,
     SnapshotManifestInfo, load_manifest_for_snapshot, snapshot_manifest_name,
 };
 use crate::sst::row_codec::{decode_key, decode_value, decode_value_masked};
-use crate::r#type::{
-    Column, RefColumn, RefKey, RefValue, Value, ValueType, decode_merge_separated_array,
-};
-use crate::vlog::{VlogPointer, VlogStore};
+use crate::r#type::{Column, RefColumn, RefKey, RefValue, Value, ValueType};
+use crate::vlog::VlogStore;
 use crate::wal::{WalCompletion, WalId, WalSegment, WalStore, WalWriter};
 use crate::write_batch::{WriteBatch, WriteOp};
 use crate::writer_options::WriterOptions;
@@ -100,133 +98,6 @@ pub enum ExpandStorageMode {
     ReferencePersistent,
     /// Keep the external reference durable while asynchronously caching preferred local reads.
     ReferencePersistentWithCache,
-}
-
-pub(crate) fn value_to_vec_of_columns(value: Value) -> Result<Option<Vec<Option<Bytes>>>> {
-    let columns: Vec<Option<Bytes>> = value
-        .columns
-        .into_iter()
-        .map(|col_opt| {
-            col_opt.and_then(|col| match col.value_type() {
-                ValueType::Put
-                | ValueType::Merge
-                // TODO: Read from value log for separated values
-                | ValueType::PutSeparated
-                | ValueType::MergeSeparated
-                | ValueType::MergeSeparatedArray
-                | ValueType::PutSeparatedArray => Some(Bytes::from(col)),
-                ValueType::Delete => None,
-            })
-        })
-        .collect();
-    if columns.iter().all(Option::is_none) {
-        return Ok(None);
-    }
-    Ok(Some(columns))
-}
-
-/// Resolve a single column value, handling any value log pointers using the provided callback.
-fn resolve_column_with_vlog<F>(
-    column: Column,
-    resolve_pointer: &mut F,
-    merge_operator: &dyn MergeOperator,
-    time_provider: Option<&dyn TimeProvider>,
-) -> Result<Option<Bytes>>
-where
-    F: FnMut(VlogPointer) -> Result<Bytes>,
-{
-    match column.value_type {
-        ValueType::Delete => Ok(None),
-        ValueType::Put => Ok(Some(Bytes::from(column))),
-        ValueType::Merge => {
-            // Read-path merge must reuse the same logical clock as write/compaction paths.
-            let (merged, _) =
-                merge_operator.merge(Bytes::new(), Bytes::from(column), time_provider)?;
-            Ok(Some(merged))
-        }
-        ValueType::PutSeparated | ValueType::MergeSeparated => {
-            let pointer = VlogPointer::from_bytes(column.data())?;
-            let resolved = resolve_pointer(pointer)?;
-            if column.value_type == ValueType::MergeSeparated {
-                let (merged, _) = merge_operator.merge(Bytes::new(), resolved, time_provider)?;
-                Ok(Some(merged))
-            } else {
-                Ok(Some(resolved))
-            }
-        }
-        ValueType::MergeSeparatedArray | ValueType::PutSeparatedArray => {
-            let items = decode_merge_separated_array(column.data())?;
-            let mut merged = Bytes::new();
-            let mut operands = Vec::with_capacity(items.len());
-            for item in items {
-                let item_value = match item.value_type {
-                    ValueType::Put | ValueType::Merge => Bytes::copy_from_slice(item.data()),
-                    ValueType::PutSeparated | ValueType::MergeSeparated => {
-                        let pointer = VlogPointer::from_bytes(item.data())?;
-                        resolve_pointer(pointer)?
-                    }
-                    ValueType::Delete
-                    | ValueType::MergeSeparatedArray
-                    | ValueType::PutSeparatedArray => {
-                        return Err(Error::IoError(format!(
-                            "Invalid value type in MergeSeparatedArray: {:?}",
-                            item.value_type
-                        )));
-                    }
-                };
-                match item.value_type {
-                    ValueType::Put | ValueType::PutSeparated => {
-                        merged = item_value;
-                        // A Put replaces prior operands; batch the remaining payload once.
-                        operands.clear();
-                    }
-                    ValueType::Merge | ValueType::MergeSeparated => {
-                        operands.push(item_value);
-                    }
-                    ValueType::Delete
-                    | ValueType::MergeSeparatedArray
-                    | ValueType::PutSeparatedArray => unreachable!(),
-                }
-            }
-            // One final batch merge avoids repeatedly concatenating the separated payload.
-            if !operands.is_empty() {
-                merged = merge_operator
-                    .merge_batch(merged, operands, time_provider)?
-                    .0;
-            }
-            Ok(Some(merged))
-        }
-    }
-}
-
-/// Convert a Value into a Vec of optional column values, resolving any value log pointers using
-/// the provided callback.
-pub(crate) fn value_to_vec_of_columns_with_vlog<F>(
-    value: Value,
-    mut resolve_pointer: F,
-    schema: &Schema,
-    column_family_id: u8,
-    time_provider: Option<&dyn TimeProvider>,
-) -> Result<Option<Vec<Option<Bytes>>>>
-where
-    F: FnMut(VlogPointer) -> Result<Bytes>,
-{
-    let resolve_pointer = &mut resolve_pointer;
-    let mut columns = Vec::with_capacity(value.columns.len());
-    for (column_idx, column) in value.columns.into_iter().enumerate() {
-        let merge_operator = schema.operator_in_family(column_family_id, column_idx);
-        let resolved = match column {
-            Some(column) => {
-                resolve_column_with_vlog(column, resolve_pointer, merge_operator, time_provider)?
-            }
-            None => None,
-        };
-        columns.push(resolved);
-    }
-    if columns.iter().all(Option::is_none) {
-        return Ok(None);
-    }
-    Ok(Some(columns))
 }
 
 pub(crate) fn select_projected_columns<T>(
@@ -2013,7 +1884,8 @@ impl Db {
                     encoded_key.as_ref(),
                     |raw, source_schema| {
                         let mut raw_value = Bytes::copy_from_slice(raw);
-                        let value = if source_schema.version() == schema.version() {
+                        let is_target_schema = source_schema.version() == schema.version();
+                        let value = if is_target_schema {
                             decode_value_masked(
                                 &mut raw_value,
                                 source_schema
@@ -2023,20 +1895,14 @@ impl Db {
                                 None,
                             )?
                         } else {
-                            let decoded = decode_value(
+                            decode_value(
                                 &mut raw_value,
                                 source_schema
                                     .num_columns_in_family(column_family_id)
                                     .unwrap_or(0),
-                            )?;
-                            self.schema_manager.evolve_value_in_family(
-                                decoded,
-                                source_schema.version(),
-                                schema.version(),
-                                column_family_id,
                             )?
                         };
-                        if let Some(mask) = terminal_mask.as_mut() {
+                        if is_target_schema && let Some(mask) = terminal_mask.as_mut() {
                             for (idx, column) in
                                 value.columns().iter().enumerate().take(num_columns)
                             {
@@ -2054,8 +1920,11 @@ impl Db {
                                 }
                             }
                         }
-                        let stop = num_columns == 1 && value.is_terminal();
-                        values.push(value);
+                        let stop = value.is_terminal();
+                        values.push(SchemaValue {
+                            schema_id: source_schema.version(),
+                            value,
+                        });
                         if stop {
                             stopped = true;
                             Ok(ControlFlow::Break(()))
@@ -2095,32 +1964,30 @@ impl Db {
         }
         let unique_results = (|| {
             let mut unique_results = Vec::with_capacity(requests.len());
+            let mut merge_plan = SchemaMergePlan::new(
+                schema.as_ref(),
+                self.schema_manager.as_ref(),
+                column_family_id,
+            );
             for request in requests {
                 let values = request
                     .values
                     .into_iter()
-                    .filter(|value| !self.ttl_provider.expired(&value.expired_at))
+                    .filter(|value| !self.ttl_provider.expired(&value.value.expired_at))
                     .rev()
                     .collect::<Vec<_>>();
                 if values.is_empty() {
                     unique_results.push(None);
                     continue;
                 }
-                let merged = Value::merge_all_in_column_family(
+                let result = merge_schema_values_to_columns(
                     values,
-                    &schema,
-                    column_family_id,
+                    &mut merge_plan,
                     Some(self.time_provider.as_ref()),
-                )?;
-                let result = value_to_vec_of_columns_with_vlog(
-                    merged,
                     |pointer| {
                         self.vlog_store
                             .read_pointer(&snapshot.vlog_version, pointer)
                     },
-                    &schema,
-                    column_family_id,
-                    Some(self.time_provider.as_ref()),
                 )?;
                 unique_results.push(result.map(|columns| match selected_columns {
                     Some(selected) => select_projected_columns(columns, selected),
@@ -2185,14 +2052,15 @@ impl Db {
             } else {
                 Some(vec![0u8; mask_size])
             };
-            let mut values: Vec<Value> = Vec::new();
+            let mut values: Vec<SchemaValue> = Vec::new();
             let mut stopped_by_memtable_terminal = false;
             self.memtable_manager.get_all_with_snapshot_until(
                 Arc::clone(&snapshot),
                 encoded_key.as_ref(),
                 |raw, source_schema| {
                     let mut raw_value = Bytes::copy_from_slice(raw);
-                    let value = if source_schema.version() == schema.version() {
+                    let is_target_schema = source_schema.version() == schema.version();
+                    let value = if is_target_schema {
                         decode_value_masked(
                             &mut raw_value,
                             source_schema
@@ -2202,21 +2070,15 @@ impl Db {
                             None,
                         )?
                     } else {
-                        let decoded = decode_value(
+                        decode_value(
                             &mut raw_value,
                             source_schema
                                 .num_columns_in_family(column_family_id)
                                 .unwrap_or(0),
-                        )?;
-                        self.schema_manager.evolve_value_in_family(
-                            decoded,
-                            source_schema.version(),
-                            schema.version(),
-                            column_family_id,
                         )?
                     };
                     // Keep the established multi-column terminal-mask behavior unchanged.
-                    if let Some(mask) = terminal_mask.as_mut() {
+                    if is_target_schema && let Some(mask) = terminal_mask.as_mut() {
                         for (idx, column) in value.columns().iter().enumerate().take(num_columns) {
                             if column
                                 .as_ref()
@@ -2231,10 +2093,13 @@ impl Db {
                             }
                         }
                     }
-                    // A terminal value in a physical single-column family, regardless of TTL, hides
-                    // all older versions. Multi-column reads keep traversing for per-column masking.
-                    let stop = num_columns == 1 && value.is_terminal();
-                    values.push(value);
+                    // A whole-row terminal hides all older schema epochs too. Per-column masks are
+                    // only safe for values already encoded with the target schema.
+                    let stop = value.is_terminal();
+                    values.push(SchemaValue {
+                        schema_id: source_schema.version(),
+                        value,
+                    });
                     if stop {
                         stopped_by_memtable_terminal = true;
                         Ok(ControlFlow::Break(()))
@@ -2271,36 +2136,32 @@ impl Db {
                 if should_stop {
                     break;
                 }
-                if num_columns > 1 {
-                    should_stop = value.is_terminal();
-                }
+                should_stop = value.value.is_terminal();
                 values.push(value);
             }
 
-            let values: Vec<Value> = values
+            let values: Vec<SchemaValue> = values
                 .into_iter()
-                .filter(|v| !self.ttl_provider.expired(&v.expired_at))
+                .filter(|value| !self.ttl_provider.expired(&value.value.expired_at))
                 .rev()
                 .collect();
 
             if values.is_empty() {
                 return Ok(None);
             }
-            let merged = Value::merge_all_in_column_family(
-                values,
-                &schema,
+            let mut merge_plan = SchemaMergePlan::new(
+                schema.as_ref(),
+                self.schema_manager.as_ref(),
                 column_family_id,
+            );
+            let result = merge_schema_values_to_columns(
+                values,
+                &mut merge_plan,
                 Some(self.time_provider.as_ref()),
-            )?;
-            let result = value_to_vec_of_columns_with_vlog(
-                merged,
                 |pointer| {
                     self.vlog_store
                         .read_pointer(&snapshot.vlog_version, pointer)
                 },
-                &schema,
-                column_family_id,
-                Some(self.time_provider.as_ref()),
             );
             match result {
                 Ok(value) => Ok(value.map(|columns| {

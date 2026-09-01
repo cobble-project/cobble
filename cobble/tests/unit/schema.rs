@@ -1,6 +1,8 @@
 use super::*;
 use crate::merge_operator::{MergeOperator, U32CounterMergeOperator};
-use crate::r#type::{Column, ValueType};
+use crate::row_merge::{SchemaMergePlan, SchemaValue, merge_schema_values};
+use crate::r#type::{Column, Value, ValueType};
+use crate::vlog::VlogPointer;
 use bytes::Bytes;
 
 struct BracketMergeOperator;
@@ -24,6 +26,175 @@ impl MergeOperator for BracketMergeOperator {
             None,
         ))
     }
+}
+
+#[test]
+fn test_schema_aware_merge_materializes_transform_boundaries() {
+    let definition_manager = Arc::new(SchemaManager::new(1));
+    let mut builder = definition_manager.builder();
+    builder
+        .add_column(1, None, Some(Bytes::from_static(b"default")), None)
+        .unwrap();
+    builder.add_column(2, None, None, None).unwrap();
+    let schema1 = builder.commit();
+    let mut schema1_file = schema_to_file(&schema1);
+    let transition = schema1_file.column_families[0].transition.as_mut().unwrap();
+    let ColumnEvolutionFile::Source { transform_id, .. } = &mut transition[0] else {
+        panic!("first target column should preserve the source");
+    };
+    *transform_id = Some("decorate".to_string());
+
+    let registry = Arc::new(SchemaTransformRegistry::default());
+    registry
+        .register("decorate", |value: Option<Bytes>| {
+            Ok(value.map(|value| [value.as_ref(), b"-x"].concat().into()))
+        })
+        .unwrap();
+    let manager = SchemaManager::new_with_transform_registry(1, registry);
+    manager
+        .register_schema_from_def(&schema1_file, None)
+        .unwrap();
+    let latest = manager.latest_schema();
+    let mut merge_plan = SchemaMergePlan::new(latest.as_ref(), &manager, DEFAULT_COLUMN_FAMILY_ID);
+
+    let pointer = VlogPointer::new(1, 9).to_bytes();
+    let merged = merge_schema_values(
+        vec![
+            SchemaValue {
+                schema_id: 0,
+                value: Value::new(vec![Some(Column::new(
+                    ValueType::PutSeparated,
+                    pointer.to_vec(),
+                ))]),
+            },
+            SchemaValue {
+                schema_id: 0,
+                value: Value::new(vec![Some(Column::new(
+                    ValueType::Merge,
+                    Bytes::from_static(b"b"),
+                ))]),
+            },
+            SchemaValue {
+                schema_id: 1,
+                value: Value::new(vec![
+                    Some(Column::new(ValueType::Merge, Bytes::from_static(b"c"))),
+                    None,
+                    None,
+                ]),
+            },
+        ],
+        &mut merge_plan,
+        None,
+        |pointer| {
+            assert_eq!(pointer, VlogPointer::new(1, 9));
+            Ok(Bytes::from_static(b"a"))
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let columns = crate::row_merge::value_to_vec_of_columns_with_vlog(
+        merged,
+        |_| unreachable!("source VLOG pointer must be materialized at the transition"),
+        latest.as_ref(),
+        DEFAULT_COLUMN_FAMILY_ID,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(columns[0].as_deref(), Some(&b"ab-xc"[..]));
+    assert_eq!(columns[1].as_deref(), Some(&b"default"[..]));
+    assert!(columns[2].is_none());
+
+    // A custom transform boundary cannot be crossed backward. Compaction must
+    // close it before an older physical schema can appear above a newer one.
+    let fallback_error = match merge_schema_values(
+        vec![
+            SchemaValue {
+                schema_id: 1,
+                value: Value::new(vec![
+                    Some(Column::new(ValueType::Put, Bytes::from_static(b"a-x"))),
+                    Some(Column::new(ValueType::Put, Bytes::from_static(b"default"))),
+                    None,
+                ]),
+            },
+            SchemaValue {
+                schema_id: 0,
+                value: Value::new(vec![Some(Column::new(
+                    ValueType::Merge,
+                    Bytes::from_static(b"b"),
+                ))]),
+            },
+        ],
+        &mut merge_plan,
+        None,
+        |_| unreachable!("this scenario has no VLOG pointers"),
+    ) {
+        Ok(_) => panic!("custom transform boundary must require compaction closure"),
+        Err(error) => error,
+    };
+    assert!(
+        fallback_error
+            .to_string()
+            .contains("compaction must close incompatible schema transitions")
+    );
+
+    let compatible_manager = Arc::new(SchemaManager::new(1));
+    let compatible_schema = compatible_manager.builder().commit();
+    let mut compatible_plan = SchemaMergePlan::new(
+        compatible_schema.as_ref(),
+        compatible_manager.as_ref(),
+        DEFAULT_COLUMN_FAMILY_ID,
+    );
+    let compatible_fallback = merge_schema_values(
+        vec![
+            SchemaValue {
+                schema_id: compatible_schema.version(),
+                value: Value::new(vec![Some(Column::new(
+                    ValueType::Put,
+                    Bytes::from_static(b"a"),
+                ))]),
+            },
+            SchemaValue {
+                schema_id: 0,
+                value: Value::new(vec![Some(Column::new(
+                    ValueType::Merge,
+                    Bytes::from_static(b"b"),
+                ))]),
+            },
+        ],
+        &mut compatible_plan,
+        None,
+        |_| unreachable!("this scenario has no VLOG pointers"),
+    )
+    .unwrap()
+    .unwrap();
+    let columns = crate::row_merge::value_to_vec_of_columns_with_vlog(
+        compatible_fallback,
+        |_| unreachable!("this scenario has no VLOG pointers"),
+        compatible_schema.as_ref(),
+        DEFAULT_COLUMN_FAMILY_ID,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(columns[0].as_deref(), Some(&b"ab"[..]));
+
+    let deleted = merge_schema_values(
+        vec![SchemaValue {
+            schema_id: 0,
+            value: Value::new(vec![Some(Column::new(ValueType::Delete, Bytes::new()))]),
+        }],
+        &mut merge_plan,
+        None,
+        |_| unreachable!("whole-row delete must not resolve VLOG"),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(deleted.columns().iter().all(|column| {
+        column
+            .as_ref()
+            .is_some_and(|column| *column.value_type() == ValueType::Delete)
+    }));
 }
 
 #[test]

@@ -3,8 +3,10 @@ use crate::MergeOperator;
 use crate::db_state::full_bucket_range;
 use crate::file::{File, SequentialWriteFile};
 use crate::paths::{GOVERNANCE_MANIFEST_POINTER_NAME, snapshot_active_data_relative_path};
+use crate::row_merge::resolve_column_with_vlog;
 use crate::snapshot::SnapshotLifecycleState;
 use crate::r#type::encode_merge_separated_array;
+use crate::vlog::VlogPointer;
 use crate::{
     CompactionMode, DbBuilder, DbGovernance, GovernanceMode, MemtableType, ReadOptions,
     RuntimeManifestMode, ScanOptions, TimeProviderKind, U32CounterMergeOperator,

@@ -1,6 +1,5 @@
 use crate::cache::{BlockCache, new_block_cache_with_config};
 use crate::db::select_projected_columns;
-use crate::db::value_to_vec_of_columns_with_vlog;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, new_truncation_cursors_with};
 use crate::db_status::DbLifecycle;
@@ -12,6 +11,7 @@ use crate::key_codec::{
 use crate::lsm::{BatchGetRequest, LSMTree};
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
+use crate::row_merge::{SchemaMergePlan, merge_schema_values_to_columns};
 use crate::schema::{Schema, SchemaManager};
 use crate::snapshot::{
     build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
@@ -19,7 +19,6 @@ use crate::snapshot::{
     load_manifest_for_snapshot,
 };
 use crate::ttl::{TTLProvider, TtlConfig};
-use crate::r#type::Value;
 use crate::util::{build_commit_short_id, build_version_string};
 use crate::vlog::VlogStore;
 use crate::{Config, MergeOperatorResolver, ReadOptions, ScanOptions};
@@ -328,35 +327,30 @@ impl ReadOnlyDb {
             column_family_id,
         )?;
         let mut unique_results = Vec::with_capacity(requests.len());
+        let mut merge_plan = SchemaMergePlan::new(
+            schema.as_ref(),
+            self.schema_manager.as_ref(),
+            column_family_id,
+        );
         for request in requests {
-            let mut values = request
+            let values = request
                 .values
                 .into_iter()
-                .filter(|value| !self.ttl_provider.expired(&value.expired_at))
+                .filter(|value| !self.ttl_provider.expired(&value.value.expired_at))
                 .rev()
-                .collect::<Vec<_>>()
-                .into_iter();
-            let Some(mut merged) = values.next() else {
+                .collect::<Vec<_>>();
+            if values.is_empty() {
                 unique_results.push(None);
                 continue;
-            };
-            for newer in values {
-                merged = merged.merge_in_column_family(
-                    newer,
-                    &schema,
-                    column_family_id,
-                    Some(self.ttl_provider.time_provider()),
-                )?;
             }
-            let value = value_to_vec_of_columns_with_vlog(
-                merged,
+            let value = merge_schema_values_to_columns(
+                values,
+                &mut merge_plan,
+                Some(self.ttl_provider.time_provider()),
                 |pointer| {
                     self.vlog_store
                         .read_pointer(&snapshot.vlog_version, pointer)
                 },
-                &schema,
-                column_family_id,
-                Some(self.ttl_provider.time_provider()),
             )?;
             unique_results.push(value.map(|columns| match options.columns() {
                 Some(selected_columns) => select_projected_columns(columns, selected_columns),
@@ -404,33 +398,27 @@ impl ReadOnlyDb {
             None,
         )?;
 
-        let values: Vec<Value> = lsm_values
+        let values: Vec<_> = lsm_values
             .into_iter()
-            .filter(|v| !self.ttl_provider.expired(&v.expired_at))
+            .filter(|v| !self.ttl_provider.expired(&v.value.expired_at))
             .rev()
             .collect();
         if values.is_empty() {
             return Ok(None);
         }
-        let mut iter = values.into_iter();
-        let mut merged = iter.next().expect("values not empty");
-        for newer in iter {
-            merged = merged.merge_in_column_family(
-                newer,
-                &schema,
-                column_family_id,
-                Some(self.ttl_provider.time_provider()),
-            )?;
-        }
-        value_to_vec_of_columns_with_vlog(
-            merged,
+        let mut merge_plan = SchemaMergePlan::new(
+            schema.as_ref(),
+            self.schema_manager.as_ref(),
+            column_family_id,
+        );
+        merge_schema_values_to_columns(
+            values,
+            &mut merge_plan,
+            Some(self.ttl_provider.time_provider()),
             |pointer| {
                 self.vlog_store
                     .read_pointer(&snapshot.vlog_version, pointer)
             },
-            &schema,
-            column_family_id,
-            Some(self.ttl_provider.time_provider()),
         )
         .map(|value| {
             value.map(|columns| {

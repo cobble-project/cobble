@@ -21,10 +21,11 @@ use crate::iterator::{
 };
 use crate::metrics_manager::MetricsManager;
 use crate::parquet::ParquetIterator;
+use crate::row_merge::SchemaValue;
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaManager};
 use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions, SSTPointReader};
-use crate::r#type::{Value, key_bucket, key_column_family};
+use crate::r#type::{key_bucket, key_column_family};
 use bytes::Bytes;
 use log::{debug, warn};
 use std::collections::{BTreeMap, HashMap};
@@ -64,7 +65,7 @@ pub(crate) struct LSMTreeVersion {
 pub(crate) struct BatchGetRequest {
     pub(crate) bucket: u16,
     pub(crate) encoded_key: Bytes,
-    pub(crate) values: Vec<Value>,
+    pub(crate) values: Vec<SchemaValue>,
     pub(crate) terminal_mask: Option<Vec<u8>>,
     pub(crate) decode_mask: Vec<u8>,
     pub(crate) stopped: bool,
@@ -976,7 +977,7 @@ impl LSMTree {
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
         terminal_mask: Option<&mut [u8]>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<SchemaValue>> {
         let snapshot = self.db_state.load();
         self.get_with_snapshot(
             file_manager,
@@ -1003,7 +1004,7 @@ impl LSMTree {
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
         terminal_mask: Option<&mut [u8]>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<SchemaValue>> {
         let column_family_id = key_column_family(encoded_key).unwrap_or(DEFAULT_COLUMN_FAMILY_ID);
         let Some(version) = snapshot
             .multi_lsm_version
@@ -1179,7 +1180,7 @@ impl LSMTree {
         selected_columns: Option<&[usize]>,
         selected_mask: Option<&[u8]>,
         mut terminal_mask: Option<&mut [u8]>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<SchemaValue>> {
         let num_columns = target_schema
             .num_columns_in_family(column_family_id)
             .unwrap_or(0);
@@ -1478,7 +1479,10 @@ impl LSMTree {
                 )?;
                 request.stopped = !should_continue
                     || (target_num_columns == 1
-                        && request.values.last().is_some_and(Value::is_terminal));
+                        && request
+                            .values
+                            .last()
+                            .is_some_and(|value| value.value.is_terminal()));
             }
             return Ok(());
         }
@@ -1527,7 +1531,6 @@ impl LSMTree {
             let should_continue = self.apply_value_from_file(
                 file,
                 target_schema,
-                schema_manager,
                 column_family_id,
                 source_num_columns,
                 selected_mask,
@@ -1538,7 +1541,10 @@ impl LSMTree {
             )?;
             request.stopped = !should_continue
                 || (target_num_columns == 1
-                    && request.values.last().is_some_and(Value::is_terminal));
+                    && request
+                        .values
+                        .last()
+                        .is_some_and(|value| value.value.is_terminal()));
         }
         Ok(())
     }
@@ -1560,7 +1566,7 @@ impl LSMTree {
         selected_mask: Option<&[u8]>,
         terminal_mask: Option<&mut [u8]>,
         decode_mask: &mut [u8],
-        out_values: &mut Vec<Value>,
+        out_values: &mut Vec<SchemaValue>,
     ) -> Result<bool> {
         let target_schema_id = target_schema.version();
         let source_schema = schema_manager.schema(file.schema_id)?;
@@ -1621,7 +1627,6 @@ impl LSMTree {
         self.apply_value_from_file(
             file,
             target_schema,
-            schema_manager,
             column_family_id,
             source_num_columns,
             selected_mask,
@@ -1638,8 +1643,8 @@ impl LSMTree {
     /// function so schema evolution, TTL, terminal values, and VLOG offsets
     /// have identical behavior. `value_bytes_opt == None` means this file has
     /// no value for the key and the caller should continue searching older
-    /// files. When a file uses an older schema, the value is decoded with its
-    /// source column-family width and evolved before it is added to the result.
+    /// files. Values keep their source schema id, so final merging can use the
+    /// merge operators that encoded each schema epoch.
     ///
     /// `terminal_mask` records columns already made terminal by newer files;
     /// `decode_mask` avoids decoding those older columns; and `out_values`
@@ -1649,13 +1654,12 @@ impl LSMTree {
         &self,
         file: &DataFile,
         target_schema: &Schema,
-        schema_manager: &SchemaManager,
         column_family_id: u8,
         source_num_columns: usize,
         selected_mask: Option<&[u8]>,
         mut terminal_mask: Option<&mut [u8]>,
         decode_mask: &mut [u8],
-        out_values: &mut Vec<Value>,
+        out_values: &mut Vec<SchemaValue>,
         value_bytes_opt: Option<Bytes>,
     ) -> Result<bool> {
         let num_columns = target_schema
@@ -1664,7 +1668,8 @@ impl LSMTree {
         let target_schema_id = target_schema.version();
         let mask_size = decode_mask.len();
         if let Some(value_bytes) = value_bytes_opt {
-            let value = if file.schema_id == target_schema_id {
+            let is_target_schema = file.schema_id == target_schema_id;
+            let value = if is_target_schema {
                 let mut value_bytes = value_bytes;
                 let value = decode_value_masked(
                     &mut value_bytes,
@@ -1682,24 +1687,21 @@ impl LSMTree {
                 if self.ttl_provider.expired(&value.expired_at) {
                     return Ok(false);
                 }
-                let value = schema_manager.evolve_value_in_family(
-                    value,
-                    file.schema_id,
-                    target_schema_id,
-                    column_family_id,
-                )?;
+                value
+            };
+            if is_target_schema {
                 if let Some(mask) = terminal_mask.as_deref_mut() {
                     let evolved_mask = value.terminal_mask();
                     for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {
                         *mask_byte |= evolved_mask.get(idx).copied().unwrap_or(0);
                     }
                 }
-                value
-            };
-            if let (Some(mask), Some(selected_mask)) = (terminal_mask.as_deref_mut(), selected_mask)
-            {
-                for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {
-                    *mask_byte &= selected_mask[idx];
+                if let (Some(mask), Some(selected_mask)) =
+                    (terminal_mask.as_deref_mut(), selected_mask)
+                {
+                    for (idx, mask_byte) in mask.iter_mut().enumerate().take(mask_size) {
+                        *mask_byte &= selected_mask[idx];
+                    }
                 }
             }
             let value = apply_vlog_offset_to_value(value, file.vlog_file_seq_offset)?;
@@ -1714,7 +1716,10 @@ impl LSMTree {
                     decode_mask[mask_size - 1] &= last_mask;
                 }
             }
-            out_values.push(value);
+            out_values.push(SchemaValue {
+                schema_id: file.schema_id,
+                value,
+            });
             return Ok(!should_stop);
         }
         Ok(true)
