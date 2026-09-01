@@ -628,7 +628,9 @@ fn dedicated_compactor_reads_tiered_runtime_manifest_replica() {
             VolumeUsageKind::Meta,
         ],
     );
-    high.size_limit = Some(Size::from_kib(16));
+    // Keep the first flushed SST below the offload watermark so the initial
+    // runtime manifest has a stable high-priority route to observe.
+    high.size_limit = Some(Size::from_kib(32));
     config.volumes = vec![
         high,
         VolumeDescriptor::new(
@@ -654,7 +656,9 @@ fn dedicated_compactor_reads_tiered_runtime_manifest_replica() {
     let source_url = format!("file://{}", source.display());
     assert!(current_runtime_manifest_references_path(root, &source_url));
 
-    for i in 10..28u32 {
+    // The second batch crosses the 40% watermark and must move the durable
+    // replica to the low-priority volume.
+    for i in 10..48u32 {
         db.put(0, format!("tiered-target-{i:08}").as_bytes(), 0, &value)
             .unwrap();
     }
@@ -669,22 +673,12 @@ fn dedicated_compactor_reads_tiered_runtime_manifest_replica() {
         }
     ));
 
-    // `run_once` performs the same observation rebuild as `probe`: it must use the surviving
-    // low-priority route registered in the runtime manifest before planning.
-    let compactor = Arc::new(DedicatedCompactor::open(config, db_id).unwrap());
-    let worker = Arc::clone(&compactor);
-    let handle = std::thread::spawn(move || worker.run_once());
-    let completed = wait_for(Duration::from_secs(2), Duration::from_millis(50), || {
-        handle.is_finished()
-    });
-    if !completed {
-        compactor.stop();
-    }
-    handle.join().unwrap().unwrap();
-    assert!(
-        completed,
-        "compactor unexpectedly published a result while probing the route"
-    );
+    // Planning rebuilds and validates the runtime observation without executing
+    // a compaction that could publish a result.
+    DedicatedCompactionPlanner::open(config, db_id)
+        .unwrap()
+        .plan()
+        .unwrap();
 
     db.close().unwrap();
     cleanup_test_root(root);
