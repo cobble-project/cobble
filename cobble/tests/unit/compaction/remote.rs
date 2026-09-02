@@ -325,6 +325,7 @@ fn test_remote_compaction_roundtrip_multiple_files() {
             0,
             runs,
             1,
+            schema_manager.latest_schema().version(),
             DataFileType::SSTable,
             Arc::new(TTLProvider::disabled()),
         )
@@ -540,6 +541,7 @@ fn test_remote_compaction_loads_writer_schema_from_request() {
             0,
             runs,
             1,
+            schema_manager.latest_schema().version(),
             DataFileType::SSTable,
             Arc::new(TTLProvider::disabled()),
         )
@@ -600,42 +602,26 @@ fn test_build_schema_manager_fails_on_malformed_carried_schema() {
 
 #[test]
 fn test_remote_compaction_protocol_rejects_mismatched_versions() {
-    // The schemas field requires protocol v3, and the min-compatible version was raised to 3
-    // too, so v2 and v3 are mutually incompatible in both directions. There is no safe rolling
-    // order: a v3 writer talking to a v2 compactor, and a v2 writer talking to a v3 compactor,
-    // must both be rejected at the handshake (rather than silently ignoring the schemas field
-    // and failing later with "Missing schema version N").
-    //
     // validate_protocol_compatibility(role, peer_version, peer_min, local_version, local_min)
-    // is a pure function, so we exercise the full version matrix directly.
+    // is a pure function, so exercise the current and immediately previous matched pairs.
+    let current = REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT;
+    let previous = current - 1;
 
-    // v3 peer against v3 local: accepted (the matched-pair steady state).
     assert!(
-        validate_protocol_compatibility("request", 3, 3, 3, 3).is_ok(),
-        "a v3 peer against a v3 local must be accepted"
+        validate_protocol_compatibility("request", current, current, current, current).is_ok(),
+        "the current matched pair must be accepted"
     );
-
-    // v2 writer (peer v2, min 2) against a v3 compactor (local v3, min 3): rejected,
-    // because peer_version(2) < local_min(3).
     assert!(
-        validate_protocol_compatibility("request", 2, 2, 3, 3).is_err(),
-        "a v2 writer must be rejected by a v3 compactor"
+        validate_protocol_compatibility("request", previous, previous, current, current).is_err(),
+        "the current compactor must reject the previous writer"
     );
-
-    // v3 writer (peer v3, min 3) against a v2 compactor (local v2, min 2): rejected,
-    // because peer_min(3) > local_version(2).
     assert!(
-        validate_protocol_compatibility("request", 3, 3, 2, 2).is_err(),
-        "a v3 writer must be rejected by a v2 compactor"
+        validate_protocol_compatibility("request", current, current, previous, previous).is_err(),
+        "the previous compactor must reject the current writer"
     );
-
-    // v2 peer against v2 local: this is the pre-schemas behavior. It is accepted by the
-    // compatibility rule itself, but a v2 endpoint is not produced by the current code
-    // (CURRENT and MIN_COMPATIBLE are both 3). This case is documented here for completeness
-    // and is not part of the v3 guarantee.
     assert!(
-        validate_protocol_compatibility("request", 2, 2, 2, 2).is_ok(),
-        "a v2 peer against a v2 local is compatible by the rule (legacy behavior)"
+        validate_protocol_compatibility("request", previous, previous, previous, previous).is_ok(),
+        "the previous matched pair remains internally compatible"
     );
 }
 
@@ -797,6 +783,7 @@ fn test_remote_compaction_with_u64_counter_merge_operator_in_non_default_family(
             0,
             runs,
             1,
+            schema_manager.latest_schema().version(),
             DataFileType::SSTable,
             Arc::new(TTLProvider::disabled()),
         )
@@ -953,6 +940,7 @@ fn test_remote_compaction_roundtrip_parquet_output() {
             0,
             runs,
             1,
+            schema_manager.latest_schema().version(),
             DataFileType::Parquet,
             Arc::new(TTLProvider::disabled()),
         )

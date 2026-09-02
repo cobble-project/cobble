@@ -21,8 +21,8 @@ pub(crate) use executor::{
 };
 pub(crate) use policy::{
     CompactionConfig, CompactionPlan, CompactionPolicy, CompactionPolicyContext, MinOverlapPolicy,
-    RoundRobinPolicy, ScorePriorityPolicy, build_runs_for_plan,
-    file_fully_covered_by_truncation_cursor, level_threshold,
+    RoundRobinPolicy, ScorePriorityPolicy, file_fully_covered_by_truncation_cursor,
+    level_threshold, resolve_compaction_plan,
 };
 pub use remote::RemoteCompactionServer;
 #[allow(unused_imports)]
@@ -52,6 +52,7 @@ pub(crate) trait CompactionWorker: Send + Sync {
         lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
+        target_schema_id: u64,
         data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>>;
@@ -121,6 +122,7 @@ impl LocalCompactionWorker {
         lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
+        target_schema_id: u64,
         data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>> {
@@ -140,7 +142,7 @@ impl LocalCompactionWorker {
             );
             return None;
         };
-        let schema = self.schema_manager.latest_schema();
+        let schema = self.schema_manager.schema(target_schema_id).ok()?;
         let runtime_num_columns = schema
             .num_columns_in_family(tree_scope.column_family_id)
             .unwrap_or_else(|| schema.num_columns());
@@ -183,6 +185,7 @@ impl LocalCompactionWorker {
             Arc::clone(&self.schema_manager),
         )
         .with_writer_options_factory(writer_options_factory)
+        .with_target_schema_id(target_schema_id)
         .with_column_family(tree_scope.column_family_id, runtime_num_columns)
         .with_truncation_cursors(truncation_cursors)
         .with_scan_hot_block_cache(
@@ -206,6 +209,7 @@ impl CompactionWorker for LocalCompactionWorker {
         lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
+        target_schema_id: u64,
         data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>> {
@@ -213,6 +217,7 @@ impl CompactionWorker for LocalCompactionWorker {
             lsm_tree_idx,
             sorted_runs,
             output_level,
+            target_schema_id,
             data_file_type,
             ttl_provider,
         )

@@ -2,14 +2,17 @@ use crate::config::{CompactionPolicyKind, SstReadMetadataCacheMode};
 use crate::data_file::DataFile;
 use crate::data_file::DataFileType;
 use crate::db_state::{LSMTreeScope, TruncationCursorMap};
+use crate::error::{Error, Result};
 use crate::file::FileId;
 use crate::iterator::SortedRun;
 use crate::lsm::Level;
+use crate::schema::SchemaManager;
 use crate::sst::SSTWriterOptions;
 use crate::r#type::{
     ENCODED_KEY_PREFIX_BYTES, encode_bucket_prefix, key_bucket, key_column_family,
 };
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -72,6 +75,18 @@ pub(crate) struct CompactionPlan {
     pub(crate) trivial_move: bool,
     pub(crate) drop_truncated: bool,
     pub(crate) drop_expired: bool,
+}
+
+/// Concrete compaction inputs resolved from a policy candidate.
+///
+/// Policy selection remains intentionally lightweight: it names a base file and
+/// adjacent output level. This resolved form is the only input passed to a
+/// compaction executor, including when schema safety expands the candidate into
+/// a bidirectional fixed-point overlap closure.
+pub(crate) struct ResolvedCompactionPlan {
+    pub(crate) output_level: u8,
+    pub(crate) runs: Vec<SortedRun>,
+    pub(crate) target_schema_id: u64,
 }
 
 impl fmt::Display for CompactionPlan {
@@ -965,6 +980,278 @@ pub(crate) fn build_runs_for_plan(
         }
     }
     runs
+}
+
+/// Resolves policy output to the exact files a rewrite compaction will consume.
+///
+/// Trivial moves and removal-only drops bypass this function. Normal candidates
+/// retain the existing adjacent-level selection unless one selected file would
+/// cross an incompatible schema transition while being materialized to the
+/// newest selected physical schema. That requires a schema closure which only
+/// includes files needed to preserve the affected overlap chain.
+pub(crate) fn resolve_compaction_plan(
+    levels: &[Level],
+    plan: &CompactionPlan,
+    config: &CompactionConfig,
+    schema_manager: &SchemaManager,
+    column_family_id: u8,
+) -> Result<ResolvedCompactionPlan> {
+    let runs = build_runs_for_plan(levels, plan, config);
+    let Some(target_schema_id) = target_schema_id_for_runs(&runs) else {
+        return Err(Error::InvalidState(format!(
+            "Compaction plan L{}->L{} has no selected input files",
+            plan.input_level, plan.output_level
+        )));
+    };
+    schema_manager.schema(target_schema_id)?;
+    if !requires_schema_barrier_closure(&runs, schema_manager, target_schema_id, column_family_id)?
+    {
+        return Ok(ResolvedCompactionPlan {
+            output_level: plan.output_level,
+            runs,
+            target_schema_id,
+        });
+    }
+
+    resolve_schema_barrier_closure(
+        levels,
+        &runs,
+        schema_manager,
+        column_family_id,
+        plan.output_level,
+    )
+}
+
+fn requires_schema_barrier_closure(
+    runs: &[SortedRun],
+    schema_manager: &SchemaManager,
+    target_schema_id: u64,
+    column_family_id: u8,
+) -> Result<bool> {
+    let mut checked_schema_ids = HashSet::new();
+    for file in runs.iter().flat_map(|run| run.files()) {
+        if file.schema_id != target_schema_id
+            && checked_schema_ids.insert(file.schema_id)
+            && !schema_manager.is_builtin_compatible_transition(
+                file.schema_id,
+                target_schema_id,
+                column_family_id,
+            )?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn target_schema_id_for_runs(runs: &[SortedRun]) -> Option<u64> {
+    runs.iter()
+        .flat_map(|run| run.files())
+        .map(|file| file.schema_id)
+        .max()
+}
+
+/// Resolves an incompatible schema boundary to the smallest stable overlap
+/// closure. The closure grows in both directions: downward to consume every
+/// overlapping lower-level file, and upward to remove incompatible older
+/// blockers which would otherwise remain above the rewritten output.
+fn resolve_schema_barrier_closure(
+    levels: &[Level],
+    candidate_runs: &[SortedRun],
+    schema_manager: &SchemaManager,
+    column_family_id: u8,
+    destination_floor: u8,
+) -> Result<ResolvedCompactionPlan> {
+    let mut selected = candidate_runs
+        .iter()
+        .flat_map(|run| run.files())
+        .map(|file| file.file_id)
+        .collect::<HashSet<_>>();
+    let mut compatibility_cache = HashMap::new();
+
+    loop {
+        let mut changed = false;
+        let selected_summary = summarize_selected_files(levels, &selected)
+            .expect("schema closure must retain at least one candidate file");
+
+        // A rewritten file descends below every selected input level. Include
+        // each overlapping deeper file so the result terminates that overlap
+        // chain, then let whole-file expansion drive the next iteration.
+        for level in levels
+            .iter()
+            .filter(|level| level.ordinal > selected_summary.shallowest_level)
+        {
+            for file in level.files.iter().filter(|file| {
+                file_overlaps_key_range(
+                    file,
+                    &selected_summary.start_key,
+                    &selected_summary.end_key,
+                )
+            }) {
+                changed |= selected.insert(file.file_id);
+            }
+        }
+
+        let selected_summary = summarize_selected_files(levels, &selected)
+            .expect("schema closure must retain at least one candidate file");
+        let target_schema_id = selected_summary.target_schema_id;
+        schema_manager.schema(target_schema_id)?;
+        let output_level = selected_summary.deepest_level.max(destination_floor);
+        let mut start_key = selected_summary.start_key;
+        let mut end_key = selected_summary.end_key;
+
+        // Files above the output that are already target-schema, newer, or
+        // built-in compatible remain valid above it. An older incompatible
+        // overlap must descend with this closure instead.
+        for level in levels.iter().filter(|level| level.ordinal < output_level) {
+            for file in &level.files {
+                if selected.contains(&file.file_id)
+                    || file.schema_id >= target_schema_id
+                    || !file_overlaps_key_range(file, &start_key, &end_key)
+                {
+                    continue;
+                }
+                if !is_transition_compatible(
+                    &mut compatibility_cache,
+                    schema_manager,
+                    file.schema_id,
+                    target_schema_id,
+                    column_family_id,
+                )? && selected.insert(file.file_id)
+                {
+                    changed = true;
+                    extend_key_range(&mut start_key, &mut end_key, file);
+                }
+            }
+        }
+
+        // `Level.files` is oldest-to-newest for tiered levels, while their
+        // runs are read newest-first. Once a tiered file descends, every older
+        // overlapping file must descend too or its relative merge order flips.
+        for level in levels
+            .iter()
+            .filter(|level| level.tiered && level.ordinal < output_level)
+        {
+            let Some(newest_selected_index) = level
+                .files
+                .iter()
+                .enumerate()
+                .filter_map(|(index, file)| selected.contains(&file.file_id).then_some(index))
+                .max()
+            else {
+                continue;
+            };
+            for file in &level.files[..newest_selected_index] {
+                if selected.contains(&file.file_id)
+                    || !file_overlaps_key_range(file, &start_key, &end_key)
+                {
+                    continue;
+                }
+                changed |= selected.insert(file.file_id);
+            }
+        }
+
+        if !changed {
+            return Ok(ResolvedCompactionPlan {
+                output_level,
+                runs: runs_from_selected_files(levels, &selected),
+                target_schema_id,
+            });
+        }
+    }
+}
+
+fn is_transition_compatible(
+    cache: &mut HashMap<(u64, u64), bool>,
+    schema_manager: &SchemaManager,
+    from_schema_id: u64,
+    to_schema_id: u64,
+    column_family_id: u8,
+) -> Result<bool> {
+    let key = (from_schema_id, to_schema_id);
+    if let Some(compatible) = cache.get(&key) {
+        return Ok(*compatible);
+    }
+    let compatible = schema_manager.is_builtin_compatible_transition(
+        from_schema_id,
+        to_schema_id,
+        column_family_id,
+    )?;
+    cache.insert(key, compatible);
+    Ok(compatible)
+}
+
+struct SelectedFileSummary {
+    shallowest_level: u8,
+    deepest_level: u8,
+    target_schema_id: u64,
+    start_key: Vec<u8>,
+    end_key: Vec<u8>,
+}
+
+fn summarize_selected_files(
+    levels: &[Level],
+    selected: &HashSet<FileId>,
+) -> Option<SelectedFileSummary> {
+    let mut summary: Option<SelectedFileSummary> = None;
+    for level in levels {
+        for file in level
+            .files
+            .iter()
+            .filter(|file| selected.contains(&file.file_id))
+        {
+            let Some(summary) = summary.as_mut() else {
+                summary = Some(SelectedFileSummary {
+                    shallowest_level: level.ordinal,
+                    deepest_level: level.ordinal,
+                    target_schema_id: file.schema_id,
+                    start_key: file.start_key.to_vec(),
+                    end_key: file.end_key.to_vec(),
+                });
+                continue;
+            };
+            summary.shallowest_level = summary.shallowest_level.min(level.ordinal);
+            summary.deepest_level = summary.deepest_level.max(level.ordinal);
+            summary.target_schema_id = summary.target_schema_id.max(file.schema_id);
+            extend_key_range(&mut summary.start_key, &mut summary.end_key, file);
+        }
+    }
+    summary
+}
+
+fn extend_key_range(start_key: &mut Vec<u8>, end_key: &mut Vec<u8>, file: &DataFile) {
+    if file.start_key.as_slice() < start_key.as_slice() {
+        *start_key = file.start_key.to_vec();
+    }
+    if file.end_key.as_slice() > end_key.as_slice() {
+        *end_key = file.end_key.to_vec();
+    }
+}
+
+fn runs_from_selected_files(levels: &[Level], selected: &HashSet<FileId>) -> Vec<SortedRun> {
+    let mut ordered_levels = levels.iter().collect::<Vec<_>>();
+    ordered_levels.sort_by_key(|level| level.ordinal);
+    let mut runs = Vec::new();
+    for level in ordered_levels {
+        let files = level
+            .files
+            .iter()
+            .filter(|file| selected.contains(&file.file_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if level.tiered {
+            for file in files.into_iter().rev() {
+                runs.push(SortedRun::new(level.ordinal, vec![file]));
+            }
+        } else if !files.is_empty() {
+            runs.push(SortedRun::new(level.ordinal, files));
+        }
+    }
+    runs
+}
+
+fn file_overlaps_key_range(file: &DataFile, start_key: &[u8], end_key: &[u8]) -> bool {
+    file.start_key.as_slice() <= end_key && start_key <= file.end_key.as_slice()
 }
 
 fn overlap_size(file: &DataFile, candidates: &[Arc<DataFile>]) -> usize {

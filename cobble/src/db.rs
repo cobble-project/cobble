@@ -1500,6 +1500,7 @@ impl Db {
             Arc::clone(&db_lifecycle),
             Arc::clone(&metrics_manager),
         );
+        lsm_tree.set_schema_manager(Arc::clone(&schema_manager));
         lsm_tree.set_sst_read_metadata_cache_mode(config.sst_read_metadata_cache_mode);
         lsm_tree.set_sst_pinned_metadata_max_level(config.sst_pinned_metadata_max_level);
         lsm_tree.set_sst_pinned_metadata_partitions_enabled(

@@ -175,6 +175,7 @@ fn test_local_compaction_worker_uses_tree_scope_column_family_width() {
             0,
             vec![SortedRun::new(0, vec![source_file])],
             1,
+            schema_manager.latest_schema().version(),
             crate::data_file::DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
         )

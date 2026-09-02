@@ -303,6 +303,7 @@ impl CompactionWorker for RecordingCompactionWorker {
         lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         _output_level: u8,
+        _target_schema_id: u64,
         data_file_type: DataFileType,
         _ttl_provider: Arc<TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<crate::compaction::CompactionResult>>> {

@@ -17,7 +17,7 @@ use crate::compaction::dedicated::{
 };
 use crate::compaction::policy::{
     CompactionPolicy, CompactionPolicyContext, MinOverlapPolicy, RoundRobinPolicy,
-    ScorePriorityPolicy, build_runs_for_plan, file_fully_covered_by_truncation_cursor,
+    ScorePriorityPolicy, file_fully_covered_by_truncation_cursor, resolve_compaction_plan,
 };
 use crate::compaction::{
     CompactionConfig, CompactionExecutor, CompactionTask, CompactionTaskMetrics,
@@ -889,8 +889,14 @@ impl DedicatedCompactor {
         job_id: &str,
         now_seconds: u32,
     ) -> Result<()> {
-        let runs = build_runs_for_plan(levels, plan, compaction_config);
-        if runs.is_empty() {
+        let resolved = resolve_compaction_plan(
+            levels,
+            plan,
+            compaction_config,
+            schema_manager.as_ref(),
+            tree_scope.column_family_id,
+        )?;
+        if resolved.runs.is_empty() {
             return Err(Error::InvalidState(format!(
                 "compaction plan produced no runs for tree {}",
                 tree_idx
@@ -898,19 +904,21 @@ impl DedicatedCompactor {
         }
 
         // Build the writer options for the output level.
-        let schema = schema_manager.latest_schema();
+        let schema = schema_manager.schema(resolved.target_schema_id)?;
         let runtime_num_columns = schema
             .num_columns_in_family(tree_scope.column_family_id)
             .unwrap_or_else(|| schema.num_columns());
         let writer_options = build_writer_options(
             &self.config,
-            plan.output_level,
+            resolved.output_level,
             compaction_config.output_file_type,
             runtime_num_columns,
         )?;
         let file_builder_factory = make_data_file_builder_factory(writer_options.clone());
         let writer_options_factory = WriterOptionsFactory::from(&writer_options);
         let sst_metrics = self.metrics_manager.sst_iterator_metrics();
+        let inputs = Self::collect_inputs_from_runs(&resolved.runs, &self.file_manager)?;
+        let output_level = resolved.output_level;
 
         // Construct the compaction task with job-namespace output paths and readonly outputs.
         let ttl_provider = Arc::new(TTLProvider::new(
@@ -924,8 +932,8 @@ impl DedicatedCompactor {
             Arc::clone(&self.compaction_metrics),
             sst_metrics,
             tree_idx,
-            runs,
-            plan.output_level,
+            resolved.runs,
+            resolved.output_level,
             Arc::clone(&self.file_manager),
             file_builder_factory,
             compaction_config.output_file_type,
@@ -933,6 +941,7 @@ impl DedicatedCompactor {
             Arc::clone(schema_manager),
         )
         .with_writer_options_factory(writer_options_factory)
+        .with_target_schema_id(resolved.target_schema_id)
         .with_column_family(tree_scope.column_family_id, runtime_num_columns)
         .with_truncation_cursors(truncation_cursors.clone())
         .with_output_path_prefix(dedicated_compaction_job_output_prefix(job_id))
@@ -942,7 +951,6 @@ impl DedicatedCompactor {
         let result = self.executor.execute_blocking(task, None)?;
 
         // Build the operation and result.
-        let inputs = Self::collect_inputs_from_plan(levels, plan, &self.file_manager)?;
         let outputs: Vec<DedicatedDataFile> = result
             .new_files()
             .iter()
@@ -951,7 +959,7 @@ impl DedicatedCompactor {
 
         let operation = DedicatedCompactionOperation::Rewrite {
             inputs,
-            output_level: plan.output_level,
+            output_level,
             outputs,
         };
 
@@ -1131,37 +1139,16 @@ impl DedicatedCompactor {
             })
     }
 
-    /// Collects input descriptors from a plan by finding the input files in the tree levels.
-    fn collect_inputs_from_plan(
-        levels: &[Level],
-        plan: &crate::compaction::policy::CompactionPlan,
+    /// Collects the exact files selected by a resolved compaction plan.
+    fn collect_inputs_from_runs(
+        runs: &[crate::iterator::SortedRun],
         file_manager: &Arc<FileManager>,
     ) -> Result<Vec<DedicatedCompactionInput>> {
         let mut inputs = Vec::new();
-        let Some(input_level) = levels.iter().find(|l| l.ordinal == plan.input_level) else {
-            return Ok(inputs);
-        };
-        if input_level.tiered {
-            // For tiered levels, all files with file_id >= base_file_id are inputs.
-            for file in &input_level.files {
-                if file.file_id >= plan.base_file_id {
-                    inputs.push(DedicatedCompactionInput {
-                        level: plan.input_level,
-                        file: DedicatedDataFile::from_data_file(file, file_manager)?,
-                    });
-                }
-            }
-        } else {
-            // For non-tiered levels, only the base file (smallest file_id >= base_file_id) is the
-            // input, matching `build_runs_for_plan`'s selection logic.
-            let base_file = input_level
-                .files
-                .iter()
-                .filter(|f| f.file_id >= plan.base_file_id)
-                .min_by_key(|f| f.file_id);
-            if let Some(file) = base_file {
+        for run in runs {
+            for file in run.files() {
                 inputs.push(DedicatedCompactionInput {
-                    level: plan.input_level,
+                    level: run.level(),
                     file: DedicatedDataFile::from_data_file(file, file_manager)?,
                 });
             }

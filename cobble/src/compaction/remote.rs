@@ -44,10 +44,11 @@ use uuid::Uuid;
 const REMOTE_FILE_ID_START: u64 = u64::MAX / 2;
 /// Remote-compaction protocol version.
 ///
-/// Version 4 adds a topology token echoed by the server, so stale responses can be discarded
-/// before they alter the writer LSM. Version 4 endpoints must be upgraded together.
-const REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT: u32 = 4;
-const REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION: u32 = 4;
+/// Version 5 adds an explicit fixed target schema id. A peer that does not
+/// understand it could compact with a different schema, so endpoints must be
+/// upgraded together.
+const REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT: u32 = 5;
+const REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION: u32 = 5;
 type RemoteCompactionOutput = (Vec<RemoteDataFile>, Vec<(u32, i64)>, Vec<BlockCachePreload>);
 
 /// Checks whether a peer speaking `(peer_version, peer_min_compatible_version)` is compatible
@@ -434,6 +435,7 @@ pub(crate) struct RemoteCompactionRequest {
     tree_scope: crate::db_state::LSMTreeScope,
     column_family_id: u8,
     output_level: u8,
+    target_schema_id: u64,
     writer_options: RemoteWriterOptions,
     ttl_config: RemoteTtlConfig,
     ttl_now_seconds: u32,
@@ -449,8 +451,9 @@ pub(crate) struct RemoteCompactionRequest {
     /// when triggered by a flush before the first checkpoint persists schemas. Schemas remain
     /// persisted to the volume only at checkpoint time, as before.
     ///
-    /// Only input-referenced versions are carried so the compaction target is the highest version
-    /// actually present in the input, avoiding spurious schema evolution (see `build_request`).
+    /// Includes the fixed compaction target plus every input-referenced version needed to decode
+    /// the selected files. The server must use `target_schema_id`, not infer a target from these
+    /// definitions' highest version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     schemas: Vec<crate::schema::SchemaFile>,
     /// Snapshot of local scan-hot input block keys.
@@ -842,6 +845,7 @@ impl RemoteCompactionWorker {
         lsm_tree_idx: usize,
         sorted_runs: &[SortedRun],
         output_level: u8,
+        target_schema_id: u64,
         data_file_type: DataFileType,
         ttl_provider: Arc<TTLProvider>,
     ) -> Result<RemoteCompactionRequest> {
@@ -863,7 +867,7 @@ impl RemoteCompactionWorker {
             .iter()
             .map(|run| RemoteSortedRun::from_sorted_run(run, &self.file_manager))
             .collect::<Result<Vec<_>>>()?;
-        let schema = self.schema_manager.latest_schema();
+        let schema = self.schema_manager.schema(target_schema_id)?;
         let num_columns = schema
             .num_columns_in_family(tree_scope.column_family_id)
             .unwrap_or_else(|| schema.num_columns());
@@ -884,22 +888,21 @@ impl RemoteCompactionWorker {
         let merge_operator_metadata = schema
             .column_metadata_for_column_family_id(tree_scope.column_family_id)
             .to_vec();
-        // Collect every schema version referenced by an input file. The compactor registers these
-        // from the request so it can decode input SST files stamped with non-zero schema ids and
-        // stamps output with the highest registered version (its `latest_schema`). Version 0 is
+        // Collect the fixed target and every schema version referenced by an input file. The
+        // compactor registers these from the request so it can decode input SST files stamped
+        // with non-zero schema ids and materialize output using `target_schema_id`. Version 0 is
         // excluded: it has no real column-family layout (the writer starts from a default schema
         // and evolves from there), and the compactor already reconstructs a version-0 fallback
         // from the request's resolved merge operators. Schemas are carried in the request itself
         // rather than read back from the shared volume, so remote compaction works regardless of
         // when the writer last persisted schemas to disk.
         //
-        // Only input-referenced versions are carried (not unconditionally the writer's latest) so
-        // that the compaction target is the highest version actually present in the input. This
-        // avoids spurious schema evolution: when every input file shares the writer's latest
-        // version (the steady-state Flink case) the target equals that version and no evolution
-        // runs; when input files predate the latest schema version, the target stays at the input
-        // version and evolution is not attempted.
+        // The target is carried even when no selected input uses it, preventing an asynchronous
+        // remote task from silently changing schema when the writer advances after planning.
         let mut schema_ids: BTreeSet<u64> = BTreeSet::new();
+        if target_schema_id > 0 {
+            schema_ids.insert(target_schema_id);
+        }
         for run in sorted_runs {
             for file in run.files() {
                 if file.schema_id > 0 {
@@ -924,6 +927,7 @@ impl RemoteCompactionWorker {
             tree_scope: tree_scope.clone(),
             column_family_id: tree_scope.column_family_id,
             output_level,
+            target_schema_id,
             writer_options: RemoteWriterOptions::from_writer_options(&writer_options, num_columns),
             ttl_config: RemoteTtlConfig {
                 enabled: self.ttl_config.enabled,
@@ -946,6 +950,7 @@ impl CompactionWorker for RemoteCompactionWorker {
         lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
+        target_schema_id: u64,
         data_file_type: DataFileType,
         ttl_provider: Arc<TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>> {
@@ -956,6 +961,7 @@ impl CompactionWorker for RemoteCompactionWorker {
             lsm_tree_idx,
             &sorted_runs,
             output_level,
+            target_schema_id,
             data_file_type,
             ttl_provider,
         ) {
@@ -1317,6 +1323,7 @@ impl RemoteCompactionServer {
             schema_manager,
         )
         .with_writer_options_factory(writer_options_factory)
+        .with_target_schema_id(request.target_schema_id)
         .with_column_family(request.column_family_id, num_columns)
         .with_truncation_cursors(truncation_cursors)
         .with_scan_hot_blocks(cache_namespace, scan_hot_blocks)

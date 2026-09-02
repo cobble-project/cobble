@@ -135,6 +135,8 @@ pub struct CompactionTask {
     /// The sorted runs to compact.
     sorted_runs: Vec<SortedRun>,
     output_level: u8,
+    /// Schema selected with the input runs; it must not follow later schema changes.
+    target_schema_id: u64,
     /// The file manager to use for reading/writing files.
     file_manager: Arc<FileManager>,
     /// Factory function for creating FileBuilder instances.
@@ -217,6 +219,7 @@ impl CompactionTask {
             sst_metrics,
             sorted_runs,
             output_level,
+            target_schema_id: schema_manager.latest_schema().version(),
             file_manager,
             file_builder_factory,
             writer_options_factory: None,
@@ -243,6 +246,11 @@ impl CompactionTask {
         writer_options_factory: WriterOptionsFactory,
     ) -> Self {
         self.writer_options_factory = Some(writer_options_factory);
+        self
+    }
+
+    pub(crate) fn with_target_schema_id(mut self, target_schema_id: u64) -> Self {
+        self.target_schema_id = target_schema_id;
         self
     }
 
@@ -507,7 +515,7 @@ impl CompactionExecutor {
         let mut all_iters: Vec<Box<dyn for<'a> KvIterator<'a>>> = Vec::new();
         let mut read_bytes = 0u64;
         let use_read_ahead = options.read_ahead_enabled;
-        let target_schema = task.schema_manager.latest_schema();
+        let target_schema = task.schema_manager.schema(task.target_schema_id)?;
         let column_family_id = task.column_family_id;
         let num_columns = target_schema
             .num_columns_in_family(column_family_id)

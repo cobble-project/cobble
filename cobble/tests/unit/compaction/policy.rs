@@ -2,8 +2,10 @@ use super::*;
 use crate::data_file::DataFileType;
 use crate::db_state::TruncationCursorId;
 use crate::schema::DEFAULT_COLUMN_FAMILY_ID;
+use crate::schema::SchemaManager;
 use crate::sst::row_codec::encode_key;
 use crate::r#type::Key;
+use bytes::Bytes;
 use std::collections::HashMap;
 
 #[test]
@@ -15,17 +17,273 @@ fn default_compaction_uses_sst_write_buffer_size() {
 }
 
 fn make_file(id: FileId, start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {
+    make_file_with_schema(id, start, end, size, 0)
+}
+
+fn make_file_with_schema(
+    id: FileId,
+    start: &[u8],
+    end: &[u8],
+    size: usize,
+    schema_id: u64,
+) -> Arc<DataFile> {
     let bucket_range = DataFile::bucket_range_from_keys(start, end);
     Arc::new(DataFile::new_untracked(
         DataFileType::SSTable,
         start.to_vec(),
         end.to_vec(),
         id,
-        0,
+        schema_id,
         size,
         bucket_range.clone(),
         bucket_range,
     ))
+}
+
+#[test]
+fn test_schema_barrier_resolves_bidirectional_fixed_point_closure() {
+    let config = CompactionConfig {
+        max_level: 4,
+        l1_base_bytes: 100,
+        ..CompactionConfig::default()
+    };
+    let schema_manager = Arc::new(SchemaManager::new(1));
+    let mut builder = schema_manager.builder();
+    builder
+        .add_column(1, None, Some(Bytes::from_static(b"default")), None)
+        .unwrap();
+    builder.commit();
+    schema_manager.builder().commit();
+    schema_manager.builder().commit();
+
+    // Schema 3 is globally latest, but an ordinary rewrite with only
+    // schema-1/schema-2 builtin-compatible inputs retains target schema 2.
+    let ordinary_levels = vec![
+        Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![make_file_with_schema(51, b"m", b"n", 1, 2)],
+        },
+        Level {
+            ordinal: 2,
+            tiered: false,
+            files: vec![make_file_with_schema(52, b"n", b"o", 1, 1)],
+        },
+    ];
+    assert_valid_schema_layering(&ordinary_levels);
+    let ordinary = resolve_compaction_plan(
+        &ordinary_levels,
+        &CompactionPlan {
+            input_level: 1,
+            output_level: 2,
+            base_file_id: 51,
+            trivial_move: false,
+            drop_truncated: false,
+            drop_expired: false,
+        },
+        &config,
+        schema_manager.as_ref(),
+        DEFAULT_COLUMN_FAMILY_ID,
+    )
+    .unwrap();
+    assert_eq!(ordinary.output_level, 2);
+    assert_eq!(ordinary.target_schema_id, 2);
+    assert_eq!(
+        run_file_ids(&ordinary.runs),
+        vec![(1, vec![51]), (2, vec![52])]
+    );
+
+    // The initial L1 schema-3 input overlaps only older schemas below it.
+    // Downward closure reaches L3 schema 0, whose expanded range then finds an
+    // older L0 blocker that did not overlap L1. Tiered ordering pulls the next
+    // older L0 file down, and that range expansion reaches L4 on the following
+    // pass. Newer compatible L0 files and disjoint files stay outside.
+    let levels = vec![
+        Level {
+            ordinal: 0,
+            tiered: true,
+            files: vec![
+                make_file_with_schema(5, b"x", b"z", 1, 0),
+                make_file_with_schema(1, b"a", b"b", 1, 0),
+                make_file_with_schema(2, b"b", b"c", 1, 0),
+                make_file_with_schema(3, b"b", b"c", 1, 1),
+                make_file_with_schema(4, b"b", b"c", 1, 2),
+            ],
+        },
+        Level {
+            ordinal: 1,
+            tiered: false,
+            files: vec![make_file_with_schema(11, b"d", b"e", 1, 3)],
+        },
+        Level {
+            ordinal: 2,
+            tiered: false,
+            files: vec![make_file_with_schema(21, b"e", b"f", 1, 0)],
+        },
+        Level {
+            ordinal: 3,
+            tiered: false,
+            files: vec![
+                make_file_with_schema(31, b"c", b"d", 1, 0),
+                make_file_with_schema(32, b"u", b"v", 1, 2),
+            ],
+        },
+        Level {
+            ordinal: 4,
+            tiered: false,
+            files: vec![make_file_with_schema(41, b"a", b"b", 1, 0)],
+        },
+    ];
+    assert_valid_schema_layering(&levels);
+    let candidate = CompactionPlan {
+        input_level: 1,
+        output_level: 2,
+        base_file_id: 11,
+        trivial_move: false,
+        drop_truncated: false,
+        drop_expired: false,
+    };
+
+    let closure = resolve_compaction_plan(
+        &levels,
+        &candidate,
+        &config,
+        schema_manager.as_ref(),
+        DEFAULT_COLUMN_FAMILY_ID,
+    )
+    .unwrap();
+    assert_eq!(closure.output_level, 4);
+    assert_eq!(closure.target_schema_id, 3);
+    assert_eq!(
+        run_file_ids(&closure.runs),
+        vec![
+            (0, vec![2]),
+            (0, vec![1]),
+            (1, vec![11]),
+            (2, vec![21]),
+            (3, vec![31]),
+            (4, vec![41]),
+        ]
+    );
+
+    // L4 is already selected, so this closure has no lower level to add. The
+    // incompatible L0 file still has to join from above.
+    let bottom_levels = vec![
+        Level {
+            ordinal: 0,
+            tiered: true,
+            files: vec![make_file_with_schema(101, b"f", b"g", 1, 0)],
+        },
+        Level {
+            ordinal: 3,
+            tiered: false,
+            files: vec![make_file_with_schema(131, b"d", b"e", 1, 1)],
+        },
+        Level {
+            ordinal: 4,
+            tiered: false,
+            files: vec![make_file_with_schema(141, b"e", b"f", 1, 0)],
+        },
+    ];
+    assert_valid_schema_layering(&bottom_levels);
+    let bottom = resolve_compaction_plan(
+        &bottom_levels,
+        &CompactionPlan {
+            input_level: 3,
+            output_level: 4,
+            base_file_id: 131,
+            trivial_move: false,
+            drop_truncated: false,
+            drop_expired: false,
+        },
+        &config,
+        schema_manager.as_ref(),
+        DEFAULT_COLUMN_FAMILY_ID,
+    )
+    .unwrap();
+    assert_eq!(bottom.output_level, 4);
+    assert_eq!(bottom.target_schema_id, 1);
+    assert_eq!(
+        run_file_ids(&bottom.runs),
+        vec![(0, vec![101]), (3, vec![131]), (4, vec![141])]
+    );
+
+    // An empty L1 output has no selected file to establish the destination,
+    // but an incompatible L0 rewrite must still preserve the policy's L1
+    // output floor.
+    let empty_output = resolve_compaction_plan(
+        &[Level {
+            ordinal: 0,
+            tiered: true,
+            files: vec![
+                make_file_with_schema(201, b"p", b"q", 1, 0),
+                make_file_with_schema(202, b"r", b"s", 1, 1),
+            ],
+        }],
+        &CompactionPlan {
+            input_level: 0,
+            output_level: 1,
+            base_file_id: 201,
+            trivial_move: false,
+            drop_truncated: false,
+            drop_expired: false,
+        },
+        &config,
+        schema_manager.as_ref(),
+        DEFAULT_COLUMN_FAMILY_ID,
+    )
+    .unwrap();
+    assert_eq!(empty_output.output_level, 1);
+    assert_eq!(empty_output.target_schema_id, 1);
+    assert_eq!(
+        run_file_ids(&empty_output.runs),
+        vec![(0, vec![202]), (0, vec![201])]
+    );
+}
+
+fn run_file_ids(runs: &[SortedRun]) -> Vec<(u8, Vec<FileId>)> {
+    runs.iter()
+        .map(|run| {
+            (
+                run.level(),
+                run.files().iter().map(|file| file.file_id).collect(),
+            )
+        })
+        .collect()
+}
+
+fn assert_valid_schema_layering(levels: &[Level]) {
+    for level in levels.iter().filter(|level| level.tiered) {
+        assert!(
+            level
+                .files
+                .windows(2)
+                .all(|files| files[0].schema_id <= files[1].schema_id),
+            "tiered files must be ordered from older to newer schemas"
+        );
+    }
+    for shallow in levels {
+        for deep in levels.iter().filter(|deep| deep.ordinal > shallow.ordinal) {
+            for shallow_file in &shallow.files {
+                for deep_file in &deep.files {
+                    if file_overlaps_key_range(
+                        deep_file,
+                        &shallow_file.start_key,
+                        &shallow_file.end_key,
+                    ) {
+                        assert!(
+                            deep_file.schema_id <= shallow_file.schema_id,
+                            "overlapping deeper file {} has newer schema {} than shallow file {} schema {}",
+                            deep_file.file_id,
+                            deep_file.schema_id,
+                            shallow_file.file_id,
+                            shallow_file.schema_id
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn make_separated_file(id: FileId, start: &[u8], end: &[u8], size: usize) -> Arc<DataFile> {

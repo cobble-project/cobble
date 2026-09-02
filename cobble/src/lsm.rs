@@ -4,8 +4,8 @@ use crate::cache::{
 };
 use crate::compaction::{
     CompactionConfig, CompactionPlan, CompactionPolicy, CompactionPolicyContext, CompactionWorker,
-    MinOverlapPolicy, RoundRobinPolicy, ScorePriorityPolicy, build_runs_for_plan,
-    file_fully_covered_by_truncation_cursor, level_threshold,
+    MinOverlapPolicy, RoundRobinPolicy, ScorePriorityPolicy,
+    file_fully_covered_by_truncation_cursor, level_threshold, resolve_compaction_plan,
 };
 use crate::config::SstReadMetadataCacheMode;
 use crate::data_file::{DataFile, DataFileType, intersect_bucket_ranges};
@@ -27,7 +27,7 @@ use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions, SSTPointReader};
 use crate::r#type::{key_bucket, key_column_family};
 use bytes::Bytes;
-use log::{debug, warn};
+use log::{debug, error, warn};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
@@ -94,6 +94,7 @@ struct LSMTreeState {
     level_options: Vec<LevelOptions>,
     compaction_config: CompactionConfig,
     compaction_policy: Box<dyn CompactionPolicy>,
+    schema_manager: Arc<SchemaManager>,
     pending_compaction: HashMap<usize, PendingCompaction>,
     compaction_worker: Option<Arc<dyn CompactionWorker>>,
 }
@@ -182,6 +183,7 @@ impl LSMTree {
                 ],
                 compaction_config: CompactionConfig::default(),
                 compaction_policy: Box::new(RoundRobinPolicy::new()),
+                schema_manager: Arc::new(SchemaManager::new(1)),
                 pending_compaction: HashMap::new(),
                 compaction_worker: None,
             }),
@@ -206,6 +208,10 @@ impl LSMTree {
 
     pub(crate) fn db_state(&self) -> Arc<DbStateHandle> {
         Arc::clone(&self.db_state)
+    }
+
+    pub(crate) fn set_schema_manager(&mut self, schema_manager: Arc<SchemaManager>) {
+        self.state.get_mut().unwrap().schema_manager = schema_manager;
     }
 
     pub(crate) fn apply_edit(
@@ -838,9 +844,12 @@ impl LSMTree {
             return;
         }
         let tree_version = levels_snapshot.multi_lsm_version.version_of_index(tree_idx);
-        let expected_scope = levels_snapshot
+        let Some(expected_scope) = levels_snapshot
             .multi_lsm_version
-            .tree_scope_of_tree(tree_idx);
+            .tree_scope_of_tree(tree_idx)
+        else {
+            return;
+        };
         let truncation_cursors = levels_snapshot.truncation_cursors.capture();
         let ttl_provider = self.ttl_provider();
         let now_seconds = if ttl_provider.is_enabled() {
@@ -850,7 +859,7 @@ impl LSMTree {
         };
         let policy_context = CompactionPolicyContext {
             truncation_cursors: Some(truncation_cursors.as_map()),
-            tree_scope: expected_scope.as_ref(),
+            tree_scope: Some(&expected_scope),
             now_seconds,
         };
         let plan = state.compaction_policy.pick_with_context(
@@ -899,11 +908,27 @@ impl LSMTree {
             return;
         }
         debug!("trigger compaction plan tree={} {}", tree_idx, plan);
-        let runs = build_runs_for_plan(&tree_version.levels, &plan, &state.compaction_config);
+        let resolved = match resolve_compaction_plan(
+            &tree_version.levels,
+            &plan,
+            &state.compaction_config,
+            state.schema_manager.as_ref(),
+            expected_scope.column_family_id,
+        ) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                error!(
+                    "failed to resolve compaction plan tree={}: {}",
+                    tree_idx, err
+                );
+                return;
+            }
+        };
         if let Some(handle) = worker.submit_runs(
             tree_idx,
-            runs,
-            plan.output_level,
+            resolved.runs,
+            resolved.output_level,
+            resolved.target_schema_id,
             state.compaction_config.output_file_type,
             self.ttl_provider(),
         ) {
@@ -918,7 +943,7 @@ impl LSMTree {
             state.pending_compaction.insert(
                 tree_idx,
                 PendingCompaction {
-                    scope: expected_scope,
+                    scope: Some(expected_scope),
                     topology_epoch: levels_snapshot.topology_epoch,
                 },
             );

@@ -920,7 +920,7 @@ fn test_compaction_evolves_older_schema_values() {
 
 #[test]
 #[serial_test::serial(file)]
-fn test_compaction_uses_latest_schema_width_when_schema_evolves_after_task_creation() {
+fn test_compaction_keeps_target_schema_when_schema_evolves_after_task_creation() {
     let test_dir = "/tmp/compaction_runtime_schema_width_test";
     cleanup_test_dir(test_dir);
 
@@ -980,12 +980,12 @@ fn test_compaction_uses_latest_schema_width_when_schema_evolves_after_task_creat
 
     let mut schema_builder = schema_manager.builder();
     schema_builder.add_column(1, None, None, None).unwrap();
-    let target_schema = schema_builder.commit();
+    schema_builder.commit();
 
     let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
     let result = executor.execute_blocking(task, None).unwrap();
     assert_eq!(result.new_files().len(), 1);
-    assert_eq!(result.new_files()[0].schema_id, target_schema.version());
+    assert_eq!(result.new_files()[0].schema_id, 0);
 
     let reader = file_manager
         .open_data_file_reader(result.new_files()[0].file_id)
@@ -995,7 +995,7 @@ fn test_compaction_uses_latest_schema_width_when_schema_evolves_after_task_creat
         result.new_files()[0].as_ref(),
         crate::sst::SSTIteratorOptions {
             bloom_filter_enabled: true,
-            num_columns: target_schema.num_columns(),
+            num_columns: old_num_columns,
             ..Default::default()
         },
         None,
@@ -1003,15 +1003,12 @@ fn test_compaction_uses_latest_schema_width_when_schema_evolves_after_task_creat
     .unwrap();
     iter.seek_to_first().unwrap();
     let (_, mut value) = iter.current().unwrap().unwrap();
-    let decoded =
-        crate::sst::row_codec::decode_value(&mut value, target_schema.num_columns()).unwrap();
-    assert_eq!(decoded.columns().len(), 2);
+    let decoded = crate::sst::row_codec::decode_value(&mut value, old_num_columns).unwrap();
+    assert_eq!(decoded.columns().len(), 1);
     assert_eq!(
         decoded.columns()[0].as_ref().unwrap().data().as_ref(),
         b"old"
     );
-    assert!(decoded.columns()[1].is_none());
-
     cleanup_test_dir(test_dir);
 }
 

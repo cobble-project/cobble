@@ -58,6 +58,7 @@ impl CompactionWorker for ResilientRemoteCompactionWorker {
         lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
+        target_schema_id: u64,
         data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<JoinHandle<Result<CompactionResult>>> {
@@ -92,6 +93,7 @@ impl CompactionWorker for ResilientRemoteCompactionWorker {
                 lsm_tree_idx,
                 &sorted_runs,
                 output_level,
+                target_schema_id,
                 data_file_type,
                 ttl_provider.clone(),
             );
@@ -108,6 +110,7 @@ impl CompactionWorker for ResilientRemoteCompactionWorker {
                         lsm_tree_idx,
                         sorted_runs,
                         output_level,
+                        target_schema_id,
                         data_file_type,
                         ttl_provider,
                     );
@@ -136,6 +139,7 @@ impl CompactionWorker for ResilientRemoteCompactionWorker {
                     lsm_tree_idx,
                     sorted_runs,
                     output_level,
+                    target_schema_id,
                     data_file_type,
                     ttl_provider,
                 ),
@@ -168,6 +172,7 @@ fn handle_remote_build_failure(
     lsm_tree_idx: usize,
     sorted_runs: Vec<SortedRun>,
     output_level: u8,
+    target_schema_id: u64,
     data_file_type: DataFileType,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
 ) -> Result<CompactionResult> {
@@ -184,6 +189,7 @@ fn handle_remote_build_failure(
                 lsm_tree_idx,
                 sorted_runs,
                 output_level,
+                target_schema_id,
                 data_file_type,
                 ttl_provider,
             )
@@ -216,6 +222,7 @@ fn handle_remote_execution_failure(
     lsm_tree_idx: usize,
     sorted_runs: Vec<SortedRun>,
     output_level: u8,
+    target_schema_id: u64,
     data_file_type: DataFileType,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
 ) -> Result<CompactionResult> {
@@ -232,6 +239,7 @@ fn handle_remote_execution_failure(
                 lsm_tree_idx,
                 sorted_runs,
                 output_level,
+                target_schema_id,
                 data_file_type,
                 ttl_provider,
             )
@@ -262,6 +270,7 @@ fn apply_failure_mode(
     lsm_tree_idx: usize,
     sorted_runs: Vec<SortedRun>,
     output_level: u8,
+    target_schema_id: u64,
     data_file_type: DataFileType,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
 ) -> Result<CompactionResult> {
@@ -277,6 +286,7 @@ fn apply_failure_mode(
                 lsm_tree_idx,
                 sorted_runs,
                 output_level,
+                target_schema_id,
                 data_file_type,
                 ttl_provider,
             )
@@ -303,6 +313,7 @@ fn run_local_fallback_blocking(
     lsm_tree_idx: usize,
     sorted_runs: Vec<SortedRun>,
     output_level: u8,
+    target_schema_id: u64,
     data_file_type: DataFileType,
     ttl_provider: Arc<crate::ttl::TTLProvider>,
 ) -> Result<CompactionResult> {
@@ -310,6 +321,7 @@ fn run_local_fallback_blocking(
         lsm_tree_idx,
         sorted_runs,
         output_level,
+        target_schema_id,
         data_file_type,
         ttl_provider,
     );
