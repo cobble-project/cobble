@@ -304,6 +304,7 @@ impl CompactionWorker for RecordingCompactionWorker {
         sorted_runs: Vec<SortedRun>,
         _output_level: u8,
         _target_schema_id: u64,
+        _vlog_version: VlogVersion,
         data_file_type: DataFileType,
         _ttl_provider: Arc<TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<crate::compaction::CompactionResult>>> {

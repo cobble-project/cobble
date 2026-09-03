@@ -307,6 +307,11 @@ where
     fn stopped_at_block_boundary(&self) -> bool {
         self.stopped_at_block_boundary
     }
+
+    fn current_schema_id(&self) -> Option<u64> {
+        self.current_idx
+            .and_then(|idx| self.iterators[idx].current_schema_id())
+    }
 }
 
 #[cfg(test)]

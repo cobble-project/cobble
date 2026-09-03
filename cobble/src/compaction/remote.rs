@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::file::{FileId, FileManager, TrackedFileId};
 use crate::iterator::SortedRun;
 use crate::lsm::{LSMTree, LevelEdit, VersionEdit};
+use crate::manifest_model::{ManifestVlogFile, build_vlog_version_from_files, manifest_vlog_files};
 use crate::merge_operator::{
     BytesMergeOperator, MergeOperator, MergeOperatorResolver, U32CounterMergeOperator,
     U64CounterMergeOperator, default_merge_operator, merge_operator_by_id,
@@ -24,7 +25,7 @@ use crate::sst::SSTWriterOptions;
 use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::util::{build_commit_short_id, build_version_string, init_logging};
-use crate::vlog::VlogEdit;
+use crate::vlog::{VlogEdit, VlogVersion};
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use crate::{Config, SstReadMetadataCacheMode};
 use bytes::Bytes;
@@ -44,9 +45,9 @@ use uuid::Uuid;
 const REMOTE_FILE_ID_START: u64 = u64::MAX / 2;
 /// Remote-compaction protocol version.
 ///
-/// Version 5 adds an explicit fixed target schema id. A peer that does not
-/// understand it could compact with a different schema, so endpoints must be
-/// upgraded together.
+/// Version 5 fixes the target schema at planning time and carries the VLOG
+/// mapping needed to materialize values across schema barriers. Endpoints must
+/// be upgraded together because older peers cannot preserve these semantics.
 const REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT: u32 = 5;
 const REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION: u32 = 5;
 type RemoteCompactionOutput = (Vec<RemoteDataFile>, Vec<(u32, i64)>, Vec<BlockCachePreload>);
@@ -456,6 +457,8 @@ pub(crate) struct RemoteCompactionRequest {
     /// definitions' highest version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     schemas: Vec<crate::schema::SchemaFile>,
+    /// Immutable VLOG mapping from the same LSM observation as `runs`.
+    vlog_files: Vec<ManifestVlogFile>,
     /// Snapshot of local scan-hot input block keys.
     ///
     /// The remote server seeds its `ScanHotBlockRegistry` from this list, so its
@@ -840,12 +843,14 @@ impl RemoteCompactionWorker {
         self.remote_timeout
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_request(
         &self,
         lsm_tree_idx: usize,
         sorted_runs: &[SortedRun],
         output_level: u8,
         target_schema_id: u64,
+        vlog_version: &VlogVersion,
         data_file_type: DataFileType,
         ttl_provider: Arc<TTLProvider>,
     ) -> Result<RemoteCompactionRequest> {
@@ -917,6 +922,27 @@ impl RemoteCompactionWorker {
                 Ok(crate::schema::schema_to_file(schema.as_ref()))
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut has_schema_barrier = false;
+        for file in sorted_runs.iter().flat_map(|run| run.files()) {
+            if !self.schema_manager.is_builtin_compatible_transition(
+                file.schema_id,
+                target_schema_id,
+                tree_scope.column_family_id,
+            )? {
+                has_schema_barrier = true;
+                break;
+            }
+        }
+        let needs_vlog_mapping = has_schema_barrier
+            && sorted_runs
+                .iter()
+                .flat_map(|run| run.files())
+                .any(|file| file.has_separated_values());
+        let vlog_files = if needs_vlog_mapping {
+            manifest_vlog_files(vlog_version, &self.file_manager)?
+        } else {
+            Vec::new()
+        };
         Ok(RemoteCompactionRequest {
             version: REMOTE_COMPACTION_PROTOCOL_VERSION_CURRENT,
             compatible_version: REMOTE_COMPACTION_PROTOCOL_MIN_COMPATIBLE_VERSION,
@@ -940,6 +966,7 @@ impl RemoteCompactionWorker {
             truncation_cursors: RemoteTruncationCursor::from_map(&truncation_cursors),
             scan_hot_block_keys,
             schemas,
+            vlog_files,
         })
     }
 }
@@ -951,6 +978,7 @@ impl CompactionWorker for RemoteCompactionWorker {
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         target_schema_id: u64,
+        vlog_version: VlogVersion,
         data_file_type: DataFileType,
         ttl_provider: Arc<TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>> {
@@ -962,6 +990,7 @@ impl CompactionWorker for RemoteCompactionWorker {
             &sorted_runs,
             output_level,
             target_schema_id,
+            &vlog_version,
             data_file_type,
             ttl_provider,
         ) {
@@ -1307,6 +1336,7 @@ impl RemoteCompactionServer {
             num_columns,
             &request_schemas,
         )?;
+        let vlog_version = build_vlog_version_from_files(&file_manager, &request.vlog_files, true)?;
         let cache_namespace = cache_namespace_for_db_id(&request.db_id);
         let scan_hot_blocks = ScanHotBlockRegistry::from_keys(request.scan_hot_block_keys);
         let truncation_cursors = RemoteTruncationCursor::into_map(request.truncation_cursors);
@@ -1324,6 +1354,7 @@ impl RemoteCompactionServer {
         )
         .with_writer_options_factory(writer_options_factory)
         .with_target_schema_id(request.target_schema_id)
+        .with_vlog_version(vlog_version)
         .with_column_family(request.column_family_id, num_columns)
         .with_truncation_cursors(truncation_cursors)
         .with_scan_hot_blocks(cache_namespace, scan_hot_blocks)

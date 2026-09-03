@@ -331,6 +331,20 @@ impl VlogMergeCollector {
         Ok(())
     }
 
+    /// Records VLOG references removed from a schema-aware input value.
+    pub(crate) fn collect_schema_input(&mut self, input: &Value) -> Result<()> {
+        self.collect_removed_entries_from_value(input)
+    }
+
+    /// Restores references retained in a schema-aware compaction output.
+    pub(crate) fn collect_schema_output(&mut self, output: &Value) -> Result<()> {
+        for column in output.columns().iter().flatten() {
+            self.collect_retained_entries_from_column(column)?;
+            self.has_separated_values |= column.value_type().uses_separated_storage();
+        }
+        Ok(())
+    }
+
     fn update_entry_delta(&mut self, file_seq: VlogFileSeq, delta: i64) {
         if delta == 0 {
             return;
@@ -361,10 +375,18 @@ impl VlogMergeCollector {
     }
 
     fn collect_removed_entries_from_column(&mut self, column: &Column) -> Result<()> {
+        self.collect_entries_from_column(column, -1)
+    }
+
+    fn collect_retained_entries_from_column(&mut self, column: &Column) -> Result<()> {
+        self.collect_entries_from_column(column, 1)
+    }
+
+    fn collect_entries_from_column(&mut self, column: &Column, delta: i64) -> Result<()> {
         match column.value_type() {
             ValueType::PutSeparated | ValueType::MergeSeparated => {
                 let pointer = VlogPointer::from_bytes(column.data())?;
-                self.update_entry_delta(pointer.file_seq(), -1);
+                self.update_entry_delta(pointer.file_seq(), delta);
             }
             ValueType::MergeSeparatedArray | ValueType::PutSeparatedArray => {
                 for item in decode_merge_separated_array(column.data())? {
@@ -372,7 +394,7 @@ impl VlogMergeCollector {
                         || item.value_type == ValueType::MergeSeparated
                     {
                         let pointer = VlogPointer::from_bytes(item.data())?;
-                        self.update_entry_delta(pointer.file_seq(), -1);
+                        self.update_entry_delta(pointer.file_seq(), delta);
                     }
                 }
             }

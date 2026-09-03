@@ -11,6 +11,7 @@ use crate::sst::row_codec::{encode_key, encode_value};
 use crate::sst::{SSTWriter, SSTWriterOptions};
 use crate::r#type::{Column, ValueType, decode_merge_separated_array};
 use crate::r#type::{Key, Value};
+use crate::vlog::{VlogStore, VlogVersion};
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use bytes::Bytes;
 use parquet::file::reader::FileReader;
@@ -914,6 +915,147 @@ fn test_compaction_evolves_older_schema_values() {
         b"old"
     );
     assert!(decoded.columns()[1].is_none());
+
+    cleanup_test_dir(test_dir);
+}
+
+#[test]
+#[serial_test::serial(file)]
+fn test_compaction_materializes_schema_barriers_with_vlog_values() {
+    let test_dir = "/tmp/compaction_schema_barrier_vlog_test";
+    cleanup_test_dir(test_dir);
+
+    let registry = FileSystemRegistry::new();
+    let fs = registry
+        .get_or_register(format!("file://{}", test_dir))
+        .unwrap();
+    let metrics_manager = Arc::new(MetricsManager::new("compaction-test"));
+    let file_manager = Arc::new(
+        FileManager::with_defaults(Arc::clone(&fs), Arc::clone(&metrics_manager)).unwrap(),
+    );
+
+    let schema_manager = Arc::new(SchemaManager::new(1));
+    let mut schema_builder = schema_manager.builder();
+    schema_builder
+        .add_column(1, None, Some(Bytes::from_static(b"one")), None)
+        .unwrap();
+    let schema1 = schema_builder.commit();
+    let mut schema_builder = schema_manager.builder();
+    schema_builder
+        .add_column(2, None, Some(Bytes::from_static(b"two")), None)
+        .unwrap();
+    let target_schema = schema_builder.commit();
+
+    let vlog_store = VlogStore::new(Arc::clone(&file_manager), 64, 1);
+    let (mut vlog_writer, vlog_edit) = vlog_store.create_writer().unwrap();
+    let pointer = vlog_writer.add_value(b"a").unwrap();
+    vlog_writer.close().unwrap();
+    let vlog_version = VlogVersion::new().apply_edit(vlog_edit);
+
+    let mut old_file = create_test_sst(
+        &file_manager,
+        vec![(
+            &b"k"[..],
+            &make_typed_value_bytes(ValueType::PutSeparated, pointer.to_bytes().as_ref(), 1),
+        )],
+    )
+    .unwrap();
+    Arc::get_mut(&mut old_file).unwrap().schema_id = 0;
+    let mut middle_file = create_test_sst(
+        &file_manager,
+        vec![(
+            &b"k"[..],
+            &encode_value(
+                &Value::new(vec![
+                    Some(Column::new(ValueType::Merge, b"b".to_vec())),
+                    None,
+                ]),
+                schema1.num_columns(),
+            ),
+        )],
+    )
+    .unwrap();
+    Arc::get_mut(&mut middle_file).unwrap().schema_id = schema1.version();
+    let mut newest_file = create_test_sst(
+        &file_manager,
+        vec![(
+            &b"k"[..],
+            &encode_value(
+                &Value::new(vec![
+                    Some(Column::new(ValueType::Merge, b"c".to_vec())),
+                    None,
+                    None,
+                ]),
+                target_schema.num_columns(),
+            ),
+        )],
+    )
+    .unwrap();
+    Arc::get_mut(&mut newest_file).unwrap().schema_id = target_schema.version();
+
+    let options = CompactionConfig {
+        num_columns: target_schema.num_columns(),
+        bloom_filter_enabled: true,
+        bloom_bits_per_key: 10,
+        ..Default::default()
+    };
+    let factory = crate::compaction::make_sst_builder_factory(SSTWriterOptions {
+        metrics: None,
+        block_size: options.block_size,
+        buffer_size: options.buffer_size,
+        num_columns: options.num_columns,
+        bloom_filter_enabled: options.bloom_filter_enabled,
+        bloom_bits_per_key: options.bloom_bits_per_key,
+        partitioned_index: options.partitioned_index,
+        read_metadata_cache_mode: crate::SstReadMetadataCacheMode::Eager,
+        data_block_restart_interval: 16,
+        compression: crate::SstCompressionAlgorithm::None,
+        value_has_ttl: true,
+        block_checksum_enabled: false,
+    });
+    let task = CompactionTask::new(
+        Arc::new(CompactionTaskMetrics::new("schema-barrier-test")),
+        Arc::new(crate::sst::SSTIteratorMetrics::new("schema-barrier-test")),
+        0,
+        vec![
+            SortedRun::new(0, vec![newest_file]),
+            SortedRun::new(1, vec![middle_file]),
+            SortedRun::new(2, vec![old_file]),
+        ],
+        1,
+        Arc::clone(&file_manager),
+        factory,
+        DataFileType::SSTable,
+        Arc::new(crate::ttl::TTLProvider::disabled()),
+        Arc::clone(&schema_manager),
+    )
+    .with_target_schema_id(target_schema.version())
+    .with_vlog_version(vlog_version);
+
+    let executor = CompactionExecutor::new(options, Arc::new(DbLifecycle::new_open())).unwrap();
+    let result = executor.execute_blocking(task, None).unwrap();
+    assert_eq!(result.vlog_edit().unwrap().entry_deltas(), vec![(0, -1)]);
+
+    let reader = file_manager
+        .open_data_file_reader(result.new_files()[0].file_id)
+        .unwrap();
+    let mut iter = crate::sst::SSTIterator::with_cache_and_file(
+        Box::new(reader),
+        result.new_files()[0].as_ref(),
+        crate::sst::SSTIteratorOptions {
+            num_columns: target_schema.num_columns(),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    iter.seek_to_first().unwrap();
+    let (_, mut value) = iter.current().unwrap().unwrap();
+    let value =
+        crate::sst::row_codec::decode_value(&mut value, target_schema.num_columns()).unwrap();
+    assert_eq!(value.columns()[0].as_ref().unwrap().data().as_ref(), b"abc");
+    assert_eq!(value.columns()[1].as_ref().unwrap().data().as_ref(), b"one");
+    assert_eq!(value.columns()[2].as_ref().unwrap().data().as_ref(), b"two");
 
     cleanup_test_dir(test_dir);
 }

@@ -929,6 +929,7 @@ impl LSMTree {
             resolved.runs,
             resolved.output_level,
             resolved.target_schema_id,
+            levels_snapshot.vlog_version.clone(),
             state.compaction_config.output_file_type,
             self.ttl_provider(),
         ) {

@@ -5,6 +5,7 @@ use crate::schema::{Schema, SchemaManager};
 use crate::r#type::{Column, Value, ValueType, decode_merge_separated_array};
 use crate::vlog::VlogPointer;
 use bytes::Bytes;
+use std::sync::Arc;
 
 /// A physical value together with the schema that encoded it.
 ///
@@ -25,15 +26,30 @@ enum EvolutionPlan {
     Materialized(crate::schema::SchemaProjectionRoute),
 }
 
-/// Per-point-read schema evolution state.
+enum SchemaMergeRef<'a, T> {
+    Borrowed(&'a T),
+    Shared(Arc<T>),
+}
+
+impl<T> SchemaMergeRef<'_, T> {
+    fn get(&self) -> &T {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Shared(value) => value.as_ref(),
+        }
+    }
+}
+
+/// Reusable schema-aware merge state.
 ///
-/// A multi-get reuses one plan for all keys, so each schema pair resolves
-/// transforms at most once without retaining a global projection cache.
+/// Reads and compaction reuse one plan across keys, so each schema pair resolves
+/// transforms and compatibility segments at most once.
 pub(crate) struct SchemaMergePlan<'a> {
-    target_schema: &'a Schema,
-    schema_manager: &'a SchemaManager,
+    target_schema: SchemaMergeRef<'a, Schema>,
+    schema_manager: SchemaMergeRef<'a, SchemaManager>,
     column_family_id: u8,
     evolutions: Vec<((u64, u64), EvolutionPlan)>,
+    segment_targets: Vec<(u64, u64)>,
 }
 
 impl<'a> SchemaMergePlan<'a> {
@@ -43,11 +59,38 @@ impl<'a> SchemaMergePlan<'a> {
         column_family_id: u8,
     ) -> Self {
         Self {
-            target_schema,
-            schema_manager,
+            target_schema: SchemaMergeRef::Borrowed(target_schema),
+            schema_manager: SchemaMergeRef::Borrowed(schema_manager),
             column_family_id,
             evolutions: Vec::new(),
+            segment_targets: Vec::new(),
         }
+    }
+
+    pub(crate) fn new_shared(
+        target_schema: Arc<Schema>,
+        schema_manager: Arc<SchemaManager>,
+        column_family_id: u8,
+    ) -> SchemaMergePlan<'static> {
+        SchemaMergePlan {
+            target_schema: SchemaMergeRef::Shared(target_schema),
+            schema_manager: SchemaMergeRef::Shared(schema_manager),
+            column_family_id,
+            evolutions: Vec::new(),
+            segment_targets: Vec::new(),
+        }
+    }
+
+    fn target_schema(&self) -> &Schema {
+        self.target_schema.get()
+    }
+
+    pub(crate) fn schema_manager(&self) -> &SchemaManager {
+        self.schema_manager.get()
+    }
+
+    pub(crate) fn column_family_id(&self) -> u8 {
+        self.column_family_id
     }
 
     fn evolution(&mut self, from_schema_id: u64, to_schema_id: u64) -> Result<&EvolutionPlan> {
@@ -55,14 +98,14 @@ impl<'a> SchemaMergePlan<'a> {
         if let Some(index) = self.evolutions.iter().position(|(pair, _)| *pair == key) {
             return Ok(&self.evolutions[index].1);
         }
-        let evolution = if self.schema_manager.is_builtin_compatible_transition(
+        let evolution = if self.schema_manager().is_builtin_compatible_transition(
             from_schema_id,
             to_schema_id,
             self.column_family_id,
         )? {
             EvolutionPlan::Builtin
         } else {
-            EvolutionPlan::Materialized(self.schema_manager.compile_projection_route(
+            EvolutionPlan::Materialized(self.schema_manager().compile_projection_route(
                 from_schema_id,
                 to_schema_id,
                 self.column_family_id,
@@ -70,6 +113,37 @@ impl<'a> SchemaMergePlan<'a> {
         };
         self.evolutions.push((key, evolution));
         Ok(&self.evolutions.last().expect("schema evolution inserted").1)
+    }
+
+    /// The last schema reachable from `schema_id` without crossing an
+    /// incompatible boundary on the way to the fixed task target.
+    fn segment_target(&mut self, schema_id: u64) -> Result<u64> {
+        if schema_id > self.target_schema().version() {
+            return Err(Error::InvalidState(format!(
+                "cannot merge schema {} value into target schema {}",
+                schema_id,
+                self.target_schema().version()
+            )));
+        }
+        if let Some((_, target)) = self
+            .segment_targets
+            .iter()
+            .find(|(source, _)| *source == schema_id)
+        {
+            return Ok(*target);
+        }
+        let mut target = schema_id;
+        while target < self.target_schema().version()
+            && self.schema_manager().is_builtin_compatible_transition(
+                target,
+                target + 1,
+                self.column_family_id,
+            )?
+        {
+            target += 1;
+        }
+        self.segment_targets.push((schema_id, target));
+        Ok(target)
     }
 }
 
@@ -216,7 +290,7 @@ where
         plan.evolution(source_schema_id, target_schema_id)?,
         EvolutionPlan::Builtin
     ) {
-        return plan.schema_manager.evolve_value_in_family(
+        return plan.schema_manager().evolve_value_in_family(
             value,
             source_schema_id,
             target_schema_id,
@@ -224,7 +298,7 @@ where
         );
     }
 
-    let target_schema = plan.schema_manager.schema(target_schema_id)?;
+    let target_schema = plan.schema_manager().schema(target_schema_id)?;
     let target_columns = target_schema
         .num_columns_in_family(plan.column_family_id)
         .unwrap_or(0);
@@ -237,7 +311,7 @@ where
             expired_at,
         ));
     }
-    let source_schema = plan.schema_manager.schema(source_schema_id)?;
+    let source_schema = plan.schema_manager().schema(source_schema_id)?;
     let columns = materialize_columns_with_vlog(
         value,
         resolve_pointer,
@@ -253,25 +327,19 @@ where
     Ok(Value::new_with_expired_at(
         columns
             .into_iter()
-            .map(|column| {
-                Some(match column {
-                    Some(value) => Column::new(ValueType::Put, value),
-                    None => Column::new(ValueType::Delete, Bytes::new()),
-                })
-            })
+            .map(|column| column.map(|value| Column::new(ValueType::Put, value)))
             .collect(),
         expired_at,
     ))
 }
 
-/// Merges values ordered from oldest to newest, using each schema epoch's operators.
+/// Merges values ordered from oldest to newest, grouping maximal builtin-compatible
+/// schema segments before crossing a schema barrier.
 ///
-/// When physical schema versions increase, the running base is evolved into the
-/// next contiguous epoch and merged with that epoch's raw values in one
-/// operation. A physical schema version may decrease when compaction has
-/// materialized an older stratum. That is safe only across builtin-compatible
-/// transitions: the newer epoch is merged and evolved forward instead. A custom
-/// transform/default/null boundary must have been closed by compaction first.
+/// A segment is normalized to its last compatible schema and merged once. Its
+/// complete result is then materialized and projected only when the next input
+/// segment crosses an incompatible boundary. Planning ensures
+/// compaction never presents an incompatible schema decrease here.
 pub(crate) fn merge_schema_values<F>(
     values: Vec<SchemaValue>,
     plan: &mut SchemaMergePlan<'_>,
@@ -288,11 +356,11 @@ where
     // old-schema value still exists, so the fast path must inspect the whole chain.
     if values
         .iter()
-        .all(|value| value.schema_id == plan.target_schema.version())
+        .all(|value| value.schema_id == plan.target_schema().version())
     {
         return Ok(Some(Value::merge_all_in_column_family(
             values.into_iter().map(|value| value.value),
-            plan.target_schema,
+            plan.target_schema(),
             plan.column_family_id,
             time_provider,
         )?));
@@ -301,22 +369,44 @@ where
     let mut values = values.into_iter().peekable();
     let mut merged: Option<SchemaValue> = None;
     while let Some(first) = values.next() {
-        let (epoch_schema_id, epoch) = take_schema_epoch(first, &mut values);
+        let segment_schema_id = plan.segment_target(first.schema_id)?;
+        let mut segment = vec![evolve_merged_value(
+            first.value,
+            first.schema_id,
+            segment_schema_id,
+            plan,
+            time_provider,
+            &mut resolve_pointer,
+        )?];
+        while let Some(next) = values.peek() {
+            if plan.segment_target(next.schema_id)? != segment_schema_id {
+                break;
+            }
+            let value = values.next().expect("peeked schema segment");
+            segment.push(evolve_merged_value(
+                value.value,
+                value.schema_id,
+                segment_schema_id,
+                plan,
+                time_provider,
+                &mut resolve_pointer,
+            )?);
+        }
         let (schema_id, value) = match merged.take() {
-            Some(previous) if previous.schema_id <= epoch_schema_id => {
-                let schema = plan.schema_manager.schema(epoch_schema_id)?;
+            Some(previous) if previous.schema_id <= segment_schema_id => {
+                let schema = plan.schema_manager().schema(segment_schema_id)?;
                 let previous = evolve_merged_value(
                     previous.value,
                     previous.schema_id,
-                    epoch_schema_id,
+                    segment_schema_id,
                     plan,
                     time_provider,
                     &mut resolve_pointer,
                 )?;
                 (
-                    epoch_schema_id,
+                    segment_schema_id,
                     Value::merge_all_in_column_family(
-                        std::iter::once(previous).chain(epoch),
+                        std::iter::once(previous).chain(segment),
                         schema.as_ref(),
                         plan.column_family_id,
                         time_provider,
@@ -324,49 +414,17 @@ where
                 )
             }
             Some(previous) => {
-                if !plan.schema_manager.is_builtin_compatible_transition(
-                    epoch_schema_id,
-                    previous.schema_id,
-                    plan.column_family_id,
-                )? {
-                    return Err(Error::InvalidState(format!(
-                        "cannot merge schema {} value after schema {} value: compaction must close incompatible schema transitions at the bottom level",
-                        epoch_schema_id, previous.schema_id
-                    )));
-                }
-                let epoch_schema = plan.schema_manager.schema(epoch_schema_id)?;
-                let epoch = Value::merge_all_in_column_family(
-                    epoch,
-                    epoch_schema.as_ref(),
-                    plan.column_family_id,
-                    time_provider,
-                )?;
-                let schema_id = previous.schema_id;
-                let epoch = evolve_merged_value(
-                    epoch,
-                    epoch_schema_id,
-                    schema_id,
-                    plan,
-                    time_provider,
-                    &mut resolve_pointer,
-                )?;
-                let schema = plan.schema_manager.schema(schema_id)?;
-                (
-                    schema_id,
-                    Value::merge_all_in_column_family(
-                        [previous.value, epoch],
-                        schema.as_ref(),
-                        plan.column_family_id,
-                        time_provider,
-                    )?,
-                )
+                return Err(Error::InvalidState(format!(
+                    "cannot merge schema {} value after schema {} value: compaction must close incompatible schema transitions",
+                    segment_schema_id, previous.schema_id
+                )));
             }
             None => {
-                let schema = plan.schema_manager.schema(epoch_schema_id)?;
+                let schema = plan.schema_manager().schema(segment_schema_id)?;
                 (
-                    epoch_schema_id,
+                    segment_schema_id,
                     Value::merge_all_in_column_family(
-                        epoch,
+                        segment,
                         schema.as_ref(),
                         plan.column_family_id,
                         time_provider,
@@ -382,29 +440,11 @@ where
     Ok(Some(evolve_merged_value(
         merged.value,
         merged.schema_id,
-        plan.target_schema.version(),
+        plan.target_schema().version(),
         plan,
         time_provider,
         &mut resolve_pointer,
     )?))
-}
-
-fn take_schema_epoch<I>(
-    first: SchemaValue,
-    values: &mut std::iter::Peekable<I>,
-) -> (u64, Vec<Value>)
-where
-    I: Iterator<Item = SchemaValue>,
-{
-    let schema_id = first.schema_id;
-    let mut epoch = vec![first.value];
-    while values
-        .peek()
-        .is_some_and(|value| value.schema_id == schema_id)
-    {
-        epoch.push(values.next().expect("peeked schema epoch").value);
-    }
-    (schema_id, epoch)
 }
 
 /// Merges schema-versioned values and materializes the final logical columns.
@@ -427,7 +467,7 @@ where
     value_to_vec_of_columns_with_vlog(
         merged,
         &mut resolve_pointer,
-        plan.target_schema,
+        plan.target_schema(),
         plan.column_family_id,
         time_provider,
     )

@@ -308,6 +308,12 @@ where
     fn stopped_at_block_boundary(&self) -> bool {
         self.stopped_at_block_boundary
     }
+
+    fn current_schema_id(&self) -> Option<u64> {
+        self.current_iter
+            .as_ref()
+            .and_then(KvIterator::current_schema_id)
+    }
 }
 
 #[cfg(test)]

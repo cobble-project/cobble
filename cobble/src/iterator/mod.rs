@@ -11,7 +11,9 @@ mod merging;
 #[cfg(test)]
 #[path = "../../tests/unit/iterator/mock_iterator.rs"]
 pub(crate) mod mock_iterator;
+mod schema_aware_deduplicating;
 mod schema_evolving;
+mod schema_tagged;
 mod sorted_run;
 mod truncation_filter;
 mod vlog_seq_offset;
@@ -28,8 +30,11 @@ pub(crate) use deduplicating::DeduplicatingIterator;
 pub(crate) use factory::{IteratorFactoryOptions, create_iterator, make_iterator_factory};
 #[allow(unused_imports)]
 pub(crate) use merging::MergingIterator;
+pub(crate) use schema_aware_deduplicating::SchemaAwareDeduplicatingIterator;
 #[allow(unused_imports)]
 pub(crate) use schema_evolving::SchemaEvolvingIterator;
+#[allow(unused_imports)]
+pub(crate) use schema_tagged::SchemaTaggedIterator;
 #[allow(unused_imports)]
 pub(crate) use sorted_run::SortedRun;
 #[allow(unused_imports)]
@@ -94,6 +99,15 @@ pub(crate) trait KvIterator<'a>: 'a {
         false
     }
 
+    /// Physical schema of the current entry when the source can provide it.
+    ///
+    /// Most iterators operate on a single logical schema and deliberately use
+    /// the default. Compaction tags each input file so its schema-aware merge
+    /// path can retain the encoding schema without changing `KvValue`.
+    fn current_schema_id(&self) -> Option<u64> {
+        None
+    }
+
     /// Take ownership of both key and value.
     /// Consumes from internal cache; should be called at most once per position.
     fn take_current(&mut self) -> Result<Option<(Bytes, KvValue)>> {
@@ -149,5 +163,9 @@ impl<'a> KvIterator<'a> for Box<dyn for<'b> KvIterator<'b>> {
 
     fn stopped_at_block_boundary(&self) -> bool {
         (**self).stopped_at_block_boundary()
+    }
+
+    fn current_schema_id(&self) -> Option<u64> {
+        (**self).current_schema_id()
     }
 }

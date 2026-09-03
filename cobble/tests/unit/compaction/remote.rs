@@ -10,6 +10,7 @@ use crate::lsm::{LSMTree, LSMTreeVersion, Level};
 use crate::parquet::{ParquetIterator, RandomAccessChunkReader, parquet_row_group_cache_keys};
 use crate::sst::row_codec::{decode_value, encode_key, encode_value};
 use crate::r#type::{Column, Key, KvValue, Value, ValueType};
+use crate::vlog::VlogVersion;
 use crate::writer_options::WriterOptions;
 use crate::{VolumeDescriptor, VolumeUsageKind};
 use parquet::file::reader::FileReader;
@@ -271,7 +272,7 @@ fn test_remote_compaction_roundtrip_multiple_files() {
         topology_epoch: 0,
         bucket_ranges: Vec::new(),
         multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
-        vlog_version: crate::vlog::VlogVersion::new(),
+        vlog_version: VlogVersion::new(),
         active: None,
         immutables: VecDeque::new(),
         truncation_cursors: crate::db_state::new_truncation_cursors(),
@@ -326,6 +327,7 @@ fn test_remote_compaction_roundtrip_multiple_files() {
             runs,
             1,
             schema_manager.latest_schema().version(),
+            VlogVersion::new(),
             DataFileType::SSTable,
             Arc::new(TTLProvider::disabled()),
         )
@@ -490,7 +492,7 @@ fn test_remote_compaction_loads_writer_schema_from_request() {
         topology_epoch: 0,
         bucket_ranges: Vec::new(),
         multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
-        vlog_version: crate::vlog::VlogVersion::new(),
+        vlog_version: VlogVersion::new(),
         active: None,
         immutables: VecDeque::new(),
         truncation_cursors: crate::db_state::new_truncation_cursors(),
@@ -542,6 +544,7 @@ fn test_remote_compaction_loads_writer_schema_from_request() {
             runs,
             1,
             schema_manager.latest_schema().version(),
+            VlogVersion::new(),
             DataFileType::SSTable,
             Arc::new(TTLProvider::disabled()),
         )
@@ -732,7 +735,7 @@ fn test_remote_compaction_with_u64_counter_merge_operator_in_non_default_family(
             vec![Arc::new(lsm_version)],
         )
         .unwrap(),
-        vlog_version: crate::vlog::VlogVersion::new(),
+        vlog_version: VlogVersion::new(),
         active: None,
         immutables: VecDeque::new(),
         truncation_cursors: crate::db_state::new_truncation_cursors(),
@@ -784,6 +787,7 @@ fn test_remote_compaction_with_u64_counter_merge_operator_in_non_default_family(
             runs,
             1,
             schema_manager.latest_schema().version(),
+            VlogVersion::new(),
             DataFileType::SSTable,
             Arc::new(TTLProvider::disabled()),
         )
@@ -873,7 +877,7 @@ fn test_remote_compaction_roundtrip_parquet_output() {
         topology_epoch: 0,
         bucket_ranges: Vec::new(),
         multi_lsm_version: MultiLSMTreeVersion::new(lsm_version),
-        vlog_version: crate::vlog::VlogVersion::new(),
+        vlog_version: VlogVersion::new(),
         active: None,
         immutables: VecDeque::new(),
         truncation_cursors: crate::db_state::new_truncation_cursors(),
@@ -941,6 +945,7 @@ fn test_remote_compaction_roundtrip_parquet_output() {
             runs,
             1,
             schema_manager.latest_schema().version(),
+            VlogVersion::new(),
             DataFileType::Parquet,
             Arc::new(TTLProvider::disabled()),
         )

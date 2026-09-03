@@ -42,17 +42,20 @@ use crate::metrics_manager::MetricsManager;
 use crate::parquet::{ParquetWriter, ParquetWriterOptions};
 use crate::schema::SchemaManager;
 use crate::sst::SSTWriterOptions;
+use crate::vlog::VlogVersion;
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::{error, info};
 use std::sync::{Arc, Mutex, Weak};
 
 pub(crate) trait CompactionWorker: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     fn submit_runs(
         &self,
         lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         target_schema_id: u64,
+        vlog_version: VlogVersion,
         data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>>;
@@ -117,12 +120,14 @@ impl LocalCompactionWorker {
         executor.execute(task, Some(on_complete))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn submit_runs_inner(
         &self,
         lsm_tree_idx: usize,
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         target_schema_id: u64,
+        vlog_version: VlogVersion,
         data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>> {
@@ -186,6 +191,7 @@ impl LocalCompactionWorker {
         )
         .with_writer_options_factory(writer_options_factory)
         .with_target_schema_id(target_schema_id)
+        .with_vlog_version(vlog_version)
         .with_column_family(tree_scope.column_family_id, runtime_num_columns)
         .with_truncation_cursors(truncation_cursors)
         .with_scan_hot_block_cache(
@@ -210,6 +216,7 @@ impl CompactionWorker for LocalCompactionWorker {
         sorted_runs: Vec<SortedRun>,
         output_level: u8,
         target_schema_id: u64,
+        vlog_version: VlogVersion,
         data_file_type: DataFileType,
         ttl_provider: Arc<crate::ttl::TTLProvider>,
     ) -> Option<tokio::task::JoinHandle<Result<CompactionResult>>> {
@@ -218,6 +225,7 @@ impl CompactionWorker for LocalCompactionWorker {
             sorted_runs,
             output_level,
             target_schema_id,
+            vlog_version,
             data_file_type,
             ttl_provider,
         )

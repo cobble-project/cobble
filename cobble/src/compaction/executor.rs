@@ -18,13 +18,14 @@ use crate::file::{FileManager, ReadAheadBufferedReader, TrackedFileId, read_ahea
 use crate::format::{FileBuildResult, FileBuilder, FileBuilderFactory};
 use crate::iterator::{
     BucketFilterIterator, DeduplicatingIterator, KvIterator, MergingIterator,
-    SchemaEvolvingIterator, SortedRun, VlogSeqOffsetIterator,
+    SchemaAwareDeduplicatingIterator, SchemaEvolvingIterator, SchemaTaggedIterator, SortedRun,
+    VlogSeqOffsetIterator,
 };
 use crate::lsm::{LevelEdit, VersionEdit};
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, SchemaManager};
 use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions, SSTWriter};
 use crate::r#type::{ENCODED_KEY_PREFIX_BYTES, key_bucket, key_column_family};
-use crate::vlog::{VlogEdit, VlogMergeCollector};
+use crate::vlog::{VlogEdit, VlogMergeCollector, VlogVersion};
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::trace;
 use metrics::{Counter, counter};
@@ -146,6 +147,8 @@ pub struct CompactionTask {
     data_file_type: DataFileType,
     /// TTL provider for compaction to determine if entries are expired and can be dropped.
     ttl_provider: Arc<crate::ttl::TTLProvider>,
+    /// Immutable VLOG mapping captured with the selected input runs.
+    vlog_version: Arc<VlogVersion>,
     /// Whether to create output files in read-only mode.
     /// This is used for remote compaction workers where we want to write files.
     output_files_readonly: bool,
@@ -225,6 +228,7 @@ impl CompactionTask {
             writer_options_factory: None,
             data_file_type,
             ttl_provider,
+            vlog_version: Arc::new(VlogVersion::new()),
             output_files_readonly: false,
             schema_manager,
             column_family_id: DEFAULT_COLUMN_FAMILY_ID,
@@ -251,6 +255,11 @@ impl CompactionTask {
 
     pub(crate) fn with_target_schema_id(mut self, target_schema_id: u64) -> Self {
         self.target_schema_id = target_schema_id;
+        self
+    }
+
+    pub(crate) fn with_vlog_version(mut self, vlog_version: VlogVersion) -> Self {
+        self.vlog_version = Arc::new(vlog_version);
         self
     }
 
@@ -517,6 +526,17 @@ impl CompactionExecutor {
         let use_read_ahead = options.read_ahead_enabled;
         let target_schema = task.schema_manager.schema(task.target_schema_id)?;
         let column_family_id = task.column_family_id;
+        let mut has_schema_barrier = false;
+        for file in task.sorted_runs.iter().flat_map(|run| run.files()) {
+            if !task.schema_manager.is_builtin_compatible_transition(
+                file.schema_id,
+                task.target_schema_id,
+                column_family_id,
+            )? {
+                has_schema_barrier = true;
+                break;
+            }
+        }
         let num_columns = target_schema
             .num_columns_in_family(column_family_id)
             .unwrap_or(task.num_columns);
@@ -623,27 +643,41 @@ impl CompactionExecutor {
                         }
                     }
                 };
-                let iter: Box<dyn for<'a> KvIterator<'a>> =
-                    if file.schema_id == target_schema.version() {
+                let iter: Box<dyn for<'a> KvIterator<'a>> = if has_schema_barrier {
+                    let iter: Box<dyn for<'a> KvIterator<'a>> = if file.vlog_file_seq_offset == 0 {
                         base_iter
                     } else {
-                        Box::new(SchemaEvolvingIterator::new(
+                        Box::new(VlogSeqOffsetIterator::new(
                             base_iter,
-                            Arc::clone(&source_schema),
-                            Arc::clone(&target_schema),
-                            Arc::clone(&schema_manager),
-                            column_family_id,
+                            source_num_columns,
+                            file.vlog_file_seq_offset,
                         ))
                     };
-                if file.vlog_file_seq_offset == 0 {
-                    Ok(iter)
+                    Box::new(SchemaTaggedIterator::new(iter, file.schema_id))
                 } else {
-                    Ok(Box::new(VlogSeqOffsetIterator::new(
-                        iter,
-                        num_columns,
-                        file.vlog_file_seq_offset,
-                    )))
-                }
+                    let iter: Box<dyn for<'a> KvIterator<'a>> =
+                        if file.schema_id == target_schema.version() {
+                            base_iter
+                        } else {
+                            Box::new(SchemaEvolvingIterator::new(
+                                base_iter,
+                                Arc::clone(&source_schema),
+                                Arc::clone(&target_schema),
+                                Arc::clone(&schema_manager),
+                                column_family_id,
+                            ))
+                        };
+                    if file.vlog_file_seq_offset == 0 {
+                        iter
+                    } else {
+                        Box::new(VlogSeqOffsetIterator::new(
+                            iter,
+                            num_columns,
+                            file.vlog_file_seq_offset,
+                        ))
+                    }
+                };
+                Ok(iter)
             });
             all_iters.push(Box::new(run_iter));
         }
@@ -662,15 +696,30 @@ impl CompactionExecutor {
             .as_ref()
             .map(VlogMergeCollector::expired_value_callback);
 
-        // Create deduplicating iterator
-        let mut dedup_iter = DeduplicatingIterator::new_for_sst_build(
-            merging_iter,
-            Some(num_columns),
-            task.ttl_provider(),
-            merge_callback,
-            expired_callback,
-            Arc::clone(&target_schema),
-        );
+        // Compatible tasks keep the existing per-file streaming projection. A
+        // schema barrier instead retains physical schema tags until all values
+        // for a key have been merged through the barrier-aware row merge.
+        let mut dedup_iter: Box<dyn for<'a> KvIterator<'a> + '_> = if has_schema_barrier {
+            Box::new(SchemaAwareDeduplicatingIterator::new(
+                merging_iter,
+                Arc::clone(&target_schema),
+                Arc::clone(&task.schema_manager),
+                column_family_id,
+                task.ttl_provider(),
+                Arc::clone(&task.file_manager),
+                Arc::clone(&task.vlog_version),
+                merge_collector.as_ref().map(std::rc::Rc::clone),
+            ))
+        } else {
+            Box::new(DeduplicatingIterator::new_for_sst_build(
+                merging_iter,
+                Some(num_columns),
+                task.ttl_provider(),
+                merge_callback,
+                expired_callback,
+                Arc::clone(&target_schema),
+            ))
+        };
         dedup_iter.seek_to_first()?;
 
         // Collect output files

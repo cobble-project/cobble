@@ -40,6 +40,7 @@ use crate::snapshot::manifest::{list_snapshot_manifest_ids, load_manifest_for_sn
 use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::util::normalize_storage_path_to_url;
+use crate::vlog::VlogVersion;
 use crate::writer_options::WriterOptionsFactory;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
@@ -320,6 +321,7 @@ struct DedicatedObservation {
 struct RebuiltObservation {
     schema_manager: Arc<SchemaManager>,
     tree_versions: Vec<crate::lsm::LSMTreeVersion>,
+    vlog_version: VlogVersion,
     truncation_cursors: crate::db_state::TruncationCursorMap,
 }
 
@@ -637,6 +639,7 @@ impl DedicatedCompactor {
             &compaction_config,
             &rebuilt.truncation_cursors,
             &rebuilt.schema_manager,
+            &rebuilt.vlog_version,
             &planned.source,
             planned.topology_epoch,
             &planned.job_id,
@@ -707,7 +710,7 @@ impl DedicatedCompactor {
         )?);
         let tree_versions =
             build_tree_versions_from_levels(&self.file_manager, &observation.tree_levels, true)?;
-        let _vlog_version =
+        let vlog_version =
             build_vlog_version_from_files(&self.file_manager, &observation.vlog_files, true)?;
         ensure_preferred_replicas_readable(
             &self.file_manager,
@@ -717,6 +720,7 @@ impl DedicatedCompactor {
         Ok(RebuiltObservation {
             schema_manager,
             tree_versions,
+            vlog_version,
             truncation_cursors: build_truncation_cursors(&observation.truncation_cursors)?,
         })
     }
@@ -778,6 +782,7 @@ impl DedicatedCompactor {
         compaction_config: &CompactionConfig,
         truncation_cursors: &crate::db_state::TruncationCursorMap,
         schema_manager: &Arc<SchemaManager>,
+        vlog_version: &VlogVersion,
         source: &DedicatedCompactionSource,
         topology_epoch: u64,
         job_id: &str,
@@ -831,6 +836,7 @@ impl DedicatedCompactor {
                 compaction_config,
                 truncation_cursors,
                 schema_manager,
+                vlog_version,
                 source,
                 topology_epoch,
                 job_id,
@@ -884,6 +890,7 @@ impl DedicatedCompactor {
         compaction_config: &CompactionConfig,
         truncation_cursors: &crate::db_state::TruncationCursorMap,
         schema_manager: &Arc<SchemaManager>,
+        vlog_version: &VlogVersion,
         source: &DedicatedCompactionSource,
         topology_epoch: u64,
         job_id: &str,
@@ -942,6 +949,7 @@ impl DedicatedCompactor {
         )
         .with_writer_options_factory(writer_options_factory)
         .with_target_schema_id(resolved.target_schema_id)
+        .with_vlog_version(vlog_version.clone())
         .with_column_family(tree_scope.column_family_id, runtime_num_columns)
         .with_truncation_cursors(truncation_cursors.clone())
         .with_output_path_prefix(dedicated_compaction_job_output_prefix(job_id))

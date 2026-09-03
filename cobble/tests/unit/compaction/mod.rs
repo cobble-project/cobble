@@ -9,6 +9,7 @@ use crate::metrics_manager::MetricsManager;
 use crate::sst::row_codec::{decode_value, encode_key, encode_value};
 use crate::sst::{SSTIterator, SSTIteratorOptions, SSTWriter, SSTWriterOptions};
 use crate::r#type::{Column, Key, Value, ValueType};
+use crate::vlog::VlogVersion;
 use serial_test::serial;
 use size::Size;
 use std::collections::VecDeque;
@@ -139,7 +140,7 @@ fn test_local_compaction_worker_uses_tree_scope_column_family_width() {
             vec![Arc::new(lsm_version)],
         )
         .unwrap(),
-        vlog_version: crate::vlog::VlogVersion::new(),
+        vlog_version: VlogVersion::new(),
         active: None,
         immutables: VecDeque::new(),
         truncation_cursors: crate::db_state::new_truncation_cursors(),
@@ -176,6 +177,7 @@ fn test_local_compaction_worker_uses_tree_scope_column_family_width() {
             vec![SortedRun::new(0, vec![source_file])],
             1,
             schema_manager.latest_schema().version(),
+            VlogVersion::new(),
             crate::data_file::DataFileType::SSTable,
             Arc::new(crate::ttl::TTLProvider::disabled()),
         )
