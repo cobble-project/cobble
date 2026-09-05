@@ -13,6 +13,10 @@ For distributed deployments, Cobble uses multiple shard `Db` instances coordinat
 - **Db** — A shard database responsible for a subset of bucket ranges.
 - **DbCoordinator** — A coordinator that assembles shard snapshots into one global snapshot manifest.
 
+![Each writer persists its own shard data to shared storage; the coordinator collects shard snapshots and publishes the global manifest.](../static/use-cases/distributed.svg)
+
+Data writes stay with the shard writers. The coordinator publishes metadata, not the shard data itself.
+
 ## Column Families
 
 Distributed ownership stays **bucket-only**. If a shard owns bucket `100`, it owns every column family inside bucket `100`.

@@ -15,6 +15,10 @@ nav_order: 6
 
 This makes `Reader` ideal for low-latency serving on a stable view, but with freshness bounded by snapshot cadence.
 
+![A following Reader stays on S1 through new writes and publication of S2, then advances on refresh; ReadOnlyDb keeps its opened shard snapshot.](../static/guides/reader-visibility.svg)
+
+Publication makes a snapshot available; refresh makes it visible to a following reader. For a fixed shard view, `ReadOnlyDb` stays on its opened snapshot until reopened.
+
 ### Opening a Reader
 
 ```rust
@@ -101,6 +105,10 @@ let scanner = read_only.scan_with_options(
 ## Distributed Scan
 
 Cobble supports distributed scan operations where work is split across multiple workers. This follows a **plan → split → scan** execution model.
+
+![A coordinator pins one global manifest and dispatches splits to independent worker processes, each reading shard data from shared storage.](../static/use-cases/distributed-scan.svg)
+
+The application dispatches the splits and starts the workers. Every worker must be able to read the files referenced by the same pinned global snapshot; the figure shows one possible process layout.
 
 ### 1. Create a Scan Plan
 

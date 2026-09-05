@@ -23,6 +23,29 @@ config.volumes.push(VolumeDescriptor::new(
 The `wal_flush_interval_ms` setting controls the maximum group-publication interval and defaults to
 5 milliseconds.
 
+## Writes, Checkpoints, and WAL Truncation
+
+![A Cobble shard at the instant checkpoint S has been published: its durable manifest records boundary C and references checkpoint data; WAL segments through C are being deleted while newer WAL segments remain and new writes continue.](../static/guides/wal-checkpoint.svg)
+
+The figure shows the system at checkpoint completion, not a sequence of steps. The published
+checkpoint covers writes through C, so its older WAL files can be removed while the newer tail
+remains available for recovery. The checkpoint and WAL areas are logical storage roles, not
+necessarily separate physical devices.
+
+A write first appends its record to an in-memory WAL buffer, then updates the memtable.
+By default, it returns only after its WAL group is durably published. Opting out with
+`await_durable = false` allows an earlier return; it does not make unpublished records durable.
+
+A checkpoint briefly blocks new WAL appends, drains pending WAL groups, and captures the
+database state with boundary **C**, the last durably published WAL segment ID. Writes can
+continue beyond C after capture while the snapshot is materialized.
+
+Only successful **per-shard snapshot publication** triggers deletion of WAL segments with
+IDs **≤ C**. The manifest records C; newer segments remain available for recovery. Merely
+requesting a checkpoint, or a failed or cancelled publication, does not authorize truncation.
+If WAL deletion fails after publication, the snapshot remains valid and leftover segments can
+be cleaned by a later successful checkpoint.
+
 ## Recovery Modes
 
 Recovery always starts from a snapshot. The selected `RecoveryMode` controls whether Cobble stops
@@ -32,6 +55,10 @@ at that snapshot or also replays its durable WAL tail:
 |------|----------|
 | `SnapshotOnly` | Restore exactly the selected snapshot. |
 | `LatestWithWal` | If the selected snapshot is the latest one, replay durable WAL records written after it. Historical snapshots are restored exactly. |
+
+![SnapshotOnly stops at the selected S2 snapshot; LatestWithWal can include its durable WAL tail, but historical S1 remains exact and unpublished WAL is not recovered.](../static/guides/wal-recovery.svg)
+
+The illustrated WAL tail assumes WAL was enabled for those writes. Selecting a historical snapshot never replays forward to the latest state, even with `LatestWithWal`.
 
 ```rust
 let db = Db::open_from_snapshot_with_recovery_mode(

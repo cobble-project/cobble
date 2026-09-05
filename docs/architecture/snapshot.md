@@ -52,6 +52,10 @@ Set `resume_primary_residual_scan_enabled` to `false` to disable this optimizati
 
 By default, Cobble keeps all snapshots. In long-running systems, old snapshots accumulate and prevent [compaction](compaction) from reclaiming space (since old file versions are still referenced). The `snapshot_retention` parameter limits how many snapshots are kept — older ones are automatically expired and their exclusively-referenced files become eligible for cleanup.
 
+![Expiring S1 releases its references: exclusive file A can be cleaned up, but shared file B stays for S2 and file C stays for S2 and the live database.](../static/guides/snapshot-retention.svg)
+
+Retention removes references, not every file named by the expired snapshot. Space is reclaimed only after no retained snapshot, active reader, current database view, or in-progress compaction still needs the file.
+
 ## Memtable Snapshotting
 
 When a snapshot is taken, Cobble flushes the active memtable to an L0 file to ensure all recent writes are captured. This guarantees that the snapshot reflects a consistent state of the database, including any in-memory data.

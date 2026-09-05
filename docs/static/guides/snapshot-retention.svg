@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600" role="img" aria-labelledby="snapshot-retention-title snapshot-retention-desc">
+<title id="snapshot-retention-title">Why old files can remain on disk</title>
+<desc id="snapshot-retention-desc">Expiring S1 releases its references: exclusive file A becomes eligible for cleanup, while shared file B stays for S2 and file C stays for S2 and the live database.</desc>
+<defs>
+<marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#655f55"/></marker>
+<marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#89643b"/></marker>
+<marker id="arrow-link" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#3f6579"/></marker>
+</defs>
+<rect x="0" y="0" width="960" height="600" fill="#faf8f3"/>
+<text x="40" y="60" font-family="Georgia, serif" font-size="32" fill="#302d28" font-weight="400" text-anchor="start">Why old files can remain on disk</text>
+<text x="40" y="100" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Expiring one snapshot does not release every file it used.</text>
+<rect x="40" y="352" width="880" height="168" rx="8" fill="#eaf0f2" stroke="#b5c7cf" stroke-width="1.5"/>
+<path d="M104 256 V376" fill="none" stroke="#655f55" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="8 6" marker-end="url(#arrow)"/>
+<path d="M232 256 V296 Q232 304 240 304 H384 Q392 304 392 312 V376" fill="none" stroke="#655f55" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="8 6" marker-end="url(#arrow)"/>
+<path d="M480 256 V376" fill="none" stroke="#3f6579" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-link)"/>
+<path d="M552 256 V320 Q552 328 560 328 H704 Q712 328 712 336 V376" fill="none" stroke="#3f6579" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-link)"/>
+<path d="M792 256 V304 Q792 312 800 312 H816 Q824 312 824 320 V376" fill="none" stroke="#3f6579" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-link)"/>
+<rect x="112" y="296" width="104" height="32" rx="8" fill="#faf8f3" stroke="none" stroke-width="1.5"/><text x="120" y="320" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Released</text>
+<rect x="248" y="264" width="104" height="32" rx="8" fill="#faf8f3" stroke="none" stroke-width="1.5"/><text x="256" y="288" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Released</text>
+<rect x="40" y="144" width="256" height="112" rx="8" fill="#f2f0eb" stroke="#c8c0b3" stroke-width="1.5" stroke-dasharray="8 6"/><text x="64" y="184" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Snapshot S1</text><text x="64" y="220" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Expired</text>
+<rect x="344" y="144" width="272" height="112" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.5"/><text x="368" y="184" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Snapshot S2</text><text x="368" y="220" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Retained</text>
+<rect x="664" y="144" width="256" height="112" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.5"/><text x="688" y="184" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Live database</text><text x="688" y="220" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Current files</text>
+<rect x="64" y="376" width="232" height="112" rx="8" fill="#f2f0eb" stroke="#c8c0b3" stroke-width="1.5" stroke-dasharray="8 6"/><text x="88" y="416" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Old file A</text><text x="88" y="452" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Can be cleaned up</text>
+<rect x="344" y="376" width="272" height="112" rx="8" fill="#f0e9dd" stroke="#89643b" stroke-width="1.5"/><text x="368" y="416" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Shared file B</text><text x="368" y="452" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Keep: S2 still needs it</text>
+<rect x="664" y="376" width="232" height="112" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.5"/><text x="688" y="416" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">New file C</text><text x="688" y="452" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Still in use</text>
+<text x="40" y="568" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Cleanup waits for the last reference — including readers and compaction.</text>
+</svg>

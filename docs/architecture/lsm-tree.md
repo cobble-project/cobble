@@ -18,6 +18,10 @@ Cobble organizes data files into numbered levels, where each level has different
 
 This design — tiered L0 for fast writes, leveled L1+ for efficient reads — is a deliberate trade-off. L0 absorbs bursts quickly, while deeper levels provide the sorted structure that makes reads predictable.
 
+![A lookup for key m overlaps both illustrated L0 files but only one file in each of L1 and L2.](../static/guides/lsm-key-ranges.svg)
+
+Each box represents a file's key range. Compaction reduces overlapping files in L0 and maintains non-overlapping ranges within deeper levels, limiting how many files can contain the requested key.
+
 ## File Formats
 
 Cobble supports two output formats, selectable via `data_file_type`:

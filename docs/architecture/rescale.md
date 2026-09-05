@@ -41,6 +41,10 @@ Assume:
   - Shard B owns `342..=683`
   - Shard C owns `684..=1023`
 
+![Read top to bottom: the full bucket range stays fixed while ownership changes from two shards to three, with all shards shrinking before B expands.](../static/guides/rescale-handoff.svg)
+
+Each horizontal bar spans the same full bucket space, with segment widths proportional to the inclusive bucket ranges. The curved bands show ownership changes, not keys moving between buckets. The diagonally hatched range is in handoff after A shrinks and before B imports it from A's pre-shrink snapshot. C is prepared with a fresh identity while traffic is paused; the final ownership map becomes the new baseline only after all handoffs and global snapshot publication complete.
+
 ### Step 0: start new shard C (fresh restore from snapshot)
 
 Use the latest global snapshot as a consistent baseline, and start shard C from shard B's snapshot

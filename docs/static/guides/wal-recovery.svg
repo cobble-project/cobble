@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 632" role="img" aria-labelledby="wal-recovery-title wal-recovery-desc">
+<title id="wal-recovery-title">Choose the recovery point</title>
+<desc id="wal-recovery-desc">SnapshotOnly restores S2 exactly; LatestWithWal can also replay the durable tail after the latest S2, while historical S1 remains exact and unpublished WAL is not recovered.</desc>
+<defs>
+<marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#655f55"/></marker>
+<marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#89643b"/></marker>
+<marker id="arrow-link" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#3f6579"/></marker>
+</defs>
+<rect x="0" y="0" width="960" height="632" fill="#faf8f3"/>
+<text x="40" y="60" font-family="Georgia, serif" font-size="32" fill="#302d28" font-weight="400" text-anchor="start">Choose the recovery point</text>
+<text x="40" y="100" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Restore a snapshot exactly, or include its durable WAL tail.</text>
+<path d="M304 196 H920" fill="none" stroke="#655f55" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="920" y="228" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#655f55" font-weight="400" text-anchor="end">Event order · not to scale</text>
+<circle cx="352" cy="196" r="6" fill="#655f55"/>
+<text x="352" y="168" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="middle">S1</text>
+<circle cx="568" cy="196" r="6" fill="#89643b"/>
+<text x="568" y="168" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="middle">Latest S2</text>
+<circle cx="776" cy="196" r="6" fill="#655f55"/>
+<text x="776" y="168" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="middle">WAL durable</text>
+<circle cx="904" cy="196" r="6" fill="#655f55"/>
+<text x="904" y="168" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="middle">Crash</text>
+<rect x="792" y="252" width="128" height="272" rx="8" fill="#f2f0eb" stroke="none" stroke-width="1.5"/>
+<text x="856" y="288" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="middle">Not yet</text>
+<text x="856" y="316" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="middle">durable</text>
+<text x="856" y="468" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="middle">Not</text>
+<text x="856" y="496" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="middle">recovered</text>
+<text x="40" y="296" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="start">SnapshotOnly</text>
+<text x="40" y="324" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#655f55" font-weight="400" text-anchor="start">Selected snapshot: S2</text>
+<rect x="304" y="268" width="264" height="64" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="436" y="308" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="400" text-anchor="middle">Through S2</text>
+<text x="40" y="400" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="start">LatestWithWal</text>
+<text x="40" y="428" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#655f55" font-weight="400" text-anchor="start">Selected snapshot: S2</text>
+<rect x="304" y="372" width="264" height="64" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="436" y="412" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="400" text-anchor="middle">S2</text>
+<rect x="568" y="372" width="208" height="64" rx="8" fill="#f0e9dd" stroke="#89643b" stroke-width="1.5"/>
+<text x="672" y="412" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#89643b" font-weight="600" text-anchor="middle">Durable WAL</text>
+<text x="40" y="504" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="start">Historical S1</text>
+<path d="M304 496 H352" fill="none" stroke="#655f55" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="352" cy="496" r="6" fill="#655f55"/>
+<text x="384" y="504" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Exact S1; no WAL replay</text>
+<text x="40" y="568" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">WAL must have been enabled and durably published.</text>
+<text x="40" y="600" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Replaying WAL does not itself create a new snapshot.</text>
+</svg>

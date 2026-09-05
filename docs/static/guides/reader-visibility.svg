@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" role="img" aria-labelledby="reader-visibility-title reader-visibility-desc">
+<title id="reader-visibility-title">When do readers see a new write?</title>
+<desc id="reader-visibility-desc">A following Reader stays on S1 through new writes and publication of S2, then advances when refreshed; a ReadOnlyDb keeps its opened shard snapshot.</desc>
+<defs>
+<marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#655f55"/></marker>
+<marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#89643b"/></marker>
+<marker id="arrow-link" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#3f6579"/></marker>
+</defs>
+<rect x="0" y="0" width="960" height="560" fill="#faf8f3"/>
+<text x="40" y="60" font-family="Georgia, serif" font-size="32" fill="#302d28" font-weight="400" text-anchor="start">When do readers see a new write?</text>
+<text x="40" y="100" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Publication and refresh are separate events.</text>
+<path d="M232 204 H920" fill="none" stroke="#655f55" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="232" y="236" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#655f55" font-weight="400" text-anchor="start">Event order · not to scale</text>
+<circle cx="248" cy="204" r="6" fill="#655f55"/>
+<text x="248" y="152" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="middle">S1 published</text>
+<text x="248" y="180" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#655f55" font-weight="400" text-anchor="middle">Reader on S1</text>
+<circle cx="436" cy="204" r="6" fill="#655f55"/>
+<text x="436" y="152" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="middle">New writes</text>
+<text x="436" y="180" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#655f55" font-weight="400" text-anchor="middle">Not yet visible</text>
+<circle cx="624" cy="204" r="6" fill="#655f55"/>
+<text x="624" y="152" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="middle">S2 published</text>
+<text x="624" y="180" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#655f55" font-weight="400" text-anchor="middle">Ready to read</text>
+<circle cx="816" cy="204" r="6" fill="#89643b"/>
+<text x="816" y="152" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="middle">Reader refresh</text>
+<text x="816" y="180" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#655f55" font-weight="400" text-anchor="middle">Now on S2</text>
+<text x="40" y="304" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="start">Following reader</text>
+<text x="40" y="408" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="600" text-anchor="start">Fixed shard view</text>
+<rect x="232" y="268" width="584" height="64" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="256" y="308" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="400" text-anchor="start">S1 stays visible</text>
+<rect x="816" y="268" width="104" height="64" rx="8" fill="#f0e9dd" stroke="#89643b" stroke-width="1.5"/>
+<text x="868" y="308" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#89643b" font-weight="600" text-anchor="middle">S2</text>
+<path d="M816 212 V268" fill="none" stroke="#89643b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-accent)"/>
+<rect x="232" y="372" width="688" height="64" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="256" y="412" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="400" text-anchor="start">Opened snapshot — unchanged</text>
+<text x="40" y="496" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Freshness depends on snapshot cadence and reader refresh.</text>
+<text x="40" y="528" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">ReadOnlyDb stays on its opened shard snapshot.</text>
+</svg>

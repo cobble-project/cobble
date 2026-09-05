@@ -70,6 +70,10 @@ keep their host clocks synchronized.
 The default `runtime_manifest_mode: auto` is recommended. Set it to `disabled` only when the
 compactor must use snapshot manifests instead.
 
+![The writer publishes its layout and applies valid result files; a separate dedicated compactor reads shared metadata and data, then publishes output files and result metadata.](../static/guides/dedicated-compaction.svg)
+
+Unlike the remote-server mode above, dedicated compaction coordinates through shared storage rather than a direct writer-to-server request. The writer still validates and applies results; runtime manifests describe persisted layout and do not replace recovery snapshots.
+
 ## Tuning Compaction Behavior
 
 Several configuration parameters let you control how aggressively compaction runs and how it shapes the LSM tree:
