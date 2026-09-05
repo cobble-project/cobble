@@ -684,17 +684,18 @@ impl DedicatedCompactor {
     }
 
     fn advance_file_id_allocator(&self, observation: &DedicatedObservation) {
-        let max_manifest_file_id = observation
+        let max_observed_file_id = observation
             .tree_levels
             .iter()
             .flat_map(|levels| levels.iter())
             .flat_map(|level| level.files.iter())
             .map(|file| file.file_id)
+            .chain(observation.vlog_files.iter().map(|file| file.file_id))
             .max()
             .unwrap_or(0);
         let next = self.file_manager.peek_next_file_id();
-        if next <= max_manifest_file_id {
-            self.file_manager.set_next_file_id(max_manifest_file_id + 1);
+        if next <= max_observed_file_id {
+            self.file_manager.set_next_file_id(max_observed_file_id + 1);
         }
     }
 
