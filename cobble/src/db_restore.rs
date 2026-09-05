@@ -389,7 +389,9 @@ fn open_restored_db_from_manifest(
         multi_lsm_version,
         vlog_version,
         active: None,
+        active_schema: None,
         immutables: VecDeque::new(),
+        min_source_schema_by_cf: Vec::new(),
         truncation_cursors: new_truncation_cursors_with(truncation_cursors),
         suggested_base_snapshot_id: suggested_base_snapshot_id.filter(|_| can_incremental_base),
     });
@@ -1121,7 +1123,9 @@ impl Db {
             multi_lsm_version,
             vlog_version,
             active: None,
+            active_schema: None,
             immutables: VecDeque::new(),
+            min_source_schema_by_cf: Vec::new(),
             truncation_cursors: new_truncation_cursors_with(truncation_cursors),
             suggested_base_snapshot_id: can_incremental_base.then_some(selected_snapshot_id),
         });

@@ -142,6 +142,8 @@ fn test_local_compaction_worker_uses_tree_scope_column_family_width() {
         .unwrap(),
         vlog_version: VlogVersion::new(),
         active: None,
+        active_schema: None,
+        min_source_schema_by_cf: Vec::new(),
         immutables: VecDeque::new(),
         truncation_cursors: crate::db_state::new_truncation_cursors(),
         suggested_base_snapshot_id: None,

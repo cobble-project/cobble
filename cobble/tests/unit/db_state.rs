@@ -4,6 +4,94 @@ fn empty_version() -> Arc<LSMTreeVersion> {
     Arc::new(LSMTreeVersion { levels: Vec::new() })
 }
 
+#[test]
+fn schema_minima_follow_current_files_and_column_families() {
+    use crate::data_file::{DataFile, DataFileType};
+    use crate::lsm::Level;
+    use crate::schema::SchemaManager;
+
+    let schemas = Arc::new(SchemaManager::new(1));
+    let mut builder = schemas.builder();
+    builder
+        .add_column(0, None, None, Some("other".to_string()))
+        .unwrap();
+    builder.commit();
+    let mut builder = schemas.builder();
+    builder.add_column(1, None, None, None).unwrap();
+    builder.commit();
+    let target = schemas.builder().commit();
+    let file_version = |id, schema_id| {
+        Arc::new(LSMTreeVersion {
+            levels: vec![Level {
+                ordinal: 0,
+                tiered: true,
+                files: vec![Arc::new(DataFile::new_untracked(
+                    DataFileType::SSTable,
+                    b"a".to_vec(),
+                    b"z".to_vec(),
+                    id,
+                    schema_id,
+                    1,
+                    0..=0,
+                    0..=0,
+                ))],
+            }],
+        })
+    };
+    let scopes = vec![
+        LSMTreeScope::new(0..=0, 0),
+        LSMTreeScope::new(1..=1, 0),
+        LSMTreeScope::new(0..=1, 1),
+    ];
+    let original = MultiLSMTreeVersion::from_scopes_with_tree_versions(
+        2,
+        &scopes,
+        vec![file_version(1, 0), file_version(2, 3), file_version(3, 1)],
+    )
+    .unwrap();
+    let handle = DbStateHandle::new();
+    let publish = |multi_lsm_version| {
+        handle.store(DbState {
+            seq_id: handle.allocate_seq_id(),
+            topology_epoch: 0,
+            bucket_ranges: vec![0..=1],
+            multi_lsm_version,
+            vlog_version: VlogVersion::new(),
+            active: None,
+            active_schema: None,
+            min_source_schema_by_cf: Vec::new(),
+            immutables: VecDeque::new(),
+            truncation_cursors: new_truncation_cursors(),
+            suggested_base_snapshot_id: None,
+        })
+    };
+    publish(original.clone());
+    let held = handle.load();
+    assert_eq!(held.min_source_schema_id(0), Some(0));
+    assert_eq!(held.min_source_schema_id(1), Some(1));
+    assert!(held.scan_requires_schema_aware(&target, 0));
+    assert!(!held.scan_requires_schema_aware(&target, 1));
+
+    // Removing the oldest file must raise the minimum even while an old
+    // snapshot still owns that file. An empty family contributes no minimum.
+    publish(
+        original
+            .with_lsm_version_at(0, empty_version())
+            .with_lsm_version_at(2, empty_version()),
+    );
+    let compacted = handle.load();
+    assert_eq!(compacted.min_source_schema_id(0), Some(3));
+    assert_eq!(compacted.min_source_schema_id(1), None);
+    assert!(!compacted.scan_requires_schema_aware(&target, 0));
+    assert_eq!(held.min_source_schema_id(0), Some(0));
+
+    // Restore/layout replacement derives the metadata again, including a
+    // decrease when older files become live in the current state once more.
+    publish(original);
+    assert_eq!(handle.load().min_source_schema_id(0), Some(0));
+    assert!(handle.load().scan_requires_schema_aware(&target, 0));
+}
+
 fn cursor_map_ptr(store: &TruncationCursorStore) -> usize {
     let cursors = store.inner.current.read().unwrap();
     Arc::as_ptr(&*cursors) as usize
@@ -117,6 +205,8 @@ fn test_store_advances_sequence_allocator_past_restored_state() {
         multi_lsm_version: current.multi_lsm_version.clone(),
         vlog_version: current.vlog_version.clone(),
         active: current.active.clone(),
+        active_schema: current.active_schema.clone(),
+        min_source_schema_by_cf: Vec::new(),
         immutables: current.immutables.clone(),
         truncation_cursors: current.truncation_cursors.clone(),
         suggested_base_snapshot_id: current.suggested_base_snapshot_id,
@@ -134,6 +224,8 @@ fn test_store_advances_sequence_allocator_past_restored_state() {
         multi_lsm_version: current.multi_lsm_version.clone(),
         vlog_version: current.vlog_version.clone(),
         active: current.active.clone(),
+        active_schema: current.active_schema.clone(),
+        min_source_schema_by_cf: Vec::new(),
         immutables: current.immutables.clone(),
         truncation_cursors: current.truncation_cursors.clone(),
         suggested_base_snapshot_id: current.suggested_base_snapshot_id,

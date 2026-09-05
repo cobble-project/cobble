@@ -199,7 +199,9 @@ impl ReadOnlyDb {
             multi_lsm_version,
             vlog_version,
             active: None,
+            active_schema: None,
             immutables: VecDeque::new(),
+            min_source_schema_by_cf: Vec::new(),
             truncation_cursors: new_truncation_cursors_with(truncation_cursors),
             suggested_base_snapshot_id: Some(snapshot_id),
         });
@@ -493,6 +495,7 @@ impl ReadOnlyDb {
                 false,
             ))
         };
+        let schema_aware = snapshot.scan_requires_schema_aware(schema.as_ref(), column_family_id);
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
             &self.file_manager,
             Arc::clone(&snapshot),
@@ -505,6 +508,7 @@ impl ReadOnlyDb {
             start_key.as_ref(),
             end_bound.as_ref().map(|(end, _)| end.as_ref()),
             options.preload_scan_cursor_block(),
+            schema_aware,
         )?;
         let mut iter = DbIterator::new(
             Vec::new(),
@@ -520,7 +524,14 @@ impl ReadOnlyDb {
                 access_guard: None,
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
-                schema: resolved_scan_options.effective_schema,
+                schema: if schema_aware {
+                    Arc::clone(&schema)
+                } else {
+                    resolved_scan_options.effective_schema
+                },
+                schema_aware,
+                schema_manager: Arc::clone(&self.schema_manager),
+                selected_columns: options.columns().map(ToOwned::to_owned),
                 column_family_id,
                 should_stop_at_block_boundary: options.should_stop_at_block_boundary(),
             },

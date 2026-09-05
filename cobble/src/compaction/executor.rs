@@ -25,7 +25,7 @@ use crate::lsm::{LevelEdit, VersionEdit};
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, SchemaManager};
 use crate::sst::{SSTIteratorMetrics, SSTIteratorOptions, SSTWriter};
 use crate::r#type::{ENCODED_KEY_PREFIX_BYTES, key_bucket, key_column_family};
-use crate::vlog::{VlogEdit, VlogMergeCollector, VlogVersion};
+use crate::vlog::{VlogEdit, VlogMergeCollector, VlogStore, VlogVersion};
 use crate::writer_options::{WriterOptions, WriterOptionsFactory};
 use log::trace;
 use metrics::{Counter, counter};
@@ -706,7 +706,7 @@ impl CompactionExecutor {
                 Arc::clone(&task.schema_manager),
                 column_family_id,
                 task.ttl_provider(),
-                Arc::clone(&task.file_manager),
+                Arc::new(VlogStore::new(Arc::clone(&task.file_manager), 0, 0)),
                 Arc::clone(&task.vlog_version),
                 merge_collector.as_ref().map(std::rc::Rc::clone),
             ))

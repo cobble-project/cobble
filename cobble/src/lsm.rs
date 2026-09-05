@@ -16,8 +16,8 @@ use crate::file::{
     read_ahead_runtime,
 };
 use crate::iterator::{
-    BucketFilterIterator, ColumnMaskingIterator, KvIterator, SchemaEvolvingIterator, SortedRun,
-    VlogSeqOffsetIterator,
+    BucketFilterIterator, ColumnMaskingIterator, KvIterator, SchemaEvolvingIterator,
+    SchemaTaggedIterator, SortedRun, VlogSeqOffsetIterator,
 };
 use crate::metrics_manager::MetricsManager;
 use crate::parquet::ParquetIterator;
@@ -331,7 +331,9 @@ impl LSMTree {
                     multi_lsm_version,
                     vlog_version: snapshot.vlog_version.clone(),
                     active: snapshot.active.clone(),
+                    active_schema: snapshot.active_schema.clone(),
                     immutables: snapshot.immutables.clone(),
+                    min_source_schema_by_cf: Vec::new(),
                     truncation_cursors: snapshot.truncation_cursors.clone(),
                     suggested_base_snapshot_id: if inherit_suggested_base_snapshot_id {
                         snapshot.suggested_base_snapshot_id
@@ -706,7 +708,9 @@ impl LSMTree {
                     multi_lsm_version: new_multi.clone(),
                     vlog_version: current.vlog_version.clone(),
                     active: current.active.clone(),
+                    active_schema: current.active_schema.clone(),
                     immutables: current.immutables.clone(),
+                    min_source_schema_by_cf: Vec::new(),
                     truncation_cursors: current.truncation_cursors.clone(),
                     suggested_base_snapshot_id: None,
                 })
@@ -1306,8 +1310,11 @@ impl LSMTree {
         encoded_start: &[u8],
         encoded_end: Option<&[u8]>,
         preload_scan_cursor_block: bool,
+        schema_aware: bool,
     ) -> Result<Vec<DynKvIterator>> {
-        let selected_columns = selected_columns.map(|columns| columns.to_vec());
+        let selected_columns = (!schema_aware)
+            .then(|| selected_columns.map(|columns| columns.to_vec()))
+            .flatten();
         let preload_scan_cursor_block = preload_scan_cursor_block && self.block_cache.is_some();
         let read_metadata_cache_mode = self.sst_read_metadata_cache_mode;
         let pinned_metadata_max_level = self.sst_pinned_metadata_max_level;
@@ -1428,25 +1435,40 @@ impl LSMTree {
                 } else {
                     Box::new(iter)
                 };
-                let iter: DynKvIterator = if file.schema_id == target_schema.version() {
-                    base_iter
+                let iter: DynKvIterator = if schema_aware {
+                    // Retain the physical schema through the cross-source merge. VLOG offsets
+                    // must be decoded with the source width before that merge materializes it.
+                    let iter: DynKvIterator = if file.vlog_file_seq_offset == 0 {
+                        base_iter
+                    } else {
+                        Box::new(VlogSeqOffsetIterator::new(
+                            base_iter,
+                            source_num_columns,
+                            file.vlog_file_seq_offset,
+                        ))
+                    };
+                    Box::new(SchemaTaggedIterator::new(iter, file.schema_id))
                 } else {
-                    Box::new(SchemaEvolvingIterator::new(
-                        base_iter,
-                        Arc::clone(&source_schema),
-                        Arc::clone(&target_schema),
-                        Arc::clone(&schema_manager),
-                        column_family_id,
-                    ))
-                };
-                let iter: DynKvIterator = if file.vlog_file_seq_offset == 0 {
-                    iter
-                } else {
-                    Box::new(VlogSeqOffsetIterator::new(
-                        iter,
-                        target_num_columns,
-                        file.vlog_file_seq_offset,
-                    ))
+                    let iter: DynKvIterator = if file.schema_id == target_schema.version() {
+                        base_iter
+                    } else {
+                        Box::new(SchemaEvolvingIterator::new(
+                            base_iter,
+                            Arc::clone(&source_schema),
+                            Arc::clone(&target_schema),
+                            Arc::clone(&schema_manager),
+                            column_family_id,
+                        ))
+                    };
+                    if file.vlog_file_seq_offset == 0 {
+                        iter
+                    } else {
+                        Box::new(VlogSeqOffsetIterator::new(
+                            iter,
+                            target_num_columns,
+                            file.vlog_file_seq_offset,
+                        ))
+                    }
                 };
                 let iter: DynKvIterator = if let Some(columns) = selected_columns.as_deref() {
                     Box::new(ColumnMaskingIterator::new(

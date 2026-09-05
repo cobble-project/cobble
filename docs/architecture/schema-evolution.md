@@ -82,7 +82,7 @@ let db = DbBuilder::new(config)
 
 Builder registration also works with `open()`, `open_from_snapshot(snapshot_id)`, and `resume_from_snapshot(snapshot_id)`, including their recovery-mode variants. Restore methods require `db_id` and use the snapshot's bucket ranges. Missing required IDs fail recovery; duplicate registrations return an error. Keep each ID's meaning stable. `switch_to_snapshot` preserves the current DB's registrations, and `Db::register_schema_transform` remains available for new runtime schema updates.
 
-Custom transforms currently support the Rust `Db` point-read (`get`/multi-get) and local compaction paths. Custom-transform integration for scans, `Reader`/`ReadOnlyDb`, remote/dedicated compaction, and higher-level bindings is not yet available.
+Custom transforms currently support `Db` reads (`get`, multi-get, and scan) and local compaction. Scans merge older values with their original operators before applying transforms, then apply column selection and row limits. Custom-transform integration for `Reader`/`ReadOnlyDb`, remote/dedicated compaction, and higher-level bindings is not yet available.
 
 ## Add Column: What Actually Happens
 

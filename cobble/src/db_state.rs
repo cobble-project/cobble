@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::lsm::LSMTreeVersion;
 use crate::memtable::{ActiveMemtable, ImmutableMemtable};
+use crate::schema::Schema;
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, MAX_COLUMN_FAMILY_COUNT};
 use crate::vlog::VlogVersion;
 use arc_swap::ArcSwap;
@@ -407,6 +408,12 @@ pub(crate) struct DbState {
     pub(crate) truncation_cursors: TruncationCursorStore,
     // This is used to suggest a base snapshot ID for new snapshots
     pub(crate) suggested_base_snapshot_id: Option<u64>,
+    /// The active table's schema is published alongside its pointer so source
+    /// metadata never needs to lock the active table.
+    pub(crate) active_schema: Option<Arc<Schema>>,
+    /// Minimum physical source schema per column family across this snapshot.
+    /// It is in-memory snapshot metadata, reconstructed from current refs.
+    pub(crate) min_source_schema_by_cf: Vec<Option<u64>>,
 }
 
 impl DbState {
@@ -421,6 +428,56 @@ impl DbState {
 
     pub(crate) fn truncation_cursors_snapshot(&self) -> TruncationCursorMap {
         self.truncation_cursors.to_map()
+    }
+
+    pub(crate) fn min_source_schema_id(&self, column_family_id: u8) -> Option<u64> {
+        self.min_source_schema_by_cf
+            .get(column_family_id as usize)
+            .copied()
+            .flatten()
+    }
+
+    pub(crate) fn scan_requires_schema_aware(
+        &self,
+        target_schema: &Schema,
+        column_family_id: u8,
+    ) -> bool {
+        self.min_source_schema_id(column_family_id)
+            .is_some_and(|source_min| {
+                target_schema
+                    .last_incompatible_schema_id_in_family(column_family_id)
+                    .is_some_and(|barrier| source_min < barrier)
+            })
+    }
+
+    fn refresh_source_schema_metadata(&mut self) {
+        fn record(minima: &mut Vec<Option<u64>>, column_family_id: u8, schema_id: u64) {
+            let index = column_family_id as usize;
+            if minima.len() <= index {
+                minima.resize(index + 1, None);
+            }
+            minima[index] = Some(minima[index].map_or(schema_id, |current| current.min(schema_id)));
+        }
+        fn record_schema(minima: &mut Vec<Option<u64>>, schema: &Schema) {
+            for column_family_id in schema.column_family_id_list() {
+                record(minima, column_family_id, schema.version());
+            }
+        }
+        let mut minima = Vec::<Option<u64>>::new();
+        if let Some(schema) = &self.active_schema {
+            record_schema(&mut minima, schema);
+        }
+        for immutable in &self.immutables {
+            record_schema(&mut minima, immutable.schema());
+        }
+        for entry in &self.multi_lsm_version.tree_versions {
+            for level in &entry.lsm_version.levels {
+                for file in &level.files {
+                    record(&mut minima, entry.scope.column_family_id, file.schema_id);
+                }
+            }
+        }
+        self.min_source_schema_by_cf = minima;
     }
 }
 
@@ -444,7 +501,9 @@ impl DbStateHandle {
                 multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: vec![] }),
                 vlog_version: VlogVersion::new(),
                 active: None,
+                active_schema: None,
                 immutables: VecDeque::new(),
+                min_source_schema_by_cf: Vec::new(),
                 truncation_cursors: new_truncation_cursors(),
                 suggested_base_snapshot_id: None,
             }),
@@ -521,7 +580,9 @@ impl DbStateHandle {
                 multi_lsm_version: snapshot.multi_lsm_version.clone(),
                 vlog_version: snapshot.vlog_version.clone(),
                 active: snapshot.active.clone(),
+                active_schema: snapshot.active_schema.clone(),
                 immutables: snapshot.immutables.clone(),
+                min_source_schema_by_cf: Vec::new(),
                 truncation_cursors: snapshot.truncation_cursors.clone(),
                 suggested_base_snapshot_id: Some(snapshot_id),
             })
@@ -545,7 +606,9 @@ impl DbStateHandle {
             multi_lsm_version: current.multi_lsm_version.clone(),
             vlog_version: current.vlog_version.clone(),
             active: current.active.clone(),
+            active_schema: current.active_schema.clone(),
             immutables: current.immutables.clone(),
+            min_source_schema_by_cf: Vec::new(),
             truncation_cursors: current.truncation_cursors.clone(),
             suggested_base_snapshot_id: replacement,
         });
@@ -587,7 +650,9 @@ impl DbStateHandle {
             multi_lsm_version,
             vlog_version: snapshot.vlog_version.clone(),
             active: snapshot.active.clone(),
+            active_schema: snapshot.active_schema.clone(),
             immutables: snapshot.immutables.clone(),
+            min_source_schema_by_cf: Vec::new(),
             truncation_cursors: snapshot.truncation_cursors.clone(),
             suggested_base_snapshot_id: None,
         });
@@ -618,14 +683,17 @@ impl DbStateHandle {
             multi_lsm_version: snapshot.multi_lsm_version.clone(),
             vlog_version: snapshot.vlog_version.clone(),
             active: snapshot.active.clone(),
+            active_schema: snapshot.active_schema.clone(),
             immutables: snapshot.immutables.clone(),
+            min_source_schema_by_cf: Vec::new(),
             truncation_cursors: new_truncation_cursors_with(cursors),
             suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
         });
         true
     }
 
-    pub(crate) fn store(&self, new_version: DbState) {
+    pub(crate) fn store(&self, mut new_version: DbState) {
+        new_version.refresh_source_schema_metadata();
         // Publish the allocator advance before the state itself. A thread that observes the new
         // state must never allocate its sequence id (or an older one), otherwise stale flush or
         // compaction work could pass a CAS after restore. Advancing early may leave harmless gaps
@@ -658,7 +726,9 @@ impl DbStateHandle {
             multi_lsm_version: snapshot.multi_lsm_version.clone(),
             vlog_version: snapshot.vlog_version.clone(),
             active: snapshot.active.clone(),
+            active_schema: snapshot.active_schema.clone(),
             immutables,
+            min_source_schema_by_cf: Vec::new(),
             truncation_cursors: snapshot.truncation_cursors.clone(),
             suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
         });

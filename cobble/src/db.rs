@@ -408,7 +408,9 @@ impl Db {
                 multi_lsm_version,
                 vlog_version: snapshot.vlog_version.clone(),
                 active: snapshot.active.clone(),
+                active_schema: snapshot.active_schema.clone(),
                 immutables: snapshot.immutables.clone(),
+                min_source_schema_by_cf: Vec::new(),
                 truncation_cursors: snapshot.truncation_cursors.clone(),
                 suggested_base_snapshot_id: None,
             });
@@ -448,7 +450,9 @@ impl Db {
             multi_lsm_version,
             vlog_version: snapshot.vlog_version.clone(),
             active: snapshot.active.clone(),
+            active_schema: snapshot.active_schema.clone(),
             immutables: snapshot.immutables.clone(),
+            min_source_schema_by_cf: Vec::new(),
             truncation_cursors: snapshot.truncation_cursors.clone(),
             suggested_base_snapshot_id: None,
         });
@@ -2277,6 +2281,10 @@ impl Db {
                 column_family_id,
             )?)
         };
+        // An incompatible transition (custom transform, defaults/nulls, or an
+        // operator change) requires retaining every physical schema through the
+        // per-key merge. Decide once before constructing either source chain.
+        let schema_aware = snapshot.scan_requires_schema_aware(schema.as_ref(), column_family_id);
         let memtable_iters = self
             .memtable_manager
             .scan_memtable_iterators_with_snapshot(
@@ -2287,6 +2295,7 @@ impl Db {
                 Some(start_key.clone()),
                 end_key.clone(),
                 options.max_rows(),
+                schema_aware,
             )?;
         let end_bound = end_key.map(|end_key| (end_key, false));
         let lsm_iters = self.lsm_tree.scan_with_snapshot(
@@ -2301,6 +2310,7 @@ impl Db {
             start_key.as_ref(),
             end_bound.as_ref().map(|(end, _)| end.as_ref()),
             options.preload_scan_cursor_block(),
+            schema_aware,
         );
         let lsm_iters = match lsm_iters {
             Ok(result) => result,
@@ -2323,7 +2333,14 @@ impl Db {
                 access_guard: Some(access_guard),
                 vlog_store: Arc::clone(&self.vlog_store),
                 ttl_provider: Arc::clone(&self.ttl_provider),
-                schema: resolved_scan_options.effective_schema,
+                schema: if schema_aware {
+                    Arc::clone(&schema)
+                } else {
+                    resolved_scan_options.effective_schema
+                },
+                schema_aware,
+                schema_manager: Arc::clone(&self.schema_manager),
+                selected_columns: options.columns().map(ToOwned::to_owned),
                 column_family_id,
                 should_stop_at_block_boundary: options.should_stop_at_block_boundary(),
             },

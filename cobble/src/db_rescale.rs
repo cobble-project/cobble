@@ -77,7 +77,9 @@ fn copy_db_state(state: &DbState) -> DbState {
         multi_lsm_version: state.multi_lsm_version.clone(),
         vlog_version: state.vlog_version.clone(),
         active: state.active.clone(),
+        active_schema: state.active_schema.clone(),
         immutables: state.immutables.clone(),
+        min_source_schema_by_cf: Vec::new(),
         truncation_cursors: crate::db_state::new_truncation_cursors_with(
             state.truncation_cursors_snapshot(),
         ),
@@ -716,7 +718,9 @@ impl Db {
                 multi_lsm_version: merged_multi_lsm,
                 vlog_version: merged_vlog,
                 active: current.active.clone(),
+                active_schema: current.active_schema.clone(),
                 immutables: current.immutables.clone(),
+                min_source_schema_by_cf: Vec::new(),
                 truncation_cursors: crate::db_state::new_truncation_cursors_with(
                     truncation_cursors,
                 ),
@@ -908,7 +912,9 @@ impl Db {
                 multi_lsm_version: updated_multi_lsm,
                 vlog_version: current.vlog_version.clone(),
                 active: current.active.clone(),
+                active_schema: current.active_schema.clone(),
                 immutables: current.immutables.clone(),
+                min_source_schema_by_cf: Vec::new(),
                 truncation_cursors: crate::db_state::new_truncation_cursors_with(
                     truncation_cursors,
                 ),

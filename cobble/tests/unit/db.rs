@@ -2127,6 +2127,362 @@ fn test_db_get_evolves_older_schema_values() {
 
 #[test]
 #[serial(file)]
+fn test_scan_merges_schema_barriers_before_projection() {
+    use crate::BytesMergeOperator;
+    use crate::data_file::DataFileType;
+
+    let source = |index, transform: Option<&str>| ColumnEvolution::Source {
+        source_index: index,
+        transform_id: transform.map(str::to_owned),
+    };
+    for memtable_type in [
+        MemtableType::Hash,
+        MemtableType::Skiplist,
+        MemtableType::Vec,
+    ] {
+        for data_file_type in [DataFileType::SSTable, DataFileType::Parquet] {
+            let temp = tempfile::tempdir().unwrap();
+            let db = open_db(Config {
+                memtable_type,
+                data_file_type,
+                memtable_capacity: Size::from_const(1 << 20),
+                parquet_row_group_size_bytes: Size::from_const(1024),
+                value_separation_threshold: Some(Size::from_const(1)),
+                l0_file_limit: 1000,
+                snapshot_on_flush: false,
+                ttl_enabled: true,
+                time_provider: TimeProviderKind::Manual,
+                volumes: VolumeDescriptor::single_volume(format!(
+                    "file://{}",
+                    temp.path().display()
+                )),
+                ..Config::default()
+            });
+            let flush = || {
+                db.memtable_manager.flush_active().unwrap();
+                for result in db.memtable_manager.wait_for_flushes() {
+                    result.unwrap();
+                }
+            };
+            let family = Some("metrics".to_string());
+            db.set_time(100);
+            let write = WriteOptions::with_column_family("metrics");
+            let read = ReadOptions::default().with_column_family("metrics");
+            let mut schema = db.update_schema();
+            schema.add_column(1, None, None, None).unwrap();
+            schema.commit();
+            let mut schema = db.update_schema();
+            for column in 0..3 {
+                schema
+                    .add_column(column, None, None, family.clone())
+                    .unwrap();
+            }
+            schema
+                .set_column_operator(family.clone(), 0, Arc::new(PipeMergeOperator))
+                .unwrap();
+            schema.commit();
+            assert!(
+                db.scan_with_options_bounds(
+                    0,
+                    None,
+                    None,
+                    &ScanOptions::default().with_column_family("metrics")
+                )
+                .unwrap()
+                .next()
+                .is_none()
+            );
+            assert_eq!(db.db_state.load().min_source_schema_id(1), None);
+            let before_adoption = db.db_state.load();
+            let before_adoption_schema = before_adoption.active_schema.as_ref().unwrap().version();
+            for (id, left, right) in [("angle", "<", ">"), ("brace", "{", "}")] {
+                db.register_schema_transform(id, move |value| {
+                    Ok(value.map(|value| {
+                        [left.as_bytes(), value.as_ref(), right.as_bytes()]
+                            .concat()
+                            .into()
+                    }))
+                })
+                .unwrap();
+            }
+            let keys: Vec<_> = (0..256).map(|i| format!("k{i:03}").into_bytes()).collect();
+            // Two old-schema runs, then an intermediate-schema run and a new
+            // active memtable. The old pipe merge must precede each transform.
+            for (i, key) in keys.iter().enumerate() {
+                db.put_with_options(0, key, 0, format!("base-{i}"), &write)
+                    .unwrap();
+                db.merge_with_options(0, key, 0, b"a", &write).unwrap();
+                db.put_with_options(0, key, 1, b"payload", &write).unwrap();
+                db.put_with_options(0, key, 2, b"discarded", &write)
+                    .unwrap();
+            }
+            assert_eq!(
+                db.db_state.load().min_source_schema_id(1),
+                Some(db.current_schema().version())
+            );
+            assert!(
+                !db.db_state
+                    .load()
+                    .scan_requires_schema_aware(&db.current_schema(), 1)
+            );
+            // Publishing metadata must not let an old state observe new-family
+            // data through a shared, retagged active-memtable wrapper.
+            assert!(!Arc::ptr_eq(
+                before_adoption.active.as_ref().unwrap(),
+                db.db_state.load().active.as_ref().unwrap()
+            ));
+            assert_eq!(
+                before_adoption.active_schema.as_ref().unwrap().version(),
+                before_adoption_schema
+            );
+            assert_eq!(before_adoption.min_source_schema_id(1), None);
+            drop(before_adoption);
+            flush();
+            assert!(
+                !db.db_state
+                    .load()
+                    .vlog_version
+                    .files_with_entries()
+                    .is_empty(),
+                "fixture must exercise VLOG reads"
+            );
+            for key in &keys {
+                db.merge_with_options(0, key, 0, b"b", &write).unwrap();
+            }
+            flush();
+            let mut schema = db.update_schema();
+            schema
+                .remap_columns(
+                    family.clone(),
+                    vec![
+                        source(1, None),
+                        source(0, Some("angle")),
+                        ColumnEvolution::Default {
+                            value: Bytes::from_static(b"D"),
+                        },
+                        ColumnEvolution::Null,
+                    ],
+                )
+                .unwrap();
+            schema
+                .replace_column(family.clone(), 1, Arc::new(BytesMergeOperator))
+                .unwrap();
+            schema.commit();
+            assert!(
+                db.db_state
+                    .load()
+                    .scan_requires_schema_aware(&db.current_schema(), 1)
+            );
+            for key in &keys {
+                db.merge_with_options(0, key, 1, b"c", &write).unwrap();
+            }
+            flush();
+            let mut schema = db.update_schema();
+            schema
+                .remap_columns(
+                    family.clone(),
+                    vec![
+                        source(1, Some("brace")),
+                        source(0, None),
+                        source(2, None),
+                        source(3, None),
+                    ],
+                )
+                .unwrap();
+            schema
+                .replace_column(family.clone(), 0, Arc::new(PipeMergeOperator))
+                .unwrap();
+            schema.commit();
+            for key in &keys {
+                db.merge_with_options(0, key, 0, b"d", &write).unwrap();
+            }
+            db.delete_row_with_options(0, &keys[20], &write).unwrap();
+            db.delete_with_options(0, &keys[21], 0, &write).unwrap();
+            db.put_with_options(0, &keys[22], 0, b"reset", &write)
+                .unwrap();
+            db.put_columns_with_options(
+                0,
+                &keys[23],
+                &[b"expired".as_slice(); 4],
+                &WriteOptions::with_ttl(1).bound_to_column_family("metrics"),
+            )
+            .unwrap();
+            db.set_time(200);
+            db.advance_truncation_cursor(0, "metrics", &keys[5])
+                .unwrap();
+
+            let expected: Vec<_> = keys
+                .iter()
+                .enumerate()
+                .skip(6)
+                .filter(|(i, _)| ![20, 23].contains(i))
+                .map(|(i, key)| {
+                    let value = match i {
+                        21 => None,
+                        22 => Some(Bytes::from_static(b"reset")),
+                        _ => Some(Bytes::from(format!("{{<base-{i}|a|b>c}}|d"))),
+                    };
+                    let columns = vec![
+                        value,
+                        Some(Bytes::from_static(b"payload")),
+                        Some(Bytes::from_static(b"D")),
+                        None,
+                    ];
+                    assert_eq!(
+                        db.get_with_options(0, key, &read).unwrap(),
+                        Some(columns.clone())
+                    );
+                    (Bytes::copy_from_slice(key), columns)
+                })
+                .collect();
+            assert!(db.get_with_options(0, &keys[23], &read).unwrap().is_none());
+            let batch = db
+                .multi_get_with_options(
+                    &expected.iter().map(|(key, _)| (0, key)).collect::<Vec<_>>(),
+                    &read,
+                )
+                .unwrap();
+            assert_eq!(
+                batch,
+                expected
+                    .iter()
+                    .map(|(_, columns)| Some(columns.clone()))
+                    .collect::<Vec<_>>()
+            );
+
+            // Projection and row limits apply to completed logical rows, not
+            // physical operands. Resume every physical stop, including stops
+            // in the middle of a key shared by several files.
+            for selected in [vec![0, 1, 2, 3], vec![1, 0, 2], vec![0], vec![3]] {
+                let projected: Vec<_> = expected
+                    .iter()
+                    .filter_map(|(key, columns)| {
+                        let columns: Vec<_> =
+                            selected.iter().map(|&i| columns[i].clone()).collect();
+                        columns
+                            .iter()
+                            .any(Option::is_some)
+                            .then(|| (key.clone(), columns))
+                    })
+                    .collect();
+                for stop in [false, true] {
+                    let options = ScanOptions::for_columns(selected.clone())
+                        .with_column_family("metrics")
+                        .with_stop_at_block_boundary(stop)
+                        .with_preload_scan_cursor_block(stop);
+                    let mut scan = db
+                        .scan_with_options_bounds(0, None, None, &options)
+                        .unwrap();
+                    let mut actual = Vec::new();
+                    let mut pauses = 0;
+                    loop {
+                        actual.extend(scan.by_ref().map(|row| row.unwrap()));
+                        if !scan.stopped_at_block_boundary() {
+                            break;
+                        }
+                        pauses += 1;
+                        assert!(pauses < 1024, "scan must make progress");
+                        scan.clear_stop_at_block_boundary();
+                    }
+                    assert_eq!(
+                        actual, projected,
+                        "{memtable_type:?}/{data_file_type:?}, {selected:?}, stop={stop}"
+                    );
+                    if stop {
+                        assert!(pauses > 0, "exercise physical block stops");
+                    }
+                    let mut limited = db
+                        .scan_with_options_bounds(
+                            0,
+                            None,
+                            None,
+                            &options.with_stop_at_block_boundary(false).with_max_rows(7),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        limited.by_ref().collect::<Result<Vec<_>>>().unwrap(),
+                        projected.iter().take(7).cloned().collect::<Vec<_>>()
+                    );
+                }
+            }
+            let bounded = db
+                .scan_with_options_bounds(
+                    0,
+                    Some(&keys[10]),
+                    Some(&keys[30]),
+                    &ScanOptions::default().with_column_family("metrics"),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                bounded,
+                expected
+                    .iter()
+                    .filter(|(key, _)| key.as_ref() >= keys[10].as_slice()
+                        && key.as_ref() < keys[30].as_slice())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            // No write/rotation follows this update: the active memtable is
+            // now also an old-schema source. An already-created cursor must
+            // retain its target even if another schema is published.
+            let mut schema = db.update_schema();
+            schema
+                .remap_columns(
+                    family.clone(),
+                    vec![
+                        source(0, Some("angle")),
+                        source(1, None),
+                        source(2, None),
+                        source(3, None),
+                    ],
+                )
+                .unwrap();
+            schema.commit();
+            let options = ScanOptions::default().with_column_family("metrics");
+            let frozen = db
+                .scan_with_options_bounds(0, None, None, &options)
+                .unwrap();
+            db.register_schema_transform("reject", |_| {
+                Err(Error::InvalidState("transform rejected".to_string()))
+            })
+            .unwrap();
+            let mut schema = db.update_schema();
+            schema
+                .remap_columns(
+                    family,
+                    vec![
+                        source(0, Some("reject")),
+                        source(1, None),
+                        source(2, None),
+                        source(3, None),
+                    ],
+                )
+                .unwrap();
+            schema.commit();
+            let frozen_expected: Vec<_> = expected
+                .into_iter()
+                .map(|(key, mut columns)| {
+                    columns[0] = columns[0]
+                        .take()
+                        .map(|value| [b"<".as_slice(), value.as_ref(), b">"].concat().into());
+                    (key, columns)
+                })
+                .collect();
+            assert_eq!(frozen.collect::<Result<Vec<_>>>().unwrap(), frozen_expected);
+            let error = match db.scan_with_options_bounds(0, None, None, &options) {
+                Err(error) => error,
+                Ok(mut scan) => scan.next().unwrap().unwrap_err(),
+            };
+            assert!(error.to_string().contains("transform rejected"));
+            db.force_close();
+        }
+    }
+}
+
+#[test]
+#[serial(file)]
 fn test_db_registered_schema_transform_remaps_old_values() {
     let root = "/tmp/db_schema_transform_registry";
     cleanup_test_root(root);

@@ -3,11 +3,14 @@ use crate::db_state::DbState;
 use crate::db_status::OwnedDbAccessGuard;
 use crate::error::Result;
 use crate::iterator::KvIterator;
-use crate::iterator::{DeduplicatingIterator, MergingIterator, TruncationFilterIterator};
+use crate::iterator::{
+    DeduplicatingIterator, MergingIterator, SchemaAwareDeduplicatingIterator,
+    TruncationFilterIterator,
+};
 use crate::lsm::DynKvIterator;
 use crate::memtable::MemtableManager;
 use crate::row_merge::value_to_vec_of_columns_with_vlog;
-use crate::schema::Schema;
+use crate::schema::{Schema, SchemaManager};
 use crate::sst::row_codec::decode_key;
 use crate::ttl::TTLProvider;
 use crate::r#type::Key;
@@ -34,12 +37,17 @@ pub(crate) struct DbIteratorOptions {
     /// When column projection is active, this is a projected schema
     /// with remapped operators matching the selected column indices.
     pub(crate) schema: Arc<Schema>,
+    /// Schema-aware scans retain full physical rows until after the final
+    /// per-key merge. Projection belongs only at that final boundary.
+    pub(crate) schema_aware: bool,
+    pub(crate) schema_manager: Arc<SchemaManager>,
+    pub(crate) selected_columns: Option<Vec<usize>>,
     pub(crate) column_family_id: u8,
     pub(crate) should_stop_at_block_boundary: bool,
 }
 
 pub struct DbIterator {
-    inner: DeduplicatingIterator<TruncationFilterIterator<MergingIterator<DynKvIterator>>>,
+    inner: DynKvIterator,
     end_bound: Option<(Bytes, bool)>,
     snapshot: Arc<DbState>,
     _memtable_manager: Option<Arc<MemtableManager>>,
@@ -49,6 +57,7 @@ pub struct DbIterator {
     schema: Arc<Schema>,
     num_columns: usize,
     column_family_id: u8,
+    selected_columns: Option<Vec<usize>>,
     remaining_rows: Option<usize>,
     /// Whether block-boundary stops are enabled for the iterator chain that
     /// feeds this row decoder.
@@ -71,13 +80,27 @@ impl DbIterator {
             .unwrap_or_else(|| schema.num_columns());
         memtable_iters.append(&mut lsm_iters);
         let merged = MergingIterator::new(memtable_iters);
-        let mut inner = DeduplicatingIterator::new(
-            TruncationFilterIterator::new(merged, options.lower_bound_exclusive),
-            Some(num_columns),
-            Arc::clone(&options.ttl_provider),
-            None,
-            schema.clone(),
-        );
+        let merged = TruncationFilterIterator::new(merged, options.lower_bound_exclusive);
+        let mut inner: DynKvIterator = if options.schema_aware {
+            Box::new(SchemaAwareDeduplicatingIterator::new(
+                merged,
+                Arc::clone(&schema),
+                Arc::clone(&options.schema_manager),
+                options.column_family_id,
+                Arc::clone(&options.ttl_provider),
+                Arc::clone(&options.vlog_store),
+                Arc::new(options.snapshot.vlog_version.clone()),
+                None,
+            ))
+        } else {
+            Box::new(DeduplicatingIterator::new(
+                merged,
+                Some(num_columns),
+                Arc::clone(&options.ttl_provider),
+                None,
+                schema.clone(),
+            ))
+        };
         inner.set_stop_at_block_boundary(options.should_stop_at_block_boundary);
         Self {
             inner,
@@ -90,6 +113,10 @@ impl DbIterator {
             schema,
             num_columns,
             column_family_id: options.column_family_id,
+            selected_columns: options
+                .schema_aware
+                .then_some(options.selected_columns)
+                .flatten(),
             remaining_rows: options.max_rows,
             should_stop_at_block_boundary: options.should_stop_at_block_boundary,
             stopped_at_block_boundary: false,
@@ -167,6 +194,17 @@ impl DbIterator {
                 Some(self.ttl_provider.time_provider()),
             )?;
             if let Some(columns) = columns {
+                let columns = if let Some(selected_columns) = &self.selected_columns {
+                    selected_columns
+                        .iter()
+                        .map(|&index| columns.get(index).cloned().unwrap_or(None))
+                        .collect()
+                } else {
+                    columns
+                };
+                if self.selected_columns.is_some() && columns.iter().all(Option::is_none) {
+                    continue;
+                }
                 return Ok(Some((key, columns)));
             }
         }

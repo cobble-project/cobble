@@ -67,6 +67,10 @@ pub(crate) struct ColumnFamily {
     column_metadata: Vec<Option<JsonValue>>,
     options: ColumnFamilyOptions,
     evolution: SchemaEvolution,
+    /// Last schema version at or before this schema whose transition for this
+    /// family needs materialized execution. This is derived runtime metadata
+    /// and deliberately never enters the persisted schema representation.
+    last_incompatible_schema_id: u64,
     projection: Option<Vec<usize>>,
 }
 
@@ -93,6 +97,7 @@ impl ColumnFamily {
             column_metadata,
             options,
             evolution: SchemaEvolution::identity(),
+            last_incompatible_schema_id: 0,
             projection: None,
         }
     }
@@ -173,25 +178,31 @@ pub struct Schema {
 
 impl Schema {
     fn compile_transition_compatibility(&mut self, previous: Option<&Schema>) {
-        let previous_is_available = previous.is_some() || self.version == 0;
         let families = Arc::make_mut(&mut self.column_families);
         for family in families {
-            let Some(columns) = family.evolution.columns.as_ref() else {
-                continue;
-            };
-            let compatibility = if previous_is_available {
-                previous
-                    .and_then(|schema| schema.column_family_by_id(family.id))
+            let previous_family = previous.and_then(|schema| schema.column_family_by_id(family.id));
+            let inherited_barrier = previous_family
+                .map(|previous| previous.last_incompatible_schema_id)
+                .unwrap_or(self.version);
+            let compatibility = match family.evolution.columns.as_ref() {
+                Some(columns) if previous.is_some() || self.version == 0 => previous_family
                     .map_or(TransitionCompatibility::Compatible, |previous| {
                         classify_columns(previous, family, columns)
-                    })
-            } else {
-                TransitionCompatibility::Unknown
+                    }),
+                Some(_) => TransitionCompatibility::Unknown,
+                None => TransitionCompatibility::Compatible,
             };
+            let columns = family.evolution.columns.as_ref().map(Arc::clone);
             family.evolution = SchemaEvolution {
-                columns: Some(Arc::clone(columns)),
+                columns,
                 compatibility,
             };
+            family.last_incompatible_schema_id =
+                if compatibility == TransitionCompatibility::Compatible {
+                    inherited_barrier
+                } else {
+                    self.version
+                };
         }
     }
 
@@ -420,6 +431,14 @@ impl Schema {
                     self.version, column_family_id
                 ))
             })
+    }
+
+    pub(crate) fn last_incompatible_schema_id_in_family(
+        &self,
+        column_family_id: u8,
+    ) -> Option<u64> {
+        self.column_family_by_id(column_family_id)
+            .map(|family| family.last_incompatible_schema_id)
     }
 
     pub(crate) fn column_metadata(&self) -> Cow<'_, [Option<JsonValue>]> {
@@ -759,7 +778,9 @@ impl SchemaManager {
             "schema builder commit version conflict"
         );
         let version = self.next_version.fetch_add(1, Ordering::SeqCst);
-        let schema = Arc::new(Schema::new_with_column_families(version, column_families));
+        let mut schema = Schema::new_with_column_families(version, column_families);
+        schema.compile_transition_compatibility(Some(base_schema));
+        let schema = Arc::new(schema);
         self.latest_schema.store(Arc::clone(&schema));
         self.schemas
             .write()
@@ -936,37 +957,33 @@ impl SchemaManager {
     /// than the current latest, and advances `next_version` past it. ArcSwap guarantees the
     /// promotion is atomic; a concurrent loader that registers an even-newer version simply wins,
     /// which is correct because both are writer-persisted schemas.
-    fn register_loaded_schema(&self, mut schema: Schema) {
+    fn register_loaded_schema(&self, schema: Schema) {
         let mut schemas = self.schemas.write().unwrap();
         let version = schema.version();
-        let previous = version
-            .checked_sub(1)
-            .and_then(|previous_version| schemas.get(&previous_version).cloned());
-        schema.compile_transition_compatibility(previous.as_deref());
-        let schema = Arc::new(schema);
-        schemas.insert(version, Arc::clone(&schema));
-        let successor = version
-            .checked_add(1)
-            .and_then(|successor_version| schemas.get(&successor_version).cloned())
-            .map(|successor| {
-                let mut successor = successor.as_ref().clone();
-                successor.compile_transition_compatibility(Some(schema.as_ref()));
-                let successor = Arc::new(successor);
-                schemas.insert(successor.version(), Arc::clone(&successor));
-                successor
-            });
-        drop(schemas);
-
-        let current_latest_version = self.latest_schema.load().version();
-        if schema.version() > current_latest_version {
-            self.latest_schema.store(Arc::clone(&schema));
-        } else if successor
-            .as_ref()
-            .is_some_and(|successor| successor.version() == current_latest_version)
-        {
-            self.latest_schema.store(successor.unwrap());
+        schemas.insert(version, Arc::new(schema));
+        // Remote schema files can arrive out of order. Recompile this schema
+        // and its loaded successors so each one inherits the corrected barrier.
+        let versions = schemas
+            .range(version..)
+            .map(|(version, _)| *version)
+            .collect::<Vec<_>>();
+        for version in versions {
+            let previous = version
+                .checked_sub(1)
+                .and_then(|previous_version| schemas.get(&previous_version).cloned());
+            let mut current = schemas
+                .get(&version)
+                .expect("loaded schema is present")
+                .as_ref()
+                .clone();
+            current.compile_transition_compatibility(previous.as_deref());
+            schemas.insert(version, Arc::new(current));
         }
-        let target_next = schema.version().saturating_add(1);
+        if let Some((_, latest)) = schemas.last_key_value() {
+            self.latest_schema.store(Arc::clone(latest));
+        }
+        drop(schemas);
+        let target_next = version.saturating_add(1);
         let mut current_next = self.next_version.load(Ordering::SeqCst);
         while current_next < target_next {
             match self.next_version.compare_exchange(

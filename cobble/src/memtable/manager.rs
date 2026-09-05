@@ -17,6 +17,7 @@ use crate::file::{File, FileManager, MetadataReader, TrackedFileId};
 use crate::format::{FileBuildResult, FileBuilder, FileBuilderFactory};
 use crate::iterator::{
     ColumnMaskingIterator, DeduplicatingIterator, KvIterator, SchemaEvolvingIterator,
+    SchemaTaggedIterator,
 };
 use crate::lsm::LSMTree;
 use crate::memtable::vlog::rewrite_kv_value_for_flush;
@@ -983,6 +984,12 @@ pub(crate) struct ImmutableMemtable {
     memtable: Arc<MemtableImpl>,
 }
 
+impl ImmutableMemtable {
+    pub(crate) fn schema(&self) -> &Arc<Schema> {
+        &self.schema
+    }
+}
+
 impl MemtableManager {
     pub(crate) fn force_close(&self) {
         self.flush_tx.lock().unwrap().take();
@@ -1272,7 +1279,9 @@ impl MemtableManager {
                         multi_lsm_version: snapshot.multi_lsm_version.clone(),
                         vlog_version: snapshot.vlog_version.clone(),
                         active: None,
+                        active_schema: None,
                         immutables: snapshot.immutables.clone(),
+                        min_source_schema_by_cf: Vec::new(),
                         truncation_cursors: snapshot.truncation_cursors.clone(),
                         suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
                     })
@@ -1620,6 +1629,7 @@ impl MemtableManager {
             state.budget -= budget_need;
             let memtable_id = Uuid::new_v4();
             let schema = schema_manager.latest_schema();
+            let active_schema = Arc::clone(&schema);
             let memtable = match memtable_type {
                 MemtableType::Hash => {
                     let buffer = vec![0u8; memtable_capacity];
@@ -1658,7 +1668,9 @@ impl MemtableManager {
                     multi_lsm_version: snapshot.multi_lsm_version.clone(),
                     vlog_version: snapshot.vlog_version.clone(),
                     active: Some(Arc::clone(&active)),
+                    active_schema: Some(Arc::clone(&active_schema)),
                     immutables: snapshot.immutables.clone(),
+                    min_source_schema_by_cf: Vec::new(),
                     truncation_cursors: snapshot.truncation_cursors.clone(),
                     suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
                 })
@@ -1724,6 +1736,51 @@ impl MemtableManager {
         })
     }
 
+    /// Publishes an empty active table's new schema together with its pointer.
+    /// This takes locks in state-then-active order, matching rotation, so a
+    /// write never becomes visible under schema metadata from an older epoch.
+    fn adopt_empty_active_schema(
+        &self,
+        expected_active: &Arc<RwLock<ActiveMemtable>>,
+        schema: Arc<Schema>,
+    ) {
+        let _state_guard = self.db_state.lock();
+        let snapshot = self.db_state.load();
+        let Some(active) = snapshot.active.as_ref() else {
+            return;
+        };
+        if !Arc::ptr_eq(active, expected_active) {
+            return;
+        }
+        let mut active_guard = active.write().unwrap();
+        let active_id = active_guard.id;
+        let Some(memtable) = active_guard.take_empty_writable() else {
+            return;
+        };
+        let replacement = Arc::new(RwLock::new(ActiveMemtable {
+            id: active_id,
+            schema: Arc::clone(&schema),
+            sealed_data_end: 0,
+            contents: ActiveMemtableContents::Writable(memtable),
+        }));
+        self.db_state
+            .cas_mutate(snapshot.seq_id, |db_state, snapshot| {
+                Some(DbState {
+                    seq_id: db_state.allocate_seq_id(),
+                    topology_epoch: snapshot.topology_epoch,
+                    bucket_ranges: snapshot.bucket_ranges.clone(),
+                    multi_lsm_version: snapshot.multi_lsm_version.clone(),
+                    vlog_version: snapshot.vlog_version.clone(),
+                    active: Some(Arc::clone(&replacement)),
+                    active_schema: Some(Arc::clone(&schema)),
+                    immutables: snapshot.immutables.clone(),
+                    min_source_schema_by_cf: Vec::new(),
+                    truncation_cursors: snapshot.truncation_cursors.clone(),
+                    suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
+                })
+            });
+    }
+
     /// Puts a key-value pair into the active memtable using reference types to avoid extra copy.
     pub(crate) fn put(&self, key: &RefKey<'_>, value: &RefValue<'_>) -> Result<()> {
         loop {
@@ -1736,10 +1793,10 @@ impl MemtableManager {
                 }
                 drop(state);
             }
-            let Some(active) = self.db_state.load().active.clone() else {
+            let Some(active_handle) = self.db_state.load().active.clone() else {
                 continue;
             };
-            let mut active = active.write().unwrap();
+            let mut active = active_handle.write().unwrap();
             if active.writable_memtable().is_none() {
                 drop(active);
                 continue;
@@ -1751,7 +1808,9 @@ impl MemtableManager {
                     .map(|memtable| memtable.is_empty())
                     .unwrap_or(true);
                 if is_empty {
-                    active.schema = latest_schema;
+                    drop(active);
+                    self.adopt_empty_active_schema(&active_handle, latest_schema);
+                    continue;
                 } else {
                     let active_id = active.id;
                     drop(active);
@@ -1828,10 +1887,10 @@ impl MemtableManager {
                 state = self.buffer_ready.wait(state).unwrap();
             }
         }
-        let Some(active) = self.db_state.load().active.clone() else {
+        let Some(active_handle) = self.db_state.load().active.clone() else {
             return Ok(false);
         };
-        let mut active = active.write().unwrap();
+        let mut active = active_handle.write().unwrap();
         if active.writable_memtable().is_none() {
             return Ok(false);
         }
@@ -1842,7 +1901,9 @@ impl MemtableManager {
                 .map(|memtable| memtable.is_empty())
                 .unwrap_or(true);
             if is_empty {
-                active.schema = latest_schema;
+                drop(active);
+                self.adopt_empty_active_schema(&active_handle, latest_schema);
+                return Ok(false);
             } else {
                 let active_id = active.id;
                 drop(active);
@@ -1911,7 +1972,9 @@ impl MemtableManager {
                             multi_lsm_version: snapshot.multi_lsm_version.clone(),
                             vlog_version: snapshot.vlog_version.clone(),
                             active: None,
+                            active_schema: None,
                             immutables: snapshot.immutables.clone(),
+                            min_source_schema_by_cf: Vec::new(),
                             truncation_cursors: snapshot.truncation_cursors.clone(),
                             suggested_base_snapshot_id: snapshot.suggested_base_snapshot_id,
                         })
@@ -2063,11 +2126,14 @@ impl MemtableManager {
         start_bound_inclusive: Option<Bytes>,
         end_bound_exclusive: Option<Bytes>,
         max_rows: Option<usize>,
+        schema_aware: bool,
     ) -> Result<Vec<DynKvIterator>> {
         let mut iterators: Vec<DynKvIterator> = Vec::new();
         let target_num_columns = target_schema
             .num_columns_in_family(column_family_id)
             .unwrap_or(0);
+        let max_rows = (!schema_aware).then_some(max_rows).flatten();
+        let selected_columns = (!schema_aware).then_some(selected_columns).flatten();
         let shared_shadow_allowance = max_rows.map(|_| Arc::new(AtomicUsize::new(0)));
         let mut first_collecting_iterator = true;
         let mut deeper_collected_limits_allowed = true;
@@ -2077,12 +2143,16 @@ impl MemtableManager {
                 active_guard.seal_read_snapshot_data();
                 Arc::clone(&active_guard.schema)
             };
-            let row_filter = build_memtable_row_filter(
-                &source_schema,
-                target_schema.version(),
-                column_family_id,
-                selected_columns,
-            );
+            let row_filter = (!schema_aware)
+                .then(|| {
+                    build_memtable_row_filter(
+                        &source_schema,
+                        target_schema.version(),
+                        column_family_id,
+                        selected_columns,
+                    )
+                })
+                .flatten();
             if max_rows.is_some() && row_filter.is_none() {
                 deeper_collected_limits_allowed = false;
             }
@@ -2102,7 +2172,9 @@ impl MemtableManager {
                 shadow_allowance,
                 shadow_allowance_root,
             ));
-            let iter: DynKvIterator = if source_schema.version() == target_schema.version() {
+            let iter: DynKvIterator = if schema_aware {
+                Box::new(SchemaTaggedIterator::new(iter, source_schema.version()))
+            } else if source_schema.version() == target_schema.version() {
                 iter
             } else {
                 Box::new(SchemaEvolvingIterator::new(
@@ -2127,16 +2199,17 @@ impl MemtableManager {
         for immutable in snapshot.immutables.iter().rev() {
             let skiplist_streaming =
                 matches!(immutable.memtable.as_ref(), MemtableImpl::Skiplist(_));
-            let row_filter = if deeper_collected_limits_allowed && !skiplist_streaming {
-                build_memtable_row_filter(
-                    &immutable.schema,
-                    target_schema.version(),
-                    column_family_id,
-                    selected_columns,
-                )
-            } else {
-                None
-            };
+            let row_filter =
+                if !schema_aware && deeper_collected_limits_allowed && !skiplist_streaming {
+                    build_memtable_row_filter(
+                        &immutable.schema,
+                        target_schema.version(),
+                        column_family_id,
+                        selected_columns,
+                    )
+                } else {
+                    None
+                };
             let row_filter_missing = row_filter.is_none();
             let shadow_allowance = if skiplist_streaming {
                 None
@@ -2162,7 +2235,9 @@ impl MemtableManager {
                 shadow_allowance,
                 shadow_allowance_root,
             ));
-            let iter: DynKvIterator = if immutable.schema.version() == target_schema.version() {
+            let iter: DynKvIterator = if schema_aware {
+                Box::new(SchemaTaggedIterator::new(iter, immutable.schema.version()))
+            } else if immutable.schema.version() == target_schema.version() {
                 iter
             } else {
                 Box::new(SchemaEvolvingIterator::new(
@@ -2382,7 +2457,9 @@ impl MemtableManager {
                         multi_lsm_version: snapshot_state.multi_lsm_version.clone(),
                         vlog_version: snapshot_state.vlog_version.clone(),
                         active: None,
+                        active_schema: None,
                         immutables,
+                        min_source_schema_by_cf: Vec::new(),
                         truncation_cursors: snapshot_state.truncation_cursors.clone(),
                         suggested_base_snapshot_id: snapshot_state.suggested_base_snapshot_id,
                     })

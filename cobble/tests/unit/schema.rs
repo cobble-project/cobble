@@ -496,10 +496,26 @@ fn test_schema_evolution_mixes_add_delete_and_replace() {
         };
         *transform_id = Some("second".to_string());
     }
+    // Later compatible schemas inherit a barrier even when the missing
+    // predecessor is registered after them. A separate family stays independent.
+    let schema3 = source_manager.builder().commit();
+    let mut builder = source_manager.builder();
+    builder
+        .add_column(0, None, None, Some("other".to_string()))
+        .unwrap();
+    let schema4 = builder.commit();
+    let schema3_file = schema_to_file(&schema3);
+    let schema4_file = schema_to_file(&schema4);
 
     let out_of_order = SchemaManager::new_with_transform_registry(1, Arc::clone(&transforms));
     out_of_order
         .register_schema_from_def(&schema2_file, None)
+        .unwrap();
+    out_of_order
+        .register_schema_from_def(&schema3_file, None)
+        .unwrap();
+    out_of_order
+        .register_schema_from_def(&schema4_file, None)
         .unwrap();
     assert_eq!(
         out_of_order
@@ -519,6 +535,38 @@ fn test_schema_evolution_mixes_add_delete_and_replace() {
             .transition_compatibility_in_family(DEFAULT_COLUMN_FAMILY_ID)
             .unwrap(),
         TransitionCompatibility::Incompatible
+    );
+    for version in [2, 3, 4] {
+        assert_eq!(
+            out_of_order
+                .schema(version)
+                .unwrap()
+                .last_incompatible_schema_id_in_family(0),
+            Some(2)
+        );
+    }
+    assert_eq!(out_of_order.latest_schema().version(), 4);
+    assert_eq!(
+        out_of_order
+            .latest_schema()
+            .last_incompatible_schema_id_in_family(1),
+        Some(4)
+    );
+    // Rebuilding from persisted definitions derives the same metadata; it is
+    // not a field in the schema file itself.
+    let restored = SchemaManager::from_schemas(
+        [&schema1_file, &schema2_file, &schema3_file, &schema4_file]
+            .into_iter()
+            .map(|file| schema_from_file(file, None).unwrap())
+            .collect(),
+        1,
+        None,
+    );
+    assert_eq!(
+        restored
+            .latest_schema()
+            .last_incompatible_schema_id_in_family(0),
+        Some(2)
     );
     let route = out_of_order
         .compile_projection_route(0, 2, DEFAULT_COLUMN_FAMILY_ID)
