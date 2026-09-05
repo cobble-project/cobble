@@ -11,6 +11,7 @@ use crate::paths::{
     SNAPSHOT_DIR, global_snapshot_current_path, global_snapshot_manifest_path_by_pointer,
     snapshot_manifest_name,
 };
+use crate::schema::SchemaTransformRegistry;
 use crate::util::{build_commit_short_id, build_version_string};
 use crate::{Config, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, VolumeDescriptor};
 use bytes::Bytes;
@@ -94,9 +95,12 @@ pub struct Reader {
     reload_tolerance: Duration,
     last_refresh_at: Option<Instant>,
     resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    transforms: Arc<SchemaTransformRegistry>,
 }
 
 impl Reader {
+    /// Opens a fixed global snapshot without eagerly opening its shards.
+    /// Schema transform IDs are validated when each routed shard is loaded.
     pub fn open(read_config: ReaderConfig, global_snapshot_id: u64) -> Result<Self> {
         Self::open_with_resolver(read_config, global_snapshot_id, None)
     }
@@ -105,6 +109,20 @@ impl Reader {
         read_config: ReaderConfig,
         global_snapshot_id: u64,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        Self::open_with_resolver_and_transforms(
+            read_config,
+            global_snapshot_id,
+            resolver,
+            Arc::new(SchemaTransformRegistry::default()),
+        )
+    }
+
+    pub(crate) fn open_with_resolver_and_transforms(
+        read_config: ReaderConfig,
+        global_snapshot_id: u64,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
     ) -> Result<Self> {
         let block_cache_size =
             crate::util::size_to_usize("reader.block_cache_size", read_config.block_cache_size)
@@ -165,9 +183,13 @@ impl Reader {
             reload_tolerance: read_config.reload_tolerance,
             last_refresh_at: None,
             resolver,
+            transforms,
         })
     }
 
+    /// Opens the current global snapshot pointer without eagerly opening its shards.
+    /// Refresh only changes global metadata; shard transform failures remain lazy
+    /// and failed shard opens are not cached.
     pub fn open_current(read_config: ReaderConfig) -> Result<Self> {
         Self::open_current_with_resolver(read_config, None)
     }
@@ -175,6 +197,18 @@ impl Reader {
     pub fn open_current_with_resolver(
         read_config: ReaderConfig,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        Self::open_current_with_resolver_and_transforms(
+            read_config,
+            resolver,
+            Arc::new(SchemaTransformRegistry::default()),
+        )
+    }
+
+    pub(crate) fn open_current_with_resolver_and_transforms(
+        read_config: ReaderConfig,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
     ) -> Result<Self> {
         let block_cache_size =
             crate::util::size_to_usize("reader.block_cache_size", read_config.block_cache_size)
@@ -236,6 +270,7 @@ impl Reader {
             reload_tolerance: read_config.reload_tolerance,
             last_refresh_at: Some(Instant::now()),
             resolver,
+            transforms,
         })
     }
 
@@ -385,16 +420,15 @@ impl Reader {
             "{}-{}",
             key.db_id, key.snapshot_id
         )));
-        let db = Arc::new(
-            ReadOnlyDb::open_with_db_id_and_cache_with_metrics_and_resolver(
-                self.config.clone(),
-                key.snapshot_id,
-                key.db_id.clone(),
-                self.block_cache.clone(),
-                shard_metrics_manager,
-                self.resolver.clone(),
-            )?,
-        );
+        let db = Arc::new(ReadOnlyDb::open_internal(
+            self.config.clone(),
+            key.snapshot_id,
+            key.db_id.clone(),
+            self.block_cache.clone(),
+            shard_metrics_manager,
+            self.resolver.clone(),
+            Arc::clone(&self.transforms),
+        )?);
         self.cache.insert(Arc::clone(key), Arc::clone(&db));
         Ok(db)
     }
@@ -452,6 +486,18 @@ impl Reader {
         self.cache.clear();
         self.last_refresh_at = Some(Instant::now());
         Ok(())
+    }
+
+    /// Registers a schema transform for future lazy shard opens and refreshes.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.transforms.register(transform_id, transform)
     }
 }
 

@@ -12,7 +12,7 @@ use crate::lsm::{BatchGetRequest, LSMTree};
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
 use crate::row_merge::{SchemaMergePlan, merge_schema_values_to_columns};
-use crate::schema::{Schema, SchemaManager};
+use crate::schema::{Schema, SchemaManager, SchemaTransformRegistry};
 use crate::snapshot::{
     build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
     build_truncation_cursors_from_manifest, build_vlog_version_from_manifest,
@@ -66,6 +66,7 @@ impl ReadOnlyDb {
             None,
             metrics_manager,
             Some(resolver),
+            Arc::new(SchemaTransformRegistry::default()),
         )
     }
 
@@ -84,6 +85,7 @@ impl ReadOnlyDb {
             block_cache,
             metrics_manager,
             None,
+            Arc::new(SchemaTransformRegistry::default()),
         )
     }
 
@@ -102,6 +104,7 @@ impl ReadOnlyDb {
             block_cache,
             metrics_manager,
             None,
+            Arc::new(SchemaTransformRegistry::default()),
         )
     }
 
@@ -121,16 +124,18 @@ impl ReadOnlyDb {
             block_cache,
             metrics_manager,
             resolver,
+            Arc::new(SchemaTransformRegistry::default()),
         )
     }
 
-    fn open_internal(
+    pub(crate) fn open_internal(
         config: Config,
         snapshot_id: u64,
         snapshot_db_id: String,
         block_cache: Option<BlockCache>,
         metrics_manager: Arc<MetricsManager>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
     ) -> Result<Self> {
         let config = config.normalize_volume_paths()?;
         info!(
@@ -165,11 +170,10 @@ impl ReadOnlyDb {
         } else {
             manifest.lsm_tree_bucket_ranges.clone()
         };
-        let schema_manager = Arc::new(SchemaManager::from_manifest(
-            &file_manager,
-            &manifest,
-            resolver,
-        )?);
+        let schema_manager = Arc::new(
+            SchemaManager::from_manifest(&file_manager, &manifest, resolver)?
+                .with_transform_registry(transforms)?,
+        );
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let tree_versions = build_tree_versions_from_manifest(&file_manager, &manifest, true)?;
         let tree_scopes = build_tree_scopes_from_manifest(&manifest);
@@ -538,5 +542,18 @@ impl ReadOnlyDb {
         );
         iter.seek(start_key.as_ref())?;
         Ok(iter)
+    }
+
+    /// Registers a schema transform for this read-only view and future reads.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.schema_manager
+            .register_transform(transform_id, transform)
     }
 }

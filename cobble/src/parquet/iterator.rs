@@ -121,21 +121,6 @@ impl ParquetIterator {
         )
     }
 
-    pub(crate) fn from_data_file_with_columns(
-        file: Box<dyn RandomAccessFile>,
-        data_file: &DataFile,
-        block_cache: Option<BlockCache>,
-        column_indices: Option<&[usize]>,
-    ) -> Result<Self> {
-        Self::from_data_file_with_options(
-            file,
-            data_file,
-            block_cache,
-            column_indices,
-            Default::default(),
-        )
-    }
-
     fn new_with_ranges(
         file: Box<dyn RandomAccessFile>,
         row_group_ranges: Option<Vec<ParquetRowGroupRange>>,

@@ -82,7 +82,26 @@ let db = DbBuilder::new(config)
 
 Builder registration also works with `open()`, `open_from_snapshot(snapshot_id)`, and `resume_from_snapshot(snapshot_id)`, including their recovery-mode variants. Restore methods require `db_id` and use the snapshot's bucket ranges. Missing required IDs fail recovery; duplicate registrations return an error. Keep each ID's meaning stable. `switch_to_snapshot` preserves the current DB's registrations, and `Db::register_schema_transform` remains available for new runtime schema updates.
 
-Custom transforms currently support `Db` reads (`get`, multi-get, and scan) and local compaction. Scans merge older values with their original operators before applying transforms, then apply column selection and row limits. Custom-transform integration for `Reader`/`ReadOnlyDb`, remote/dedicated compaction, and higher-level bindings is not yet available.
+Custom transforms support `Db`, `ReadOnlyDb`, and `Reader` reads (`get`, multi-get, and scan), plus local compaction. Scans merge older values with their original operators before applying transforms, then apply column selection and row limits. Custom-transform registration for remote/dedicated compaction and higher-level bindings is not yet available.
+
+### Snapshot Readers
+
+Register transforms before opening a shard snapshot or a global snapshot reader:
+
+```rust
+use cobble::{ReadOnlyDbBuilder, ReaderBuilder};
+
+let snapshot = ReadOnlyDbBuilder::new(config)
+    .db_id("my-shard")
+    .register_schema_transform("append-suffix-v1", append_suffix)?
+    .open(snapshot_id)?;
+
+let reader = ReaderBuilder::new(reader_config)
+    .register_schema_transform("append-suffix-v1", append_suffix)?
+    .open_current()?; // Use open(global_snapshot_id) for a specific snapshot.
+```
+
+`ReadOnlyDbBuilder` requires the source `db_id` and validates required transform IDs during open. `Reader` opens shards lazily, so missing IDs are reported on the first access to the affected shard, not when opening the global snapshot. Both types expose `register_schema_transform`; a failed lazy shard open can be retried after registration. Reader registrations survive refreshes and shard cache eviction. Transform callbacks and registries are runtime-only and must be registered again after restart.
 
 ## Add Column: What Actually Happens
 

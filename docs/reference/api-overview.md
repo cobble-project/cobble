@@ -187,10 +187,16 @@ with a local read cache. See [Rescale](../architecture/rescale).
 
 ```rust
 Reader::open_current(reader_config) -> Result<Reader>
+ReaderBuilder::new(reader_config).register_schema_transform(id, transform)?.open_current() -> Result<Reader>
+ReadOnlyDbBuilder::new(config).db_id(db_id).register_schema_transform(id, transform)?.open(snapshot_id) -> Result<ReadOnlyDb>
+reader.register_schema_transform(id, transform) -> Result<()>
+read_only_db.register_schema_transform(id, transform) -> Result<()>
 reader.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Bytes>>>>
 reader.current_global_snapshot() -> &GlobalSnapshotManifest
 reader.refresh() -> Result<()>
 ```
+
+Both builders support registering transforms before opening; see [Schema Evolution](../architecture/schema-evolution#snapshot-readers).
 
 #### Scan
 

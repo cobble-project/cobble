@@ -1655,11 +1655,15 @@ impl LSMTree {
                 } else {
                     None
                 };
-                let mut iter = ParquetIterator::from_data_file_with_columns(
+                let mut iter = ParquetIterator::from_data_file_with_options(
                     Box::new(reader),
                     file.as_ref(),
                     self.block_cache.clone(),
                     parquet_read_columns,
+                    crate::parquet::ParquetIteratorOptions {
+                        cache_namespace,
+                        ..Default::default()
+                    },
                 )?;
                 iter.seek(encoded_key)?;
                 if iter.valid()
