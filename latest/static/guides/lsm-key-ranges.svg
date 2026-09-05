@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 688" role="img" aria-labelledby="lsm-key-ranges-title lsm-key-ranges-desc">
+<title id="lsm-key-ranges-title">Why overlapping files add read work</title>
+<desc id="lsm-key-ranges-desc">A lookup for key m overlaps both illustrated L0 files but only one file in L1 and one in L2; compaction maintains non-overlapping file ranges within deeper levels.</desc>
+<defs>
+<marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#655f55"/></marker>
+<marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#89643b"/></marker>
+<marker id="arrow-link" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#3f6579"/></marker>
+</defs>
+<rect x="0" y="0" width="960" height="688" fill="#faf8f3"/>
+<text x="40" y="60" font-family="Georgia, serif" font-size="32" fill="#302d28" font-weight="400" text-anchor="start">Why overlapping files add read work</text>
+<text x="40" y="100" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">L0 ranges can overlap; deeper levels have at most one candidate file.</text>
+<path d="M264 176 H896" fill="none" stroke="#655f55" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="264" y="160" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">a</text>
+<text x="896" y="160" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="end">z</text>
+<circle cx="552" cy="176" r="6" fill="#89643b"/>
+<text x="584" y="160" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#89643b" font-weight="600" text-anchor="start">Look up key m</text>
+<rect x="40" y="216" width="880" height="184" rx="8" fill="#f0e9dd" stroke="#89643b" stroke-width="1.5"/>
+<rect x="40" y="416" width="880" height="88" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<rect x="40" y="520" width="880" height="88" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="64" y="260" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">L0</text>
+<text x="64" y="292" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Overlapping</text>
+<text x="64" y="464" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">L1</text>
+<text x="64" y="568" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">L2</text>
+<path d="M552 184 V240" fill="none" stroke="#89643b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-accent)"/>
+<path d="M552 284 V312" fill="none" stroke="#89643b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-accent)"/>
+<path d="M552 356 V440" fill="none" stroke="#89643b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-accent)"/>
+<path d="M552 480 V544" fill="none" stroke="#89643b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-accent)"/>
+<rect x="264" y="240" width="408" height="44" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="468" y="268" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="500" text-anchor="middle">a–p</text>
+<rect x="432" y="312" width="464" height="44" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="664" y="340" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="500" text-anchor="middle">h–z</text>
+<rect x="264" y="440" width="160" height="44" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="344" y="468" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="500" text-anchor="middle">a–g</text>
+<rect x="440" y="440" width="256" height="44" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="568" y="468" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="500" text-anchor="middle">h–q</text>
+<rect x="712" y="440" width="184" height="44" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="804" y="468" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="500" text-anchor="middle">r–z</text>
+<rect x="264" y="544" width="248" height="44" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="388" y="572" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="500" text-anchor="middle">a–l</text>
+<rect x="528" y="544" width="368" height="44" rx="8" fill="#ffffff" stroke="#c8c0b3" stroke-width="1.5"/>
+<text x="712" y="572" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#302d28" font-weight="500" text-anchor="middle">m–z</text>
+<text x="40" y="656" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Illustrative file ranges; deeper levels continue in the same way.</text>
+</svg>
