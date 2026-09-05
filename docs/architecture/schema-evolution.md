@@ -44,6 +44,46 @@ builder.set_column_operator(
 let _new_schema = builder.commit();
 ```
 
+## Custom Column Transforms
+
+Register a transform on `Db`, then reference its stable ID in `SchemaBuilder::remap_columns`:
+
+```rust
+use bytes::Bytes;
+use cobble::{ColumnEvolution, DbBuilder};
+
+fn append_suffix(value: Option<Bytes>) -> cobble::Result<Option<Bytes>> {
+    Ok(value.map(|value| [value.as_ref(), b"-v2"].concat().into()))
+}
+
+db.register_schema_transform("append-suffix-v1", append_suffix)?;
+let mut schema = db.update_schema();
+schema.remap_columns(None, vec![
+    ColumnEvolution::Source {
+        source_index: 0,
+        transform_id: Some("append-suffix-v1".into()),
+    },
+    ColumnEvolution::Default { value: Bytes::from_static(b"new-column") },
+    ColumnEvolution::Null,
+])?;
+schema.commit();
+```
+
+Each entry defines one target column. `Source` refers to a column in the builder's current layout; omitted columns are removed. A transform receives only that column's `Option<Bytes>` and returns `Result<Option<Bytes>>`; it cannot read other columns. New writes must already use the new representation. A column can have one transform per schema transition; commit an intermediate schema before applying another.
+
+Only the transform ID is persisted, so register the same implementation on every restart. Use the builder **before recovery begins**: restoring memtables or replaying WAL can trigger background compaction before the DB is returned.
+
+```rust
+let db = DbBuilder::new(config)
+    .db_id("my-shard")
+    .register_schema_transform("append-suffix-v1", append_suffix)?
+    .resume()?;
+```
+
+Builder registration also works with `open()`, `open_from_snapshot(snapshot_id)`, and `resume_from_snapshot(snapshot_id)`, including their recovery-mode variants. Restore methods require `db_id` and use the snapshot's bucket ranges. Missing required IDs fail recovery; duplicate registrations return an error. Keep each ID's meaning stable. `switch_to_snapshot` preserves the current DB's registrations, and `Db::register_schema_transform` remains available for new runtime schema updates.
+
+Custom transforms currently support the Rust `Db` point-read (`get`/multi-get) and local compaction paths. Custom-transform integration for scans, `Reader`/`ReadOnlyDb`, remote/dedicated compaction, and higher-level bindings is not yet available.
+
 ## Add Column: What Actually Happens
 
 When a column is added:
@@ -51,7 +91,7 @@ When a column is added:
 - New writes use the new schema immediately.
 - Old SST/Parquet/VLOG-backed rows are still physically in old shape.
 - During reads, Cobble evolves old rows to the current schema in memory, filling added columns with default/empty values (or `add_column` default value if configured).
-- During [compaction](compaction), data is rewritten into new files under the latest schema, so the conversion cost gradually disappears.
+- During [compaction](compaction), data is rewritten into new files under the selected target schema, so the conversion cost gradually disappears.
 
 Operationally, this means you get forward-compatible reads immediately after commit, while storage catches up in background compaction.
 
@@ -68,7 +108,7 @@ This is why deletion is safe online: query behavior switches at schema-commit ti
 
 ## Impact on Read Path
 
-Read APIs (`get`, `scan`, `Reader`, `ReadOnlyDb`) always return values in the current schema shape:
+For built-in column additions and deletions, read APIs (`get`, `scan`, `Reader`, `ReadOnlyDb`) return values in the schema selected by that reader or snapshot:
 
 - Schema evolution is applied per-row when source files are older than current schema.
 - Column projection (`ReadOptions.column_indices` / `ScanOptions.column_indices`) is interpreted against the current schema of the selected column family.
@@ -81,7 +121,7 @@ In short: callers do not need to branch on file age or schema version.
 Compaction is where logical evolution becomes physical:
 
 - Input rows from mixed schema versions are normalized to target schema.
-- Output files are written with latest schema id.
+- Output files carry the target schema id selected when compaction was planned; this may be older than the latest schema.
 - Repeated compaction reduces schema-conversion overhead and removes deleted-column payload from storage.
 
 This is also why long snapshot retention can delay full reclamation after column deletion: old snapshots keep older files alive (see [Snapshot System](snapshot)).

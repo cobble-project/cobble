@@ -165,7 +165,7 @@ impl Db {
     }
 
     pub(crate) fn open_with_builder(builder: DbBuilder) -> Result<Self> {
-        let (config, bucket_ranges, db_id, governance) = builder.into_parts();
+        let (config, bucket_ranges, db_id, governance, resolver, transforms) = builder.into_parts();
         if config.total_buckets == 0 || config.total_buckets > (u16::MAX as u32) + 1 {
             return Err(Error::ConfigError(
                 "total_buckets must be in range 1..=65536".to_string(),
@@ -211,7 +211,11 @@ impl Db {
             FileManager::from_config(&file_manager_config, &id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let db_state = Arc::new(DbStateHandle::new());
-        let schema_manager = Arc::new(SchemaManager::new(config.num_columns));
+        let schema_manager = Arc::new(SchemaManager::new_with_runtime_wiring(
+            config.num_columns,
+            resolver,
+            transforms,
+        ));
         let db_lifecycle = Arc::new(DbLifecycle::new_initializing());
         // Fresh open starts from an empty DbState, so bucket-range layout must be initialized here.
         db_state.configure_multi_lsm(config.total_buckets, &bucket_ranges)?;
@@ -283,6 +287,25 @@ impl Db {
             self.config.jni_direct_buffer_size_bytes()?,
             self.config.jni_direct_buffer_pool_size,
         ))
+    }
+
+    /// Register a single-column schema transform under a stable ID.
+    ///
+    /// Register before referencing the ID in a schema update. For startup
+    /// registration while resuming, use [`DbBuilder::register_schema_transform`].
+    /// Only the ID is persisted; the closure belongs to this database instance.
+    /// Duplicate IDs return an error so an existing schema's transform cannot be replaced.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        let _access = self.begin_access()?;
+        self.schema_manager
+            .register_transform(transform_id, transform)
     }
 
     /// Start a schema update transaction.
@@ -594,6 +617,8 @@ impl Db {
                             .register_schema_from_file(&self.file_manager, schema_id)?;
                     }
                     let schema = self.schema_manager.schema(schema_id)?;
+                    self.schema_manager
+                        .validate_schema_transforms(schema.as_ref())?;
                     self.ensure_multi_lsm_scopes_for_schema_if_dirty(schema.as_ref())?;
                     for (mut encoded_key, mut encoded_value) in
                         crate::memtable::decode_vec_entry_stream(entry_bytes.as_ref())?

@@ -8,11 +8,11 @@ use crate::snapshot::SnapshotLifecycleState;
 use crate::r#type::encode_merge_separated_array;
 use crate::vlog::VlogPointer;
 use crate::{
-    CompactionMode, DbBuilder, DbGovernance, GovernanceMode, MemtableType, ReadOptions,
-    RuntimeManifestMode, ScanOptions, TimeProviderKind, U32CounterMergeOperator,
+    ColumnEvolution, CompactionMode, DbBuilder, DbGovernance, GovernanceMode, MemtableType,
+    ReadOptions, RuntimeManifestMode, ScanOptions, TimeProviderKind, U32CounterMergeOperator,
     U64CounterMergeOperator, VolumeDescriptor, VolumeUsageKind, WriteOptions,
 };
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use serial_test::serial;
 use size::Size;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -2123,6 +2123,191 @@ fn test_db_get_evolves_older_schema_values() {
     assert!(value[1].is_none());
 
     cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn test_db_registered_schema_transform_remaps_old_values() {
+    let root = "/tmp/db_schema_transform_registry";
+    cleanup_test_root(root);
+    let config = Config {
+        memtable_capacity: Size::from_const(128),
+        memtable_buffer_count: 2,
+        num_columns: 2,
+        sst_bloom_filter_enabled: true,
+        volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+        ..Config::default()
+    };
+    let db = DbBuilder::new(config)
+        .bucket_ranges(vec![0..=0])
+        .open()
+        .unwrap();
+
+    db.put(0, b"old-row", 0, b"discarded").unwrap();
+    db.put(0, b"old-row", 1, b"value").unwrap();
+
+    db.register_schema_transform("append-suffix", |value| {
+        Ok(value.map(|value| [value.as_ref(), b"-evolved"].concat().into()))
+    })
+    .unwrap();
+    let duplicate = db
+        .register_schema_transform("append-suffix", Ok)
+        .unwrap_err();
+    assert!(duplicate.to_string().contains("already registered"));
+
+    let mut schema = db.update_schema();
+    let missing = schema
+        .remap_columns(
+            None,
+            vec![ColumnEvolution::Source {
+                source_index: 0,
+                transform_id: Some("missing-transform".to_string()),
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        missing
+            .to_string()
+            .contains("missing-transform' is not registered")
+    );
+    schema
+        .remap_columns(
+            None,
+            vec![
+                ColumnEvolution::Source {
+                    source_index: 1,
+                    transform_id: Some("append-suffix".to_string()),
+                },
+                ColumnEvolution::Default {
+                    value: Bytes::from_static(b"default"),
+                },
+                ColumnEvolution::Null,
+            ],
+        )
+        .unwrap();
+    schema.commit();
+
+    let value = db.get(0, b"old-row").unwrap().expect("evolved value");
+    assert_eq!(value.len(), 3);
+    assert_eq!(value[0].as_deref(), Some(&b"value-evolved"[..]));
+    assert_eq!(value[1].as_deref(), Some(&b"default"[..]));
+    assert!(value[2].is_none());
+
+    db.close().unwrap();
+    cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn test_registered_transforms_available_during_restore_and_snapshot_switch() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = Config {
+        num_columns: 1,
+        memtable_capacity: Size::from_const(4096),
+        active_memtable_incremental_snapshot_ratio: 1.0,
+        snapshot_on_flush: false,
+        l0_file_limit: 1,
+        wal_enabled: true,
+        wal_flush_interval_ms: 1,
+        volumes: vec![VolumeDescriptor::new(
+            format!("file://{}", temp.path().display()),
+            vec![
+                VolumeUsageKind::Meta,
+                VolumeUsageKind::PrimaryDataPriorityHigh,
+                VolumeUsageKind::Wal,
+            ],
+        )],
+        ..Config::default()
+    };
+    let db_id = "transform-restore";
+    let builder = || DbBuilder::new(config.clone()).db_id(db_id);
+    let transform = |value: Option<Bytes>| -> Result<Option<Bytes>> {
+        Ok(value.map(|value| [value.as_ref(), b"-evolved"].concat().into()))
+    };
+    let db = builder()
+        .bucket_ranges(vec![0..=0])
+        .register_schema_transform("evolve", transform)
+        .unwrap()
+        .open()
+        .unwrap();
+    assert!(db.register_schema_transform("evolve", Ok).is_err());
+    db.put(0, b"middle", 0, b"old").unwrap();
+    db.memtable_manager.flush_active().unwrap();
+    for result in db.memtable_manager.wait_for_flushes() {
+        result.unwrap();
+    }
+    let mut schema = db.update_schema();
+    schema
+        .remap_columns(
+            None,
+            vec![ColumnEvolution::Source {
+                source_index: 0,
+                transform_id: Some("evolve".into()),
+            }],
+        )
+        .unwrap();
+    schema.commit();
+    // The restored active memtable spans the old SST, forcing an overlapping
+    // cross-schema compaction when recovery installs it as the second L0 file.
+    db.put(0, b"a", 0, b"new-a").unwrap();
+    db.put(0, b"z", 0, b"new-z").unwrap();
+    let snapshot_id = db.create_snapshot_and_wait("transform restore").unwrap();
+    let manifest = load_manifest_for_snapshot(&db.file_manager, snapshot_id).unwrap();
+    assert!(!manifest.active_memtable_data.is_empty());
+    db.put(0, b"wal-tail", 0, b"tail").unwrap();
+    db.force_close();
+    drop(db);
+
+    let error = builder()
+        .resume()
+        .err()
+        .expect("missing transform must reject startup");
+    assert!(error.to_string().contains("evolve"));
+    let (tx, rx) = mpsc::channel();
+    let mut db = builder()
+        .register_schema_transform("evolve", move |value| {
+            let output = transform(value)?;
+            tx.send(()).unwrap();
+            Ok(output)
+        })
+        .unwrap()
+        .resume()
+        .unwrap();
+    // No user read/write has run on this handle: only recovery/background work
+    // can have invoked the registered transform.
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("startup compaction used transform");
+    assert_eq!(
+        db.get(0, b"middle").unwrap().unwrap()[0].as_deref(),
+        Some(&b"old-evolved"[..])
+    );
+    assert!(db.get(0, b"wal-tail").unwrap().is_some());
+    db.switch_to_snapshot(snapshot_id).unwrap();
+    assert_eq!(
+        db.get(0, b"middle").unwrap().unwrap()[0].as_deref(),
+        Some(&b"old-evolved"[..])
+    );
+    assert!(db.get(0, b"wal-tail").unwrap().is_none());
+    db.force_close();
+    drop(db);
+
+    for resume_chain in [true, false] {
+        let builder = builder()
+            .register_schema_transform("evolve", transform)
+            .unwrap();
+        let db = if resume_chain {
+            builder.resume_from_snapshot(snapshot_id)
+        } else {
+            builder.open_from_snapshot(snapshot_id)
+        }
+        .unwrap();
+        assert_eq!(
+            db.get(0, b"middle").unwrap().unwrap()[0].as_deref(),
+            Some(&b"old-evolved"[..])
+        );
+        assert!(db.get(0, b"wal-tail").unwrap().is_none());
+        db.close().unwrap();
+    }
 }
 
 #[test]

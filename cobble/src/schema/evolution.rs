@@ -6,16 +6,29 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 /// One target column in a schema transition.
-#[doc(hidden)]
+///
+/// [`SchemaBuilder::remap_columns`](super::SchemaBuilder::remap_columns) accepts one
+/// entry for every target column. Source indexes refer to the builder's current
+/// columns, so a remap can be combined with earlier add, delete, or remap calls
+/// before the schema is committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ColumnEvolution {
+    /// Retain a current source column, optionally applying a registered transform.
     Source {
+        /// Index of the source column in the builder's current column layout.
         source_index: usize,
+        /// Stable transform ID registered through [`Db::register_schema_transform`](crate::Db::register_schema_transform).
+        ///
+        /// The transform implementation is runtime configuration and is not
+        /// persisted in the schema file.
         transform_id: Option<String>,
     },
+    /// Populate the target column with a fixed value when the source row is live.
     Default {
+        /// Bytes to write for the target column.
         value: Bytes,
     },
+    /// Populate the target column with no value when the source row is live.
     Null,
 }
 
@@ -105,7 +118,9 @@ impl SchemaEvolution {
     }
 }
 
+/// Converts the logical bytes for one source column during schema evolution.
 pub(crate) trait SchemaTransform: Send + Sync {
+    /// Convert a source value into the target value.
     fn apply(&self, value: Option<Bytes>) -> Result<Option<Bytes>>;
 }
 
@@ -118,12 +133,19 @@ where
     }
 }
 
+/// Runtime registry of schema transform implementations keyed by stable IDs.
+///
+/// Schema files retain only the ID; implementations belong to a database instance.
 #[derive(Default)]
 pub(crate) struct SchemaTransformRegistry {
     transforms: RwLock<HashMap<String, Arc<dyn SchemaTransform>>>,
 }
 
 impl SchemaTransformRegistry {
+    /// Register `transform` under its stable persisted ID.
+    ///
+    /// IDs must be unique within a registry. Re-registering an ID returns an
+    /// error rather than replacing the transform used by an existing schema.
     pub(crate) fn register<F>(&self, transform_id: impl Into<String>, transform: F) -> Result<()>
     where
         F: SchemaTransform + 'static,

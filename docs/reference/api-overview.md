@@ -16,6 +16,7 @@ This page summarizes the public Rust API surface of the Cobble crates.
 |------|-------------|
 | `SingleDb` | Single-machine embedded database (wraps Db + Coordinator) |
 | `Db` | Shard database for distributed deployments |
+| `DbBuilder` | Configure a writer before opening or restoring it, including schema transform registration |
 | `ReadOnlyDb` | Read-only snapshot access |
 | `Reader` | Snapshot-following read proxy (visibility advances by snapshot cadence) |
 | `DbCoordinator` | Global snapshot coordinator |
@@ -60,6 +61,7 @@ fails.
 |------|-------------|
 | `Schema` | Current raw schema with family-local metadata |
 | `SchemaBuilder` | Schema evolution builder; column-family aware via optional family arguments |
+| `ColumnEvolution` | Target column mapping: `Source` with optional transform ID, `Default`, or `Null` |
 | `ShardSnapshotInput` | Shard snapshot DTO used by the coordinator |
 | `GlobalSnapshotManifest` | Materialized global snapshot manifest |
 
@@ -122,6 +124,7 @@ Db::open_new_with_manifest_path(config, manifest_path) -> Result<Db>
 ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id) -> Result<ReadOnlyDb>
 db.current_schema() -> Arc<Schema>
 db.update_schema() -> SchemaBuilder
+db.register_schema_transform(id, transform) -> Result<()>
 db.put(bucket, key, column, value) -> Result<()>
 db.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Bytes>>>>
 db.scan(bucket, range) -> Result<DbIterator<'_>>
@@ -152,6 +155,12 @@ exact source manifest path.
 
 Use `RecoveryMode::SnapshotOnly` for an exact snapshot restore or `RecoveryMode::LatestWithWal` to
 replay the latest snapshot's durable WAL tail. See [Write-Ahead Log](../architecture/wal).
+
+For custom column transforms, call
+`DbBuilder::register_schema_transform(id, transform) -> Result<DbBuilder>` before `open()`,
+`resume()`, `open_from_snapshot(...)`, or `resume_from_snapshot(...)`. Use the DB registration
+method for subsequent runtime updates. See [Custom Column Transforms](../architecture/schema-evolution#custom-column-transforms)
+for examples, recovery requirements, and current support limits.
 
 `switch_to_snapshot` is runtime-only until a later snapshot is published. It deliberately keeps
 the existing WAL tail so the latest state remains recoverable, but it does not create an isolated

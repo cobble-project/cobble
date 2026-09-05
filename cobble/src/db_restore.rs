@@ -3,6 +3,7 @@ use crate::Config;
 use crate::config::{
     PrimaryVolumeOffloadPolicyKind, VolumeDescriptor, resolve_volume_descriptor_credentials,
 };
+use crate::db_builder::DbBuilder;
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, new_truncation_cursors_with};
 use crate::db_status::DbLifecycle;
 use crate::error::{Error, Result};
@@ -16,6 +17,7 @@ use crate::merge_operator::MergeOperatorResolver;
 use crate::metrics_manager::MetricsManager;
 use crate::metrics_registry;
 use crate::paths::bucket_snapshot_manifest_path;
+use crate::schema::{SchemaManager, SchemaTransformRegistry};
 use crate::snapshot::{
     ManifestSnapshot, build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
     build_truncation_cursors_from_manifest, build_vlog_version_from_manifest,
@@ -339,12 +341,13 @@ fn open_restored_db_from_manifest(
     db_id: String,
     hybrid_cache_plan: Option<crate::config::HybridCacheVolumePlan>,
     metrics_manager: Arc<MetricsManager>,
-    schema_manager: Arc<crate::schema::SchemaManager>,
+    schema_manager: Arc<SchemaManager>,
     manifest: ManifestSnapshot,
     suggested_base_snapshot_id: Option<u64>,
     advance_next_id_from_existing_manifests: bool,
     retained_owned_source_id: Option<String>,
     recovery_wal_volume: Option<VolumeDescriptor>,
+    governance: Option<Arc<dyn crate::governance::DbGovernance>>,
 ) -> Result<Db> {
     let residual_primary_file_ids = prepare_manifest_data_files_for_restore(
         &file_manager,
@@ -390,20 +393,31 @@ fn open_restored_db_from_manifest(
         truncation_cursors: new_truncation_cursors_with(truncation_cursors),
         suggested_base_snapshot_id: suggested_base_snapshot_id.filter(|_| can_incremental_base),
     });
-    let mut db = Db::open_with_state(
+    if let Some(governance) = governance.as_ref() {
+        governance.register_db(&db_id, &bucket_ranges, config.total_buckets)?;
+    }
+    let mut db = match Db::open_with_state(
         config,
         Arc::clone(&file_manager),
         db_state,
         Arc::clone(&db_lifecycle),
-        db_id,
-        None,
+        db_id.clone(),
+        governance.as_ref().map(Arc::clone),
         bucket_ranges,
         max_vlog_file_seq.saturating_add(1).min(u32::MAX as u64) as u32,
         manifest.wal_checkpoint_id,
         hybrid_cache_plan,
         metrics_manager,
         schema_manager,
-    )?;
+    ) {
+        Ok(db) => db,
+        Err(err) => {
+            if let Some(governance) = governance.as_ref() {
+                let _ = governance.unregister_db(&db_id);
+            }
+            return Err(err);
+        }
+    };
     if advance_next_id_from_existing_manifests
         && let Some(max_snapshot_id) = list_snapshot_manifest_ids(&file_manager)?.into_iter().max()
     {
@@ -483,6 +497,48 @@ impl Db {
         recovery_mode: RecoveryMode,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
+        Self::open_from_snapshot_internal(
+            config,
+            snapshot_id,
+            db_id,
+            recovery_mode,
+            resolver,
+            None,
+            Arc::new(SchemaTransformRegistry::default()),
+        )
+    }
+
+    pub(crate) fn open_from_snapshot_with_builder(
+        builder: DbBuilder,
+        snapshot_id: u64,
+        recovery_mode: RecoveryMode,
+    ) -> Result<Self> {
+        let (config, _bucket_ranges, db_id, governance, resolver, transforms) =
+            builder.into_parts();
+        let db_id = db_id.ok_or_else(|| {
+            Error::ConfigError("db_id must be set when opening from a snapshot".to_string())
+        })?;
+        Self::open_from_snapshot_internal(
+            config,
+            snapshot_id,
+            db_id,
+            recovery_mode,
+            resolver,
+            governance,
+            transforms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_from_snapshot_internal(
+        config: Config,
+        snapshot_id: u64,
+        db_id: impl Into<String>,
+        recovery_mode: RecoveryMode,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+        governance: Option<Arc<dyn crate::governance::DbGovernance>>,
+        transforms: Arc<SchemaTransformRegistry>,
+    ) -> Result<Self> {
         let db_id = db_id.into();
         let config = config.normalize_volume_paths()?;
         let retained_owned_source_id = Some(format!("snapshot:{db_id}:{snapshot_id}"));
@@ -514,11 +570,10 @@ impl Db {
                     .map(|route| resolve_volume_descriptor_credentials(route, &config))
             })
             .flatten();
-        let schema_manager = Arc::new(crate::schema::SchemaManager::from_manifest(
-            &file_manager,
-            &manifest,
-            resolver,
-        )?);
+        let schema_manager = Arc::new(
+            SchemaManager::from_manifest(&file_manager, &manifest, resolver)?
+                .with_transform_registry(transforms)?,
+        );
         open_restored_db_from_manifest(
             config,
             file_manager,
@@ -531,6 +586,7 @@ impl Db {
             true,
             retained_owned_source_id,
             recovery_wal_volume,
+            governance,
         )
     }
 
@@ -616,14 +672,12 @@ impl Db {
             .ok_or_else(|| {
                 Error::IoError(format!("Snapshot manifest not found: {}", manifest_path))
             })?;
-        let schema_manager = Arc::new(
-            crate::schema::SchemaManager::from_snapshot_source_manifests(
-                &file_manager,
-                &manifest_path,
-                manifest_chain.iter().map(|entry| &entry.manifest),
-                resolver,
-            )?,
-        );
+        let schema_manager = Arc::new(SchemaManager::from_snapshot_source_manifests(
+            &file_manager,
+            &manifest_path,
+            manifest_chain.iter().map(|entry| &entry.manifest),
+            resolver,
+        )?);
         schema_manager.persist_loaded_schemas(&file_manager)?;
         open_restored_db_from_manifest(
             config,
@@ -636,6 +690,7 @@ impl Db {
             None,
             false,
             Some(retained_owned_source_id),
+            None,
             None,
         )
     }
@@ -737,6 +792,7 @@ impl Db {
             resolver,
             None,
             None,
+            Arc::new(SchemaTransformRegistry::default()),
         )
     }
 
@@ -747,7 +803,38 @@ impl Db {
         recovery_mode: RecoveryMode,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
-        Self::resume_internal(config, db_id, None, recovery_mode, resolver, None, None)
+        Self::resume_internal(
+            config,
+            db_id,
+            None,
+            recovery_mode,
+            resolver,
+            None,
+            None,
+            Arc::new(SchemaTransformRegistry::default()),
+        )
+    }
+
+    pub(crate) fn resume_with_builder(
+        builder: DbBuilder,
+        selected_snapshot_id: Option<u64>,
+        recovery_mode: RecoveryMode,
+    ) -> Result<Self> {
+        let (config, _bucket_ranges, db_id, governance, resolver, transforms) =
+            builder.into_parts();
+        let db_id = db_id.ok_or_else(|| {
+            Error::ConfigError("db_id must be set when resuming a database".to_string())
+        })?;
+        Self::resume_internal(
+            config,
+            db_id,
+            selected_snapshot_id,
+            recovery_mode,
+            resolver,
+            governance,
+            None,
+            transforms,
+        )
     }
 
     /// Switch this active handle to a historical snapshot by closing and rebuilding its runtime.
@@ -783,6 +870,7 @@ impl Db {
         snapshot_id: u64,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<()> {
+        let transforms = self.schema_manager.transform_registry();
         {
             let _access = self.begin_access()?;
             self.preflight_switch_to_snapshot(snapshot_id, resolver.as_ref().map(Arc::clone))?;
@@ -814,6 +902,7 @@ impl Db {
             resolver,
             governance,
             allocator_floors,
+            transforms,
         )?;
         *self = replacement;
         Ok(())
@@ -826,6 +915,7 @@ impl Db {
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
         governance: Option<Arc<dyn crate::governance::DbGovernance>>,
         allocator_floors: ResumeAllocatorFloors,
+        transforms: Arc<SchemaTransformRegistry>,
     ) -> Result<Self> {
         Self::resume_internal(
             config,
@@ -835,6 +925,7 @@ impl Db {
             resolver,
             governance,
             Some(allocator_floors),
+            transforms,
         )
     }
 
@@ -860,8 +951,8 @@ impl Db {
             )));
         }
         build_truncation_cursors_from_manifest(&manifest)?;
-        let schema_manager =
-            crate::schema::SchemaManager::from_manifest(&self.file_manager, &manifest, resolver)?;
+        let schema_manager = SchemaManager::from_manifest(&self.file_manager, &manifest, resolver)?
+            .with_transform_registry(self.schema_manager.transform_registry())?;
         schema_manager.select_latest_schema_for_restore(manifest.latest_schema_id)?;
         // Preflight must not construct tracked handles: dropping a temporary TrackedFileId would
         // unregister the same logical file id that the still-active runtime is using.
@@ -870,6 +961,7 @@ impl Db {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resume_internal(
         config: Config,
         db_id: impl Into<String>,
@@ -878,6 +970,7 @@ impl Db {
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
         governance: Option<Arc<dyn crate::governance::DbGovernance>>,
         allocator_floors: Option<ResumeAllocatorFloors>,
+        transforms: Arc<SchemaTransformRegistry>,
     ) -> Result<Self> {
         let db_id = db_id.into();
         let config = config.normalize_volume_paths()?;
@@ -963,6 +1056,15 @@ impl Db {
                 selected_snapshot_id
             )));
         }
+        let schema_manager = Arc::new(
+            SchemaManager::from_manifests(
+                &file_manager,
+                loaded.iter().map(|entry| &entry.manifest),
+                resolver,
+            )?
+            .with_transform_registry(transforms)?,
+        );
+        schema_manager.select_latest_schema_for_restore(manifest.latest_schema_id)?;
         if config.resume_primary_residual_scan_enabled {
             register_scanned_primary_residuals(&file_manager, &manifest);
         }
@@ -976,12 +1078,6 @@ impl Db {
         };
         let active_memtable_data = manifest.active_memtable_data.clone();
         let truncation_cursors = build_truncation_cursors_from_manifest(&manifest)?;
-        let schema_manager = Arc::new(crate::schema::SchemaManager::from_manifests(
-            &file_manager,
-            loaded.iter().map(|entry| &entry.manifest),
-            resolver,
-        )?);
-        schema_manager.select_latest_schema_for_restore(manifest.latest_schema_id)?;
         let manifest_next_vlog_file_seq = loaded
             .iter()
             .flat_map(|entry| entry.manifest.vlog_files.iter())
