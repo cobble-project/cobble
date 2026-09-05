@@ -33,6 +33,8 @@ let server = RemoteCompactionServer::new(server_config)?;
 server.serve("0.0.0.0:9000")?;
 ```
 
+For custom schema transforms, call `server.register_schema_transform(id, transform)?` before serving. The server needs the same implementations as the writer; see [Schema Evolution](../architecture/schema-evolution#standalone-compactors).
+
 ### Server Configuration
 
 | Parameter | Default | Description |
@@ -67,7 +69,7 @@ When `compaction_remote_addr` is set, writers try the remote server first. Remot
 | `RemoteCompactionFailureMode::FallbackLocal` | `fallback_local` | Default. Run the compaction locally and keep the DB writable. |
 | `RemoteCompactionFailureMode::Skip` | `skip` | Abandon this compaction attempt and keep the DB healthy. A later write or flush can trigger compaction again. |
 
-Permanent errors do not use either fallback path. Protocol mismatches, unsupported merge operators, malformed carried schemas, and other deterministic config/schema errors are surfaced to the DB instead of being hidden by local compaction.
+Permanent errors do not use either fallback path. Protocol mismatches, unsupported merge operators, unregistered schema transforms, malformed carried schemas, and other deterministic config/schema errors are surfaced to the DB instead of being hidden by local compaction.
 
 ## Structured Mode
 

@@ -12,7 +12,9 @@ use crate::config::{Config, VolumeDescriptor, VolumeUsageKind};
 use crate::error::{Error, Result};
 use crate::file::FileSystemRegistry;
 use crate::properties::DB_PROPERTIES_NAME;
+use crate::schema::SchemaTransformRegistry;
 use crate::util::normalize_storage_path_to_url;
+use bytes::Bytes;
 use log::{debug, info, warn};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -58,6 +60,7 @@ pub struct DedicatedCompactionService {
     monitor: Mutex<DedicatedCompactionMonitor>,
     executor_config: Arc<Config>,
     resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+    transforms: Arc<SchemaTransformRegistry>,
     worker_count: usize,
     scan_interval: Duration,
     stop: Arc<AtomicBool>,
@@ -80,6 +83,7 @@ pub struct DedicatedCompactionMonitor {
     input: MonitorInput,
     file_system_registry: FileSystemRegistry,
     resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+    transforms: Arc<SchemaTransformRegistry>,
     planners: HashMap<ShardLocation, DedicatedCompactionPlanner>,
     outstanding: HashMap<String, OutstandingPlan>,
 }
@@ -153,9 +157,22 @@ impl DedicatedCompactionMonitor {
             },
             file_system_registry: FileSystemRegistry::new(),
             resolver,
+            transforms: Arc::new(SchemaTransformRegistry::default()),
             planners: HashMap::new(),
             outstanding: HashMap::new(),
         })
+    }
+
+    /// Register a single-column schema transform under its stable persisted ID.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.transforms.register(transform_id, transform)
     }
 
     /// Discovers current DBs and returns at most one plan per DB.
@@ -188,10 +205,11 @@ impl DedicatedCompactionMonitor {
                 continue;
             }
             if !self.planners.contains_key(&shard.location) {
-                match DedicatedCompactionPlanner::open_with_resolver(
+                match DedicatedCompactionPlanner::open_with_runtime_wiring(
                     shard.config,
                     &shard.db_id,
                     self.resolver.clone(),
+                    Arc::clone(&self.transforms),
                 ) {
                     Ok(planner) => {
                         info!(
@@ -339,14 +357,28 @@ impl DedicatedCompactionService {
         }
         let executor_config = Arc::new(monitor.config.clone());
         let resolver = monitor.resolver.clone();
+        let transforms = Arc::clone(&monitor.transforms);
         Ok(Self {
             monitor: Mutex::new(monitor),
             executor_config,
             resolver,
+            transforms,
             worker_count,
             scan_interval,
             stop: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Register a single-column schema transform under its stable persisted ID.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.transforms.register(transform_id, transform)
     }
 
     /// Signals the scanner and workers to stop. Running compactions finish their current step.
@@ -369,6 +401,7 @@ impl DedicatedCompactionService {
                 Arc::clone(&self.stop),
                 Arc::clone(&self.executor_config),
                 self.resolver.clone(),
+                Arc::clone(&self.transforms),
             )?);
         }
         drop(completion_tx);
@@ -456,13 +489,15 @@ fn spawn_worker(
     stop: Arc<AtomicBool>,
     executor_config: Arc<Config>,
     resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+    transforms: Arc<SchemaTransformRegistry>,
 ) -> Result<JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("dedicated-worker-{worker_idx}"))
         .spawn(move || {
-            let executor = match DedicatedCompactionExecutor::open_with_resolver(
+            let executor = match DedicatedCompactionExecutor::open_with_runtime_wiring(
                 executor_config.as_ref().clone(),
                 resolver,
+                transforms,
             ) {
                 Ok(executor) => executor,
                 Err(err) => {

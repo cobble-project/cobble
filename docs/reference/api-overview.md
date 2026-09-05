@@ -198,6 +198,8 @@ reader.refresh() -> Result<()>
 
 Both builders support registering transforms before opening; see [Schema Evolution](../architecture/schema-evolution#snapshot-readers).
 
+Remote and dedicated compactor entrypoints also expose `register_schema_transform(id, transform)` for process-local callback registration; see [Standalone Compactors](../architecture/schema-evolution#standalone-compactors).
+
 #### Scan
 
 ```rust

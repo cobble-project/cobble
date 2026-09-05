@@ -16,11 +16,11 @@ use crate::lsm::{LSMTree, LevelEdit, VersionEdit};
 use crate::manifest_model::{ManifestVlogFile, build_vlog_version_from_files, manifest_vlog_files};
 use crate::merge_operator::{
     BytesMergeOperator, MergeOperator, MergeOperatorResolver, U32CounterMergeOperator,
-    U64CounterMergeOperator, default_merge_operator, merge_operator_by_id,
+    U64CounterMergeOperator,
 };
 use crate::metrics_manager::MetricsManager;
 use crate::parquet::ParquetWriterOptions;
-use crate::schema::{Schema, SchemaManager};
+use crate::schema::{Schema, SchemaManager, SchemaTransformRegistry, schema_from_file};
 use crate::sst::SSTWriterOptions;
 use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
@@ -31,7 +31,7 @@ use crate::{Config, SstReadMetadataCacheMode};
 use bytes::Bytes;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -442,20 +442,18 @@ pub(crate) struct RemoteCompactionRequest {
     ttl_now_seconds: u32,
     runs: Vec<RemoteSortedRun>,
     merge_operator_ids: Vec<String>,
-    merge_operator_metadata: Vec<Option<serde_json::Value>>,
     truncation_cursors: Vec<RemoteTruncationCursor>,
     /// Schema definitions the compactor needs to decode input SST files and stamp output.
     ///
-    /// Carries exactly the schema versions referenced by the input files (version 0 excluded),
+    /// Carries every schema version from the oldest selected input through the fixed target,
     /// serialized as `SchemaFile`. This lets the compactor reconstruct the writer's schema registry
     /// from the request alone, without reading the shared volume — so remote compaction works even
     /// when triggered by a flush before the first checkpoint persists schemas. Schemas remain
     /// persisted to the volume only at checkpoint time, as before.
     ///
-    /// Includes the fixed compaction target plus every input-referenced version needed to decode
-    /// the selected files. The server must use `target_schema_id`, not infer a target from these
+    /// Includes intermediate transitions needed to materialize selected files at
+    /// `target_schema_id`. The server must use that fixed target, not infer one from these
     /// definitions' highest version.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     schemas: Vec<crate::schema::SchemaFile>,
     /// Immutable VLOG mapping from the same LSM observation as `runs`.
     vlog_files: Vec<ManifestVlogFile>,
@@ -465,6 +463,27 @@ pub(crate) struct RemoteCompactionRequest {
     /// compaction input iterators can produce the same output preload requests as
     /// local compaction. The client remaps returned file ids before async loading.
     scan_hot_block_keys: Vec<BlockCacheKey>,
+}
+
+/// Resolves remote schemas against process-local custom operators without serializing any
+/// callbacks. Explicit resolver wiring wins so callers can use metadata; static registrations
+/// provide the server's simple startup registration path.
+struct RemoteSchemaMergeOperatorResolver {
+    resolver: Option<Arc<dyn MergeOperatorResolver>>,
+    operators: Arc<Mutex<HashMap<String, Arc<dyn MergeOperator>>>>,
+}
+
+impl MergeOperatorResolver for RemoteSchemaMergeOperatorResolver {
+    fn resolve(
+        &self,
+        id: &str,
+        metadata: Option<&serde_json::Value>,
+    ) -> Option<Arc<dyn MergeOperator>> {
+        self.resolver
+            .as_ref()
+            .and_then(|resolver| resolver.resolve(id, metadata))
+            .or_else(|| self.operators.lock().unwrap().get(id).cloned())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -890,31 +909,17 @@ impl RemoteCompactionWorker {
         // failing when the compactor is down. A fetch failure is returned as-is so the resilient
         // wrapper can classify and handle it (fallback/skip). Once fetched the result is cached.
         self.ensure_supported_merge_operator_ids(&merge_operator_ids)?;
-        let merge_operator_metadata = schema
-            .column_metadata_for_column_family_id(tree_scope.column_family_id)
-            .to_vec();
-        // Collect the fixed target and every schema version referenced by an input file. The
-        // compactor registers these from the request so it can decode input SST files stamped
-        // with non-zero schema ids and materialize output using `target_schema_id`. Version 0 is
-        // excluded: it has no real column-family layout (the writer starts from a default schema
-        // and evolves from there), and the compactor already reconstructs a version-0 fallback
-        // from the request's resolved merge operators. Schemas are carried in the request itself
-        // rather than read back from the shared volume, so remote compaction works regardless of
-        // when the writer last persisted schemas to disk.
-        //
-        // The target is carried even when no selected input uses it, preventing an asynchronous
-        // remote task from silently changing schema when the writer advances after planning.
-        let mut schema_ids: BTreeSet<u64> = BTreeSet::new();
-        if target_schema_id > 0 {
-            schema_ids.insert(target_schema_id);
-        }
-        for run in sorted_runs {
-            for file in run.files() {
-                if file.schema_id > 0 {
-                    schema_ids.insert(file.schema_id);
-                }
-            }
-        }
+        // Carry the full transition chain from the oldest selected input to the fixed target.
+        // A transform/remap can live in an intermediate schema that no current input file is
+        // stamped with, so sending only input and target definitions is insufficient. Version 0
+        // is a real schema too and must be carried when a selected file uses it.
+        let minimum_source_schema_id = sorted_runs
+            .iter()
+            .flat_map(|run| run.files())
+            .map(|file| file.schema_id)
+            .min()
+            .unwrap_or(target_schema_id);
+        let schema_ids = minimum_source_schema_id..=target_schema_id;
         let schemas = schema_ids
             .into_iter()
             .map(|schema_id| {
@@ -962,7 +967,6 @@ impl RemoteCompactionWorker {
             ttl_now_seconds: ttl_provider.now_seconds(),
             runs,
             merge_operator_ids,
-            merge_operator_metadata,
             truncation_cursors: RemoteTruncationCursor::from_map(&truncation_cursors),
             scan_hot_block_keys,
             schemas,
@@ -1065,6 +1069,7 @@ pub struct RemoteCompactionServer {
     merge_operator_map: Arc<Mutex<HashMap<String, Arc<dyn MergeOperator>>>>,
     merge_operator_resolver: Arc<Mutex<Option<Arc<dyn MergeOperatorResolver>>>>,
     resolvable_operator_ids: Arc<Mutex<HashSet<String>>>,
+    transforms: Arc<SchemaTransformRegistry>,
     limiter: Arc<RequestLimiter>,
     shutdown: Arc<AtomicBool>,
 }
@@ -1104,6 +1109,7 @@ impl RemoteCompactionServer {
             merge_operator_map: Arc::new(Mutex::new(merge_operator_map)),
             merge_operator_resolver: Arc::new(Mutex::new(None)),
             resolvable_operator_ids: Arc::new(Mutex::new(HashSet::new())),
+            transforms: Arc::new(SchemaTransformRegistry::default()),
             limiter,
             shutdown,
         })
@@ -1126,6 +1132,21 @@ impl RemoteCompactionServer {
         for id in resolvable_ids {
             ids.insert(id);
         }
+    }
+
+    /// Register a single-column schema transform under its stable persisted ID.
+    ///
+    /// The callback stays in this compactor process; remote requests carry only the ID recorded
+    /// in their schema definitions. Register every ID needed by incoming requests before serving.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.transforms.register(transform_id, transform)
     }
 
     pub fn supported_merge_operator_ids(&self) -> Vec<String> {
@@ -1191,6 +1212,7 @@ impl RemoteCompactionServer {
         let merge_operator_map = Arc::clone(&self.merge_operator_map);
         let merge_operator_resolver = self.merge_operator_resolver.lock().unwrap().clone();
         let resolvable_ids = self.resolvable_operator_ids.lock().unwrap().clone();
+        let transforms = Arc::clone(&self.transforms);
         let limiter = Arc::clone(&self.limiter);
         self.runtime.spawn_blocking(move || {
             if !limiter.acquire_slot(Some(&stream)) {
@@ -1242,6 +1264,7 @@ impl RemoteCompactionServer {
                         Arc::clone(&metrics_manager),
                         Arc::clone(&merge_operator_map),
                         merge_operator_resolver.clone(),
+                        Arc::clone(&transforms),
                         *request,
                     ) {
                         Ok((files, vlog_entry_deltas, preload_block_keys)) => {
@@ -1285,13 +1308,12 @@ impl RemoteCompactionServer {
         metrics_manager: Arc<MetricsManager>,
         merge_operator_map: Arc<Mutex<HashMap<String, Arc<dyn MergeOperator>>>>,
         merge_operator_resolver: Option<Arc<dyn MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
         request: RemoteCompactionRequest,
     ) -> Result<RemoteCompactionOutput> {
         let file_manager = Self::file_manager_for_with(config, &request.db_id, &metrics_manager)?;
         let data_file_type = request.writer_options.data_file_type();
         let num_columns = request.writer_options.num_columns();
-        let column_family_id = request.column_family_id;
-        let merge_operator_metadata = request.merge_operator_metadata.clone();
         let writer_options = request.writer_options.into_writer_options(&metrics_manager);
         let file_builder_factory = super::make_data_file_builder_factory(writer_options.clone());
         let writer_options_factory = WriterOptionsFactory::from(&writer_options);
@@ -1319,23 +1341,13 @@ impl RemoteCompactionServer {
         ));
         let compaction_metrics = metrics_manager.compaction_metrics();
         let sst_metrics = metrics_manager.sst_iterator_metrics();
-        let schema_resolver = merge_operator_resolver.clone();
-        let request_schemas = request.schemas.clone();
-        let merge_operators = Self::resolve_merge_operators(
-            Arc::clone(&merge_operator_map),
-            merge_operator_resolver,
-            &request.merge_operator_ids,
-            &request.merge_operator_metadata,
-            num_columns,
-        )?;
-        let schema_manager = Self::build_schema_manager(
-            column_family_id,
-            &merge_operator_metadata,
-            merge_operators,
-            schema_resolver.as_ref(),
-            num_columns,
-            &request_schemas,
-        )?;
+        let schema_resolver: Arc<dyn MergeOperatorResolver> =
+            Arc::new(RemoteSchemaMergeOperatorResolver {
+                resolver: merge_operator_resolver,
+                operators: merge_operator_map,
+            });
+        let schema_manager =
+            Self::build_schema_manager(Some(&schema_resolver), &request.schemas, transforms)?;
         let vlog_version = build_vlog_version_from_files(&file_manager, &request.vlog_files, true)?;
         let cache_namespace = cache_namespace_for_db_id(&request.db_id);
         let scan_hot_blocks = ScanHotBlockRegistry::from_keys(request.scan_hot_block_keys);
@@ -1380,43 +1392,6 @@ impl RemoteCompactionServer {
         ))
     }
 
-    fn resolve_merge_operators(
-        merge_operator_map: Arc<Mutex<HashMap<String, Arc<dyn MergeOperator>>>>,
-        resolver: Option<Arc<dyn MergeOperatorResolver>>,
-        request_ids: &[String],
-        request_metadata: &[Option<serde_json::Value>],
-        num_columns: usize,
-    ) -> Result<Vec<Arc<dyn MergeOperator>>> {
-        let ids: Vec<String> = if request_ids.is_empty() {
-            vec![default_merge_operator().id(); num_columns]
-        } else if request_ids.len() >= num_columns {
-            request_ids[..num_columns].to_vec()
-        } else {
-            let mut ids = request_ids.to_vec();
-            ids.resize(num_columns, default_merge_operator().id());
-            ids
-        };
-        let map = merge_operator_map.lock().unwrap();
-        let mut operators = Vec::with_capacity(num_columns);
-        for (idx, id) in ids.iter().enumerate() {
-            let metadata = request_metadata.get(idx).and_then(|m| m.as_ref());
-            // Try resolver with metadata first, then fall back to the static map
-            if let Some(ref resolver) = resolver
-                && let Some(op) = resolver.resolve(id, metadata)
-            {
-                operators.push(op);
-                continue;
-            }
-            if let Some(op) = map.get(id.as_str()).cloned() {
-                operators.push(op);
-                continue;
-            }
-            // Final fallback: merge_operator_by_id (built-in operators)
-            operators.push(merge_operator_by_id(id, metadata, None)?);
-        }
-        Ok(operators)
-    }
-
     fn file_manager_for_with(
         process_config: &Config,
         db_id: &str,
@@ -1434,60 +1409,41 @@ impl RemoteCompactionServer {
         Ok(Arc::new(file_manager))
     }
 
-    /// Builds the schema manager for a compaction request.
+    /// Builds the schema manager for a compaction request from its carried schema chain.
     ///
-    /// The writer carries the schema versions referenced by the input files inside the request
-    /// itself (`schemas`), so the compactor can decode input SST files stamped with non-zero
-    /// schema ids — without reading the shared volume. This keeps schemas persisted to the volume
-    /// only at checkpoint time (as before) and makes remote compaction independent of the writer's
-    /// volume directory layout.
-    ///
-    /// Only input-referenced versions are registered, so the compaction target (`latest_schema`)
-    /// is the highest version actually present in the input. Output is stamped with that version,
-    /// which avoids spurious schema evolution: when every input file shares the writer's latest
-    /// version the target equals it and no evolution runs; when input files predate the latest
-    /// version the target stays at the input version and evolution is not attempted.
-    ///
-    /// A version-0 fallback schema (carrying the request's resolved merge operators) is always
-    /// registered first so that the existing version-0 protocol path keeps working when no schemas
-    /// are carried (e.g. an older writer). Each carried schema is then registered; a schema that
-    /// fails to decode fails the request immediately rather than silently falling back, since a
-    /// missing schema would only surface later inside the compaction executor as an opaque
-    /// "Missing schema version N" error.
+    /// The request carries real schema definitions, including version 0 when a selected file uses
+    /// it, so the server does not synthesize a fallback layout from the target. That matters when
+    /// version 0 has a different width or merge operators from the fixed target. Attaching the
+    /// process-local transform registry validates every persisted transform ID before execution.
     fn build_schema_manager(
-        column_family_id: u8,
-        merge_operator_metadata: &[Option<serde_json::Value>],
-        merge_operators: Vec<Arc<dyn MergeOperator>>,
         merge_operator_resolver: Option<&Arc<dyn MergeOperatorResolver>>,
-        num_columns: usize,
         schemas: &[crate::schema::SchemaFile],
+        transforms: Arc<SchemaTransformRegistry>,
     ) -> Result<Arc<SchemaManager>> {
-        let schema_manager = Arc::new(SchemaManager::from_schemas(
-            vec![Schema::new_for_column_family(
-                0,
-                column_family_id,
-                merge_operators,
-                merge_operator_metadata.to_vec(),
-                crate::schema::ColumnFamilyOptions::default(),
-            )],
-            num_columns,
-            None,
-        ));
-        for schema_file in schemas {
-            if schema_file.id == 0 {
-                // Version 0 is already registered as the fallback above.
-                continue;
-            }
-            schema_manager
-                .register_schema_from_def(schema_file, merge_operator_resolver)
-                .map_err(|err| {
+        if schemas.is_empty() {
+            return Err(Error::InvalidState(
+                "remote compaction request carries no schema definitions".to_string(),
+            ));
+        }
+        let schemas = schemas
+            .iter()
+            .map(|schema_file| {
+                schema_from_file(schema_file, merge_operator_resolver).map_err(|err| {
                     Error::InvalidState(format!(
-                        "remote compactor failed to register carried schema version {}: {}",
+                        "remote compactor failed to decode carried schema version {}: {}",
                         schema_file.id, err
                     ))
-                })?;
-        }
-        Ok(schema_manager)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let default_num_columns = schemas.first().map_or(1, Schema::num_columns);
+        let schema_manager = SchemaManager::from_schemas(
+            schemas,
+            default_num_columns,
+            merge_operator_resolver.cloned(),
+        )
+        .with_transform_registry(transforms)?;
+        Ok(Arc::new(schema_manager))
     }
 }
 

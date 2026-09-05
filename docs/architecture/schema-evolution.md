@@ -82,7 +82,7 @@ let db = DbBuilder::new(config)
 
 Builder registration also works with `open()`, `open_from_snapshot(snapshot_id)`, and `resume_from_snapshot(snapshot_id)`, including their recovery-mode variants. Restore methods require `db_id` and use the snapshot's bucket ranges. Missing required IDs fail recovery; duplicate registrations return an error. Keep each ID's meaning stable. `switch_to_snapshot` preserves the current DB's registrations, and `Db::register_schema_transform` remains available for new runtime schema updates.
 
-Custom transforms support `Db`, `ReadOnlyDb`, and `Reader` reads (`get`, multi-get, and scan), plus local compaction. Scans merge older values with their original operators before applying transforms, then apply column selection and row limits. Custom-transform registration for remote/dedicated compaction and higher-level bindings is not yet available.
+Custom transforms support `Db`, `ReadOnlyDb`, and `Reader` reads (`get`, multi-get, and scan), plus local, remote, and dedicated compaction. Scans merge older values with their original operators before applying transforms, then apply column selection and row limits. Higher-level binding registration is not yet available.
 
 ### Snapshot Readers
 
@@ -102,6 +102,20 @@ let reader = ReaderBuilder::new(reader_config)
 ```
 
 `ReadOnlyDbBuilder` requires the source `db_id` and validates required transform IDs during open. `Reader` opens shards lazily, so missing IDs are reported on the first access to the affected shard, not when opening the global snapshot. Both types expose `register_schema_transform`; a failed lazy shard open can be retried after registration. Reader registrations survive refreshes and shard cache eviction. Transform callbacks and registries are runtime-only and must be registered again after restart.
+
+### Standalone Compactors
+
+Register the same IDs and implementations in each compactor process before starting work:
+
+```rust
+let server = cobble::RemoteCompactionServer::new(server_config)?;
+server.register_schema_transform("append-suffix-v1", append_suffix)?;
+server.serve("0.0.0.0:9000")?;
+```
+
+Dedicated compaction exposes the same method on `DedicatedCompactor`, `DedicatedCompactionService`, `DedicatedCompactionMonitor`, `DedicatedCompactionPlanner`, and `DedicatedCompactionExecutor`. Register before `run`, `poll`, `plan`, or `execute`; separately deployed planners and executors need their own registrations. Service registrations are shared with its discovered shards and workers.
+
+Remote requests carry the complete schema chain through the planned target, including intermediate versions with no remaining files. Dedicated compactors load the chain from shared storage. Only IDs and schema definitions travel between processes, never callback code; use an application-owned compactor executable to register custom Rust callbacks, not the unmodified CLI. Missing IDs fail planning/execution without publishing a compaction result. Registration must be repeated after restart.
 
 ## Add Column: What Actually Happens
 

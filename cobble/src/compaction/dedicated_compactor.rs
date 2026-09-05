@@ -35,13 +35,14 @@ use crate::manifest_model::{
 };
 use crate::metrics_manager::MetricsManager;
 use crate::runtime_manifest::{LoadedRuntimeManifest, RuntimeManifestStore};
-use crate::schema::SchemaManager;
+use crate::schema::{SchemaManager, SchemaTransformRegistry};
 use crate::snapshot::manifest::{list_snapshot_manifest_ids, load_manifest_for_snapshot};
 use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::util::normalize_storage_path_to_url;
 use crate::vlog::VlogVersion;
 use crate::writer_options::WriterOptionsFactory;
+use bytes::Bytes;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -62,6 +63,8 @@ pub struct DedicatedCompactor {
     /// Saved merge operator resolver, passed to every schema reload so custom merge
     /// operators remain functional across manifest refreshes.
     resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+    /// Process-local implementations for stable transform IDs persisted in schemas.
+    transforms: Arc<SchemaTransformRegistry>,
     poll_interval: Duration,
     /// Interval at which the lease heartbeat is refreshed. Independently computed from
     /// `orphan_min_age / 3` (capped at `poll_interval`) so the lease is always refreshed well
@@ -220,6 +223,32 @@ impl DedicatedCompactionPlanner {
         })
     }
 
+    pub(crate) fn open_with_runtime_wiring(
+        config: Config,
+        db_id: impl Into<String>,
+        resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: DedicatedCompactor::open_with_runtime_wiring(
+                config, db_id, resolver, transforms,
+            )?,
+        })
+    }
+
+    /// Register a single-column schema transform under its stable persisted ID.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.inner
+            .register_schema_transform(transform_id, transform)
+    }
+
     pub fn plan(&self) -> Result<DedicatedCompactionPlanning> {
         self.inner.plan_once()
     }
@@ -234,13 +263,16 @@ struct DedicatedCompactionPlanExecutor {
 }
 
 impl DedicatedCompactionPlanExecutor {
-    fn open_with_resolver(
+    fn open_with_runtime_wiring(
         config: Config,
         db_id: impl Into<String>,
         resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
     ) -> Result<Self> {
         Ok(Self {
-            inner: DedicatedCompactor::open_with_resolver(config, db_id, resolver)?,
+            inner: DedicatedCompactor::open_with_runtime_wiring(
+                config, db_id, resolver, transforms,
+            )?,
         })
     }
 
@@ -248,8 +280,14 @@ impl DedicatedCompactionPlanExecutor {
         base_config: &Config,
         plan: &DedicatedCompactionPlan,
         resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
     ) -> Result<Self> {
-        Self::open_with_resolver(plan.execution_config(base_config)?, plan.db_id(), resolver)
+        Self::open_with_runtime_wiring(
+            plan.execution_config(base_config)?,
+            plan.db_id(),
+            resolver,
+            transforms,
+        )
     }
 
     fn execute(&self, plan: &DedicatedCompactionPlan) -> Result<DedicatedCompactionExecution> {
@@ -265,6 +303,7 @@ impl DedicatedCompactionPlanExecutor {
 pub struct DedicatedCompactionExecutor {
     base_config: Config,
     resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+    transforms: Arc<SchemaTransformRegistry>,
 }
 
 impl DedicatedCompactionExecutor {
@@ -276,11 +315,36 @@ impl DedicatedCompactionExecutor {
         config: Config,
         resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
     ) -> Result<Self> {
+        Self::open_with_runtime_wiring(
+            config,
+            resolver,
+            Arc::new(SchemaTransformRegistry::default()),
+        )
+    }
+
+    pub(crate) fn open_with_runtime_wiring(
+        config: Config,
+        resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
+    ) -> Result<Self> {
         config.validate_dedicated_compactor()?;
         Ok(Self {
             base_config: config,
             resolver,
+            transforms,
         })
+    }
+
+    /// Register a single-column schema transform under its stable persisted ID.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.transforms.register(transform_id, transform)
     }
 
     pub fn execute(&self, plan: &DedicatedCompactionPlan) -> Result<DedicatedCompactionExecution> {
@@ -288,6 +352,7 @@ impl DedicatedCompactionExecutor {
             &self.base_config,
             plan,
             self.resolver.clone(),
+            Arc::clone(&self.transforms),
         )?
         .execute(plan)
     }
@@ -381,7 +446,12 @@ impl DedicatedCompactor {
     /// volume. This does NOT call `Db::open`; it constructs an independent `FileManager` and
     /// rebuilds schemas lazily from each durable observation.
     pub fn open(config: Config, db_id: impl Into<String>) -> Result<Self> {
-        Self::open_with_resolver(config, db_id, None)
+        Self::open_with_runtime_wiring(
+            config,
+            db_id,
+            None,
+            Arc::new(SchemaTransformRegistry::default()),
+        )
     }
 
     /// Opens a dedicated compactor with an optional merge operator resolver.
@@ -389,6 +459,20 @@ impl DedicatedCompactor {
         process_config: Config,
         db_id: impl Into<String>,
         resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+    ) -> Result<Self> {
+        Self::open_with_runtime_wiring(
+            process_config,
+            db_id,
+            resolver,
+            Arc::new(SchemaTransformRegistry::default()),
+        )
+    }
+
+    fn open_with_runtime_wiring(
+        process_config: Config,
+        db_id: impl Into<String>,
+        resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
     ) -> Result<Self> {
         // Re-validate dedicated compaction constraints. This catches unsafe overrides
         // (e.g. CLI --poll-interval) applied after Config::from_path.
@@ -433,6 +517,7 @@ impl DedicatedCompactor {
             file_manager,
             metrics_manager,
             resolver,
+            transforms,
             poll_interval,
             heartbeat_interval,
             executor,
@@ -440,6 +525,18 @@ impl DedicatedCompactor {
             compaction_metrics,
             stop: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Register a single-column schema transform under its stable persisted ID.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.transforms.register(transform_id, transform)
     }
 
     /// Signals the compactor to stop its main loop.
@@ -704,11 +801,14 @@ impl DedicatedCompactor {
         observation: &DedicatedObservation,
     ) -> Result<RebuiltObservation> {
         self.validate_observation_topology(observation)?;
-        let schema_manager = Arc::new(SchemaManager::from_persisted_schema_ids(
-            &self.file_manager,
-            manifest_schema_ids(observation.latest_schema_id, &observation.tree_levels),
-            self.resolver.clone(),
-        )?);
+        let schema_manager = Arc::new(
+            SchemaManager::from_persisted_schema_ids(
+                &self.file_manager,
+                manifest_schema_ids(observation.latest_schema_id, &observation.tree_levels),
+                self.resolver.clone(),
+            )?
+            .with_transform_registry(Arc::clone(&self.transforms))?,
+        );
         let tree_versions =
             build_tree_versions_from_levels(&self.file_manager, &observation.tree_levels, true)?;
         let vlog_version =

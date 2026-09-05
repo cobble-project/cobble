@@ -238,8 +238,8 @@ pub(crate) fn build_truncation_cursors(
         .collect()
 }
 
-/// Returns every schema id needed to interpret a persisted layout, including an otherwise empty
-/// latest schema version.
+/// Returns every schema id needed to interpret a persisted layout, including intermediate
+/// transitions from the oldest live input schema through the latest schema version.
 pub(crate) fn manifest_schema_ids(
     latest_schema_id: u64,
     tree_levels: &[Vec<ManifestLevel>],
@@ -249,6 +249,11 @@ pub(crate) fn manifest_schema_ids(
         for level in levels {
             schema_ids.extend(level.files.iter().map(|file| file.schema_id));
         }
+    }
+    if let Some(minimum_schema_id) = schema_ids.iter().next().copied()
+        && minimum_schema_id <= latest_schema_id
+    {
+        schema_ids.extend(minimum_schema_id..=latest_schema_id);
     }
     schema_ids
 }

@@ -7,18 +7,76 @@ use crate::db_state::{DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion}
 use crate::file::{File, RandomAccessFile, SequentialWriteFile};
 use crate::format::FileBuildResult;
 use crate::lsm::{LSMTree, LSMTreeVersion, Level};
+use crate::merge_operator::MergeOperator;
 use crate::parquet::{ParquetIterator, RandomAccessChunkReader, parquet_row_group_cache_keys};
 use crate::sst::row_codec::{decode_value, encode_key, encode_value};
 use crate::r#type::{Column, Key, KvValue, Value, ValueType};
-use crate::vlog::VlogVersion;
+use crate::vlog::{VlogStore, VlogVersion};
 use crate::writer_options::WriterOptions;
 use crate::{VolumeDescriptor, VolumeUsageKind};
+use bytes::Bytes;
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
 use serial_test::serial;
 use size::Size;
 use std::collections::{HashMap, VecDeque};
+use std::process::{Child, Command};
 use std::sync::Arc;
+use std::time::Instant;
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct RemotePipeMergeOperator;
+
+impl MergeOperator for RemotePipeMergeOperator {
+    fn id(&self) -> String {
+        "remote-test-pipe".to_string()
+    }
+
+    fn merge(
+        &self,
+        existing_value: Bytes,
+        value: Bytes,
+        _time_provider: Option<&dyn crate::TimeProvider>,
+    ) -> Result<(Bytes, Option<ValueType>)> {
+        Ok((
+            [existing_value.as_ref(), b"|", value.as_ref()]
+                .concat()
+                .into(),
+            None,
+        ))
+    }
+}
+
+fn remote_parse_number(value: Option<Bytes>) -> Result<Option<Bytes>> {
+    value
+        .map(|value| {
+            let number = std::str::from_utf8(&value)
+                .map_err(|err| Error::InvalidState(err.to_string()))?
+                .parse::<u32>()
+                .map_err(|err| Error::InvalidState(err.to_string()))?;
+            Ok(Bytes::copy_from_slice(&number.to_le_bytes()))
+        })
+        .transpose()
+}
+
+fn remote_render_number(value: Option<Bytes>) -> Result<Option<Bytes>> {
+    value
+        .map(|value| {
+            let bytes: [u8; 4] = value.as_ref().try_into().map_err(|_| {
+                Error::InvalidState("remote transform expected a u32 column".to_string())
+            })?;
+            Ok(Bytes::from(format!("n={}", u32::from_le_bytes(bytes))))
+        })
+        .transpose()
+}
 
 fn cleanup_test_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
@@ -117,6 +175,21 @@ fn create_test_sst_with_schema(
     options: SSTWriterOptions,
     schema_id: u64,
 ) -> Result<Arc<DataFile>> {
+    let num_columns = options.num_columns;
+    let has_separated_values = entries
+        .iter()
+        .try_fold(false, |has_separated, (_, bytes)| {
+            let mut value = Bytes::copy_from_slice(bytes);
+            let value = decode_value(&mut value, num_columns)?;
+            Ok::<_, Error>(
+                has_separated
+                    || value
+                        .columns()
+                        .iter()
+                        .flatten()
+                        .any(|column| column.value_type().uses_separated_storage()),
+            )
+        })?;
     let (file_id, writer_file) = file_manager.create_data_file_with_offload()?;
     let mut writer = crate::sst::SSTWriter::new(writer_file, options);
 
@@ -143,7 +216,8 @@ fn create_test_sst_with_schema(
         file_size,
         bucket_range.clone(),
         bucket_range,
-    );
+    )
+    .with_separated_values(has_separated_values);
     data_file.set_meta_bytes(meta_bytes);
     data_file.set_max_expired_at(max_expired_at);
     file_manager.finalize_data_file(&data_file)?;
@@ -595,8 +669,11 @@ fn test_build_schema_manager_fails_on_malformed_carried_schema() {
         id: 7,
         column_families: Vec::new(),
     };
-    let result =
-        RemoteCompactionServer::build_schema_manager(0, &[], Vec::new(), None, 1, &[malformed]);
+    let result = RemoteCompactionServer::build_schema_manager(
+        None,
+        &[malformed],
+        Arc::new(crate::schema::SchemaTransformRegistry::default()),
+    );
     let err = match result {
         Ok(_) => panic!("malformed schema must fail the request"),
         Err(err) => err,
@@ -605,6 +682,368 @@ fn test_build_schema_manager_fails_on_malformed_carried_schema() {
         err.to_string().contains("schema version 7"),
         "error should name the offending schema id, got: {err}"
     );
+}
+
+#[test]
+#[serial(file)]
+fn test_remote_compaction_transforms_cross_process_with_unpersisted_chain() {
+    const CHILD_ROOT: &str = "COBBLE_REMOTE_TRANSFORM_TEST_ROOT";
+    const CHILD_ADDR: &str = "COBBLE_REMOTE_TRANSFORM_TEST_ADDR";
+    const CHILD_REGISTERED: &str = "COBBLE_REMOTE_TRANSFORM_TEST_REGISTERED";
+
+    if let Ok(root) = std::env::var(CHILD_ROOT) {
+        let server = RemoteCompactionServer::new(Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+            compaction_threads: 1,
+            log_console: false,
+            ..Config::default()
+        })
+        .unwrap();
+        // This static registration must resolve the operator in carried schema 1, even though
+        // the request target is schema 2 and no input file is stamped with schema 1.
+        server.register_merge_operator(Arc::new(RemotePipeMergeOperator));
+        if std::env::var(CHILD_REGISTERED).unwrap() == "true" {
+            server
+                .register_schema_transform("remote-parse", remote_parse_number)
+                .unwrap();
+            server
+                .register_schema_transform("remote-render", remote_render_number)
+                .unwrap();
+        }
+        server.serve(&std::env::var(CHILD_ADDR).unwrap()).unwrap();
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_str().unwrap().to_string();
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+        num_columns: 2,
+        total_buckets: 1,
+        base_file_size: Size::from_mib(1),
+        compaction_threads: 1,
+        log_console: false,
+        ..Config::default()
+    };
+    let db_id = "remote-transform-subprocess".to_string();
+    let metrics_manager = Arc::new(MetricsManager::new(&db_id));
+    let file_manager = test_file_manager(&config, &db_id, &metrics_manager);
+
+    let transforms = Arc::new(crate::schema::SchemaTransformRegistry::default());
+    transforms
+        .register("remote-parse", remote_parse_number)
+        .unwrap();
+    transforms
+        .register("remote-render", remote_render_number)
+        .unwrap();
+    transforms
+        .register("unused-latest", |value: Option<Bytes>| Ok(value))
+        .unwrap();
+    let schema_manager = Arc::new(SchemaManager::new_with_transform_registry(2, transforms));
+    let source = |index, transform: Option<&str>| crate::schema::ColumnEvolution::Source {
+        source_index: index,
+        transform_id: transform.map(str::to_owned),
+    };
+    let mut builder = schema_manager.builder();
+    builder
+        .remap_columns(
+            None,
+            vec![
+                source(1, None),
+                source(0, Some("remote-parse")),
+                crate::schema::ColumnEvolution::Default {
+                    value: Bytes::from_static(b"D"),
+                },
+            ],
+        )
+        .unwrap();
+    builder
+        .replace_column(None, 1, Arc::new(RemotePipeMergeOperator))
+        .unwrap();
+    let schema1 = builder.commit();
+    let mut builder = schema_manager.builder();
+    builder
+        .remap_columns(
+            None,
+            vec![
+                source(1, Some("remote-render")),
+                source(0, None),
+                source(2, None),
+                crate::schema::ColumnEvolution::Null,
+            ],
+        )
+        .unwrap();
+    builder
+        .replace_column(None, 0, Arc::new(BytesMergeOperator))
+        .unwrap();
+    let target_schema = builder.commit();
+    let mut builder = schema_manager.builder();
+    builder
+        .remap_columns(
+            None,
+            vec![
+                source(0, Some("unused-latest")),
+                source(1, None),
+                source(2, None),
+                source(3, None),
+            ],
+        )
+        .unwrap();
+    let unused_latest = builder.commit();
+    assert_eq!(schema1.version(), 1);
+    assert_eq!(target_schema.version(), 2);
+    assert_eq!(unused_latest.version(), 3);
+
+    // Keep schema files absent: this must exercise schema transport over TCP, not shared-volume
+    // schema loading. The only physical inputs retain the real version-0 two-column layout.
+    assert!(
+        file_manager
+            .open_metadata_file_reader_untracked(&crate::paths::schema_file_relative_path(0))
+            .is_err()
+    );
+
+    let vlog_store = VlogStore::new(Arc::clone(&file_manager), 64, 1);
+    let (mut vlog_writer, mut vlog_edit) = vlog_store.create_writer().unwrap();
+    let pointer = vlog_writer.add_value(b"4").unwrap();
+    vlog_writer.close().unwrap();
+    vlog_edit.add_entry_delta(pointer.file_seq(), 1);
+    let vlog_version = VlogVersion::new().apply_edit(vlog_edit);
+
+    let mut sst_options = build_sst_writer_options(&config, 0, 2);
+    sst_options.metrics = Some(metrics_manager.sst_writer_metrics(sst_options.compression));
+    let key = make_test_key(b"key");
+    let old_value = encode_value(
+        &Value::new(vec![
+            Some(Column::new(
+                ValueType::PutSeparated,
+                Bytes::copy_from_slice(&pointer.to_bytes()),
+            )),
+            Some(Column::new(ValueType::Put, Bytes::from_static(b"payload"))),
+        ]),
+        2,
+    );
+    let new_value = encode_value(
+        &Value::new(vec![
+            Some(Column::new(ValueType::Merge, Bytes::from_static(b"2"))),
+            None,
+        ]),
+        2,
+    );
+    let old_file = create_test_sst_with_schema(
+        &file_manager,
+        vec![(key.clone(), old_value.to_vec())],
+        sst_options.clone(),
+        0,
+    )
+    .unwrap();
+    let new_file = create_test_sst_with_schema(
+        &file_manager,
+        vec![(key, new_value.to_vec())],
+        sst_options,
+        0,
+    )
+    .unwrap();
+    let input_ids = vec![new_file.file_id, old_file.file_id];
+
+    let db_state = Arc::new(DbStateHandle::new());
+    db_state.store(DbState {
+        seq_id: 0,
+        topology_epoch: 0,
+        bucket_ranges: Vec::new(),
+        multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion {
+            levels: vec![
+                Level {
+                    ordinal: 0,
+                    tiered: true,
+                    files: vec![Arc::clone(&new_file), Arc::clone(&old_file)],
+                },
+                Level {
+                    ordinal: 1,
+                    tiered: false,
+                    files: Vec::new(),
+                },
+            ],
+        }),
+        vlog_version: vlog_version.clone(),
+        active: None,
+        active_schema: None,
+        min_source_schema_by_cf: Vec::new(),
+        immutables: VecDeque::new(),
+        truncation_cursors: crate::db_state::new_truncation_cursors(),
+        suggested_base_snapshot_id: None,
+    });
+    let lsm_tree = Arc::new(LSMTree::with_state(
+        Arc::clone(&db_state),
+        Arc::clone(&metrics_manager),
+    ));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let spawn_server = |registered: bool| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "compaction::remote::tests::test_remote_compaction_transforms_cross_process_with_unpersisted_chain",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, &root)
+                .env(CHILD_ADDR, &addr)
+                .env(CHILD_REGISTERED, registered.to_string())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if fetch_supported_merge_operator_ids(&addr, Duration::from_millis(100)).is_ok() {
+                break (child, addr);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "remote transform child did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let submit = |address: String| {
+        RemoteCompactionWorker::new(
+            address,
+            Arc::clone(&file_manager),
+            Arc::downgrade(&lsm_tree),
+            config.clone(),
+            TtlConfig::default(),
+            Duration::from_secs(5),
+            Arc::clone(&metrics_manager),
+            Arc::clone(&schema_manager),
+        )
+        .unwrap()
+    };
+    let runs = || {
+        vec![
+            SortedRun::new(0, vec![Arc::clone(&new_file)]),
+            SortedRun::new(0, vec![Arc::clone(&old_file)]),
+        ]
+    };
+
+    // Missing registration is a permanent remote schema error and cannot alter the inputs.
+    {
+        let (_child, addr) = spawn_server(false);
+        let worker = submit(addr);
+        lsm_tree.on_compaction_started(0);
+        let error = runtime
+            .block_on(
+                worker
+                    .submit_runs(
+                        0,
+                        runs(),
+                        1,
+                        target_schema.version(),
+                        vlog_version.clone(),
+                        DataFileType::SSTable,
+                        Arc::new(TTLProvider::disabled()),
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+            .err()
+            .expect("missing transform rejected");
+        let message = error.to_string();
+        assert!(
+            matches!(error, Error::InvalidState(_)),
+            "missing transform must be a permanent remote error: {message}"
+        );
+        assert!(message.contains("remote-parse"), "{message}");
+        assert_eq!(
+            lsm_tree
+                .level_files(0)
+                .iter()
+                .map(|file| file.file_id)
+                .collect::<Vec<_>>(),
+            input_ids
+        );
+        assert!(lsm_tree.level_files(1).is_empty());
+    }
+
+    let result = {
+        let (_child, addr) = spawn_server(true);
+        let worker = submit(addr);
+        let request_runs = runs();
+        let request = worker
+            .build_request(
+                0,
+                &request_runs,
+                1,
+                target_schema.version(),
+                &vlog_version,
+                DataFileType::SSTable,
+                Arc::new(TTLProvider::disabled()),
+            )
+            .unwrap();
+        assert_eq!(request.target_schema_id, target_schema.version());
+        assert_eq!(
+            request
+                .schemas
+                .iter()
+                .map(|schema| schema.id)
+                .collect::<Vec<_>>(),
+            vec![0, schema1.version(), target_schema.version()]
+        );
+        assert_eq!(request.vlog_files.len(), 1);
+        lsm_tree.on_compaction_started(0);
+        runtime
+            .block_on(
+                worker
+                    .submit_runs(
+                        0,
+                        runs(),
+                        1,
+                        target_schema.version(),
+                        vlog_version,
+                        DataFileType::SSTable,
+                        Arc::new(TTLProvider::disabled()),
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(result.vlog_edit().unwrap().entry_deltas(), vec![(0, -1)]);
+    assert!(
+        result
+            .new_files()
+            .iter()
+            .all(|file| file.schema_id == target_schema.version())
+    );
+    assert!(lsm_tree.level_files(0).is_empty());
+    assert!(db_state.load().vlog_version.files_with_entries().is_empty());
+    let reader = file_manager
+        .open_data_file_reader(result.new_files()[0].file_id)
+        .unwrap();
+    let mut iter = crate::sst::SSTIterator::with_cache_and_file(
+        Box::new(reader),
+        result.new_files()[0].as_ref(),
+        crate::sst::SSTIteratorOptions {
+            num_columns: target_schema.num_columns(),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    iter.seek_to_first().unwrap();
+    let (_, mut value) = iter.current().unwrap().unwrap();
+    let value = decode_value(&mut value, target_schema.num_columns()).unwrap();
+    assert_eq!(
+        value.columns()[0].as_ref().unwrap().data().as_ref(),
+        b"n=42"
+    );
+    assert_eq!(
+        value.columns()[1].as_ref().unwrap().data().as_ref(),
+        b"payload"
+    );
+    assert_eq!(value.columns()[2].as_ref().unwrap().data().as_ref(), b"D");
+    assert!(value.columns()[3].is_none());
 }
 
 #[test]
@@ -685,7 +1124,7 @@ fn test_remote_compaction_with_u64_counter_merge_operator_in_non_default_family(
             Arc::new(U64CounterMergeOperator),
         )
         .unwrap();
-    let _ = schema_builder.commit();
+    let schema = schema_builder.commit();
 
     let mut expected = HashMap::new();
     let entries_old = (0..20u64)
@@ -711,8 +1150,20 @@ fn test_remote_compaction_with_u64_counter_merge_operator_in_non_default_family(
         })
         .collect::<Vec<_>>();
 
-    let older_file = create_test_sst(&file_manager, entries_old, sst_options.clone()).unwrap();
-    let newer_file = create_test_sst(&file_manager, entries_new, sst_options.clone()).unwrap();
+    let older_file = create_test_sst_with_schema(
+        &file_manager,
+        entries_old,
+        sst_options.clone(),
+        schema.version(),
+    )
+    .unwrap();
+    let newer_file = create_test_sst_with_schema(
+        &file_manager,
+        entries_new,
+        sst_options.clone(),
+        schema.version(),
+    )
+    .unwrap();
 
     let lsm_version = LSMTreeVersion {
         levels: vec![
