@@ -8,10 +8,11 @@ has_children: true
 
 This section guides you through setting up and using Cobble for different use cases — from a single-machine embedded store to a distributed cluster with snapshot-following reads and parallel scans.
 
-Start with [Basic Concepts](basic-concepts) for an overview of the key components, then [Configuration](configuration) to understand how Cobble organizes storage, and finally choose the deployment model that fits your application:
+Start with [Quick Start](quick-start) for runnable examples, then use the focused guides for deeper explanations:
 
 | Guide | When to use |
 |-------|-------------|
+| [Quick Start](quick-start) | Runnable examples for the main Cobble usage patterns |
 | [Basic Concepts](basic-concepts) | Core components — Db, Coordinator, Reader, Scanner, snapshots |
 | [Configuration](configuration) | Every deployment starts here — volumes, tuning, and storage layout |
 | [Single-Machine Embedded DB](single-db) | Simple embedded key-value store on a single machine |

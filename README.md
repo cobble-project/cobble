@@ -36,233 +36,65 @@ For more details on features and design, see docs:
 Projects that use Cobble:
 - [Cobble Flink](https://github.com/cobble-project/cobble-flink) - a [Apache Flink](https://github.com/apache/flink)'s state backend, source and sink built on Cobble.
 
-## Install
+## Use Cases
 
-Add `cobble` to your `Cargo.toml`:
+### Single-machine embedded database
 
-```toml
-[dependencies]
-cobble = "0.4.0"
-```
+Embed Cobble in the same process as the application for fast local reads and writes. Local SSTs are offloaded to remote storage for checkpoints or capacity pressure, while remote SST blocks are loaded back into the isolated local cache on demand; the global manifest remains durable remotely.
 
-Cobble uses Apache OpenDAL for volume backends.
+<p align="center">
+  <img src="docs/static/use-cases/single-machine.svg" width="100%" alt="Cobble writes to local disk and the remote global manifest; local SSTs are offloaded to remote storage, while remote SST blocks are loaded back into an isolated local cache." />
+</p>
 
-The local `file://` backend is always enabled by default and does not require any Cargo feature.
-Optional remote/storage-service features exposed by Cobble are:
+[Learn about single-machine deployments](https://cobble-project.github.io/cobble/latest/getting-started/single-db.html).
 
-- `storage-alluxio`
-- `storage-cos`
-- `storage-oss`
-- `storage-s3`
-- `storage-ftp`
-- `storage-goosefs`
-- `storage-hdfs`
-- `storage-sftp`
+### Distributed write and snapshot coordination
 
-> On Windows, `storage-hdfs` and `storage-sftp` are currently not supported.
+Partition write ownership across Cobble shards when the workload needs to scale, while a coordinator assembles shard snapshots into one globally consistent view.
 
-```toml
-[dependencies]
-cobble = { version = "0.4.0", default-features = false, features = ["storage-s3"] }
-```
+<p align="center">
+  <img src="docs/static/use-cases/distributed.svg" width="100%" alt="Each writer process writes its Cobble shard data to shared storage, while DbCoordinator collects shard snapshots and writes the global manifest." />
+</p>
 
-- Enable all optional remote/storage-service backends: `storage-all`
-- Workspace crates re-expose the same `storage-*` feature names and forward them to `cobble`; language bindings do so through the internal `cobble-binding` crate.
+[Learn about distributed deployments](https://cobble-project.github.io/cobble/latest/getting-started/distributed.html).
+
+### Snapshot-following read service
+
+Run readers independently from writers when serving traffic should use a stable materialized view and advance only when a newer snapshot is ready.
+
+<p align="center">
+  <img src="docs/static/use-cases/snapshot-reader.svg" width="100%" alt="Writer and reader processes contain different Cobble modules and communicate through materialized checkpoints on shared storage." />
+</p>
+
+[Learn about readers](https://cobble-project.github.io/cobble/latest/getting-started/reader-and-scan.html#reader--snapshot-following-read-service).
+
+### Distributed scan on one snapshot
+
+Split a pinned global snapshot into independent work units when batch or analytical processing must scan every shard from the same consistent point in time.
+
+<p align="center">
+  <img src="docs/static/use-cases/distributed-scan.svg" width="100%" alt="A Scan Coordinator dispatches splits to staggered Scan Worker processes; the coordinator opens a global manifest and workers read immutable shard data files from shared storage." />
+</p>
+
+[Learn about distributed scans](https://cobble-project.github.io/cobble/latest/getting-started/reader-and-scan.html#distributed-scan).
+
+### Structured application state
+
+Use the structured layer for `Bytes` and `List` columns or a column-family-scoped priority queue with cursor-based fast truncation, while retaining Cobble's underlying storage behavior.
+
+<p align="center">
+  <img src="docs/static/use-cases/structured-data.svg" width="100%" alt="Bytes columns, List columns, and a column-family-scoped Priority Queue with cursor-based fast truncation are built on a shared Cobble Core foundation." />
+</p>
+
+[Learn about structured data](https://cobble-project.github.io/cobble/latest/getting-started/structured-db.html).
 
 ## Getting Started
 
-Cobble usage can be viewed as **step 0 + five patterns**.
+Follow the [Quick Start](https://cobble-project.github.io/cobble/latest/getting-started/quick-start.html) for runnable examples covering the main usage patterns, or browse the [complete documentation](https://cobble-project.github.io/cobble/latest/).
 
-For complete guides and more examples, see docs:
-- https://cobble-project.github.io/cobble/latest/
-- https://cobble-project.github.io/cobble/latest/getting-started/
+## Build and Test
 
-### 0) Config first: understand volumes
-
-Before any API flow, define `Config` and volume layout.
-
-Volume categories (`VolumeUsageKind`) and their roles:
-- `PrimaryDataPriorityHigh/Medium/Low`: main data files (SST/parquet/VLOG) with priority-aware placement.
-- `Meta`: metadata (manifests, pointers, schema files).
-- `Snapshot`: snapshot materialization target when separated from primary.
-- `Cache`: block cache disk tier (when hybrid cache is enabled).
-- `Readonly`: read-only source volumes for loading historical files.
-
-Minimal practical setup: one local path via `VolumeDescriptor::single_volume(...)`.
-This is the simplest single-path deployment and is enough for local development.
-
-```rust
-use cobble::{Config, VolumeDescriptor};
-
-let mut config = Config::default();
-config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble");
-```
-
-> [!IMPORTANT]
-> For **any restore/resume flow**, runtime must still be able to access **all files referenced by that snapshot** (snapshot manifests, schema files, and data/VLOG files). If any referenced file is missing or inaccessible, restore can fail.
-
-### 1) Single-machine embedded DB (`SingleDb`)
-
-This is the simplest mode. You run one embedded process with local write/read and
-single-node global snapshots.
-
-Create + write:
-
-```rust
-use cobble::{Config, SingleDb, VolumeDescriptor};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = Config::default();
-    config.num_columns = 2;
-    config.total_buckets = 1;
-    config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-single");
-
-    let db = SingleDb::open(config)?;
-    db.put(0, b"user:1", 0, b"Alice")?;
-    db.put(0, b"user:1", 1, b"premium")?;
-    let global_snapshot_id = db.snapshot()?;
-    println!("snapshot id = {}", global_snapshot_id);
-    Ok(())
-}
-```
-
-Recover/read flow:
-- Resume directly via `SingleDb::resume(config, global_snapshot_id)`.
-- Continue normal read/write on the resumed embedded instance.
-
-### 2) Distributed write/read with `N x Db` + `1 x DbCoordinator`
-
-```rust
-use cobble::{Config, CoordinatorConfig, Db, DbCoordinator};
-
-// shard writers
-let db1 = Db::open(config1, vec![0..=499])?;
-let db2 = Db::open(config2, vec![500..=999])?;
-
-// coordinator
-let coord = DbCoordinator::open(CoordinatorConfig {
-    volumes: coordinator_volumes,
-    snapshot_retention: Some(5),
-})?;
-
-// write
-db1.put(100, b"user:1", 0, b"Alice")?;
-db2.put(700, b"order:9", 0, b"paid")?;
-
-// global snapshot
-let s1 = db1.snapshot()?;
-let s2 = db2.snapshot()?;
-let i1 = db1.shard_snapshot_input(s1)?;
-let i2 = db2.shard_snapshot_input(s2)?;
-let manifest = coord.take_global_snapshot(1000, vec![i1, i2])?;
-coord.materialize_global_snapshot(&manifest)?;
-```
-
-Remote compaction example:
-
-```rust
-let mut config = Config::default();
-config.compaction_remote_addr = Some("127.0.0.1:18888".to_string());
-```
-
-See full distributed setup and restore examples:
-https://cobble-project.github.io/cobble/latest/getting-started/distributed/
-
-### 3) Real-time read while writing (`Reader`)
-
-```rust
-use cobble::{ReadOptions, Reader, ReaderConfig, VolumeDescriptor};
-
-let read_config = ReaderConfig {
-    volumes: VolumeDescriptor::single_volume("file:///tmp/cobble"),
-    total_buckets: 1024,
-    ..ReaderConfig::default()
-};
-let mut reader = Reader::open_current(read_config)?;
-let v = reader.get(0, b"user:1")?;
-let metrics = reader.get_with_options(
-    0,
-    b"user:1",
-    &ReadOptions::for_column_in_family("metrics", 0),
-)?;
-reader.refresh()?; // pull newer materialized snapshot
-```
-
-More `Reader` details:
-https://cobble-project.github.io/cobble/latest/getting-started/reader-and-scan/
-
-### 4) Distributed scan on one snapshot
-
-```rust
-use cobble::{ScanOptions, ScanPlan};
-
-let plan = ScanPlan::new(global_manifest); // plan stays bucket-only
-let scan_options = ScanOptions::for_column(0).with_column_family("metrics");
-
-for split in plan.splits() {
-    let scanner = split.create_scanner(config.clone(), &scan_options)?;
-    for row in scanner {
-        let (key, columns) = row?;
-        // process row...
-    }
-}
-```
-
-If you want to scan a non-default family, pass it when creating the scanner. `ScanPlan` / `ScanSplit` do not bind a family by themselves.
-
-`create_scanner(...)` keeps the full `ScanOptions` inside the worker-side scanner, so `column_family` still takes effect after a split is serialized and reopened elsewhere.
-
-### 5) Structured DB wrappers (typed columns)
-
-`cobble-data-structure` provides typed wrappers for all flows above:
-- Single-machine embedded: `StructuredSingleDb`
-- Distributed write shards: `StructuredDb`
-- Real-time read: `StructuredReader`
-- Snapshot pinned read: `StructuredReadOnlyDb`
-- Distributed scan: `StructuredScanPlan` / `StructuredScanSplit`
-
-All snapshot/read/scan patterns are the same as core `cobble`, but values are
-encoded/decoded as structured typed columns (`Bytes`/`List`).
-
-Structured wrappers are column-family aware too: `StructuredSchema` keeps
-family-local typed columns, and you still select a family through the same raw
-`ReadOptions` / `ScanOptions` / `WriteOptions`.
-
-```rust
-use bytes::Bytes;
-use cobble::{Config, VolumeDescriptor};
-use cobble_data_structure::{ListConfig, ListRetainMode, StructuredColumnValue, StructuredSingleDb};
-
-let mut config = Config::default();
-config.num_columns = 2;
-config.total_buckets = 1;
-config.volumes = VolumeDescriptor::single_volume("file:///tmp/cobble-structured");
-
-let mut db = StructuredSingleDb::open(config)?;
-db.update_schema()
-  .add_list_column(None, 1, ListConfig {
-      max_elements: Some(100),
-      retain_mode: ListRetainMode::Last,
-      preserve_element_ttl: false,
-  })
-  .commit()?;
-
-db.put(0, b"k1", 0, StructuredColumnValue::Bytes(Bytes::from_static(b"v0")))?;
-```
-
-More scan examples:
-https://cobble-project.github.io/cobble/latest/getting-started/reader-and-scan/
-
-More structured examples:
-https://cobble-project.github.io/cobble/latest/getting-started/structured-db/
-
-### Build / test
-
-- Format: `cargo fmt --all`
-- Lint (workspace): `cargo clippy --workspace -- -D warnings`
-- Daily unit-test suite: `cargo test-short`
-- Complete pre-commit suite: `cargo test --workspace`
-- Focused inner-loop test: `cargo test <pattern>`
+See the [contributing guide](CONTRIBUTING.md) for environment setup, build commands, formatting, linting, and test workflows.
 
 ## Contributing
 
