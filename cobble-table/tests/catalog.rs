@@ -127,9 +127,10 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         let evolved = catalog
             .evolve_schema(
                 &accounts,
-                vec![SchemaChange::AddField(
-                    DataField::new(4, "region", LogicalType::string().nullable()).unwrap(),
-                )],
+                vec![SchemaChange::AddField {
+                    name: "region".into(),
+                    logical_type: LogicalType::string().nullable(),
+                }],
             )
             .unwrap();
         assert_eq!(evolved.catalog_schema_id().as_u32(), 1);
@@ -159,22 +160,25 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
             .evolve_schema(
                 &accounts,
                 vec![
-                    SchemaChange::AddField(
-                        DataField::new(5, "state", LogicalType::int32().nullable()).unwrap(),
-                    ),
+                    SchemaChange::AddField {
+                        name: "state".into(),
+                        logical_type: LogicalType::int32().nullable(),
+                    },
                     SchemaChange::RenameField {
-                        field_id: 5.into(),
+                        field_name: "state".into(),
                         new_name: "status".to_string(),
                     },
                     SchemaChange::RenameField {
-                        field_id: 3.into(),
+                        field_name: "payload".into(),
                         new_name: "body".to_string(),
                     },
                     SchemaChange::RenameField {
-                        field_id: 4.into(),
+                        field_name: "region".into(),
                         new_name: "zone".to_string(),
                     },
-                    SchemaChange::DropField(4.into()),
+                    SchemaChange::DropField {
+                        field_name: "zone".into(),
+                    },
                 ],
             )
             .unwrap();
@@ -259,7 +263,12 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         event_table.put(&deleted_event_row).unwrap();
         event_table.delete(&deleted_event_key).unwrap();
         second
-            .evolve_schema(&events, vec![SchemaChange::DropField(3.into())])
+            .evolve_schema(
+                &events,
+                vec![SchemaChange::DropField {
+                    field_name: "payload".into(),
+                }],
+            )
             .unwrap();
         let event_table = catalog.materialize_table(&shard_one, &events).unwrap();
         let event_key = build_key(&event_table, &event_row[..2]);
@@ -272,9 +281,10 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         second
             .evolve_schema(
                 &events,
-                vec![SchemaChange::AddField(
-                    DataField::new(6, "optional", LogicalType::int32().nullable()).unwrap(),
-                )],
+                vec![SchemaChange::AddField {
+                    name: "optional".into(),
+                    logical_type: LogicalType::int32().nullable(),
+                }],
             )
             .unwrap();
         let event_table = catalog.materialize_table(&shard_one, &events).unwrap();
@@ -289,25 +299,43 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         );
         let deleted_event_key = build_key(&event_table, &deleted_event_row[..2]);
         assert_eq!(event_table.get(&deleted_event_key).unwrap(), None);
-        assert!(matches!(
-            catalog.evolve_schema(&accounts, vec![SchemaChange::DropField(1.into())]),
-            Err(CatalogError::InvalidSchemaEvolution(_))
-        ));
+        // Retire the highest assigned ID before closing the catalog. It must
+        // remain reserved when a new field is added after restart.
+        assert_eq!(event_table.schema().fields[2].id.0, 4);
+        second
+            .evolve_schema(
+                &events,
+                vec![SchemaChange::DropField {
+                    field_name: "optional".into(),
+                }],
+            )
+            .unwrap();
         assert!(matches!(
             catalog.evolve_schema(
                 &accounts,
-                vec![SchemaChange::AddField(
-                    DataField::new(6, "required", LogicalType::string()).unwrap()
-                )]
+                vec![SchemaChange::DropField {
+                    field_name: "tenant".into()
+                }]
             ),
             Err(CatalogError::InvalidSchemaEvolution(_))
         ));
         assert!(matches!(
             catalog.evolve_schema(
                 &accounts,
-                vec![SchemaChange::AddField(
-                    DataField::new(4, "reused", LogicalType::int32().nullable()).unwrap()
-                )]
+                vec![SchemaChange::AddField {
+                    name: "required".into(),
+                    logical_type: LogicalType::string(),
+                }]
+            ),
+            Err(CatalogError::InvalidSchemaEvolution(_))
+        ));
+        assert!(matches!(
+            catalog.evolve_schema(
+                &accounts,
+                vec![SchemaChange::AddField {
+                    name: "body".into(),
+                    logical_type: LogicalType::int32().nullable(),
+                }]
             ),
             Err(CatalogError::InvalidSchemaEvolution(_))
         ));
@@ -386,12 +414,36 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
                 .unwrap()
                 .catalog_schema_id()
                 .as_u32(),
-            2
+            3
         );
         assert!(matches!(
             catalog.load_table(&accounts),
             Err(CatalogError::TableNotFound(_))
         ));
+
+        let evolved_events = catalog
+            .evolve_schema(
+                &events,
+                vec![SchemaChange::AddField {
+                    name: "optional".into(),
+                    logical_type: LogicalType::int32().nullable(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(evolved_events.schema().fields[2].id.0, 5);
+        let event_table = catalog.materialize_table(&shard_one, &events).unwrap();
+        let event_key = build_key(
+            &event_table,
+            &[Value::String("tenant-b".into()), Value::Int64(9)],
+        );
+        assert_eq!(
+            event_table.get(&event_key).unwrap(),
+            Some(vec![
+                Value::String("tenant-b".into()),
+                Value::Int64(9),
+                Value::Null,
+            ])
+        );
 
         catalog.drop_table(&customers).unwrap();
         catalog.drop_table(&events).unwrap();

@@ -1,4 +1,5 @@
-use super::model::{CatalogSchemaId, CatalogTable, SchemaChange, TableIdentifier};
+use super::model::{CatalogSchemaId, CatalogTable, TableIdentifier};
+use crate::evolution::SchemaChange;
 use crate::{TableError, TableSchema};
 use thiserror::Error;
 

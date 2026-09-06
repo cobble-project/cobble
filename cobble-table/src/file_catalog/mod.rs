@@ -3,12 +3,10 @@ use crate::catalog::{
     Catalog, CatalogError, CatalogResult, CatalogSchemaId, CatalogTable, SchemaChange, TableId,
     TableIdentifier,
 };
+use crate::evolution::{apply_schema_changes, compile_column_evolution, schema_field_ids};
 use crate::metadata::TableMetadata;
-use crate::{
-    DataField, FieldId, LogicalType, LogicalTypeKind, Table, TableError, TableSchema, Value,
-    ValueCodec,
-};
-use cobble::{ColumnEvolution, ColumnFamilyOptions, Config, Db};
+use crate::{FieldId, Table, TableError, TableSchema};
+use cobble::{ColumnFamilyOptions, Config, Db};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -228,7 +226,7 @@ impl FileCatalog {
                 }
                 current.version()
             } else {
-                let remap = build_column_remap(&existing, &target)?;
+                let remap = compile_column_evolution(&existing, &target)?;
                 let mut builder = db.update_schema();
                 builder.remap_columns(Some(physical_name.clone()), remap)?;
                 builder.set_column_family_options(
@@ -541,7 +539,7 @@ impl Catalog for FileCatalog {
                 version: CATALOG_VERSION,
                 table_id,
                 catalog_schema_id: CatalogSchemaId::INITIAL,
-                used_field_ids: schema_field_ids(&schema),
+                used_field_ids: sorted_field_ids(schema_field_ids(&schema)),
                 schema,
             };
             write_json(
@@ -621,13 +619,14 @@ impl Catalog for FileCatalog {
             let table_id = namespace.tables[entry_index].table_id;
             let current_catalog_schema_id = namespace.tables[entry_index].catalog_schema_id;
             let current_schema = self.load_schema(table_id, current_catalog_schema_id)?;
-            let mut used_field_ids = current_schema
+            let used_field_ids = current_schema
                 .used_field_ids
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>();
-            let next_schema =
-                apply_schema_changes(current_schema.schema, changes, &mut used_field_ids)?;
+            let (next_schema, used_field_ids) =
+                apply_schema_changes(current_schema.schema, changes, used_field_ids)
+                    .map_err(|error| CatalogError::InvalidSchemaEvolution(error.to_string()))?;
             let next_catalog_schema_id = current_catalog_schema_id.next().ok_or_else(|| {
                 CatalogError::InvalidSchemaEvolution("schema id space exhausted".to_string())
             })?;
@@ -861,188 +860,10 @@ fn validate_schema_mapping_key(
     Ok(())
 }
 
-fn build_column_remap(
-    existing: &TableMetadata,
-    target: &TableMetadata,
-) -> CatalogResult<Vec<ColumnEvolution>> {
-    if existing.layout.key_fields != target.layout.key_fields
-        || existing.layout.bucket_fields != target.layout.bucket_fields
-    {
-        return Err(TableError::InvalidSchema(
-            "catalog evolution changed the table key".to_string(),
-        )
-        .into());
-    }
-    let existing_fields = existing
-        .schema
-        .fields
-        .iter()
-        .map(|field| (field.id, field))
-        .collect::<HashMap<_, _>>();
-    for field in &target.schema.fields {
-        if let Some(previous) = existing_fields.get(&field.id)
-            && previous.logical_type != field.logical_type
-        {
-            return Err(TableError::InvalidSchema(format!(
-                "catalog evolution changed the type of field {}",
-                field.id.0
-            ))
-            .into());
-        }
-    }
-
-    if target.layout.value_columns.is_empty() {
-        return Ok(vec![ColumnEvolution::Default {
-            value: Vec::new().into(),
-        }]);
-    }
-    let existing_columns = existing
-        .layout
-        .value_columns
-        .iter()
-        .map(|column| (column.field_id, usize::from(column.column_index)))
-        .collect::<HashMap<_, _>>();
-    let target_fields = target
-        .schema
-        .fields
-        .iter()
-        .map(|field| (field.id, &field.logical_type))
-        .collect::<HashMap<_, _>>();
-    target
-        .layout
-        .value_columns
-        .iter()
-        .map(|column| {
-            if let Some(source) = existing_columns.get(&column.field_id) {
-                return Ok(ColumnEvolution::Source {
-                    source_index: *source,
-                    transform_id: None,
-                });
-            }
-            let logical_type = target_fields[&column.field_id];
-            Ok(ColumnEvolution::Default {
-                value: ValueCodec::encode_validated(logical_type, &Value::Null)?.into(),
-            })
-        })
-        .collect()
-}
-
-fn apply_schema_changes(
-    mut schema: TableSchema,
-    changes: Vec<SchemaChange>,
-    used_field_ids: &mut HashSet<FieldId>,
-) -> CatalogResult<TableSchema> {
-    if changes.is_empty() {
-        return Err(CatalogError::InvalidSchemaEvolution(
-            "schema changes must not be empty".to_string(),
-        ));
-    }
-    let key_ids = schema
-        .primary_key
-        .iter()
-        .chain(&schema.bucket_key)
-        .copied()
-        .collect::<HashSet<_>>();
-
-    for change in changes {
-        match change {
-            SchemaChange::AddField(field) => {
-                let mut added_ids = HashSet::new();
-                collect_field_ids(&field, &mut added_ids);
-                if let Some(reused) = added_ids.intersection(used_field_ids).next() {
-                    return Err(CatalogError::InvalidSchemaEvolution(format!(
-                        "field {} already exists",
-                        reused.0
-                    )));
-                }
-                if !field.logical_type.nullable {
-                    return Err(CatalogError::InvalidSchemaEvolution(format!(
-                        "added field '{}' must be nullable",
-                        field.name
-                    )));
-                }
-                used_field_ids.extend(added_ids);
-                schema.fields.push(field);
-            }
-            SchemaChange::RenameField { field_id, new_name } => {
-                let field = schema
-                    .fields
-                    .iter_mut()
-                    .find(|field| field.id == field_id)
-                    .ok_or_else(|| {
-                        CatalogError::InvalidSchemaEvolution(format!(
-                            "field {} does not exist",
-                            field_id.0
-                        ))
-                    })?;
-                field.name = new_name;
-            }
-            SchemaChange::DropField(field_id) => {
-                if key_ids.contains(&field_id) {
-                    return Err(CatalogError::InvalidSchemaEvolution(format!(
-                        "key field {} cannot be dropped",
-                        field_id.0
-                    )));
-                }
-                let index = schema
-                    .fields
-                    .iter()
-                    .position(|field| field.id == field_id)
-                    .ok_or_else(|| {
-                        CatalogError::InvalidSchemaEvolution(format!(
-                            "field {} does not exist",
-                            field_id.0
-                        ))
-                    })?;
-                schema.fields.remove(index);
-            }
-        }
-    }
-    TableSchema::new(schema.fields, schema.primary_key, schema.bucket_key)
-        .map_err(|error| CatalogError::InvalidSchemaEvolution(error.to_string()))
-}
-
-fn schema_field_ids(schema: &TableSchema) -> Vec<FieldId> {
-    let mut field_ids = HashSet::new();
-    for field in &schema.fields {
-        collect_field_ids(field, &mut field_ids);
-    }
-    sorted_field_ids(field_ids)
-}
-
 fn sorted_field_ids(field_ids: HashSet<FieldId>) -> Vec<FieldId> {
     let mut field_ids = field_ids.into_iter().collect::<Vec<_>>();
     field_ids.sort_unstable();
     field_ids
-}
-
-fn collect_field_ids(field: &DataField, field_ids: &mut HashSet<FieldId>) {
-    field_ids.insert(field.id);
-    collect_type_field_ids(&field.logical_type, field_ids);
-}
-
-fn collect_type_field_ids(logical_type: &LogicalType, field_ids: &mut HashSet<FieldId>) {
-    match &logical_type.kind {
-        LogicalTypeKind::List { element_type } => {
-            collect_type_field_ids(element_type, field_ids);
-        }
-        LogicalTypeKind::Map {
-            key_type,
-            value_type,
-        } => {
-            collect_type_field_ids(key_type, field_ids);
-            collect_type_field_ids(value_type, field_ids);
-        }
-        LogicalTypeKind::Struct { fields } => {
-            for field in fields {
-                collect_field_ids(field, field_ids);
-            }
-        }
-        LogicalTypeKind::Extension { extension } => {
-            collect_type_field_ids(&extension.physical_type, field_ids);
-        }
-        _ => {}
-    }
 }
 
 fn read_json<T: DeserializeOwned>(store: &CatalogStore, path: &str) -> CatalogResult<T> {

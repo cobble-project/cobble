@@ -246,6 +246,7 @@ exclusive-end semantics as raw `Db`.
 | `Table` / `ReadOnlyTable` | Borrowed table access when the application already manages the underlying database |
 | `TableSchema` / `TableKey` | Logical row structure and reusable encoded primary keys |
 | `TableProjection` | Reusable field selection for typed reads and scans |
+| `SchemaChange` | Add, rename, or drop top-level fields by name while retaining stable field identities |
 
 Define a new schema by name; field IDs are assigned automatically:
 
@@ -262,6 +263,10 @@ Use `LogicalType::struct_from_fields` for name-based nested fields. The schema b
 assigns IDs across the entire new schema, including nested fields. Explicit-ID
 `DataField::new` and `TableSchema::new` remain available for advanced integrations.
 When reopening existing tables, use their persisted schema; do not rebuild and renumber it.
+
+`Catalog::evolve_schema` accepts `SchemaChange` values. Added fields must be nullable;
+renaming preserves the field ID, and deleted IDs are never reused. Publishing a catalog
+schema does not refresh an already opened reader or writer automatically.
 
 Standalone readers and writers open storage directly from configuration; a catalog is not required.
 Selecting the current global snapshot captures its version when the reader opens; it does not

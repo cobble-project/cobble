@@ -8,6 +8,7 @@ mod bucket;
 pub mod catalog;
 mod codec;
 mod error;
+mod evolution;
 pub mod file_catalog;
 mod layout;
 mod logical_type;
@@ -21,9 +22,14 @@ mod table;
 #[path = "../tests/unit/metadata.rs"]
 mod metadata_tests;
 
+#[cfg(test)]
+#[path = "../tests/unit/evolution.rs"]
+mod evolution_tests;
+
 pub use bucket::BucketHash;
 pub use codec::{KeyCodec, Value, ValueCodec};
 pub use error::{Result, TableError};
+pub use evolution::SchemaChange;
 pub use logical_type::{
     DataField, ExtensionType, FieldId, LogicalType, LogicalTypeKind, TimestampKind,
 };

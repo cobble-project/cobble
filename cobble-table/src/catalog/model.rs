@@ -1,4 +1,4 @@
-use crate::{DataField, FieldId, TableSchema};
+use crate::TableSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
@@ -50,17 +50,6 @@ impl Display for CatalogSchemaId {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.0, formatter)
     }
-}
-
-/// An explicit, top-level catalog schema change.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SchemaChange {
-    /// Append a new nullable value field.
-    AddField(DataField),
-    /// Rename a field while retaining its stable field id.
-    RenameField { field_id: FieldId, new_name: String },
-    /// Drop a non-key field.
-    DropField(FieldId),
 }
 
 /// A semantic table name with an extensible, multi-component namespace.
