@@ -237,6 +237,40 @@ exclusive-end semantics as raw `Db`.
 
 ---
 
+## cobble-table
+
+| Type | Description |
+|------|-------------|
+| `TableWriterBuilder` / `TableWriter` | Open and own a writable table shard, with typed reads, writes, and snapshots |
+| `TableReaderBuilder` / `TableReader` | Open and own typed access to a fixed shard or global snapshot |
+| `Table` / `ReadOnlyTable` | Borrowed table access when the application already manages the underlying database |
+| `TableSchema` / `TableKey` | Logical row structure and reusable encoded primary keys |
+| `TableProjection` | Reusable field selection for typed reads and scans |
+
+Define a new schema by name; field IDs are assigned automatically:
+
+```rust
+let schema = TableSchema::builder()
+    .field("id", LogicalType::int64())
+    .field("name", LogicalType::string().nullable())
+    .primary_key(["id"])
+    .bucket_key(["id"])
+    .build()?;
+```
+
+Use `LogicalType::struct_from_fields` for name-based nested fields. The schema builder
+assigns IDs across the entire new schema, including nested fields. Explicit-ID
+`DataField::new` and `TableSchema::new` remain available for advanced integrations.
+When reopening existing tables, use their persisted schema; do not rebuild and renumber it.
+
+Standalone readers and writers open storage directly from configuration; a catalog is not required.
+Selecting the current global snapshot captures its version when the reader opens; it does not
+automatically follow later snapshots or schema changes.
+`TableWriter::snapshot()` starts an asynchronous snapshot; `snapshot_and_wait()` returns the
+completed `ShardSnapshotInput` for opening a reader or submitting to a snapshot coordinator.
+
+---
+
 ## cobble-web-monitor
 
 ### Types

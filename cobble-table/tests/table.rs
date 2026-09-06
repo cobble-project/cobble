@@ -1,5 +1,8 @@
-use cobble::{Config, DbBuilder, VolumeDescriptor};
-use cobble_table::{DataField, LogicalType, ReadOnlyTable, Table, TableKey, TableSchema, Value};
+use cobble::{Config, CoordinatorConfig, DbBuilder, DbCoordinator, VolumeDescriptor};
+use cobble_table::{
+    DataField, LogicalType, ReadOnlyTable, Table, TableKey, TableKeyBuilder, TableReaderBuilder,
+    TableSchema, TableWriterBuilder, Value,
+};
 use std::sync::mpsc;
 
 #[test]
@@ -321,8 +324,296 @@ fn schema_only_snapshot_preserves_empty_table() {
     assert_eq!(table.schema(), &schema);
 }
 
+#[test]
+fn standalone_table_shard_owns_storage_snapshots_and_cursors() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root.path().display())),
+        total_buckets: 1,
+        ..Config::default()
+    };
+    let writer_builder = || {
+        TableWriterBuilder::new(config.clone())
+            .table_name("events")
+            .db_id("owned-shard")
+            .bucket_ranges(vec![0..=0])
+    };
+    let schema = runtime_schema(LogicalType::string().nullable());
+    let writer = writer_builder().create(schema.clone()).unwrap();
+    let empty = writer.snapshot_and_wait().unwrap();
+    let empty_reader = TableReaderBuilder::new(config.clone())
+        .table_name("events")
+        .shard_snapshot(&empty.db_id, empty.snapshot_id)
+        .open()
+        .unwrap();
+    assert_eq!(empty_reader.schema(), &schema);
+    assert!(empty_reader.scan(0).unwrap().next().is_none());
+    drop(empty_reader);
+
+    let row = vec![Value::Int64(1), Value::String("first".into())];
+    let other = vec![Value::Int64(2), Value::Null];
+    let key = build_runtime_key(writer.key_builder(), &row[..1]);
+    let other_key = build_runtime_key(writer.key_builder(), &other[..1]);
+    let missing = build_runtime_key(writer.key_builder(), &[Value::Int64(3)]);
+    writer.put(&row).unwrap();
+    writer.put(&other).unwrap();
+    writer
+        .delete_batch(&[other_key.clone(), other_key.clone()])
+        .unwrap();
+    writer.put(&other).unwrap();
+    writer.delete(&other_key).unwrap();
+    assert_eq!(writer.get(&other_key).unwrap(), None);
+    assert_eq!(
+        writer
+            .multi_get(&[key.clone(), missing.clone(), key.clone()])
+            .unwrap(),
+        vec![Some(row.clone()), None, Some(row.clone())]
+    );
+    let snapshot = writer.snapshot_and_wait().unwrap();
+    let reader = TableReaderBuilder::new(config.clone())
+        .table_name("events")
+        .shard_snapshot(&snapshot.db_id, snapshot.snapshot_id)
+        .open()
+        .unwrap();
+    let reader_key = build_runtime_key(reader.key_builder(), &row[..1]);
+    assert_eq!(
+        reader.multi_get(&[missing, reader_key.clone()]).unwrap(),
+        vec![None, Some(row.clone())]
+    );
+
+    let updated = vec![Value::Int64(1), Value::String("second".into())];
+    writer.put(&updated).unwrap();
+    let latest = writer.snapshot_and_wait().unwrap();
+    assert_eq!(reader.get(&reader_key).unwrap(), Some(row.clone()));
+
+    // Both kinds of writer cursor must outlive the owning handle without
+    // triggering Db::drop while an iterator still holds its access guard.
+    let scan = writer.scan_bounds(0, Some(&key), None).unwrap();
+    let projection = writer.project_by_names(&["name", "id"]).unwrap();
+    assert_eq!(
+        projection.get(&key).unwrap(),
+        Some(vec![updated[1].clone(), updated[0].clone()])
+    );
+    let projected_scan = projection.scan(0).unwrap();
+    drop(projection);
+    drop(writer);
+    assert_eq!(
+        scan.collect::<Result<Vec<_>, _>>().unwrap(),
+        vec![updated.clone()]
+    );
+    assert_eq!(
+        projected_scan.collect::<Result<Vec<_>, _>>().unwrap(),
+        vec![vec![updated[1].clone(), updated[0].clone()]]
+    );
+
+    let resumed = writer_builder().resume().unwrap();
+    assert_eq!(resumed.schema(), &schema);
+    assert_eq!(resumed.get(&key).unwrap(), Some(updated));
+    assert!(resumed.shard_snapshot_input(latest.snapshot_id).is_ok());
+    resumed.close().unwrap();
+    drop(resumed);
+
+    let projection = reader.project_by_names(&["name"]).unwrap();
+    let scan = reader.scan(0).unwrap();
+    drop(reader);
+    assert_eq!(
+        projection.get(&reader_key).unwrap(),
+        Some(vec![row[1].clone()])
+    );
+    assert_eq!(scan.collect::<Result<Vec<_>, _>>().unwrap(), vec![row]);
+}
+
+#[test]
+fn standalone_table_global_reader_routes_pins_and_validates_schema() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root.path().display())),
+        total_buckets: 4,
+        ..Config::default()
+    };
+    let schema = runtime_schema(LogicalType::string().nullable());
+    let left = TableWriterBuilder::new(config.clone())
+        .table_name("events")
+        .db_id("left")
+        .bucket_ranges(vec![0..=1])
+        .create(schema.clone())
+        .unwrap();
+    let right = TableWriterBuilder::new(config.clone())
+        .table_name("events")
+        .db_id("right")
+        .bucket_ranges(vec![2..=3])
+        .create(schema.clone())
+        .unwrap();
+    let rows = (0..16)
+        .map(|id| vec![Value::Int64(id), Value::String(format!("row-{id}"))])
+        .collect::<Vec<_>>();
+    let keys = rows
+        .iter()
+        .map(|row| build_runtime_key(left.key_builder(), &row[..1]))
+        .collect::<Vec<_>>();
+    for (row, key) in rows.iter().zip(&keys) {
+        if key.bucket() < 2 {
+            left.put(row).unwrap();
+        } else {
+            right.put(row).unwrap();
+        }
+    }
+    let coordinator = DbCoordinator::open(CoordinatorConfig::from_config(&config)).unwrap();
+    let first = coordinator
+        .take_global_snapshot(
+            4,
+            vec![
+                left.snapshot_and_wait().unwrap(),
+                right.snapshot_and_wait().unwrap(),
+            ],
+        )
+        .unwrap();
+    coordinator.materialize_global_snapshot(&first).unwrap();
+
+    // The global manifest, not the caller's default config, determines key hashing.
+    let mut reader_config = config.clone();
+    reader_config.total_buckets = 64;
+    reader_config.reader.pin_partition_in_memory_count = 1;
+    let open_reader = || TableReaderBuilder::new(reader_config.clone()).table_name("events");
+    let reader = open_reader().current_global_snapshot().open().unwrap();
+    assert_eq!(reader.schema(), &schema);
+    let reader_keys = rows
+        .iter()
+        .map(|row| build_runtime_key(reader.key_builder(), &row[..1]))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reader_keys.iter().map(TableKey::bucket).collect::<Vec<_>>(),
+        keys.iter().map(TableKey::bucket).collect::<Vec<_>>()
+    );
+    let missing = build_runtime_key(reader.key_builder(), &[Value::Int64(100)]);
+    let mut requests = reader_keys.clone();
+    requests.extend([reader_keys[0].clone(), missing]);
+    let mut expected = rows.iter().cloned().map(Some).collect::<Vec<_>>();
+    expected.extend([Some(rows[0].clone()), None]);
+    assert_eq!(reader.multi_get(&requests).unwrap(), expected);
+    // Alternate routed shards with a one-entry cache, including projected batches.
+    for _ in 0..2 {
+        for (key, row) in reader_keys.iter().zip(&rows) {
+            assert_eq!(reader.get(key).unwrap(), Some(row.clone()));
+        }
+    }
+    let projection = reader.project_by_names(&["name"]).unwrap();
+    assert_eq!(
+        projection.multi_get(&reader_keys).unwrap(),
+        rows.iter()
+            .map(|row| Some(vec![row[1].clone()]))
+            .collect::<Vec<_>>()
+    );
+    for bucket in 0..4 {
+        let bucket_rows = rows
+            .iter()
+            .zip(&keys)
+            .filter(|(_, key)| key.bucket() == bucket)
+            .map(|(row, _)| row.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reader
+                .scan(bucket)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            bucket_rows
+        );
+    }
+
+    let updated = vec![rows[0][0].clone(), Value::String("updated".into())];
+    if keys[0].bucket() < 2 {
+        left.put(&updated).unwrap();
+    } else {
+        right.put(&updated).unwrap();
+    }
+    let second = coordinator
+        .take_global_snapshot(
+            4,
+            vec![
+                left.snapshot_and_wait().unwrap(),
+                right.snapshot_and_wait().unwrap(),
+            ],
+        )
+        .unwrap();
+    coordinator.materialize_global_snapshot(&second).unwrap();
+    assert_eq!(reader.get(&reader_keys[0]).unwrap(), Some(rows[0].clone()));
+    assert_eq!(
+        open_reader()
+            .global_snapshot(first.id)
+            .open()
+            .unwrap()
+            .get(&reader_keys[0])
+            .unwrap(),
+        Some(rows[0].clone())
+    );
+    assert_eq!(
+        open_reader()
+            .current_global_snapshot()
+            .open()
+            .unwrap()
+            .get(&reader_keys[0])
+            .unwrap(),
+        Some(updated)
+    );
+
+    let cursor = projection.scan(reader_keys[0].bucket()).unwrap();
+    drop(projection);
+    drop(reader);
+    assert_eq!(
+        cursor.collect::<Result<Vec<_>, _>>().unwrap(),
+        rows.iter()
+            .zip(&keys)
+            .filter(|(_, key)| key.bucket() == keys[0].bucket())
+            .map(|(row, _)| vec![row[1].clone()])
+            .collect::<Vec<_>>()
+    );
+
+    // There is no cross-shard schema negotiation in this first runtime step.
+    // A shard with a different layout must fail instead of decoding as `schema`.
+    right.close().unwrap();
+    let incompatible = TableWriterBuilder::new(config.clone())
+        .table_name("events")
+        .db_id("incompatible")
+        .bucket_ranges(vec![2..=3])
+        .create(runtime_schema(LogicalType::int64().nullable()))
+        .unwrap();
+    let mixed = coordinator
+        .take_global_snapshot(
+            4,
+            vec![
+                left.snapshot_and_wait().unwrap(),
+                incompatible.snapshot_and_wait().unwrap(),
+            ],
+        )
+        .unwrap();
+    coordinator.materialize_global_snapshot(&mixed).unwrap();
+    let reader = open_reader().current_global_snapshot().open().unwrap();
+    let right_key = keys.iter().find(|key| key.bucket() >= 2).unwrap();
+    assert!(matches!(
+        reader.get(right_key),
+        Err(cobble_table::TableError::InvalidSchema(_))
+    ));
+    drop(reader);
+    incompatible.close().unwrap();
+    left.close().unwrap();
+}
+
+fn runtime_schema(value_type: LogicalType) -> TableSchema {
+    TableSchema::builder()
+        .field("id", LogicalType::int64())
+        .field("name", value_type)
+        .primary_key(["id"])
+        .bucket_key(["id"])
+        .build()
+        .unwrap()
+}
+
 fn build_key(table: &Table<'_>, values: &[Value]) -> TableKey {
-    let mut builder = table.key_builder();
+    build_runtime_key(table.key_builder(), values)
+}
+
+fn build_runtime_key(mut builder: TableKeyBuilder, values: &[Value]) -> TableKey {
     for value in values {
         builder.push(value.clone());
     }
@@ -330,9 +621,5 @@ fn build_key(table: &Table<'_>, values: &[Value]) -> TableKey {
 }
 
 fn build_read_only_key(table: &ReadOnlyTable<'_>, values: &[Value]) -> TableKey {
-    let mut builder = table.key_builder();
-    for value in values {
-        builder.push(value.clone());
-    }
-    builder.build().unwrap()
+    build_runtime_key(table.key_builder(), values)
 }

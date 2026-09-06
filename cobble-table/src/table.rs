@@ -8,9 +8,9 @@ use cobble::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-struct CompiledTable {
-    schema: TableSchema,
-    key_positions: Vec<usize>,
+pub(crate) struct CompiledTable {
+    pub(crate) schema: TableSchema,
+    pub(crate) key_positions: Vec<usize>,
     key_types: Vec<LogicalType>,
     bucket_key_fields: usize,
     value_positions: Vec<usize>,
@@ -19,10 +19,10 @@ struct CompiledTable {
     bucket_hash: BucketHash,
 }
 
-struct TableKeyData {
-    values: Vec<Value>,
-    bucket: u16,
-    encoded: Vec<u8>,
+pub(crate) struct TableKeyData {
+    pub(crate) values: Vec<Value>,
+    pub(crate) bucket: u16,
+    pub(crate) encoded: Vec<u8>,
 }
 
 /// A validated and encoded primary key for a table.
@@ -30,7 +30,7 @@ struct TableKeyData {
 /// Cloning a key is cheap and shares its encoded bytes and typed values.
 #[derive(Clone)]
 pub struct TableKey {
-    inner: Arc<TableKeyData>,
+    pub(crate) inner: Arc<TableKeyData>,
 }
 
 impl TableKey {
@@ -43,8 +43,8 @@ impl TableKey {
 
 /// Incrementally builds one table primary key in schema order.
 pub struct TableKeyBuilder {
-    compiled: Arc<CompiledTable>,
-    values: Vec<Value>,
+    pub(crate) compiled: Arc<CompiledTable>,
+    pub(crate) values: Vec<Value>,
 }
 
 enum ProjectedFieldSource {
@@ -62,46 +62,56 @@ struct ProjectionPlan {
     has_key_fields: bool,
 }
 
-#[derive(Clone, Copy)]
 enum TableReadBackend<'db> {
     Writable(&'db Db),
     ReadOnly(&'db ReadOnlyDb),
+    Runtime(Arc<crate::runtime::RuntimeReadBackend>),
 }
 
 impl<'db> TableReadBackend<'db> {
     fn get_with_options(
-        self,
+        &self,
         bucket: u16,
         key: &[u8],
         options: &ReadOptions,
-    ) -> cobble::Result<Option<Vec<Option<Bytes>>>> {
+    ) -> Result<Option<Vec<Option<Bytes>>>> {
         match self {
-            Self::Writable(db) => db.get_with_options(bucket, key, options),
-            Self::ReadOnly(db) => db.get_with_options(bucket, key, options),
+            Self::Writable(db) => Ok(db.get_with_options(bucket, key, options)?),
+            Self::ReadOnly(db) => Ok(db.get_with_options(bucket, key, options)?),
+            Self::Runtime(backend) => backend.get(bucket, key, options),
         }
     }
 
     fn multi_get_with_options(
-        self,
+        &self,
         keys: &[(u16, &[u8])],
         options: &ReadOptions,
-    ) -> cobble::Result<Vec<Option<Vec<Option<Bytes>>>>> {
+    ) -> Result<Vec<Option<Vec<Option<Bytes>>>>> {
         match self {
-            Self::Writable(db) => db.multi_get_with_options(keys, options),
-            Self::ReadOnly(db) => db.multi_get_with_options(keys, options),
+            Self::Writable(db) => Ok(db.multi_get_with_options(keys, options)?),
+            Self::ReadOnly(db) => Ok(db.multi_get_with_options(keys, options)?),
+            Self::Runtime(backend) => backend.multi_get(keys, options),
         }
     }
 
     fn scan_with_options_bounds(
-        self,
+        &self,
         bucket: u16,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         options: &ScanOptions,
-    ) -> cobble::Result<DbIterator> {
+    ) -> Result<DbIterator> {
         match self {
-            Self::Writable(db) => db.scan_with_options_bounds(bucket, start, end, options),
-            Self::ReadOnly(db) => db.scan_with_options_bounds(bucket, start, end, options),
+            Self::Writable(db) => Ok(db.scan_with_options_bounds(bucket, start, end, options)?),
+            Self::ReadOnly(db) => Ok(db.scan_with_options_bounds(bucket, start, end, options)?),
+            Self::Runtime(backend) => backend.scan(bucket, start, end, options),
+        }
+    }
+
+    fn writer_backend(&self) -> Option<Arc<Db>> {
+        match self {
+            Self::Writable(_) | Self::ReadOnly(_) => None,
+            Self::Runtime(backend) => backend.writer_backend(),
         }
     }
 }
@@ -165,31 +175,7 @@ impl<'db> Table<'db> {
     /// Create a table or reopen it when its persisted schema is identical.
     pub fn create(db: &'db Db, name: impl Into<String>, schema: TableSchema) -> Result<Self> {
         let name = validate_name(name.into())?;
-        let metadata = TableMetadata::compile(schema)?;
-        let expected_columns = metadata.layout.value_columns.len().max(1);
-        let current = db.current_schema();
-        if let Some(id) = current.column_family_ids().get(&name).copied() {
-            let existing = load_metadata(&current.column_family_options_in_family(id))?;
-            if existing != metadata || current.num_columns_in_family(id) != Some(expected_columns) {
-                return Err(TableError::InvalidSchema(format!(
-                    "column family '{name}' is not this table"
-                )));
-            }
-        } else {
-            let mut builder = db.update_schema();
-            builder.ensure_column_family_exists(name.clone())?;
-            for column in 0..expected_columns {
-                builder.add_column(column, None, None, Some(name.clone()))?;
-            }
-            builder.set_column_family_options(
-                Some(name.clone()),
-                ColumnFamilyOptions {
-                    metadata: Some(metadata.to_value()?),
-                    ..ColumnFamilyOptions::default()
-                },
-            )?;
-            builder.commit();
-        }
+        let metadata = ensure_table_schema(db, &name, schema)?;
         Self::from_metadata(db, name, metadata)
     }
 
@@ -263,19 +249,7 @@ impl<'db> Table<'db> {
     }
 
     fn put_bound(&self, row: &[Value], options: &WriteOptions) -> Result<()> {
-        let (bucket, key) = self.encode_row_key(row)?;
-        let mut values = Vec::with_capacity(self.compiled.physical_columns);
-        for (position, logical_type) in self
-            .compiled
-            .value_positions
-            .iter()
-            .zip(&self.compiled.value_types)
-        {
-            values.push(ValueCodec::encode_validated(logical_type, &row[*position])?);
-        }
-        if values.is_empty() {
-            values.push(vec![1]);
-        }
+        let (bucket, key, values) = encode_table_row(&self.compiled, row)?;
         self.db
             .put_columns_with_options(bucket, key, &values, options)?;
         Ok(())
@@ -285,7 +259,9 @@ impl<'db> Table<'db> {
     pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
         self.db
             .get_with_options(key.inner.bucket, &key.inner.encoded, &self.read_options)?
-            .map(|columns| self.assemble_row_from_key_values(&key.inner.values, &columns))
+            .map(|columns| {
+                assemble_row_from_key_values(&self.compiled, &key.inner.values, &columns)
+            })
             .transpose()
     }
 
@@ -301,7 +277,9 @@ impl<'db> Table<'db> {
             .zip(keys)
             .map(|(columns, key)| {
                 columns
-                    .map(|columns| self.assemble_row_from_key_values(&key.inner.values, &columns))
+                    .map(|columns| {
+                        assemble_row_from_key_values(&self.compiled, &key.inner.values, &columns)
+                    })
                     .transpose()
             })
             .collect()
@@ -328,6 +306,7 @@ impl<'db> Table<'db> {
                 end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
                 &self.scan_options,
             )?,
+            _writer_backend: None,
             compiled: Arc::clone(&self.compiled),
         })
     }
@@ -347,30 +326,39 @@ impl<'db> Table<'db> {
             write_options: WriteOptions::with_column_family(name),
         })
     }
+}
 
-    fn encode_row_key(&self, row: &[Value]) -> Result<(u16, Vec<u8>)> {
-        if row.len() != self.compiled.schema.fields.len() {
-            return Err(TableError::codec("row field count does not match schema"));
+pub(crate) fn ensure_table_schema(
+    db: &Db,
+    name: &str,
+    schema: TableSchema,
+) -> Result<TableMetadata> {
+    let metadata = TableMetadata::compile(schema)?;
+    let expected_columns = metadata.layout.value_columns.len().max(1);
+    let current = db.current_schema();
+    if let Some(id) = current.column_family_ids().get(name).copied() {
+        let existing = load_metadata(&current.column_family_options_in_family(id))?;
+        if existing != metadata || current.num_columns_in_family(id) != Some(expected_columns) {
+            return Err(TableError::InvalidSchema(format!(
+                "column family '{name}' is not this table"
+            )));
         }
-        let (encoded, prefix_end) = KeyCodec::encode_row_from_positions_validated(
-            &self.compiled.key_types,
-            row,
-            &self.compiled.key_positions,
-            self.compiled.bucket_key_fields,
+    } else {
+        let mut builder = db.update_schema();
+        builder.ensure_column_family_exists(name.to_string())?;
+        for column in 0..expected_columns {
+            builder.add_column(column, None, None, Some(name.to_string()))?;
+        }
+        builder.set_column_family_options(
+            Some(name.to_string()),
+            ColumnFamilyOptions {
+                metadata: Some(metadata.to_value()?),
+                ..ColumnFamilyOptions::default()
+            },
         )?;
-        Ok((
-            self.compiled.bucket_hash.bucket(&encoded[..prefix_end]),
-            encoded,
-        ))
+        builder.commit();
     }
-
-    fn assemble_row_from_key_values(
-        &self,
-        primary_key: &[Value],
-        columns: &[Option<Bytes>],
-    ) -> Result<Vec<Value>> {
-        assemble_row_from_key_values(&self.compiled, primary_key, columns)
-    }
+    Ok(metadata)
 }
 
 impl<'db> ReadOnlyTable<'db> {
@@ -466,6 +454,7 @@ impl<'db> ReadOnlyTable<'db> {
                 end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
                 &self.scan_options,
             )?,
+            _writer_backend: None,
             compiled: Arc::clone(&self.compiled),
         })
     }
@@ -533,21 +522,42 @@ impl TableProjection<'_> {
                 end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
                 &self.scan_options,
             )?,
+            _writer_backend: self.backend.writer_backend(),
             compiled: Arc::clone(&self.compiled),
             plan: Arc::clone(&self.plan),
         })
     }
 }
 
+impl TableProjection<'static> {
+    pub(crate) fn from_runtime<S: AsRef<str>>(
+        backend: Arc<crate::runtime::RuntimeReadBackend>,
+        name: String,
+        compiled: Arc<CompiledTable>,
+        field_names: &[S],
+    ) -> Result<Self> {
+        build_projection(
+            TableReadBackend::Runtime(backend),
+            &name,
+            compiled,
+            field_names,
+        )
+    }
+}
+
 /// Iterator over typed rows from a bucket-scoped table scan.
 pub struct TableScan {
-    inner: DbIterator,
-    compiled: Arc<CompiledTable>,
+    pub(crate) inner: DbIterator,
+    // `inner` drops first, releasing Db's owned access guard before this can
+    // release the last writer backend reference.
+    pub(crate) _writer_backend: Option<Arc<Db>>,
+    pub(crate) compiled: Arc<CompiledTable>,
 }
 
 /// Iterator over projected typed rows from a bucket-scoped scan.
 pub struct ProjectedTableScan {
     inner: DbIterator,
+    _writer_backend: Option<Arc<Db>>,
     compiled: Arc<CompiledTable>,
     plan: Arc<ProjectionPlan>,
 }
@@ -587,7 +597,7 @@ impl Iterator for TableScan {
     }
 }
 
-fn assemble_row_from_key_values(
+pub(crate) fn assemble_row_from_key_values(
     compiled: &CompiledTable,
     key_values: &[Value],
     columns: &[Option<Bytes>],
@@ -599,6 +609,33 @@ fn assemble_row_from_key_values(
     }
     decode_value_columns(compiled, &mut row, columns)?;
     Ok(row)
+}
+
+pub(crate) fn encode_table_row(
+    compiled: &CompiledTable,
+    row: &[Value],
+) -> Result<(u16, Vec<u8>, Vec<Vec<u8>>)> {
+    if row.len() != compiled.schema.fields.len() {
+        return Err(TableError::codec("row field count does not match schema"));
+    }
+    let (encoded, prefix_end) = KeyCodec::encode_row_from_positions_validated(
+        &compiled.key_types,
+        row,
+        &compiled.key_positions,
+        compiled.bucket_key_fields,
+    )?;
+    let mut values = Vec::with_capacity(compiled.physical_columns);
+    for (position, logical_type) in compiled.value_positions.iter().zip(&compiled.value_types) {
+        values.push(ValueCodec::encode_validated(logical_type, &row[*position])?);
+    }
+    if values.is_empty() {
+        values.push(vec![1]);
+    }
+    Ok((
+        compiled.bucket_hash.bucket(&encoded[..prefix_end]),
+        encoded,
+        values,
+    ))
 }
 
 fn assemble_projected_row(
@@ -657,6 +694,22 @@ fn build_projection<'db, S: AsRef<str>>(
     compiled: Arc<CompiledTable>,
     field_names: &[S],
 ) -> Result<TableProjection<'db>> {
+    let (plan, read_options, scan_options) =
+        build_projection_parts(name, Arc::clone(&compiled), field_names)?;
+    Ok(TableProjection {
+        backend,
+        compiled,
+        plan,
+        read_options,
+        scan_options,
+    })
+}
+
+fn build_projection_parts<S: AsRef<str>>(
+    name: &str,
+    compiled: Arc<CompiledTable>,
+    field_names: &[S],
+) -> Result<(Arc<ProjectionPlan>, ReadOptions, ScanOptions)> {
     if field_names.is_empty() {
         return Err(TableError::InvalidSchema(
             "table projection must contain at least one field".to_string(),
@@ -705,23 +758,20 @@ fn build_projection<'db, S: AsRef<str>>(
     if physical_columns.is_empty() {
         physical_columns.push(0);
     }
-    Ok(TableProjection {
-        backend,
-        compiled,
-        plan: Arc::new(ProjectionPlan {
+    Ok((
+        Arc::new(ProjectionPlan {
             sources,
             has_key_fields,
         }),
-        read_options: ReadOptions::for_columns_in_family(
-            name.to_string(),
-            physical_columns.clone(),
-        ),
-        scan_options: ScanOptions::for_columns(physical_columns)
-            .with_column_family(name.to_string()),
-    })
+        ReadOptions::for_columns_in_family(name.to_string(), physical_columns.clone()),
+        ScanOptions::for_columns(physical_columns).with_column_family(name.to_string()),
+    ))
 }
 
-fn compile_table(metadata: TableMetadata, total_buckets: u32) -> Result<Arc<CompiledTable>> {
+pub(crate) fn compile_table(
+    metadata: TableMetadata,
+    total_buckets: u32,
+) -> Result<Arc<CompiledTable>> {
     metadata.validate()?;
     let positions = metadata
         .schema
@@ -762,7 +812,7 @@ fn compile_table(metadata: TableMetadata, total_buckets: u32) -> Result<Arc<Comp
     }))
 }
 
-fn load_table_metadata(schema: &Schema, name: &str) -> Result<TableMetadata> {
+pub(crate) fn load_table_metadata(schema: &Schema, name: &str) -> Result<TableMetadata> {
     let id = schema
         .column_family_ids()
         .get(name)
@@ -777,7 +827,7 @@ fn load_table_metadata(schema: &Schema, name: &str) -> Result<TableMetadata> {
     Ok(metadata)
 }
 
-fn validate_bound(bucket: u16, key: Option<&TableKey>) -> Result<()> {
+pub(crate) fn validate_bound(bucket: u16, key: Option<&TableKey>) -> Result<()> {
     if key.is_some_and(|key| key.inner.bucket != bucket) {
         return Err(TableError::codec(
             "table scan bound belongs to a different bucket",
@@ -794,7 +844,7 @@ fn load_metadata(options: &ColumnFamilyOptions) -> Result<TableMetadata> {
     TableMetadata::from_value(metadata)
 }
 
-fn validate_name(name: String) -> Result<String> {
+pub(crate) fn validate_name(name: String) -> Result<String> {
     if name.is_empty() || name != name.trim() {
         return Err(TableError::InvalidSchema(
             "table name must be non-empty without surrounding whitespace".to_string(),

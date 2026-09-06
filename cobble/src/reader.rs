@@ -13,7 +13,7 @@ use crate::paths::{
 };
 use crate::schema::SchemaTransformRegistry;
 use crate::util::{build_commit_short_id, build_version_string};
-use crate::{Config, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, VolumeDescriptor};
+use crate::{Config, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, Schema, VolumeDescriptor};
 use bytes::Bytes;
 use log::info;
 use serde_json::Error as SerdeError;
@@ -127,7 +127,7 @@ impl Reader {
         let block_cache_size =
             crate::util::size_to_usize("reader.block_cache_size", read_config.block_cache_size)
                 .map_err(Error::ConfigError)?;
-        let config = Config {
+        let mut config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
             block_cache_size: read_config.block_cache_size,
@@ -154,6 +154,10 @@ impl Reader {
         let fs = registry.get_or_register_volume(meta_volume)?;
         let manifest_name = snapshot_manifest_name(global_snapshot_id);
         let global_snapshot = load_global_snapshot_by_name(&fs, &manifest_name)?;
+        // A global manifest is authoritative for bucket routing. In particular,
+        // callers may use a reader config inherited from a differently sized
+        // writer without changing the key hash used for this fixed view.
+        config.total_buckets = global_snapshot.total_buckets;
         let bucket_map = build_bucket_map(&global_snapshot)?;
         let db_id = Uuid::new_v4().to_string();
         let block_cache = if block_cache_size > 0 {
@@ -213,7 +217,7 @@ impl Reader {
         let block_cache_size =
             crate::util::size_to_usize("reader.block_cache_size", read_config.block_cache_size)
                 .map_err(Error::ConfigError)?;
-        let config = Config {
+        let mut config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
             block_cache_size: read_config.block_cache_size,
@@ -241,6 +245,7 @@ impl Reader {
         let (pointer, modified) = read_manifest_pointer(&fs, None)?
             .ok_or_else(|| Error::IoError("Global snapshot pointer missing".to_string()))?;
         let global_snapshot = load_global_snapshot_by_name(&fs, &pointer)?;
+        config.total_buckets = global_snapshot.total_buckets;
         let bucket_map = build_bucket_map(&global_snapshot)?;
         let db_id = Uuid::new_v4().to_string();
         let block_cache = if block_cache_size > 0 {
@@ -354,6 +359,33 @@ impl Reader {
         db.scan_with_options(bucket_id, range, options)
     }
 
+    /// Scan a routed bucket with optional key bounds. The returned iterator
+    /// retains its snapshot resources independently of the reader cache.
+    pub fn scan_with_options_bounds(
+        &mut self,
+        bucket_id: u16,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        options: &ScanOptions,
+    ) -> Result<DbIterator> {
+        if self.auto_refresh {
+            self.refresh_if_changed(false)?;
+        }
+        let snapshot_key = self.snapshot_key_for_bucket(bucket_id)?;
+        let db = self.load_snapshot(&snapshot_key)?;
+        db.scan_with_options_bounds(bucket_id, start, end, options)
+    }
+
+    /// Return the schema belonging to the routed shard for a bucket in this
+    /// reader's current view. Fixed readers never refresh this view.
+    pub fn schema_for_bucket(&mut self, bucket_id: u16) -> Result<Arc<Schema>> {
+        if self.auto_refresh {
+            self.refresh_if_changed(false)?;
+        }
+        let snapshot_key = self.snapshot_key_for_bucket(bucket_id)?;
+        Ok(self.load_snapshot(&snapshot_key)?.current_schema())
+    }
+
     pub fn read_mode(&self) -> &'static str {
         if self.fixed_snapshot_id.is_some() {
             "snapshot"
@@ -364,6 +396,14 @@ impl Reader {
 
     pub fn configured_snapshot_id(&self) -> Option<u64> {
         self.fixed_snapshot_id
+    }
+
+    /// Freeze a current-pointer reader at the manifest it has already loaded.
+    /// This does not reload metadata or open any shard snapshots, and does not
+    /// retain the selected snapshot against external expiration.
+    pub fn pin_current_snapshot(&mut self) {
+        self.auto_refresh = false;
+        self.fixed_snapshot_id = Some(self.global_snapshot.id);
     }
 
     pub fn current_global_snapshot(&self) -> &GlobalSnapshotManifest {
@@ -479,6 +519,7 @@ impl Reader {
         }
         let global_snapshot = load_global_snapshot_by_name(&self.fs, &pointer)?;
         let bucket_map = build_bucket_map(&global_snapshot)?;
+        self.config.total_buckets = global_snapshot.total_buckets;
         self.global_snapshot = global_snapshot;
         self.bucket_map = bucket_map;
         self.last_pointer = Some(pointer);

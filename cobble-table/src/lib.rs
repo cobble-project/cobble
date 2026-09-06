@@ -12,6 +12,7 @@ pub mod file_catalog;
 mod layout;
 mod logical_type;
 mod metadata;
+mod runtime;
 mod schema;
 pub mod snapshot;
 mod table;
@@ -26,7 +27,8 @@ pub use error::{Result, TableError};
 pub use logical_type::{
     DataField, ExtensionType, FieldId, LogicalType, LogicalTypeKind, TimestampKind,
 };
-pub use schema::TableSchema;
+pub use runtime::{TableReader, TableReaderBuilder, TableWriter, TableWriterBuilder};
+pub use schema::{TableSchema, TableSchemaBuilder};
 pub use table::{
     ProjectedTableScan, ReadOnlyTable, Table, TableKey, TableKeyBuilder, TableProjection, TableScan,
 };

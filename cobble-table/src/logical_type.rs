@@ -182,6 +182,32 @@ impl LogicalType {
         Self::new(LogicalTypeKind::Struct { fields })
     }
 
+    /// Build a fresh struct type without requiring callers to assign field ids.
+    ///
+    /// The assigned ids are local to this type and are renumbered again when
+    /// the type is included in a [`crate::TableSchemaBuilder`]. Use
+    /// [`Self::struct_type`] with explicit [`FieldId`] values only when
+    /// restoring or constructing an already identified schema.
+    pub fn struct_from_fields<I, N>(fields: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (N, LogicalType)>,
+        N: Into<String>,
+    {
+        let mut fields = fields
+            .into_iter()
+            .map(|(name, logical_type)| DataField {
+                id: FieldId(0),
+                name: name.into(),
+                logical_type,
+            })
+            .collect::<Vec<_>>();
+        let mut next_id = 0;
+        assign_fresh_field_ids(&mut fields, &mut next_id)?;
+        let logical_type = Self::struct_type(fields);
+        logical_type.validate()?;
+        Ok(logical_type)
+    }
+
     pub fn extension(extension: ExtensionType) -> Self {
         Self::new(LogicalTypeKind::Extension { extension })
     }
@@ -266,6 +292,11 @@ pub struct DataField {
 }
 
 impl DataField {
+    /// Construct a field with an explicit persisted id.
+    ///
+    /// Prefer [`crate::TableSchemaBuilder`] for fresh schemas. This constructor
+    /// is intended for advanced uses such as restoration and interoperating
+    /// with a schema whose field identities are already known.
     pub fn new(
         id: impl Into<FieldId>,
         name: impl Into<String>,
@@ -288,5 +319,35 @@ impl DataField {
             )));
         }
         self.logical_type.validate()
+    }
+}
+
+/// Assign deterministic, depth-first preorder field ids to a fresh field tree.
+pub(crate) fn assign_fresh_field_ids(fields: &mut [DataField], next_id: &mut u32) -> Result<()> {
+    for field in fields {
+        field.id = FieldId(*next_id);
+        *next_id = next_id.checked_add(1).ok_or_else(|| {
+            TableError::InvalidSchema("fresh schema exceeds available field ids".to_string())
+        })?;
+        assign_fresh_type_ids(&mut field.logical_type, next_id)?;
+    }
+    Ok(())
+}
+
+fn assign_fresh_type_ids(logical_type: &mut LogicalType, next_id: &mut u32) -> Result<()> {
+    match &mut logical_type.kind {
+        LogicalTypeKind::List { element_type } => assign_fresh_type_ids(element_type, next_id),
+        LogicalTypeKind::Map {
+            key_type,
+            value_type,
+        } => {
+            assign_fresh_type_ids(key_type, next_id)?;
+            assign_fresh_type_ids(value_type, next_id)
+        }
+        LogicalTypeKind::Struct { fields } => assign_fresh_field_ids(fields, next_id),
+        LogicalTypeKind::Extension { extension } => {
+            assign_fresh_type_ids(&mut extension.physical_type, next_id)
+        }
+        _ => Ok(()),
     }
 }
