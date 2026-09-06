@@ -2,7 +2,8 @@ use crate::structured_db::{
     StructuredColumnValue, StructuredDbIterator, StructuredReadOptions, StructuredScanOptions,
     StructuredSchema, combined_resolver, decode_row, load_structured_schema_from_cobble_schema,
 };
-use cobble::{Config, MergeOperatorResolver, ReadOnlyDb, Result};
+use bytes::Bytes;
+use cobble::{Config, MergeOperatorResolver, ReadOnlyDb, ReadOnlyDbBuilder, Result};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -13,7 +14,61 @@ pub struct StructuredReadOnlyDb {
     default_scan_options: StructuredScanOptions,
 }
 
+/// Builder for a snapshot-backed structured database with runtime schema wiring.
+pub struct StructuredReadOnlyDbBuilder {
+    inner: ReadOnlyDbBuilder,
+}
+
+impl StructuredReadOnlyDbBuilder {
+    pub fn new(config: Config) -> Self {
+        Self {
+            inner: ReadOnlyDbBuilder::new(config).merge_operator_resolver(combined_resolver(None)),
+        }
+    }
+
+    pub fn db_id(mut self, db_id: impl Into<String>) -> Self {
+        self.inner = self.inner.db_id(db_id);
+        self
+    }
+
+    pub fn merge_operator_resolver(mut self, resolver: Arc<dyn MergeOperatorResolver>) -> Self {
+        self.inner = self
+            .inner
+            .merge_operator_resolver(combined_resolver(Some(resolver)));
+        self
+    }
+
+    /// Register a raw single-column transform before opening persisted schemas.
+    pub fn register_schema_transform<F>(
+        mut self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<Self>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.inner = self
+            .inner
+            .register_schema_transform(transform_id, transform)?;
+        Ok(self)
+    }
+
+    pub fn open(self, snapshot_id: u64) -> Result<StructuredReadOnlyDb> {
+        StructuredReadOnlyDb::from_db(self.inner.open(snapshot_id)?)
+    }
+}
+
 impl StructuredReadOnlyDb {
+    fn from_db(db: ReadOnlyDb) -> Result<Self> {
+        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
+        Ok(Self {
+            db,
+            structured_schema: Arc::new(structured_schema),
+            default_read_options: StructuredReadOptions::default(),
+            default_scan_options: StructuredScanOptions::default(),
+        })
+    }
+
     pub fn open(config: Config, snapshot_id: u64, db_id: impl Into<String>) -> Result<Self> {
         Self::open_with_resolver(config, snapshot_id, db_id, None)
     }
@@ -30,13 +85,7 @@ impl StructuredReadOnlyDb {
             db_id,
             combined_resolver(resolver),
         )?;
-        let structured_schema = load_structured_schema_from_cobble_schema(&db.current_schema())?;
-        Ok(Self {
-            db,
-            structured_schema: Arc::new(structured_schema),
-            default_read_options: StructuredReadOptions::default(),
-            default_scan_options: StructuredScanOptions::default(),
-        })
+        Self::from_db(db)
     }
 
     pub fn id(&self) -> &str {
@@ -45,6 +94,18 @@ impl StructuredReadOnlyDb {
 
     pub fn current_schema(&self) -> StructuredSchema {
         self.structured_schema.as_ref().clone()
+    }
+
+    /// Register a raw single-column transform before using its persisted ID.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.db.register_schema_transform(transform_id, transform)
     }
 
     pub fn get(

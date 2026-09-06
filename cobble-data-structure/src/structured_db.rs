@@ -2,7 +2,7 @@
 use crate::list::encode_borrowed_list_for_write;
 use crate::list::{
     LIST_OPERATOR_ID, ListConfig, decode_list_for_read, encode_list_for_write, list_operator,
-    list_operator_from_metadata,
+    list_operator_from_metadata, transform_list_elements,
 };
 use crate::priority_queue::{
     PriorityQueue, priority_queue_column_family_name, priority_queue_column_family_options,
@@ -11,9 +11,9 @@ use crate::priority_queue::{
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use cobble::{
-    BytesMergeOperator, Config, Db, DbIterator, Error, MemtableType, MergeOperatorResolver,
-    ReadOptions, RecoveryMode, Result, ScanOptions, Schema, SchemaBuilder, ShardSnapshotInput,
-    WriteBatch, WriteOptions,
+    BytesMergeOperator, ColumnEvolution, Config, Db, DbBuilder, DbIterator, Error, MemtableType,
+    MergeOperatorResolver, ReadOptions, RecoveryMode, Result, ScanOptions, Schema, SchemaBuilder,
+    ShardSnapshotInput, WriteBatch, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -41,6 +41,31 @@ pub enum StructuredColumnType {
     #[default]
     Bytes,
     List(ListConfig),
+}
+
+impl StructuredColumnType {
+    /// Adapt an element transform into a raw List-column schema transform.
+    ///
+    /// The returned callback can be registered on writers, readers, or standalone
+    /// compactors. It preserves null/empty lists, element order/count, and original
+    /// expiration timestamps, without filtering expired elements or applying caps.
+    /// `config.preserve_element_ttl` must match the source and target List encoding;
+    /// the other config fields do not affect this adapter.
+    pub fn list_element_transform<F>(
+        config: ListConfig,
+        transform: F,
+    ) -> impl Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static
+    where
+        F: Fn(Bytes) -> Result<Bytes> + Send + Sync + 'static,
+    {
+        move |value| {
+            value
+                .map(|payload| {
+                    transform_list_elements(payload, config.preserve_element_ttl, &transform)
+                })
+                .transpose()
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +111,14 @@ impl StructuredColumnFamilySchema {
             shifted.insert(shifted_column, existing_type);
         }
         self.columns = shifted;
+    }
+
+    fn set_column_type(&mut self, column: u16, column_type: StructuredColumnType) {
+        if matches!(column_type, StructuredColumnType::Bytes) {
+            self.columns.remove(&column);
+        } else {
+            self.columns.insert(column, column_type);
+        }
     }
 }
 
@@ -632,9 +665,96 @@ pub struct StructuredDb {
     default_scan_options: StructuredScanOptions,
 }
 
+/// Builder for opening a structured database with runtime schema wiring.
+pub struct StructuredDbBuilder {
+    inner: DbBuilder,
+}
+
+impl StructuredDbBuilder {
+    pub fn new(config: Config) -> Self {
+        Self {
+            inner: DbBuilder::new(config).merge_operator_resolver(combined_resolver(None)),
+        }
+    }
+
+    pub fn bucket_ranges(mut self, bucket_ranges: Vec<RangeInclusive<u16>>) -> Self {
+        self.inner = self.inner.bucket_ranges(bucket_ranges);
+        self
+    }
+
+    pub fn db_id(mut self, db_id: impl Into<String>) -> Self {
+        self.inner = self.inner.db_id(db_id);
+        self
+    }
+
+    pub fn merge_operator_resolver(mut self, resolver: Arc<dyn MergeOperatorResolver>) -> Self {
+        self.inner = self
+            .inner
+            .merge_operator_resolver(combined_resolver(Some(resolver)));
+        self
+    }
+
+    /// Register a raw single-column transform before opening persisted schemas.
+    pub fn register_schema_transform<F>(
+        mut self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<Self>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.inner = self
+            .inner
+            .register_schema_transform(transform_id, transform)?;
+        Ok(self)
+    }
+
+    pub fn open(self) -> Result<StructuredDb> {
+        StructuredDb::from_db(self.inner.open()?)
+    }
+
+    pub fn open_from_snapshot(self, snapshot_id: u64) -> Result<StructuredDb> {
+        StructuredDb::from_db(self.inner.open_from_snapshot(snapshot_id)?)
+    }
+
+    pub fn open_from_snapshot_with_recovery_mode(
+        self,
+        snapshot_id: u64,
+        recovery_mode: RecoveryMode,
+    ) -> Result<StructuredDb> {
+        StructuredDb::from_db(
+            self.inner
+                .open_from_snapshot_with_recovery_mode(snapshot_id, recovery_mode)?,
+        )
+    }
+
+    pub fn resume(self) -> Result<StructuredDb> {
+        StructuredDb::from_db(self.inner.resume()?)
+    }
+
+    pub fn resume_with_recovery_mode(self, recovery_mode: RecoveryMode) -> Result<StructuredDb> {
+        StructuredDb::from_db(self.inner.resume_with_recovery_mode(recovery_mode)?)
+    }
+
+    pub fn resume_from_snapshot(self, snapshot_id: u64) -> Result<StructuredDb> {
+        StructuredDb::from_db(self.inner.resume_from_snapshot(snapshot_id)?)
+    }
+
+    pub fn resume_from_snapshot_with_recovery_mode(
+        self,
+        snapshot_id: u64,
+        recovery_mode: RecoveryMode,
+    ) -> Result<StructuredDb> {
+        StructuredDb::from_db(
+            self.inner
+                .resume_from_snapshot_with_recovery_mode(snapshot_id, recovery_mode)?,
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 struct StructuredProjectionCacheEntry {
-    schema_ptr: usize,
+    schema: Arc<StructuredSchema>,
     projected_schema: Arc<StructuredColumnFamilySchema>,
 }
 
@@ -644,15 +764,14 @@ fn resolve_structured_projection_cached(
     column_family: Option<&str>,
     column_indices: Option<&[usize]>,
 ) -> Result<Arc<StructuredColumnFamilySchema>> {
-    let schema_ptr = Arc::as_ptr(structured_schema) as usize;
     if let Some(entry) = cache.load_full()
-        && entry.schema_ptr == schema_ptr
+        && Arc::ptr_eq(&entry.schema, structured_schema)
     {
         return Ok(Arc::clone(&entry.projected_schema));
     }
     let projected = structured_schema.project_structured_family(column_family, column_indices)?;
     cache.store(Some(Arc::new(StructuredProjectionCacheEntry {
-        schema_ptr,
+        schema: Arc::clone(structured_schema),
         projected_schema: Arc::clone(&projected),
     })));
     Ok(projected)
@@ -877,7 +996,8 @@ impl From<StructuredScanOptions> for ScanOptions {
 pub trait StructuredSchemaOwner {
     fn current_structured_schema(&self) -> StructuredSchema;
     fn begin_core_schema_update(&self) -> SchemaBuilder;
-    fn reload_structured_schema_from_core(&mut self) -> Result<StructuredSchema>;
+    fn install_committed_structured_schema(&mut self, schema: StructuredSchema)
+    -> StructuredSchema;
 }
 
 pub struct StructuredSchemaBuilder<'a, O: StructuredSchemaOwner> {
@@ -992,6 +1112,63 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
         self
     }
 
+    /// Transform one existing column into `target_type` during this schema transition.
+    ///
+    /// The callback registered for `transform_id` receives the source column's raw
+    /// optional bytes and must return bytes valid for `target_type`. In particular,
+    /// list transforms must preserve or produce Cobble's complete encoded list
+    /// payload, including any element TTL information.
+    pub fn transform_column(
+        &mut self,
+        column_family: Option<String>,
+        column: u16,
+        target_type: StructuredColumnType,
+        transform_id: impl Into<String>,
+    ) -> &mut Self {
+        let Some((column_family_name, core_column_family)) =
+            self.normalize_column_family_or_record_error(column_family)
+        else {
+            return self;
+        };
+        let transform_id = transform_id.into();
+        let Some(()) = self.apply_inner(|inner| {
+            let column_count = inner.num_columns_in_family(core_column_family.clone())?;
+            let column_index = usize::from(column);
+            if column_index >= column_count {
+                return Err(Error::InvalidState(format!(
+                    "Cannot transform column {} in column family {} with {} columns",
+                    column, column_family_name, column_count
+                )));
+            }
+            let columns = (0..column_count)
+                .map(|source_index| ColumnEvolution::Source {
+                    source_index,
+                    transform_id: (source_index == column_index).then(|| transform_id.clone()),
+                })
+                .collect();
+            inner.remap_columns(core_column_family.clone(), columns)?;
+            apply_structured_column_type(
+                inner,
+                core_column_family.clone(),
+                column_index,
+                &target_type,
+            )
+        }) else {
+            return self;
+        };
+        let Some(column_family_id) =
+            self.structured_column_family_id_or_record_error(&column_family_name)
+        else {
+            return self;
+        };
+        self.schema
+            .column_families
+            .entry(column_family_id)
+            .or_default()
+            .set_column_type(column, target_type);
+        self
+    }
+
     pub fn set_column_family_options(
         &mut self,
         column_family: Option<String>,
@@ -1043,6 +1220,10 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
         self.schema
             .column_family_ids
             .insert(column_family.to_string(), column_family_id);
+        self.schema
+            .column_families
+            .entry(column_family_id)
+            .or_default();
     }
 
     fn normalize_column_family_or_record_error(
@@ -1080,7 +1261,9 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
             .take()
             .ok_or_else(|| Error::InvalidState("schema builder already committed".to_string()))?;
         inner.commit();
-        self.owner.reload_structured_schema_from_core()
+        Ok(self
+            .owner
+            .install_committed_structured_schema(self.schema.clone()))
     }
 
     fn apply_inner<T, F>(&mut self, f: F) -> Option<T>
@@ -1342,6 +1525,18 @@ impl StructuredDb {
 
     pub fn current_schema(&self) -> StructuredSchema {
         self.structured_schema.as_ref().clone()
+    }
+
+    /// Register a raw single-column transform before using its persisted ID.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.db.register_schema_transform(transform_id, transform)
     }
 
     pub fn update_schema(&mut self) -> StructuredSchemaBuilder<'_, Self> {
@@ -1972,9 +2167,13 @@ impl StructuredSchemaOwner for StructuredDb {
         self.db.update_schema()
     }
 
-    fn reload_structured_schema_from_core(&mut self) -> Result<StructuredSchema> {
-        self.reload_schema()?;
-        Ok(self.current_schema())
+    fn install_committed_structured_schema(
+        &mut self,
+        schema: StructuredSchema,
+    ) -> StructuredSchema {
+        self.structured_schema = Arc::new(schema.clone());
+        self.reset_default_options();
+        schema
     }
 }
 
@@ -2132,6 +2331,19 @@ fn apply_structured_family(
         }
     }
     Ok(())
+}
+
+fn apply_structured_column_type(
+    schema: &mut SchemaBuilder,
+    column_family: Option<String>,
+    column: usize,
+    column_type: &StructuredColumnType,
+) -> Result<()> {
+    let operator = match column_type {
+        StructuredColumnType::Bytes => Arc::new(BytesMergeOperator) as Arc<_>,
+        StructuredColumnType::List(config) => list_operator(config.clone()),
+    };
+    schema.replace_column(column_family, column, operator)
 }
 
 #[cfg(test)]

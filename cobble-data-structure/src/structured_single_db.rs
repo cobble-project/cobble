@@ -13,6 +13,7 @@ use crate::structured_db::{
     StructuredWriteOptions, decode_row, encode_for_write,
     load_structured_schema_from_cobble_schema, persist_structured_schema_on_db,
 };
+use bytes::Bytes;
 use cobble::{Config, DbIterator, Error, MemtableType, Result, SingleDb};
 use std::ops::Range;
 use std::sync::Arc;
@@ -50,6 +51,20 @@ impl StructuredSingleDb {
 
     pub fn current_schema(&self) -> StructuredSchema {
         self.structured_schema.as_ref().clone()
+    }
+
+    /// Register a raw single-column transform before using its persisted ID.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.db
+            .db()
+            .register_schema_transform(transform_id, transform)
     }
 
     pub fn update_schema(&mut self) -> StructuredSchemaBuilder<'_, Self> {
@@ -558,9 +573,13 @@ impl StructuredSchemaOwner for StructuredSingleDb {
         self.db.db().update_schema()
     }
 
-    fn reload_structured_schema_from_core(&mut self) -> Result<StructuredSchema> {
-        self.reload_schema()?;
-        Ok(self.current_schema())
+    fn install_committed_structured_schema(
+        &mut self,
+        schema: StructuredSchema,
+    ) -> StructuredSchema {
+        self.structured_schema = Arc::new(schema.clone());
+        self.reset_default_options();
+        schema
     }
 }
 

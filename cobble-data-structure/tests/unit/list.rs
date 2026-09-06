@@ -1,6 +1,75 @@
 use super::*;
 
 #[test]
+fn test_list_element_transform_preserves_layout_and_propagates_errors() {
+    use crate::StructuredColumnType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for preserve_element_ttl in [false, true] {
+        let config = ListConfig {
+            max_elements: Some(1), // The adapter must not apply this cap.
+            preserve_element_ttl,
+            ..ListConfig::default()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let transform =
+            StructuredColumnType::list_element_transform(config.clone(), move |value| {
+                count.fetch_add(1, Ordering::Relaxed);
+                let mut bytes = value.to_vec();
+                bytes.push(b'!');
+                Ok(Bytes::from(bytes))
+            });
+        assert_eq!(transform(None).unwrap(), None);
+        assert_eq!(transform(Some(Bytes::new())).unwrap(), Some(Bytes::new()));
+        let empty = encode_list_payload(&[], &config).unwrap();
+        assert_eq!(transform(Some(empty.clone())).unwrap(), Some(empty));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let mut elements = vec![
+            DecodedListElement {
+                value: Bytes::from_static(b"a"),
+                expires_at_secs: Some(5),
+            },
+            DecodedListElement {
+                value: Bytes::new(),
+                expires_at_secs: None,
+            },
+            DecodedListElement {
+                value: Bytes::from_static(b"xyz"),
+                expires_at_secs: Some(90),
+            },
+        ];
+        let payload = encode_list_payload(&elements, &config).unwrap();
+        let output = transform(Some(payload.clone())).unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        for element in &mut elements {
+            let mut value = element.value.to_vec();
+            value.push(b'!');
+            element.value = Bytes::from(value);
+        }
+        // Exact encoding equality covers order/count, empty elements and every TTL.
+        assert_eq!(output, encode_list_payload(&elements, &config).unwrap());
+
+        let mut trailing = payload.to_vec();
+        trailing.push(0);
+        for corrupt in [
+            Bytes::from_static(b"\x01"),
+            payload.slice(..payload.len() - 1),
+            Bytes::from(trailing),
+        ] {
+            assert!(transform(Some(corrupt)).is_err());
+        }
+        let failing = StructuredColumnType::list_element_transform(config, |_| {
+            Err(Error::InputError("element transform failed".into()))
+        });
+        assert!(
+            matches!(failing(Some(payload)), Err(Error::InputError(message)) if message == "element transform failed")
+        );
+    }
+}
+
+#[test]
 fn test_list_round_trip() {
     let config = ListConfig {
         max_elements: Some(2),

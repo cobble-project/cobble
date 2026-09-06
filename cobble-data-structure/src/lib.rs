@@ -68,12 +68,12 @@ pub use list::{ListConfig, ListRetainMode};
 pub use priority_queue::PriorityQueue;
 pub use structured_db::{
     DataStructureDb, StructuredColumnFamilySchema, StructuredColumnType, StructuredColumnValue,
-    StructuredDb, StructuredDbIterator, StructuredReadOptions, StructuredScanOptions,
-    StructuredSchema, StructuredSchemaBuilder, StructuredWriteBatch, StructuredWriteOptions,
-    structured_merge_operator_resolver, structured_resolvable_operator_ids,
+    StructuredDb, StructuredDbBuilder, StructuredDbIterator, StructuredReadOptions,
+    StructuredScanOptions, StructuredSchema, StructuredSchemaBuilder, StructuredWriteBatch,
+    StructuredWriteOptions, structured_merge_operator_resolver, structured_resolvable_operator_ids,
 };
-pub use structured_read_only_db::StructuredReadOnlyDb;
-pub use structured_reader::StructuredReader;
+pub use structured_read_only_db::{StructuredReadOnlyDb, StructuredReadOnlyDbBuilder};
+pub use structured_reader::{StructuredReader, StructuredReaderBuilder};
 pub use structured_remote_compaction_server::StructuredRemoteCompactionServer;
 pub use structured_scan::{StructuredScanPlan, StructuredScanSplit, StructuredScanSplitScanner};
 pub use structured_single_db::StructuredSingleDb;

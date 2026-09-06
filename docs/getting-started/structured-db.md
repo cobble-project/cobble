@@ -129,8 +129,43 @@ Builder methods are applied incrementally to the inner schema builder (matching 
 - `add_bytes_column(None, column)` / `add_bytes_column(Some("metrics".to_string()), column)` — set column type to `Bytes`
 - `add_list_column(None, column, config)` / `add_list_column(Some("metrics".to_string()), column, config)` — set column type to `List`
 - `delete_column(None, column)` / `delete_column(Some("metrics".to_string()), column)` — remove structured typing for this family-local column
+- `transform_column(family, column, target_type, transform_id)` — transform one existing column and update its `Bytes` / `List` definition together with the underlying schema
 
 Adding a typed column in a new family also creates that family in the underlying raw schema.
+
+Register a transform before referring to its ID in a schema update:
+
+```rust
+use bytes::Bytes;
+use cobble_data_structure::StructuredColumnType;
+
+db.register_schema_transform("uppercase-v1", |value| {
+    Ok(value.map(|bytes| Bytes::from(bytes.to_ascii_uppercase())))
+})?;
+db.update_schema()
+    .transform_column(None, 0, StructuredColumnType::Bytes, "uppercase-v1")
+    .commit()?;
+```
+
+Transforms receive one column's optional encoded bytes and return bytes in the target column's format. They can be combined with column additions/deletions in the same update; column indices refer to the builder's current layout. List transforms must preserve valid List encoding and any per-element TTL information. Old data is converted lazily by the kernel; reads, projections, scans, and compaction share the same evolution rules.
+
+For element-wise List changes, use the adapter without handling List encoding yourself:
+
+```rust
+db.register_schema_transform(
+    "list-uppercase-v1",
+    StructuredColumnType::list_element_transform(list_config.clone(), |element| {
+        Ok(Bytes::from(element.to_ascii_uppercase()))
+    }),
+)?;
+db.update_schema()
+    .transform_column(None, 1, StructuredColumnType::List(list_config), "list-uppercase-v1")
+    .commit()?;
+```
+
+The adapter preserves element order, count and TTL timestamps; it does not filter or truncate the List. Its `preserve_element_ttl` setting must match both source and target encoding. The same adapter can be passed to `register_schema_transform` on dedicated and remote compactors.
+
+Only transform IDs are persisted. Before reopening a database that uses them, register the same callbacks through `StructuredDbBuilder`, `StructuredReadOnlyDbBuilder`, or `StructuredReaderBuilder` using `.register_schema_transform(id, callback)?`, then call the desired open/resume method. Register them on compactor processes too (`StructuredRemoteCompactionServer::register_schema_transform`). See [schema evolution](../architecture/schema-evolution.md) for the callback contract.
 
 ## StructuredReader and StructuredReadOnlyDb
 

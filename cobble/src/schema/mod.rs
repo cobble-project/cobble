@@ -1260,6 +1260,15 @@ impl SchemaBuilder {
         }
     }
 
+    /// Returns the current staged column count for a column family.
+    ///
+    /// This includes preceding add, delete, and remap operations in this
+    /// builder, rather than only the schema that started the update.
+    pub fn num_columns_in_family(&self, column_family: Option<String>) -> Result<usize> {
+        let family_position = self.resolve_existing_family_position(column_family)?;
+        Ok(self.column_families[family_position].num_columns())
+    }
+
     /// Set the merge operator for a column index.
     pub fn set_column_operator(
         &mut self,

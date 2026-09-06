@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use cobble::{Config, RemoteCompactionServer, Result};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -29,6 +30,19 @@ impl StructuredRemoteCompactionServer {
 
     pub fn supported_merge_operator_ids(&self) -> Vec<String> {
         self.inner.supported_merge_operator_ids()
+    }
+
+    /// Register a raw single-column transform under its stable persisted ID.
+    pub fn register_schema_transform<F>(
+        &self,
+        transform_id: impl Into<String>,
+        transform: F,
+    ) -> Result<()>
+    where
+        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.inner
+            .register_schema_transform(transform_id, transform)
     }
 
     pub fn serve(&self, address: &str) -> Result<()> {

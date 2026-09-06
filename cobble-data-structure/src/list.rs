@@ -197,6 +197,38 @@ pub(crate) fn decode_list_for_read(
     Ok(elements.into_iter().map(|element| element.value).collect())
 }
 
+/// Rewrite element bytes without applying read-time TTL or retention policies.
+pub(crate) fn transform_list_elements<F>(
+    payload: Bytes,
+    preserve_element_ttl: bool,
+    transform: &F,
+) -> Result<Bytes>
+where
+    F: Fn(Bytes) -> Result<Bytes>,
+{
+    if payload.is_empty() {
+        return Ok(payload);
+    }
+    let mut cursor = ListPayloadCursor::new(&payload, preserve_element_ttl)?;
+    let mut output = BytesMut::with_capacity(payload.len());
+    output.put_u32_le(cursor.remaining_elements as u32);
+    while let Some(element) = cursor.next()? {
+        let value = transform(element.value)?;
+        let len = u32::try_from(value.len()).map_err(|_| {
+            Error::InputError(format!(
+                "list element is too large to encode: {} bytes",
+                value.len()
+            ))
+        })?;
+        if preserve_element_ttl {
+            output.put_u32_le(element.expires_at_secs.unwrap_or(0));
+        }
+        output.put_u32_le(len);
+        output.extend_from_slice(&value);
+    }
+    Ok(output.freeze())
+}
+
 #[derive(Clone)]
 struct DecodedListElement {
     value: Bytes,
