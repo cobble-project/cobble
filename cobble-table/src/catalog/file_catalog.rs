@@ -295,13 +295,13 @@ impl FileCatalog {
     /// Materialize the current catalog schema into one writable shard.
     ///
     /// Calls for a shard must not run concurrently with other core schema updates.
-    pub fn materialize_table<'db>(
+    pub fn materialize_table(
         &self,
-        db: &'db Db,
+        db: Arc<Db>,
         identifier: &TableIdentifier,
-    ) -> CatalogResult<Table<'db>> {
+    ) -> CatalogResult<Table> {
         let table = self.load_table(identifier)?;
-        let (physical_name, target) = materialize_loaded_table(&self.store, db, &table)?;
+        let (physical_name, target) = materialize_loaded_table(&self.store, db.as_ref(), &table)?;
         Table::from_metadata(db, physical_name, target).map_err(Into::into)
     }
 

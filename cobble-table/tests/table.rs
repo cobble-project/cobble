@@ -3,7 +3,7 @@ use cobble_table::{
     DataField, LogicalType, ReadOnlyTable, Table, TableKey, TableKeyBuilder, TableReaderBuilder,
     TableSchema, TableWriterBuilder, Value,
 };
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 #[test]
 fn table_runtime_create_open_and_typed_rows() {
@@ -51,15 +51,17 @@ fn table_runtime_create_open_and_typed_rows() {
     let key2 = vec![row2[0].clone(), row2[1].clone()];
     let missing = vec![Value::String("tenant-a".to_string()), Value::Int64(9)];
 
-    let db = DbBuilder::new(config.clone())
-        .bucket_ranges(vec![0..=7])
-        .db_id("table-runtime")
-        .open()
-        .unwrap();
+    let db = Arc::new(
+        DbBuilder::new(config.clone())
+            .bucket_ranges(vec![0..=7])
+            .db_id("table-runtime")
+            .open()
+            .unwrap(),
+    );
     {
-        let table = Table::create(&db, "events", schema.clone()).unwrap();
+        let table = Table::create(Arc::clone(&db), "events", schema.clone()).unwrap();
         assert_eq!(
-            Table::create(&db, "events", schema.clone())
+            Table::create(Arc::clone(&db), "events", schema.clone())
                 .unwrap()
                 .schema(),
             &schema
@@ -149,7 +151,7 @@ fn table_runtime_create_open_and_typed_rows() {
         assert_eq!(table.get(&key1).unwrap(), None);
 
         let keys = Table::create(
-            &db,
+            Arc::clone(&db),
             "keys",
             TableSchema::new(
                 vec![DataField::new(1, "id", LogicalType::int64()).unwrap()],
@@ -273,15 +275,16 @@ fn table_runtime_create_open_and_typed_rows() {
     }
     drop(read_only);
 
-    let reopened = cobble::Db::open_from_snapshot(config, snapshot_id, "table-runtime").unwrap();
+    let reopened =
+        Arc::new(cobble::Db::open_from_snapshot(config, snapshot_id, "table-runtime").unwrap());
     {
-        let table = Table::open(&reopened, "events").unwrap();
+        let table = Table::open(Arc::clone(&reopened), "events").unwrap();
         let key2 = build_key(
             &table,
             &[Value::String("tenant-a".to_string()), Value::Int64(2)],
         );
         assert_eq!(table.get(&key2).unwrap(), Some(row2));
-        let keys = Table::open(&reopened, "keys").unwrap();
+        let keys = Table::open(Arc::clone(&reopened), "keys").unwrap();
         let key = build_key(&keys, &[Value::Int64(42)]);
         assert_eq!(keys.get(&key).unwrap(), Some(vec![Value::Int64(42)]));
     }
@@ -305,12 +308,14 @@ fn schema_only_snapshot_preserves_empty_table() {
         vec![0.into()],
     )
     .unwrap();
-    let db = DbBuilder::new(config.clone())
-        .bucket_ranges(vec![0..=7])
-        .db_id("empty-table")
-        .open()
-        .unwrap();
-    Table::create(&db, "events", schema.clone()).unwrap();
+    let db = Arc::new(
+        DbBuilder::new(config.clone())
+            .bucket_ranges(vec![0..=7])
+            .db_id("empty-table")
+            .open()
+            .unwrap(),
+    );
+    Table::create(Arc::clone(&db), "events", schema.clone()).unwrap();
     let (sender, receiver) = mpsc::sync_channel(1);
     let snapshot_id = db
         .snapshot_with_callback(move |result| sender.send(result).unwrap())
@@ -410,7 +415,6 @@ fn standalone_table_shard_owns_storage_snapshots_and_cursors() {
     assert_eq!(resumed.schema(), &schema);
     assert_eq!(resumed.get(&key).unwrap(), Some(updated));
     assert!(resumed.shard_snapshot_input(latest.snapshot_id).is_ok());
-    resumed.close().unwrap();
     drop(resumed);
 
     let projection = reader.project_by_names(&["name"]).unwrap();
@@ -571,7 +575,7 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
 
     // There is no cross-shard schema negotiation in this first runtime step.
     // A shard with a different layout must fail instead of decoding as `schema`.
-    right.close().unwrap();
+    drop(right);
     let incompatible = TableWriterBuilder::new(config.clone())
         .table_name("events")
         .db_id("incompatible")
@@ -595,8 +599,8 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
         Err(cobble_table::TableError::InvalidSchema(_))
     ));
     drop(reader);
-    incompatible.close().unwrap();
-    left.close().unwrap();
+    drop(incompatible);
+    drop(left);
 }
 
 fn runtime_schema(value_type: LogicalType) -> TableSchema {
@@ -609,7 +613,7 @@ fn runtime_schema(value_type: LogicalType) -> TableSchema {
         .unwrap()
 }
 
-fn build_key(table: &Table<'_>, values: &[Value]) -> TableKey {
+fn build_key(table: &Table, values: &[Value]) -> TableKey {
     build_runtime_key(table.key_builder(), values)
 }
 

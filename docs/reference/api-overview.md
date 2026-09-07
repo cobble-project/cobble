@@ -241,9 +241,10 @@ exclusive-end semantics as raw `Db`.
 
 | Type | Description |
 |------|-------------|
-| `TableWriterBuilder` / `TableWriter` | Open and own a writable table shard, with typed reads, writes, and snapshots |
+| `TableWriterBuilder` | Open a writable shard and return a `Table` |
 | `TableReaderBuilder` / `TableReader` | Open and own typed access to a fixed shard or global snapshot |
-| `Table` / `ReadOnlyTable` | Borrowed table access when the application already manages the underlying database |
+| `Table` | Typed reads, writes, and snapshots over a shared `Arc<Db>` |
+| `ReadOnlyTable` | Typed access borrowing an application-managed `ReadOnlyDb` |
 | `TableSchema` / `TableKey` | Logical row structure and reusable encoded primary keys |
 | `TableProjection` | Reusable field selection for typed reads and scans |
 | `SchemaChange` | Add, rename, or drop top-level fields by name while retaining stable field identities |
@@ -266,6 +267,11 @@ assigns IDs across the entire new schema, including nested fields. Explicit-ID
 `DataField::new` and `TableSchema::new` remain available for advanced integrations.
 When reopening existing tables, use their persisted schema; do not rebuild and renumber it.
 
+`Table::create(Arc::clone(&db), name, schema)` and `Table::open(Arc::clone(&db), name)`
+use an existing shared database. Catalog and writer-plan builders return the same `Table` type.
+Dropping a table releases its reference without explicitly closing the shared database;
+calling `Db::close()` affects all users of that database.
+
 `Catalog::evolve_schema` accepts `SchemaChange` values. Added fields must be nullable;
 renaming preserves the field ID, and deleted IDs are never reused. Publishing a catalog
 schema does not refresh an already opened reader or writer automatically.
@@ -282,7 +288,7 @@ For catalog-backed writers, `open()` creates a shard and `resume()` applies the 
 definition. Explicit snapshot restores and readers use the schema stored in that snapshot.
 Selecting the current global snapshot captures its version when the reader opens; it does not
 automatically follow later snapshots or schema changes.
-`TableWriter::snapshot()` starts an asynchronous snapshot; `snapshot_and_wait()` returns the
+`Table::snapshot()` starts an asynchronous snapshot; `snapshot_and_wait()` returns the
 completed `ShardSnapshotInput` for opening a reader or submitting to a snapshot coordinator.
 
 For distributed writing, build a plan once and serialize it for workers:

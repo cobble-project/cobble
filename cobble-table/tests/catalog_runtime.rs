@@ -194,9 +194,9 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
             .is_err()
     );
 
-    left.close().unwrap();
-    right.close().unwrap();
-    other.close().unwrap();
+    drop(left);
+    drop(right);
+    drop(other);
     let renamed = catalog.rename_table(&users_id, "accounts".into()).unwrap();
     let accounts_id = renamed.identifier().clone();
     assert_eq!(renamed.table_id(), users.table_id());
@@ -250,7 +250,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     assert_eq!(worker_key.bucket(), keys[worker_index].bucket());
     worker.put(&rows[worker_index]).unwrap();
     let worker_snapshot = worker.snapshot_and_wait().unwrap();
-    worker.close().unwrap();
+    drop(worker);
     let worker_historical = worker_plan
         .writer_builder(worker_runtime)
         .unwrap()
@@ -263,7 +263,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         worker_historical.get(&worker_key).unwrap(),
         Some(rows[worker_index].clone())
     );
-    worker_historical.close().unwrap();
+    drop(worker_historical);
 
     let resumed = evolved
         .writer_builder(runtime.clone())
@@ -277,7 +277,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     assert_eq!(resumed.schema(), evolved.schema());
     assert_eq!(resumed.get(&keys[left_index]).unwrap(), Some(expected));
     resumed.snapshot_and_wait().unwrap();
-    resumed.close().unwrap();
+    drop(resumed);
 
     // An explicit historical restore must not apply the catalog's latest schema.
     let restored = evolved
@@ -292,7 +292,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         restored.get(&keys[left_index]).unwrap(),
         Some(rows[left_index].clone())
     );
-    restored.close().unwrap();
+    drop(restored);
     // The table-local pointer is still the original published global snapshot.
     assert_eq!(
         coordinator

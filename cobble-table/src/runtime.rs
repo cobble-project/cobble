@@ -1,15 +1,14 @@
 use crate::catalog::{TableId, physical_table_name};
 use crate::table::{
     TableKey, TableKeyBuilder, TableScan, assemble_row_from_key_values, compile_table,
-    encode_table_row, ensure_table_schema, load_table_metadata, validate_bound, validate_name,
+    load_table_metadata, validate_bound, validate_name,
 };
-use crate::{Result, TableError, TableSchema, TableWritePlan, Value};
+use crate::{Result, Table, TableError, TableSchema, TableWritePlan, Value};
 use cobble::{
     Config, Db, DbBuilder, DbIterator, ReadOnlyDb, ReadOptions, Reader, ReaderConfig, ScanOptions,
-    ShardSnapshotInput, WriteOptions,
 };
 use std::ops::RangeInclusive;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 
 /// Builder for a standalone writable typed table shard.
 pub struct TableWriterBuilder {
@@ -65,7 +64,7 @@ impl TableWriterBuilder {
     }
 
     /// Create a new database and create the typed table schema.
-    pub fn create(self, schema: TableSchema) -> Result<TableWriter> {
+    pub fn create(self, schema: TableSchema) -> Result<Table> {
         if self.catalog_binding.is_some() {
             return Err(TableError::InvalidSchema(
                 "catalog-bound TableWriterBuilder requires open()".into(),
@@ -73,48 +72,46 @@ impl TableWriterBuilder {
         }
         let name = self.required_table_name()?;
         let db = Arc::new(self.db_builder().open()?);
-        TableWriter::create(db, name, schema)
+        Table::create(db, name, schema)
     }
 
     /// Open a new writable shard for a catalog-bound table.
-    pub fn open(self) -> Result<TableWriter> {
+    pub fn open(self) -> Result<Table> {
         let (plan, store_config) = self.catalog_binding.clone().ok_or_else(|| {
             TableError::InvalidSchema("TableWriterBuilder::open requires a catalog table".into())
         })?;
         self.required_table_name()?;
         let db = Arc::new(self.db_builder().open()?);
-        TableWriter::from_write_plan_materialized(db, &plan, &store_config)
+        open_materialized_catalog_table(db, &plan, &store_config)
     }
 
     /// Resume a writable shard, materializing the loaded catalog definition when bound.
-    pub fn resume(self) -> Result<TableWriter> {
+    pub fn resume(self) -> Result<Table> {
         let name = self.required_table_name()?;
         let db = Arc::new(self.db_builder().resume()?);
         match self.catalog_binding {
-            Some((plan, store_config)) => {
-                TableWriter::from_write_plan_materialized(db, &plan, &store_config)
-            }
-            None => TableWriter::open(db, name),
+            Some((plan, store_config)) => open_materialized_catalog_table(db, &plan, &store_config),
+            None => Table::open(db, name),
         }
     }
 
     /// Open a writable shard at a selected snapshot boundary.
-    pub fn open_from_snapshot(self, snapshot_id: u64) -> Result<TableWriter> {
+    pub fn open_from_snapshot(self, snapshot_id: u64) -> Result<Table> {
         let name = self.required_table_name()?;
         let db = Arc::new(self.db_builder().open_from_snapshot(snapshot_id)?);
         match self.catalog_binding {
-            Some((plan, _)) => TableWriter::open_catalog_snapshot(db, name, plan.table_id()),
-            None => TableWriter::open(db, name),
+            Some((plan, _)) => open_catalog_snapshot(db, name, plan.table_id()),
+            None => Table::open(db, name),
         }
     }
 
     /// Resume a writable shard from a selected snapshot boundary.
-    pub fn resume_from_snapshot(self, snapshot_id: u64) -> Result<TableWriter> {
+    pub fn resume_from_snapshot(self, snapshot_id: u64) -> Result<Table> {
         let name = self.required_table_name()?;
         let db = Arc::new(self.db_builder().resume_from_snapshot(snapshot_id)?);
         match self.catalog_binding {
-            Some((plan, _)) => TableWriter::open_catalog_snapshot(db, name, plan.table_id()),
-            None => TableWriter::open(db, name),
+            Some((plan, _)) => open_catalog_snapshot(db, name, plan.table_id()),
+            None => Table::open(db, name),
         }
     }
 
@@ -146,211 +143,19 @@ impl TableWriterBuilder {
     }
 }
 
-/// An owned writable typed table. Borrowed [`crate::Table`] remains appropriate
-/// when multiple tables share an application-owned shard database.
-pub struct TableWriter {
+fn open_materialized_catalog_table(
     db: Arc<Db>,
-    name: String,
-    compiled: Arc<crate::table::CompiledTable>,
-    read_options: ReadOptions,
-    scan_options: ScanOptions,
-    write_options: WriteOptions,
+    plan: &TableWritePlan,
+    store_config: &Config,
+) -> Result<Table> {
+    let (name, metadata) = crate::catalog::materialize_write_plan(store_config, db.as_ref(), plan)?;
+    Table::from_metadata(db, name, metadata)
 }
 
-impl TableWriter {
-    fn create(db: Arc<Db>, name: String, schema: TableSchema) -> Result<Self> {
-        let metadata = ensure_table_schema(db.as_ref(), &name, schema)?;
-        Self::from_table_metadata(db, name, metadata)
-    }
-
-    fn open(db: Arc<Db>, name: String) -> Result<Self> {
-        Self::from_metadata(db, name)
-    }
-
-    fn from_write_plan_materialized(
-        db: Arc<Db>,
-        plan: &TableWritePlan,
-        store_config: &Config,
-    ) -> Result<Self> {
-        let (name, metadata) =
-            crate::catalog::materialize_write_plan(store_config, db.as_ref(), plan)?;
-        Self::from_table_metadata(db, name, metadata)
-    }
-
-    fn open_catalog_snapshot(db: Arc<Db>, name: String, table_id: TableId) -> Result<Self> {
-        let metadata = load_table_metadata(&db.current_schema(), &name)?;
-        validate_catalog_binding(&metadata, table_id)?;
-        Self::from_table_metadata(db, name, metadata)
-    }
-
-    fn from_metadata(db: Arc<Db>, name: String) -> Result<Self> {
-        let metadata = load_table_metadata(&db.current_schema(), &name)?;
-        Self::from_table_metadata(db, name, metadata)
-    }
-
-    fn from_table_metadata(
-        db: Arc<Db>,
-        name: String,
-        metadata: crate::metadata::TableMetadata,
-    ) -> Result<Self> {
-        let compiled = compile_table(metadata, db.total_buckets())?;
-        Ok(Self {
-            db,
-            name: name.clone(),
-            compiled,
-            read_options: ReadOptions::default().with_column_family(name.clone()),
-            scan_options: ScanOptions::default().with_column_family(name.clone()),
-            write_options: WriteOptions::with_column_family(name),
-        })
-    }
-
-    pub fn schema(&self) -> &TableSchema {
-        &self.compiled.schema
-    }
-
-    pub fn key_builder(&self) -> TableKeyBuilder {
-        TableKeyBuilder {
-            compiled: Arc::clone(&self.compiled),
-            values: Vec::with_capacity(self.compiled.key_positions.len()),
-        }
-    }
-
-    pub fn put(&self, row: &[Value]) -> Result<()> {
-        let (bucket, key, values) = encode_table_row(&self.compiled, row)?;
-        self.db
-            .put_columns_with_options(bucket, key, &values, &self.write_options)?;
-        Ok(())
-    }
-
-    pub fn put_with_options(&self, row: &[Value], options: &WriteOptions) -> Result<()> {
-        let (bucket, key, values) = encode_table_row(&self.compiled, row)?;
-        self.db.put_columns_with_options(
-            bucket,
-            key,
-            &values,
-            &options.bound_to_column_family(self.name.clone()),
-        )?;
-        Ok(())
-    }
-
-    pub fn delete(&self, key: &TableKey) -> Result<()> {
-        self.db.delete_row_with_options(
-            key.inner.bucket,
-            &key.inner.encoded,
-            &self.write_options,
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_batch(&self, keys: &[TableKey]) -> Result<()> {
-        let requests = keys
-            .iter()
-            .map(|key| (key.inner.bucket, key.inner.encoded.as_slice()))
-            .collect::<Vec<_>>();
-        if !requests.is_empty() {
-            self.db
-                .delete_rows_with_options(&requests, &self.write_options)?;
-        }
-        Ok(())
-    }
-
-    pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
-        self.db
-            .get_with_options(key.inner.bucket, &key.inner.encoded, &self.read_options)?
-            .map(|columns| {
-                assemble_row_from_key_values(&self.compiled, &key.inner.values, &columns)
-            })
-            .transpose()
-    }
-
-    pub fn multi_get(&self, keys: &[TableKey]) -> Result<Vec<Option<Vec<Value>>>> {
-        let requests = keys
-            .iter()
-            .map(|key| (key.inner.bucket, key.inner.encoded.as_slice()))
-            .collect::<Vec<_>>();
-        self.db
-            .multi_get_with_options(&requests, &self.read_options)?
-            .into_iter()
-            .zip(keys)
-            .map(|(columns, key)| {
-                columns
-                    .map(|columns| {
-                        assemble_row_from_key_values(&self.compiled, &key.inner.values, &columns)
-                    })
-                    .transpose()
-            })
-            .collect()
-    }
-
-    pub fn scan(&self, bucket: u16) -> Result<TableScan> {
-        self.scan_bounds(bucket, None, None)
-    }
-
-    pub fn scan_bounds(
-        &self,
-        bucket: u16,
-        start_key_inclusive: Option<&TableKey>,
-        end_key_exclusive: Option<&TableKey>,
-    ) -> Result<TableScan> {
-        validate_bound(bucket, start_key_inclusive)?;
-        validate_bound(bucket, end_key_exclusive)?;
-        Ok(TableScan {
-            inner: self.db.scan_with_options_bounds(
-                bucket,
-                start_key_inclusive.map(|key| key.inner.encoded.as_slice()),
-                end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
-                &self.scan_options,
-            )?,
-            _writer_backend: Some(Arc::clone(&self.db)),
-            compiled: Arc::clone(&self.compiled),
-        })
-    }
-
-    pub fn project_by_names<S: AsRef<str>>(
-        &self,
-        field_names: &[S],
-    ) -> Result<crate::TableProjection<'static>> {
-        crate::TableProjection::from_runtime(
-            Arc::new(RuntimeReadBackend::Writer(Arc::clone(&self.db))),
-            self.name.clone(),
-            Arc::clone(&self.compiled),
-            field_names,
-        )
-    }
-
-    /// Start an asynchronous shard snapshot, returning its id immediately.
-    pub fn snapshot(&self) -> Result<u64> {
-        Ok(self.db.snapshot()?)
-    }
-
-    /// Receive either the completed shard input or its publication error.
-    pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
-    where
-        F: Fn(cobble::Result<ShardSnapshotInput>) + Send + Sync + 'static,
-    {
-        Ok(self.db.snapshot_with_callback(callback)?)
-    }
-
-    /// Create a snapshot and wait for its callback, without polling.
-    pub fn snapshot_and_wait(&self) -> Result<ShardSnapshotInput> {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        self.snapshot_with_callback(move |result| {
-            let _ = sender.send(result);
-        })?;
-        receiver
-            .recv()
-            .map_err(|err| TableError::internal(format!("snapshot callback disconnected: {err}")))?
-            .map_err(Into::into)
-    }
-
-    pub fn shard_snapshot_input(&self, snapshot_id: u64) -> Result<ShardSnapshotInput> {
-        Ok(self.db.shard_snapshot_input(snapshot_id)?)
-    }
-
-    /// Close this writer after all owned scan iterators have been dropped.
-    pub fn close(&self) -> Result<()> {
-        Ok(self.db.close()?)
-    }
+fn open_catalog_snapshot(db: Arc<Db>, name: String, table_id: TableId) -> Result<Table> {
+    let metadata = load_table_metadata(&db.current_schema(), &name)?;
+    validate_catalog_binding(&metadata, table_id)?;
+    Table::from_metadata(db, name, metadata)
 }
 
 /// Builder for a standalone typed reader pinned to one snapshot selection.
@@ -607,7 +412,6 @@ impl TableReader {
 }
 
 pub(crate) enum RuntimeReadBackend {
-    Writer(Arc<Db>),
     Shard(Arc<ReadOnlyDb>),
     // Core Reader routing and cache access are serialized for this simple
     // pinned table view; shard-only readers remain fully concurrent.
@@ -624,13 +428,6 @@ pub(crate) struct GlobalReaderState {
 }
 
 impl RuntimeReadBackend {
-    pub(crate) fn writer_backend(&self) -> Option<Arc<Db>> {
-        match self {
-            Self::Writer(db) => Some(Arc::clone(db)),
-            Self::Shard(_) | Self::Global { .. } => None,
-        }
-    }
-
     pub(crate) fn get(
         &self,
         bucket: u16,
@@ -638,7 +435,6 @@ impl RuntimeReadBackend {
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<bytes::Bytes>>>> {
         Ok(match self {
-            Self::Writer(db) => db.get_with_options(bucket, key, options)?,
             Self::Shard(db) => db.get_with_options(bucket, key, options)?,
             Self::Global { state } => {
                 let mut state = lock_global_state(state)?;
@@ -654,7 +450,6 @@ impl RuntimeReadBackend {
         options: &ReadOptions,
     ) -> Result<Vec<Option<Vec<Option<bytes::Bytes>>>>> {
         Ok(match self {
-            Self::Writer(db) => db.multi_get_with_options(keys, options)?,
             Self::Shard(db) => db.multi_get_with_options(keys, options)?,
             Self::Global { state } => {
                 let mut state = lock_global_state(state)?;
@@ -674,7 +469,6 @@ impl RuntimeReadBackend {
         options: &ScanOptions,
     ) -> Result<DbIterator> {
         Ok(match self {
-            Self::Writer(db) => db.scan_with_options_bounds(bucket, start, end, options)?,
             Self::Shard(db) => db.scan_with_options_bounds(bucket, start, end, options)?,
             Self::Global { state } => {
                 let mut state = lock_global_state(state)?;

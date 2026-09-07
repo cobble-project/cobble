@@ -1,4 +1,4 @@
-use crate::db::db_from_handle_or_throw;
+use crate::db::{db_arc_from_handle_or_throw, db_from_handle_or_throw};
 use crate::read_only_db::read_only_db_from_handle_or_throw;
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_u16,
@@ -10,6 +10,7 @@ use cobble_table::{ReadOnlyTable, Table, TableError, TableSchema};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JByteBuffer, JClass, JIntArray, JObjectArray, JString};
 use jni::sys::{jint, jlong, jstring};
+use std::sync::Arc;
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_table_Table_createNative(
@@ -19,7 +20,7 @@ pub extern "system" fn Java_io_cobble_table_Table_createNative(
     name: JString,
     schema_json: JString,
 ) -> jstring {
-    let Some(db) = db_from_handle_or_throw(&mut env, db_handle) else {
+    let Some(db) = db_arc_from_handle_or_throw(&mut env, db_handle) else {
         return std::ptr::null_mut();
     };
     let name = match decode_java_string(&mut env, name) {
@@ -43,7 +44,7 @@ pub extern "system" fn Java_io_cobble_table_Table_createNative(
             return std::ptr::null_mut();
         }
     };
-    let table = match Table::create(db, name, schema) {
+    let table = match Table::create(Arc::clone(db), name, schema) {
         Ok(value) => value,
         Err(error) => {
             throw_table_error(&mut env, error);
@@ -60,7 +61,7 @@ pub extern "system" fn Java_io_cobble_table_Table_openNative(
     db_handle: jlong,
     name: JString,
 ) -> jstring {
-    let Some(db) = db_from_handle_or_throw(&mut env, db_handle) else {
+    let Some(db) = db_arc_from_handle_or_throw(&mut env, db_handle) else {
         return std::ptr::null_mut();
     };
     let name = match decode_java_string(&mut env, name) {
@@ -70,7 +71,7 @@ pub extern "system" fn Java_io_cobble_table_Table_openNative(
             return std::ptr::null_mut();
         }
     };
-    let table = match Table::open(db, name) {
+    let table = match Table::open(Arc::clone(db), name) {
         Ok(value) => value,
         Err(error) => {
             throw_table_error(&mut env, error);

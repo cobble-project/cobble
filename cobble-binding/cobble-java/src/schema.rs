@@ -92,7 +92,7 @@ fn db_from_handle(native_handle: jlong) -> Option<&'static Db> {
     if native_handle == 0 {
         return None;
     }
-    Some(unsafe { &*(native_handle as *const Db) })
+    Some(unsafe { &*(native_handle as *const Arc<Db>) }.as_ref())
 }
 
 #[unsafe(no_mangle)]

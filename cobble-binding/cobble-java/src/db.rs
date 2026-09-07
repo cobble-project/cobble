@@ -18,6 +18,7 @@ use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jintArray, jlong, jobject, jstring};
 use serde_json::json;
+use std::sync::Arc;
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_Db_openHandle(
@@ -135,7 +136,7 @@ fn restore_db(
         Db::open_from_snapshot_with_recovery_mode(config, snapshot_id, db_id, recovery_mode)
     };
     match db {
-        Ok(v) => Box::into_raw(Box::new(v)) as jlong,
+        Ok(v) => Box::into_raw(Box::new(Arc::new(v))) as jlong,
         Err(err) => {
             throw_illegal_state(env, err.to_string());
             0
@@ -156,7 +157,7 @@ fn restore_db_from_manifest_path(
         }
     };
     match Db::open_new_with_manifest_path(config, manifest_path) {
-        Ok(v) => Box::into_raw(Box::new(v)) as jlong,
+        Ok(v) => Box::into_raw(Box::new(Arc::new(v))) as jlong,
         Err(err) => {
             throw_illegal_state(env, err.to_string());
             0
@@ -390,7 +391,7 @@ fn resume_db(
             return 0;
         }
     };
-    Box::into_raw(Box::new(db)) as jlong
+    Box::into_raw(Box::new(Arc::new(db))) as jlong
 }
 
 fn resume_db_from_snapshot(
@@ -426,7 +427,7 @@ fn resume_db_from_snapshot(
             return 0;
         }
     };
-    Box::into_raw(Box::new(db)) as jlong
+    Box::into_raw(Box::new(Arc::new(db))) as jlong
 }
 
 #[unsafe(no_mangle)]
@@ -698,7 +699,7 @@ fn open_db_with_owned_range(
             return 0;
         }
     };
-    Box::into_raw(Box::new(db)) as jlong
+    Box::into_raw(Box::new(Arc::new(db))) as jlong
 }
 
 fn validate_total_buckets(env: &mut JNIEnv, config: &Config) -> Option<u16> {
@@ -723,8 +724,8 @@ pub extern "system" fn Java_io_cobble_Db_disposeInternal(
         throw_illegal_state(&mut env, "db handle is already disposed".to_string());
         return;
     }
-    let ptr = native_handle as *mut Db;
-    // SAFETY: `native_handle` is returned by `Db.openHandle` from `Box<Db>`.
+    let ptr = native_handle as *mut Arc<Db>;
+    // SAFETY: `native_handle` is returned by `Db.openHandle` from `Box<Arc<Db>>`.
     let boxed = unsafe { Box::from_raw(ptr) };
     if let Err(err) = boxed.close() {
         throw_illegal_state(&mut env, err.to_string());
@@ -2107,12 +2108,19 @@ pub(crate) fn db_from_handle_or_throw(
     env: &mut JNIEnv,
     native_handle: jlong,
 ) -> Option<&'static Db> {
+    db_arc_from_handle_or_throw(env, native_handle).map(Arc::as_ref)
+}
+
+pub(crate) fn db_arc_from_handle_or_throw(
+    env: &mut JNIEnv,
+    native_handle: jlong,
+) -> Option<&'static Arc<Db>> {
     if native_handle == 0 {
         throw_illegal_state(env, "db handle is disposed".to_string());
         return None;
     }
-    // SAFETY: `native_handle` is created from `Box<Db>` and valid until `disposeInternal`.
-    Some(unsafe { &*(native_handle as *const Db) })
+    // SAFETY: `native_handle` is created from `Box<Arc<Db>>` and valid until `disposeInternal`.
+    Some(unsafe { &*(native_handle as *const Arc<Db>) })
 }
 
 fn db_from_handle_mut_or_throw(env: &mut JNIEnv, native_handle: jlong) -> Option<&'static mut Db> {
@@ -2120,9 +2128,16 @@ fn db_from_handle_mut_or_throw(env: &mut JNIEnv, native_handle: jlong) -> Option
         throw_illegal_state(env, "db handle is disposed".to_string());
         return None;
     }
-    // SAFETY: `native_handle` is created from `Box<Db>` and Java serializes active snapshot
+    // SAFETY: `native_handle` is created from `Box<Arc<Db>>` and Java serializes active snapshot
     // switching against all other operations on the same handle.
-    Some(unsafe { &mut *(native_handle as *mut Db) })
+    let db = unsafe { &mut *(native_handle as *mut Arc<Db>) };
+    Arc::get_mut(db).or_else(|| {
+        throw_illegal_state(
+            env,
+            "cannot switch snapshot while the database is shared".to_string(),
+        );
+        None
+    })
 }
 
 fn direct_buffer_pool_config_array(

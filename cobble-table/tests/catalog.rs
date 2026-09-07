@@ -40,16 +40,20 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         total_buckets: 8,
         ..Config::default()
     };
-    let shard_one = DbBuilder::new(shard_config("shard-one"))
-        .bucket_ranges(vec![0..=7])
-        .db_id("catalog-shard-one")
-        .open()
-        .unwrap();
-    let shard_two = DbBuilder::new(shard_config("shard-two"))
-        .bucket_ranges(vec![0..=7])
-        .db_id("catalog-shard-two")
-        .open()
-        .unwrap();
+    let shard_one = Arc::new(
+        DbBuilder::new(shard_config("shard-one"))
+            .bucket_ranges(vec![0..=7])
+            .db_id("catalog-shard-one")
+            .open()
+            .unwrap(),
+    );
+    let shard_two = Arc::new(
+        DbBuilder::new(shard_config("shard-two"))
+            .bucket_ranges(vec![0..=7])
+            .db_id("catalog-shard-two")
+            .open()
+            .unwrap(),
+    );
     let mut unrelated = shard_two.update_schema();
     unrelated.ensure_column_family_exists("unrelated").unwrap();
     unrelated.commit();
@@ -98,8 +102,12 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
             Value::Int64(7),
             Value::Binary(vec![1, 2, 3].into()),
         ];
-        let table_one = catalog.materialize_table(&shard_one, &accounts).unwrap();
-        let table_two = catalog.materialize_table(&shard_two, &accounts).unwrap();
+        let table_one = catalog
+            .materialize_table(Arc::clone(&shard_one), &accounts)
+            .unwrap();
+        let table_two = catalog
+            .materialize_table(Arc::clone(&shard_two), &accounts)
+            .unwrap();
         let key_one = build_key(&table_one, &row[..2]);
         let key_two = build_key(&table_two, &row[..2]);
         let deleted_row = vec![
@@ -142,7 +150,9 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
                 .unwrap(),
             schema
         );
-        let table_one = catalog.materialize_table(&shard_one, &accounts).unwrap();
+        let table_one = catalog
+            .materialize_table(Arc::clone(&shard_one), &accounts)
+            .unwrap();
         let key_one = build_key(&table_one, &row[..2]);
         let mut expected = row.clone();
         expected.push(Value::Null);
@@ -190,7 +200,9 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
                 .unwrap(),
             schema_one
         );
-        let table_one = second.materialize_table(&shard_one, &accounts).unwrap();
+        let table_one = second
+            .materialize_table(Arc::clone(&shard_one), &accounts)
+            .unwrap();
         let key_one = build_key(&table_one, &row[..2]);
         let expected = vec![row[0].clone(), row[1].clone(), row[2].clone(), Value::Null];
         assert_eq!(table_one.get(&key_one).unwrap(), Some(expected));
@@ -208,7 +220,7 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         let applied_version = shard_one.current_schema().version();
         assert_eq!(
             second
-                .materialize_table(&shard_one, &accounts)
+                .materialize_table(Arc::clone(&shard_one), &accounts)
                 .unwrap()
                 .get(&key_one)
                 .unwrap(),
@@ -228,18 +240,22 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
             stable_mapping
         );
 
-        second.materialize_table(&shard_two, &accounts).unwrap();
+        second
+            .materialize_table(Arc::clone(&shard_two), &accounts)
+            .unwrap();
         let pre_rollback_mapping = second
             .load_shard_schema_mapping(&accounts, shard_two.id(), CatalogSchemaId::from(2))
             .unwrap()
             .core_schema_id();
-        let rolled_back_shard = DbBuilder::new(shard_config("shard-two-rollback"))
-            .bucket_ranges(vec![0..=7])
-            .db_id(shard_two.id())
-            .open()
-            .unwrap();
+        let rolled_back_shard = Arc::new(
+            DbBuilder::new(shard_config("shard-two-rollback"))
+                .bucket_ranges(vec![0..=7])
+                .db_id(shard_two.id())
+                .open()
+                .unwrap(),
+        );
         second
-            .materialize_table(&rolled_back_shard, &accounts)
+            .materialize_table(Arc::clone(&rolled_back_shard), &accounts)
             .unwrap();
         let repaired_mapping = second
             .load_shard_schema_mapping(&accounts, shard_two.id(), CatalogSchemaId::from(2))
@@ -252,7 +268,9 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
             Value::Int64(9),
             Value::Binary(vec![9].into()),
         ];
-        let event_table = catalog.materialize_table(&shard_one, &events).unwrap();
+        let event_table = catalog
+            .materialize_table(Arc::clone(&shard_one), &events)
+            .unwrap();
         let deleted_event_row = vec![
             Value::String("tenant-b".to_string()),
             Value::Int64(10),
@@ -270,7 +288,9 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
                 }],
             )
             .unwrap();
-        let event_table = catalog.materialize_table(&shard_one, &events).unwrap();
+        let event_table = catalog
+            .materialize_table(Arc::clone(&shard_one), &events)
+            .unwrap();
         let event_key = build_key(&event_table, &event_row[..2]);
         assert_eq!(
             event_table.get(&event_key).unwrap(),
@@ -287,7 +307,9 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
                 }],
             )
             .unwrap();
-        let event_table = catalog.materialize_table(&shard_one, &events).unwrap();
+        let event_table = catalog
+            .materialize_table(Arc::clone(&shard_one), &events)
+            .unwrap();
         let event_key = build_key(&event_table, &event_row[..2]);
         assert_eq!(
             event_table.get(&event_key).unwrap(),
@@ -431,7 +453,9 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
             )
             .unwrap();
         assert_eq!(evolved_events.schema().fields[2].id.0, 5);
-        let event_table = catalog.materialize_table(&shard_one, &events).unwrap();
+        let event_table = catalog
+            .materialize_table(Arc::clone(&shard_one), &events)
+            .unwrap();
         let event_key = build_key(
             &event_table,
             &[Value::String("tenant-b".into()), Value::Int64(9)],
@@ -507,7 +531,7 @@ fn schema_after_changes() -> TableSchema {
     .unwrap()
 }
 
-fn build_key(table: &Table<'_>, values: &[Value]) -> cobble_table::TableKey {
+fn build_key(table: &Table, values: &[Value]) -> cobble_table::TableKey {
     let mut builder = table.key_builder();
     for value in values {
         builder.push(value.clone());

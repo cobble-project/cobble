@@ -3,10 +3,11 @@ use crate::metadata::TableMetadata;
 use crate::{BucketHash, FieldId, LogicalType, Result, TableError, TableSchema, Value, ValueCodec};
 use bytes::Bytes;
 use cobble::{
-    ColumnFamilyOptions, Db, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, Schema, WriteOptions,
+    ColumnFamilyOptions, Db, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, Schema,
+    ShardSnapshotInput, WriteOptions,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 pub(crate) struct CompiledTable {
     pub(crate) schema: TableSchema,
@@ -63,7 +64,7 @@ struct ProjectionPlan {
 }
 
 enum TableReadBackend<'db> {
-    Writable(&'db Db),
+    Writable(Arc<Db>),
     ReadOnly(&'db ReadOnlyDb),
     Runtime(Arc<crate::runtime::RuntimeReadBackend>),
 }
@@ -110,8 +111,8 @@ impl<'db> TableReadBackend<'db> {
 
     fn writer_backend(&self) -> Option<Arc<Db>> {
         match self {
-            Self::Writable(_) | Self::ReadOnly(_) => None,
-            Self::Runtime(backend) => backend.writer_backend(),
+            Self::Writable(db) => Some(Arc::clone(db)),
+            Self::ReadOnly(_) | Self::Runtime(_) => None,
         }
     }
 }
@@ -153,8 +154,8 @@ impl TableKeyBuilder {
 }
 
 /// Typed access to one table-backed Cobble column family.
-pub struct Table<'db> {
-    db: &'db Db,
+pub struct Table {
+    db: Arc<Db>,
     name: String,
     compiled: Arc<CompiledTable>,
     read_options: ReadOptions,
@@ -171,16 +172,16 @@ pub struct ReadOnlyTable<'db> {
     scan_options: ScanOptions,
 }
 
-impl<'db> Table<'db> {
+impl Table {
     /// Create a table or reopen it when its persisted schema is identical.
-    pub fn create(db: &'db Db, name: impl Into<String>, schema: TableSchema) -> Result<Self> {
+    pub fn create(db: Arc<Db>, name: impl Into<String>, schema: TableSchema) -> Result<Self> {
         let name = validate_name(name.into())?;
-        let metadata = ensure_table_schema(db, &name, schema)?;
+        let metadata = ensure_table_schema(db.as_ref(), &name, schema)?;
         Self::from_metadata(db, name, metadata)
     }
 
     /// Open a table from metadata stored in its column-family options.
-    pub fn open(db: &'db Db, name: impl Into<String>) -> Result<Self> {
+    pub fn open(db: Arc<Db>, name: impl Into<String>) -> Result<Self> {
         let name = validate_name(name.into())?;
         let current = db.current_schema();
         let metadata = load_table_metadata(&current, &name)?;
@@ -204,9 +205,9 @@ impl<'db> Table<'db> {
     pub fn project_by_names<S: AsRef<str>>(
         &self,
         field_names: &[S],
-    ) -> Result<TableProjection<'db>> {
+    ) -> Result<TableProjection<'static>> {
         build_projection(
-            TableReadBackend::Writable(self.db),
+            TableReadBackend::Writable(Arc::clone(&self.db)),
             &self.name,
             Arc::clone(&self.compiled),
             field_names,
@@ -306,13 +307,43 @@ impl<'db> Table<'db> {
                 end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
                 &self.scan_options,
             )?,
-            _writer_backend: None,
+            _writer_backend: Some(Arc::clone(&self.db)),
             compiled: Arc::clone(&self.compiled),
         })
     }
 
+    /// Start an asynchronous shard snapshot, returning its id immediately.
+    pub fn snapshot(&self) -> Result<u64> {
+        Ok(self.db.snapshot()?)
+    }
+
+    /// Receive either the completed shard input or its publication error.
+    pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
+    where
+        F: Fn(cobble::Result<ShardSnapshotInput>) + Send + Sync + 'static,
+    {
+        Ok(self.db.snapshot_with_callback(callback)?)
+    }
+
+    /// Create a snapshot and wait for its callback, without polling.
+    pub fn snapshot_and_wait(&self) -> Result<ShardSnapshotInput> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.snapshot_with_callback(move |result| {
+            let _ = sender.send(result);
+        })?;
+        receiver
+            .recv()
+            .map_err(|err| TableError::internal(format!("snapshot callback disconnected: {err}")))?
+            .map_err(Into::into)
+    }
+
+    /// Return the published shard input for a completed snapshot.
+    pub fn shard_snapshot_input(&self, snapshot_id: u64) -> Result<ShardSnapshotInput> {
+        Ok(self.db.shard_snapshot_input(snapshot_id)?)
+    }
+
     pub(crate) fn from_metadata(
-        db: &'db Db,
+        db: Arc<Db>,
         name: String,
         metadata: TableMetadata,
     ) -> Result<Self> {
