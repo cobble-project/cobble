@@ -2,7 +2,7 @@ use cobble::{Config, DbBuilder, VolumeDescriptor, VolumeUsageKind};
 use cobble_table::catalog::{
     Catalog, CatalogError, CatalogSchemaId, SchemaChange, TableIdentifier,
 };
-use cobble_table::file_catalog::{FileCatalog, FileCatalogConfig};
+use cobble_table::catalog::{FileCatalog, FileCatalogConfig};
 use cobble_table::{DataField, LogicalType, Table, TableSchema, Value};
 use std::sync::Arc;
 

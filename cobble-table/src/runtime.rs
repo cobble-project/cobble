@@ -1,3 +1,4 @@
+use crate::catalog::{CatalogTable, TableId, physical_table_name};
 use crate::table::{
     TableKey, TableKeyBuilder, TableScan, assemble_row_from_key_values, compile_table,
     encode_table_row, ensure_table_schema, load_table_metadata, validate_bound, validate_name,
@@ -16,6 +17,7 @@ pub struct TableWriterBuilder {
     table_name: Option<String>,
     db_id: Option<String>,
     bucket_ranges: Vec<RangeInclusive<u16>>,
+    catalog_table: Option<CatalogTable>,
 }
 
 impl TableWriterBuilder {
@@ -25,6 +27,17 @@ impl TableWriterBuilder {
             table_name: None,
             db_id: None,
             bucket_ranges: Vec::new(),
+            catalog_table: None,
+        }
+    }
+
+    pub(crate) fn from_catalog(config: Config, table_name: String, table: CatalogTable) -> Self {
+        Self {
+            config,
+            table_name: Some(table_name),
+            db_id: None,
+            bucket_ranges: Vec::new(),
+            catalog_table: Some(table),
         }
     }
 
@@ -48,39 +61,72 @@ impl TableWriterBuilder {
 
     /// Create a new database and create the typed table schema.
     pub fn create(self, schema: TableSchema) -> Result<TableWriter> {
+        if self.catalog_table.is_some() {
+            return Err(TableError::InvalidSchema(
+                "catalog-bound TableWriterBuilder requires open()".into(),
+            ));
+        }
         let name = self.required_table_name()?;
         let db = Arc::new(self.db_builder().open()?);
         TableWriter::create(db, name, schema)
     }
 
-    /// Resume a writable shard and load its persisted table schema.
+    /// Open a new writable shard for a catalog-bound table.
+    pub fn open(self) -> Result<TableWriter> {
+        let table = self.catalog_table.clone().ok_or_else(|| {
+            TableError::InvalidSchema("TableWriterBuilder::open requires a catalog table".into())
+        })?;
+        self.required_table_name()?;
+        let db = Arc::new(self.db_builder().open()?);
+        TableWriter::from_catalog_materialized(db, table)
+    }
+
+    /// Resume a writable shard, materializing the loaded catalog definition when bound.
     pub fn resume(self) -> Result<TableWriter> {
         let name = self.required_table_name()?;
         let db = Arc::new(self.db_builder().resume()?);
-        TableWriter::open(db, name)
+        match self.catalog_table {
+            Some(table) => TableWriter::from_catalog_materialized(db, table),
+            None => TableWriter::open(db, name),
+        }
     }
 
     /// Open a writable shard at a selected snapshot boundary.
     pub fn open_from_snapshot(self, snapshot_id: u64) -> Result<TableWriter> {
         let name = self.required_table_name()?;
         let db = Arc::new(self.db_builder().open_from_snapshot(snapshot_id)?);
-        TableWriter::open(db, name)
+        match self.catalog_table {
+            Some(table) => TableWriter::open_catalog_snapshot(db, name, table.table_id()),
+            None => TableWriter::open(db, name),
+        }
     }
 
     /// Resume a writable shard from a selected snapshot boundary.
     pub fn resume_from_snapshot(self, snapshot_id: u64) -> Result<TableWriter> {
         let name = self.required_table_name()?;
         let db = Arc::new(self.db_builder().resume_from_snapshot(snapshot_id)?);
-        TableWriter::open(db, name)
+        match self.catalog_table {
+            Some(table) => TableWriter::open_catalog_snapshot(db, name, table.table_id()),
+            None => TableWriter::open(db, name),
+        }
     }
 
     fn required_table_name(&self) -> Result<String> {
-        self.table_name
+        let name = self
+            .table_name
             .clone()
             .ok_or_else(|| {
                 TableError::InvalidSchema("TableWriterBuilder requires table_name".into())
             })
-            .and_then(validate_name)
+            .and_then(validate_name)?;
+        if let Some(table) = &self.catalog_table
+            && name != physical_table_name(table.table_id())
+        {
+            return Err(TableError::InvalidSchema(
+                "catalog-bound TableWriterBuilder cannot change table_name".into(),
+            ));
+        }
+        Ok(name)
     }
 
     fn db_builder(&self) -> DbBuilder {
@@ -112,6 +158,17 @@ impl TableWriter {
 
     fn open(db: Arc<Db>, name: String) -> Result<Self> {
         Self::from_metadata(db, name)
+    }
+
+    fn from_catalog_materialized(db: Arc<Db>, table: CatalogTable) -> Result<Self> {
+        let (name, metadata) = table.materialize_for_runtime(db.as_ref())?;
+        Self::from_table_metadata(db, name, metadata)
+    }
+
+    fn open_catalog_snapshot(db: Arc<Db>, name: String, table_id: TableId) -> Result<Self> {
+        let metadata = load_table_metadata(&db.current_schema(), &name)?;
+        validate_catalog_binding(&metadata, table_id)?;
+        Self::from_table_metadata(db, name, metadata)
     }
 
     fn from_metadata(db: Arc<Db>, name: String) -> Result<Self> {
@@ -289,6 +346,7 @@ pub struct TableReaderBuilder {
     config: Config,
     table_name: Option<String>,
     selection: Option<TableReaderSelection>,
+    catalog_table_id: Option<TableId>,
 }
 
 enum TableReaderSelection {
@@ -303,6 +361,16 @@ impl TableReaderBuilder {
             config,
             table_name: None,
             selection: None,
+            catalog_table_id: None,
+        }
+    }
+
+    pub(crate) fn from_catalog(config: Config, table_name: String, table_id: TableId) -> Self {
+        Self {
+            config,
+            table_name: Some(table_name),
+            selection: None,
+            catalog_table_id: Some(table_id),
         }
     }
 
@@ -331,12 +399,7 @@ impl TableReaderBuilder {
     }
 
     pub fn open(self) -> Result<TableReader> {
-        let name = self
-            .table_name
-            .ok_or_else(|| {
-                TableError::InvalidSchema("TableReaderBuilder requires table_name".into())
-            })
-            .and_then(validate_name)?;
+        let name = self.required_table_name()?;
         match self.selection.ok_or_else(|| {
             TableError::InvalidSchema("TableReaderBuilder requires a snapshot selection".into())
         })? {
@@ -346,19 +409,37 @@ impl TableReaderBuilder {
                     snapshot_id,
                     db_id,
                 )?);
-                TableReader::from_shard(db, name)
+                TableReader::from_shard(db, name, self.catalog_table_id)
             }
             TableReaderSelection::Global { snapshot_id } => {
                 let reader = Reader::open(ReaderConfig::from_config(&self.config), snapshot_id)?;
-                TableReader::from_global(reader, name)
+                TableReader::from_global(reader, name, self.catalog_table_id)
             }
             TableReaderSelection::CurrentGlobal => {
                 let reader_config = ReaderConfig::from_config(&self.config);
                 let mut reader = Reader::open_current(reader_config)?;
                 reader.pin_current_snapshot();
-                TableReader::from_global(reader, name)
+                TableReader::from_global(reader, name, self.catalog_table_id)
             }
         }
+    }
+
+    fn required_table_name(&self) -> Result<String> {
+        let name = self
+            .table_name
+            .clone()
+            .ok_or_else(|| {
+                TableError::InvalidSchema("TableReaderBuilder requires table_name".into())
+            })
+            .and_then(validate_name)?;
+        if let Some(table_id) = self.catalog_table_id
+            && name != physical_table_name(table_id)
+        {
+            return Err(TableError::InvalidSchema(
+                "catalog-bound TableReaderBuilder cannot change table_name".into(),
+            ));
+        }
+        Ok(name)
     }
 }
 
@@ -372,8 +453,15 @@ pub struct TableReader {
 }
 
 impl TableReader {
-    fn from_shard(db: Arc<ReadOnlyDb>, name: String) -> Result<Self> {
+    fn from_shard(
+        db: Arc<ReadOnlyDb>,
+        name: String,
+        catalog_table_id: Option<TableId>,
+    ) -> Result<Self> {
         let metadata = load_table_metadata(&db.current_schema(), &name)?;
+        if let Some(table_id) = catalog_table_id {
+            validate_catalog_binding(&metadata, table_id)?;
+        }
         let compiled = compile_table(metadata, db.total_buckets())?;
         Ok(Self::new(
             name,
@@ -382,7 +470,11 @@ impl TableReader {
         ))
     }
 
-    fn from_global(mut reader: Reader, name: String) -> Result<Self> {
+    fn from_global(
+        mut reader: Reader,
+        name: String,
+        catalog_table_id: Option<TableId>,
+    ) -> Result<Self> {
         let manifest = reader.current_global_snapshot();
         let bucket = manifest
             .shard_snapshots
@@ -393,6 +485,9 @@ impl TableReader {
             })?;
         let total_buckets = manifest.total_buckets;
         let metadata = load_table_metadata(reader.schema_for_bucket(bucket)?.as_ref(), &name)?;
+        if let Some(table_id) = catalog_table_id {
+            validate_catalog_binding(&metadata, table_id)?;
+        }
         let compiled = compile_table(metadata.clone(), total_buckets)?;
         let state_name = name.clone();
         Ok(Self::new(
@@ -619,6 +714,21 @@ fn validate_global_bucket(state: &mut GlobalReaderState, bucket: u16) -> Result<
         for bucket in *range.start()..=*range.end() {
             state.validated_buckets[usize::from(bucket)] = true;
         }
+    }
+    Ok(())
+}
+
+fn validate_catalog_binding(
+    metadata: &crate::metadata::TableMetadata,
+    table_id: TableId,
+) -> Result<()> {
+    let binding = metadata.catalog_binding.ok_or_else(|| {
+        TableError::InvalidSchema("table metadata is not bound to a catalog table".into())
+    })?;
+    if binding.table_id != table_id {
+        return Err(TableError::InvalidSchema(
+            "table metadata belongs to another catalog table".into(),
+        ));
     }
     Ok(())
 }

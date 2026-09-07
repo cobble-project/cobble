@@ -247,6 +247,7 @@ exclusive-end semantics as raw `Db`.
 | `TableSchema` / `TableKey` | Logical row structure and reusable encoded primary keys |
 | `TableProjection` | Reusable field selection for typed reads and scans |
 | `SchemaChange` | Add, rename, or drop top-level fields by name while retaining stable field identities |
+| `CatalogTable` | Loaded table definition with reader, writer, and coordinator factories sharing a stable storage namespace |
 
 Define a new schema by name; field IDs are assigned automatically:
 
@@ -269,6 +270,15 @@ renaming preserves the field ID, and deleted IDs are never reused. Publishing a 
 schema does not refresh an already opened reader or writer automatically.
 
 Standalone readers and writers open storage directly from configuration; a catalog is not required.
+Catalog APIs are grouped under `cobble_table::catalog`. With a `FileCatalog`, use the loaded
+table's `writer_builder(config)`, `reader_builder(config)`,
+and `coordinator(config)` factories. Catalog configuration supplies Meta, Snapshot, and WAL volumes;
+its Primary roles are ignored. Runtime configuration supplies all Primary volumes (High, Medium,
+and Low), Cache, and READONLY, retaining their configured priorities. READONLY source paths remain
+unchanged. Table directories follow stable IDs, so renaming a table does not move its files or
+change its snapshot location.
+For catalog-backed writers, `open()` creates a shard and `resume()` applies the loaded table
+definition. Explicit snapshot restores and readers use the schema stored in that snapshot.
 Selecting the current global snapshot captures its version when the reader opens; it does not
 automatically follow later snapshots or schema changes.
 `TableWriter::snapshot()` starts an asynchronous snapshot; `snapshot_and_wait()` returns the

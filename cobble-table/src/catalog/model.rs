@@ -1,6 +1,8 @@
+use super::file_catalog::CatalogRuntimeContext;
 use crate::TableSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 /// Stable identity of a table, independent of its catalog name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -88,12 +90,25 @@ impl TableIdentifier {
 }
 
 /// Semantic table descriptor returned by a catalog.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct CatalogTable {
     pub(crate) identifier: TableIdentifier,
     pub(crate) table_id: TableId,
     pub(crate) catalog_schema_id: CatalogSchemaId,
     pub(crate) schema: TableSchema,
+    pub(crate) runtime_context: Arc<CatalogRuntimeContext>,
+}
+
+impl std::fmt::Debug for CatalogTable {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CatalogTable")
+            .field("identifier", &self.identifier)
+            .field("table_id", &self.table_id)
+            .field("catalog_schema_id", &self.catalog_schema_id)
+            .field("schema", &self.schema)
+            .finish()
+    }
 }
 
 impl CatalogTable {

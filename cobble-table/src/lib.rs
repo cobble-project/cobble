@@ -9,7 +9,6 @@ pub mod catalog;
 mod codec;
 mod error;
 mod evolution;
-pub mod file_catalog;
 mod layout;
 mod logical_type;
 mod metadata;
