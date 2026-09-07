@@ -16,6 +16,7 @@ mod runtime;
 mod schema;
 pub mod snapshot;
 mod table;
+mod write;
 
 #[cfg(test)]
 #[path = "../tests/unit/metadata.rs"]
@@ -37,3 +38,4 @@ pub use schema::{TableSchema, TableSchemaBuilder};
 pub use table::{
     ProjectedTableScan, ReadOnlyTable, Table, TableKey, TableKeyBuilder, TableProjection, TableScan,
 };
+pub use write::{TableWriteBuilder, TableWritePlan};

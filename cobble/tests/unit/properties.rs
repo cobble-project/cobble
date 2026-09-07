@@ -41,6 +41,16 @@ fn properties_are_plain_toml_without_volume_credentials() {
     let path = dir.path().join("shard-7").join(DB_PROPERTIES_NAME);
     let contents = std::fs::read_to_string(path).unwrap();
     let decoded: DbProperties = toml::from_str(&contents).unwrap();
+    let route = config.volumes[0].without_credentials();
+    assert_eq!(
+        serde_json::to_value(&route).unwrap(),
+        serde_json::to_value(&decoded.config.volumes[0]).unwrap()
+    );
+    let rebound = route.with_credentials_from(&config);
+    assert_eq!(rebound.base_dir, config.volumes[0].base_dir);
+    assert_eq!(rebound.access_id, config.volumes[0].access_id);
+    assert_eq!(rebound.secret_key, config.volumes[0].secret_key);
+    assert_eq!(rebound.custom_options, config.volumes[0].custom_options);
 
     assert_eq!(decoded.version, DB_PROPERTIES_VERSION_CURRENT);
     assert_eq!(decoded.db_id, "shard-7");

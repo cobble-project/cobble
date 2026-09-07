@@ -62,6 +62,14 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     let users = catalog
         .create_table(users_id.clone(), schema.clone())
         .unwrap();
+    let write_plan = users.new_write_builder().total_buckets(4).build().unwrap();
+    let write_plan_json = serde_json::to_string(&write_plan).unwrap();
+    assert!(!write_plan_json.contains("catalog-runtime-access"));
+    assert!(!write_plan_json.contains("catalog-runtime-secret"));
+    let unsupported_plan_json = write_plan_json.replacen("\"version\":1", "\"version\":2", 1);
+    let unsupported_plan =
+        serde_json::from_str::<cobble_table::TableWritePlan>(&unsupported_plan_json).unwrap();
+    assert!(unsupported_plan.writer_builder(runtime.clone()).is_err());
     let events = catalog.create_table(events_id, schema.clone()).unwrap();
     assert!(!format!("{users:?}").contains("catalog-runtime-secret"));
     let left = users
@@ -222,6 +230,41 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         old_reader.get(&keys[left_index]).unwrap(),
         Some(rows[left_index].clone())
     );
+    drop(catalog);
+
+    // A worker needs only the serialized, fixed plan, not a live catalog or its latest schema.
+    let worker_plan =
+        serde_json::from_str::<cobble_table::TableWritePlan>(&write_plan_json).unwrap();
+    let mut worker_runtime = runtime.clone();
+    worker_runtime.total_buckets = 1;
+    let worker = worker_plan
+        .writer_builder(worker_runtime.clone())
+        .unwrap()
+        .db_id("worker-shard")
+        .bucket_ranges(vec![0..=3])
+        .open()
+        .unwrap();
+    assert_eq!(worker.schema(), &schema);
+    let worker_index = keys.iter().position(|key| key.bucket() != 0).unwrap();
+    let worker_key = key(worker.key_builder(), &rows[worker_index][0]);
+    assert_eq!(worker_key.bucket(), keys[worker_index].bucket());
+    worker.put(&rows[worker_index]).unwrap();
+    let worker_snapshot = worker.snapshot_and_wait().unwrap();
+    worker.close().unwrap();
+    let worker_historical = worker_plan
+        .writer_builder(worker_runtime)
+        .unwrap()
+        .db_id("worker-shard")
+        .bucket_ranges(vec![0..=3])
+        .open_from_snapshot(worker_snapshot.snapshot_id)
+        .unwrap();
+    assert_eq!(worker_historical.schema(), &schema);
+    assert_eq!(
+        worker_historical.get(&worker_key).unwrap(),
+        Some(rows[worker_index].clone())
+    );
+    worker_historical.close().unwrap();
+
     let resumed = evolved
         .writer_builder(runtime.clone())
         .unwrap()

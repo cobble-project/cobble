@@ -248,6 +248,7 @@ exclusive-end semantics as raw `Db`.
 | `TableProjection` | Reusable field selection for typed reads and scans |
 | `SchemaChange` | Add, rename, or drop top-level fields by name while retaining stable field identities |
 | `CatalogTable` | Loaded table definition with reader, writer, and coordinator factories sharing a stable storage namespace |
+| `TableWriteBuilder` / `TableWritePlan` | Capture a table definition and storage routes for distributed shard writers; plans support Serde serialization |
 
 Define a new schema by name; field IDs are assigned automatically:
 
@@ -283,6 +284,27 @@ Selecting the current global snapshot captures its version when the reader opens
 automatically follow later snapshots or schema changes.
 `TableWriter::snapshot()` starts an asynchronous snapshot; `snapshot_and_wait()` returns the
 completed `ShardSnapshotInput` for opening a reader or submitting to a snapshot coordinator.
+
+For distributed writing, build a plan once and serialize it for workers:
+
+```rust
+let plan = table.new_write_builder().total_buckets(256).build()?;
+let payload = serde_json::to_vec(&plan)?;
+
+// On a worker, after receiving the payload:
+let plan: cobble_table::TableWritePlan = serde_json::from_slice(&payload)?;
+let writer = plan.writer_builder(runtime_config)?
+    .db_id("shard-0")
+    .bucket_ranges(vec![0..=127])
+    .open()?;
+```
+
+The plan fixes the schema, table identity, bucket count, and shared storage routes. A worker does
+not reload the latest Catalog definition. Credentials are excluded from the serialized plan;
+workers supply them through matching volume descriptors in their runtime config. Shared-volume
+descriptors supply credentials only: the plan determines Meta/Snapshot/WAL locations, while runtime
+config determines Primary/Cache/READONLY volumes. An in-process plan retains access to the original
+Catalog credentials. Applications choose how to transport the serialized bytes.
 
 ---
 

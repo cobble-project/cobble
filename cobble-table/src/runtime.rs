@@ -1,9 +1,9 @@
-use crate::catalog::{CatalogTable, TableId, physical_table_name};
+use crate::catalog::{TableId, physical_table_name};
 use crate::table::{
     TableKey, TableKeyBuilder, TableScan, assemble_row_from_key_values, compile_table,
     encode_table_row, ensure_table_schema, load_table_metadata, validate_bound, validate_name,
 };
-use crate::{Result, TableError, TableSchema, Value};
+use crate::{Result, TableError, TableSchema, TableWritePlan, Value};
 use cobble::{
     Config, Db, DbBuilder, DbIterator, ReadOnlyDb, ReadOptions, Reader, ReaderConfig, ScanOptions,
     ShardSnapshotInput, WriteOptions,
@@ -17,7 +17,7 @@ pub struct TableWriterBuilder {
     table_name: Option<String>,
     db_id: Option<String>,
     bucket_ranges: Vec<RangeInclusive<u16>>,
-    catalog_table: Option<CatalogTable>,
+    catalog_binding: Option<(TableWritePlan, Config)>,
 }
 
 impl TableWriterBuilder {
@@ -27,17 +27,22 @@ impl TableWriterBuilder {
             table_name: None,
             db_id: None,
             bucket_ranges: Vec::new(),
-            catalog_table: None,
+            catalog_binding: None,
         }
     }
 
-    pub(crate) fn from_catalog(config: Config, table_name: String, table: CatalogTable) -> Self {
+    pub(crate) fn from_write_plan(
+        config: Config,
+        table_name: String,
+        plan: TableWritePlan,
+        catalog_store_config: Config,
+    ) -> Self {
         Self {
             config,
             table_name: Some(table_name),
             db_id: None,
             bucket_ranges: Vec::new(),
-            catalog_table: Some(table),
+            catalog_binding: Some((plan, catalog_store_config)),
         }
     }
 
@@ -61,7 +66,7 @@ impl TableWriterBuilder {
 
     /// Create a new database and create the typed table schema.
     pub fn create(self, schema: TableSchema) -> Result<TableWriter> {
-        if self.catalog_table.is_some() {
+        if self.catalog_binding.is_some() {
             return Err(TableError::InvalidSchema(
                 "catalog-bound TableWriterBuilder requires open()".into(),
             ));
@@ -73,20 +78,22 @@ impl TableWriterBuilder {
 
     /// Open a new writable shard for a catalog-bound table.
     pub fn open(self) -> Result<TableWriter> {
-        let table = self.catalog_table.clone().ok_or_else(|| {
+        let (plan, store_config) = self.catalog_binding.clone().ok_or_else(|| {
             TableError::InvalidSchema("TableWriterBuilder::open requires a catalog table".into())
         })?;
         self.required_table_name()?;
         let db = Arc::new(self.db_builder().open()?);
-        TableWriter::from_catalog_materialized(db, table)
+        TableWriter::from_write_plan_materialized(db, &plan, &store_config)
     }
 
     /// Resume a writable shard, materializing the loaded catalog definition when bound.
     pub fn resume(self) -> Result<TableWriter> {
         let name = self.required_table_name()?;
         let db = Arc::new(self.db_builder().resume()?);
-        match self.catalog_table {
-            Some(table) => TableWriter::from_catalog_materialized(db, table),
+        match self.catalog_binding {
+            Some((plan, store_config)) => {
+                TableWriter::from_write_plan_materialized(db, &plan, &store_config)
+            }
             None => TableWriter::open(db, name),
         }
     }
@@ -95,8 +102,8 @@ impl TableWriterBuilder {
     pub fn open_from_snapshot(self, snapshot_id: u64) -> Result<TableWriter> {
         let name = self.required_table_name()?;
         let db = Arc::new(self.db_builder().open_from_snapshot(snapshot_id)?);
-        match self.catalog_table {
-            Some(table) => TableWriter::open_catalog_snapshot(db, name, table.table_id()),
+        match self.catalog_binding {
+            Some((plan, _)) => TableWriter::open_catalog_snapshot(db, name, plan.table_id()),
             None => TableWriter::open(db, name),
         }
     }
@@ -105,8 +112,8 @@ impl TableWriterBuilder {
     pub fn resume_from_snapshot(self, snapshot_id: u64) -> Result<TableWriter> {
         let name = self.required_table_name()?;
         let db = Arc::new(self.db_builder().resume_from_snapshot(snapshot_id)?);
-        match self.catalog_table {
-            Some(table) => TableWriter::open_catalog_snapshot(db, name, table.table_id()),
+        match self.catalog_binding {
+            Some((plan, _)) => TableWriter::open_catalog_snapshot(db, name, plan.table_id()),
             None => TableWriter::open(db, name),
         }
     }
@@ -119,8 +126,8 @@ impl TableWriterBuilder {
                 TableError::InvalidSchema("TableWriterBuilder requires table_name".into())
             })
             .and_then(validate_name)?;
-        if let Some(table) = &self.catalog_table
-            && name != physical_table_name(table.table_id())
+        if let Some((plan, _)) = &self.catalog_binding
+            && name != physical_table_name(plan.table_id())
         {
             return Err(TableError::InvalidSchema(
                 "catalog-bound TableWriterBuilder cannot change table_name".into(),
@@ -160,8 +167,13 @@ impl TableWriter {
         Self::from_metadata(db, name)
     }
 
-    fn from_catalog_materialized(db: Arc<Db>, table: CatalogTable) -> Result<Self> {
-        let (name, metadata) = table.materialize_for_runtime(db.as_ref())?;
+    fn from_write_plan_materialized(
+        db: Arc<Db>,
+        plan: &TableWritePlan,
+        store_config: &Config,
+    ) -> Result<Self> {
+        let (name, metadata) =
+            crate::catalog::materialize_write_plan(store_config, db.as_ref(), plan)?;
         Self::from_table_metadata(db, name, metadata)
     }
 

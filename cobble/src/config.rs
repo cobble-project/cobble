@@ -323,6 +323,18 @@ impl VolumeDescriptor {
         (self.kinds & kind.mask()) != 0
     }
 
+    /// Copy this storage route without credentials, including credentials in its URL and options.
+    /// Use this when sending storage descriptions to another process or persisting them.
+    pub fn without_credentials(&self) -> Self {
+        sanitize_volume_descriptor(self)
+    }
+
+    /// Resolve this route's credentials from a matching volume in the current process config.
+    /// The route's roles and capacity remain unchanged. If no volume matches, return a copy.
+    pub fn with_credentials_from(&self, config: &Config) -> Self {
+        resolve_volume_descriptor_credentials(self, config)
+    }
+
     pub(crate) fn size_limit_bytes(&self) -> Result<Option<u64>> {
         self.size_limit
             .map(|size| size_to_u64("volumes[].size_limit", size))

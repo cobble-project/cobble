@@ -5,7 +5,11 @@ use crate::catalog::{
 };
 use crate::evolution::{apply_schema_changes, compile_column_evolution, schema_field_ids};
 use crate::metadata::TableMetadata;
-use crate::{FieldId, Table, TableError, TableReaderBuilder, TableSchema, TableWriterBuilder};
+use crate::write::{TABLE_WRITE_PLAN_FORMAT, TABLE_WRITE_PLAN_VERSION};
+use crate::{
+    FieldId, Table, TableError, TableReaderBuilder, TableSchema, TableWriteBuilder, TableWritePlan,
+    TableWriterBuilder,
+};
 use cobble::{
     ColumnFamilyOptions, Config, CoordinatorConfig, Db, DbCoordinator, VolumeDescriptor,
     VolumeUsageKind,
@@ -38,30 +42,43 @@ const CATALOG_VERSION: u32 = 1;
 pub(crate) struct CatalogRuntimeContext {
     config: Config,
     storage_id: String,
-    store: CatalogStore,
 }
 
 impl CatalogRuntimeContext {
-    fn scoped_config(&self, mut runtime: Config, table_id: TableId) -> Config {
-        let relative_root = format!("{}/tables/TABLE-{table_id}", self.storage_id);
-        let mut volumes = self
-            .config
-            .volumes
-            .iter()
-            .filter_map(|volume| shared_volume(volume, &relative_root))
-            .collect::<Vec<_>>();
-        volumes.extend(
-            runtime
-                .volumes
-                .iter()
-                .flat_map(|volume| runtime_volumes(volume, &relative_root)),
-        );
-        runtime.volumes = volumes;
-        runtime
+    fn scoped_config(&self, runtime: Config, table_id: TableId) -> Config {
+        scoped_table_config(&self.config.volumes, &self.storage_id, table_id, runtime)
     }
 }
 
+fn scoped_table_config(
+    shared_volumes: &[VolumeDescriptor],
+    storage_id: &str,
+    table_id: TableId,
+    mut runtime: Config,
+) -> Config {
+    let relative_root = format!("{storage_id}/tables/TABLE-{table_id}");
+    let mut volumes = shared_volumes
+        .iter()
+        .filter_map(|volume| shared_volume(volume, &relative_root))
+        .collect::<Vec<_>>();
+    volumes.extend(
+        runtime
+            .volumes
+            .iter()
+            .flat_map(|volume| runtime_volumes(volume, &relative_root)),
+    );
+    runtime.volumes = volumes;
+    runtime
+}
+
 fn shared_volume(source: &VolumeDescriptor, relative_root: &str) -> Option<VolumeDescriptor> {
+    plan_shared_volume(source).map(|mut volume| {
+        volume.base_dir = append_relative_path(&volume.base_dir, relative_root);
+        volume
+    })
+}
+
+fn plan_shared_volume(source: &VolumeDescriptor) -> Option<VolumeDescriptor> {
     let mut volume = source.clone();
     volume.kinds = 0;
     for kind in [
@@ -73,10 +90,7 @@ fn shared_volume(source: &VolumeDescriptor, relative_root: &str) -> Option<Volum
             volume.set_usage(kind);
         }
     }
-    (volume.kinds != 0).then(|| {
-        volume.base_dir = append_relative_path(&volume.base_dir, relative_root);
-        volume
-    })
+    (volume.kinds != 0).then_some(volume)
 }
 
 fn runtime_volumes(source: &VolumeDescriptor, relative_root: &str) -> Vec<VolumeDescriptor> {
@@ -269,7 +283,6 @@ impl FileCatalog {
         let runtime_context = Arc::new(CatalogRuntimeContext {
             config: config.clone(),
             storage_id: catalog_config.storage_id().to_string(),
-            store: store.clone(),
         });
         Ok(Self {
             store,
@@ -435,12 +448,42 @@ fn materialize_loaded_table(
     db: &Db,
     table: &CatalogTable,
 ) -> CatalogResult<(String, TableMetadata)> {
-    let physical_name = physical_table_name(table.table_id);
-    let target = TableMetadata::compile_catalog(
-        table.schema.clone(),
+    materialize_table_definition(
+        store,
+        db,
         table.table_id,
         table.catalog_schema_id,
-    )?;
+        &table.schema,
+    )
+}
+
+pub(crate) fn materialize_write_plan(
+    store_config: &Config,
+    db: &Db,
+    plan: &TableWritePlan,
+) -> crate::Result<(String, TableMetadata)> {
+    plan.validate()?;
+    let store = CatalogStore::open(store_config, &plan.storage_id)
+        .map_err(|error| TableError::internal(error.to_string()))?;
+    materialize_table_definition(
+        &store,
+        db,
+        plan.table_id,
+        plan.catalog_schema_id,
+        &plan.schema,
+    )
+    .map_err(|error| TableError::internal(error.to_string()))
+}
+
+fn materialize_table_definition(
+    store: &CatalogStore,
+    db: &Db,
+    table_id: TableId,
+    catalog_schema_id: CatalogSchemaId,
+    schema: &TableSchema,
+) -> CatalogResult<(String, TableMetadata)> {
+    let physical_name = physical_table_name(table_id);
+    let target = TableMetadata::compile_catalog(schema.clone(), table_id, catalog_schema_id)?;
     let current = db.current_schema();
     let core_schema_id =
         if let Some(column_family_id) = current.column_family_ids().get(&physical_name).copied() {
@@ -456,20 +499,20 @@ fn materialize_loaded_table(
                     "column family '{physical_name}' is not a catalog table"
                 ))
             })?;
-            if binding.table_id != table.table_id {
+            if binding.table_id != table_id {
                 return Err(TableError::InvalidSchema(format!(
                     "column family '{physical_name}' belongs to another catalog table"
                 ))
                 .into());
             }
-            if binding.catalog_schema_id > table.catalog_schema_id {
+            if binding.catalog_schema_id > catalog_schema_id {
                 return Err(TableError::InvalidSchema(format!(
                     "catalog schema {} cannot replace newer materialized schema {}",
-                    table.catalog_schema_id, binding.catalog_schema_id
+                    catalog_schema_id, binding.catalog_schema_id
                 ))
                 .into());
             }
-            if binding.catalog_schema_id == table.catalog_schema_id {
+            if binding.catalog_schema_id == catalog_schema_id {
                 if existing != target
                     || current.num_columns_in_family(column_family_id)
                         != Some(target.layout.value_columns.len().max(1))
@@ -514,9 +557,9 @@ fn materialize_loaded_table(
         ShardSchemaMappingFile {
             format: CATALOG_FORMAT.to_string(),
             version: CATALOG_VERSION,
-            table_id: table.table_id,
+            table_id,
             db_id: db.id().to_string(),
-            catalog_schema_id: table.catalog_schema_id,
+            catalog_schema_id,
             core_schema_id,
         },
     )?;
@@ -545,15 +588,17 @@ fn write_schema_mapping(
 }
 
 impl CatalogTable {
+    /// Start building a portable writer initialization plan for this table.
+    pub fn new_write_builder(&self) -> TableWriteBuilder {
+        TableWriteBuilder::new(self.clone(), self.runtime_context.config.total_buckets)
+    }
+
     /// Build an owned writer for this table using its catalog-managed shared storage.
     pub fn writer_builder(&self, runtime: Config) -> CatalogResult<TableWriterBuilder> {
-        let context = &self.runtime_context;
-        let config = context.scoped_config(runtime, self.table_id);
-        Ok(TableWriterBuilder::from_catalog(
-            config,
-            physical_table_name(self.table_id),
-            self.clone(),
-        ))
+        self.new_write_builder()
+            .total_buckets(runtime.total_buckets)
+            .build()?
+            .writer_builder(runtime)
     }
 
     /// Build an owned snapshot reader for this table using its catalog-managed shared storage.
@@ -575,14 +620,59 @@ impl CatalogTable {
             &config,
         ))?)
     }
+}
 
-    pub(crate) fn materialize_for_runtime(
-        &self,
-        db: &Db,
-    ) -> crate::Result<(String, TableMetadata)> {
-        materialize_loaded_table(&self.runtime_context.store, db, self)
-            .map_err(|error| TableError::internal(error.to_string()))
-    }
+pub(crate) fn build_write_plan(
+    table: CatalogTable,
+    total_buckets: u32,
+) -> CatalogResult<TableWritePlan> {
+    let context = &table.runtime_context;
+    let shared_volumes = context
+        .config
+        .volumes
+        .iter()
+        .filter_map(plan_shared_volume)
+        .map(|volume| volume.without_credentials())
+        .collect();
+    let plan = TableWritePlan {
+        format: TABLE_WRITE_PLAN_FORMAT.to_string(),
+        version: TABLE_WRITE_PLAN_VERSION,
+        identifier: table.identifier,
+        table_id: table.table_id,
+        catalog_schema_id: table.catalog_schema_id,
+        schema: table.schema,
+        storage_id: context.storage_id.clone(),
+        shared_volumes,
+        total_buckets,
+        auth_source: Some(context.config.clone()),
+    };
+    plan.validate()?;
+    Ok(plan)
+}
+
+pub(crate) fn writer_builder_from_write_plan(
+    plan: &TableWritePlan,
+    runtime: Config,
+) -> CatalogResult<TableWriterBuilder> {
+    plan.validate()?;
+    let credential_source = plan.auth_source.as_ref().unwrap_or(&runtime);
+    let shared_volumes = plan
+        .shared_volumes
+        .iter()
+        .map(|volume| volume.with_credentials_from(credential_source))
+        .collect::<Vec<_>>();
+    let store_config = Config {
+        volumes: shared_volumes.clone(),
+        ..Config::default()
+    };
+    let mut config = scoped_table_config(&shared_volumes, &plan.storage_id, plan.table_id, runtime);
+    config.total_buckets = plan.total_buckets;
+    Ok(TableWriterBuilder::from_write_plan(
+        config,
+        physical_table_name(plan.table_id),
+        plan.clone(),
+        store_config,
+    ))
 }
 
 impl FileCatalog {
