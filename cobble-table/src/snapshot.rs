@@ -161,35 +161,51 @@ impl TableSnapshotCommitter {
                         .take_global_snapshot(self.total_buckets, inputs)?,
                 );
             }
+            self.materialize_prepared_snapshot(pending)?;
             pending
                 .prepared_snapshot
                 .as_ref()
-                .expect("snapshot was prepared")
+                .expect("published commit retains its prepared snapshot")
                 .clone()
         };
-        let materialized = self.materialize_prepared_snapshot(&snapshot)?;
         state.latest_completed_commit_id = Some(commit_id);
         state.pending.retain(|id, _| *id > commit_id);
-        Ok(materialized.then_some(snapshot))
+        Ok(Some(snapshot))
     }
 
-    fn materialize_prepared_snapshot(&self, snapshot: &GlobalSnapshotManifest) -> Result<bool> {
-        if let Some(current) = self.coordinator.load_current_global_snapshot()? {
+    fn materialize_prepared_snapshot(&self, pending: &mut PendingCommit) -> Result<()> {
+        let current = self.coordinator.load_current_global_snapshot()?;
+        if let Some(current) = &current {
+            let snapshot = pending
+                .prepared_snapshot
+                .as_ref()
+                .expect("complete commit has a prepared snapshot");
             if current.id > snapshot.id {
-                return Ok(false);
-            }
-            if current.id == snapshot.id {
-                if current != *snapshot {
-                    return Err(coordination_error(format!(
-                        "global snapshot {} conflicts with its prepared manifest",
-                        snapshot.id
-                    )));
-                }
-                return Ok(true);
+                // An older checkpoint may have completed while this newer one awaited retry.
+                // Snapshot IDs follow allocation order, not application commit order.
+                pending.prepared_snapshot = Some(
+                    self.coordinator
+                        .take_global_snapshot(self.total_buckets, canonical_inputs(pending))?,
+                );
             }
         }
+        let snapshot = pending
+            .prepared_snapshot
+            .as_ref()
+            .expect("complete commit has a prepared snapshot");
+        if let Some(current) = current
+            && current.id == snapshot.id
+        {
+            if current != *snapshot {
+                return Err(coordination_error(format!(
+                    "global snapshot {} conflicts with its prepared manifest",
+                    snapshot.id
+                )));
+            }
+            return Ok(());
+        }
         self.coordinator.materialize_global_snapshot(snapshot)?;
-        Ok(true)
+        Ok(())
     }
 }
 

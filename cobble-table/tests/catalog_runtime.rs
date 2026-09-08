@@ -1,6 +1,5 @@
 use cobble::{Config, VolumeDescriptor, VolumeUsageKind};
 use cobble_table::catalog::{Catalog, FileCatalog, FileCatalogConfig, TableIdentifier};
-use cobble_table::snapshot::TableSnapshotCommitter;
 use cobble_table::{LogicalType, SchemaChange, TableKey, TableKeyBuilder, TableSchema, Value};
 use std::sync::Arc;
 
@@ -114,13 +113,12 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     let left_snapshot = left.snapshot_and_wait().unwrap();
     let right_snapshot = right.snapshot_and_wait().unwrap();
     let coordinator = Arc::new(users.coordinator(runtime.clone()).unwrap());
-    let committer = TableSnapshotCommitter::new(coordinator.clone(), 4, 2).unwrap();
+    let committer = users.snapshot_committer(runtime.clone(), 2).unwrap();
     let first = committer
         .commit_batch(1, vec![left_snapshot.clone(), right_snapshot])
         .unwrap()
         .unwrap();
-    let other_coordinator = Arc::new(events.coordinator(runtime.clone()).unwrap());
-    let other_committer = TableSnapshotCommitter::new(other_coordinator, 4, 2).unwrap();
+    let other_committer = events.snapshot_committer(runtime.clone(), 2).unwrap();
     other_committer
         .commit_batch(1, vec![other.snapshot_and_wait().unwrap()])
         .unwrap()

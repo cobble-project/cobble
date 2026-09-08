@@ -5,6 +5,7 @@ use crate::catalog::{
 };
 use crate::evolution::{apply_schema_changes, compile_column_evolution, schema_field_ids};
 use crate::metadata::TableMetadata;
+use crate::snapshot::TableSnapshotCommitter;
 use crate::write::{TABLE_WRITE_PLAN_FORMAT, TABLE_WRITE_PLAN_VERSION};
 use crate::{
     FieldId, ReadOnlyTableBuilder, Table, TableError, TableReaderBuilder, TableSchema,
@@ -621,6 +622,21 @@ impl CatalogTable {
             physical_table_name(self.table_id),
             self.table_id,
         ))
+    }
+
+    /// Build an in-process committer in this table's global snapshot namespace.
+    pub fn snapshot_committer(
+        &self,
+        runtime: Config,
+        max_pending_commits: usize,
+    ) -> CatalogResult<TableSnapshotCommitter> {
+        let total_buckets = runtime.total_buckets;
+        let coordinator = Arc::new(self.coordinator(runtime)?);
+        Ok(TableSnapshotCommitter::new(
+            coordinator,
+            total_buckets,
+            max_pending_commits,
+        )?)
     }
 
     /// Open the core coordinator in this table's global snapshot namespace.

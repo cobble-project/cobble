@@ -250,7 +250,8 @@ exclusive-end semantics as raw `Db`.
 | `TableSchema` / `TableKey` | Logical row structure and reusable encoded primary keys |
 | `TableProjection` | Reusable field selection for typed reads and scans |
 | `SchemaChange` | Add, rename, or drop top-level fields by name while retaining stable field identities |
-| `CatalogTable` | Loaded table definition with reader, writer, and coordinator factories sharing a stable storage namespace |
+| `CatalogTable` | Loaded table definition with reader, writer, and snapshot committer factories sharing a stable storage namespace |
+| `TableSnapshotCommitter` | Collect shard snapshots and publish complete global checkpoints |
 | `TableWriteBuilder` / `TableWritePlan` | Capture a table definition and storage routes for distributed shard writers; plans support Serde serialization |
 
 Define a new schema by name; field IDs are assigned automatically:
@@ -287,7 +288,8 @@ schema does not refresh an already opened reader or writer automatically.
 Standalone readers and writers open storage directly from configuration; a catalog is not required.
 Catalog APIs are grouped under `cobble_table::catalog`. With a `FileCatalog`, use the loaded
 table's `writer_builder(config)`, `readonly_table_builder(config)` for a shard,
-`reader_builder(config)` for a global read proxy, and `coordinator(config)` factories.
+`reader_builder(config)` for a global read proxy, and `snapshot_committer(config, max_pending_commits)` factories.
+The lower-level `coordinator(config)` remains available for direct snapshot management.
 Catalog configuration supplies Meta, Snapshot, and WAL volumes;
 its Primary roles are ignored. Runtime configuration supplies all Primary volumes (High, Medium,
 and Low), Cache, and READONLY, retaining their configured priorities. READONLY source paths remain
@@ -299,6 +301,12 @@ Selecting the current global snapshot captures its version when the reader opens
 automatically follow later snapshots or schema changes.
 `Table::snapshot()` starts an asynchronous snapshot; `snapshot_and_wait()` returns the
 completed `ShardSnapshotInput` for opening a reader or submitting to a snapshot coordinator.
+
+`snapshot_committer(config, max_pending_commits)` returns the same `TableSnapshotCommitter`
+available without a catalog. Use `submit(commit_id, shard_snapshot)` as shards arrive or
+`commit_batch(commit_id, shard_snapshots)` for a complete checkpoint. Run one active committer
+per table; pending state is in memory, so the application must replay incomplete checkpoints
+after a restart.
 
 For distributed writing, build a plan once and serialize it for workers:
 

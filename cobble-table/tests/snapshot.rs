@@ -156,6 +156,75 @@ fn table_snapshot_committer_collects_and_commits_interleaved_checkpoints() {
             .id,
         9
     );
+
+    let retry_a = shard_input("db-a", vec![0..=1], 100);
+    let retry_b = shard_input("db-b", vec![2..=3], 101);
+    // A publication failure without a newer CURRENT reuses its prepared manifest.
+    let blocked_normal = root.path().join("snapshot/SNAPSHOT-10");
+    std::fs::create_dir(&blocked_normal).unwrap();
+    assert!(
+        new_session
+            .commit_batch(5, vec![retry_a.clone(), retry_b.clone()])
+            .is_err()
+    );
+    std::fs::remove_dir(&blocked_normal).unwrap();
+    let retried_normal = new_session
+        .commit_batch(5, vec![retry_a.clone(), retry_b.clone()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(retried_normal.id, 10);
+    assert_eq!(
+        retried_normal
+            .shard_snapshots
+            .iter()
+            .map(|shard| shard.snapshot_id)
+            .collect::<Vec<_>>(),
+        vec![100, 101]
+    );
+
+    let newer_a = shard_input("db-a", vec![0..=1], 300);
+    let newer_b = shard_input("db-b", vec![2..=3], 301);
+    let older_a = shard_input("db-a", vec![0..=1], 200);
+    let older_b = shard_input("db-b", vec![2..=3], 201);
+    // A newer checkpoint that failed first must be reallocated after an older one publishes.
+    let blocked_newer = root.path().join("snapshot/SNAPSHOT-11");
+    std::fs::create_dir(&blocked_newer).unwrap();
+    assert!(
+        new_session
+            .commit_batch(20, vec![newer_a.clone(), newer_b.clone()])
+            .is_err()
+    );
+    std::fs::remove_dir(&blocked_newer).unwrap();
+    let older = new_session
+        .commit_batch(10, vec![older_a, older_b])
+        .unwrap()
+        .unwrap();
+    assert_eq!(older.id, 12);
+    assert_eq!(
+        older
+            .shard_snapshots
+            .iter()
+            .map(|shard| shard.snapshot_id)
+            .collect::<Vec<_>>(),
+        vec![200, 201]
+    );
+    let retried_newer = new_session
+        .commit_batch(20, vec![newer_a, newer_b])
+        .unwrap()
+        .unwrap();
+    assert_eq!(retried_newer.id, 13);
+    assert_eq!(
+        retried_newer
+            .shard_snapshots
+            .iter()
+            .map(|shard| shard.snapshot_id)
+            .collect::<Vec<_>>(),
+        vec![300, 301]
+    );
+    assert_eq!(
+        coordinator.load_current_global_snapshot().unwrap().unwrap(),
+        retried_newer
+    );
 }
 
 fn shard_input(
