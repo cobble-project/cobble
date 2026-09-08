@@ -9,9 +9,9 @@ use cobble::{
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 
-pub(crate) struct CompiledTable {
-    pub(crate) schema: TableSchema,
-    pub(crate) key_positions: Vec<usize>,
+struct CompiledTable {
+    schema: TableSchema,
+    key_positions: Vec<usize>,
     key_types: Vec<LogicalType>,
     bucket_key_fields: usize,
     value_positions: Vec<usize>,
@@ -20,10 +20,10 @@ pub(crate) struct CompiledTable {
     bucket_hash: BucketHash,
 }
 
-pub(crate) struct TableKeyData {
-    pub(crate) values: Vec<Value>,
-    pub(crate) bucket: u16,
-    pub(crate) encoded: Vec<u8>,
+struct TableKeyData {
+    values: Vec<Value>,
+    bucket: u16,
+    encoded: Vec<u8>,
 }
 
 /// A validated and encoded primary key for a table.
@@ -31,7 +31,7 @@ pub(crate) struct TableKeyData {
 /// Cloning a key is cheap and shares its encoded bytes and typed values.
 #[derive(Clone)]
 pub struct TableKey {
-    pub(crate) inner: Arc<TableKeyData>,
+    inner: Arc<TableKeyData>,
 }
 
 impl TableKey {
@@ -44,8 +44,8 @@ impl TableKey {
 
 /// Incrementally builds one table primary key in schema order.
 pub struct TableKeyBuilder {
-    pub(crate) compiled: Arc<CompiledTable>,
-    pub(crate) values: Vec<Value>,
+    compiled: Arc<CompiledTable>,
+    values: Vec<Value>,
 }
 
 enum ProjectedFieldSource {
@@ -63,13 +63,14 @@ struct ProjectionPlan {
     has_key_fields: bool,
 }
 
-enum TableReadBackend<'db> {
+#[derive(Clone)]
+enum ReadBackend {
     Writable(Arc<Db>),
-    ReadOnly(&'db ReadOnlyDb),
-    Runtime(Arc<crate::runtime::RuntimeReadBackend>),
+    Shard(Arc<ReadOnlyDb>),
+    Global(Arc<crate::runtime::GlobalReaderState>),
 }
 
-impl<'db> TableReadBackend<'db> {
+impl ReadBackend {
     fn get_with_options(
         &self,
         bucket: u16,
@@ -78,8 +79,8 @@ impl<'db> TableReadBackend<'db> {
     ) -> Result<Option<Vec<Option<Bytes>>>> {
         match self {
             Self::Writable(db) => Ok(db.get_with_options(bucket, key, options)?),
-            Self::ReadOnly(db) => Ok(db.get_with_options(bucket, key, options)?),
-            Self::Runtime(backend) => backend.get(bucket, key, options),
+            Self::Shard(db) => Ok(db.get_with_options(bucket, key, options)?),
+            Self::Global(state) => state.get(bucket, key, options),
         }
     }
 
@@ -90,8 +91,8 @@ impl<'db> TableReadBackend<'db> {
     ) -> Result<Vec<Option<Vec<Option<Bytes>>>>> {
         match self {
             Self::Writable(db) => Ok(db.multi_get_with_options(keys, options)?),
-            Self::ReadOnly(db) => Ok(db.multi_get_with_options(keys, options)?),
-            Self::Runtime(backend) => backend.multi_get(keys, options),
+            Self::Shard(db) => Ok(db.multi_get_with_options(keys, options)?),
+            Self::Global(state) => state.multi_get(keys, options),
         }
     }
 
@@ -104,22 +105,15 @@ impl<'db> TableReadBackend<'db> {
     ) -> Result<DbIterator> {
         match self {
             Self::Writable(db) => Ok(db.scan_with_options_bounds(bucket, start, end, options)?),
-            Self::ReadOnly(db) => Ok(db.scan_with_options_bounds(bucket, start, end, options)?),
-            Self::Runtime(backend) => backend.scan(bucket, start, end, options),
-        }
-    }
-
-    fn writer_backend(&self) -> Option<Arc<Db>> {
-        match self {
-            Self::Writable(db) => Some(Arc::clone(db)),
-            Self::ReadOnly(_) | Self::Runtime(_) => None,
+            Self::Shard(db) => Ok(db.scan_with_options_bounds(bucket, start, end, options)?),
+            Self::Global(state) => state.scan(bucket, start, end, options),
         }
     }
 }
 
 /// A reusable typed projection over one table or fixed snapshot table.
-pub struct TableProjection<'db> {
-    backend: TableReadBackend<'db>,
+pub struct TableProjection {
+    backend: ReadBackend,
     compiled: Arc<CompiledTable>,
     plan: Arc<ProjectionPlan>,
     read_options: ReadOptions,
@@ -156,6 +150,7 @@ impl TableKeyBuilder {
 /// Typed access to one table-backed Cobble column family.
 pub struct Table {
     db: Arc<Db>,
+    read_backend: ReadBackend,
     name: String,
     compiled: Arc<CompiledTable>,
     read_options: ReadOptions,
@@ -164,10 +159,14 @@ pub struct Table {
 }
 
 /// Typed read-only access to one table in a fixed shard snapshot.
-pub struct ReadOnlyTable<'db> {
-    db: &'db ReadOnlyDb,
+pub struct ReadOnlyTable {
+    typed: TypedRead,
+}
+
+pub(crate) struct TypedRead {
     name: String,
     compiled: Arc<CompiledTable>,
+    read_backend: ReadBackend,
     read_options: ReadOptions,
     scan_options: ScanOptions,
 }
@@ -202,12 +201,9 @@ impl Table {
     }
 
     /// Compile a reusable read projection from top-level field names.
-    pub fn project_by_names<S: AsRef<str>>(
-        &self,
-        field_names: &[S],
-    ) -> Result<TableProjection<'static>> {
+    pub fn project_by_names<S: AsRef<str>>(&self, field_names: &[S]) -> Result<TableProjection> {
         build_projection(
-            TableReadBackend::Writable(Arc::clone(&self.db)),
+            self.read_backend.clone(),
             &self.name,
             Arc::clone(&self.compiled),
             field_names,
@@ -301,13 +297,13 @@ impl Table {
         validate_bound(bucket, start_key_inclusive)?;
         validate_bound(bucket, end_key_exclusive)?;
         Ok(TableScan {
-            inner: self.db.scan_with_options_bounds(
+            inner: self.read_backend.scan_with_options_bounds(
                 bucket,
                 start_key_inclusive.map(|key| key.inner.encoded.as_slice()),
                 end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
                 &self.scan_options,
             )?,
-            _writer_backend: Some(Arc::clone(&self.db)),
+            _read_backend: self.read_backend.clone(),
             compiled: Arc::clone(&self.compiled),
         })
     }
@@ -349,6 +345,7 @@ impl Table {
     ) -> Result<Self> {
         let compiled = compile_table(metadata, db.total_buckets())?;
         Ok(Self {
+            read_backend: ReadBackend::Writable(Arc::clone(&db)),
             db,
             name: name.clone(),
             compiled,
@@ -359,11 +356,7 @@ impl Table {
     }
 }
 
-pub(crate) fn ensure_table_schema(
-    db: &Db,
-    name: &str,
-    schema: TableSchema,
-) -> Result<TableMetadata> {
+fn ensure_table_schema(db: &Db, name: &str, schema: TableSchema) -> Result<TableMetadata> {
     let metadata = TableMetadata::compile(schema)?;
     let expected_columns = metadata.layout.value_columns.len().max(1);
     let current = db.current_schema();
@@ -392,20 +385,95 @@ pub(crate) fn ensure_table_schema(
     Ok(metadata)
 }
 
-impl<'db> ReadOnlyTable<'db> {
+impl ReadOnlyTable {
     /// Open a table from metadata stored in this snapshot's schema.
-    pub fn open(db: &'db ReadOnlyDb, name: impl Into<String>) -> Result<Self> {
+    pub fn open(db: Arc<ReadOnlyDb>, name: impl Into<String>) -> Result<Self> {
         let name = validate_name(name.into())?;
         let current = db.current_schema();
         let metadata = load_table_metadata(&current, &name)?;
-        let compiled = compile_table(metadata, db.total_buckets())?;
+        Self::from_shard_metadata(db, name, metadata)
+    }
+
+    pub(crate) fn from_shard_metadata(
+        db: Arc<ReadOnlyDb>,
+        name: String,
+        metadata: TableMetadata,
+    ) -> Result<Self> {
         Ok(Self {
-            db,
+            typed: TypedRead::from_shard_metadata(db, name, metadata)?,
+        })
+    }
+
+    /// Return the persisted semantic schema of this table.
+    pub fn schema(&self) -> &TableSchema {
+        self.typed.schema()
+    }
+
+    /// Start building one primary key in schema order.
+    pub fn key_builder(&self) -> TableKeyBuilder {
+        self.typed.key_builder()
+    }
+
+    /// Compile a reusable read projection from top-level field names.
+    pub fn project_by_names<S: AsRef<str>>(&self, field_names: &[S]) -> Result<TableProjection> {
+        self.typed.project_by_names(field_names)
+    }
+
+    /// Read one row by primary key.
+    pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
+        self.typed.get(key)
+    }
+
+    /// Read many primary keys while preserving order and duplicates.
+    pub fn multi_get(&self, keys: &[TableKey]) -> Result<Vec<Option<Vec<Value>>>> {
+        self.typed.multi_get(keys)
+    }
+
+    /// Scan all rows in one bucket.
+    pub fn scan(&self, bucket: u16) -> Result<TableScan> {
+        self.typed.scan(bucket)
+    }
+
+    /// Scan one bucket from an inclusive primary-key bound to an exclusive bound.
+    pub fn scan_bounds(
+        &self,
+        bucket: u16,
+        start_key_inclusive: Option<&TableKey>,
+        end_key_exclusive: Option<&TableKey>,
+    ) -> Result<TableScan> {
+        self.typed
+            .scan_bounds(bucket, start_key_inclusive, end_key_exclusive)
+    }
+}
+
+impl TypedRead {
+    pub(crate) fn from_shard_metadata(
+        db: Arc<ReadOnlyDb>,
+        name: String,
+        metadata: TableMetadata,
+    ) -> Result<Self> {
+        let compiled = compile_table(metadata, db.total_buckets())?;
+        Ok(Self::new(name, compiled, ReadBackend::Shard(db)))
+    }
+
+    pub(crate) fn from_global_metadata(
+        state: Arc<crate::runtime::GlobalReaderState>,
+        name: String,
+        metadata: TableMetadata,
+    ) -> Result<Self> {
+        let total_buckets = state.total_buckets();
+        let compiled = compile_table(metadata, total_buckets)?;
+        Ok(Self::new(name, compiled, ReadBackend::Global(state)))
+    }
+
+    fn new(name: String, compiled: Arc<CompiledTable>, read_backend: ReadBackend) -> Self {
+        Self {
             name: name.clone(),
             compiled,
+            read_backend,
             read_options: ReadOptions::default().with_column_family(name.clone()),
             scan_options: ScanOptions::default().with_column_family(name),
-        })
+        }
     }
 
     /// Return the persisted semantic schema of this table.
@@ -422,12 +490,9 @@ impl<'db> ReadOnlyTable<'db> {
     }
 
     /// Compile a reusable read projection from top-level field names.
-    pub fn project_by_names<S: AsRef<str>>(
-        &self,
-        field_names: &[S],
-    ) -> Result<TableProjection<'db>> {
+    pub fn project_by_names<S: AsRef<str>>(&self, field_names: &[S]) -> Result<TableProjection> {
         build_projection(
-            TableReadBackend::ReadOnly(self.db),
+            self.read_backend.clone(),
             &self.name,
             Arc::clone(&self.compiled),
             field_names,
@@ -436,7 +501,7 @@ impl<'db> ReadOnlyTable<'db> {
 
     /// Read one row by primary key.
     pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
-        self.db
+        self.read_backend
             .get_with_options(key.inner.bucket, &key.inner.encoded, &self.read_options)?
             .map(|columns| {
                 assemble_row_from_key_values(&self.compiled, &key.inner.values, &columns)
@@ -450,7 +515,7 @@ impl<'db> ReadOnlyTable<'db> {
             .iter()
             .map(|key| (key.inner.bucket, key.inner.encoded.as_slice()))
             .collect::<Vec<_>>();
-        self.db
+        self.read_backend
             .multi_get_with_options(&requests, &self.read_options)?
             .into_iter()
             .zip(keys)
@@ -479,19 +544,19 @@ impl<'db> ReadOnlyTable<'db> {
         validate_bound(bucket, start_key_inclusive)?;
         validate_bound(bucket, end_key_exclusive)?;
         Ok(TableScan {
-            inner: self.db.scan_with_options_bounds(
+            inner: self.read_backend.scan_with_options_bounds(
                 bucket,
                 start_key_inclusive.map(|key| key.inner.encoded.as_slice()),
                 end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
                 &self.scan_options,
             )?,
-            _writer_backend: None,
+            _read_backend: self.read_backend.clone(),
             compiled: Arc::clone(&self.compiled),
         })
     }
 }
 
-impl TableProjection<'_> {
+impl TableProjection {
     /// Read one projected row.
     pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
         self.backend
@@ -553,42 +618,26 @@ impl TableProjection<'_> {
                 end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
                 &self.scan_options,
             )?,
-            _writer_backend: self.backend.writer_backend(),
+            _read_backend: self.backend.clone(),
             compiled: Arc::clone(&self.compiled),
             plan: Arc::clone(&self.plan),
         })
     }
 }
 
-impl TableProjection<'static> {
-    pub(crate) fn from_runtime<S: AsRef<str>>(
-        backend: Arc<crate::runtime::RuntimeReadBackend>,
-        name: String,
-        compiled: Arc<CompiledTable>,
-        field_names: &[S],
-    ) -> Result<Self> {
-        build_projection(
-            TableReadBackend::Runtime(backend),
-            &name,
-            compiled,
-            field_names,
-        )
-    }
-}
-
 /// Iterator over typed rows from a bucket-scoped table scan.
 pub struct TableScan {
-    pub(crate) inner: DbIterator,
-    // `inner` drops first, releasing Db's owned access guard before this can
-    // release the last writer backend reference.
-    pub(crate) _writer_backend: Option<Arc<Db>>,
-    pub(crate) compiled: Arc<CompiledTable>,
+    inner: DbIterator,
+    // `inner` drops first, releasing its owned access guard before this can
+    // release the backend that owns the underlying read route.
+    _read_backend: ReadBackend,
+    compiled: Arc<CompiledTable>,
 }
 
 /// Iterator over projected typed rows from a bucket-scoped scan.
 pub struct ProjectedTableScan {
     inner: DbIterator,
-    _writer_backend: Option<Arc<Db>>,
+    _read_backend: ReadBackend,
     compiled: Arc<CompiledTable>,
     plan: Arc<ProjectionPlan>,
 }
@@ -628,7 +677,7 @@ impl Iterator for TableScan {
     }
 }
 
-pub(crate) fn assemble_row_from_key_values(
+fn assemble_row_from_key_values(
     compiled: &CompiledTable,
     key_values: &[Value],
     columns: &[Option<Bytes>],
@@ -642,7 +691,7 @@ pub(crate) fn assemble_row_from_key_values(
     Ok(row)
 }
 
-pub(crate) fn encode_table_row(
+fn encode_table_row(
     compiled: &CompiledTable,
     row: &[Value],
 ) -> Result<(u16, Vec<u8>, Vec<Vec<u8>>)> {
@@ -719,12 +768,12 @@ fn decode_value_columns(
     Ok(())
 }
 
-fn build_projection<'db, S: AsRef<str>>(
-    backend: TableReadBackend<'db>,
+fn build_projection<S: AsRef<str>>(
+    backend: ReadBackend,
     name: &str,
     compiled: Arc<CompiledTable>,
     field_names: &[S],
-) -> Result<TableProjection<'db>> {
+) -> Result<TableProjection> {
     let (plan, read_options, scan_options) =
         build_projection_parts(name, Arc::clone(&compiled), field_names)?;
     Ok(TableProjection {
@@ -799,10 +848,7 @@ fn build_projection_parts<S: AsRef<str>>(
     ))
 }
 
-pub(crate) fn compile_table(
-    metadata: TableMetadata,
-    total_buckets: u32,
-) -> Result<Arc<CompiledTable>> {
+fn compile_table(metadata: TableMetadata, total_buckets: u32) -> Result<Arc<CompiledTable>> {
     metadata.validate()?;
     let positions = metadata
         .schema
@@ -858,7 +904,7 @@ pub(crate) fn load_table_metadata(schema: &Schema, name: &str) -> Result<TableMe
     Ok(metadata)
 }
 
-pub(crate) fn validate_bound(bucket: u16, key: Option<&TableKey>) -> Result<()> {
+fn validate_bound(bucket: u16, key: Option<&TableKey>) -> Result<()> {
     if key.is_some_and(|key| key.inner.bucket != bucket) {
         return Err(TableError::codec(
             "table scan bound belongs to a different bucket",

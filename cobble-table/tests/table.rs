@@ -1,7 +1,9 @@
-use cobble::{Config, CoordinatorConfig, DbBuilder, DbCoordinator, VolumeDescriptor};
+use cobble::{
+    Config, CoordinatorConfig, DbBuilder, DbCoordinator, Reader, ReaderConfig, VolumeDescriptor,
+};
 use cobble_table::{
-    DataField, LogicalType, ReadOnlyTable, Table, TableKey, TableKeyBuilder, TableReaderBuilder,
-    TableSchema, TableWriterBuilder, Value,
+    DataField, LogicalType, ReadOnlyTable, ReadOnlyTableBuilder, Table, TableKey, TableKeyBuilder,
+    TableReader, TableReaderBuilder, TableSchema, TableWriterBuilder, Value,
 };
 use std::sync::{Arc, mpsc};
 
@@ -197,10 +199,11 @@ fn table_runtime_create_open_and_typed_rows() {
     receiver.recv().unwrap().unwrap();
     db.close().unwrap();
 
-    let read_only =
-        cobble::ReadOnlyDb::open_with_db_id(config.clone(), snapshot_id, "table-runtime").unwrap();
+    let read_only = Arc::new(
+        cobble::ReadOnlyDb::open_with_db_id(config.clone(), snapshot_id, "table-runtime").unwrap(),
+    );
     {
-        let table = ReadOnlyTable::open(&read_only, "events").unwrap();
+        let table = ReadOnlyTable::open(Arc::clone(&read_only), "events").unwrap();
         assert_eq!(table.schema(), &schema);
         let key2 = build_read_only_key(
             &table,
@@ -247,7 +250,7 @@ fn table_runtime_create_open_and_typed_rows() {
         );
 
         let detached_projection = {
-            let handle = ReadOnlyTable::open(&read_only, "events").unwrap();
+            let handle = ReadOnlyTable::open(Arc::clone(&read_only), "events").unwrap();
             handle.project_by_names(&["id"]).unwrap()
         };
         assert_eq!(
@@ -255,7 +258,7 @@ fn table_runtime_create_open_and_typed_rows() {
             Some(vec![row2[1].clone()])
         );
         let detached_scan = {
-            let handle = ReadOnlyTable::open(&read_only, "events").unwrap();
+            let handle = ReadOnlyTable::open(Arc::clone(&read_only), "events").unwrap();
             handle
                 .scan_bounds(key2.bucket(), Some(&key2), Some(&missing))
                 .unwrap()
@@ -265,7 +268,7 @@ fn table_runtime_create_open_and_typed_rows() {
             vec![row2.clone()]
         );
 
-        let keys = ReadOnlyTable::open(&read_only, "keys").unwrap();
+        let keys = ReadOnlyTable::open(Arc::clone(&read_only), "keys").unwrap();
         let key = build_read_only_key(&keys, &[Value::Int64(42)]);
         assert_eq!(keys.get(&key).unwrap(), Some(vec![Value::Int64(42)]));
         assert_eq!(
@@ -324,8 +327,8 @@ fn schema_only_snapshot_preserves_empty_table() {
     db.close().unwrap();
 
     let read_only =
-        cobble::ReadOnlyDb::open_with_db_id(config, snapshot_id, "empty-table").unwrap();
-    let table = ReadOnlyTable::open(&read_only, "events").unwrap();
+        Arc::new(cobble::ReadOnlyDb::open_with_db_id(config, snapshot_id, "empty-table").unwrap());
+    let table = ReadOnlyTable::open(Arc::clone(&read_only), "events").unwrap();
     assert_eq!(table.schema(), &schema);
 }
 
@@ -346,7 +349,7 @@ fn standalone_table_shard_owns_storage_snapshots_and_cursors() {
     let schema = runtime_schema(LogicalType::string().nullable());
     let writer = writer_builder().create(schema.clone()).unwrap();
     let empty = writer.snapshot_and_wait().unwrap();
-    let empty_reader = TableReaderBuilder::new(config.clone())
+    let empty_reader = ReadOnlyTableBuilder::new(config.clone())
         .table_name("events")
         .shard_snapshot(&empty.db_id, empty.snapshot_id)
         .open()
@@ -375,7 +378,7 @@ fn standalone_table_shard_owns_storage_snapshots_and_cursors() {
         vec![Some(row.clone()), None, Some(row.clone())]
     );
     let snapshot = writer.snapshot_and_wait().unwrap();
-    let reader = TableReaderBuilder::new(config.clone())
+    let reader = ReadOnlyTableBuilder::new(config.clone())
         .table_name("events")
         .shard_snapshot(&snapshot.db_id, snapshot.snapshot_id)
         .open()
@@ -495,6 +498,15 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
     let mut expected = rows.iter().cloned().map(Some).collect::<Vec<_>>();
     expected.extend([Some(rows[0].clone()), None]);
     assert_eq!(reader.multi_get(&requests).unwrap(), expected);
+    let direct_reader = TableReader::open(
+        Reader::open_current(ReaderConfig::from_config(&reader_config)).unwrap(),
+        "events",
+    )
+    .unwrap();
+    assert_eq!(
+        direct_reader.get(&reader_keys[0]).unwrap(),
+        Some(rows[0].clone())
+    );
     // Alternate routed shards with a one-entry cache, including projected batches.
     for _ in 0..2 {
         for (key, row) in reader_keys.iter().zip(&rows) {
@@ -542,6 +554,11 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
         .unwrap();
     coordinator.materialize_global_snapshot(&second).unwrap();
     assert_eq!(reader.get(&reader_keys[0]).unwrap(), Some(rows[0].clone()));
+    assert_eq!(
+        direct_reader.get(&reader_keys[0]).unwrap(),
+        Some(rows[0].clone())
+    );
+    drop(direct_reader);
     assert_eq!(
         open_reader()
             .global_snapshot(first.id)
@@ -624,6 +641,6 @@ fn build_runtime_key(mut builder: TableKeyBuilder, values: &[Value]) -> TableKey
     builder.build().unwrap()
 }
 
-fn build_read_only_key(table: &ReadOnlyTable<'_>, values: &[Value]) -> TableKey {
+fn build_read_only_key(table: &ReadOnlyTable, values: &[Value]) -> TableKey {
     build_runtime_key(table.key_builder(), values)
 }

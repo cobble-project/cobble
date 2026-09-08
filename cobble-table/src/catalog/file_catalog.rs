@@ -7,8 +7,8 @@ use crate::evolution::{apply_schema_changes, compile_column_evolution, schema_fi
 use crate::metadata::TableMetadata;
 use crate::write::{TABLE_WRITE_PLAN_FORMAT, TABLE_WRITE_PLAN_VERSION};
 use crate::{
-    FieldId, Table, TableError, TableReaderBuilder, TableSchema, TableWriteBuilder, TableWritePlan,
-    TableWriterBuilder,
+    FieldId, ReadOnlyTableBuilder, Table, TableError, TableReaderBuilder, TableSchema,
+    TableWriteBuilder, TableWritePlan, TableWriterBuilder,
 };
 use cobble::{
     ColumnFamilyOptions, Config, CoordinatorConfig, Db, DbCoordinator, VolumeDescriptor,
@@ -606,6 +606,17 @@ impl CatalogTable {
         let context = &self.runtime_context;
         let config = context.scoped_config(runtime, self.table_id);
         Ok(TableReaderBuilder::from_catalog(
+            config,
+            physical_table_name(self.table_id),
+            self.table_id,
+        ))
+    }
+
+    /// Build an owned shard snapshot table for this catalog table.
+    pub fn readonly_table_builder(&self, runtime: Config) -> CatalogResult<ReadOnlyTableBuilder> {
+        let context = &self.runtime_context;
+        let config = context.scoped_config(runtime, self.table_id);
+        Ok(ReadOnlyTableBuilder::from_catalog(
             config,
             physical_table_name(self.table_id),
             self.table_id,

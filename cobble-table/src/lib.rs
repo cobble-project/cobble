@@ -33,7 +33,7 @@ pub use evolution::SchemaChange;
 pub use logical_type::{
     DataField, ExtensionType, FieldId, LogicalType, LogicalTypeKind, TimestampKind,
 };
-pub use runtime::{TableReader, TableReaderBuilder, TableWriterBuilder};
+pub use runtime::{ReadOnlyTableBuilder, TableReader, TableReaderBuilder, TableWriterBuilder};
 pub use schema::{TableSchema, TableSchemaBuilder};
 pub use table::{
     ProjectedTableScan, ReadOnlyTable, Table, TableKey, TableKeyBuilder, TableProjection, TableScan,

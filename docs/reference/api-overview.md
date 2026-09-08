@@ -242,9 +242,11 @@ exclusive-end semantics as raw `Db`.
 | Type | Description |
 |------|-------------|
 | `TableWriterBuilder` | Open a writable shard and return a `Table` |
-| `TableReaderBuilder` / `TableReader` | Open and own typed access to a fixed shard or global snapshot |
+| `ReadOnlyTableBuilder` | Open a fixed shard snapshot and return a `ReadOnlyTable` |
+| `TableReaderBuilder` | Open a fixed global snapshot and return a `TableReader` |
 | `Table` | Typed reads, writes, and snapshots over a shared `Arc<Db>` |
-| `ReadOnlyTable` | Typed access borrowing an application-managed `ReadOnlyDb` |
+| `ReadOnlyTable` | Typed reads from one shard over a shared `Arc<ReadOnlyDb>` |
+| `TableReader` | Read proxy over a pinned global `Reader`, routing requests across shards |
 | `TableSchema` / `TableKey` | Logical row structure and reusable encoded primary keys |
 | `TableProjection` | Reusable field selection for typed reads and scans |
 | `SchemaChange` | Add, rename, or drop top-level fields by name while retaining stable field identities |
@@ -272,14 +274,21 @@ use an existing shared database. Catalog and writer-plan builders return the sam
 Dropping a table releases its reference without explicitly closing the shared database;
 calling `Db::close()` affects all users of that database.
 
+`ReadOnlyTable::open(Arc::clone(&db), name)` uses an existing read-only shard.
+`TableReader::open(reader, name)` takes ownership of a core `Reader` and pins its current
+global snapshot. The proxy handles bucket routing and cross-shard schema validation;
+`ReadOnlyTable` only accesses its shard. Both provide typed reads, projections, and scans.
+Projections and scan cursors can outlive the table handle.
+
 `Catalog::evolve_schema` accepts `SchemaChange` values. Added fields must be nullable;
 renaming preserves the field ID, and deleted IDs are never reused. Publishing a catalog
 schema does not refresh an already opened reader or writer automatically.
 
 Standalone readers and writers open storage directly from configuration; a catalog is not required.
 Catalog APIs are grouped under `cobble_table::catalog`. With a `FileCatalog`, use the loaded
-table's `writer_builder(config)`, `reader_builder(config)`,
-and `coordinator(config)` factories. Catalog configuration supplies Meta, Snapshot, and WAL volumes;
+table's `writer_builder(config)`, `readonly_table_builder(config)` for a shard,
+`reader_builder(config)` for a global read proxy, and `coordinator(config)` factories.
+Catalog configuration supplies Meta, Snapshot, and WAL volumes;
 its Primary roles are ignored. Runtime configuration supplies all Primary volumes (High, Medium,
 and Low), Cache, and READONLY, retaining their configured priorities. READONLY source paths remain
 unchanged. Table directories follow stable IDs, so renaming a table does not move its files or

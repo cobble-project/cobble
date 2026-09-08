@@ -1,5 +1,5 @@
 use crate::db::{db_arc_from_handle_or_throw, db_from_handle_or_throw};
-use crate::read_only_db::read_only_db_from_handle_or_throw;
+use crate::read_only_db::read_only_db_arc_from_handle_or_throw;
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_u16,
     throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
@@ -88,7 +88,7 @@ pub extern "system" fn Java_io_cobble_table_ReadOnlyTable_openNative(
     db_handle: jlong,
     name: JString,
 ) -> jstring {
-    let Some(db) = read_only_db_from_handle_or_throw(&mut env, db_handle) else {
+    let Some(db) = read_only_db_arc_from_handle_or_throw(&mut env, db_handle) else {
         return std::ptr::null_mut();
     };
     let name = match decode_java_string(&mut env, name) {
@@ -98,7 +98,7 @@ pub extern "system" fn Java_io_cobble_table_ReadOnlyTable_openNative(
             return std::ptr::null_mut();
         }
     };
-    let table = match ReadOnlyTable::open(db, name) {
+    let table = match ReadOnlyTable::open(Arc::clone(db), name) {
         Ok(value) => value,
         Err(error) => {
             throw_table_error(&mut env, error);

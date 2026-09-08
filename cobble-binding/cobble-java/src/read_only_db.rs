@@ -9,6 +9,7 @@ use cobble_binding::{Config, ReadOnlyDb};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{jint, jlong, jobject, jstring};
+use std::sync::Arc;
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_ReadOnlyDb_openHandle(
@@ -53,7 +54,7 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openHandle(
             return 0;
         }
     };
-    Box::into_raw(Box::new(db)) as jlong
+    Box::into_raw(Box::new(Arc::new(db))) as jlong
 }
 
 #[unsafe(no_mangle)]
@@ -95,7 +96,7 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openHandleFromJson(
             return 0;
         }
     };
-    Box::into_raw(Box::new(db)) as jlong
+    Box::into_raw(Box::new(Arc::new(db))) as jlong
 }
 
 #[unsafe(no_mangle)]
@@ -111,8 +112,8 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_disposeInternal(
         );
         return;
     }
-    let ptr = native_handle as *mut ReadOnlyDb;
-    // SAFETY: `native_handle` is returned by `ReadOnlyDb.openHandle` from `Box<ReadOnlyDb>`.
+    let ptr = native_handle as *mut Arc<ReadOnlyDb>;
+    // SAFETY: `native_handle` comes from `Box<Arc<ReadOnlyDb>>` in `ReadOnlyDb.openHandle`.
     let _boxed = unsafe { Box::from_raw(ptr) };
 }
 
@@ -280,10 +281,17 @@ pub(crate) fn read_only_db_from_handle_or_throw(
     env: &mut JNIEnv,
     native_handle: jlong,
 ) -> Option<&'static ReadOnlyDb> {
+    read_only_db_arc_from_handle_or_throw(env, native_handle).map(Arc::as_ref)
+}
+
+pub(crate) fn read_only_db_arc_from_handle_or_throw(
+    env: &mut JNIEnv,
+    native_handle: jlong,
+) -> Option<&'static Arc<ReadOnlyDb>> {
     if native_handle == 0 {
         throw_illegal_state(env, "readonly db handle is disposed".to_string());
         return None;
     }
-    // SAFETY: `native_handle` is created from `Box<ReadOnlyDb>` and valid until `disposeInternal`.
-    Some(unsafe { &*(native_handle as *const ReadOnlyDb) })
+    // SAFETY: The handle comes from `Box<Arc<ReadOnlyDb>>` and is valid until `disposeInternal`.
+    Some(unsafe { &*(native_handle as *const Arc<ReadOnlyDb>) })
 }

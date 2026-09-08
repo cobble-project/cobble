@@ -175,7 +175,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     );
     let left_index = keys.iter().position(|key| key.bucket() < 2).unwrap();
     let shard_reader = users
-        .reader_builder(runtime.clone())
+        .readonly_table_builder(runtime.clone())
         .unwrap()
         .shard_snapshot(&left_snapshot.db_id, left_snapshot.snapshot_id)
         .open()
