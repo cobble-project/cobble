@@ -1,4 +1,4 @@
-use cobble::{Config, VolumeDescriptor, VolumeUsageKind};
+use cobble::{Config, ShardSnapshotMetadata, VolumeDescriptor, VolumeUsageKind};
 use cobble_table::catalog::{Catalog, FileCatalog, FileCatalogConfig, TableIdentifier};
 use cobble_table::{LogicalType, SchemaChange, TableKey, TableKeyBuilder, TableSchema, Value};
 use std::sync::Arc;
@@ -228,6 +228,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         old_reader.get(&keys[left_index]).unwrap(),
         Some(rows[left_index].clone())
     );
+    assert_eq!(table_field_count(&left_snapshot), 2);
     drop(catalog);
 
     // A worker needs only the serialized, fixed plan, not a live catalog or its latest schema.
@@ -274,7 +275,12 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     expected.push(Value::Null);
     assert_eq!(resumed.schema(), evolved.schema());
     assert_eq!(resumed.get(&keys[left_index]).unwrap(), Some(expected));
-    resumed.snapshot_and_wait().unwrap();
+    let historical_snapshot = resumed
+        .shard_snapshot_metadata(left_snapshot.snapshot_id)
+        .unwrap();
+    assert_eq!(table_field_count(&historical_snapshot), 2);
+    let resumed_snapshot = resumed.snapshot_and_wait().unwrap();
+    assert_eq!(table_field_count(&resumed_snapshot), 3);
     drop(resumed);
 
     // An explicit historical restore must not apply the catalog's latest schema.
@@ -306,4 +312,27 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
 fn key(mut builder: TableKeyBuilder, value: &Value) -> TableKey {
     builder.push(value.clone());
     builder.build().unwrap()
+}
+
+fn table_field_count(snapshot: &ShardSnapshotMetadata) -> usize {
+    snapshot
+        .column_families
+        .values()
+        .find(|family| {
+            family
+                .options
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("format"))
+                .and_then(serde_json::Value::as_str)
+                == Some("cobble-table")
+        })
+        .unwrap()
+        .options
+        .metadata
+        .as_ref()
+        .unwrap()["schema"]["fields"]
+        .as_array()
+        .unwrap()
+        .len()
 }

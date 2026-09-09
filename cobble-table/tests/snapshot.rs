@@ -26,8 +26,37 @@ fn table_snapshot_committer_collects_and_commits_interleaved_checkpoints() {
     let input_a = shard_input("db-a", vec![0..=1], 1);
     let input_b = shard_input("db-b", vec![2..=3], 2);
 
+    let mismatched_metadata = mismatched_table_metadata(input_b.clone());
+    assert!(
+        committer
+            .commit_batch(8, vec![input_a.clone(), mismatched_metadata])
+            .is_err()
+    );
+    assert!(
+        coordinator
+            .load_current_global_snapshot()
+            .unwrap()
+            .is_none()
+    );
+
     assert!(committer.submit(10, input_a.clone()).unwrap().is_none());
     assert!(committer.submit(11, input_a.clone()).unwrap().is_none());
+    assert!(
+        committer
+            .commit_batch(
+                11,
+                vec![
+                    mismatched_table_metadata(input_a.clone()),
+                    mismatched_table_metadata(input_b.clone()),
+                ],
+            )
+            .is_err()
+    );
+    assert!(
+        committer
+            .submit(11, mismatched_table_metadata(input_b.clone()))
+            .is_err()
+    );
     assert!(committer.submit(11, input_a.clone()).unwrap().is_none());
     let mut conflicting = input_a.clone();
     conflicting.snapshot_id = 99;
@@ -235,20 +264,45 @@ fn shard_input(
 ) -> ShardSnapshotMetadata {
     ShardSnapshotMetadata {
         ranges,
-        schema_id: 0,
-        column_families: BTreeMap::from([(
-            "default".to_string(),
-            SnapshotColumnFamily {
-                id: 0,
-                num_columns: 1,
-                options: ColumnFamilyOptions::default(),
-            },
-        )]),
         db_id: db_id.to_string(),
         snapshot_id,
         manifest_path: format!("file:///snapshots/{db_id}/{snapshot_id}"),
         timestamp_seconds: snapshot_id as u32,
         data_size_bytes: 10,
         incremental_data_size_bytes: 1,
+        // Snapshot-local schema IDs legitimately differ across shards. Table commits compare
+        // the captured table metadata rather than these local IDs.
+        schema_id: snapshot_id,
+        column_families: BTreeMap::from([(
+            "default".to_string(),
+            SnapshotColumnFamily {
+                id: 0,
+                num_columns: 3,
+                options: ColumnFamilyOptions {
+                    value_has_ttl: true,
+                    metadata: Some(
+                        serde_json::from_str(include_str!(
+                            "../../spec/table/fixtures/table_metadata_v1.json"
+                        ))
+                        .unwrap(),
+                    ),
+                },
+            },
+        )]),
     }
+}
+
+fn mismatched_table_metadata(mut input: ShardSnapshotMetadata) -> ShardSnapshotMetadata {
+    input
+        .column_families
+        .get_mut("default")
+        .unwrap()
+        .options
+        .metadata
+        .as_mut()
+        .unwrap()["catalog_binding"] = serde_json::json!({
+        "table_id": 99,
+        "catalog_schema_id": 1,
+    });
+    input
 }

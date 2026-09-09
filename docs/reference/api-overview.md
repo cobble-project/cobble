@@ -310,6 +310,10 @@ available without a catalog. Use `submit(commit_id, shard_snapshot)` as shards a
 `commit_batch(commit_id, shard_snapshots)` for a complete checkpoint. Run one active committer
 per table; pending state is in memory, so the application must replay incomplete checkpoints
 after a restart.
+The committer checks the reported table schemas and layouts before publishing, without reading
+shard manifests. Submit the complete reports returned by the DB snapshot APIs.
+Readers trust this committed consistency and load table metadata only during initialization.
+Applications publishing through the raw `DbCoordinator` must ensure table consistency themselves.
 
 For distributed writing, build a plan once and serialize it for workers:
 

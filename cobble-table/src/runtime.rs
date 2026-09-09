@@ -1,6 +1,6 @@
 use crate::catalog::{TableId, physical_table_name};
 use crate::metadata::TableMetadata;
-use crate::table::{TypedRead, load_table_metadata, validate_name};
+use crate::table::{TypedRead, load_table_metadata, load_table_metadata_for_shard, validate_name};
 use crate::{
     ReadOnlyTable, Result, Table, TableError, TableKey, TableKeyBuilder, TableProjection,
     TableScan, TableSchema, TableWritePlan, Value,
@@ -169,16 +169,12 @@ impl TableReader {
     pub fn open(mut reader: Reader, name: impl Into<String>) -> Result<Self> {
         reader.pin_current_snapshot();
         let name = validate_name(name.into())?;
-        let metadata = global_metadata(&mut reader, &name)?;
+        let metadata = global_metadata(&reader, &name)?;
         Self::from_metadata(reader, name, metadata)
     }
 
     fn from_metadata(reader: Reader, name: String, metadata: TableMetadata) -> Result<Self> {
-        let state = Arc::new(GlobalReaderState::new(
-            reader,
-            name.clone(),
-            metadata.clone(),
-        ));
+        let state = Arc::new(GlobalReaderState::new(reader));
         Ok(Self {
             typed: TypedRead::from_global_metadata(state, name, metadata)?,
         })
@@ -288,7 +284,7 @@ impl TableReaderBuilder {
             }
         };
         reader.pin_current_snapshot();
-        let metadata = global_metadata(&mut reader, &name)?;
+        let metadata = global_metadata(&reader, &name)?;
         validate_catalog_binding(&metadata, self.catalog_table_id)?;
         TableReader::from_metadata(reader, name, metadata)
     }
@@ -377,27 +373,15 @@ fn required_reader_table_name(
 
 pub(crate) struct GlobalReaderState {
     total_buckets: u32,
-    state: Mutex<GlobalReaderInner>,
-}
-
-struct GlobalReaderInner {
-    reader: Reader,
-    name: String,
-    expected_metadata: TableMetadata,
-    validated_buckets: Vec<bool>,
+    state: Mutex<Reader>,
 }
 
 impl GlobalReaderState {
-    fn new(reader: Reader, name: String, expected_metadata: TableMetadata) -> Self {
+    fn new(reader: Reader) -> Self {
         let total_buckets = reader.current_global_snapshot().total_buckets;
         Self {
             total_buckets,
-            state: Mutex::new(GlobalReaderInner {
-                reader,
-                name,
-                expected_metadata,
-                validated_buckets: vec![false; total_buckets as usize],
-            }),
+            state: Mutex::new(reader),
         }
     }
 
@@ -412,8 +396,7 @@ impl GlobalReaderState {
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<bytes::Bytes>>>> {
         let mut state = lock_global_state(&self.state)?;
-        validate_global_bucket(&mut state, bucket)?;
-        Ok(state.reader.get_with_options(bucket, key, options)?)
+        Ok(state.get_with_options(bucket, key, options)?)
     }
 
     pub(crate) fn multi_get(
@@ -422,10 +405,7 @@ impl GlobalReaderState {
         options: &ReadOptions,
     ) -> Result<Vec<Option<Vec<Option<bytes::Bytes>>>>> {
         let mut state = lock_global_state(&self.state)?;
-        for (bucket, _) in keys {
-            validate_global_bucket(&mut state, *bucket)?;
-        }
-        Ok(state.reader.multi_get_with_options(keys, options)?)
+        Ok(state.multi_get_with_options(keys, options)?)
     }
 
     pub(crate) fn scan(
@@ -436,64 +416,24 @@ impl GlobalReaderState {
         options: &ScanOptions,
     ) -> Result<DbIterator> {
         let mut state = lock_global_state(&self.state)?;
-        validate_global_bucket(&mut state, bucket)?;
-        Ok(state
-            .reader
-            .scan_with_options_bounds(bucket, start, end, options)?)
+        Ok(state.scan_with_options_bounds(bucket, start, end, options)?)
     }
 }
 
-fn global_metadata(reader: &mut Reader, name: &str) -> Result<TableMetadata> {
-    let bucket = reader
+fn global_metadata(reader: &Reader, name: &str) -> Result<TableMetadata> {
+    let shard = reader
         .current_global_snapshot()
         .shard_snapshots
         .iter()
-        .find_map(|shard| shard.ranges.first().map(|range| *range.start()))
+        .find(|shard| !shard.ranges.is_empty())
         .ok_or_else(|| TableError::InvalidSchema("global snapshot has no shard buckets".into()))?;
-    load_table_metadata(reader.schema_for_bucket(bucket)?.as_ref(), name)
+    load_table_metadata_for_shard(reader.config(), shard, name)
 }
 
-fn lock_global_state(
-    state: &Mutex<GlobalReaderInner>,
-) -> Result<std::sync::MutexGuard<'_, GlobalReaderInner>> {
+fn lock_global_state(state: &Mutex<Reader>) -> Result<std::sync::MutexGuard<'_, Reader>> {
     state
         .lock()
         .map_err(|_| TableError::internal("table reader core lock poisoned"))
-}
-
-fn validate_global_bucket(state: &mut GlobalReaderInner, bucket: u16) -> Result<()> {
-    let bucket_index = usize::from(bucket);
-    if state
-        .validated_buckets
-        .get(bucket_index)
-        .copied()
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    let schema = state.reader.schema_for_bucket(bucket)?;
-    let metadata = load_table_metadata(&schema, &state.name)?;
-    if metadata != state.expected_metadata {
-        return Err(TableError::InvalidSchema(format!(
-            "table '{}' has incompatible schema in bucket {bucket}",
-            state.name
-        )));
-    }
-    let shard = state
-        .reader
-        .current_global_snapshot()
-        .shard_snapshots
-        .iter()
-        .find(|shard| shard.ranges.iter().any(|range| range.contains(&bucket)))
-        .ok_or_else(|| {
-            TableError::InvalidSchema(format!("bucket {bucket} has no shard snapshot"))
-        })?;
-    for range in &shard.ranges {
-        for bucket in *range.start()..=*range.end() {
-            state.validated_buckets[usize::from(bucket)] = true;
-        }
-    }
-    Ok(())
 }
 
 fn validate_catalog_binding(

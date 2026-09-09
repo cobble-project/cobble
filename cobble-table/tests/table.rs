@@ -1,6 +1,7 @@
 use cobble::{
     Config, CoordinatorConfig, DbBuilder, DbCoordinator, Reader, ReaderConfig, VolumeDescriptor,
 };
+use cobble_table::snapshot::TableSnapshotCommitter;
 use cobble_table::{
     DataField, LogicalType, ReadOnlyTable, ReadOnlyTableBuilder, Table, TableKey, TableKeyBuilder,
     TableReader, TableReaderBuilder, TableSchema, TableWriterBuilder, Value,
@@ -590,8 +591,7 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
             .collect::<Vec<_>>()
     );
 
-    // There is no cross-shard schema negotiation in this first runtime step.
-    // A shard with a different layout must fail instead of decoding as `schema`.
+    // Commit preparation rejects incompatible shard metadata before publishing a mixed snapshot.
     drop(right);
     let incompatible = TableWriterBuilder::new(config.clone())
         .table_name("events")
@@ -599,23 +599,25 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
         .bucket_ranges(vec![2..=3])
         .create(runtime_schema(LogicalType::int64().nullable()))
         .unwrap();
-    let mixed = coordinator
-        .take_global_snapshot(
-            4,
-            vec![
-                left.snapshot_and_wait().unwrap(),
-                incompatible.snapshot_and_wait().unwrap(),
-            ],
-        )
-        .unwrap();
-    coordinator.materialize_global_snapshot(&mixed).unwrap();
-    let reader = open_reader().current_global_snapshot().open().unwrap();
-    let right_key = keys.iter().find(|key| key.bucket() >= 2).unwrap();
-    assert!(matches!(
-        reader.get(right_key),
-        Err(cobble_table::TableError::InvalidSchema(_))
-    ));
-    drop(reader);
+    let committer = TableSnapshotCommitter::new(
+        Arc::new(DbCoordinator::open(CoordinatorConfig::from_config(&config)).unwrap()),
+        4,
+        2,
+    )
+    .unwrap();
+    let current = coordinator.load_current_global_snapshot().unwrap();
+    assert!(
+        committer
+            .commit_batch(
+                99,
+                vec![
+                    left.snapshot_and_wait().unwrap(),
+                    incompatible.snapshot_and_wait().unwrap(),
+                ],
+            )
+            .is_err()
+    );
+    assert_eq!(coordinator.load_current_global_snapshot().unwrap(), current);
     drop(incompatible);
     drop(left);
 }

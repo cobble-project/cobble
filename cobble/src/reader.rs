@@ -410,6 +410,11 @@ impl Reader {
         &self.global_snapshot
     }
 
+    /// Return the effective configuration used by this reader.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     pub fn list_global_snapshots(&self) -> Result<Vec<GlobalSnapshotSummary>> {
         let current_snapshot_id = read_manifest_pointer(&self.fs, None)?
             .and_then(|(pointer, _)| parse_snapshot_id(&pointer));

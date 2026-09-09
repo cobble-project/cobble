@@ -3,8 +3,8 @@ use crate::metadata::TableMetadata;
 use crate::{BucketHash, FieldId, LogicalType, Result, TableError, TableSchema, Value, ValueCodec};
 use bytes::Bytes;
 use cobble::{
-    ColumnFamilyOptions, Db, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, Schema,
-    ShardSnapshotMetadata, WriteOptions,
+    ColumnFamilyOptions, Config, Db, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, Schema,
+    ShardSnapshotMetadata, ShardSnapshotRef, WriteOptions,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
@@ -895,8 +895,75 @@ pub(crate) fn load_table_metadata(schema: &Schema, name: &str) -> Result<TableMe
         .get(name)
         .copied()
         .ok_or_else(|| TableError::InvalidSchema(format!("unknown table '{name}'")))?;
-    let metadata = load_metadata(&schema.column_family_options_in_family(id))?;
-    if schema.num_columns_in_family(id) != Some(metadata.layout.value_columns.len().max(1)) {
+    load_table_metadata_from_options(
+        &schema.column_family_options_in_family(id),
+        schema.num_columns_in_family(id),
+        name,
+    )
+}
+
+pub(crate) fn load_table_metadata_from_snapshot(
+    snapshot: &ShardSnapshotMetadata,
+    name: &str,
+) -> Result<TableMetadata> {
+    let family = snapshot
+        .column_families
+        .get(name)
+        .ok_or_else(|| TableError::InvalidSchema(format!("unknown table '{name}'")))?;
+    load_table_metadata_from_options(&family.options, Some(family.num_columns), name)
+}
+
+pub(crate) fn load_table_metadata_for_shard(
+    config: &Config,
+    shard: &ShardSnapshotRef,
+    name: &str,
+) -> Result<TableMetadata> {
+    let snapshot =
+        cobble::load_shard_snapshot_metadata(config, &shard.db_id, &shard.manifest_path)?;
+    if snapshot.snapshot_id != shard.snapshot_id {
+        return Err(TableError::InvalidSchema(format!(
+            "shard manifest snapshot {} does not match assigned snapshot {}",
+            snapshot.snapshot_id, shard.snapshot_id
+        )));
+    }
+    load_table_metadata_from_snapshot(&snapshot, name)
+}
+
+pub(crate) fn table_metadata_from_shard_snapshot(
+    snapshot: &ShardSnapshotMetadata,
+) -> Result<std::collections::BTreeMap<String, TableMetadata>> {
+    let mut tables = std::collections::BTreeMap::new();
+    for (name, family) in &snapshot.column_families {
+        let is_table = family
+            .options
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("format"))
+            .and_then(serde_json::Value::as_str)
+            == Some(crate::metadata::TABLE_METADATA_FORMAT);
+        if !is_table {
+            continue;
+        }
+        tables.insert(
+            name.clone(),
+            load_table_metadata_from_options(&family.options, Some(family.num_columns), name)?,
+        );
+    }
+    if tables.is_empty() {
+        return Err(TableError::InvalidSchema(
+            "table shard snapshot contains no table metadata".into(),
+        ));
+    }
+    Ok(tables)
+}
+
+fn load_table_metadata_from_options(
+    options: &ColumnFamilyOptions,
+    num_columns: Option<usize>,
+    name: &str,
+) -> Result<TableMetadata> {
+    let metadata = load_metadata(options)?;
+    if num_columns != Some(metadata.layout.value_columns.len().max(1)) {
         return Err(TableError::InvalidSchema(format!(
             "table '{name}' has an incompatible physical column count"
         )));

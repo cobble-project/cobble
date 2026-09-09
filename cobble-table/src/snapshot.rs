@@ -7,6 +7,7 @@
 //! committer across processes and does not persist commit identity, so a replacement committer may
 //! publish a new equivalent global snapshot when work is replayed.
 
+use crate::metadata::TableMetadata;
 use crate::{Result, TableError};
 use cobble::{DbCoordinator, GlobalSnapshotManifest, ShardSnapshotMetadata};
 use std::collections::BTreeMap;
@@ -28,6 +29,7 @@ struct CommitterState {
 #[derive(Default)]
 struct PendingCommit {
     shards: BTreeMap<String, ShardSnapshotMetadata>,
+    table_metadata: Option<BTreeMap<String, TableMetadata>>,
     prepared_snapshot: Option<GlobalSnapshotManifest>,
 }
 
@@ -60,10 +62,11 @@ impl TableSnapshotCommitter {
         })
     }
 
-    /// Submit one shard snapshot for a process-local commit ID.
+    /// Submit one full shard report for a process-local commit ID.
     ///
     /// Returns `Some` only when this shard completes and materializes the commit. Pending,
-    /// completed, and superseded submissions return `None`.
+    /// completed, and superseded submissions return `None`. Captured table metadata is validated
+    /// in memory; this does not read shard manifests.
     pub fn submit(
         &self,
         commit_id: u64,
@@ -75,6 +78,7 @@ impl TableSnapshotCommitter {
         }
 
         normalize_ranges(self.total_buckets, &mut snapshot)?;
+        let table_metadata = crate::table::table_metadata_from_shard_snapshot(&snapshot)?;
         if let std::collections::btree_map::Entry::Vacant(entry) = state.pending.entry(commit_id) {
             entry.insert(PendingCommit::default());
             if !retain_new_pending_commit(&mut state, commit_id, self.max_pending_commits) {
@@ -86,6 +90,7 @@ impl TableSnapshotCommitter {
                 .pending
                 .get_mut(&commit_id)
                 .expect("commit remains in the pending window");
+            validate_table_metadata(pending, table_metadata)?;
             insert_shard(pending, snapshot, commit_id)?;
             if !has_exact_bucket_coverage(self.total_buckets, pending) {
                 return Ok(None);
@@ -96,9 +101,10 @@ impl TableSnapshotCommitter {
 
     /// Commit an already collected, complete checkpoint batch.
     ///
-    /// Inputs may be unordered. Equivalent duplicate shard inputs are ignored, while gaps,
-    /// overlaps, and conflicting duplicates are rejected. Returns `None` when this commit or a
-    /// higher commit has already completed.
+    /// Full reports may be unordered. Equivalent duplicate shard inputs are ignored, while gaps,
+    /// overlaps, conflicting duplicates, and incompatible captured table metadata are rejected
+    /// without reading manifests. Returns `None` when this commit or a higher commit has already
+    /// completed.
     pub fn commit_batch(
         &self,
         commit_id: u64,
@@ -112,6 +118,8 @@ impl TableSnapshotCommitter {
         let mut batch = PendingCommit::default();
         for mut snapshot in shard_snapshots {
             normalize_ranges(self.total_buckets, &mut snapshot)?;
+            let table_metadata = crate::table::table_metadata_from_shard_snapshot(&snapshot)?;
+            validate_table_metadata(&mut batch, table_metadata)?;
             insert_shard(&mut batch, snapshot, commit_id)?;
         }
         if !has_exact_bucket_coverage(self.total_buckets, &batch) {
@@ -122,6 +130,11 @@ impl TableSnapshotCommitter {
         match state.pending.entry(commit_id) {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let pending = entry.get();
+                if pending.table_metadata.as_ref() != batch.table_metadata.as_ref() {
+                    return Err(coordination_error(
+                        "table shard snapshots have incompatible captured table metadata",
+                    ));
+                }
                 if pending.prepared_snapshot.is_some() && pending.shards != batch.shards {
                     return Err(coordination_error(format!(
                         "commit {commit_id} conflicts with its prepared snapshot"
@@ -207,6 +220,24 @@ impl TableSnapshotCommitter {
         self.coordinator.materialize_global_snapshot(snapshot)?;
         Ok(())
     }
+}
+
+fn validate_table_metadata(
+    pending: &mut PendingCommit,
+    metadata: BTreeMap<String, TableMetadata>,
+) -> Result<()> {
+    if let Some(expected) = &pending.table_metadata {
+        // TODO: Permit read-compatible per-shard evolution once commit preparation can establish
+        // an explicit common table view.
+        if *expected != metadata {
+            return Err(coordination_error(
+                "table shard snapshots have incompatible captured table metadata",
+            ));
+        }
+    } else {
+        pending.table_metadata = Some(metadata);
+    }
+    Ok(())
 }
 
 fn is_completed_or_superseded(state: &CommitterState, commit_id: u64) -> bool {
