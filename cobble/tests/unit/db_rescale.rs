@@ -524,8 +524,9 @@ fn test_shrink_bucket_removes_data_from_kicked_range() {
     db.put(2, b"k2", 0, b"v2").unwrap();
 
     let shrink_snapshot = db.shrink_bucket(vec![2u16..=3u16]).unwrap();
-    let bucket_input = db.shard_snapshot_metadata(shrink_snapshot).unwrap();
-    assert_eq!(bucket_input.ranges, vec![0u16..=1u16]);
+    let snapshot_metadata = db.shard_snapshot_metadata(shrink_snapshot).unwrap();
+    // Shrink returns the pre-shrink snapshot, not the live database's remaining ranges.
+    assert_eq!(snapshot_metadata.ranges, vec![0u16..=3u16]);
 
     let kept = db.get(1, b"k1").unwrap().unwrap();
     assert_eq!(kept[0].as_deref(), Some(&b"v1"[..]));
