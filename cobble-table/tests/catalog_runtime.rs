@@ -1,6 +1,9 @@
 use cobble::{Config, ShardSnapshotMetadata, VolumeDescriptor, VolumeUsageKind};
 use cobble_table::catalog::{Catalog, FileCatalog, FileCatalogConfig, TableIdentifier};
-use cobble_table::{LogicalType, SchemaChange, TableKey, TableKeyBuilder, TableSchema, Value};
+use cobble_table::{
+    LogicalType, SchemaChange, TableKey, TableKeyBuilder, TableScanPlan, TableScanSplit,
+    TableSchema, Value,
+};
 use std::sync::Arc;
 
 #[test]
@@ -161,6 +164,11 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         reader.multi_get(&keys).unwrap(),
         rows.iter().cloned().map(Some).collect::<Vec<_>>()
     );
+    let scan_plan = reader.scan_plan().unwrap();
+    let scan_plan_json = serde_json::to_string(&scan_plan).unwrap();
+    assert!(!scan_plan_json.contains("catalog-runtime-access"));
+    assert!(!scan_plan_json.contains("catalog-runtime-secret"));
+    assert!(scan_plan_json.contains(&format!("warehouse/tables/TABLE-{}", users.table_id())));
     let event_reader = events
         .reader_builder(runtime.clone())
         .unwrap()
@@ -230,6 +238,36 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     );
     assert_eq!(table_field_count(&left_snapshot), 2);
     drop(catalog);
+
+    // The worker supplies fresh local primary/cache roots; the plan never appends catalog paths.
+    let worker_scan_plan = serde_json::from_str::<TableScanPlan>(&scan_plan_json).unwrap();
+    let worker_scan_runtime = Config {
+        volumes: vec![
+            VolumeDescriptor::new(
+                format!("file://{}", root.path().join("worker-primary").display()),
+                vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{}", root.path().join("worker-cache").display()),
+                vec![VolumeUsageKind::Cache],
+            ),
+        ],
+        total_buckets: 1,
+        ..Config::default()
+    };
+    let mut worker_splits = worker_scan_plan.splits().unwrap();
+    let first_split_json = serde_json::to_string(&worker_splits[0]).unwrap();
+    worker_splits[0] = serde_json::from_str::<TableScanSplit>(&first_split_json).unwrap();
+    let mut worker_rows = worker_splits
+        .into_iter()
+        .flat_map(|split| split.create_scanner(worker_scan_runtime.clone()).unwrap())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    worker_rows.sort_by_key(|row| match row.first() {
+        Some(Value::Int64(id)) => *id,
+        _ => panic!("catalog schema always starts with an int64 id"),
+    });
+    assert_eq!(worker_rows, rows);
 
     // A worker needs only the serialized, fixed plan, not a live catalog or its latest schema.
     let worker_plan =

@@ -256,6 +256,8 @@ exclusive-end semantics as raw `Db`.
 | `CatalogTable` | Loaded table definition with reader, writer, and snapshot committer factories sharing a stable storage namespace |
 | `TableSnapshotCommitter` | Collect shard snapshots and publish complete global checkpoints |
 | `TableWriteBuilder` / `TableWritePlan` | Capture a table definition and storage routes for distributed shard writers; plans support Serde serialization |
+| `TableScanPlan` / `TableScanSplit` | Fixed snapshot scan descriptions that support Serde serialization for distributed workers |
+| `TableScanSplitScanner` | Typed row decoding over the core `ScanSplitScanner` |
 
 Define a new schema by name; field IDs are assigned automatically:
 
@@ -335,6 +337,30 @@ workers supply them through matching volume descriptors in their runtime config.
 descriptors supply credentials only: the plan determines Meta/Snapshot/WAL locations, while runtime
 config determines Primary/Cache/READONLY volumes. An in-process plan retains access to the original
 Catalog credentials. Applications choose how to transport the serialized bytes.
+
+For distributed reading, plan from a pinned `TableReader` and send each split to a worker:
+
+```rust
+let plan = reader.scan_plan()?;
+for split in plan.splits()? {
+    let payload = serde_json::to_vec(&split)?;
+    // On a worker, after receiving the payload:
+    let split: cobble_table::TableScanSplit = serde_json::from_slice(&payload)?;
+    for row in split.create_scanner(runtime_config.clone())? {
+        let row = row?;
+        // Process the typed row.
+    }
+}
+```
+
+Workers need no Catalog. The plan fixes the snapshot, schema, bucket count, and source paths;
+runtime configuration supplies local storage and credentials. Later CURRENT or Catalog schema
+changes do not alter an existing plan. Applications must retain the referenced snapshots until
+scanning finishes; serializing a plan does not retain them.
+
+The plan carries the table definition captured when the reader opens. Workers use that definition
+without rereading shard metadata for consistency checks. Execution delegates shard opening and
+bucket traversal to the core `ScanSplit` / `ScanSplitScanner`, adding only typed row decoding.
 
 ---
 

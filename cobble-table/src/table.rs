@@ -9,7 +9,7 @@ use cobble::{
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 
-struct CompiledTable {
+pub(crate) struct CompiledTable {
     schema: TableSchema,
     key_positions: Vec<usize>,
     key_types: Vec<LogicalType>,
@@ -333,7 +333,7 @@ impl Table {
             .map_err(Into::into)
     }
 
-    /// Return the published shard input for a completed snapshot.
+    /// Return complete metadata for a completed shard snapshot.
     pub fn shard_snapshot_metadata(&self, snapshot_id: u64) -> Result<ShardSnapshotMetadata> {
         Ok(self.db.shard_snapshot_metadata(snapshot_id)?)
     }
@@ -473,6 +473,13 @@ impl TypedRead {
             read_backend,
             read_options: ReadOptions::default().with_column_family(name.clone()),
             scan_options: ScanOptions::default().with_column_family(name),
+        }
+    }
+
+    pub(crate) fn global_state(&self) -> Option<&Arc<crate::runtime::GlobalReaderState>> {
+        match &self.read_backend {
+            ReadBackend::Global(state) => Some(state),
+            ReadBackend::Writable(_) | ReadBackend::Shard(_) => None,
         }
     }
 
@@ -664,17 +671,25 @@ impl Iterator for TableScan {
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|row| {
             let (key, columns) = row?;
-            let mut row = vec![Value::Null; self.compiled.schema.fields.len()];
-            KeyCodec::decode_row_into_positions_validated(
-                &self.compiled.key_types,
-                &key,
-                &self.compiled.key_positions,
-                &mut row,
-            )?;
-            decode_value_columns(&self.compiled, &mut row, &columns)?;
-            Ok(row)
+            decode_table_scan_row(&self.compiled, &key, &columns)
         })
     }
+}
+
+pub(crate) fn decode_table_scan_row(
+    compiled: &CompiledTable,
+    key: &[u8],
+    columns: &[Option<Bytes>],
+) -> Result<Vec<Value>> {
+    let mut row = vec![Value::Null; compiled.schema.fields.len()];
+    KeyCodec::decode_row_into_positions_validated(
+        &compiled.key_types,
+        key,
+        &compiled.key_positions,
+        &mut row,
+    )?;
+    decode_value_columns(compiled, &mut row, columns)?;
+    Ok(row)
 }
 
 fn assemble_row_from_key_values(
@@ -848,7 +863,10 @@ fn build_projection_parts<S: AsRef<str>>(
     ))
 }
 
-fn compile_table(metadata: TableMetadata, total_buckets: u32) -> Result<Arc<CompiledTable>> {
+pub(crate) fn compile_table(
+    metadata: TableMetadata,
+    total_buckets: u32,
+) -> Result<Arc<CompiledTable>> {
     metadata.validate()?;
     let positions = metadata
         .schema

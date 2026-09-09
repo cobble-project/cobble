@@ -174,7 +174,11 @@ impl TableReader {
     }
 
     fn from_metadata(reader: Reader, name: String, metadata: TableMetadata) -> Result<Self> {
-        let state = Arc::new(GlobalReaderState::new(reader));
+        let state = Arc::new(GlobalReaderState::new(
+            reader,
+            name.clone(),
+            metadata.clone(),
+        ));
         Ok(Self {
             typed: TypedRead::from_global_metadata(state, name, metadata)?,
         })
@@ -219,6 +223,15 @@ impl TableReader {
     ) -> Result<TableScan> {
         self.typed
             .scan_bounds(bucket, start_key_inclusive, end_key_exclusive)
+    }
+
+    /// Build a portable full-scan plan pinned to this reader's current snapshot.
+    pub fn scan_plan(&self) -> Result<crate::TableScanPlan> {
+        let state = self
+            .typed
+            .global_state()
+            .ok_or_else(|| TableError::internal("table reader is missing its global read state"))?;
+        state.scan_plan()
     }
 }
 
@@ -373,15 +386,25 @@ fn required_reader_table_name(
 
 pub(crate) struct GlobalReaderState {
     total_buckets: u32,
-    state: Mutex<Reader>,
+    state: Mutex<GlobalReaderInner>,
+}
+
+struct GlobalReaderInner {
+    reader: Reader,
+    name: String,
+    metadata: TableMetadata,
 }
 
 impl GlobalReaderState {
-    fn new(reader: Reader) -> Self {
+    fn new(reader: Reader, name: String, metadata: TableMetadata) -> Self {
         let total_buckets = reader.current_global_snapshot().total_buckets;
         Self {
             total_buckets,
-            state: Mutex::new(reader),
+            state: Mutex::new(GlobalReaderInner {
+                reader,
+                name,
+                metadata,
+            }),
         }
     }
 
@@ -396,7 +419,7 @@ impl GlobalReaderState {
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<bytes::Bytes>>>> {
         let mut state = lock_global_state(&self.state)?;
-        Ok(state.get_with_options(bucket, key, options)?)
+        Ok(state.reader.get_with_options(bucket, key, options)?)
     }
 
     pub(crate) fn multi_get(
@@ -405,7 +428,7 @@ impl GlobalReaderState {
         options: &ReadOptions,
     ) -> Result<Vec<Option<Vec<Option<bytes::Bytes>>>>> {
         let mut state = lock_global_state(&self.state)?;
-        Ok(state.multi_get_with_options(keys, options)?)
+        Ok(state.reader.multi_get_with_options(keys, options)?)
     }
 
     pub(crate) fn scan(
@@ -416,7 +439,22 @@ impl GlobalReaderState {
         options: &ScanOptions,
     ) -> Result<DbIterator> {
         let mut state = lock_global_state(&self.state)?;
-        Ok(state.scan_with_options_bounds(bucket, start, end, options)?)
+        Ok(state
+            .reader
+            .scan_with_options_bounds(bucket, start, end, options)?)
+    }
+
+    pub(crate) fn scan_plan(&self) -> Result<crate::TableScanPlan> {
+        let state = lock_global_state(&self.state)?;
+        let snapshot = state.reader.current_global_snapshot().clone();
+        crate::TableScanPlan::from_global_reader(
+            state.name.clone(),
+            state.metadata.clone(),
+            snapshot.id,
+            snapshot.total_buckets,
+            snapshot.shard_snapshots,
+            state.reader.config().clone(),
+        )
     }
 }
 
@@ -430,7 +468,9 @@ fn global_metadata(reader: &Reader, name: &str) -> Result<TableMetadata> {
     load_table_metadata_for_shard(reader.config(), shard, name)
 }
 
-fn lock_global_state(state: &Mutex<Reader>) -> Result<std::sync::MutexGuard<'_, Reader>> {
+fn lock_global_state(
+    state: &Mutex<GlobalReaderInner>,
+) -> Result<std::sync::MutexGuard<'_, GlobalReaderInner>> {
     state
         .lock()
         .map_err(|_| TableError::internal("table reader core lock poisoned"))

@@ -4,7 +4,7 @@ use cobble::{
 use cobble_table::snapshot::TableSnapshotCommitter;
 use cobble_table::{
     DataField, LogicalType, ReadOnlyTable, ReadOnlyTableBuilder, Table, TableKey, TableKeyBuilder,
-    TableReader, TableReaderBuilder, TableSchema, TableWriterBuilder, Value,
+    TableReader, TableReaderBuilder, TableScanPlan, TableSchema, TableWriterBuilder, Value,
 };
 use std::sync::{Arc, mpsc};
 
@@ -537,6 +537,13 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
             bucket_rows
         );
     }
+    let scan_plan = reader.scan_plan().unwrap();
+    assert_eq!(scan_plan.snapshot_id(), first.id);
+    assert_eq!(scan_plan.schema(), &schema);
+    let scan_plan_json = serde_json::to_string(&scan_plan).unwrap();
+    let worker_plan = serde_json::from_str::<TableScanPlan>(&scan_plan_json).unwrap();
+    let mut worker_runtime = reader_config.clone();
+    worker_runtime.total_buckets = 1;
 
     let updated = vec![rows[0][0].clone(), Value::String("updated".into())];
     if keys[0].bucket() < 2 {
@@ -578,6 +585,18 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
             .unwrap(),
         Some(updated)
     );
+    let mut scanned_rows = worker_plan
+        .splits()
+        .unwrap()
+        .into_iter()
+        .flat_map(|split| split.create_scanner(worker_runtime.clone()).unwrap())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    scanned_rows.sort_by_key(|row| match row.first() {
+        Some(Value::Int64(id)) => *id,
+        _ => panic!("runtime schema always starts with an int64 id"),
+    });
+    assert_eq!(scanned_rows, rows);
 
     let cursor = projection.scan(reader_keys[0].bucket()).unwrap();
     drop(projection);
